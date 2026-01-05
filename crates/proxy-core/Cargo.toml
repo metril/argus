@@ -74,10 +74,14 @@ common = { path = "../common" }
 # HTTP/3 support (optional)
 proxy-http3 = { path = "../proxy-http3", optional = true }
 
+# Filter engine (optional)
+filter-engine = { path = "../filter-engine", optional = true }
+
 [features]
 default = []
 http3 = ["proxy-http3"]
 websockets = ["proxy-http3"]
+adblock = ["filter-engine"]
 
 [dev-dependencies]
 mockall = { workspace = true }

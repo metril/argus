@@ -8,6 +8,8 @@ pub struct ProxyConfig {
     pub proxy: ProxySettings,
     pub mitm: MitmSettings,
     pub performance: PerformanceSettings,
+    #[serde(default)]
+    pub adblock: AdblockSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +40,25 @@ pub struct PerformanceSettings {
     pub request_timeout_secs: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdblockSettings {
+    pub enabled: bool,
+    pub data_dir: PathBuf,
+    pub auto_update: bool,
+    pub update_interval_hours: u64,
+}
+
+impl Default for AdblockSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_dir: PathBuf::from("data/filters"),
+            auto_update: true,
+            update_interval_hours: 24,
+        }
+    }
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +84,7 @@ impl Default for ProxyConfig {
                 connection_timeout_secs: 30,
                 request_timeout_secs: 60,
             },
+            adblock: AdblockSettings::default(),
         }
     }
 }

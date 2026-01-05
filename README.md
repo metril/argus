@@ -16,13 +16,15 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 - Concurrent UDP (HTTP/3) and TCP (HTTP/1.1, HTTP/2) listeners
 - WebSocket proxying with bidirectional frame forwarding (optional feature flag, enabled by default)
 
-### Adblocking Engine (Phase 3 - v0.3.0)
-- AdBlock Plus and AdGuard syntax support
-- Network request blocking (all filter modifiers)
-- Cosmetic filtering (element hiding, CSS injection)
-- Scriptlet injection
-- Auto-updating filter lists (EasyList, AdGuard, uBlock Origin)
-- Client-side cosmetic filtering by default (5ms vs 50ms)
+### Adblocking Engine (Phase 3 - v0.3.0) 🚧
+- ✅ Core filter engine with adblock-rust integration
+- ✅ Network request blocking with AdBlock Plus syntax
+- ✅ Filter list management (EasyList, EasyPrivacy, AdGuard Base & Tracking Protection)
+- ✅ Auto-downloading filter lists from URLs
+- ✅ Statistics tracking (blocked requests, by type, top domains)
+- ⏳ AdGuard syntax extensions (in progress)
+- ⏳ Cosmetic filtering (planned)
+- ⏳ Scriptlet injection (planned)
 
 ### Userscript Engine (Phase 4 - v0.4.0)
 - Greasemonkey-compatible userscript execution
@@ -74,11 +76,14 @@ cd adblocker
 # Build release binary (HTTP/1.1, HTTP/2, and WebSockets)
 cargo build --release --features websockets
 
-# Build with HTTP/3 support (optional)
+# Build with adblocking support
+cargo build --release --features "websockets,adblock"
+
+# Build with HTTP/3 support
 cargo build --release --features http3
 
-# Build with all protocols (HTTP/1.1, HTTP/2, HTTP/3, and WebSockets)
-cargo build --release --features "http3,websockets"
+# Build with all features (HTTP/3, WebSockets, and Adblocking)
+cargo build --release --features "http3,websockets,adblock"
 
 # Run the proxy
 ./target/release/adblocker
@@ -129,6 +134,12 @@ enabled = true  # Required for HTTP/3
 ca_cert_path = "certs/root-ca.crt"
 ca_key_path = "certs/root-ca.key"
 cert_cache_size = 1000
+
+[adblock]
+enabled = false           # Requires building with --features adblock
+data_dir = "data/filters"
+auto_update = true
+update_interval_hours = 24
 
 [filters]
 enabled = true
@@ -225,10 +236,10 @@ See `docs/SECURITY.md` for our security policy.
 
 ## Status
 
-**Current Version**: v0.2.0 (Alpha)
+**Current Version**: v0.3.0 (Alpha)
 
 - ✅ **Phase 1 Complete**: HTTP/1.1, HTTP/2, MITM, Docker deployment
 - ✅ **Phase 2 Complete**: HTTP/3, QUIC, and WebSocket support (optional features)
-- 🚧 **Phase 3 In Progress**: Adblocking engine
+- 🚧 **Phase 3 In Progress**: Adblocking engine (Core filter engine complete, Week 8/12)
 - 📅 **Phase 4 Planned**: Userscript execution
 - 📅 **Phase 5 Planned**: Web management UI
