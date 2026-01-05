@@ -4,6 +4,7 @@ use crate::{
     cosmetic::CosmeticFilterManager,
     list::FilterListManager,
     matcher::{MatchResult, RequestMatcher},
+    scriptlets::ScriptletManager,
     stats::FilterStats,
     Error, Result,
 };
@@ -24,6 +25,8 @@ pub struct FilterEngine {
     list_manager: Arc<FilterListManager>,
     /// Cosmetic filtering manager
     cosmetic_manager: Arc<RwLock<CosmeticFilterManager>>,
+    /// Scriptlet injection manager
+    scriptlet_manager: Arc<RwLock<ScriptletManager>>,
     /// Statistics tracker
     stats: FilterStats,
     /// Whether the engine is enabled
@@ -50,6 +53,7 @@ impl FilterEngine {
             engine: Arc::new(ArcSwap::new(Arc::new(engine))),
             list_manager,
             cosmetic_manager: Arc::new(RwLock::new(CosmeticFilterManager::new())),
+            scriptlet_manager: Arc::new(RwLock::new(ScriptletManager::new())),
             stats: FilterStats::new(),
             enabled: Arc::new(RwLock::new(true)),
         })
@@ -103,6 +107,9 @@ impl FilterEngine {
         // Create new cosmetic filter manager
         let mut cosmetic_manager = CosmeticFilterManager::new();
 
+        // Create new scriptlet manager
+        let mut scriptlet_manager = ScriptletManager::new();
+
         for (list_id, content) in lists {
             debug!("Processing filter list: {}", list_id);
 
@@ -115,8 +122,15 @@ impl FilterEngine {
                     continue;
                 }
 
+                // Check if this is a scriptlet injection rule
+                if line.contains("#%#") || line.contains("#@%#") {
+                    // Try to parse as scriptlet rule
+                    if let Err(e) = scriptlet_manager.add_rule_from_string(line) {
+                        debug!("Failed to parse scriptlet rule '{}': {}", line, e);
+                    }
+                }
                 // Check if this is a cosmetic filtering rule
-                if line.contains("##") || line.contains("#@#") || line.contains("#?#")
+                else if line.contains("##") || line.contains("#@#") || line.contains("#?#")
                     || line.contains("#@?#") || line.contains("#$#") || line.contains("#@$#") {
                     // Try to parse as cosmetic rule
                     if let Err(e) = cosmetic_manager.add_rule_from_string(line) {
@@ -137,6 +151,9 @@ impl FilterEngine {
 
         // Update cosmetic manager
         *self.cosmetic_manager.write() = cosmetic_manager;
+
+        // Update scriptlet manager
+        *self.scriptlet_manager.write() = scriptlet_manager;
 
         info!("Filter engine loaded successfully");
         Ok(())
@@ -208,6 +225,16 @@ impl FilterEngine {
         }
 
         format!("{}\n{}", hiding, injection).trim().to_string()
+    }
+
+    /// Get scriptlet JavaScript code for a domain
+    pub fn get_scriptlet_code(&self, domain: &str) -> String {
+        if !*self.enabled.read() {
+            return String::new();
+        }
+
+        let manager = self.scriptlet_manager.read();
+        manager.get_scriptlet_code(domain)
     }
 }
 

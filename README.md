@@ -31,7 +31,11 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - Extended CSS selectors (`#?#`, `#@?#`) with `:has()`, `:contains()`, `:xpath()`, etc.
   - CSS injection rules (`#$#`, `#@$#`) for style modifications
   - Domain-specific and exception rules
-- ⏳ Scriptlet injection (planned)
+- ✅ Scriptlet injection (`#%#`, `#@%#`)
+  - JavaScript injection for complex filtering scenarios
+  - Built-in scriptlet library (abort-on-property-read, set-constant, remove-class, etc.)
+  - AdGuard and uBlock Origin syntax compatibility
+  - Exception rules for disabling scriptlets
 
 ### Userscript Engine (Phase 4 - v0.4.0)
 - Greasemonkey-compatible userscript execution
@@ -335,6 +339,127 @@ example.com#@$#.container
 3. **Test exception rules** - verify they don't break website functionality
 4. **Prefer element hiding over injection** - simpler and more maintainable
 5. **Use `:remove()` carefully** - can break page functionality
+
+## Scriptlet Injection
+
+Scriptlets are JavaScript functions injected into pages to modify behavior that cannot be blocked with network or cosmetic filters.
+
+### Basic Syntax
+
+```
+# AdGuard syntax
+domain.com#%#//scriptlet('scriptlet-name', 'arg1', 'arg2')
+
+# Exception rule
+domain.com#@%#//scriptlet('scriptlet-name')
+```
+
+### Built-in Scriptlets
+
+**abort-on-property-read** - Prevents access to object properties:
+```
+# Block access to window.advert property
+example.com#%#//scriptlet('abort-on-property-read', 'advert')
+
+# Throws ReferenceError when accessed
+example.com#%#//scriptlet('abort-on-property-read', 'alert')
+```
+
+**abort-on-property-write** - Prevents writing to object properties:
+```
+# Prevent setting window.tracking
+example.com#%#//scriptlet('abort-on-property-write', 'tracking')
+```
+
+**set-constant** - Override property values with constants:
+```
+# Set window.isAdBlocker to false
+example.com#%#//scriptlet('set-constant', 'isAdBlocker', 'false')
+
+# Set numeric value
+example.com#%#//scriptlet('set-constant', 'adsShown', '5')
+
+# Set to undefined
+example.com#%#//scriptlet('set-constant', 'adConfig', 'undefined')
+```
+
+**remove-attr** - Remove HTML attributes from elements:
+```
+# Remove data-ad attribute from divs
+example.com#%#//scriptlet('remove-attr', 'data-ad', 'div')
+
+# Remove onclick from buttons
+example.com#%#//scriptlet('remove-attr', 'onclick', 'button.ad-button')
+```
+
+**remove-class** - Remove CSS classes from elements:
+```
+# Remove 'premium-only' class
+example.com#%#//scriptlet('remove-class', 'premium-only', 'div.content')
+
+# Remove multiple classes
+example.com#%#//scriptlet('remove-class', 'overlay', 'body')
+```
+
+**noopjs** - No-operation scriptlet (placeholder):
+```
+# Does nothing, useful for testing
+example.com#%#//scriptlet('noopjs')
+```
+
+### Cross-Browser Compatibility
+
+The implementation supports AdGuard and uBlock Origin syntax:
+
+```
+# AdGuard syntax
+example.com#%#//scriptlet('abort-on-property-read', 'alert')
+
+# uBlock Origin syntax (aliases supported)
+example.com#%#//scriptlet('ubo-abort-on-property-read.js', 'alert')
+
+# Adblock Plus syntax (aliases supported)
+example.com#%#//scriptlet('abp-abort-on-property-read', 'alert')
+```
+
+### Argument Escaping
+
+Use backslash to escape special characters in arguments:
+
+```
+# Escape quotes
+example.com#%#//scriptlet('set-constant', 'message', 'it\'s working')
+
+# Escape commas in arguments
+example.com#%#//scriptlet('abort-on-property-read', 'config.ads\,trackers')
+```
+
+### Exception Rules
+
+Disable scriptlets for specific domains:
+
+```
+# Disable all scriptlets
+example.com#@%#//scriptlet()
+
+# Disable specific scriptlet
+example.com#@%#//scriptlet('abort-on-property-read')
+```
+
+### Scriptlet Execution
+
+Scriptlets are:
+- Injected before page scripts execute
+- Wrapped in IIFE for isolation: `(function() { 'use strict'; /* scriptlet code */ })();`
+- Execute in page context (not extension context)
+- Can modify page behavior without network blocking
+
+### Security Considerations
+
+1. **Scriptlets execute in page context** - they have full access to the DOM
+2. **Use trusted filter lists only** - malicious scriptlets can steal data
+3. **Test before deploying** - ensure scriptlets don't break functionality
+4. **Monitor for exceptions** - some sites detect and block scriptlet injection
 
 ## Project Structure
 

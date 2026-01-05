@@ -9,6 +9,7 @@ pub mod error;
 pub mod list;
 pub mod matcher;
 pub mod modifiers;
+pub mod scriptlets;
 pub mod stats;
 
 pub use cosmetic::{CosmeticFilterManager, CosmeticRule, CosmeticRuleType};
@@ -17,4 +18,5 @@ pub use error::{Error, Result};
 pub use list::{FilterList, FilterListManager};
 pub use matcher::{MatchResult, RequestMatcher};
 pub use modifiers::{RemoveHeaderModifier, RemoveParamModifier, ReplaceModifier};
+pub use scriptlets::{ScriptletManager, ScriptletRule};
 pub use stats::{BlockingStats, FilterStats};
