@@ -1,6 +1,7 @@
 //! Main filter engine implementation
 
 use crate::{
+    cosmetic::CosmeticFilterManager,
     list::FilterListManager,
     matcher::{MatchResult, RequestMatcher},
     stats::FilterStats,
@@ -21,6 +22,8 @@ pub struct FilterEngine {
     engine: Arc<ArcSwap<AdblockEngine>>,
     /// Filter list manager
     list_manager: Arc<FilterListManager>,
+    /// Cosmetic filtering manager
+    cosmetic_manager: Arc<RwLock<CosmeticFilterManager>>,
     /// Statistics tracker
     stats: FilterStats,
     /// Whether the engine is enabled
@@ -46,6 +49,7 @@ impl FilterEngine {
         Ok(Self {
             engine: Arc::new(ArcSwap::new(Arc::new(engine))),
             list_manager,
+            cosmetic_manager: Arc::new(RwLock::new(CosmeticFilterManager::new())),
             stats: FilterStats::new(),
             enabled: Arc::new(RwLock::new(true)),
         })
@@ -96,6 +100,9 @@ impl FilterEngine {
         // Combine all rules into a single FilterSet
         let mut filter_set = FilterSet::new(false); // false = not debug mode
 
+        // Create new cosmetic filter manager
+        let mut cosmetic_manager = CosmeticFilterManager::new();
+
         for (list_id, content) in lists {
             debug!("Processing filter list: {}", list_id);
 
@@ -104,12 +111,21 @@ impl FilterEngine {
                 let line = line.trim();
 
                 // Skip empty lines and comments
-                if line.is_empty() || line.starts_with('!') || line.starts_with('#') && !line.starts_with("##") {
+                if line.is_empty() || line.starts_with('!') {
                     continue;
                 }
 
-                // Add rule to filter set
-                filter_set.add_filter(line).ok(); // Ignore parse errors for individual rules
+                // Check if this is a cosmetic filtering rule
+                if line.contains("##") || line.contains("#@#") || line.contains("#?#")
+                    || line.contains("#@?#") || line.contains("#$#") || line.contains("#@$#") {
+                    // Try to parse as cosmetic rule
+                    if let Err(e) = cosmetic_manager.add_rule_from_string(line) {
+                        debug!("Failed to parse cosmetic rule '{}': {}", line, e);
+                    }
+                } else {
+                    // Network blocking rule - add to filter set
+                    filter_set.add_filter(line).ok(); // Ignore parse errors for individual rules
+                }
             }
         }
 
@@ -118,6 +134,9 @@ impl FilterEngine {
 
         // Atomically swap the engine
         self.engine.store(Arc::new(new_engine));
+
+        // Update cosmetic manager
+        *self.cosmetic_manager.write() = cosmetic_manager;
 
         info!("Filter engine loaded successfully");
         Ok(())
@@ -153,6 +172,42 @@ impl FilterEngine {
     /// Get filter list manager
     pub fn list_manager(&self) -> &FilterListManager {
         &self.list_manager
+    }
+
+    /// Get cosmetic hiding CSS for a domain
+    pub fn get_cosmetic_hiding_css(&self, domain: &str) -> String {
+        if !*self.enabled.read() {
+            return String::new();
+        }
+
+        let manager = self.cosmetic_manager.read();
+        manager.get_hiding_css(domain)
+    }
+
+    /// Get cosmetic injection CSS for a domain
+    pub fn get_cosmetic_injection_css(&self, domain: &str) -> String {
+        if !*self.enabled.read() {
+            return String::new();
+        }
+
+        let manager = self.cosmetic_manager.read();
+        manager.get_injection_css(domain)
+    }
+
+    /// Get combined cosmetic CSS (hiding + injection) for a domain
+    pub fn get_cosmetic_css(&self, domain: &str) -> String {
+        if !*self.enabled.read() {
+            return String::new();
+        }
+
+        let hiding = self.get_cosmetic_hiding_css(domain);
+        let injection = self.get_cosmetic_injection_css(domain);
+
+        if hiding.is_empty() && injection.is_empty() {
+            return String::new();
+        }
+
+        format!("{}\n{}", hiding, injection).trim().to_string()
     }
 }
 

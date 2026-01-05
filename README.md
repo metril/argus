@@ -26,7 +26,11 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - `$removeparam` - Remove query parameters from URLs (supports regex)
   - `$removeheader` - Remove HTTP headers from requests/responses
   - `$replace` - Content replacement with regex (10MB limit, text only)
-- ⏳ Cosmetic filtering (planned)
+- ✅ Cosmetic filtering (element hiding and CSS injection)
+  - Element hiding rules (`##`, `#@#`) for standard CSS selectors
+  - Extended CSS selectors (`#?#`, `#@?#`) with `:has()`, `:contains()`, `:xpath()`, etc.
+  - CSS injection rules (`#$#`, `#@$#`) for style modifications
+  - Domain-specific and exception rules
 - ⏳ Scriptlet injection (planned)
 
 ### Userscript Engine (Phase 4 - v0.4.0)
@@ -235,6 +239,102 @@ Disable modifiers for specific domains:
 # Disable specific removeheader rule
 @@||example.com^$removeheader=refresh
 ```
+
+## Cosmetic Filtering
+
+Cosmetic filtering hides unwanted page elements and injects custom styles without blocking network requests.
+
+### Element Hiding Rules (`##`)
+
+Hide elements matching CSS selectors:
+
+```
+# Hide all elements with class .ad-banner
+##.ad-banner
+
+# Domain-specific hiding
+example.com##.sidebar-ad
+
+# Multiple domains
+example.com,test.org##.promo-box
+
+# Complex selectors
+##div.ad-container > iframe[src*="ads"]
+```
+
+### Element Hiding Exceptions (`#@#`)
+
+Disable hiding rules for specific domains:
+
+```
+# Allow .ad-banner on example.com
+example.com#@#.ad-banner
+
+# Domain negation - hide everywhere EXCEPT example.com
+~example.com##.ad-banner
+```
+
+### Extended CSS Selectors (`#?#`)
+
+Use advanced selectors not available in standard CSS:
+
+```
+# Hide elements containing specific text
+example.com#?#div:contains(Advertisement)
+
+# Case-insensitive text matching
+example.com#?#div:contains(/sponsored/i)
+
+# Hide parent elements using :has()
+example.com#?#div:has(> .ad-label)
+
+# XPath expressions
+example.com#?#:xpath(//div[@class="banner"])
+
+# Move up DOM tree
+example.com#?#.ad-marker:nth-ancestor(2)
+
+# Find ancestor matching selector
+example.com#?#.inner:upward(div[data-ad])
+
+# Remove elements entirely
+example.com#?#.popup:remove()
+
+# Match computed styles
+example.com#?#div:matches-css(display: block)
+```
+
+### CSS Injection (`#$#`)
+
+Inject custom CSS styles:
+
+```
+# Change element appearance
+example.com#$#.container { background: transparent !important; }
+
+# Hide with custom styles
+example.com#$#.sticky-header { position: static !important; }
+
+# Modify layout
+example.com#$#.sidebar { width: 0 !important; }
+```
+
+**Security restriction**: Cannot use `url()` values to prevent resource loading.
+
+### CSS Injection Exceptions (`#@$#`)
+
+```
+# Disable CSS injection on specific domain
+example.com#@$#.container
+```
+
+### Cosmetic Filtering Best Practices
+
+1. **Use standard selectors when possible** (`##`) - better performance than extended CSS
+2. **Be specific with domains** - reduces false positives
+3. **Test exception rules** - verify they don't break website functionality
+4. **Prefer element hiding over injection** - simpler and more maintainable
+5. **Use `:remove()` carefully** - can break page functionality
 
 ## Project Structure
 
