@@ -16,6 +16,14 @@ pub struct MatchResult {
     pub exception_rule: Option<String>,
     /// Redirect URL if the request should be redirected
     pub redirect: Option<String>,
+    /// Query parameters to remove from URL
+    pub remove_params: Vec<String>,
+    /// Request headers to remove
+    pub remove_request_headers: Vec<String>,
+    /// Response headers to remove
+    pub remove_response_headers: Vec<String>,
+    /// Content replacement patterns (regex, replacement)
+    pub content_replacements: Vec<(String, String)>,
 }
 
 impl MatchResult {
@@ -26,6 +34,10 @@ impl MatchResult {
             matched_rule: Some(rule.into()),
             exception_rule: None,
             redirect: None,
+            remove_params: Vec::new(),
+            remove_request_headers: Vec::new(),
+            remove_response_headers: Vec::new(),
+            content_replacements: Vec::new(),
         }
     }
 
@@ -36,6 +48,10 @@ impl MatchResult {
             matched_rule: None,
             exception_rule: None,
             redirect: None,
+            remove_params: Vec::new(),
+            remove_request_headers: Vec::new(),
+            remove_response_headers: Vec::new(),
+            content_replacements: Vec::new(),
         }
     }
 
@@ -46,6 +62,10 @@ impl MatchResult {
             matched_rule: None,
             exception_rule: Some(rule.into()),
             redirect: None,
+            remove_params: Vec::new(),
+            remove_request_headers: Vec::new(),
+            remove_response_headers: Vec::new(),
+            content_replacements: Vec::new(),
         }
     }
 
@@ -56,7 +76,19 @@ impl MatchResult {
             matched_rule: Some(rule.into()),
             exception_rule: None,
             redirect: Some(url.into()),
+            remove_params: Vec::new(),
+            remove_request_headers: Vec::new(),
+            remove_response_headers: Vec::new(),
+            content_replacements: Vec::new(),
         }
+    }
+
+    /// Check if any modifiers are present
+    pub fn has_modifiers(&self) -> bool {
+        !self.remove_params.is_empty()
+            || !self.remove_request_headers.is_empty()
+            || !self.remove_response_headers.is_empty()
+            || !self.content_replacements.is_empty()
     }
 }
 

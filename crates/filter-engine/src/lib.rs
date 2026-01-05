@@ -7,10 +7,12 @@ pub mod engine;
 pub mod error;
 pub mod list;
 pub mod matcher;
+pub mod modifiers;
 pub mod stats;
 
 pub use engine::FilterEngine;
 pub use error::{Error, Result};
 pub use list::{FilterList, FilterListManager};
-pub use matcher::RequestMatcher;
+pub use matcher::{MatchResult, RequestMatcher};
+pub use modifiers::{RemoveHeaderModifier, RemoveParamModifier, ReplaceModifier};
 pub use stats::{BlockingStats, FilterStats};

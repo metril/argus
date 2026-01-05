@@ -22,7 +22,10 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 - ✅ Filter list management (EasyList, EasyPrivacy, AdGuard Base & Tracking Protection)
 - ✅ Auto-downloading filter lists from URLs
 - ✅ Statistics tracking (blocked requests, by type, top domains)
-- ⏳ AdGuard syntax extensions (in progress)
+- ✅ AdGuard syntax extensions: `$removeparam`, `$removeheader`, `$replace`
+  - `$removeparam` - Remove query parameters from URLs (supports regex)
+  - `$removeheader` - Remove HTTP headers from requests/responses
+  - `$replace` - Content replacement with regex (10MB limit, text only)
 - ⏳ Cosmetic filtering (planned)
 - ⏳ Scriptlet injection (planned)
 
@@ -157,6 +160,80 @@ enabled = true
 port = 8081
 username = "admin"
 password_hash = "$2b$12$..."  # Generate with: bcrypt-cli hash "your-password"
+```
+
+## AdGuard Filter Syntax
+
+The filter engine supports AdGuard's advanced modifiers for fine-grained control over request/response handling:
+
+### $removeparam - URL Parameter Removal
+
+Remove tracking parameters from URLs:
+
+```
+# Remove specific parameter
+||example.com^$removeparam=utm_source
+
+# Remove multiple parameters (regex)
+||example.com^$removeparam=/^(utm_source|utm_medium|utm_term)=/
+
+# Remove all parameters
+||tracking.site^$removeparam
+
+# Case-insensitive regex
+||example.com^$removeparam=/SESSION/i
+```
+
+### $removeheader - HTTP Header Removal
+
+Remove unwanted HTTP headers:
+
+```
+# Remove response header (default)
+||example.com^$removeheader=refresh
+
+# Remove request header
+||example.com^$removeheader=request:user-agent
+
+# Security headers cannot be removed (Content-Length, Set-Cookie, etc.)
+```
+
+**Restricted headers** (cannot be removed for security):
+- Content-Length, Content-Encoding, Transfer-Encoding
+- Cookie, Set-Cookie, Authorization
+- Access-Control-*, Origin, Content-Security-Policy
+- And 20+ others (see source code for full list)
+
+### $replace - Content Replacement
+
+Replace content in responses using regex:
+
+```
+# Basic replacement
+||example.com^$replace=/test1/test2/
+
+# Case-insensitive
+||example.com^$replace=/ADS/removed/i
+
+# Escape special characters
+||example.com^$replace=/price\:\s*\$99/price: \$49/
+```
+
+**Limitations**:
+- Only applies to text content types (HTML, JS, CSS, JSON)
+- Maximum response size: 10 MB
+- Rules from trusted filters only
+
+### Exception Rules
+
+Disable modifiers for specific domains:
+
+```
+# Disable all removeparam rules for example.com
+@@||example.com^$removeparam
+
+# Disable specific removeheader rule
+@@||example.com^$removeheader=refresh
 ```
 
 ## Project Structure
