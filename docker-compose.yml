@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"  # Proxy port
-      - "8081:8081"  # WebUI port
+      # - "8081:8081"  # WebUI port (Phase 5)
     volumes:
       # Persist generated certificates
       - ./certs:/app/certs

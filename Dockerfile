@@ -1,4 +1,4 @@
-# Multi-stage Dockerfile for Rust MITM Proxy
+# Multi-stage Dockerfile for Adblocker MITM Proxy
 # Target: Alpine-based image <100MB
 
 # Build stage
@@ -8,41 +8,23 @@ FROM rust:1.85-alpine AS builder
 RUN apk add --no-cache \
     musl-dev \
     openssl-dev \
+    openssl-libs-static \
     pkgconfig
 
 # Set working directory
-WORKDIR /app
+WORKDIR /build
 
-# Copy workspace manifest and dependency files
-COPY Cargo.toml ./
-COPY crates/common/Cargo.toml ./crates/common/
-COPY crates/proxy-core/Cargo.toml ./crates/proxy-core/
-COPY crates/proxy-http3/Cargo.toml ./crates/proxy-http3/
-COPY crates/filter-engine/Cargo.toml ./crates/filter-engine/
-COPY crates/userscript-engine/Cargo.toml ./crates/userscript-engine/
-COPY crates/web-api/Cargo.toml ./crates/web-api/
-COPY crates/web-ui/Cargo.toml ./crates/web-ui/
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY crates/common ./crates/common
+COPY crates/proxy-core ./crates/proxy-core
 
-# Create dummy source files to cache dependencies
-RUN mkdir -p crates/common/src crates/proxy-core/src crates/proxy-http3/src \
-    crates/filter-engine/src crates/userscript-engine/src crates/web-api/src \
-    crates/web-ui/src && \
-    echo "fn main() {}" > crates/common/src/lib.rs && \
-    echo "fn main() {}" > crates/proxy-core/src/lib.rs && \
-    echo "fn main() {}" > crates/proxy-http3/src/lib.rs && \
-    echo "fn main() {}" > crates/filter-engine/src/lib.rs && \
-    echo "fn main() {}" > crates/userscript-engine/src/lib.rs && \
-    echo "fn main() {}" > crates/web-api/src/lib.rs && \
-    echo "fn main() {}" > crates/web-ui/src/lib.rs
-
-# Build dependencies (cached layer)
-RUN cargo build --release || true
-
-# Copy actual source code
-COPY crates/ ./crates/
-
-# Build the actual application
+# Build in release mode with optimizations
+ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-s"
 RUN cargo build --release --bin adblocker
+
+# Verify binary was created and show size
+RUN ls -lh /build/target/release/adblocker
 
 # Runtime stage
 FROM alpine:3.21
@@ -50,8 +32,7 @@ FROM alpine:3.21
 # Install runtime dependencies
 RUN apk add --no-cache \
     ca-certificates \
-    libgcc \
-    openssl
+    libgcc
 
 # Create non-root user
 RUN adduser -D -u 1000 -h /app adblocker
@@ -60,24 +41,28 @@ RUN adduser -D -u 1000 -h /app adblocker
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/adblocker /app/adblocker
+COPY --from=builder /build/target/release/adblocker /app/adblocker
 
 # Copy default configuration
-COPY config/ /app/config/
+COPY config/default.toml /app/config/default.toml
 
-# Create necessary directories
-RUN mkdir -p /app/certs /app/data/filters /app/data/userscripts /app/logs && \
+# Create necessary directories with proper permissions
+RUN mkdir -p /app/certs /app/data /app/logs && \
     chown -R adblocker:adblocker /app
 
 # Switch to non-root user
 USER adblocker
 
-# Expose ports
-EXPOSE 8080 8081
+# Expose proxy port (default 8080)
+EXPOSE 8080
 
-# Health check
+# Set environment variables
+ENV RUST_LOG=info
+ENV CONFIG_PATH=/app/config/default.toml
+
+# Health check (simple TCP check on proxy port)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8081/health || exit 1
+    CMD nc -z localhost 8080 || exit 1
 
 # Run the proxy
-CMD ["/app/adblocker"]
+ENTRYPOINT ["/app/adblocker"]
