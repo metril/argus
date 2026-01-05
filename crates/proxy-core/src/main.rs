@@ -21,7 +21,10 @@ async fn main() -> Result<()> {
     })?;
 
     // Create and start the proxy server
-    let server = ProxyServer::new(config);
+    let server = ProxyServer::new(config).map_err(|e| {
+        error!("Failed to initialize proxy server: {}", e);
+        e
+    })?;
 
     info!("Proxy server initialized successfully");
 

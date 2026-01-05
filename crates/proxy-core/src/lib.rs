@@ -13,6 +13,7 @@ pub mod error;
 pub mod mitm;
 pub mod pipeline;
 pub mod server;
+pub mod tls;
 
 pub use config::ProxyConfig;
 pub use error::{Error, Result};

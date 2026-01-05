@@ -36,7 +36,7 @@ async fn test_server_starts() {
 
     // Note: This test just verifies the server can be created
     // Actually starting it would block forever
-    let _server = ProxyServer::new(config);
+    let _server = ProxyServer::new(config).expect("Failed to create server");
 }
 
 #[test]

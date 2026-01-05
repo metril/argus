@@ -1,24 +1,29 @@
 //! Connection handling and management
 
-use crate::{Error, Result};
+use crate::{mitm::MitmHandler, Error, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
 pub struct ConnectionHandler {
     client_addr: SocketAddr,
+    mitm_handler: Option<Arc<MitmHandler>>,
 }
 
 impl ConnectionHandler {
-    pub fn new(client_addr: SocketAddr) -> Self {
-        Self { client_addr }
+    pub fn new(client_addr: SocketAddr, mitm_handler: Option<Arc<MitmHandler>>) -> Self {
+        Self {
+            client_addr,
+            mitm_handler,
+        }
     }
 
     /// Handle an incoming connection
