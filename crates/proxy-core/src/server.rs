@@ -72,6 +72,12 @@ impl ProxyServer {
         // Create shutdown channel
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+        // Start HTTP/3 server if enabled
+        #[cfg(feature = "http3")]
+        if self.config.proxy.enable_http3 {
+            self.start_http3_server(shutdown_tx.subscribe()).await?;
+        }
+
         // Spawn signal handler
         let shutdown_signal = shutdown_tx.clone();
         tokio::spawn(async move {
@@ -125,6 +131,62 @@ impl ProxyServer {
     /// Get MITM handler
     pub fn mitm_handler(&self) -> Option<&Arc<MitmHandler>> {
         self.mitm_handler.as_ref()
+    }
+
+    /// Start HTTP/3 server (optional feature)
+    #[cfg(feature = "http3")]
+    async fn start_http3_server(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
+        use proxy_http3::{Http3Server, QuicConfig};
+
+        // HTTP/3 requires MITM to be enabled for certificate generation
+        let mitm_handler = self.mitm_handler.as_ref()
+            .ok_or_else(|| Error::Config("HTTP/3 requires MITM to be enabled".to_string()))?;
+
+        // Get or generate CA certificate for QUIC/TLS
+        let ca = &mitm_handler.ca;
+        let ca_cert_pem = std::fs::read_to_string(&self.config.mitm.ca_cert_path)
+            .map_err(|e| Error::Tls(format!("Failed to read CA certificate: {}", e)))?;
+        let ca_key_pem = std::fs::read_to_string(&self.config.mitm.ca_key_path)
+            .map_err(|e| Error::Tls(format!("Failed to read CA key: {}", e)))?;
+
+        // Parse CA certificate and key
+        let ca_certs = rustls_pemfile::certs(&mut ca_cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Tls(format!("Failed to parse CA certificate: {}", e)))?;
+
+        let ca_key = rustls_pemfile::private_key(&mut ca_key_pem.as_bytes())
+            .map_err(|e| Error::Tls(format!("Failed to parse CA key: {}", e)))?
+            .ok_or_else(|| Error::Tls("No private key found in CA key file".to_string()))?;
+
+        // Create TLS config with ALPN for HTTP/3
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(ca_certs, ca_key)
+            .map_err(|e| Error::Tls(format!("Failed to create TLS config: {}", e)))?;
+
+        // HTTP/3 requires "h3" ALPN protocol
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+        // Create QUIC configuration
+        let udp_addr = format!("{}:{}", self.config.proxy.host, self.config.proxy.port)
+            .parse()
+            .map_err(|e| Error::Connection(format!("Invalid address: {}", e)))?;
+
+        let quic_config = QuicConfig::new(udp_addr, Arc::new(tls_config));
+        let endpoint = quic_config.create_endpoint()
+            .map_err(|e| Error::Connection(format!("Failed to create QUIC endpoint: {}", e)))?;
+
+        info!("HTTP/3 server will start on UDP {}", udp_addr);
+
+        // Spawn HTTP/3 server in background
+        let http3_server = Http3Server::new(endpoint);
+        tokio::spawn(async move {
+            if let Err(e) = http3_server.start(shutdown_rx).await {
+                warn!("HTTP/3 server error: {}", e);
+            }
+        });
+
+        Ok(())
     }
 }
 

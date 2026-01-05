@@ -11,9 +11,10 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 - Connection pooling and graceful shutdown
 - Request/response pipeline architecture
 
-### Advanced Protocols (Phase 2 - v0.2.0)
-- HTTP/3 and QUIC support (optional, disabled by default)
-- WebSocket proxying with frame-level control
+### Advanced Protocols (Phase 2 - v0.2.0) ✅
+- HTTP/3 and QUIC support (optional feature flag, disabled by default)
+- Concurrent UDP (HTTP/3) and TCP (HTTP/1.1, HTTP/2) listeners
+- WebSocket proxying with frame-level control (planned)
 
 ### Adblocking Engine (Phase 3 - v0.3.0)
 - AdBlock Plus and AdGuard syntax support
@@ -70,8 +71,11 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 git clone https://github.com/yourusername/adblocker.git
 cd adblocker
 
-# Build release binary
+# Build release binary (HTTP/1.1 and HTTP/2 only)
 cargo build --release
+
+# Build with HTTP/3 support (optional)
+cargo build --release --features http3
 
 # Run the proxy
 ./target/release/adblocker
@@ -114,11 +118,11 @@ host = "0.0.0.0"
 port = 8080
 max_connections = 10000
 enable_http2 = true
-enable_http3 = false
+enable_http3 = false  # Requires building with --features http3
 enable_websockets = true
 
 [mitm]
-enabled = true
+enabled = true  # Required for HTTP/3
 ca_cert_path = "certs/root-ca.crt"
 ca_key_path = "certs/root-ca.key"
 cert_cache_size = 1000
@@ -212,9 +216,15 @@ See `docs/SECURITY.md` for our security policy.
 - [Boa](https://github.com/boa-dev/boa) - JavaScript engine
 - [Tokio](https://tokio.rs) - Async runtime
 - [Hyper](https://hyper.rs) - HTTP implementation
+- [Quinn](https://github.com/quinn-rs/quinn) - QUIC implementation
+- [h3](https://github.com/hyperium/h3) - HTTP/3 protocol
 
 ## Status
 
-**Current Version**: v0.0.1 (Pre-alpha)
+**Current Version**: v0.2.0 (Alpha)
 
-This project is under active development. Phase 1 (Core proxy) is in progress.
+- ✅ **Phase 1 Complete**: HTTP/1.1, HTTP/2, MITM, Docker deployment
+- ✅ **Phase 2 (Partial)**: HTTP/3 and QUIC support (optional feature)
+- 🚧 **Phase 3 In Progress**: Adblocking engine
+- 📅 **Phase 4 Planned**: Userscript execution
+- 📅 **Phase 5 Planned**: Web management UI

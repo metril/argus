@@ -71,5 +71,12 @@ chrono = { workspace = true }
 # Common utilities
 common = { path = "../common" }
 
+# HTTP/3 support (optional)
+proxy-http3 = { path = "../proxy-http3", optional = true }
+
+[features]
+default = []
+http3 = ["proxy-http3"]
+
 [dev-dependencies]
 mockall = { workspace = true }

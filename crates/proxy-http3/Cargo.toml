@@ -12,7 +12,12 @@ tokio = { workspace = true }
 
 # HTTP/3 and QUIC
 h3 = { workspace = true }
+h3-quinn = "0.0.8"
 quinn = { workspace = true }
+http = "1.1"
+
+# TLS
+rustls = { workspace = true }
 
 # WebSocket
 tokio-tungstenite = { workspace = true }
@@ -29,3 +34,6 @@ bytes = { workspace = true }
 
 # Common utilities
 common = { path = "../common" }
+
+[dev-dependencies]
+rcgen = { workspace = true }
