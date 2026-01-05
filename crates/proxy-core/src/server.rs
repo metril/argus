@@ -1,6 +1,6 @@
 //! Main proxy server implementation
 
-use crate::{config::ProxyConfig, Error, Result};
+use crate::{config::ProxyConfig, connection::ConnectionHandler, Error, Result};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -29,10 +29,16 @@ impl ProxyServer {
 
         loop {
             match listener.accept().await {
-                Ok((stream, addr)) => {
-                    info!("Accepted connection from {}", addr);
-                    // TODO: Handle connection
-                    drop(stream);
+                Ok((stream, client_addr)) => {
+                    info!("Accepted connection from {}", client_addr);
+
+                    // Spawn a new task to handle this connection
+                    tokio::spawn(async move {
+                        let handler = ConnectionHandler::new(client_addr);
+                        if let Err(e) = handler.handle(stream).await {
+                            warn!("Error handling connection from {}: {}", client_addr, e);
+                        }
+                    });
                 }
                 Err(e) => {
                     warn!("Failed to accept connection: {}", e);

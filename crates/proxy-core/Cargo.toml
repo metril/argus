@@ -6,6 +6,14 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "adblocker"
+path = "src/main.rs"
+
+[lib]
+name = "proxy_core"
+path = "src/lib.rs"
+
 [dependencies]
 # Async runtime
 tokio = { workspace = true }
