@@ -96,12 +96,13 @@ impl ProxyServer {
                             // Clone the MITM handler and config for this connection
                             let mitm_handler = self.mitm_handler.clone();
                             let enable_http2 = self.config.proxy.enable_http2;
+                            let enable_websockets = self.config.proxy.enable_websockets;
                             let mut shutdown_rx = shutdown_tx.subscribe();
 
                             // Spawn a new task to handle this connection
                             tokio::spawn(async move {
                                 tokio::select! {
-                                    result = ConnectionHandler::new(client_addr, mitm_handler, enable_http2).handle(stream) => {
+                                    result = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets).handle(stream) => {
                                         if let Err(e) = result {
                                             warn!("Error handling connection from {}: {}", client_addr, e);
                                         }

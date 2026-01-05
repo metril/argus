@@ -31,6 +31,8 @@ anyhow = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
+futures-util = "0.3"
+hyper = { workspace = true }
 
 # Common utilities
 common = { path = "../common" }

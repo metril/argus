@@ -19,6 +19,7 @@ pub struct ConnectionHandler {
     client_addr: SocketAddr,
     mitm_handler: Option<Arc<MitmHandler>>,
     enable_http2: bool,
+    enable_websockets: bool,
 }
 
 impl ConnectionHandler {
@@ -26,11 +27,13 @@ impl ConnectionHandler {
         client_addr: SocketAddr,
         mitm_handler: Option<Arc<MitmHandler>>,
         enable_http2: bool,
+        enable_websockets: bool,
     ) -> Self {
         Self {
             client_addr,
             mitm_handler,
             enable_http2,
+            enable_websockets,
         }
     }
 
@@ -74,15 +77,59 @@ impl ConnectionHandler {
     }
 
     /// Handle a single HTTP request
-    async fn handle_request(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let method = req.method();
-        let uri = req.uri();
+        let uri = req.uri().clone();
         let version = req.version();
 
         info!(
             "Request from {}: {} {} {:?}",
             self.client_addr, method, uri, version
         );
+
+        // Check for WebSocket upgrade
+        #[cfg(feature = "websockets")]
+        if self.enable_websockets {
+            use proxy_http3::{is_websocket_upgrade, extract_ws_target};
+
+            if is_websocket_upgrade(req.headers()) {
+                info!("WebSocket upgrade request detected from {}", self.client_addr);
+
+                // Extract target WebSocket URL
+                let target_url = match extract_ws_target(&uri, req.headers()) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        error!("Failed to extract WebSocket target: {}", e);
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(Full::new(Bytes::from("Invalid WebSocket target")))
+                            .unwrap());
+                    }
+                };
+
+                // Spawn WebSocket proxy task with hyper upgrade
+                let enable_ws = self.enable_websockets;
+                tokio::spawn(async move {
+                    match hyper::upgrade::on(&mut req).await {
+                        Ok(upgraded) => {
+                            let upgraded_io = hyper_util::rt::TokioIo::new(upgraded);
+                            if let Err(e) = proxy_http3::proxy_websocket(upgraded_io, &target_url).await {
+                                error!("WebSocket proxy error: {}", e);
+                            }
+                        }
+                        Err(e) => error!("Upgrade error: {}", e),
+                    }
+                });
+
+                // Return switching protocols response
+                return Ok(Response::builder()
+                    .status(StatusCode::SWITCHING_PROTOCOLS)
+                    .header(hyper::header::UPGRADE, "websocket")
+                    .header(hyper::header::CONNECTION, "Upgrade")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap());
+            }
+        }
 
         // Handle different request methods
         match *method {
