@@ -55,6 +55,7 @@ anyhow = { workspace = true }
 # Utilities
 url = { workspace = true }
 bytes = { workspace = true }
+async-trait = { workspace = true }
 
 # Caching
 moka = { workspace = true }

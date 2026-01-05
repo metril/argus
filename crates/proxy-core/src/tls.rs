@@ -10,16 +10,34 @@ use tracing::debug;
 
 /// Create a TLS server configuration from certificate data
 pub fn create_server_config(cert_data: &CertificateData) -> Result<Arc<ServerConfig>> {
-    debug!("Creating TLS server config");
+    create_server_config_with_alpn(cert_data, true)
+}
+
+/// Create a TLS server configuration with optional ALPN support
+pub fn create_server_config_with_alpn(
+    cert_data: &CertificateData,
+    enable_http2: bool,
+) -> Result<Arc<ServerConfig>> {
+    debug!(
+        "Creating TLS server config (HTTP/2: {})",
+        enable_http2
+    );
 
     // Create certificate chain with just the server cert
     let cert_chain = vec![cert_data.cert.clone()];
 
     // Create server config
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, cert_data.key.clone_key())
         .map_err(|e| Error::Tls(format!("Failed to create TLS server config: {}", e)))?;
+
+    // Configure ALPN protocols
+    if enable_http2 {
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    } else {
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
 
     Ok(Arc::new(config))
 }

@@ -10,6 +10,7 @@ pub mod ca;
 pub mod config;
 pub mod connection;
 pub mod error;
+pub mod http2;
 pub mod mitm;
 pub mod pipeline;
 pub mod server;

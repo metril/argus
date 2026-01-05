@@ -6,6 +6,8 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::signal;
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 pub struct ProxyServer {
@@ -46,7 +48,7 @@ impl ProxyServer {
         })
     }
 
-    /// Start the proxy server
+    /// Start the proxy server with graceful shutdown
     pub async fn start(&self) -> Result<()> {
         let addr = format!("{}:{}", self.config.proxy.host, self.config.proxy.port);
         let listener = TcpListener::bind(&addr)
@@ -67,31 +69,90 @@ impl ProxyServer {
             );
         }
 
+        // Create shutdown channel
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+        // Spawn signal handler
+        let shutdown_signal = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown_signal_handler().await;
+            info!("Shutdown signal received, stopping server...");
+            let _ = shutdown_signal.send(());
+        });
+
         loop {
-            match listener.accept().await {
-                Ok((stream, client_addr)) => {
-                    info!("Accepted connection from {}", client_addr);
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, client_addr)) => {
+                            info!("Accepted connection from {}", client_addr);
 
-                    // Clone the MITM handler for this connection
-                    let mitm_handler = self.mitm_handler.clone();
+                            // Clone the MITM handler and config for this connection
+                            let mitm_handler = self.mitm_handler.clone();
+                            let enable_http2 = self.config.proxy.enable_http2;
+                            let mut shutdown_rx = shutdown_tx.subscribe();
 
-                    // Spawn a new task to handle this connection
-                    tokio::spawn(async move {
-                        let handler = ConnectionHandler::new(client_addr, mitm_handler);
-                        if let Err(e) = handler.handle(stream).await {
-                            warn!("Error handling connection from {}: {}", client_addr, e);
+                            // Spawn a new task to handle this connection
+                            tokio::spawn(async move {
+                                tokio::select! {
+                                    result = ConnectionHandler::new(client_addr, mitm_handler, enable_http2).handle(stream) => {
+                                        if let Err(e) = result {
+                                            warn!("Error handling connection from {}: {}", client_addr, e);
+                                        }
+                                    }
+                                    _ = shutdown_rx.recv() => {
+                                        info!("Connection from {} terminated due to shutdown", client_addr);
+                                    }
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            warn!("Failed to accept connection: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to accept connection: {}", e);
+                _ = shutdown_tx.subscribe().recv() => {
+                    info!("Shutting down proxy server...");
+                    break;
                 }
             }
         }
+
+        info!("Proxy server stopped");
+        Ok(())
     }
 
     /// Get MITM handler
     pub fn mitm_handler(&self) -> Option<&Arc<MitmHandler>> {
         self.mitm_handler.as_ref()
+    }
+}
+
+/// Wait for shutdown signal (SIGINT or SIGTERM)
+async fn shutdown_signal_handler() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C signal");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM signal");
+        }
     }
 }

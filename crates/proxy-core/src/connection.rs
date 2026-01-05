@@ -18,13 +18,19 @@ use tracing::{debug, error, info, warn};
 pub struct ConnectionHandler {
     client_addr: SocketAddr,
     mitm_handler: Option<Arc<MitmHandler>>,
+    enable_http2: bool,
 }
 
 impl ConnectionHandler {
-    pub fn new(client_addr: SocketAddr, mitm_handler: Option<Arc<MitmHandler>>) -> Self {
+    pub fn new(
+        client_addr: SocketAddr,
+        mitm_handler: Option<Arc<MitmHandler>>,
+        enable_http2: bool,
+    ) -> Self {
         Self {
             client_addr,
             mitm_handler,
+            enable_http2,
         }
     }
 
@@ -150,8 +156,8 @@ impl ConnectionHandler {
                     .await
                     .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
 
-                // Create TLS server config
-                let server_config = tls::create_server_config(&cert_data)?;
+                // Create TLS server config with ALPN
+                let server_config = tls::create_server_config_with_alpn(&cert_data, self.enable_http2)?;
                 let acceptor = TlsAcceptor::from(server_config);
 
                 // Perform TLS handshake with client
@@ -187,18 +193,42 @@ impl ConnectionHandler {
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        debug!("Handling MITM connection for {}:{}", domain, port);
+        // Check negotiated protocol via ALPN
+        let (_, session) = tls_stream.get_ref();
+        let negotiated_protocol = session.alpn_protocol();
 
-        let io = TokioIo::new(tls_stream);
-        let service = service_fn(move |req| self.proxy_request(req));
+        let use_http2 = if let Some(protocol) = negotiated_protocol {
+            let is_h2 = crate::http2::is_http2_protocol(protocol);
+            debug!(
+                "ALPN negotiated protocol for {}:{}: {:?} (HTTP/2: {})",
+                domain,
+                port,
+                String::from_utf8_lossy(protocol),
+                is_h2
+            );
+            is_h2
+        } else {
+            debug!("No ALPN protocol negotiated for {}:{}, using HTTP/1.1", domain, port);
+            false
+        };
 
-        // Serve HTTP over the TLS connection
-        if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-            error!("Error serving MITM connection: {}", err);
-            return Err(Error::Connection(format!("MITM connection error: {}", err)));
+        if use_http2 {
+            info!("Using HTTP/2 for {}:{}", domain, port);
+            let service = move |req| self.proxy_request(req);
+            crate::http2::serve_http2(tls_stream, service).await
+        } else {
+            info!("Using HTTP/1.1 for {}:{}", domain, port);
+            let io = TokioIo::new(tls_stream);
+            let service = service_fn(move |req| self.proxy_request(req));
+
+            // Serve HTTP/1.1 over the TLS connection
+            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                error!("Error serving MITM connection: {}", err);
+                return Err(Error::Connection(format!("MITM connection error: {}", err)));
+            }
+
+            Ok(())
         }
-
-        Ok(())
     }
 
     /// Tunnel connection without MITM (direct passthrough)
