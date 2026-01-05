@@ -1,0 +1,31 @@
+[package]
+name = "proxy-http3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP/3 and QUIC
+h3 = { workspace = true }
+quinn = { workspace = true }
+
+# WebSocket
+tokio-tungstenite = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+
+# Common utilities
+common = { path = "../common" }

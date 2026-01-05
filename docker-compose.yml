@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  adblocker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: adblocker-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"  # Proxy port
+      - "8081:8081"  # WebUI port
+    volumes:
+      # Persist generated certificates
+      - ./certs:/app/certs
+      # Persist filter lists and userscripts
+      - ./data:/app/data
+      # Persist logs
+      - ./logs:/app/logs
+      # Custom configuration
+      - ./config:/app/config:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    networks:
+      - adblocker-net
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 3G
+        reservations:
+          cpus: '2'
+          memory: 1G
+
+networks:
+  adblocker-net:
+    driver: bridge

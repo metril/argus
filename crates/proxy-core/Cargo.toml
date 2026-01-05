@@ -1,0 +1,66 @@
+[package]
+name = "proxy-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# HTTP
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+h2 = { workspace = true }
+http-body-util = { workspace = true }
+
+# TLS
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Tower middleware
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+toml = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+bytes = { workspace = true }
+
+# Caching
+moka = { workspace = true }
+arc-swap = { workspace = true }
+
+# Concurrency
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Common utilities
+common = { path = "../common" }
+
+[dev-dependencies]
+mockall = { workspace = true }

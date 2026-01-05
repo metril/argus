@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+target/
+Cargo.lock
+
+# Runtime directories (will be mounted as volumes)
+certs/*.key
+certs/*.crt
+data/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+*.md
+!README.md
+
+# CI/CD
+.github/
+
+# Environment
+.env
+.env.local

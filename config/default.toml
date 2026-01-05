@@ -1,0 +1,23 @@
+# Default configuration for Rust MITM Proxy
+
+[proxy]
+host = "0.0.0.0"
+port = 8080
+max_connections = 10000
+enable_http2 = true
+enable_http3 = false
+enable_websockets = true
+
+[mitm]
+enabled = true
+ca_cert_path = "certs/root-ca.crt"
+ca_key_path = "certs/root-ca.key"
+cert_cache_size = 1000
+cert_ttl_days = 30
+cert_idle_timeout_secs = 3600
+
+[performance]
+max_cert_generations = 10
+max_html_buffers = 200
+connection_timeout_secs = 30
+request_timeout_secs = 60

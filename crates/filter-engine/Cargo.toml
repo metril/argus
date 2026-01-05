@@ -1,0 +1,51 @@
+[package]
+name = "filter-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# Adblocking
+adblock = { workspace = true }
+
+# HTML/CSS parsing
+html5ever = { workspace = true }
+cssparser = { workspace = true }
+selectors = { workspace = true }
+ammonia = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+regex = { workspace = true }
+
+# Caching
+moka = { workspace = true }
+arc-swap = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Common utilities
+common = { path = "../common" }

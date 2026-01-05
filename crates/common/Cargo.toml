@@ -1,0 +1,23 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+bytes = { workspace = true }
+
+# Time
+chrono = { workspace = true }

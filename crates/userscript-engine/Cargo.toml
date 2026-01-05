@@ -1,0 +1,50 @@
+[package]
+name = "userscript-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+
+# JavaScript engine
+boa_engine = { workspace = true }
+boa_parser = { workspace = true }
+
+# Database
+sled = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+url = { workspace = true }
+regex = { workspace = true }
+
+# Concurrency
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Security
+publicsuffix = { workspace = true }
+validator = { workspace = true }
+
+# Common utilities
+common = { path = "../common" }
