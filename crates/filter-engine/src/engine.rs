@@ -6,6 +6,7 @@ use crate::{
     matcher::{MatchResult, RequestMatcher},
     scriptlets::ScriptletManager,
     stats::FilterStats,
+    update::{UpdateConfig, UpdateScheduler, UpdateStats},
     Error, Result,
 };
 use adblock::lists::FilterSet;
@@ -31,6 +32,8 @@ pub struct FilterEngine {
     stats: FilterStats,
     /// Whether the engine is enabled
     enabled: Arc<RwLock<bool>>,
+    /// Auto-update scheduler (optional)
+    update_scheduler: Arc<RwLock<Option<UpdateScheduler>>>,
 }
 
 impl FilterEngine {
@@ -56,6 +59,7 @@ impl FilterEngine {
             scriptlet_manager: Arc::new(RwLock::new(ScriptletManager::new())),
             stats: FilterStats::new(),
             enabled: Arc::new(RwLock::new(true)),
+            update_scheduler: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -235,6 +239,72 @@ impl FilterEngine {
 
         let manager = self.scriptlet_manager.read();
         manager.get_scriptlet_code(domain)
+    }
+
+    /// Enable auto-update with specified configuration
+    pub fn enable_auto_update(&self, config: UpdateConfig) {
+        let scheduler = UpdateScheduler::new(self.clone(), config);
+        *self.update_scheduler.write() = Some(scheduler);
+        info!("Auto-update enabled");
+    }
+
+    /// Start auto-update scheduler
+    pub async fn start_auto_update(&self) {
+        if let Some(scheduler) = self.update_scheduler.read().as_ref() {
+            scheduler.start().await;
+        } else {
+            warn!("Auto-update not enabled, call enable_auto_update() first");
+        }
+    }
+
+    /// Stop auto-update scheduler
+    pub fn stop_auto_update(&self) {
+        if let Some(scheduler) = self.update_scheduler.read().as_ref() {
+            scheduler.stop();
+        }
+    }
+
+    /// Trigger an immediate manual update
+    pub async fn trigger_update(&self) -> Result<(usize, usize)> {
+        if let Some(scheduler) = self.update_scheduler.read().as_ref() {
+            scheduler.trigger_update().await
+        } else {
+            Err(Error::UpdateFailed(
+                "Auto-update not enabled".to_string(),
+            ))
+        }
+    }
+
+    /// Get auto-update statistics
+    pub fn update_stats(&self) -> Option<&UpdateStats> {
+        self.update_scheduler
+            .read()
+            .as_ref()
+            .map(|s| s.stats())
+    }
+
+    /// Check if auto-update is running
+    pub fn is_auto_update_running(&self) -> bool {
+        self.update_scheduler
+            .read()
+            .as_ref()
+            .map(|s| s.is_running())
+            .unwrap_or(false)
+    }
+
+    /// Update auto-update configuration
+    pub fn set_update_config(&self, config: UpdateConfig) {
+        if let Some(scheduler) = self.update_scheduler.read().as_ref() {
+            scheduler.set_config(config);
+        }
+    }
+
+    /// Get current auto-update configuration
+    pub fn get_update_config(&self) -> Option<UpdateConfig> {
+        self.update_scheduler
+            .read()
+            .as_ref()
+            .map(|s| s.get_config())
     }
 }
 

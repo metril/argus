@@ -47,5 +47,9 @@ parking_lot = { workspace = true }
 # Time
 chrono = { workspace = true }
 
+# Cryptography (for checksums)
+md5 = "0.7"
+base64 = "0.22"
+
 # Common utilities
 common = { path = "../common" }

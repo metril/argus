@@ -11,6 +11,7 @@ pub mod matcher;
 pub mod modifiers;
 pub mod scriptlets;
 pub mod stats;
+pub mod update;
 
 pub use cosmetic::{CosmeticFilterManager, CosmeticRule, CosmeticRuleType};
 pub use engine::FilterEngine;
@@ -20,3 +21,6 @@ pub use matcher::{MatchResult, RequestMatcher};
 pub use modifiers::{RemoveHeaderModifier, RemoveParamModifier, ReplaceModifier};
 pub use scriptlets::{ScriptletManager, ScriptletRule};
 pub use stats::{BlockingStats, FilterStats};
+pub use update::{
+    ListUpdateStats, UpdateAttempt, UpdateConfig, UpdateScheduler, UpdateStats,
+};

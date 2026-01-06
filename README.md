@@ -461,6 +461,182 @@ Scriptlets are:
 3. **Test before deploying** - ensure scriptlets don't break functionality
 4. **Monitor for exceptions** - some sites detect and block scriptlet injection
 
+## Auto-Update System
+
+The filter engine includes an automatic update system for keeping filter lists current.
+
+### Basic Usage
+
+```rust
+use filter_engine::{FilterEngine, UpdateConfig};
+
+// Create engine
+let engine = FilterEngine::new("./data".into())?;
+
+// Enable auto-update with default config (24-hour updates)
+engine.enable_auto_update(UpdateConfig::default());
+
+// Start the background updater
+engine.start_auto_update().await;
+```
+
+### Update Configuration
+
+```rust
+use filter_engine::UpdateConfig;
+
+let config = UpdateConfig {
+    interval_hours: 12,           // Update every 12 hours
+    enabled: true,                // Auto-update enabled
+    verify_checksums: true,       // Verify MD5 checksums
+    max_retries: 3,               // Retry failed updates 3 times
+    retry_delay_secs: 300,        // Wait 5 minutes between retries
+};
+
+engine.enable_auto_update(config);
+engine.start_auto_update().await;
+```
+
+### Manual Updates
+
+Trigger an immediate update manually:
+
+```rust
+// Trigger update and get results
+let (updated, failed) = engine.trigger_update().await?;
+println!("Updated: {}, Failed: {}", updated, failed);
+```
+
+### Update Statistics
+
+Monitor update history and per-list statistics:
+
+```rust
+// Get update statistics
+if let Some(stats) = engine.update_stats() {
+    // Get recent update attempts
+    let recent = stats.get_attempts(10);
+    for attempt in recent {
+        println!("Update at {}: {} updated, {} failed",
+            attempt.timestamp, attempt.lists_updated, attempt.lists_failed);
+    }
+
+    // Get statistics for specific list
+    if let Some(list_stats) = stats.get_list_stats("easylist") {
+        println!("EasyList: {} successful, {} failed",
+            list_stats.success_count, list_stats.failure_count);
+        println!("Last checksum: {:?}", list_stats.last_checksum);
+    }
+
+    // Get all list statistics
+    let all_stats = stats.get_all_list_stats();
+    for stat in all_stats {
+        println!("{}: success={}, failures={}",
+            stat.list_id, stat.success_count, stat.failure_count);
+    }
+}
+```
+
+### Checksum Verification
+
+Filter lists can include MD5 checksums for integrity verification:
+
+```
+! Title: EasyList
+! Checksum: 8/FRX6I9PqnMzpPRCLwE5Q==
+example.com##.ad-banner
+```
+
+The update system:
+- Automatically extracts checksums from filter list headers
+- Calculates MD5 hash of downloaded content (excluding checksum line)
+- Compares checksums and rejects corrupted downloads
+- Stores last verified checksum for each list
+
+### Atomic Hot Reload
+
+Updates are applied atomically without downtime:
+
+1. **Download Phase**: All filter lists downloaded in parallel
+2. **Verification Phase**: Checksums verified if enabled
+3. **Compilation Phase**: New filter engine compiled
+4. **Atomic Swap**: Old engine replaced via arc-swap
+5. **No Downtime**: Requests continue during entire process
+
+### Stopping Auto-Update
+
+```rust
+// Stop the background scheduler
+engine.stop_auto_update();
+
+// Check if running
+if engine.is_auto_update_running() {
+    println!("Auto-update is active");
+}
+```
+
+### Updating Configuration
+
+Change configuration without restarting:
+
+```rust
+let new_config = UpdateConfig {
+    interval_hours: 6,  // Change to 6-hour updates
+    ..engine.get_update_config().unwrap()
+};
+
+engine.set_update_config(new_config);
+```
+
+### Error Handling
+
+The update system includes comprehensive error handling:
+
+- **Network Errors**: Automatic retries with exponential backoff
+- **Checksum Failures**: Lists rejected, errors logged
+- **Partial Failures**: Successful lists still loaded
+- **Statistics Tracking**: All failures recorded with error messages
+
+```rust
+match engine.trigger_update().await {
+    Ok((updated, failed)) => {
+        println!("Update completed: {} updated, {} failed", updated, failed);
+
+        // Check for failures
+        if failed > 0 {
+            if let Some(stats) = engine.update_stats() {
+                for stat in stats.get_all_list_stats() {
+                    if let Some(error) = stat.last_error {
+                        eprintln!("List {} failed: {}", stat.list_id, error);
+                    }
+                }
+            }
+        }
+    }
+    Err(e) => {
+        eprintln!("Update failed completely: {}", e);
+    }
+}
+```
+
+### Best Practices
+
+1. **Set appropriate intervals**: 12-24 hours for most filter lists
+2. **Enable checksum verification**: Protects against corrupted downloads
+3. **Monitor statistics**: Track update success rates
+4. **Handle failures gracefully**: Don't fail application on update errors
+5. **Use conditional requests**: ETags prevent unnecessary downloads (automatic)
+6. **Test before production**: Verify update behavior in staging
+
+### Implementation Details
+
+- Uses `tokio::time::interval` for scheduling
+- Background task runs in separate spawn
+- Thread-safe with `Arc<RwLock<T>>` for shared state
+- MD5 checksums follow AdBlock Plus standard
+- Base64 encoding for checksum representation
+- Supports ETag-based conditional requests
+
 ## Project Structure
 
 ```

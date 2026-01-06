@@ -30,6 +30,9 @@ pub enum Error {
 
     #[error("Invalid filter syntax: {0}")]
     InvalidSyntax(String),
+
+    #[error("Auto-update failed: {0}")]
+    UpdateFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
