@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Storage value that can be any JSON-serializable type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum StorageValue {
     Null,

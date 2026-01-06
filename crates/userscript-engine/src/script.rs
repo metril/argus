@@ -92,7 +92,7 @@ impl Userscript {
     pub fn needs_update(&self, new_version: &str) -> bool {
         if let Some(current_version) = &self.metadata.version {
             // Simple version comparison (could be enhanced with semver)
-            new_version > current_version
+            new_version > current_version.as_str()
         } else {
             true // No version = always update
         }

@@ -4,20 +4,26 @@
 //! Week 14: Full GM_* API with xmlhttpRequest, notification, addStyle, etc.
 
 use crate::{storage::{StorageValue, UserscriptStorage}, Error, Result};
+use boa_gc::{Finalize, Trace};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// GM API context for a specific userscript
+#[derive(Clone, Trace, Finalize)]
 pub struct GmApi {
     /// Script ID for storage isolation
+    #[unsafe_ignore_trace]
     script_id: String,
     /// Storage instance
+    #[unsafe_ignore_trace]
     storage: Arc<UserscriptStorage>,
     /// Granted capabilities
+    #[unsafe_ignore_trace]
     grants: Vec<String>,
     /// Resource URLs (from @resource directives)
+    #[unsafe_ignore_trace]
     resources: HashMap<String, String>,
 }
 

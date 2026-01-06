@@ -3,9 +3,10 @@
 //! Provides script execution with GM_* API injection and sandboxing.
 
 use crate::{gm_api::GmApi, Error, Result};
+use boa_gc::Gc;
 use boa_engine::{
-    context::ContextBuilder, native_function::NativeFunction, object::ObjectInitializer,
-    property::Attribute, Context, JsResult, JsValue, Source,
+    context::ContextBuilder, js_string, native_function::NativeFunction,
+    object::ObjectInitializer, property::Attribute, Context, JsResult, JsString, JsValue, Source,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -57,19 +58,22 @@ impl ScriptExecutor {
     fn inject_gm_api(context: &mut Context, gm_api: Arc<GmApi>) -> Result<()> {
         let global = context.global_object().clone();
 
+
+        // Convert Arc to Gc for closure captures (required by Boa's GC)
+        let gc_api = Gc::new((*gm_api).clone());
         // Create GM object
         let mut gm_object = ObjectInitializer::new(context);
 
         // Storage APIs
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let set_value = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, context| {
                     let name = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("name must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("name must be a string")))
                         })?
                         .to_std_string_escaped();
 
@@ -77,25 +81,25 @@ impl ScriptExecutor {
                     let json_value = js_value_to_json(value, context)?;
 
                     api.set_value(&name, json_value)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(set_value, "setValue", 2);
+            gm_object.function(set_value, js_string!("setValue"), 2);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let get_value = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, context| {
                     let name = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("name must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("name must be a string")))
                         })?
                         .to_std_string_escaped();
 
@@ -106,63 +110,70 @@ impl ScriptExecutor {
 
                     let result = api
                         .get_value(&name, default_value)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     json_to_js_value(result, context)
                 },
                 api,
             );
 
-            gm_object.function(get_value, "getValue", 2);
+            gm_object.function(get_value, js_string!("getValue"), 2);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let delete_value = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, _context| {
                     let name = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("name must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("name must be a string")))
                         })?
                         .to_std_string_escaped();
 
                     api.delete_value(&name)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(delete_value, "deleteValue", 1);
+            gm_object.function(delete_value, js_string!("deleteValue"), 1);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let list_values = NativeFunction::from_copy_closure_with_captures(
                 move |_this, _args, api, context| {
                     let values = api
                         .list_values()
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
-                    let arr = boa_engine::object::JsArray::new(context);
+                    // Create array using Vec<JsValue>
+                    let mut arr_vec = Vec::new();
                     for (i, value) in values.iter().enumerate() {
-                        arr.set(i, JsValue::new(value.clone()), context)?;
+                        arr_vec.push(JsValue::from(JsString::from(value.clone())));
                     }
 
-                    Ok(arr.into())
+                    // Create array object manually since JsArray is private
+                    let arr_obj = context.intrinsics().constructors().array().constructor();
+                    let js_array = arr_obj.construct(&[], None, context)?;
+                    for (i, val) in arr_vec.iter().enumerate() {
+                        js_array.set(i, val.clone(), true, context)?;
+                    }
+                    Ok(js_array.into())
                 },
                 api,
             );
 
-            gm_object.function(list_values, "listValues", 0);
+            gm_object.function(list_values, js_string!("listValues"), 0);
         }
 
         // Info API
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let info = NativeFunction::from_copy_closure_with_captures(
                 move |_this, _args, api, context| {
                     let info_value = api.info();
@@ -171,18 +182,19 @@ impl ScriptExecutor {
                 api,
             );
 
-            gm_object.function(info, "info", 0);
+            gm_object.function(info, js_string!("info"), 0);
         }
 
         // Log API
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let log = NativeFunction::from_copy_closure_with_captures(
-                move |_this, args, api, _context| {
+                move |_this, args, api, context| {
                     let message = args
                         .get(0)
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "".to_string());
+                        .map(|v| v.to_string(context).map(|s| s.to_std_string_escaped()))
+                        .transpose()?
+                        .unwrap_or_else(String::new);
 
                     api.log(&message);
                     Ok(JsValue::undefined())
@@ -190,42 +202,42 @@ impl ScriptExecutor {
                 api,
             );
 
-            gm_object.function(log, "log", 1);
+            gm_object.function(log, js_string!("log"), 1);
         }
 
         // Advanced APIs (placeholders for Week 14)
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let add_style = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, _context| {
                     let css = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("css must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("css must be a string")))
                         })?
                         .to_std_string_escaped();
 
                     api.add_style(&css)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(add_style, "addStyle", 1);
+            gm_object.function(add_style, js_string!("addStyle"), 1);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let open_in_tab = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, context| {
                     let url = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("url must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("url must be a string")))
                         })?
                         .to_std_string_escaped();
 
@@ -235,18 +247,18 @@ impl ScriptExecutor {
                         .transpose()?;
 
                     api.open_in_tab(&url, options)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(open_in_tab, "openInTab", 2);
+            gm_object.function(open_in_tab, js_string!("openInTab"), 2);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let notification = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, context| {
                     let details = args
@@ -256,18 +268,18 @@ impl ScriptExecutor {
                         .unwrap_or(Value::Null);
 
                     api.notification(details)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(notification, "notification", 1);
+            gm_object.function(notification, js_string!("notification"), 1);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let xml_http_request = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, context| {
                     let details = args
@@ -275,67 +287,67 @@ impl ScriptExecutor {
                         .map(|v| js_value_to_json(v.clone(), context))
                         .transpose()?
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new(
-                                "details object required",
-                            ))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!(
+                                "details object required"
+                            )))
                         })?;
 
                     api.xml_http_request(details)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(xml_http_request, "xmlhttpRequest", 1);
+            gm_object.function(xml_http_request, js_string!("xmlhttpRequest"), 1);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let get_resource_url = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, context| {
                     let name = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("name must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("name must be a string")))
                         })?
                         .to_std_string_escaped();
 
                     let url = api
                         .get_resource_url(&name)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
-                    Ok(JsValue::new(url))
+                    Ok(JsValue::from(JsString::from(url)))
                 },
                 api,
             );
 
-            gm_object.function(get_resource_url, "getResourceURL", 1);
+            gm_object.function(get_resource_url, js_string!("getResourceURL"), 1);
         }
 
         {
-            let api = gm_api.clone();
+            let api = gc_api.clone();
             let set_clipboard = NativeFunction::from_copy_closure_with_captures(
                 move |_this, args, api, _context| {
                     let text = args
                         .get(0)
                         .and_then(|v| v.as_string())
                         .ok_or_else(|| {
-                            boa_engine::JsError::from_opaque(JsValue::new("text must be a string"))
+                            boa_engine::JsError::from_opaque(JsValue::from(js_string!("text must be a string")))
                         })?
                         .to_std_string_escaped();
 
                     api.set_clipboard(&text)
-                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::new(e.to_string())))?;
+                        .map_err(|e| boa_engine::JsError::from_opaque(JsValue::from(JsString::from(e.to_string()))))?;
 
                     Ok(JsValue::undefined())
                 },
                 api,
             );
 
-            gm_object.function(set_clipboard, "setClipboard", 1);
+            gm_object.function(set_clipboard, js_string!("setClipboard"), 1);
         }
 
         // Build GM object
@@ -343,7 +355,7 @@ impl ScriptExecutor {
 
         // Add to global
         global
-            .set("GM", gm, true, context)
+            .set(js_string!("GM"), gm, true, context)
             .map_err(|e| Error::ScriptExecution(format!("Failed to inject GM API: {}", e)))?;
 
         debug!("GM API injected into JavaScript context");
@@ -368,8 +380,10 @@ fn js_value_to_json(value: JsValue, context: &mut Context) -> JsResult<Value> {
 
         // Check if it's an array
         if obj.is_array() {
-            let arr = boa_engine::object::JsArray::from_object(obj.clone())?;
-            let len = arr.length(context)? as usize;
+            let arr = obj.clone();
+            // Get array length
+            let length_key = js_string!("length");
+            let len = arr.get(length_key, context)?.to_u32(context)? as usize;
             let mut values = Vec::with_capacity(len);
 
             for i in 0..len {
@@ -383,7 +397,7 @@ fn js_value_to_json(value: JsValue, context: &mut Context) -> JsResult<Value> {
             let mut map = serde_json::Map::new();
 
             for key in obj.own_property_keys(context)? {
-                if let Some(key_str) = key.as_string() {
+                if let boa_engine::property::PropertyKey::String(key_str) = &key {
                     let key_string = key_str.to_std_string_escaped();
                     if let Ok(value) = obj.get(key.clone(), context) {
                         map.insert(key_string, js_value_to_json(value, context)?);
@@ -404,20 +418,26 @@ fn json_to_js_value(value: Value, context: &mut Context) -> JsResult<JsValue> {
         Value::Null => Ok(JsValue::null()),
         Value::Bool(b) => Ok(JsValue::new(b)),
         Value::Number(n) => Ok(JsValue::new(n.as_f64().unwrap_or(0.0))),
-        Value::String(s) => Ok(JsValue::new(s)),
+        Value::String(s) => Ok(JsValue::from(JsString::from(s))),
         Value::Array(arr) => {
-            let js_arr = boa_engine::object::JsArray::new(context);
+            let mut arr_vec = Vec::new();
             for (i, item) in arr.into_iter().enumerate() {
                 let js_item = json_to_js_value(item, context)?;
-                js_arr.set(i, js_item, context)?;
+                arr_vec.push(js_item);
             }
-            Ok(js_arr.into())
+            // Create array object manually since JsArray is private
+                    let arr_obj = context.intrinsics().constructors().array().constructor();
+                    let js_array = arr_obj.construct(&[], None, context)?;
+                    for (i, val) in arr_vec.iter().enumerate() {
+                        js_array.set(i, val.clone(), true, context)?;
+                    }
+                    Ok(js_array.into())
         }
         Value::Object(obj) => {
             let js_obj = boa_engine::object::JsObject::with_null_proto();
             for (key, val) in obj {
                 let js_val = json_to_js_value(val, context)?;
-                js_obj.set(key, js_val, true, context)?;
+                js_obj.set(JsString::from(key.as_str()), js_val, true, context)?;
             }
             Ok(js_obj.into())
         }
