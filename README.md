@@ -842,14 +842,294 @@ Each userscript has isolated storage:
 5. **Test before deploying** - Verify script works on target sites
 6. **Namespace your scripts** - Prevents ID conflicts with other authors
 
-### Implementation Notes (Week 13)
+### JavaScript Execution (Week 14)
 
-- Metadata parser supports all standard directives
-- Storage uses sled for persistence with in-memory cache
+Execute userscripts with the Boa JavaScript engine:
+
+```rust
+use userscript_engine::{ScriptExecutor, GmApi, UserscriptStorage};
+use std::sync::Arc;
+
+// Create storage and API
+let storage = Arc::new(UserscriptStorage::new("./data/userscripts".into())?);
+let grants = vec!["GM_setValue".to_string(), "GM_getValue".to_string()];
+let gm_api = Arc::new(GmApi::new("my-script".to_string(), storage, grants));
+
+// Create executor with GM API injected
+let mut executor = ScriptExecutor::new(gm_api)?;
+
+// Execute userscript
+executor.execute(&script.source, &script.name())?;
+```
+
+### Advanced GM_* APIs
+
+#### GM_addStyle - CSS Injection
+
+Inject custom CSS into the page:
+
+```javascript
+// ==UserScript==
+// @name         Style Injector
+// @grant        GM_addStyle
+// ==/UserScript==
+
+// Hide ads
+GM.addStyle(`
+    .advertisement,
+    .sponsored-content {
+        display: none !important;
+    }
+`);
+
+// Custom theme
+GM.addStyle(`
+    body {
+        background-color: #1e1e1e;
+        color: #d4d4d4;
+    }
+`);
+```
+
+#### GM_xmlhttpRequest - Cross-Domain Requests
+
+Make HTTP requests that bypass CORS:
+
+```javascript
+// ==UserScript==
+// @name         API Client
+// @grant        GM_xmlhttpRequest
+// @connect      api.example.com
+// ==/UserScript==
+
+GM.xmlhttpRequest({
+    method: "GET",
+    url: "https://api.example.com/data",
+    headers: {
+        "User-Agent": "MyScript/1.0"
+    },
+    onload: function(response) {
+        console.log("Status:", response.status);
+        console.log("Data:", response.responseText);
+    },
+    onerror: function(error) {
+        console.error("Request failed:", error);
+    }
+});
+```
+
+#### GM_notification - Desktop Notifications
+
+Show desktop notifications:
+
+```javascript
+// ==UserScript==
+// @name         Notifier
+// @grant        GM_notification
+// ==/UserScript==
+
+GM.notification({
+    title: "Script Loaded",
+    text: "Your userscript is running!",
+    timeout: 5000
+});
+
+// Notification with callback
+GM.notification({
+    title: "New Message",
+    text: "You have a new message",
+    onclick: function() {
+        window.location.href = "/messages";
+    }
+});
+```
+
+#### GM_openInTab - Open URLs
+
+Open URLs in new tabs:
+
+```javascript
+// ==UserScript==
+// @name         Link Opener
+// @grant        GM_openInTab
+// ==/UserScript==
+
+document.querySelectorAll('a.external').forEach(link => {
+    link.addEventListener('click', (e) => {
+        e.preventDefault();
+
+        // Open in background tab
+        GM.openInTab(link.href, {
+            active: false,
+            insert: true,
+            setParent: true
+        });
+    });
+});
+```
+
+#### GM_getResourceURL - Resource Access
+
+Access @resource files:
+
+```javascript
+// ==UserScript==
+// @name         Resource User
+// @grant        GM_getResourceURL
+// @resource     icon https://example.com/icon.png
+// @resource     config https://example.com/config.json
+// ==/UserScript==
+
+// Get icon URL
+const iconUrl = GM.getResourceURL('icon');
+document.querySelector('#logo').src = iconUrl;
+
+// Fetch config
+const configUrl = GM.getResourceURL('config');
+fetch(configUrl)
+    .then(r => r.json())
+    .then(config => console.log('Config:', config));
+```
+
+#### GM_setClipboard - Clipboard Access
+
+Copy text to clipboard:
+
+```javascript
+// ==UserScript==
+// @name         Clipboard Helper
+// @grant        GM_setClipboard
+// ==/UserScript==
+
+document.querySelectorAll('.copy-button').forEach(button => {
+    button.addEventListener('click', () => {
+        const text = button.dataset.text;
+        GM.setClipboard(text);
+
+        button.textContent = 'Copied!';
+        setTimeout(() => {
+            button.textContent = 'Copy';
+        }, 2000);
+    });
+});
+```
+
+### Complete Example Userscript
+
+```javascript
+// ==UserScript==
+// @name         Complete Example
+// @namespace    http://example.com
+// @version      1.0.0
+// @description  Demonstrates all GM_* APIs
+// @match        *://example.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @grant        GM_notification
+// @grant        GM_openInTab
+// @grant        GM_setClipboard
+// @grant        GM_getResourceURL
+// @connect      api.example.com
+// @resource     logo https://example.com/logo.png
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Get script info
+    const info = GM.info();
+    console.log('Script:', info.script.id);
+
+    // Track visits
+    const visits = GM.getValue('visits', 0) + 1;
+    GM.setValue('visits', visits);
+
+    // Show notification on first visit
+    if (visits === 1) {
+        GM.notification({
+            title: 'Welcome!',
+            text: 'This is your first visit'
+        });
+    }
+
+    // Inject custom styles
+    GM.addStyle(`
+        .custom-banner {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+    `);
+
+    // Add banner
+    const banner = document.createElement('div');
+    banner.className = 'custom-banner';
+    banner.textContent = `Visit count: ${visits}`;
+    document.body.insertBefore(banner, document.body.firstChild);
+
+    // Add copy button
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = 'Copy Visit Count';
+    copyBtn.onclick = () => {
+        GM.setClipboard(`You've visited ${visits} times`);
+    };
+    banner.appendChild(copyBtn);
+
+    // Fetch remote data
+    GM.xmlhttpRequest({
+        method: 'GET',
+        url: 'https://api.example.com/status',
+        onload: (response) => {
+            console.log('API Status:', response.responseText);
+        }
+    });
+
+    // Open link in tab on button click
+    const linkBtn = document.createElement('button');
+    linkBtn.textContent = 'Open Related Page';
+    linkBtn.onclick = () => {
+        GM.openInTab('https://example.com/related', {
+            active: false
+        });
+    };
+    banner.appendChild(linkBtn);
+
+})();
+```
+
+### Implementation Notes (Week 14)
+
+- **Week 13**: Metadata parser, storage system, basic GM_* APIs (setValue, getValue, deleteValue, listValues)
+- **Week 14**: Boa JavaScript engine integration, advanced GM_* APIs (xmlhttpRequest, notification, addStyle, etc.)
+- Full Greasemonkey/Tampermonkey compatibility
 - Permission system enforces @grant declarations
-- URL matching supports glob patterns and exclusions
-- Script manager handles install/update/uninstall lifecycle
-- Foundation ready for Boa JavaScript engine integration (Week 14)
+- JavaScript execution with proper value conversion between Rust and JS
+- GM object injected into global scope
+- All GM_* functions return promises or values as per spec
+- Error handling with detailed error messages
+
+### Architecture
+
+The userscript engine consists of:
+
+1. **Metadata Parser** (`metadata.rs`) - Parses `// ==UserScript==` blocks
+2. **Script Manager** (`manager.rs`) - Lifecycle management (install/update/uninstall)
+3. **Storage** (`storage.rs`) - Persistent key-value storage with sled database
+4. **GM API** (`gm_api.rs`) - Implementation of all GM_* functions
+5. **Executor** (`executor.rs`) - Boa engine integration and JavaScript execution
+
+### Limitations (Week 14)
+
+These will be addressed in Weeks 15-16:
+
+- **GM_xmlhttpRequest**: Basic implementation, no async callbacks yet
+- **DOM Access**: Limited, full DOM manipulation coming in Week 15
+- **Sandboxing**: Basic isolation, enhanced security in Week 16
+- **Resource Fetching**: Returns placeholder URLs, full implementation in Week 15
+- **System Clipboard**: Stores in database instead of system clipboard
 
 ## Project Structure
 

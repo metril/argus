@@ -5,8 +5,10 @@
 //! - Script storage and management
 //! - Persistent data storage (GM_setValue/GM_getValue)
 //! - JavaScript execution via Boa engine
+//! - Full GM_* API (xmlhttpRequest, notification, addStyle, etc.)
 
 pub mod error;
+pub mod executor;
 pub mod gm_api;
 pub mod manager;
 pub mod metadata;
@@ -14,6 +16,7 @@ pub mod script;
 pub mod storage;
 
 pub use error::{Error, Result};
+pub use executor::ScriptExecutor;
 pub use gm_api::GmApi;
 pub use manager::{UserscriptManager, UserscriptStats};
 pub use metadata::{RunAt, UserscriptMetadata};
