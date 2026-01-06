@@ -46,6 +46,9 @@ chrono = { workspace = true }
 publicsuffix = { workspace = true }
 validator = { workspace = true }
 
+# Encoding
+base64 = "0.22"
+
 # Common utilities
 common = { path = "../common" }
 

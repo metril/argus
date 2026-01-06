@@ -1121,15 +1121,243 @@ The userscript engine consists of:
 4. **GM API** (`gm_api.rs`) - Implementation of all GM_* functions
 5. **Executor** (`executor.rs`) - Boa engine integration and JavaScript execution
 
-### Limitations (Week 14)
+### Execution Runtime (Week 15)
 
-These will be addressed in Weeks 15-16:
+Execute userscripts with proper timing and resource management:
 
-- **GM_xmlhttpRequest**: Basic implementation, no async callbacks yet
-- **DOM Access**: Limited, full DOM manipulation coming in Week 15
-- **Sandboxing**: Basic isolation, enhanced security in Week 16
-- **Resource Fetching**: Returns placeholder URLs, full implementation in Week 15
-- **System Clipboard**: Stores in database instead of system clipboard
+```rust
+use userscript_engine::{UserscriptManager, UserscriptRuntime, UserscriptStorage, RunAt};
+use std::sync::Arc;
+
+// Create manager and storage
+let manager = Arc::new(UserscriptManager::new("./data/userscripts".into())?);
+let storage = Arc::new(UserscriptStorage::new("./data/userscripts".into())?);
+
+// Create runtime
+let runtime = UserscriptRuntime::new(manager.clone(), storage);
+
+// Load userscripts from disk
+manager.load_all()?;
+
+// Execute scripts at document-start
+let results = runtime.execute_for_url(
+    "https://example.com/page",
+    RunAt::DocumentStart
+).await?;
+
+println!("Executed: {}", results.executed.len());
+println!("Failed: {}", results.failed.len());
+
+// Execute scripts at document-end
+let results = runtime.execute_for_url(
+    "https://example.com/page",
+    RunAt::DocumentEnd
+).await?;
+
+// Execute scripts at document-idle
+let results = runtime.execute_for_url(
+    "https://example.com/page",
+    RunAt::DocumentIdle
+).await?;
+```
+
+### @run-at Timing
+
+Control when scripts execute:
+
+```javascript
+// ==UserScript==
+// @name         Early Script
+// @run-at       document-start
+// ==/UserScript==
+
+// Runs before page scripts execute
+// Can intercept page behavior
+
+// ==UserScript==
+// @name         DOM Ready Script
+// @run-at       document-end
+// ==/UserScript==
+
+// Runs when DOM is ready
+// Most common for DOM manipulation
+
+// ==UserScript==
+// @name         Full Load Script
+// @run-at       document-idle
+// ==/UserScript==
+
+// Runs after everything is loaded
+// Use for non-critical functionality
+```
+
+### @require Dependencies
+
+Load external libraries:
+
+```javascript
+// ==UserScript==
+// @name         jQuery Script
+// @require      https://code.jquery.com/jquery-3.6.0.min.js
+// @require      https://cdn.example.com/library.js
+// @grant        GM_setValue
+// ==/UserScript==
+
+// jQuery is now available
+$('button').click(() => {
+    GM.setValue('clicked', true);
+});
+```
+
+The runtime automatically:
+- Fetches @require URLs
+- Caches dependencies for performance
+- Executes them before your script
+- Handles fetch errors gracefully
+
+### @resource Files
+
+Access external resources:
+
+```javascript
+// ==UserScript==
+// @name         Resource Example
+// @resource     icon https://example.com/icon.png
+// @resource     template https://example.com/template.html
+// @grant        GM_getResourceURL
+// ==/UserScript==
+
+// Get resource as data URL
+const iconUrl = GM.getResourceURL('icon');
+document.querySelector('#logo').src = iconUrl;
+
+// Resources are:
+// - Fetched and cached automatically
+// - Converted to base64 data URLs
+// - MIME type detected from extension
+```
+
+### Page Context
+
+Track page state and inject CSS:
+
+```rust
+use userscript_engine::{PageContext, DocumentReadyState};
+
+let mut ctx = PageContext::new("https://example.com".to_string());
+
+// Update ready state as page loads
+ctx.ready_state = DocumentReadyState::Interactive;
+
+// Collect injected CSS from GM_addStyle
+ctx.injected_css.push("body { background: #000; }".to_string());
+
+// Get all CSS to inject
+let css = ctx.get_css();
+```
+
+### Cache Management
+
+Monitor and control caches:
+
+```rust
+// Get cache statistics
+let stats = runtime.cache_stats();
+println!("@require cached: {}", stats.require_cached);
+println!("@resource cached: {}", stats.resource_cached);
+
+// Clear caches
+runtime.clear_caches();
+```
+
+### Complete Integration Example
+
+```rust
+use userscript_engine::{
+    UserscriptManager, UserscriptRuntime, UserscriptStorage,
+    RunAt, DocumentReadyState, PageContext
+};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Setup
+    let manager = Arc::new(UserscriptManager::new("./data/userscripts".into())?);
+    let storage = Arc::new(UserscriptStorage::new("./data/userscripts".into())?);
+    let runtime = UserscriptRuntime::new(manager.clone(), storage);
+
+    // Load installed scripts
+    manager.load_all()?;
+
+    // Install a new script
+    let script = r#"
+// ==UserScript==
+// @name         Page Enhancer
+// @match        *://example.com/*
+// @run-at       document-end
+// @require      https://code.jquery.com/jquery-3.6.0.min.js
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+GM.addStyle('body { font-family: Arial; }');
+
+const visits = GM.getValue('visits', 0) + 1;
+GM.setValue('visits', visits);
+
+$('body').prepend(`<div>Visit #${visits}</div>`);
+"#;
+
+    manager.install(script.to_string())?;
+
+    // Execute for a page request
+    let url = "https://example.com/page";
+    let mut page_ctx = PageContext::new(url.to_string());
+
+    // Execute at document-start
+    runtime.execute_for_url(url, RunAt::DocumentStart).await?;
+
+    // Simulate DOM ready
+    page_ctx.ready_state = DocumentReadyState::Interactive;
+    let results = runtime.execute_for_url(url, RunAt::DocumentEnd).await?;
+
+    println!("Executed {} scripts", results.executed.len());
+
+    // Get injected CSS
+    let css = page_ctx.get_css();
+    println!("Injected CSS: {}", css);
+
+    // Simulate complete load
+    page_ctx.ready_state = DocumentReadyState::Complete;
+    runtime.execute_for_url(url, RunAt::DocumentIdle).await?;
+
+    Ok(())
+}
+```
+
+### Implementation Notes (Week 15)
+
+- **Week 13**: Metadata parser, storage, basic GM_* APIs
+- **Week 14**: Boa JavaScript engine integration, advanced GM_* APIs
+- **Week 15**: Execution orchestration, @run-at timing, @require/@resource support
+- UserscriptRuntime manages execution lifecycle
+- Automatic @require and @resource fetching with caching
+- DocumentReadyState determines when scripts execute
+- ExecutionResults tracks success/failure
+- PageContext for injected CSS management
+- MIME type detection for resources
+- Base64 data URL generation
+
+### Limitations (Week 15)
+
+These will be addressed in Week 16 (Security & Sandboxing):
+
+- **Async GM_xmlhttpRequest**: Currently synchronous validation only
+- **DOM Manipulation**: Scripts execute in Boa context (no real DOM yet)
+- **Content Security Policy**: Not yet enforced
+- **Resource Sandboxing**: Basic fetch, no security isolation
+- **System Integration**: Notifications and clipboard are logged/stored, not system-level
 
 ## Project Structure
 

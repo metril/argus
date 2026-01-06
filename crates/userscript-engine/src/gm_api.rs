@@ -5,6 +5,7 @@
 
 use crate::{storage::{StorageValue, UserscriptStorage}, Error, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -16,6 +17,8 @@ pub struct GmApi {
     storage: Arc<UserscriptStorage>,
     /// Granted capabilities
     grants: Vec<String>,
+    /// Resource URLs (from @resource directives)
+    resources: HashMap<String, String>,
 }
 
 impl GmApi {
@@ -25,6 +28,22 @@ impl GmApi {
             script_id,
             storage,
             grants,
+            resources: HashMap::new(),
+        }
+    }
+
+    /// Create GM API with resource URLs
+    pub fn with_resources(
+        script_id: String,
+        storage: Arc<UserscriptStorage>,
+        grants: Vec<String>,
+        resources: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            script_id,
+            storage,
+            grants,
+            resources,
         }
     }
 

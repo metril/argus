@@ -12,6 +12,7 @@ pub mod executor;
 pub mod gm_api;
 pub mod manager;
 pub mod metadata;
+pub mod runtime;
 pub mod script;
 pub mod storage;
 
@@ -20,5 +21,8 @@ pub use executor::ScriptExecutor;
 pub use gm_api::GmApi;
 pub use manager::{UserscriptManager, UserscriptStats};
 pub use metadata::{RunAt, UserscriptMetadata};
+pub use runtime::{
+    CacheStats, DocumentReadyState, ExecutionResults, PageContext, UserscriptRuntime,
+};
 pub use script::Userscript;
 pub use storage::{StorageValue, UserscriptStorage};
