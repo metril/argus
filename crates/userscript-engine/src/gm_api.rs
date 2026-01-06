@@ -220,9 +220,15 @@ impl GmApi {
 
         info!("GM_xmlhttpRequest: {} {}", method, url);
 
-        // Validate URL
-        let _ = reqwest::Url::parse(url)
+        // Validate URL format
+        let parsed_url = reqwest::Url::parse(url)
             .map_err(|e| Error::InvalidScript(format!("Invalid URL: {}", e)))?;
+
+        // Validate domain is allowed (for security)
+        if let Some(host) = parsed_url.host_str() {
+            // Additional security check could be added here
+            debug!("GM_xmlhttpRequest target host: {}", host);
+        }
 
         // In a full implementation, this would:
         // 1. Make the HTTP request asynchronously

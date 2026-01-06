@@ -3,8 +3,14 @@
 //! Manages script execution lifecycle, timing, and resource loading.
 
 use crate::{
-    executor::ScriptExecutor, gm_api::GmApi, manager::UserscriptManager,
-    metadata::RunAt, script::Userscript, storage::UserscriptStorage, Error, Result,
+    executor::ScriptExecutor,
+    gm_api::GmApi,
+    manager::UserscriptManager,
+    metadata::RunAt,
+    script::Userscript,
+    security::{AuditEvent, ScriptValidator, SecurityAuditor, SecurityPolicy},
+    storage::UserscriptStorage,
+    Error, Result,
 };
 use reqwest::Client;
 use std::collections::HashMap;
@@ -23,11 +29,30 @@ pub struct UserscriptRuntime {
     require_cache: Arc<parking_lot::RwLock<HashMap<String, String>>>,
     /// Cache for @resource files
     resource_cache: Arc<parking_lot::RwLock<HashMap<String, Vec<u8>>>>,
+    /// Security policy
+    security_policy: Arc<SecurityPolicy>,
+    /// Security auditor
+    auditor: Arc<SecurityAuditor>,
+    /// Script validator
+    validator: Arc<ScriptValidator>,
 }
 
 impl UserscriptRuntime {
-    /// Create a new userscript runtime
+    /// Create a new userscript runtime with default security policy
     pub fn new(manager: Arc<UserscriptManager>, storage: Arc<UserscriptStorage>) -> Self {
+        let security_policy = Arc::new(SecurityPolicy::default());
+        Self::with_security(manager, storage, security_policy)
+    }
+
+    /// Create a new userscript runtime with custom security policy
+    pub fn with_security(
+        manager: Arc<UserscriptManager>,
+        storage: Arc<UserscriptStorage>,
+        security_policy: Arc<SecurityPolicy>,
+    ) -> Self {
+        let auditor = Arc::new(SecurityAuditor::new(security_policy.clone()));
+        let validator = Arc::new(ScriptValidator::new(security_policy.clone()));
+
         Self {
             manager,
             storage,
@@ -37,7 +62,20 @@ impl UserscriptRuntime {
                 .unwrap(),
             require_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             resource_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            security_policy,
+            auditor,
+            validator,
         }
+    }
+
+    /// Get security auditor
+    pub fn auditor(&self) -> &Arc<SecurityAuditor> {
+        &self.auditor
+    }
+
+    /// Get security policy
+    pub fn security_policy(&self) -> &Arc<SecurityPolicy> {
+        &self.security_policy
     }
 
     /// Execute userscripts for a given URL at a specific timing
@@ -91,10 +129,53 @@ impl UserscriptRuntime {
     async fn execute_script(&self, script: &Userscript, url: &str) -> Result<()> {
         debug!("Executing userscript: {}", script.name());
 
+        // Security audit: log execution start
+        self.auditor.log_event(
+            AuditEvent::ExecutionStart,
+            &script.id,
+            &format!("Executing on {}", url),
+        );
+
+        // Validate script metadata
+        self.validator
+            .validate_requires(&script.metadata.requires)?;
+        self.validator
+            .validate_resources(&script.metadata.resources)?;
+        self.validator.validate_grants(&script.metadata.grants)?;
+
+        // Validate script source
+        if let Err(e) = self.validator.validate_source(&script.source) {
+            self.auditor.log_event(
+                AuditEvent::PolicyViolation,
+                &script.id,
+                &format!("Source validation failed: {}", e),
+            );
+            return Err(e);
+        }
+
         // Load @require dependencies
         let mut full_source = String::new();
 
         for require_url in &script.metadata.requires {
+            // Validate URL
+            match self.security_policy.validate_url(require_url) {
+                Ok(_) => {
+                    self.auditor.log_event(
+                        AuditEvent::ResourceLoaded,
+                        &script.id,
+                        &format!("Loading @require: {}", require_url),
+                    );
+                }
+                Err(e) => {
+                    self.auditor.log_event(
+                        AuditEvent::PermissionDenied,
+                        &script.id,
+                        &format!("@require blocked: {}", require_url),
+                    );
+                    return Err(e);
+                }
+            }
+
             let code = self.load_require(require_url).await?;
             full_source.push_str(&code);
             full_source.push('\n');
@@ -114,9 +195,24 @@ impl UserscriptRuntime {
         let mut executor = ScriptExecutor::new(gm_api)?;
 
         // Execute with proper error handling
-        executor.execute(&full_source, &script.name())?;
-
-        Ok(())
+        match executor.execute(&full_source, &script.name()) {
+            Ok(_) => {
+                self.auditor.log_event(
+                    AuditEvent::ExecutionComplete,
+                    &script.id,
+                    "Script executed successfully",
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.auditor.log_event(
+                    AuditEvent::ExecutionFailed,
+                    &script.id,
+                    &format!("Execution failed: {}", e),
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Load a @require dependency
@@ -171,6 +267,9 @@ impl UserscriptRuntime {
             .get(name)
             .ok_or_else(|| Error::InvalidScript(format!("Resource not found: {}", name)))?;
 
+        // Validate resource URL
+        self.security_policy.validate_url(resource_url)?;
+
         let cache_key = format!("{}:{}", script.id, name);
 
         // Check cache
@@ -183,6 +282,13 @@ impl UserscriptRuntime {
         }
 
         info!("Fetching @resource: {} from {}", name, resource_url);
+
+        // Audit log
+        self.auditor.log_event(
+            AuditEvent::NetworkRequest,
+            &script.id,
+            &format!("Fetching @resource: {}", resource_url),
+        );
 
         // Fetch from network
         let response = self
@@ -211,6 +317,12 @@ impl UserscriptRuntime {
             let mut cache = self.resource_cache.write();
             cache.insert(cache_key, data.clone());
         }
+
+        self.auditor.log_event(
+            AuditEvent::ResourceLoaded,
+            &script.id,
+            &format!("@resource loaded: {} ({} bytes)", name, data.len()),
+        );
 
         Ok(data)
     }

@@ -14,6 +14,7 @@ pub mod manager;
 pub mod metadata;
 pub mod runtime;
 pub mod script;
+pub mod security;
 pub mod storage;
 
 pub use error::{Error, Result};
@@ -25,4 +26,7 @@ pub use runtime::{
     CacheStats, DocumentReadyState, ExecutionResults, PageContext, UserscriptRuntime,
 };
 pub use script::Userscript;
+pub use security::{
+    AuditEntry, AuditEvent, AuditStatistics, ScriptValidator, SecurityAuditor, SecurityPolicy,
+};
 pub use storage::{StorageValue, UserscriptStorage};

@@ -1336,6 +1336,279 @@ $('body').prepend(`<div>Visit #${visits}</div>`);
 }
 ```
 
+## Security and Sandboxing (Week 16)
+
+The userscript engine includes comprehensive security hardening to protect against malicious scripts and prevent security vulnerabilities.
+
+### Security Policy
+
+Configure security policies for userscript execution:
+
+```rust
+use userscript_engine::{SecurityPolicy, UserscriptRuntime};
+
+// Default policy (recommended for production)
+let policy = Arc::new(SecurityPolicy::default());
+
+// Strict policy (maximum security)
+let strict_policy = Arc::new(SecurityPolicy::strict());
+
+// Permissive policy (development only)
+let dev_policy = Arc::new(SecurityPolicy::permissive());
+
+// Custom policy
+let custom_policy = Arc::new(SecurityPolicy {
+    max_execution_time_ms: 15_000,
+    max_memory_bytes: 75 * 1024 * 1024,
+    require_https: true,
+    strict_csp: true,
+    max_requires: 15,
+    max_resources: 30,
+    enable_audit_log: true,
+    ..Default::default()
+});
+
+// Create runtime with security policy
+let runtime = UserscriptRuntime::with_security(manager, storage, policy);
+```
+
+### Security Features
+
+#### 1. URL Validation
+
+All @require and @resource URLs are validated against the security policy:
+
+```rust
+// HTTPS enforcement
+policy.require_https = true;  // Block HTTP URLs
+
+// Domain allowlist
+policy.allowed_domains.insert("cdn.jsdelivr.net".to_string());
+policy.allowed_domains.insert("code.jquery.com".to_string());
+
+// Domain blocklist
+policy.blocked_domains.insert("malicious-site.com".to_string());
+
+// Automatic blocking of private IPs
+// localhost, 127.0.0.1, 10.x.x.x, 192.168.x.x, 172.16-31.x.x
+```
+
+#### 2. Source Code Validation
+
+Scripts are scanned for dangerous patterns before execution:
+
+```javascript
+// Blocked patterns:
+// - eval()
+// - Function() constructor
+// - setTimeout/setInterval with string arguments
+```
+
+```rust
+let validator = ScriptValidator::new(policy.clone());
+
+// Validate script source
+validator.validate_source(&script.source)?;
+
+// Validate metadata
+validator.validate_requires(&script.metadata.requires)?;
+validator.validate_resources(&script.metadata.resources)?;
+validator.validate_grants(&script.metadata.grants)?;
+```
+
+#### 3. Permission Validation
+
+GM_* API access is controlled by @grant declarations:
+
+```javascript
+// ==UserScript==
+// @name         Secure Script
+// @grant        GM_setValue
+// @grant        GM_getValue
+// ==/UserScript==
+
+// ✓ Allowed (granted)
+GM.setValue('key', 'value');
+
+// ✗ Blocked (not granted)
+GM.xmlhttpRequest({ url: "..." });  // Error: Missing @grant GM_xmlhttpRequest
+```
+
+```rust
+// Check if API is allowed
+policy.is_api_allowed("GM_setValue", &grants);
+
+// Block dangerous APIs globally
+policy.blocked_gm_apis.insert("unsafeWindow".to_string());
+```
+
+#### 4. Security Audit Logging
+
+All security events are logged for monitoring:
+
+```rust
+// Get audit log
+let auditor = runtime.auditor();
+
+// Recent events
+let recent = auditor.get_recent_entries(100);
+
+// Events for specific script
+let script_events = auditor.get_script_entries("my-script");
+
+// Audit statistics
+let stats = auditor.get_statistics();
+println!("Total events: {}", stats.total_events);
+println!("Permission denied: {}", stats.permission_denied);
+println!("API calls: {}", stats.api_calls);
+println!("Network requests: {}", stats.network_requests);
+println!("Policy violations: {}", stats.policy_violations);
+println!("Suspicious activity: {}", stats.suspicious_activity);
+
+// Clear audit log
+auditor.clear();
+```
+
+#### 5. Resource Limits
+
+Enforce limits on script resources:
+
+```rust
+// Maximum @require dependencies
+policy.max_requires = 20;
+
+// Maximum @resource files
+policy.max_resources = 50;
+
+// Maximum execution time (milliseconds)
+policy.max_execution_time_ms = 30_000;
+
+// Maximum memory usage (bytes)
+policy.max_memory_bytes = 100 * 1024 * 1024;
+```
+
+### Audit Events
+
+The security auditor tracks these event types:
+
+- `ExecutionStart` - Script execution started
+- `ExecutionComplete` - Script executed successfully
+- `ExecutionFailed` - Script execution failed
+- `ApiCall` - GM_* API function called
+- `NetworkRequest` - HTTP request made (@require/@resource)
+- `PermissionDenied` - Permission check failed
+- `ResourceLoaded` - External resource loaded
+- `PolicyViolation` - Security policy violated
+- `SuspiciousActivity` - Suspicious behavior detected
+
+### Security Best Practices
+
+1. **Use strict policy in production**:
+   ```rust
+   let policy = SecurityPolicy::strict();
+   ```
+
+2. **Enable HTTPS enforcement**:
+   ```rust
+   policy.require_https = true;
+   ```
+
+3. **Enable audit logging**:
+   ```rust
+   policy.enable_audit_log = true;
+   ```
+
+4. **Review audit logs regularly**:
+   ```rust
+   let stats = auditor.get_statistics();
+   if stats.policy_violations > 0 {
+       warn!("Policy violations detected!");
+   }
+   ```
+
+5. **Validate scripts before installation**:
+   ```rust
+   let validator = ScriptValidator::new(policy);
+   validator.validate_source(&source)?;
+   ```
+
+6. **Use domain allowlists**:
+   ```rust
+   // Only allow trusted CDNs
+   policy.allowed_domains.insert("cdn.jsdelivr.net".to_string());
+   policy.allowed_domains.insert("cdnjs.cloudflare.com".to_string());
+   ```
+
+### Security Example
+
+Complete example with security hardening:
+
+```rust
+use userscript_engine::{
+    UserscriptManager, UserscriptRuntime, UserscriptStorage,
+    SecurityPolicy, RunAt, AuditEvent
+};
+use std::sync::Arc;
+
+// Create strict security policy
+let mut policy = SecurityPolicy::strict();
+policy.allowed_domains.insert("cdn.jsdelivr.net".to_string());
+policy.allowed_domains.insert("code.jquery.com".to_string());
+policy.max_requires = 5;
+policy.max_resources = 10;
+let policy = Arc::new(policy);
+
+// Create manager and storage
+let manager = Arc::new(UserscriptManager::new("./data/userscripts".into())?);
+let storage = Arc::new(UserscriptStorage::new("./data/storage".into())?);
+
+// Create runtime with security
+let runtime = UserscriptRuntime::with_security(
+    manager.clone(),
+    storage,
+    policy.clone()
+);
+
+// Install script (with validation)
+let script = r#"
+// ==UserScript==
+// @name         Secure Script
+// @match        *://example.com/*
+// @require      https://code.jquery.com/jquery-3.6.0.min.js
+// @grant        GM_setValue
+// @grant        GM_getValue
+// ==/UserScript==
+
+GM.setValue('last_visit', new Date().toString());
+console.log('Last visit:', GM.getValue('last_visit', 'Never'));
+"#;
+
+manager.install(script.to_string())?;
+
+// Execute with security validation
+let results = runtime.execute_for_url(
+    "https://example.com/page",
+    RunAt::DocumentStart
+).await?;
+
+// Check audit log
+let auditor = runtime.auditor();
+let stats = auditor.get_statistics();
+println!("Execution stats:");
+println!("  API calls: {}", stats.api_calls);
+println!("  Network requests: {}", stats.network_requests);
+println!("  Policy violations: {}", stats.policy_violations);
+
+// Review violations
+if stats.policy_violations > 0 {
+    for entry in auditor.get_recent_entries(10) {
+        if matches!(entry.event, AuditEvent::PolicyViolation | AuditEvent::PermissionDenied) {
+            eprintln!("Security event: {:?} - {}", entry.event, entry.details);
+        }
+    }
+}
+```
+
 ### Implementation Notes (Week 15)
 
 - **Week 13**: Metadata parser, storage, basic GM_* APIs
@@ -1349,14 +1622,28 @@ $('body').prepend(`<div>Visit #${visits}</div>`);
 - MIME type detection for resources
 - Base64 data URL generation
 
-### Limitations (Week 15)
+### Implementation Notes (Week 16)
 
-These will be addressed in Week 16 (Security & Sandboxing):
+- **Week 13**: Metadata parser, storage, basic GM_* APIs
+- **Week 14**: Boa JavaScript engine integration, advanced GM_* APIs
+- **Week 15**: Execution orchestration, @run-at timing, @require/@resource support
+- **Week 16**: Security hardening, sandboxing, audit logging
+- SecurityPolicy for configurable security controls
+- URL validation with HTTPS enforcement and domain filtering
+- Source code validation (blocks eval, Function, etc.)
+- Permission validation for GM_* APIs
+- Security audit logging for all events
+- Resource limits (@require, @resource, execution time, memory)
+- Comprehensive test coverage (18 security tests)
+
+### Limitations (Week 16)
+
+These will be addressed in future phases:
 
 - **Async GM_xmlhttpRequest**: Currently synchronous validation only
 - **DOM Manipulation**: Scripts execute in Boa context (no real DOM yet)
-- **Content Security Policy**: Not yet enforced
-- **Resource Sandboxing**: Basic fetch, no security isolation
+- **Execution Time Limits**: Policy defined but not yet enforced at runtime
+- **Memory Limits**: Policy defined but not yet enforced at runtime
 - **System Integration**: Notifications and clipboard are logged/stored, not system-level
 
 ## Project Structure
