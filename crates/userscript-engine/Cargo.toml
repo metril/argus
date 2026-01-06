@@ -48,3 +48,6 @@ validator = { workspace = true }
 
 # Common utilities
 common = { path = "../common" }
+
+[dev-dependencies]
+tempfile = "3.15"

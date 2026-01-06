@@ -637,6 +637,220 @@ match engine.trigger_update().await {
 - Base64 encoding for checksum representation
 - Supports ETag-based conditional requests
 
+## Userscript Engine
+
+The userscript engine provides Greasemonkey/Tampermonkey compatibility for running custom JavaScript on web pages.
+
+### Installing Userscripts
+
+```rust
+use userscript_engine::UserscriptManager;
+
+// Create manager
+let manager = UserscriptManager::new("./data/userscripts".into())?;
+
+// Install a userscript
+let script_source = r#"
+// ==UserScript==
+// @name         Example Script
+// @namespace    http://example.com
+// @version      1.0.0
+// @description  Demonstrates userscript features
+// @match        *://example.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// ==/UserScript==
+
+// Your script code here
+GM_setValue('visits', (GM_getValue('visits', 0) + 1));
+console.log('Visit count:', GM_getValue('visits'));
+"#;
+
+let script_id = manager.install(script_source.to_string())?;
+```
+
+### Metadata Block
+
+Userscripts must include a metadata block with directives:
+
+**Required**:
+- `@name` - Script name (used as unique identifier with namespace)
+
+**Common**:
+- `@namespace` - Unique namespace (combined with name for ID)
+- `@version` - Version string for update checks
+- `@description` - Human-readable description
+- `@author` - Script author
+
+**Execution Control**:
+- `@match` - URL patterns where script runs (recommended)
+- `@include` - URL patterns to include (legacy)
+- `@exclude` - URL patterns to exclude
+- `@run-at` - When to inject: `document-start`, `document-end` (default), `document-idle`
+- `@noframes` - Don't run in iframes
+
+**Permissions**:
+- `@grant` - Required GM_* API functions (e.g., `@grant GM_setValue`)
+- `@connect` - Domains allowed for GM_xmlhttpRequest
+
+**Resources**:
+- `@require` - External scripts to load before execution
+- `@resource` - Named resources accessible via GM_getResourceURL
+
+**Updates**:
+- `@updateURL` - URL to check for updates
+- `@downloadURL` - URL to download updates
+
+### Example Metadata Block
+
+```javascript
+// ==UserScript==
+// @name         Advanced Example
+// @namespace    http://mysite.com/userscripts
+// @version      2.1.0
+// @description  Comprehensive userscript example
+// @author       Your Name
+// @match        *://example.com/*
+// @match        *://test.example.com/*
+// @exclude      *://example.com/admin*
+// @run-at       document-end
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_info
+// @require      https://code.jquery.com/jquery-3.6.0.min.js
+// @resource     icon https://example.com/icon.png
+// @updateURL    https://example.com/script.meta.js
+// @downloadURL  https://example.com/script.user.js
+// ==/UserScript==
+```
+
+### GM_* API (Week 13 Foundation)
+
+**Storage Functions** (Implemented):
+
+```javascript
+// Store values (supports string, number, boolean, arrays, objects)
+GM_setValue('username', 'john');
+GM_setValue('count', 42);
+GM_setValue('config', {theme: 'dark', lang: 'en'});
+
+// Retrieve values with optional default
+let name = GM_getValue('username', 'guest');
+let count = GM_getValue('count', 0);
+
+// Delete values
+GM_deleteValue('old_key');
+
+// List all stored keys
+let keys = GM_listValues(); // Returns ['username', 'count', 'config']
+
+// Get script info
+let info = GM_info();
+console.log(info.script.id);      // Script unique ID
+console.log(info.scriptHandler);   // "AdBlocker Userscript Engine"
+console.log(info.version);         // Engine version
+```
+
+**Coming in Week 14**:
+- `GM_xmlhttpRequest` - Cross-domain HTTP requests
+- `GM_notification` - Desktop notifications
+- `GM_openInTab` - Open URLs in new tabs
+- `GM_addStyle` - Inject CSS
+- `GM_getResourceURL` - Access @resource files
+- `GM_setClipboard` - Clipboard access
+
+### Managing Userscripts
+
+```rust
+// Load all scripts from disk
+manager.load_all()?;
+
+// Get script by ID
+if let Some(script) = manager.get("example.com:Example Script") {
+    println!("Name: {}", script.name());
+    println!("Version: {:?}", script.version());
+    println!("Enabled: {}", script.enabled);
+}
+
+// Get scripts for a URL
+let scripts = manager.get_scripts_for_url("https://example.com/page");
+for script in scripts {
+    println!("Will run: {}", script.name());
+}
+
+// Enable/disable scripts
+manager.set_enabled("script-id", false)?;
+
+// Update a script
+manager.update("script-id", new_source)?;
+
+// Uninstall a script
+manager.uninstall("script-id")?;
+
+// Get statistics
+let stats = manager.stats();
+println!("Total: {}, Enabled: {}, Disabled: {}",
+    stats.total_scripts, stats.enabled_scripts, stats.disabled_scripts);
+```
+
+### URL Matching
+
+Scripts use glob-style patterns for matching:
+
+```javascript
+// Exact domain
+// @match https://example.com/*
+
+// Any subdomain
+// @match *://*.example.com/*
+
+// Any protocol
+// @match *://example.com/*
+
+// All URLs
+// @match *://*/*
+// @match <all_urls>
+
+// Exclusions
+// @exclude *://example.com/admin*
+```
+
+### Storage Isolation
+
+Each userscript has isolated storage:
+- Values are namespaced by script ID
+- Scripts cannot access other scripts' data
+- Persistent storage using sled database
+- In-memory caching for performance
+
+### Security Considerations
+
+1. **@grant declarations required** - Scripts must declare which GM_* APIs they need
+2. **Permission checks enforced** - Calling undeclared APIs throws PermissionDenied error
+3. **Storage isolation** - Scripts cannot access each other's data
+4. **URL pattern validation** - Only runs on matched URLs
+5. **Metadata validation** - Scripts require valid metadata block
+
+### Best Practices
+
+1. **Always use @match over @include** - More precise, better performance
+2. **Declare minimal @grant permissions** - Request only needed APIs
+3. **Use @exclude for sensitive pages** - Don't run on admin/login pages
+4. **Version your scripts** - Enables proper update detection
+5. **Test before deploying** - Verify script works on target sites
+6. **Namespace your scripts** - Prevents ID conflicts with other authors
+
+### Implementation Notes (Week 13)
+
+- Metadata parser supports all standard directives
+- Storage uses sled for persistence with in-memory cache
+- Permission system enforces @grant declarations
+- URL matching supports glob patterns and exclusions
+- Script manager handles install/update/uninstall lifecycle
+- Foundation ready for Boa JavaScript engine integration (Week 14)
+
 ## Project Structure
 
 ```
