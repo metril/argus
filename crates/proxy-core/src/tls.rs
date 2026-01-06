@@ -5,7 +5,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::{TlsAcceptor, TlsStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use tracing::debug;
 
 /// Create a TLS server configuration from certificate data

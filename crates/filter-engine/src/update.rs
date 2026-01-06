@@ -7,6 +7,7 @@
 //! - Update statistics and error tracking
 
 use crate::{Error, FilterEngine, Result};
+use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
@@ -220,7 +221,7 @@ impl ChecksumVerifier {
         }
 
         let result = hasher.finalize();
-        base64::encode(result)
+        base64::engine::general_purpose::STANDARD.encode(result)
     }
 
     /// Verify checksum of filter list content
@@ -268,7 +269,10 @@ impl UpdateScheduler {
     }
 
     /// Start the auto-update scheduler
-    pub async fn start(&self) {
+    ///
+    /// Note: This should be called from a dedicated task/thread that owns the UpdateScheduler
+    /// because FilterEngine is not Send due to adblock crate limitations.
+    pub async fn start(self: Arc<Self>) {
         if *self.running.read() {
             warn!("Update scheduler already running");
             return;
@@ -277,67 +281,65 @@ impl UpdateScheduler {
         *self.running.write() = true;
         info!("Starting auto-update scheduler");
 
-        let engine = self.engine.clone();
-        let config = self.config.clone();
-        let stats = self.stats.clone();
-        let running = self.running.clone();
+        // Clone Arcs for the background task
+        let scheduler = self;
 
-        tokio::spawn(async move {
-            let mut update_interval = {
-                let cfg = config.read();
-                interval(std::time::Duration::from_secs(cfg.interval_hours * 3600))
-            };
+        // Use tokio::task::spawn_local for !Send futures
+        // This requires running within a LocalSet
+        let mut update_interval = {
+            let cfg = scheduler.config.read();
+            interval(std::time::Duration::from_secs(cfg.interval_hours * 3600))
+        };
 
-            loop {
-                update_interval.tick().await;
+        loop {
+            update_interval.tick().await;
 
-                if !*running.read() {
-                    info!("Update scheduler stopped");
-                    break;
+            if !*scheduler.running.read() {
+                info!("Update scheduler stopped");
+                break;
+            }
+
+            let cfg = scheduler.config.read().clone();
+            if !cfg.enabled {
+                debug!("Auto-update disabled, skipping");
+                continue;
+            }
+
+            info!("Starting scheduled filter list update");
+            let start = std::time::Instant::now();
+
+            match Self::perform_update(&scheduler.engine, &cfg, &scheduler.stats).await {
+                Ok((updated, failed)) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    info!(
+                        "Update completed: {} updated, {} failed, took {}ms",
+                        updated, failed, duration_ms
+                    );
+
+                    scheduler.stats.record_attempt(UpdateAttempt {
+                        timestamp: Utc::now(),
+                        success: true,
+                        lists_updated: updated,
+                        lists_failed: failed,
+                        error: None,
+                        duration_ms,
+                    });
                 }
+                Err(e) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    error!("Update failed: {}", e);
 
-                let cfg = config.read().clone();
-                if !cfg.enabled {
-                    debug!("Auto-update disabled, skipping");
-                    continue;
-                }
-
-                info!("Starting scheduled filter list update");
-                let start = std::time::Instant::now();
-
-                match Self::perform_update(&engine, &cfg, &stats).await {
-                    Ok((updated, failed)) => {
-                        let duration_ms = start.elapsed().as_millis() as u64;
-                        info!(
-                            "Update completed: {} updated, {} failed, took {}ms",
-                            updated, failed, duration_ms
-                        );
-
-                        stats.record_attempt(UpdateAttempt {
-                            timestamp: Utc::now(),
-                            success: true,
-                            lists_updated: updated,
-                            lists_failed: failed,
-                            error: None,
-                            duration_ms,
-                        });
-                    }
-                    Err(e) => {
-                        let duration_ms = start.elapsed().as_millis() as u64;
-                        error!("Update failed: {}", e);
-
-                        stats.record_attempt(UpdateAttempt {
-                            timestamp: Utc::now(),
-                            success: false,
-                            lists_updated: 0,
-                            lists_failed: 0,
-                            error: Some(e.to_string()),
-                            duration_ms,
-                        });
-                    }
+                    scheduler.stats.record_attempt(UpdateAttempt {
+                        timestamp: Utc::now(),
+                        success: false,
+                        lists_updated: 0,
+                        lists_failed: 0,
+                        error: Some(e.to_string()),
+                        duration_ms,
+                    });
                 }
             }
-        });
+        }
     }
 
     /// Stop the auto-update scheduler
@@ -448,7 +450,7 @@ impl UpdateScheduler {
 
             info!("Updating filter list: {}", list.name);
 
-            match list.download(&list_manager.http_client).await {
+            match list.download(list_manager.http_client()).await {
                 Ok(content) => {
                     // Verify checksum if enabled
                     if config.verify_checksums {

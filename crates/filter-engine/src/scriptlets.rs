@@ -347,12 +347,12 @@ impl Default for ScriptletManager {
 
 /// Built-in scriptlet library
 struct ScriptletLibrary {
-    scriptlets: HashMap<String, Box<dyn Fn(&[String]) -> String>>,
+    scriptlets: HashMap<String, Box<dyn Fn(&[String]) -> String + Send + Sync>>,
 }
 
 impl ScriptletLibrary {
     fn new() -> Self {
-        let mut scriptlets: HashMap<String, Box<dyn Fn(&[String]) -> String>> = HashMap::new();
+        let mut scriptlets: HashMap<String, Box<dyn Fn(&[String]) -> String + Send + Sync>> = HashMap::new();
 
         // abort-on-property-read
         scriptlets.insert(

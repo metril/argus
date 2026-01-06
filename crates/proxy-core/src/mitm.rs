@@ -12,7 +12,7 @@ use tracing::{debug, info};
 #[derive(Clone)]
 pub struct CertificateData {
     pub cert: CertificateDer<'static>,
-    pub key: PrivateKeyDer<'static>,
+    pub key: Arc<PrivateKeyDer<'static>>,
 }
 
 /// MITM handler with certificate caching
@@ -82,7 +82,7 @@ impl MitmHandler {
         info!("Generating certificate for domain: {}", domain);
         let (cert, key) = self.ca.generate_cert(&domain)?;
 
-        let cert_data = Arc::new(CertificateData { cert, key });
+        let cert_data = Arc::new(CertificateData { cert, key: Arc::new(key) });
 
         // Cache the certificate
         self.cert_cache.insert(domain.clone(), cert_data.clone());

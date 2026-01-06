@@ -372,7 +372,7 @@ impl CosmeticFilterManager {
 
         format!(
             "{} {{ display: none !important; }}",
-            selectors.join(", ")
+            selectors.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         )
     }
 

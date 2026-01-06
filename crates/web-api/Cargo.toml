@@ -22,6 +22,7 @@ jsonwebtoken = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = "0.8"
 
 # Logging
 tracing = { workspace = true }
@@ -38,6 +39,18 @@ validator = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+
+# Database
+sled = { workspace = true }
+
+# Utilities
+uuid = { version = "1.6", features = ["v4", "serde"] }
+rand = "0.8"
+dashmap = "5.5"
+cookie = "0.18"
+parking_lot = { workspace = true }
+base64 = "0.22"
+nonzero_ext = "0.3"
 
 # Common utilities
 common = { path = "../common" }

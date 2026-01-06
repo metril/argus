@@ -67,6 +67,7 @@ parking_lot = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+time = { workspace = true }
 
 # Common utilities
 common = { path = "../common" }

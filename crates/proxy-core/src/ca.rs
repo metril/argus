@@ -2,8 +2,8 @@
 
 use crate::{Error, Result};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-    KeyUsagePurpose, SanType,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
@@ -13,8 +13,10 @@ use tracing::info;
 
 /// Certificate Authority for generating and signing certificates
 pub struct CertificateAuthority {
-    /// The CA certificate
-    ca_cert: Certificate,
+    /// The CA key pair
+    ca_key_pair: KeyPair,
+    /// The CA certificate parameters (for issuer)
+    ca_params: CertificateParams,
     /// The CA certificate in DER format
     ca_cert_der: CertificateDer<'static>,
     /// The CA private key in DER format
@@ -51,12 +53,13 @@ impl CertificateAuthority {
         let key_pem = fs::read_to_string(key_path)
             .map_err(|e| Error::Certificate(format!("Failed to read CA private key: {}", e)))?;
 
-        // Parse the certificate
-        let ca_cert = Certificate::from_params(
-            CertificateParams::from_ca_cert_pem(&cert_pem)
-                .map_err(|e| Error::Certificate(format!("Failed to parse CA certificate: {}", e)))?,
-        )
-        .map_err(|e| Error::Certificate(format!("Failed to create certificate: {}", e)))?;
+        // Parse the key pair from PEM
+        let ca_key_pair = KeyPair::from_pem(&key_pem)
+            .map_err(|e| Error::Certificate(format!("Failed to parse CA private key: {}", e)))?;
+
+        // For loading existing CA, we create default params
+        // The actual certificate parameters will be extracted when creating an Issuer
+        let ca_params = CertificateParams::default();
 
         // Get DER formats
         let ca_cert_der = CertificateDer::from(cert_pem.as_bytes().to_vec());
@@ -64,7 +67,8 @@ impl CertificateAuthority {
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
 
         Ok(Self {
-            ca_cert,
+            ca_key_pair,
+            ca_params,
             ca_cert_der,
             ca_key_der,
         })
@@ -106,15 +110,17 @@ impl CertificateAuthority {
         params.not_before = OffsetDateTime::now_utc();
         params.not_after = OffsetDateTime::now_utc() + Duration::days(3650);
 
-        // Generate the certificate
-        let ca_cert = Certificate::from_params(params)
+        // Generate key pair
+        let ca_key_pair = KeyPair::generate()
+            .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
+
+        // Generate self-signed certificate
+        let ca_cert = params.self_signed(&ca_key_pair)
             .map_err(|e| Error::Certificate(format!("Failed to generate CA certificate: {}", e)))?;
 
         // Get PEM formats
-        let cert_pem = ca_cert
-            .serialize_pem()
-            .map_err(|e| Error::Certificate(format!("Failed to serialize CA certificate: {}", e)))?;
-        let key_pem = ca_cert.serialize_private_key_pem();
+        let cert_pem = ca_cert.pem();
+        let key_pem = ca_key_pair.serialize_pem();
 
         // Write certificate to file
         fs::write(cert_path, &cert_pem).map_err(|e| {
@@ -146,7 +152,8 @@ impl CertificateAuthority {
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
 
         Ok(Self {
-            ca_cert,
+            ca_key_pair,
+            ca_params: params,
             ca_cert_der,
             ca_key_der,
         })
@@ -166,9 +173,9 @@ impl CertificateAuthority {
 
         // Add subject alternative names
         params.subject_alt_names = vec![
-            SanType::DnsName(domain.to_string()),
+            SanType::DnsName(domain.try_into().map_err(|e| Error::Certificate(format!("Invalid domain name: {:?}", e)))?),
             // Also add wildcard for subdomains
-            SanType::DnsName(format!("*.{}", domain)),
+            SanType::DnsName(format!("*.{}", domain).try_into().map_err(|e| Error::Certificate(format!("Invalid wildcard domain: {:?}", e)))?),
         ];
 
         // Set validity period (30 days)
@@ -181,15 +188,20 @@ impl CertificateAuthority {
             KeyUsagePurpose::KeyEncipherment,
         ];
 
-        // Generate the certificate
-        let cert = Certificate::from_params(params)
-            .map_err(|e| Error::Certificate(format!("Failed to generate certificate: {}", e)))?;
+        // Generate key pair for the server certificate
+        let key_pair = KeyPair::generate()
+            .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
 
-        // Sign with CA
-        let cert_pem = cert
-            .serialize_pem_with_signer(&self.ca_cert)
+        // Create an Issuer from our CA
+        let issuer = Issuer::from_params(&self.ca_params, &self.ca_key_pair);
+
+        // Sign the certificate with our CA
+        let cert = params.signed_by(&key_pair, &issuer)
             .map_err(|e| Error::Certificate(format!("Failed to sign certificate: {}", e)))?;
-        let key_pem = cert.serialize_private_key_pem();
+
+        // Get PEM formats
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
 
         // Convert to DER format for rustls
         let cert_der = CertificateDer::from(cert_pem.as_bytes().to_vec());

@@ -86,6 +86,9 @@ impl ProxyServer {
             let _ = shutdown_signal.send(());
         });
 
+        // Subscribe to shutdown signal for the main loop
+        let mut main_shutdown_rx = shutdown_tx.subscribe();
+
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -101,8 +104,9 @@ impl ProxyServer {
 
                             // Spawn a new task to handle this connection
                             tokio::spawn(async move {
+                                let handler = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets);
                                 tokio::select! {
-                                    result = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets).handle(stream) => {
+                                    result = handler.handle(stream) => {
                                         if let Err(e) = result {
                                             warn!("Error handling connection from {}: {}", client_addr, e);
                                         }
@@ -118,7 +122,7 @@ impl ProxyServer {
                         }
                     }
                 }
-                _ = shutdown_tx.subscribe().recv() => {
+                _ = main_shutdown_rx.recv() => {
                     info!("Shutting down proxy server...");
                     break;
                 }

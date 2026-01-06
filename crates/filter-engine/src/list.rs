@@ -106,6 +106,11 @@ impl FilterListManager {
         }
     }
 
+    /// Get the HTTP client
+    pub fn http_client(&self) -> &Client {
+        &self.http_client
+    }
+
     /// Add a filter list
     pub fn add_list(&self, list: FilterList) {
         let mut lists = self.lists.write();

@@ -9,7 +9,7 @@ use crate::{
     update::{UpdateConfig, UpdateScheduler, UpdateStats},
     Error, Result,
 };
-use adblock::lists::FilterSet;
+use adblock::lists::{FilterSet, ParseOptions};
 use adblock::Engine as AdblockEngine;
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -33,7 +33,7 @@ pub struct FilterEngine {
     /// Whether the engine is enabled
     enabled: Arc<RwLock<bool>>,
     /// Auto-update scheduler (optional)
-    update_scheduler: Arc<RwLock<Option<UpdateScheduler>>>,
+    update_scheduler: Arc<RwLock<Option<Arc<UpdateScheduler>>>>,
 }
 
 impl FilterEngine {
@@ -142,7 +142,7 @@ impl FilterEngine {
                     }
                 } else {
                     // Network blocking rule - add to filter set
-                    filter_set.add_filter(line).ok(); // Ignore parse errors for individual rules
+                    filter_set.add_filter(line, ParseOptions::default()).ok(); // Ignore parse errors for individual rules
                 }
             }
         }
@@ -183,6 +183,14 @@ impl FilterEngine {
     /// Get statistics snapshot
     pub fn stats(&self) -> crate::stats::BlockingStats {
         self.stats.snapshot()
+    }
+
+    /// Get a cloneable handle to the statistics tracker
+    ///
+    /// This allows sharing the stats with other components (like web API handlers)
+    /// even when the FilterEngine itself cannot be shared due to Send/Sync constraints.
+    pub fn stats_handle(&self) -> FilterStats {
+        self.stats.clone()
     }
 
     /// Reset statistics
@@ -243,15 +251,20 @@ impl FilterEngine {
 
     /// Enable auto-update with specified configuration
     pub fn enable_auto_update(&self, config: UpdateConfig) {
-        let scheduler = UpdateScheduler::new(self.clone(), config);
+        let scheduler = Arc::new(UpdateScheduler::new(self.clone(), config));
         *self.update_scheduler.write() = Some(scheduler);
         info!("Auto-update enabled");
     }
 
     /// Start auto-update scheduler
-    pub async fn start_auto_update(&self) {
-        if let Some(scheduler) = self.update_scheduler.read().as_ref() {
-            scheduler.start().await;
+    ///
+    /// This spawns the scheduler in a background task using the LocalSet pattern
+    /// to work around FilterEngine not being Send.
+    pub fn start_auto_update(&self) {
+        if let Some(scheduler) = self.update_scheduler.read().as_ref().cloned() {
+            tokio::task::spawn_local(async move {
+                scheduler.start().await;
+            });
         } else {
             warn!("Auto-update not enabled, call enable_auto_update() first");
         }
@@ -276,11 +289,11 @@ impl FilterEngine {
     }
 
     /// Get auto-update statistics
-    pub fn update_stats(&self) -> Option<&UpdateStats> {
+    pub fn update_stats(&self) -> Option<UpdateStats> {
         self.update_scheduler
             .read()
             .as_ref()
-            .map(|s| s.stats())
+            .map(|s| s.stats().clone())
     }
 
     /// Check if auto-update is running

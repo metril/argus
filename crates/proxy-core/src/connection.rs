@@ -145,7 +145,7 @@ impl ConnectionHandler {
             Method::GET | Method::POST | Method::PUT | Method::DELETE | Method::HEAD
             | Method::OPTIONS | Method::PATCH => {
                 // Standard HTTP proxy
-                self.proxy_request(req).await
+                Self::proxy_request_static(req).await
             }
             _ => {
                 warn!("Unsupported method: {}", method);
@@ -233,7 +233,7 @@ impl ConnectionHandler {
     /// Handle HTTP requests over MITM TLS connection
     async fn handle_mitm_connection<IO>(
         &self,
-        tls_stream: tokio_rustls::TlsStream<IO>,
+        tls_stream: tokio_rustls::server::TlsStream<IO>,
         domain: &str,
         port: u16,
     ) -> Result<()>
@@ -261,12 +261,12 @@ impl ConnectionHandler {
 
         if use_http2 {
             info!("Using HTTP/2 for {}:{}", domain, port);
-            let service = move |req| self.proxy_request(req);
+            let service = |req| async move { Self::proxy_request_static(req).await };
             crate::http2::serve_http2(tls_stream, service).await
         } else {
             info!("Using HTTP/1.1 for {}:{}", domain, port);
             let io = TokioIo::new(tls_stream);
-            let service = service_fn(move |req| self.proxy_request(req));
+            let service = service_fn(|req| async move { Self::proxy_request_static(req).await });
 
             // Serve HTTP/1.1 over the TLS connection
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -315,8 +315,8 @@ impl ConnectionHandler {
         }
     }
 
-    /// Proxy a standard HTTP request
-    async fn proxy_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    /// Proxy a standard HTTP request (static method)
+    async fn proxy_request_static(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let uri = req.uri();
 
         // Extract host and port from the request
