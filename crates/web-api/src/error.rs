@@ -31,8 +31,8 @@ pub enum ApiError {
     #[error("Resource already exists: {0}")]
     AlreadyExists(String),
 
-    #[error("Rate limit exceeded")]
-    RateLimitExceeded,
+    #[error("Rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
 
     #[error("CSRF validation failed")]
     CsrfValidationFailed,
@@ -75,7 +75,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::AlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
-            ApiError::RateLimitExceeded => {
+            ApiError::RateLimitExceeded(_) => {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }
             ApiError::CsrfValidationFailed => (StatusCode::FORBIDDEN, self.to_string()),

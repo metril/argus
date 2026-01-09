@@ -6,19 +6,19 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use tower::ServiceBuilder;
 use tower_http::{
-    cors::{CorsLayer, Any},
+    cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
 
 use crate::auth::middleware::auth_middleware;
 use crate::config::ApiConfig;
 use crate::handlers;
+use crate::middleware::{rate_limit_middleware, request_id_middleware};
 use crate::state::AppState;
 
 /// Create the Axum router with all routes and middleware
-pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
+pub fn create_router(state: Arc<AppState>, _config: &ApiConfig) -> Router {
     // Build CORS layer
     let cors = CorsLayer::new()
         .allow_origin(Any) // TODO: Configure from config.security.cors_origins
@@ -52,15 +52,22 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         .with_state(state.clone());
 
-    // Build the main router
+    // Build the main router with global middleware
+    // Layers are applied bottom-to-top (last added = outermost)
     Router::new()
         .nest("/api/auth", auth_router)
         .nest("/api", health_router)
-        .layer(
-            ServiceBuilder::new()
-                .layer(TraceLayer::new_for_http())
-                .layer(cors),
-        )
+        // Innermost: CORS (handles preflight)
+        .layer(cors)
+        // TraceLayer for request/response logging
+        .layer(TraceLayer::new_for_http())
+        // Rate limiting
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        // Outermost: Request ID (ensures all logs have request ID)
+        .layer(middleware::from_fn(request_id_middleware))
 }
 
 /// Start the web server
