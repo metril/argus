@@ -60,11 +60,23 @@ pub fn create_router(state: Arc<AppState>, _config: &ApiConfig) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
+    // Filter management routes (protected)
+    let filters_router = Router::new()
+        .route("/lists", get(handlers::filters::list_filter_lists).post(handlers::filters::add_filter_list))
+        .route("/lists/{id}", get(handlers::filters::get_filter_list)
+            .put(handlers::filters::update_filter_list)
+            .delete(handlers::filters::delete_filter_list))
+        .route("/stats", get(handlers::filters::get_stats))
+        .route("/stats/reset", post(handlers::filters::reset_stats))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state.clone());
+
     // Build the main router with global middleware
     // Layers are applied bottom-to-top (last added = outermost)
     Router::new()
         .nest("/api/auth", auth_router)
         .nest("/api/proxy", proxy_router)
+        .nest("/api/filters", filters_router)
         .nest("/api", health_router)
         // Innermost: CORS (handles preflight)
         .layer(cors)
