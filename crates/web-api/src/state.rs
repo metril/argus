@@ -2,20 +2,23 @@
 //!
 //! Defines the shared state that is passed to all handlers via Arc<AppState>.
 
+use crate::auth::models::{User, UserRole};
+use crate::auth::session::SessionManager;
 use crate::config::ApiConfig;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
+use chrono::Utc;
 use dashmap::DashMap;
 use filter_engine::{FilterEngine, FilterStats};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
-use std::num::NonZeroU32;
 use proxy_core::{config::ProxyConfig, mitm::MitmHandler};
 use std::net::IpAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use userscript_engine::{UserscriptManager, UserscriptRuntime, UserscriptStorage};
+use userscript_engine::{UserscriptManager, UserscriptRuntime};
+use uuid::Uuid;
 
 /// Main application state shared across all handlers
 pub struct AppState {
@@ -33,8 +36,11 @@ pub struct AppState {
     /// Userscript runtime
     pub userscript_runtime: Arc<UserscriptRuntime>,
 
-    /// Session store for authentication
+    /// Session store for authentication (persistent user data)
     pub session_store: Arc<SessionStore>,
+
+    /// Session manager (in-memory active sessions)
+    pub session_manager: Arc<SessionManager>,
 
     /// JWT configuration
     pub jwt_config: Arc<JwtConfig>,
@@ -148,10 +154,10 @@ pub struct JwtConfig {
     pub secret: String,
 
     /// Access token expiry in seconds
-    pub access_token_expiry: u64,
+    pub access_token_expiry_secs: u64,
 
     /// Refresh token expiry in seconds
-    pub refresh_token_expiry: u64,
+    pub refresh_token_expiry_secs: u64,
 
     /// Issuer
     pub issuer: String,
@@ -177,9 +183,98 @@ impl SessionStore {
         Ok(self.db.open_tree("users")?)
     }
 
-    /// Get the revoked tokens tree
-    fn revoked_tree(&self) -> ApiResult<sled::Tree> {
-        Ok(self.db.open_tree("revoked_tokens")?)
+    /// Get the username index tree
+    fn username_index(&self) -> ApiResult<sled::Tree> {
+        Ok(self.db.open_tree("username_index")?)
+    }
+
+    /// Store a user in the database
+    pub fn store_user(&self, user: &User) -> ApiResult<()> {
+        let users = self.users_tree()?;
+        let index = self.username_index()?;
+
+        let user_bytes =
+            serde_json::to_vec(user).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        // Store user by ID
+        users.insert(user.id.as_bytes(), user_bytes)?;
+
+        // Store username -> ID index
+        index.insert(user.username.as_bytes(), user.id.as_bytes())?;
+
+        Ok(())
+    }
+
+    /// Get a user by ID
+    pub fn get_user(&self, id: &Uuid) -> ApiResult<Option<User>> {
+        let users = self.users_tree()?;
+
+        match users.get(id.as_bytes())? {
+            Some(bytes) => {
+                let user: User = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                Ok(Some(user))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get a user by username
+    pub fn get_user_by_username(&self, username: &str) -> ApiResult<Option<User>> {
+        let index = self.username_index()?;
+
+        match index.get(username.as_bytes())? {
+            Some(id_bytes) => {
+                let id = Uuid::from_slice(&id_bytes)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                self.get_user(&id)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Update user's last login timestamp
+    pub fn update_last_login(&self, id: &Uuid) -> ApiResult<()> {
+        if let Some(mut user) = self.get_user(id)? {
+            user.last_login = Some(Utc::now());
+            self.store_user(&user)?;
+        }
+        Ok(())
+    }
+
+    /// Check if a username exists
+    pub fn username_exists(&self, username: &str) -> ApiResult<bool> {
+        let index = self.username_index()?;
+        Ok(index.contains_key(username.as_bytes())?)
+    }
+
+    /// Delete a user
+    pub fn delete_user(&self, id: &Uuid) -> ApiResult<bool> {
+        let users = self.users_tree()?;
+        let index = self.username_index()?;
+
+        if let Some(user) = self.get_user(id)? {
+            users.remove(id.as_bytes())?;
+            index.remove(user.username.as_bytes())?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Get all users
+    pub fn get_all_users(&self) -> ApiResult<Vec<User>> {
+        let users = self.users_tree()?;
+        let mut result = Vec::new();
+
+        for item in users.iter() {
+            let (_, value) = item.map_err(|e| ApiError::Internal(e.to_string()))?;
+            let user: User = serde_json::from_slice(&value)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            result.push(user);
+        }
+
+        Ok(result)
     }
 }
 
@@ -223,14 +318,17 @@ pub async fn build_state(
     // Initialize JWT config
     let jwt_config = Arc::new(JwtConfig {
         secret: load_or_generate_jwt_secret(&api_config.auth.jwt_secret_path).await?,
-        access_token_expiry: api_config.auth.access_token_expiry_seconds,
-        refresh_token_expiry: api_config.auth.refresh_token_expiry_seconds,
+        access_token_expiry_secs: api_config.auth.access_token_expiry_seconds,
+        refresh_token_expiry_secs: api_config.auth.refresh_token_expiry_seconds,
         issuer: api_config.auth.issuer.clone(),
         audience: api_config.auth.audience.clone(),
     });
 
-    // Initialize session store
+    // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
+
+    // Initialize session manager (in-memory active sessions)
+    let session_manager = Arc::new(SessionManager::default());
 
     // Initialize rate limiters
     let rate_limiters = Arc::new(RateLimiters::new(
@@ -256,6 +354,7 @@ pub async fn build_state(
         userscript_manager,
         userscript_runtime,
         session_store,
+        session_manager,
         jwt_config,
         rate_limiters,
         config_path: Arc::new(RwLock::new(config_path)),

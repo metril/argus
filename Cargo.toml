@@ -113,7 +113,7 @@ governor = "0.7"
 publicsuffix = "2.0"
 
 # Input validation
-validator = "0.19"
+validator = { version = "0.19", features = ["derive"] }
 
 # Concurrency
 dashmap = "6.1"

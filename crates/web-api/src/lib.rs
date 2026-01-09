@@ -3,6 +3,7 @@
 //! Provides a secure, production-ready API for managing proxy configuration,
 //! filter lists, userscripts, and monitoring.
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod handlers;
