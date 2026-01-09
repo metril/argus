@@ -2,7 +2,7 @@
 
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -71,12 +71,25 @@ pub fn create_router(state: Arc<AppState>, _config: &ApiConfig) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state.clone());
 
+    // Userscript management routes (protected)
+    let userscripts_router = Router::new()
+        .route("/", get(handlers::userscripts::list_userscripts).post(handlers::userscripts::install_userscript))
+        .route("/stats", get(handlers::userscripts::get_stats))
+        .route("/{id}", get(handlers::userscripts::get_userscript)
+            .put(handlers::userscripts::update_userscript)
+            .delete(handlers::userscripts::uninstall_userscript))
+        .route("/{id}/source", get(handlers::userscripts::get_userscript_source))
+        .route("/{id}/enabled", put(handlers::userscripts::set_enabled))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state.clone());
+
     // Build the main router with global middleware
     // Layers are applied bottom-to-top (last added = outermost)
     Router::new()
         .nest("/api/auth", auth_router)
         .nest("/api/proxy", proxy_router)
         .nest("/api/filters", filters_router)
+        .nest("/api/userscripts", userscripts_router)
         .nest("/api", health_router)
         // Innermost: CORS (handles preflight)
         .layer(cors)
