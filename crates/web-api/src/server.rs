@@ -52,10 +52,19 @@ pub fn create_router(state: Arc<AppState>, _config: &ApiConfig) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         .with_state(state.clone());
 
+    // Proxy management routes (protected)
+    let proxy_router = Router::new()
+        .route("/config", get(handlers::proxy::get_config).put(handlers::proxy::update_config))
+        .route("/stats", get(handlers::proxy::get_stats))
+        .route("/reload-config", post(handlers::proxy::reload_config))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state.clone());
+
     // Build the main router with global middleware
     // Layers are applied bottom-to-top (last added = outermost)
     Router::new()
         .nest("/api/auth", auth_router)
+        .nest("/api/proxy", proxy_router)
         .nest("/api", health_router)
         // Innermost: CORS (handles preflight)
         .layer(cors)
