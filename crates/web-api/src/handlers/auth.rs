@@ -1,17 +1,16 @@
 //! Authentication handlers
 //!
 //! Provides endpoints for:
+//! - Register (POST /api/auth/register)
 //! - Login (POST /api/auth/login)
 //! - Logout (POST /api/auth/logout)
 //! - Token refresh (POST /api/auth/refresh)
 //! - Current user info (GET /api/auth/me)
 
 use crate::auth::jwt::{generate_token_pair, validate_refresh_token};
-use crate::auth::middleware::{
-    extract_refresh_token_from_cookies, AuthUser, ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE,
-};
-use crate::auth::models::{LoginRequest, LoginResponse, UserInfo, UserRole};
-use crate::auth::password::verify_password;
+use crate::auth::middleware::{AuthUser, ACCESS_TOKEN_COOKIE, REFRESH_TOKEN_COOKIE};
+use crate::auth::models::{LoginRequest, LoginResponse, RegisterRequest, User, UserInfo, UserRole};
+use crate::auth::password::{hash_password, validate_password_strength, verify_password};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{
@@ -58,6 +57,89 @@ fn create_expired_cookie(name: &str, path: &str) -> String {
         .max_age(Duration::seconds(0))
         .path(path)
         .to_string()
+}
+
+/// Register endpoint
+///
+/// POST /api/auth/register
+///
+/// Creates a new user account. First user becomes admin, subsequent users are regular users.
+pub async fn register(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterRequest>,
+) -> ApiResult<(HeaderMap, Json<LoginResponse>)> {
+    // Validate request
+    req.validate()
+        .map_err(|e| ApiError::ValidationError(e.to_string()))?;
+
+    // Validate password strength
+    validate_password_strength(&req.password)?;
+
+    // Check if username already exists
+    if state.session_store.username_exists(&req.username)? {
+        return Err(ApiError::ValidationError(
+            "Username already taken".to_string(),
+        ));
+    }
+
+    // Hash password
+    let password_hash = hash_password(&req.password)?;
+
+    // Determine role: first user is admin, others are regular users
+    let all_users = state.session_store.get_all_users()?;
+    let role = if all_users.is_empty() {
+        info!("Creating first user as admin: {}", req.username);
+        UserRole::Admin
+    } else {
+        UserRole::User
+    };
+
+    // Create user
+    let user = User::new(req.username.clone(), password_hash, role);
+
+    // Store user
+    state.session_store.store_user(&user)?;
+
+    info!("New user registered: {} (role: {:?})", user.username, role);
+
+    // Generate tokens
+    let tokens = generate_token_pair(&user.id, &user.username, user.role, &state.jwt_config)?;
+
+    // Create session
+    let _session_id = state.session_manager.create_session(
+        user.id,
+        user.username.clone(),
+        validate_refresh_token(&tokens.refresh_token, &state.jwt_config)?.jti,
+        None,
+        None,
+    );
+
+    // Set cookies
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&create_access_token_cookie(
+            &tokens.access_token,
+            tokens.access_expires_in,
+        ))
+        .unwrap(),
+    );
+    headers.append(
+        SET_COOKIE,
+        HeaderValue::from_str(&create_refresh_token_cookie(
+            &tokens.refresh_token,
+            tokens.refresh_expires_in,
+        ))
+        .unwrap(),
+    );
+
+    Ok((
+        headers,
+        Json(LoginResponse {
+            user: UserInfo::from(&user),
+            expires_in: tokens.access_expires_in,
+        }),
+    ))
 }
 
 /// Login endpoint

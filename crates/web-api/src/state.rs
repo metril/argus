@@ -2,7 +2,7 @@
 //!
 //! Defines the shared state that is passed to all handlers via Arc<AppState>.
 
-use crate::auth::models::{User, UserRole};
+use crate::auth::models::User;
 use crate::auth::session::SessionManager;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};

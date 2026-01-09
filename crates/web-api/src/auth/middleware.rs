@@ -9,7 +9,6 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
     middleware::Next,
     response::Response,
 };
