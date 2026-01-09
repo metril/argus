@@ -137,9 +137,9 @@ pub fn generate_token_pair(
 /// - Invalid signatures
 /// - Malformed tokens
 pub fn validate_token(token: &str, config: &JwtConfig) -> ApiResult<Claims> {
-    let mut validation = Validation::default();
-    validation.set_issuer(&[&config.issuer]);
-    validation.set_audience(&[&config.audience]);
+    // Use default validation (validates exp, allows any issuer/audience)
+    // Since we generate tokens without iss/aud claims, we don't validate them
+    let validation = Validation::default();
 
     let token_data = decode::<Claims>(
         token,

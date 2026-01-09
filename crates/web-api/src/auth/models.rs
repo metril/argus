@@ -4,11 +4,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
 
 /// User role for authorization
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     /// Full administrative access
@@ -37,15 +38,16 @@ impl UserRole {
     }
 }
 
-/// User account
+/// User account (stored in database)
+/// Note: password_hash is serialized for database storage but should never be
+/// exposed in API responses. Use UserInfo for external responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     /// Unique user ID
     pub id: Uuid,
     /// Username (unique)
     pub username: String,
-    /// bcrypt hashed password
-    #[serde(skip_serializing)]
+    /// bcrypt hashed password (stored but not exposed in API)
     pub password_hash: String,
     /// User role
     pub role: UserRole,
@@ -101,7 +103,7 @@ pub enum TokenType {
 }
 
 /// Login request payload
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct LoginRequest {
     #[validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))]
     pub username: String,
@@ -111,7 +113,7 @@ pub struct LoginRequest {
 }
 
 /// Register request payload
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct RegisterRequest {
     #[validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))]
     #[validate(custom(function = "validate_username"))]
@@ -136,14 +138,14 @@ fn validate_username(username: &str) -> Result<(), validator::ValidationError> {
 }
 
 /// Login response with tokens
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct LoginResponse {
     pub user: UserInfo,
     pub expires_in: u64,
 }
 
 /// Safe user info (no sensitive data)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct UserInfo {
     pub id: Uuid,
     pub username: String,

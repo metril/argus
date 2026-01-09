@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::info;
+use utoipa::ToSchema;
 use validator::Validate;
 
 /// Proxy configuration response (sanitized, without sensitive paths)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ProxyConfigResponse {
     /// Server host
     pub host: String,

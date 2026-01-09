@@ -6,8 +6,9 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use axum::http::{header, HeaderValue, Method};
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     trace::TraceLayer,
 };
 
@@ -18,13 +19,10 @@ use crate::middleware::{rate_limit_middleware, request_id_middleware};
 use crate::state::AppState;
 
 /// Create the Axum router with all routes and middleware
-pub fn create_router(state: Arc<AppState>, _config: &ApiConfig) -> Router {
-    // Build CORS layer
-    let cors = CorsLayer::new()
-        .allow_origin(Any) // TODO: Configure from config.security.cors_origins
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .allow_credentials(true);
+pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
+    // Build CORS layer from configuration
+    // Note: Cannot use `Any` with `allow_credentials(true)`, so we specify allowed values
+    let cors = build_cors_layer(&config.security.cors_origins);
 
     // Public auth routes (no authentication required)
     let public_auth_routes = Router::new()
@@ -121,4 +119,44 @@ pub async fn start_server(
         .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
 
     Ok(())
+}
+
+/// Build CORS layer from configuration
+///
+/// SECURITY: Uses explicit origin allowlist instead of wildcard.
+/// Cannot use `Any` with `allow_credentials(true)`.
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    use tower_http::cors::AllowOrigin;
+
+    // Build list of allowed origins
+    let allowed_origins: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+        .collect();
+
+    // Fallback to development origin if none configured
+    let origins = if allowed_origins.is_empty() {
+        tracing::warn!("No CORS origins configured, using localhost:5173 default");
+        vec!["http://localhost:5173".parse::<HeaderValue>().unwrap()]
+    } else {
+        allowed_origins
+    };
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::ACCEPT,
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::COOKIE,
+        ])
+        .allow_credentials(true)
+        .max_age(std::time::Duration::from_secs(3600)) // Cache preflight for 1 hour
 }

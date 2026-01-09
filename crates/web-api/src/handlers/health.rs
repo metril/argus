@@ -7,6 +7,18 @@ use std::sync::Arc;
 use crate::state::AppState;
 
 /// Health check endpoint
+///
+/// GET /api/health
+///
+/// Returns the health status and version of the API.
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "health",
+    responses(
+        (status = 200, description = "API is healthy", body = Value)
+    )
+)]
 pub async fn health_check() -> Json<Value> {
     Json(json!({
         "status": "healthy",
@@ -15,6 +27,18 @@ pub async fn health_check() -> Json<Value> {
 }
 
 /// Metrics endpoint
+///
+/// GET /api/metrics
+///
+/// Returns proxy and filter statistics.
+#[utoipa::path(
+    get,
+    path = "/api/metrics",
+    tag = "health",
+    responses(
+        (status = 200, description = "Current metrics", body = Value)
+    )
+)]
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
     let proxy_stats = state.proxy_state.stats.snapshot();
     let filter_stats = state.filter_stats.snapshot();

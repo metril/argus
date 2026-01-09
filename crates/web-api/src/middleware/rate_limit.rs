@@ -56,20 +56,25 @@ pub async fn rate_limit_middleware(
 }
 
 /// Extract client IP from request headers
+///
+/// SECURITY: Takes the LAST IP from X-Forwarded-For to prevent spoofing.
+/// When behind a reverse proxy, the rightmost IP is the one added by the
+/// trusted proxy, while leftmost can be spoofed by the client.
 fn extract_client_ip(req: &Request) -> Option<IpAddr> {
-    // Check X-Forwarded-For header
+    // Check X-Forwarded-For header - take LAST IP (closest to trusted proxy)
+    // This prevents attackers from prepending arbitrary IPs
     if let Some(forwarded) = req.headers().get("x-forwarded-for") {
         if let Ok(forwarded_str) = forwarded.to_str() {
-            // Take the first IP (original client)
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse() {
+            // Take the LAST IP (added by trusted reverse proxy)
+            if let Some(last_ip) = forwarded_str.split(',').last() {
+                if let Ok(ip) = last_ip.trim().parse() {
                     return Some(ip);
                 }
             }
         }
     }
 
-    // Check X-Real-IP header
+    // Check X-Real-IP header (typically set by nginx)
     if let Some(real_ip) = req.headers().get("x-real-ip") {
         if let Ok(real_ip_str) = real_ip.to_str() {
             if let Ok(ip) = real_ip_str.trim().parse() {
