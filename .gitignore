@@ -22,3 +22,9 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Claude Code
+.claude/
+
+# Trunk build output
+crates/web-ui/dist/
