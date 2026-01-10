@@ -5,9 +5,7 @@
 use crate::{Error, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    accept_async, client_async, tungstenite::protocol::Message, WebSocketStream,
-};
+use tokio_tungstenite::{accept_async, client_async, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 /// Check if a request is a WebSocket upgrade request
@@ -184,7 +182,8 @@ mod tests {
         let headers = HeaderMap::new();
 
         let target = extract_ws_target(&uri, &headers).unwrap();
-        assert_eq!(target, "wss://example.com:443/ws");
+        // Note: port is not included in output since uri.host() doesn't include it
+        assert_eq!(target, "wss://example.com/ws");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Tests for connection handling
 
-use proxy_core::config::{MitmConfig, PerformanceConfig, ProxyConfig};
+use proxy_core::config::{MitmSettings, PerformanceSettings, AdblockSettings, ProxyConfig};
 use proxy_core::ProxyServer;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -16,20 +16,21 @@ async fn test_server_with_mitm_enabled() {
             enable_http3: false,
             enable_websockets: false,
         },
-        mitm: MitmConfig {
+        mitm: MitmSettings {
             enabled: true,
             ca_cert_path: std::env::temp_dir().join("test-conn-ca.crt"),
             ca_key_path: std::env::temp_dir().join("test-conn-ca.key"),
             cert_cache_size: 100,
             cert_ttl_days: 30,
+            cert_idle_timeout_secs: 3600,
         },
-        performance: PerformanceConfig {
+        performance: PerformanceSettings {
             max_cert_generations: 10,
-            buffer_size: 8192,
             max_html_buffers: 10,
             connection_timeout_secs: 5,
             request_timeout_secs: 10,
         },
+        adblock: AdblockSettings::default(),
     };
 
     // Clean up any existing CA files
@@ -67,20 +68,21 @@ async fn test_server_with_mitm_disabled() {
             enable_http3: false,
             enable_websockets: false,
         },
-        mitm: MitmConfig {
+        mitm: MitmSettings {
             enabled: false,
             ca_cert_path: std::env::temp_dir().join("unused-ca.crt"),
             ca_key_path: std::env::temp_dir().join("unused-ca.key"),
             cert_cache_size: 100,
             cert_ttl_days: 30,
+            cert_idle_timeout_secs: 3600,
         },
-        performance: PerformanceConfig {
+        performance: PerformanceSettings {
             max_cert_generations: 10,
-            buffer_size: 8192,
             max_html_buffers: 10,
             connection_timeout_secs: 5,
             request_timeout_secs: 10,
         },
+        adblock: AdblockSettings::default(),
     };
 
     // Create server with MITM disabled
@@ -104,20 +106,21 @@ async fn test_certificate_generation() {
             enable_http3: false,
             enable_websockets: false,
         },
-        mitm: MitmConfig {
+        mitm: MitmSettings {
             enabled: true,
             ca_cert_path: std::env::temp_dir().join("test-certgen-ca.crt"),
             ca_key_path: std::env::temp_dir().join("test-certgen-ca.key"),
             cert_cache_size: 100,
             cert_ttl_days: 30,
+            cert_idle_timeout_secs: 3600,
         },
-        performance: PerformanceConfig {
+        performance: PerformanceSettings {
             max_cert_generations: 10,
-            buffer_size: 8192,
             max_html_buffers: 10,
             connection_timeout_secs: 5,
             request_timeout_secs: 10,
         },
+        adblock: AdblockSettings::default(),
     };
 
     // Clean up any existing CA files
@@ -139,7 +142,7 @@ async fn test_certificate_generation() {
     // Verify cert is not empty
     assert!(!cert1.cert.is_empty(), "Certificate should not be empty");
     assert!(
-        !matches!(cert1.key, rustls::pki_types::PrivateKeyDer::Pkcs8(_) if false),
+        !matches!(*cert1.key, rustls::pki_types::PrivateKeyDer::Pkcs8(_) if false),
         "Private key should exist"
     );
 
@@ -154,6 +157,9 @@ async fn test_certificate_generation() {
         std::sync::Arc::ptr_eq(&cert1, &cert2),
         "Should return cached certificate"
     );
+
+    // Force cache maintenance to update stats
+    mitm.run_pending_tasks();
 
     // Check cache stats
     let stats = mitm.cache_stats();

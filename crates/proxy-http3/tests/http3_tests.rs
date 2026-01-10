@@ -5,11 +5,14 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 fn create_test_tls_config() -> Arc<rustls::ServerConfig> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert_der = cert.serialize_der().unwrap();
-    let key_der = cert.serialize_private_key_der();
+    // Install ring crypto provider for tests
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+    let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = certified_key.cert.der().clone();
+    let key_der = certified_key.signing_key.serialize_der();
+
+    let cert_chain = vec![cert_der];
     let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
 
     let mut config = rustls::ServerConfig::builder()

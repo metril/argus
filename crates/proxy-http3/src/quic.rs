@@ -32,7 +32,9 @@ impl QuicConfig {
 
     /// Build a Quinn ServerConfig from this configuration
     pub fn build_server_config(&self) -> Result<ServerConfig> {
-        let mut server_config = ServerConfig::with_crypto(self.tls_config.clone());
+        let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from((*self.tls_config).clone())
+            .map_err(|e| Error::QuicEndpoint(format!("Failed to create QUIC crypto config: {}", e)))?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
 
         // Configure transport parameters
         let mut transport_config = quinn::TransportConfig::default();
@@ -78,12 +80,15 @@ mod tests {
     use std::sync::Arc;
 
     fn create_test_tls_config() -> Arc<rustls::ServerConfig> {
-        // Create a minimal TLS config for testing
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_der = cert.serialize_der().unwrap();
-        let key_der = cert.serialize_private_key_der();
+        // Install ring crypto provider for tests
+        let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+        // Create a minimal TLS config for testing
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = certified_key.cert.der().clone();
+        let key_der = certified_key.signing_key.serialize_der();
+
+        let cert_chain = vec![cert_der];
         let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
 
         let mut config = rustls::ServerConfig::builder()

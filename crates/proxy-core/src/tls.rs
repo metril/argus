@@ -64,6 +64,9 @@ mod tests {
 
     #[test]
     fn test_server_config_creation() {
+        // Install ring crypto provider for tests
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let temp_dir = env::temp_dir();
         let cert_path = temp_dir.join("test-tls-ca.crt");
         let key_path = temp_dir.join("test-tls-ca.key");
@@ -79,7 +82,7 @@ mod tests {
         // Generate a certificate
         let (cert, key) = ca.generate_cert("test.com").expect("Failed to generate cert");
 
-        let cert_data = CertificateData { cert, key };
+        let cert_data = CertificateData { cert, key: Arc::new(key) };
 
         // Create server config
         let config = create_server_config(&cert_data);

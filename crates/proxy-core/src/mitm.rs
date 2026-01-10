@@ -114,6 +114,11 @@ impl MitmHandler {
         }
     }
 
+    /// Run pending cache maintenance tasks (useful for testing to ensure stats are updated)
+    pub fn run_pending_tasks(&self) {
+        self.cert_cache.run_pending_tasks();
+    }
+
     /// Clear the certificate cache
     pub fn clear_cache(&self) {
         info!("Clearing certificate cache");
@@ -167,6 +172,9 @@ mod tests {
 
         // Both should be the same (Arc pointing to same data)
         assert!(Arc::ptr_eq(&cert1, &cert2));
+
+        // Force cache maintenance to update stats
+        handler.run_pending_tasks();
 
         // Check cache stats
         let stats = handler.cache_stats();
@@ -222,6 +230,9 @@ mod tests {
             .get_certificate("another.com")
             .await
             .expect("Failed to get certificate");
+
+        // Force cache maintenance to update stats
+        handler.run_pending_tasks();
 
         // Check cache stats
         let stats = handler.cache_stats();

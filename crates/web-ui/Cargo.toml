@@ -5,15 +5,48 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Web UI for adblocker proxy - Leptos SPA"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Frontend framework
 leptos = { workspace = true }
 leptos_router = { workspace = true }
 
+# HTTP client for browser
+gloo-net = "0.6"
+gloo-timers = "0.3"
+gloo-storage = "0.3"
+
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Common utilities
-common = { path = "../common" }
+# Error handling
+thiserror = { workspace = true }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlFormElement",
+    "Storage",
+    "Location",
+    "console",
+] }
+js-sys = "0.3"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-web = "0.1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

@@ -4,9 +4,8 @@ use crate::{Error, Result};
 use bytes::Bytes;
 use h3::server::Connection;
 use quinn::Endpoint;
-use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// HTTP/3 server that handles QUIC connections
 pub struct Http3Server {
@@ -87,13 +86,19 @@ async fn handle_connection(
             // Accept new HTTP/3 request stream
             result = h3_conn.accept() => {
                 match result {
-                    Ok(Some((req, stream))) => {
-                        debug!("HTTP/3 request: {} {}", req.method(), req.uri());
-
-                        // Spawn task to handle this request
+                    Ok(Some(resolver)) => {
+                        // Spawn task to resolve and handle this request
                         tokio::spawn(async move {
-                            if let Err(e) = handle_request(req, stream).await {
-                                error!("Request handling error: {}", e);
+                            match resolver.resolve_request().await {
+                                Ok((req, stream)) => {
+                                    debug!("HTTP/3 request: {} {}", req.method(), req.uri());
+                                    if let Err(e) = handle_request(req, stream).await {
+                                        error!("Request handling error: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to resolve request: {}", e);
+                                }
                             }
                         });
                     }
@@ -157,16 +162,20 @@ async fn handle_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
 
     #[tokio::test]
     async fn test_http3_server_creation() {
-        // Create a test TLS config
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_der = cert.serialize_der().unwrap();
-        let key_der = cert.serialize_private_key_der();
+        use std::sync::Arc;
 
-        let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+        // Install ring crypto provider for tests
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Create a test TLS config
+        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = certified_key.cert.der().clone();
+        let key_der = certified_key.signing_key.serialize_der();
+
+        let cert_chain = vec![cert_der];
         let key = rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
 
         let mut tls_config = rustls::ServerConfig::builder()

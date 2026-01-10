@@ -61,9 +61,14 @@ impl CertificateAuthority {
         // The actual certificate parameters will be extracted when creating an Issuer
         let ca_params = CertificateParams::default();
 
-        // Get DER formats
-        let ca_cert_der = CertificateDer::from(cert_pem.as_bytes().to_vec());
-        let ca_key_der = PrivateKeyDer::try_from(key_pem.as_bytes().to_vec())
+        // Parse PEM to get DER formats
+        let cert_der_bytes = pem::parse(&cert_pem)
+            .map_err(|e| Error::Certificate(format!("Failed to parse CA certificate PEM: {}", e)))?
+            .contents()
+            .to_vec();
+        let ca_cert_der = CertificateDer::from(cert_der_bytes);
+
+        let ca_key_der = PrivateKeyDer::try_from(ca_key_pair.serialize_der())
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
 
         Ok(Self {
@@ -147,8 +152,8 @@ impl CertificateAuthority {
         info!("Generated new CA certificate");
 
         // Get DER formats
-        let ca_cert_der = CertificateDer::from(cert_pem.as_bytes().to_vec());
-        let ca_key_der = PrivateKeyDer::try_from(key_pem.as_bytes().to_vec())
+        let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
+        let ca_key_der = PrivateKeyDer::try_from(ca_key_pair.serialize_der())
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
 
         Ok(Self {
@@ -199,13 +204,9 @@ impl CertificateAuthority {
         let cert = params.signed_by(&key_pair, &issuer)
             .map_err(|e| Error::Certificate(format!("Failed to sign certificate: {}", e)))?;
 
-        // Get PEM formats
-        let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
-
         // Convert to DER format for rustls
-        let cert_der = CertificateDer::from(cert_pem.as_bytes().to_vec());
-        let key_der = PrivateKeyDer::try_from(key_pem.as_bytes().to_vec())
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
 
         Ok((cert_der, key_der))

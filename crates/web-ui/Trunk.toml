@@ -1,0 +1,17 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "style", "index.html"]
+ignore = []
+
+[serve]
+address = "127.0.0.1"
+port = 5173
+open = false
+
+# Proxy API requests to backend in development
+[[proxy]]
+rewrite = "/api/"
+backend = "http://localhost:3000/api/"

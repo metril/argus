@@ -1,6 +1,6 @@
 //! Configuration tests
 
-use proxy_core::config::{ProxyConfig, ProxySettings, MitmSettings, PerformanceSettings};
+use proxy_core::config::{ProxyConfig, ProxySettings, MitmSettings, PerformanceSettings, AdblockSettings};
 use std::path::PathBuf;
 
 #[test]
@@ -69,6 +69,7 @@ fn test_custom_config() {
             connection_timeout_secs: 15,
             request_timeout_secs: 30,
         },
+        adblock: AdblockSettings::default(),
     };
 
     assert_eq!(config.proxy.host, "127.0.0.1");

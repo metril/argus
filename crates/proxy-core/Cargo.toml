@@ -30,6 +30,7 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
+pem = { workspace = true }
 
 # Tower middleware
 tower = { workspace = true }

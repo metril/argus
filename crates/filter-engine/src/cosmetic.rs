@@ -205,6 +205,9 @@ impl CosmeticRule {
         match &self.domains {
             None => true, // No domain restrictions = applies to all domains
             Some(domains) => {
+                let mut has_positive_domains = false;
+                let mut matched_positive = false;
+
                 for rule_domain in domains {
                     if rule_domain.starts_with('~') {
                         // Negation - if domain matches, rule doesn't apply
@@ -214,13 +217,20 @@ impl CosmeticRule {
                         }
                     } else {
                         // Positive match
+                        has_positive_domains = true;
                         if Self::domain_matches(domain, rule_domain) {
-                            return true;
+                            matched_positive = true;
                         }
                     }
                 }
-                // If we have domains but none matched positively
-                false
+
+                // If only negation rules (no positive domains), apply to all non-excluded domains
+                // If has positive domains, must match at least one
+                if has_positive_domains {
+                    matched_positive
+                } else {
+                    true // Only negations, and none matched (domain not excluded)
+                }
             }
         }
     }
@@ -353,18 +363,21 @@ impl CosmeticFilterManager {
     /// Generate combined CSS for element hiding
     pub fn get_hiding_css(&self, domain: &str) -> String {
         let rules = self.get_rules_for_domain(domain);
-        let mut selectors = Vec::new();
-        let mut exceptions = Vec::new();
 
-        for rule in rules {
-            if rule.is_exception() {
-                exceptions.push(&rule.selector);
-            } else if let Some(_) = rule.to_hiding_css() {
-                if !exceptions.contains(&&rule.selector) {
-                    selectors.push(&rule.selector);
-                }
-            }
-        }
+        // First collect all exceptions
+        let exceptions: Vec<&String> = rules
+            .iter()
+            .filter(|r| r.is_exception())
+            .map(|r| &r.selector)
+            .collect();
+
+        // Then collect selectors that are not excepted
+        let selectors: Vec<&String> = rules
+            .iter()
+            .filter(|r| !r.is_exception() && r.to_hiding_css().is_some())
+            .filter(|r| !exceptions.contains(&&r.selector))
+            .map(|r| &r.selector)
+            .collect();
 
         if selectors.is_empty() {
             return String::new();
@@ -430,7 +443,7 @@ mod tests {
     fn test_parse_extended_css() {
         let rule = CosmeticRule::parse("##div:has(> .ad)").unwrap();
         assert!(rule.is_extended);
-        assert!(rule.has_extended_selectors(&rule.selector));
+        assert!(CosmeticRule::has_extended_selectors(&rule.selector));
     }
 
     #[test]
@@ -443,7 +456,8 @@ mod tests {
 
     #[test]
     fn test_css_injection_no_url() {
-        let result = CosmeticRule::parse("##.element { background: url(ad.png); }");
+        // CSS injection rules (#$#) cannot contain url() for security
+        let result = CosmeticRule::parse("example.com#$#.element { background: url(ad.png); }");
         assert!(result.is_err());
     }
 
