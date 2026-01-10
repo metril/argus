@@ -200,9 +200,14 @@ impl UserscriptManager {
         Ok(count)
     }
 
-    /// Get storage instance
+    /// Get storage instance reference
     pub fn storage(&self) -> &UserscriptStorage {
         &self.storage
+    }
+
+    /// Get storage instance as Arc (for sharing with runtime)
+    pub fn storage_arc(&self) -> Arc<UserscriptStorage> {
+        Arc::clone(&self.storage)
     }
 
     /// Get path for a script file
@@ -320,11 +325,16 @@ console.log('test');
     #[test]
     fn test_load_save() {
         let temp_dir = tempdir().unwrap();
-        let manager = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let script_id;
 
-        let script_id = manager.install(TEST_SCRIPT.to_string()).unwrap();
+        {
+            // Create first manager and install script
+            let manager = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+            script_id = manager.install(TEST_SCRIPT.to_string()).unwrap();
+            // manager is dropped here, releasing the sled lock
+        }
 
-        // Create new manager instance
+        // Create new manager instance - now the lock is released
         let manager2 = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
         manager2.load_all().unwrap();
 

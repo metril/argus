@@ -465,19 +465,21 @@ impl DocumentReadyState {
 mod tests {
     use super::*;
     use crate::UserscriptManager;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
-    fn create_test_runtime() -> UserscriptRuntime {
+    // Returns both the runtime and the TempDir to keep the directory alive
+    fn create_test_runtime() -> (UserscriptRuntime, TempDir) {
         let temp_dir = tempdir().unwrap();
         let manager = Arc::new(UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap());
-        let storage = Arc::new(UserscriptStorage::new(temp_dir.path().to_path_buf()).unwrap());
+        // Use the manager's internal storage to avoid sled lock conflicts
+        let storage = manager.storage_arc();
 
-        UserscriptRuntime::new(manager, storage)
+        (UserscriptRuntime::new(manager, storage), temp_dir)
     }
 
     #[tokio::test]
     async fn test_execute_for_url() {
-        let runtime = create_test_runtime();
+        let (runtime, _temp_dir) = create_test_runtime();
 
         // Install a test script
         let script = r#"
@@ -509,7 +511,7 @@ GM.setValue('test', 'value');
 
     #[tokio::test]
     async fn test_run_at_filtering() {
-        let runtime = create_test_runtime();
+        let (runtime, _temp_dir) = create_test_runtime();
 
         // Install script that runs at document-end
         let script = r#"
@@ -519,7 +521,8 @@ GM.setValue('test', 'value');
 // @run-at       document-end
 // ==/UserScript==
 
-console.log('running at end');
+// Simple script that doesn't require console
+var x = 1 + 1;
 "#;
 
         runtime
@@ -542,11 +545,12 @@ console.log('running at end');
             .unwrap();
 
         assert_eq!(results.executed.len(), 1);
+        assert_eq!(results.failed.len(), 0);
     }
 
     #[test]
     fn test_mime_type_detection() {
-        let runtime = create_test_runtime();
+        let (runtime, _temp_dir) = create_test_runtime();
 
         assert_eq!(runtime.detect_mime_type("icon.png"), "image/png");
         assert_eq!(runtime.detect_mime_type("style.css"), "text/css");
@@ -600,7 +604,7 @@ console.log('running at end');
 
     #[test]
     fn test_cache_stats() {
-        let runtime = create_test_runtime();
+        let (runtime, _temp_dir) = create_test_runtime();
         let stats = runtime.cache_stats();
 
         assert_eq!(stats.require_cached, 0);

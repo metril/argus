@@ -51,7 +51,13 @@ impl From<StorageValue> for Value {
             StorageValue::Null => Value::Null,
             StorageValue::Bool(b) => Value::Bool(b),
             StorageValue::Number(n) => {
-                Value::Number(serde_json::Number::from_f64(n).unwrap_or_else(|| 0.into()))
+                // If the number is a whole integer that fits in i64, use integer representation
+                // This preserves equality with the original value (42 == 42, not 42.0)
+                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                    Value::Number((n as i64).into())
+                } else {
+                    Value::Number(serde_json::Number::from_f64(n).unwrap_or_else(|| 0.into()))
+                }
             }
             StorageValue::String(s) => Value::String(s),
             StorageValue::Array(arr) => {

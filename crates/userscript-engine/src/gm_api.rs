@@ -409,6 +409,8 @@ mod tests {
         let grants = vec![
             "GM_setValue".to_string(),
             "GM_getValue".to_string(),
+            "GM_deleteValue".to_string(),
+            "GM_listValues".to_string(),
             "GM_addStyle".to_string(),
             "GM_openInTab".to_string(),
             "GM_notification".to_string(),
