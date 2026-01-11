@@ -22,6 +22,9 @@ pub struct ApiConfig {
 
     /// Session storage settings
     pub session: SessionConfig,
+
+    /// WebUI settings
+    pub webui: WebUiConfig,
 }
 
 impl Default for ApiConfig {
@@ -32,6 +35,7 @@ impl Default for ApiConfig {
             rate_limit: RateLimitConfig::default(),
             security: SecurityConfig::default(),
             session: SessionConfig::default(),
+            webui: WebUiConfig::default(),
         }
     }
 }
@@ -159,6 +163,25 @@ impl Default for SessionConfig {
         Self {
             storage_path: PathBuf::from("data/sessions"),
             cleanup_interval_seconds: 3600, // 1 hour
+        }
+    }
+}
+
+/// WebUI configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebUiConfig {
+    /// Enable serving WebUI static files
+    pub enabled: bool,
+
+    /// Path to WebUI dist directory
+    pub dist_path: PathBuf,
+}
+
+impl Default for WebUiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dist_path: PathBuf::from("crates/web-ui/dist"),
         }
     }
 }

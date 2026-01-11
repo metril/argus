@@ -1,18 +1,23 @@
 //! Main proxy server implementation
 
 use crate::{
-    ca::CertificateAuthority, config::ProxyConfig, connection::ConnectionHandler, mitm::MitmHandler,
+    ca::CertificateAuthority,
+    config::ProxyConfig,
+    connection::ConnectionHandler,
+    load_manager::{AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig},
+    mitm::MitmHandler,
     Error, Result,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct ProxyServer {
     config: ProxyConfig,
     mitm_handler: Option<Arc<MitmHandler>>,
+    load_manager: Arc<LoadManager>,
 }
 
 impl ProxyServer {
@@ -42,10 +47,33 @@ impl ProxyServer {
             None
         };
 
+        // Initialize load manager with configuration from performance settings
+        let load_manager_config = LoadManagerConfig {
+            max_connections: config.performance.max_connections,
+            connection_rate_limit: config.performance.connection_rate_limit.unwrap_or(1000),
+            adaptive_concurrency: true,
+            ..Default::default()
+        };
+        let load_manager = Arc::new(LoadManager::new(load_manager_config));
+
+        info!(
+            "Load manager initialized: max_connections={}, rate_limit={}/s",
+            config.performance.max_connections,
+            config.performance.connection_rate_limit.unwrap_or(1000)
+        );
+
         Ok(Self {
             config,
             mitm_handler,
+            load_manager,
         })
+    }
+
+    /// Create a new proxy server with custom load manager configuration
+    pub fn with_load_manager(config: ProxyConfig, load_manager_config: LoadManagerConfig) -> Result<Self> {
+        let mut server = Self::new(config)?;
+        server.load_manager = Arc::new(LoadManager::new(load_manager_config));
+        Ok(server)
     }
 
     /// Start the proxy server with graceful shutdown
@@ -68,6 +96,10 @@ impl ProxyServer {
                 stats.entry_count, stats.weighted_size
             );
         }
+
+        // Start load manager monitoring
+        let _monitoring_handle = self.load_manager.start_monitoring();
+        info!("Load manager monitoring started");
 
         // Create shutdown channel
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -94,16 +126,40 @@ impl ProxyServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, client_addr)) => {
+                            // Check if connection should be admitted
+                            match self.load_manager.check_admission() {
+                                AdmissionResult::Admitted => {
+                                    debug!("Connection from {} admitted", client_addr);
+                                }
+                                AdmissionResult::RejectedMemoryPressure => {
+                                    warn!("Connection from {} rejected: memory pressure", client_addr);
+                                    // Connection is dropped automatically
+                                    continue;
+                                }
+                                AdmissionResult::RejectedMaxConnections => {
+                                    warn!("Connection from {} rejected: max connections reached", client_addr);
+                                    continue;
+                                }
+                                AdmissionResult::RejectedRateLimit => {
+                                    debug!("Connection from {} rejected: rate limit", client_addr);
+                                    continue;
+                                }
+                            }
+
                             info!("Accepted connection from {}", client_addr);
 
-                            // Clone the MITM handler and config for this connection
+                            // Clone the MITM handler, config, and load manager for this connection
                             let mitm_handler = self.mitm_handler.clone();
                             let enable_http2 = self.config.proxy.enable_http2;
                             let enable_websockets = self.config.proxy.enable_websockets;
                             let mut shutdown_rx = shutdown_tx.subscribe();
+                            let load_manager = self.load_manager.clone();
 
                             // Spawn a new task to handle this connection
                             tokio::spawn(async move {
+                                // Create connection guard for automatic cleanup
+                                let _guard = ConnectionGuard::new(load_manager);
+
                                 let handler = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets);
                                 tokio::select! {
                                     result = handler.handle(stream) => {
@@ -115,6 +171,7 @@ impl ProxyServer {
                                         info!("Connection from {} terminated due to shutdown", client_addr);
                                     }
                                 }
+                                // _guard is dropped here, releasing the connection
                             });
                         }
                         Err(e) => {
@@ -129,13 +186,33 @@ impl ProxyServer {
             }
         }
 
-        info!("Proxy server stopped");
+        // Log final statistics
+        let stats = self.load_manager.stats();
+        info!(
+            "Proxy server stopped. Final stats: accepted={}, rejected={} (memory={}, max={}, rate={})",
+            stats.connections_accepted,
+            stats.connections_rejected,
+            stats.connections_rejected_memory,
+            stats.connections_rejected_max,
+            stats.connections_rejected_rate
+        );
+
         Ok(())
     }
 
     /// Get MITM handler
     pub fn mitm_handler(&self) -> Option<&Arc<MitmHandler>> {
         self.mitm_handler.as_ref()
+    }
+
+    /// Get load manager
+    pub fn load_manager(&self) -> &Arc<LoadManager> {
+        &self.load_manager
+    }
+
+    /// Get load manager statistics
+    pub fn load_stats(&self) -> crate::load_manager::LoadManagerStatsSnapshot {
+        self.load_manager.stats()
     }
 
     /// Start HTTP/3 server (optional feature)
@@ -147,8 +224,8 @@ impl ProxyServer {
         let mitm_handler = self.mitm_handler.as_ref()
             .ok_or_else(|| Error::Config("HTTP/3 requires MITM to be enabled".to_string()))?;
 
-        // Get or generate CA certificate for QUIC/TLS
-        let ca = &mitm_handler.ca;
+        // Get CA reference for QUIC/TLS
+        let _ca = mitm_handler.ca();
         let ca_cert_pem = std::fs::read_to_string(&self.config.mitm.ca_cert_path)
             .map_err(|e| Error::Tls(format!("Failed to read CA certificate: {}", e)))?;
         let ca_key_pem = std::fs::read_to_string(&self.config.mitm.ca_key_path)

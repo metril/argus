@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::http::{header, HeaderValue, Method};
 use tower_http::{
     cors::CorsLayer,
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 
@@ -83,12 +84,32 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
 
     // Build the main router with global middleware
     // Layers are applied bottom-to-top (last added = outermost)
-    Router::new()
+    let mut router = Router::new()
         .nest("/api/auth", auth_router)
         .nest("/api/proxy", proxy_router)
         .nest("/api/filters", filters_router)
         .nest("/api/userscripts", userscripts_router)
-        .nest("/api", health_router)
+        .nest("/api", health_router);
+
+    // Add static file serving for WebUI if enabled
+    if config.webui.enabled {
+        let dist_path = &config.webui.dist_path;
+        if dist_path.exists() {
+            let index_file = dist_path.join("index.html");
+
+            // Serve static files from dist directory
+            // fallback_service routes all non-API requests to index.html for SPA routing
+            let serve_dir = ServeDir::new(dist_path)
+                .not_found_service(ServeFile::new(&index_file));
+
+            router = router.fallback_service(serve_dir);
+            tracing::info!("WebUI static files enabled from {:?}", dist_path);
+        } else {
+            tracing::warn!("WebUI dist path {:?} does not exist, static files disabled", dist_path);
+        }
+    }
+
+    router
         // Innermost: CORS (handles preflight)
         .layer(cors)
         // TraceLayer for request/response logging

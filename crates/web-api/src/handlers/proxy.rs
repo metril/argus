@@ -10,9 +10,10 @@ use crate::auth::middleware::AuthUser;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{extract::State, Extension, Json};
-use proxy_core::config::ProxyConfig;
+use common::config::ProxyConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::info;
 use utoipa::ToSchema;
@@ -48,7 +49,7 @@ impl From<&ProxyConfig> for ProxyConfigResponse {
         Self {
             host: config.proxy.host.clone(),
             port: config.proxy.port,
-            max_connections: config.proxy.max_connections as u32,
+            max_connections: config.performance.max_connections as u32,
             enable_http2: config.proxy.enable_http2,
             enable_http3: config.proxy.enable_http3,
             enable_websockets: config.proxy.enable_websockets,
@@ -177,7 +178,7 @@ pub async fn update_config(
         }
 
         if let Some(max_connections) = req.max_connections {
-            config.proxy.max_connections = max_connections as usize;
+            config.performance.max_connections = max_connections as usize;
         }
 
         if let Some(enable_http2) = req.enable_http2 {
@@ -240,13 +241,14 @@ pub async fn get_stats(
 ) -> ApiResult<Json<ProxyStatsResponse>> {
     let stats = state.proxy_state.stats.snapshot();
 
-    // Get MITM stats if available
-    let mitm_stats = state.proxy_state.mitm_handler.as_ref().map(|_handler| {
-        // TODO: Expose certificate cache count from MitmHandler
-        MitmStats {
-            cached_certificates: 0,
-        }
-    });
+    // Get MITM stats if enabled
+    let mitm_stats = if state.proxy_state.mitm_enabled {
+        Some(MitmStats {
+            cached_certificates: state.proxy_state.mitm_cached_certs.load(Ordering::Relaxed) as usize,
+        })
+    } else {
+        None
+    };
 
     Ok(Json(ProxyStatsResponse {
         connections: ConnectionStats {

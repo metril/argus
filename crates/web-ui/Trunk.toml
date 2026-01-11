@@ -1,6 +1,9 @@
 [build]
 target = "index.html"
 dist = "dist"
+# Disable wasm-opt to avoid compatibility issues with bulk memory operations
+# The setting takes effect via "skip_wasm_opt = true" in [[hooks]] or we can
+# pass --no-optimize to trunk build (added in Dockerfile)
 
 [watch]
 watch = ["src", "style", "index.html"]

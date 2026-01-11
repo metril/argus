@@ -70,6 +70,14 @@ parking_lot = { workspace = true }
 chrono = { workspace = true }
 time = { workspace = true }
 
+# Encryption (for CA key encryption at rest)
+age = { workspace = true }
+secrecy = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+rand = "0.8"
+base64 = "0.22"
+
 # Common utilities
 common = { path = "../common" }
 
@@ -79,11 +87,26 @@ proxy-http3 = { path = "../proxy-http3", optional = true }
 # Filter engine (optional)
 filter-engine = { path = "../filter-engine", optional = true }
 
+# Userscript engine (optional)
+userscript-engine = { path = "../userscript-engine", optional = true }
+
+# Web API (optional)
+web-api = { path = "../web-api", optional = true }
+
 [features]
 default = []
 http3 = ["proxy-http3"]
 websockets = ["proxy-http3"]
 adblock = ["filter-engine"]
+userscripts = ["userscript-engine"]
+webui = ["web-api", "filter-engine", "userscript-engine"]
+full = ["http3", "websockets", "adblock", "userscripts", "webui"]
 
 [dev-dependencies]
 mockall = { workspace = true }
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "proxy_bench"
+harness = false

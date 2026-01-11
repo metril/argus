@@ -4,7 +4,6 @@
 
 # Build artifacts
 target/
-Cargo.lock
 
 # Runtime directories (will be mounted as volumes)
 certs/*.key

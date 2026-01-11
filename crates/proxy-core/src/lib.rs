@@ -5,17 +5,35 @@
 //! - TLS interception and certificate generation
 //! - Request/response pipeline
 //! - Connection management
+//! - Circuit breaker pattern for upstream failures
+//! - Memory pressure monitoring and load shedding
+//! - Unified load management for production hardening
+//! - CA private key encryption at rest
 
 pub mod ca;
+pub mod ca_encryption;
+pub mod circuit_breaker;
 pub mod config;
 pub mod connection;
 pub mod error;
 pub mod http2;
+pub mod load_manager;
+pub mod memory_monitor;
 pub mod mitm;
 pub mod pipeline;
 pub mod server;
 pub mod tls;
 
+pub use ca_encryption::{
+    decrypt_ca_key, encrypt_ca_key, is_encrypted_key, read_encrypted_key,
+    validate_passphrase, write_encrypted_key, CaEncryptionConfig,
+};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitCheck, CircuitState};
 pub use config::ProxyConfig;
 pub use error::{Error, Result};
+pub use load_manager::{
+    AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig, LoadManagerStatsSnapshot,
+    SharedLoadManager,
+};
+pub use memory_monitor::{LoadSheddingAction, MemoryMonitor, MemoryMonitorConfig, MemoryPressure};
 pub use server::ProxyServer;

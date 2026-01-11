@@ -1,9 +1,7 @@
 //! Tests for connection handling
 
-use proxy_core::config::{MitmSettings, PerformanceSettings, AdblockSettings, ProxyConfig};
+use proxy_core::config::{MitmSettings, PerformanceSettings, AdblockSettings, ProxyConfig, UserscriptSettings, WebUiSettings};
 use proxy_core::ProxyServer;
-use std::time::Duration;
-use tokio::time::timeout;
 
 #[tokio::test]
 async fn test_server_with_mitm_enabled() {
@@ -11,7 +9,6 @@ async fn test_server_with_mitm_enabled() {
         proxy: proxy_core::config::ProxySettings {
             host: "127.0.0.1".to_string(),
             port: 0, // Use random port for testing
-            max_connections: 100,
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
@@ -25,12 +22,16 @@ async fn test_server_with_mitm_enabled() {
             cert_idle_timeout_secs: 3600,
         },
         performance: PerformanceSettings {
+            max_connections: 100,
             max_cert_generations: 10,
             max_html_buffers: 10,
             connection_timeout_secs: 5,
             request_timeout_secs: 10,
+            connection_rate_limit: Some(100),
         },
         adblock: AdblockSettings::default(),
+        userscripts: UserscriptSettings::default(),
+        webui: WebUiSettings::default(),
     };
 
     // Clean up any existing CA files
@@ -63,7 +64,6 @@ async fn test_server_with_mitm_disabled() {
         proxy: proxy_core::config::ProxySettings {
             host: "127.0.0.1".to_string(),
             port: 0,
-            max_connections: 100,
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
@@ -77,12 +77,16 @@ async fn test_server_with_mitm_disabled() {
             cert_idle_timeout_secs: 3600,
         },
         performance: PerformanceSettings {
+            max_connections: 100,
             max_cert_generations: 10,
             max_html_buffers: 10,
             connection_timeout_secs: 5,
             request_timeout_secs: 10,
+            connection_rate_limit: Some(100),
         },
         adblock: AdblockSettings::default(),
+        userscripts: UserscriptSettings::default(),
+        webui: WebUiSettings::default(),
     };
 
     // Create server with MITM disabled
@@ -101,7 +105,6 @@ async fn test_certificate_generation() {
         proxy: proxy_core::config::ProxySettings {
             host: "127.0.0.1".to_string(),
             port: 0,
-            max_connections: 100,
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
@@ -115,12 +118,16 @@ async fn test_certificate_generation() {
             cert_idle_timeout_secs: 3600,
         },
         performance: PerformanceSettings {
+            max_connections: 100,
             max_cert_generations: 10,
             max_html_buffers: 10,
             connection_timeout_secs: 5,
             request_timeout_secs: 10,
+            connection_rate_limit: Some(100),
         },
         adblock: AdblockSettings::default(),
+        userscripts: UserscriptSettings::default(),
+        webui: WebUiSettings::default(),
     };
 
     // Clean up any existing CA files
@@ -168,4 +175,45 @@ async fn test_certificate_generation() {
     // Clean up
     let _ = std::fs::remove_file(std::env::temp_dir().join("test-certgen-ca.crt"));
     let _ = std::fs::remove_file(std::env::temp_dir().join("test-certgen-ca.key"));
+}
+
+#[tokio::test]
+async fn test_load_manager_integration() {
+    let config = ProxyConfig {
+        proxy: proxy_core::config::ProxySettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            enable_http2: false,
+            enable_http3: false,
+            enable_websockets: false,
+        },
+        mitm: MitmSettings {
+            enabled: false,
+            ca_cert_path: std::env::temp_dir().join("unused.crt"),
+            ca_key_path: std::env::temp_dir().join("unused.key"),
+            cert_cache_size: 100,
+            cert_ttl_days: 30,
+            cert_idle_timeout_secs: 3600,
+        },
+        performance: PerformanceSettings {
+            max_connections: 100,
+            max_cert_generations: 10,
+            max_html_buffers: 10,
+            connection_timeout_secs: 5,
+            request_timeout_secs: 10,
+            connection_rate_limit: Some(50),
+        },
+        adblock: AdblockSettings::default(),
+        userscripts: UserscriptSettings::default(),
+        webui: WebUiSettings::default(),
+    };
+
+    // Create server
+    let server = ProxyServer::new(config).expect("Failed to create server");
+
+    // Verify load manager is initialized
+    let load_stats = server.load_stats();
+    assert_eq!(load_stats.connections_accepted, 0);
+    assert_eq!(load_stats.connections_rejected, 0);
+    assert_eq!(load_stats.active_connections, 0);
 }
