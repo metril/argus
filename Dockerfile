@@ -2,13 +2,8 @@
 # Supports multi-arch builds: amd64, arm64
 # Build with: docker buildx build --platform linux/amd64,linux/arm64 -t adblocker .
 
-# Build stage
-FROM --platform=$BUILDPLATFORM rust:1.85-alpine AS builder
-
-# Target architecture for cross-compilation
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-ARG TARGETARCH
+# Build stage - native build for target architecture (no cross-compilation)
+FROM rust:1.85-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -18,12 +13,6 @@ RUN apk add --no-cache \
     pkgconfig \
     perl \
     make
-
-# Install cross-compilation toolchains if needed
-RUN case "$TARGETARCH" in \
-        arm64) \
-            apk add --no-cache gcc-aarch64-none-elf || true ;; \
-    esac
 
 # Set working directory
 WORKDIR /build
@@ -40,23 +29,16 @@ COPY crates/userscript-engine ./crates/userscript-engine
 COPY crates/web-api ./crates/web-api
 COPY crates/web-ui ./crates/web-ui
 
-# Set Rust target based on architecture
-RUN case "$TARGETARCH" in \
-        amd64) echo "x86_64-unknown-linux-musl" > /tmp/target ;; \
-        arm64) echo "aarch64-unknown-linux-musl" > /tmp/target ;; \
-        *) echo "x86_64-unknown-linux-musl" > /tmp/target ;; \
-    esac && \
-    rustup target add $(cat /tmp/target)
-
 # Build in release mode with optimizations
-ENV RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-s"
-RUN cargo build --release --target $(cat /tmp/target) --bin adblocker && \
-    cp /build/target/$(cat /tmp/target)/release/adblocker /build/adblocker
+# Note: On Alpine with musl, static linking is the default
+# -C link-arg=-s strips symbols for smaller binary
+RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker
 
-# Verify binary was created and show size
-RUN ls -lh /build/adblocker
+# Copy binary to known location and verify
+RUN cp /build/target/release/adblocker /build/adblocker && \
+    ls -lh /build/adblocker
 
-# WebUI build stage
+# WebUI build stage (WASM is architecture-independent, use x86_64 for speed)
 FROM --platform=$BUILDPLATFORM node:20-alpine AS webui-builder
 
 # Install build dependencies and trunk
