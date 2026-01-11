@@ -27,35 +27,34 @@ use uuid::Uuid;
 use validator::Validate;
 
 /// Create httpOnly cookie for access token
-fn create_access_token_cookie(token: &str, max_age_secs: u64) -> String {
+fn create_access_token_cookie(token: &str, max_age_secs: u64, secure: bool) -> String {
     Cookie::build((ACCESS_TOKEN_COOKIE, token))
         .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict)
+        .secure(secure)
+        .same_site(SameSite::Lax)
         .max_age(Duration::seconds(max_age_secs as i64))
-        .path("/api")
+        .path("/")
         .to_string()
 }
 
 /// Create httpOnly cookie for refresh token
-fn create_refresh_token_cookie(token: &str, max_age_secs: u64) -> String {
+fn create_refresh_token_cookie(token: &str, max_age_secs: u64, secure: bool) -> String {
     Cookie::build((REFRESH_TOKEN_COOKIE, token))
         .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict)
+        .secure(secure)
+        .same_site(SameSite::Lax)
         .max_age(Duration::seconds(max_age_secs as i64))
-        .path("/api/auth")
+        .path("/")
         .to_string()
 }
 
 /// Create cookie that expires immediately (for logout)
-fn create_expired_cookie(name: &str, path: &str) -> String {
+fn create_expired_cookie(name: &str) -> String {
     Cookie::build((name, ""))
         .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict)
+        .same_site(SameSite::Lax)
         .max_age(Duration::seconds(0))
-        .path(path)
+        .path("/")
         .to_string()
 }
 
@@ -114,13 +113,15 @@ pub async fn register(
         None,
     );
 
-    // Set cookies
+    // Set cookies (secure=false for HTTP development, should be true in production with HTTPS)
+    let secure = false;
     let mut headers = HeaderMap::new();
     headers.insert(
         SET_COOKIE,
         HeaderValue::from_str(&create_access_token_cookie(
             &tokens.access_token,
             tokens.access_expires_in,
+            secure,
         ))
         .unwrap(),
     );
@@ -129,6 +130,7 @@ pub async fn register(
         HeaderValue::from_str(&create_refresh_token_cookie(
             &tokens.refresh_token,
             tokens.refresh_expires_in,
+            secure,
         ))
         .unwrap(),
     );
@@ -200,13 +202,15 @@ pub async fn login(
 
     info!("User logged in: {}", user.username);
 
-    // Set cookies
+    // Set cookies (secure=false for HTTP development, should be true in production with HTTPS)
+    let secure = false;
     let mut headers = HeaderMap::new();
     headers.insert(
         SET_COOKIE,
         HeaderValue::from_str(&create_access_token_cookie(
             &tokens.access_token,
             tokens.access_expires_in,
+            secure,
         ))
         .unwrap(),
     );
@@ -215,6 +219,7 @@ pub async fn login(
         HeaderValue::from_str(&create_refresh_token_cookie(
             &tokens.refresh_token,
             tokens.refresh_expires_in,
+            secure,
         ))
         .unwrap(),
     );
@@ -247,11 +252,11 @@ pub async fn logout(
     let mut headers = HeaderMap::new();
     headers.insert(
         SET_COOKIE,
-        HeaderValue::from_str(&create_expired_cookie(ACCESS_TOKEN_COOKIE, "/api")).unwrap(),
+        HeaderValue::from_str(&create_expired_cookie(ACCESS_TOKEN_COOKIE)).unwrap(),
     );
     headers.append(
         SET_COOKIE,
-        HeaderValue::from_str(&create_expired_cookie(REFRESH_TOKEN_COOKIE, "/api/auth")).unwrap(),
+        HeaderValue::from_str(&create_expired_cookie(REFRESH_TOKEN_COOKIE)).unwrap(),
     );
 
     Ok((headers, Json(json!({ "message": "Logged out successfully" }))))
@@ -315,13 +320,15 @@ pub async fn refresh(
 
     info!("Token refreshed for user: {}", claims.username);
 
-    // Set new cookies
+    // Set new cookies (secure=false for HTTP development, should be true in production with HTTPS)
+    let secure = false;
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         SET_COOKIE,
         HeaderValue::from_str(&create_access_token_cookie(
             &tokens.access_token,
             tokens.access_expires_in,
+            secure,
         ))
         .unwrap(),
     );
@@ -330,6 +337,7 @@ pub async fn refresh(
         HeaderValue::from_str(&create_refresh_token_cookie(
             &tokens.refresh_token,
             tokens.refresh_expires_in,
+            secure,
         ))
         .unwrap(),
     );
