@@ -1,9 +1,11 @@
 # Multi-stage Dockerfile for Adblocker MITM Proxy
 # Supports multi-arch builds: amd64, arm64
 # Build with: docker buildx build --platform linux/amd64,linux/arm64 -t adblocker .
+#
+# Uses cargo-chef for dependency caching - incremental builds are ~10x faster
 
-# Build stage - native build for target architecture
-FROM alpine:3.21 AS builder
+# Stage 1: Chef base - install Rust and cargo-chef
+FROM alpine:3.21 AS chef
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -21,31 +23,34 @@ RUN apk add --no-cache \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Set working directory
+# Install cargo-chef for dependency caching
+RUN cargo install cargo-chef --locked
+
 WORKDIR /build
 
-# Copy workspace files for dependency caching
+# Stage 2: Planner - analyze dependencies and create recipe
+FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Copy all crates
-COPY crates/common ./crates/common
-COPY crates/proxy-core ./crates/proxy-core
-COPY crates/proxy-http3 ./crates/proxy-http3
-COPY crates/filter-engine ./crates/filter-engine
-COPY crates/userscript-engine ./crates/userscript-engine
-COPY crates/web-api ./crates/web-api
-COPY crates/web-ui ./crates/web-ui
+# Stage 3: Builder - build dependencies (cached) then source
+FROM chef AS builder
 
-# Build in release mode with optimizations
-# Note: On Alpine with musl, static linking is the default
-# -C link-arg=-s strips symbols for smaller binary
+# Copy recipe and build dependencies only (this layer is cached!)
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --features webui
+
+# Now copy source and build (only your code compiles, deps are cached)
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
 RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker --features webui
 
 # Copy binary to known location and verify
 RUN cp /build/target/release/adblocker /build/adblocker && \
     ls -lh /build/adblocker
 
-# WebUI build stage (WASM is architecture-independent, use x86_64 for speed)
+# Stage 4: WebUI build (WASM is architecture-independent, use x86_64 for speed)
 FROM --platform=$BUILDPLATFORM node:20-alpine AS webui-builder
 
 # Install build dependencies and trunk
@@ -61,19 +66,13 @@ WORKDIR /build
 
 # Copy workspace files (full workspace needed for cargo metadata)
 COPY Cargo.toml Cargo.lock ./
-COPY crates/common ./crates/common
-COPY crates/proxy-core ./crates/proxy-core
-COPY crates/proxy-http3 ./crates/proxy-http3
-COPY crates/filter-engine ./crates/filter-engine
-COPY crates/userscript-engine ./crates/userscript-engine
-COPY crates/web-api ./crates/web-api
-COPY crates/web-ui ./crates/web-ui
+COPY crates ./crates
 
 # Build WebUI (wasm-opt disabled via index.html to avoid compatibility issues)
 WORKDIR /build/crates/web-ui
 RUN trunk build --release
 
-# Runtime stage
+# Stage 5: Runtime
 FROM alpine:3.21
 
 # Install runtime dependencies
