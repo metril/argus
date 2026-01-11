@@ -3,7 +3,6 @@
 [proxy]
 host = "0.0.0.0"
 port = 8080
-max_connections = 10000
 enable_http2 = true
 enable_http3 = false
 enable_websockets = true
@@ -17,6 +16,7 @@ cert_ttl_days = 30
 cert_idle_timeout_secs = 3600
 
 [performance]
+max_connections = 10000
 max_cert_generations = 10
 max_html_buffers = 200
 connection_timeout_secs = 30
