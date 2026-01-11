@@ -4,10 +4,7 @@
 //! custom CSS styles into web pages.
 
 use crate::{Error, Result};
-use regex::Regex;
-use selectors::parser::SelectorParseErrorKind;
 use std::collections::HashMap;
-use tracing::debug;
 
 /// Type of cosmetic rule
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -96,7 +96,7 @@ pub struct PaginatedResponse<T> {
 ///
 /// GET /api/filters/lists
 pub async fn list_filter_lists(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(_auth_user): Extension<AuthUser>,
     Query(query): Query<ListFiltersQuery>,
 ) -> ApiResult<Json<PaginatedResponse<FilterListResponse>>> {
@@ -134,7 +134,7 @@ pub async fn list_filter_lists(
 ///
 /// POST /api/filters/lists
 pub async fn add_filter_list(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<AddFilterListRequest>,
 ) -> ApiResult<Json<FilterListResponse>> {
@@ -164,7 +164,7 @@ pub async fn add_filter_list(
 ///
 /// GET /api/filters/lists/:id
 pub async fn get_filter_list(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(_auth_user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<FilterListResponse>> {
@@ -176,7 +176,7 @@ pub async fn get_filter_list(
 ///
 /// PUT /api/filters/lists/:id
 pub async fn update_filter_list(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Path(id): Path<String>,
     Json(req): Json<UpdateFilterListRequest>,
@@ -205,7 +205,7 @@ pub async fn update_filter_list(
 ///
 /// DELETE /api/filters/lists/:id
 pub async fn delete_filter_list(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {

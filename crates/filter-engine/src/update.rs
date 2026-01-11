@@ -8,7 +8,7 @@
 
 use crate::{Error, FilterEngine, Result};
 use base64::Engine;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

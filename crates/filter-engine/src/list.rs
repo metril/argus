@@ -87,6 +87,7 @@ impl FilterList {
 pub struct FilterListManager {
     lists: Arc<RwLock<HashMap<String, FilterList>>>,
     http_client: Client,
+    #[allow(dead_code)] // Used for future file-based caching
     data_dir: PathBuf,
 }
 

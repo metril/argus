@@ -54,7 +54,6 @@ url = "2.5"
 
 # Common utilities
 common = { path = "../common" }
-proxy-core = { path = "../proxy-core" }
 filter-engine = { path = "../filter-engine" }
 userscript-engine = { path = "../userscript-engine" }
 

@@ -106,6 +106,11 @@ impl MitmHandler {
         domain.to_lowercase()
     }
 
+    /// Get a reference to the Certificate Authority
+    pub fn ca(&self) -> &Arc<CertificateAuthority> {
+        &self.ca
+    }
+
     /// Get cache statistics
     pub fn cache_stats(&self) -> CacheStats {
         CacheStats {

@@ -7,11 +7,11 @@ use crate::auth::session::SessionManager;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
 use chrono::Utc;
+use common::config::ProxyConfig;
 use dashmap::DashMap;
 use filter_engine::{FilterEngine, FilterStats};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
-use proxy_core::{config::ProxyConfig, mitm::MitmHandler};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -60,8 +60,11 @@ pub struct ProxyState {
     /// Runtime statistics
     pub stats: Arc<ProxyStats>,
 
-    /// MITM handler reference for cert cache stats
-    pub mitm_handler: Option<Arc<MitmHandler>>,
+    /// MITM enabled flag (for stats display)
+    pub mitm_enabled: bool,
+
+    /// Cached certificate count (updated periodically if MITM is enabled)
+    pub mitm_cached_certs: Arc<AtomicU64>,
 }
 
 /// Proxy runtime statistics
@@ -291,7 +294,7 @@ pub struct RateLimiters {
 }
 
 impl RateLimiters {
-    pub fn new(global_rpm: u64, ip_rpm: u64, user_rpm: u64) -> Self {
+    pub fn new(global_rpm: u64, _ip_rpm: u64, _user_rpm: u64) -> Self {
         // Convert to NonZeroU32, defaulting to 1 if 0 or too large
         let global_rpm_u32 = NonZeroU32::new(global_rpm.min(u32::MAX as u64) as u32).unwrap_or(NonZeroU32::new(1).unwrap());
         let global_quota = Quota::per_minute(global_rpm_u32);
@@ -309,7 +312,6 @@ impl RateLimiters {
 pub async fn build_state(
     api_config: ApiConfig,
     proxy_config: ProxyConfig,
-    mitm_handler: Option<Arc<MitmHandler>>,
     filter_engine: FilterEngine,
     userscript_manager: Arc<UserscriptManager>,
     userscript_runtime: Arc<UserscriptRuntime>,
@@ -338,10 +340,12 @@ pub async fn build_state(
     ));
 
     // Create proxy state
+    let mitm_enabled = proxy_config.mitm.enabled;
     let proxy_state = Arc::new(ProxyState {
         config: Arc::new(RwLock::new(proxy_config)),
         stats: Arc::new(ProxyStats::new()),
-        mitm_handler,
+        mitm_enabled,
+        mitm_cached_certs: Arc::new(AtomicU64::new(0)),
     });
 
     // Get a cloneable stats handle from the filter engine

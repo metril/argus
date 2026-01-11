@@ -5,7 +5,6 @@
 
 use crate::{Error, Result};
 use std::collections::HashMap;
-use tracing::debug;
 
 /// Represents a scriptlet injection rule
 #[derive(Debug, Clone)]

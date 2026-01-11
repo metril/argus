@@ -1,7 +1,6 @@
 //! TLS utilities and helpers
 
 use crate::{mitm::CertificateData, Error, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};

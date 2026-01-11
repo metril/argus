@@ -6,17 +6,18 @@ use crate::{gm_api::GmApi, Error, Result};
 use boa_gc::Gc;
 use boa_engine::{
     context::ContextBuilder, js_string, native_function::NativeFunction,
-    object::ObjectInitializer, property::Attribute, Context, JsResult, JsString, JsValue, Source,
+    object::ObjectInitializer, Context, JsResult, JsString, JsValue, Source,
 };
 use serde_json::Value;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 /// JavaScript executor for userscripts
 pub struct ScriptExecutor {
     /// Boa JavaScript context
     context: Context,
     /// GM API instance
+    #[allow(dead_code)] // Held to keep GmApi alive for context callbacks
     gm_api: Arc<GmApi>,
 }
 
@@ -153,7 +154,7 @@ impl ScriptExecutor {
 
                     // Create array using Vec<JsValue>
                     let mut arr_vec = Vec::new();
-                    for (i, value) in values.iter().enumerate() {
+                    for (_i, value) in values.iter().enumerate() {
                         arr_vec.push(JsValue::from(JsString::from(value.clone())));
                     }
 
@@ -306,7 +307,7 @@ impl ScriptExecutor {
         {
             let api = gc_api.clone();
             let get_resource_url = NativeFunction::from_copy_closure_with_captures(
-                move |_this, args, api, context| {
+                move |_this, args, api, _context| {
                     let name = args
                         .get(0)
                         .and_then(|v| v.as_string())
@@ -421,7 +422,7 @@ fn json_to_js_value(value: Value, context: &mut Context) -> JsResult<JsValue> {
         Value::String(s) => Ok(JsValue::from(JsString::from(s))),
         Value::Array(arr) => {
             let mut arr_vec = Vec::new();
-            for (i, item) in arr.into_iter().enumerate() {
+            for (_i, item) in arr.into_iter().enumerate() {
                 let js_item = json_to_js_value(item, context)?;
                 arr_vec.push(js_item);
             }

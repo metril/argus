@@ -53,3 +53,10 @@ base64 = "0.22"
 
 # Common utilities
 common = { path = "../common" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "filter_bench"
+harness = false

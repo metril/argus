@@ -3,10 +3,9 @@
 //! The pipeline provides a flexible framework for processing HTTP requests and responses
 //! through a series of stages. Each stage can inspect, modify, or block the request/response.
 
-use crate::{Error, Result};
+use crate::Result;
 use bytes::Bytes;
-use hyper::body::Incoming;
-use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
+use hyper::{HeaderMap, Method, Response, StatusCode, Uri, Version};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, info};

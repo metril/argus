@@ -10,6 +10,7 @@ license.workspace = true
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

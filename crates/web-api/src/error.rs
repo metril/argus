@@ -40,8 +40,8 @@ pub enum ApiError {
     #[error("Internal server error: {0}")]
     Internal(String),
 
-    #[error("Proxy error: {0}")]
-    Proxy(#[from] proxy_core::Error),
+    #[error("Configuration error: {0}")]
+    Config(#[from] common::ConfigError),
 
     #[error("Filter engine error: {0}")]
     FilterEngine(#[from] filter_engine::Error),
@@ -80,7 +80,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::CsrfValidationFailed => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::Internal(_)
-            | ApiError::Proxy(_)
+            | ApiError::Config(_)
             | ApiError::FilterEngine(_)
             | ApiError::Userscript(_)
             | ApiError::Io(_)

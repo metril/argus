@@ -3,8 +3,8 @@
 //! Provides common setup and utilities for integration tests.
 
 use axum::Router;
+use common::config::ProxyConfig;
 use filter_engine::FilterEngine;
-use proxy_core::config::ProxyConfig;
 use std::sync::Arc;
 use tempfile::TempDir;
 use userscript_engine::{UserscriptManager, UserscriptRuntime, UserscriptStorage};
@@ -61,7 +61,6 @@ impl TestContext {
         let state = build_state(
             api_config.clone(),
             proxy_config,
-            None,
             filter_engine,
             userscript_manager,
             userscript_runtime,

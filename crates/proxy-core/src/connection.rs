@@ -19,6 +19,7 @@ pub struct ConnectionHandler {
     client_addr: SocketAddr,
     mitm_handler: Option<Arc<MitmHandler>>,
     enable_http2: bool,
+    #[allow(dead_code)] // Reserved for future WebSocket support
     enable_websockets: bool,
 }
 
@@ -38,7 +39,7 @@ impl ConnectionHandler {
     }
 
     /// Handle an incoming connection
-    pub async fn handle(&self, mut stream: TcpStream) -> Result<()> {
+    pub async fn handle(&self, stream: TcpStream) -> Result<()> {
         debug!("Handling connection from {}", self.client_addr);
 
         // Peek at the first line to check if it's a CONNECT request
@@ -77,7 +78,7 @@ impl ConnectionHandler {
     }
 
     /// Handle a single HTTP request
-    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_request(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let method = req.method();
         let uri = req.uri().clone();
         let version = req.version();
@@ -316,7 +317,7 @@ impl ConnectionHandler {
     }
 
     /// Proxy a standard HTTP request (static method)
-    async fn proxy_request_static(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn proxy_request_static(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let uri = req.uri();
 
         // Extract host and port from the request

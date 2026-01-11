@@ -2,7 +2,7 @@
 
 use crate::{Error, Result};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, Issuer,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer,
     KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};

@@ -24,6 +24,7 @@ pub struct GmApi {
     grants: Vec<String>,
     /// Resource URLs (from @resource directives)
     #[unsafe_ignore_trace]
+    #[allow(dead_code)] // Reserved for @resource directive support
     resources: HashMap<String, String>,
 }
 
