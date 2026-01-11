@@ -5,10 +5,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      # Enable multi-arch builds when using buildx
-      platforms:
-        - linux/amd64
-        - linux/arm64
     image: adblocker-proxy:latest
     container_name: adblocker-proxy
     restart: unless-stopped
