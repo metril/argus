@@ -142,6 +142,7 @@ fn validate_username(username: &str) -> Result<(), validator::ValidationError> {
 pub struct LoginResponse {
     pub user: UserInfo,
     pub expires_in: u64,
+    pub message: String,
 }
 
 /// Safe user info (no sensitive data)

@@ -138,6 +138,7 @@ pub async fn register(
         Json(LoginResponse {
             user: UserInfo::from(&user),
             expires_in: tokens.access_expires_in,
+            message: "Registration successful".to_string(),
         }),
     ))
 }
@@ -223,6 +224,7 @@ pub async fn login(
         Json(LoginResponse {
             user: UserInfo::from(&user),
             expires_in: tokens.access_expires_in,
+            message: "Login successful".to_string(),
         }),
     ))
 }

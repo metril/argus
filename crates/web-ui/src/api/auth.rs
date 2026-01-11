@@ -55,6 +55,7 @@ pub struct UserInfo {
 pub struct LoginResponse {
     pub user: UserInfo,
     pub message: String,
+    pub expires_in: u64,
 }
 
 /// Register response
@@ -62,6 +63,7 @@ pub struct LoginResponse {
 pub struct RegisterResponse {
     pub user: UserInfo,
     pub message: String,
+    pub expires_in: u64,
 }
 
 /// Generic message response
