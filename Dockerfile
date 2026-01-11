@@ -23,8 +23,14 @@ RUN apk add --no-cache \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install cargo-chef for dependency caching
-RUN cargo install cargo-chef --locked
+# Download pre-built cargo-chef binary (much faster than compiling from source)
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) CHEF_ARCH="x86_64" ;; \
+      arm64) CHEF_ARCH="aarch64" ;; \
+      *) CHEF_ARCH="x86_64" ;; \
+    esac && \
+    curl -sSL "https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-${CHEF_ARCH}-unknown-linux-musl.tar.gz" | tar -xzf - -C /root/.cargo/bin
 
 WORKDIR /build
 
