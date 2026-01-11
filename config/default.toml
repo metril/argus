@@ -27,3 +27,14 @@ enabled = false
 data_dir = "data/filters"
 auto_update = true
 update_interval_hours = 24
+
+[webui]
+enabled = true
+host = "0.0.0.0"
+port = 3000
+jwt_secret_path = "data/jwt_secret"
+session_storage_path = "data/sessions"
+cors_origins = ["http://localhost:3000"]
+rate_limit_global_rpm = 10000
+rate_limit_ip_rpm = 100
+rate_limit_user_rpm = 1000

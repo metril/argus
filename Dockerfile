@@ -2,8 +2,8 @@
 # Supports multi-arch builds: amd64, arm64
 # Build with: docker buildx build --platform linux/amd64,linux/arm64 -t adblocker .
 
-# Build stage - native build for target architecture (no cross-compilation)
-FROM rust:1.85-alpine AS builder
+# Build stage - native build for target architecture
+FROM alpine:3.21 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -12,7 +12,14 @@ RUN apk add --no-cache \
     openssl-libs-static \
     pkgconfig \
     perl \
-    make
+    make \
+    curl \
+    libgcc \
+    gcc
+
+# Install Rust nightly via rustup (needed for tag_ptr 0.1.0 which requires Rust 1.88+)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Set working directory
 WORKDIR /build
@@ -32,7 +39,7 @@ COPY crates/web-ui ./crates/web-ui
 # Build in release mode with optimizations
 # Note: On Alpine with musl, static linking is the default
 # -C link-arg=-s strips symbols for smaller binary
-RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker
+RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker --features webui
 
 # Copy binary to known location and verify
 RUN cp /build/target/release/adblocker /build/adblocker && \

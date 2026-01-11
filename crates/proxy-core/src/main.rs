@@ -60,6 +60,8 @@ async fn start_webui_server(
     config: &ProxyConfig,
     config_path: String,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    use std::sync::Arc;
+    use tracing::warn;
     use filter_engine::FilterEngine;
     use userscript_engine::{UserscriptManager, UserscriptRuntime};
     use web_api::{build_state, start_server, ApiConfig};
@@ -133,6 +135,12 @@ async fn start_webui_server(
         session: web_api::config::SessionConfig {
             storage_path: config.webui.session_storage_path.clone(),
             cleanup_interval_seconds: 3600,
+        },
+        webui: web_api::config::WebUiConfig {
+            enabled: true,
+            dist_path: std::env::var("WEBUI_DIST_PATH")
+                .unwrap_or_else(|_| "webui".to_string())
+                .into(),
         },
     };
 
