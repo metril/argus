@@ -150,6 +150,10 @@ pub struct UserInfo {
     pub id: Uuid,
     pub username: String,
     pub role: UserRole,
+    #[schema(value_type = String)]
+    pub created_at: DateTime<Utc>,
+    #[schema(value_type = Option<String>)]
+    pub last_login: Option<DateTime<Utc>>,
 }
 
 impl From<&User> for UserInfo {
@@ -158,6 +162,8 @@ impl From<&User> for UserInfo {
             id: user.id,
             username: user.username.clone(),
             role: user.role,
+            created_at: user.created_at,
+            last_login: user.last_login,
         }
     }
 }
