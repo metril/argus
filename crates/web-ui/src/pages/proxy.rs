@@ -43,14 +43,14 @@ pub fn ProxyPage() -> impl IntoView {
 
                 match client.get_proxy_config().await {
                     Ok(response) => {
-                        let config = response.config;
-                        port.set(config.port.to_string());
-                        host.set(config.host);
-                        connection_timeout.set(config.connection_timeout_secs.to_string());
-                        request_timeout.set(config.request_timeout_secs.to_string());
-                        max_connections.set(config.max_connections.to_string());
-                        enable_mitm.set(config.enable_mitm);
-                        enable_http2.set(config.enable_http2);
+                        // Response is flat, access fields directly
+                        port.set(response.port.to_string());
+                        host.set(response.host);
+                        connection_timeout.set(response.connection_timeout_secs.to_string());
+                        request_timeout.set(response.request_timeout_secs.to_string());
+                        max_connections.set(response.max_connections.to_string());
+                        enable_mitm.set(response.enable_mitm);
+                        enable_http2.set(response.enable_http2);
                     }
                     Err(e) => {
                         app_state.error(format!("Failed to load config: {}", e));

@@ -17,10 +17,19 @@ pub struct ProxyConfig {
     pub enable_http2: bool,
 }
 
-/// Proxy configuration response
-#[derive(Debug, Deserialize)]
+/// Proxy configuration response (matches backend flat structure)
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfigResponse {
-    pub config: ProxyConfig,
+    pub host: String,
+    pub port: u16,
+    pub max_connections: u32,
+    pub enable_http2: bool,
+    pub enable_http3: bool,
+    pub enable_websockets: bool,
+    pub enable_mitm: bool,
+    pub connection_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+    pub enable_adblock: bool,
 }
 
 /// Proxy statistics

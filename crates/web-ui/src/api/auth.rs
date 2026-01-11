@@ -77,7 +77,8 @@ pub struct MessageResponse {
 pub struct SessionInfo {
     pub id: String,
     pub created_at: String,
-    pub last_used: String,
+    pub last_activity: String,
+    #[serde(default)]
     pub user_agent: Option<String>,
     pub ip_address: Option<String>,
 }
