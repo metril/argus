@@ -24,6 +24,9 @@ gloo-storage = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# UUID generation
+uuid = { version = "1", features = ["v4", "js"] }
+
 # Error handling
 thiserror = { workspace = true }
 

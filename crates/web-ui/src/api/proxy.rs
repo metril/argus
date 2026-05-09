@@ -32,21 +32,34 @@ pub struct ProxyConfigResponse {
     pub enable_adblock: bool,
 }
 
-/// Proxy statistics
+/// Connection statistics
 #[derive(Debug, Clone, Deserialize)]
-pub struct ProxyStats {
-    pub connections_total: u64,
-    pub connections_active: u64,
-    pub requests_total: u64,
-    pub bytes_received: u64,
-    pub bytes_sent: u64,
-    pub uptime_seconds: u64,
+pub struct ConnectionStats {
+    pub total: u64,
+    pub active: u64,
 }
 
-/// Proxy stats response
-#[derive(Debug, Deserialize)]
+/// Request statistics
+#[derive(Debug, Clone, Deserialize)]
+pub struct RequestStats {
+    pub total: u64,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+    pub errors: u64,
+}
+
+/// MITM statistics
+#[derive(Debug, Clone, Deserialize)]
+pub struct MitmStats {
+    pub cached_certificates: usize,
+}
+
+/// Proxy stats response (matches backend nested structure)
+#[derive(Debug, Clone, Deserialize)]
 pub struct ProxyStatsResponse {
-    pub stats: ProxyStats,
+    pub connections: ConnectionStats,
+    pub requests: RequestStats,
+    pub mitm: Option<MitmStats>,
 }
 
 impl ApiClient {

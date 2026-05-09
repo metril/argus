@@ -1,6 +1,7 @@
 //! Filter lists management page
 
 use leptos::prelude::*;
+use uuid::Uuid;
 use web_sys::HtmlInputElement;
 
 use crate::api::filters::FilterList;
@@ -22,7 +23,7 @@ pub fn FiltersPage() -> impl IntoView {
     let add_url = RwSignal::new(String::new());
 
     // Stats
-    let total_rules = RwSignal::new(0usize);
+    let total_requests = RwSignal::new(0u64);
     let requests_blocked = RwSignal::new(0u64);
 
     // Action signals
@@ -46,9 +47,9 @@ pub fn FiltersPage() -> impl IntoView {
                     }
                 }
 
-                if let Ok(response) = client.get_filter_stats().await {
-                    total_rules.set(response.stats.total_rules);
-                    requests_blocked.set(response.stats.requests_blocked);
+                if let Ok(stats) = client.get_filter_stats().await {
+                    total_requests.set(stats.total_requests);
+                    requests_blocked.set(stats.blocked_requests);
                 }
 
                 loading.set(false);
@@ -67,8 +68,9 @@ pub fn FiltersPage() -> impl IntoView {
 
                 wasm_bindgen_futures::spawn_local(async move {
                     let client = ApiClient::new();
+                    let filter_id = Uuid::new_v4().to_string();
 
-                    match client.add_filter_list(&name, &url, true).await {
+                    match client.add_filter_list(&filter_id, &name, &url, true).await {
                         Ok(filter) => {
                             filters.update(|f| f.push(filter));
                             app_state.success("Filter list added");
@@ -121,8 +123,8 @@ pub fn FiltersPage() -> impl IntoView {
 
             <div class="filters-stats">
                 <div class="stat-badge">
-                    <span class="stat-value">{total_rules}</span>
-                    <span class="stat-label">"Total Rules"</span>
+                    <span class="stat-value">{total_requests}</span>
+                    <span class="stat-label">"Requests Checked"</span>
                 </div>
                 <div class="stat-badge">
                     <span class="stat-value">{requests_blocked}</span>
@@ -146,7 +148,7 @@ pub fn FiltersPage() -> impl IntoView {
                                 )}>
                                     <div class="filter-info">
                                         <h3 class="filter-name">{filter.name.clone()}</h3>
-                                        <p class="filter-url">{filter.url.clone().unwrap_or_default()}</p>
+                                        <p class="filter-url">{filter.url.clone()}</p>
                                         <div class="filter-meta">
                                             <span class="filter-rules">{filter.rule_count}" rules"</span>
                                         </div>

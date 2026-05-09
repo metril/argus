@@ -58,12 +58,11 @@ pub fn ProxyPage() -> impl IntoView {
                 }
 
                 if let Ok(response) = client.get_proxy_stats().await {
-                    let stats = response.stats;
-                    connections_total.set(stats.connections_total);
-                    connections_active.set(stats.connections_active);
-                    requests_total.set(stats.requests_total);
-                    bytes_received.set(stats.bytes_received);
-                    bytes_sent.set(stats.bytes_sent);
+                    connections_total.set(response.connections.total);
+                    connections_active.set(response.connections.active);
+                    requests_total.set(response.requests.total);
+                    bytes_received.set(response.requests.bytes_received);
+                    bytes_sent.set(response.requests.bytes_sent);
                 }
 
                 loading.set(false);

@@ -137,6 +137,10 @@ impl ApiClient {
                     .await
                     .map_err(|e| ApiError::Parse(e.to_string()))
             }
+            400 => {
+                let text = response.text().await.unwrap_or_default();
+                Err(ApiError::Validation(text))
+            }
             401 => Err(ApiError::Unauthorized),
             403 => {
                 let text = response.text().await.unwrap_or_default();

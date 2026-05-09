@@ -66,9 +66,14 @@ impl AuthState {
                     }
                 }
             }
-            Err(e) => {
-                tracing::warn!("Session check failed: {}", e);
+            Err(ApiError::Forbidden(_)) => {
+                // Access denied - logout
                 self.user.set(None);
+            }
+            Err(e) => {
+                // Network/server/validation errors should NOT cause logout
+                // Keep user logged in, just log the warning
+                tracing::warn!("Session check failed (transient): {}", e);
             }
         }
 

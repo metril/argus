@@ -10,7 +10,7 @@ use super::client::{ApiClient, ApiError};
 pub struct FilterList {
     pub id: String,
     pub name: String,
-    pub url: Option<String>,
+    pub url: String,
     pub enabled: bool,
     pub rule_count: usize,
     pub last_updated: Option<String>,
@@ -19,6 +19,7 @@ pub struct FilterList {
 /// Request to add a filter list
 #[derive(Debug, Serialize)]
 pub struct AddFilterListRequest {
+    pub id: String,
     pub name: String,
     pub url: String,
     pub enabled: bool,
@@ -41,20 +42,16 @@ pub struct FilterListsResponse {
     pub limit: u32,
 }
 
-/// Filter blocking statistics
+/// Filter blocking statistics (matches backend BlockingStats)
 #[derive(Debug, Clone, Deserialize)]
 pub struct FilterStats {
-    pub total_rules: usize,
-    pub requests_checked: u64,
-    pub requests_blocked: u64,
-    pub requests_allowed: u64,
-    pub cosmetic_filters_applied: u64,
-}
-
-/// Filter stats response
-#[derive(Debug, Deserialize)]
-pub struct FilterStatsResponse {
-    pub stats: FilterStats,
+    pub total_requests: u64,
+    pub blocked_requests: u64,
+    pub allowed_requests: u64,
+    #[serde(default)]
+    pub blocked_by_type: std::collections::HashMap<String, u64>,
+    #[serde(default)]
+    pub top_blocked_domains: Vec<(String, u64)>,
 }
 
 impl ApiClient {
@@ -76,11 +73,13 @@ impl ApiClient {
     /// Add a new filter list
     pub async fn add_filter_list(
         &self,
+        id: &str,
         name: &str,
         url: &str,
         enabled: bool,
     ) -> Result<FilterList, ApiError> {
         let req = AddFilterListRequest {
+            id: id.to_string(),
             name: name.to_string(),
             url: url.to_string(),
             enabled,
@@ -103,7 +102,7 @@ impl ApiClient {
     }
 
     /// Get filter statistics
-    pub async fn get_filter_stats(&self) -> Result<FilterStatsResponse, ApiError> {
+    pub async fn get_filter_stats(&self) -> Result<FilterStats, ApiError> {
         self.get("/api/filters/stats").await
     }
 

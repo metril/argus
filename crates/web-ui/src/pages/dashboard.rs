@@ -12,7 +12,7 @@ pub fn DashboardPage() -> impl IntoView {
     // Stats signals
     let requests_blocked = RwSignal::new("--".to_string());
     let active_connections = RwSignal::new("--".to_string());
-    let filter_rules = RwSignal::new("--".to_string());
+    let requests_checked = RwSignal::new("--".to_string());
     let userscripts_installed = RwSignal::new("--".to_string());
     let uptime = RwSignal::new("--".to_string());
 
@@ -23,16 +23,15 @@ pub fn DashboardPage() -> impl IntoView {
 
             // Fetch proxy stats
             if let Ok(response) = client.get_proxy_stats().await {
-                let stats = response.stats;
-                active_connections.set(format_number(stats.connections_active));
-                uptime.set(format_uptime(stats.uptime_seconds));
+                active_connections.set(format_number(response.connections.active));
+                // Uptime not available from backend stats
+                uptime.set("N/A".to_string());
             }
 
             // Fetch filter stats
-            if let Ok(response) = client.get_filter_stats().await {
-                let stats = response.stats;
-                requests_blocked.set(format_number(stats.requests_blocked));
-                filter_rules.set(format_number(stats.total_rules as u64));
+            if let Ok(stats) = client.get_filter_stats().await {
+                requests_blocked.set(format_number(stats.blocked_requests));
+                requests_checked.set(format_number(stats.total_requests));
             }
 
             // Fetch userscript stats
@@ -66,9 +65,9 @@ pub fn DashboardPage() -> impl IntoView {
                 <div class="stat-card">
                     <div class="stat-card-header">
                         <span class="stat-icon">"F"</span>
-                        <span class="stat-title">"Filter Rules"</span>
+                        <span class="stat-title">"Requests Checked"</span>
                     </div>
-                    <div class="stat-value">{filter_rules}</div>
+                    <div class="stat-value">{requests_checked}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-card-header">
@@ -109,20 +108,5 @@ pub fn DashboardPage() -> impl IntoView {
                 </Card>
             </div>
         </Layout>
-    }
-}
-
-/// Format uptime seconds to human-readable string
-fn format_uptime(seconds: u64) -> String {
-    let days = seconds / 86400;
-    let hours = (seconds % 86400) / 3600;
-    let minutes = (seconds % 3600) / 60;
-
-    if days > 0 {
-        format!("{}d {}h {}m", days, hours, minutes)
-    } else if hours > 0 {
-        format!("{}h {}m", hours, minutes)
-    } else {
-        format!("{}m", minutes)
     }
 }
