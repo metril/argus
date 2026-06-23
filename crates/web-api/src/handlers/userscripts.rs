@@ -16,40 +16,30 @@ use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::info;
 
-/// Userscript response
-#[derive(Debug, Serialize)]
-pub struct UserscriptResponse {
-    pub id: String,
-    pub name: String,
-    pub namespace: Option<String>,
-    pub version: Option<String>,
-    pub description: Option<String>,
-    pub author: Option<String>,
-    pub enabled: bool,
-    pub execution_count: u64,
-    pub last_executed: Option<String>,
-    pub match_patterns: Vec<String>,
-}
+// Wire-facing DTOs live in the shared `api-types` crate.
+pub use api_types::{
+    InstallUserscriptRequest, PaginatedResponse, SetEnabledRequest, UpdateUserscriptRequest,
+    UserscriptResponse, UserscriptStatsResponse,
+};
 
-impl From<&userscript_engine::Userscript> for UserscriptResponse {
-    fn from(script: &userscript_engine::Userscript) -> Self {
-        Self {
-            id: script.id.clone(),
-            name: script.metadata.name.clone(),
-            namespace: script.metadata.namespace.clone(),
-            version: script.metadata.version.clone(),
-            description: script.metadata.description.clone(),
-            author: script.metadata.author.clone(),
-            enabled: script.enabled,
-            execution_count: script.execution_count,
-            last_executed: script.last_executed.map(|dt| dt.to_rfc3339()),
-            match_patterns: script.metadata.matches.clone(),
-        }
+/// Build a wire response from an engine userscript.
+fn userscript_response(script: &userscript_engine::Userscript) -> UserscriptResponse {
+    UserscriptResponse {
+        id: script.id.clone(),
+        name: script.metadata.name.clone(),
+        namespace: script.metadata.namespace.clone(),
+        version: script.metadata.version.clone(),
+        description: script.metadata.description.clone(),
+        author: script.metadata.author.clone(),
+        enabled: script.enabled,
+        execution_count: script.execution_count,
+        last_executed: script.last_executed.map(|dt| dt.to_rfc3339()),
+        match_patterns: script.metadata.matches.clone(),
     }
 }
 
@@ -59,42 +49,6 @@ pub struct ListUserscriptsQuery {
     pub enabled: Option<bool>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
-}
-
-/// Request to install a new userscript
-#[derive(Debug, Deserialize)]
-pub struct InstallUserscriptRequest {
-    pub source: String,
-}
-
-/// Request to update a userscript
-#[derive(Debug, Deserialize)]
-pub struct UpdateUserscriptRequest {
-    pub source: String,
-}
-
-/// Request to set enabled status
-#[derive(Debug, Deserialize)]
-pub struct SetEnabledRequest {
-    pub enabled: bool,
-}
-
-/// Paginated response wrapper
-#[derive(Debug, Serialize)]
-pub struct PaginatedResponse<T> {
-    pub data: Vec<T>,
-    pub total: usize,
-    pub page: u32,
-    pub limit: u32,
-}
-
-/// Statistics response
-#[derive(Debug, Serialize)]
-pub struct UserscriptStatsResponse {
-    pub total_scripts: usize,
-    pub enabled_scripts: usize,
-    pub disabled_scripts: usize,
-    pub total_executions: u64,
 }
 
 /// List all userscripts
@@ -111,7 +65,7 @@ pub async fn list_userscripts(
     let limit = query.limit.unwrap_or(50).min(100);
 
     // Convert to responses
-    let script_responses: Vec<UserscriptResponse> = scripts.iter().map(UserscriptResponse::from).collect();
+    let script_responses: Vec<UserscriptResponse> = scripts.iter().map(userscript_response).collect();
 
     // Filter by enabled status if specified
     let filtered: Vec<_> = if let Some(enabled) = query.enabled {
@@ -175,7 +129,7 @@ pub async fn install_userscript(
         script_id
     );
 
-    Ok(Json(UserscriptResponse::from(&script)))
+    Ok(Json(userscript_response(&script)))
 }
 
 /// Get a specific userscript
@@ -191,7 +145,7 @@ pub async fn get_userscript(
         .get(&id)
         .ok_or_else(|| ApiError::NotFound(format!("Userscript '{}' not found", id)))?;
 
-    Ok(Json(UserscriptResponse::from(&script)))
+    Ok(Json(userscript_response(&script)))
 }
 
 /// Get userscript source code
@@ -260,7 +214,7 @@ pub async fn update_userscript(
         id
     );
 
-    Ok(Json(UserscriptResponse::from(&script)))
+    Ok(Json(userscript_response(&script)))
 }
 
 /// Uninstall a userscript
@@ -331,7 +285,7 @@ pub async fn set_enabled(
         auth_user.username()
     );
 
-    Ok(Json(UserscriptResponse::from(&script)))
+    Ok(Json(userscript_response(&script)))
 }
 
 /// Get userscript statistics

@@ -24,6 +24,9 @@ gloo-storage = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Shared API DTOs (single source of truth with web-api; wasm-lean, no server feature)
+api-types = { workspace = true }
+
 # UUID generation
 uuid = { version = "1", features = ["v4", "js"] }
 

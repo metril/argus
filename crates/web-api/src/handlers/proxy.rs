@@ -11,123 +11,32 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{extract::State, Extension, Json};
 use common::config::ProxyConfig;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::info;
-use utoipa::ToSchema;
 use validator::Validate;
 
-/// Proxy configuration response (sanitized, without sensitive paths)
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ProxyConfigResponse {
-    /// Server host
-    pub host: String,
-    /// Server port
-    pub port: u16,
-    /// Maximum concurrent connections
-    pub max_connections: u32,
-    /// Enable HTTP/2
-    pub enable_http2: bool,
-    /// Enable HTTP/3
-    pub enable_http3: bool,
-    /// Enable WebSockets
-    pub enable_websockets: bool,
-    /// Enable MITM
-    pub enable_mitm: bool,
-    /// Connection timeout in seconds
-    pub connection_timeout_secs: u64,
-    /// Request timeout in seconds
-    pub request_timeout_secs: u64,
-    /// Enable adblock filtering
-    pub enable_adblock: bool,
-}
+// Wire-facing DTOs live in the shared `api-types` crate.
+pub use api_types::{
+    ConnectionStats, MitmStats, ProxyConfigResponse, ProxyStatsResponse, RequestStats,
+    UpdateProxyConfigRequest,
+};
 
-impl From<&ProxyConfig> for ProxyConfigResponse {
-    fn from(config: &ProxyConfig) -> Self {
-        Self {
-            host: config.proxy.host.clone(),
-            port: config.proxy.port,
-            max_connections: config.performance.max_connections as u32,
-            enable_http2: config.proxy.enable_http2,
-            enable_http3: config.proxy.enable_http3,
-            enable_websockets: config.proxy.enable_websockets,
-            enable_mitm: config.mitm.enabled,
-            connection_timeout_secs: config.performance.connection_timeout_secs,
-            request_timeout_secs: config.performance.request_timeout_secs,
-            enable_adblock: config.adblock.enabled,
-        }
+/// Build the sanitized config response (no sensitive paths) from the full config.
+fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
+    ProxyConfigResponse {
+        host: config.proxy.host.clone(),
+        port: config.proxy.port,
+        max_connections: config.performance.max_connections as u32,
+        enable_http2: config.proxy.enable_http2,
+        enable_http3: config.proxy.enable_http3,
+        enable_websockets: config.proxy.enable_websockets,
+        enable_mitm: config.mitm.enabled,
+        connection_timeout_secs: config.performance.connection_timeout_secs,
+        request_timeout_secs: config.performance.request_timeout_secs,
+        enable_adblock: config.adblock.enabled,
     }
-}
-
-/// Proxy configuration update request
-#[derive(Debug, Deserialize, Validate)]
-pub struct UpdateProxyConfigRequest {
-    /// Server host
-    #[validate(length(min = 1, max = 255))]
-    pub host: Option<String>,
-
-    /// Server port (1-65535)
-    #[validate(range(min = 1, max = 65535))]
-    pub port: Option<u16>,
-
-    /// Maximum concurrent connections (1-100000)
-    #[validate(range(min = 1, max = 100000))]
-    pub max_connections: Option<u32>,
-
-    /// Enable HTTP/2
-    pub enable_http2: Option<bool>,
-
-    /// Enable HTTP/3
-    pub enable_http3: Option<bool>,
-
-    /// Enable WebSockets
-    pub enable_websockets: Option<bool>,
-
-    /// Enable MITM
-    pub enable_mitm: Option<bool>,
-
-    /// Connection timeout in seconds (1-300)
-    #[validate(range(min = 1, max = 300))]
-    pub connection_timeout_secs: Option<u64>,
-
-    /// Request timeout in seconds (1-600)
-    #[validate(range(min = 1, max = 600))]
-    pub request_timeout_secs: Option<u64>,
-
-    /// Enable adblock filtering
-    pub enable_adblock: Option<bool>,
-}
-
-/// Proxy statistics response
-#[derive(Debug, Serialize)]
-pub struct ProxyStatsResponse {
-    /// Connection statistics
-    pub connections: ConnectionStats,
-    /// Request statistics
-    pub requests: RequestStats,
-    /// MITM statistics (if enabled)
-    pub mitm: Option<MitmStats>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ConnectionStats {
-    pub total: u64,
-    pub active: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RequestStats {
-    pub total: u64,
-    pub bytes_received: u64,
-    pub bytes_sent: u64,
-    pub errors: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MitmStats {
-    pub cached_certificates: usize,
 }
 
 /// Get proxy configuration
@@ -140,7 +49,7 @@ pub async fn get_config(
     Extension(_auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<ProxyConfigResponse>> {
     let config = state.proxy_state.config.read();
-    Ok(Json(ProxyConfigResponse::from(&*config)))
+    Ok(Json(proxy_config_response(&config)))
 }
 
 /// Update proxy configuration
@@ -212,7 +121,7 @@ pub async fn update_config(
         let config_str =
             toml::to_string_pretty(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
         let config_path = state.config_path.read().clone();
-        let response = ProxyConfigResponse::from(&*config);
+        let response = proxy_config_response(&config);
 
         (config_str, config_path, response)
     }; // config lock released here

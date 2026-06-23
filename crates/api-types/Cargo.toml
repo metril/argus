@@ -1,0 +1,20 @@
+[package]
+name = "api-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared serde DTOs for the web API contract (single source of truth for web-api and web-ui)"
+
+[dependencies]
+serde = { workspace = true }
+
+# Server-only: validation + OpenAPI schema derives. Gated behind `server` so the
+# wasm web-ui never pulls validator/utoipa into its bundle.
+validator = { workspace = true, optional = true }
+utoipa = { version = "5.3", optional = true }
+
+[features]
+default = []
+server = ["dep:validator", "dep:utoipa"]

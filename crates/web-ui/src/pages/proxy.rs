@@ -3,7 +3,7 @@
 use leptos::prelude::*;
 use web_sys::HtmlInputElement;
 
-use crate::api::proxy::ProxyConfig;
+use crate::api::proxy::UpdateProxyConfigRequest;
 use crate::api::ApiClient;
 use crate::components::{Card, Layout};
 use crate::state::use_app_state;
@@ -78,14 +78,18 @@ pub fn ProxyPage() -> impl IntoView {
                 saving.set(true);
                 let app_state = app_state.clone();
 
-                let config = ProxyConfig {
-                    port: port.get().parse().unwrap_or(8080),
-                    host: host.get(),
-                    connection_timeout_secs: connection_timeout.get().parse().unwrap_or(30),
-                    request_timeout_secs: request_timeout.get().parse().unwrap_or(60),
-                    max_connections: max_connections.get().parse().unwrap_or(1000),
-                    enable_mitm: enable_mitm.get(),
-                    enable_http2: enable_http2.get(),
+                let config = UpdateProxyConfigRequest {
+                    port: Some(port.get().parse().unwrap_or(8080)),
+                    host: Some(host.get()),
+                    connection_timeout_secs: Some(connection_timeout.get().parse().unwrap_or(30)),
+                    request_timeout_secs: Some(request_timeout.get().parse().unwrap_or(60)),
+                    max_connections: Some(max_connections.get().parse().unwrap_or(1000)),
+                    enable_mitm: Some(enable_mitm.get()),
+                    enable_http2: Some(enable_http2.get()),
+                    // Not exposed in this form; left unchanged on the server.
+                    enable_http3: None,
+                    enable_websockets: None,
+                    enable_adblock: None,
                 };
 
                 wasm_bindgen_futures::spawn_local(async move {

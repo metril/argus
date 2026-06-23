@@ -1,93 +1,12 @@
 //! Authentication API calls
 
-use serde::{Deserialize, Serialize};
-
 use super::client::{ApiClient, ApiError};
 
-/// Login request
-#[derive(Debug, Serialize)]
-pub struct LoginRequest {
-    pub username: String,
-    pub password: String,
-}
-
-/// Registration request
-#[derive(Debug, Serialize)]
-pub struct RegisterRequest {
-    pub username: String,
-    pub password: String,
-    pub password_confirm: String,
-}
-
-/// User role
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum UserRole {
-    Admin,
-    User,
-    Viewer,
-}
-
-impl UserRole {
-    /// Check if user can modify data
-    pub fn can_modify(&self) -> bool {
-        matches!(self, UserRole::Admin | UserRole::User)
-    }
-
-    /// Check if user is admin
-    pub fn is_admin(&self) -> bool {
-        matches!(self, UserRole::Admin)
-    }
-}
-
-/// User info returned from API
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct UserInfo {
-    pub id: String,
-    pub username: String,
-    pub role: UserRole,
-    pub created_at: String,
-    pub last_login: Option<String>,
-}
-
-/// Login response
-#[derive(Debug, Deserialize)]
-pub struct LoginResponse {
-    pub user: UserInfo,
-    pub message: String,
-    pub expires_in: u64,
-}
-
-/// Register response
-#[derive(Debug, Deserialize)]
-pub struct RegisterResponse {
-    pub user: UserInfo,
-    pub message: String,
-    pub expires_in: u64,
-}
-
-/// Generic message response
-#[derive(Debug, Deserialize)]
-pub struct MessageResponse {
-    pub message: String,
-}
-
-/// Session info
-#[derive(Debug, Clone, Deserialize)]
-pub struct SessionInfo {
-    pub id: String,
-    pub created_at: String,
-    pub last_activity: String,
-    #[serde(default)]
-    pub user_agent: Option<String>,
-    pub ip_address: Option<String>,
-}
-
-/// Sessions list response
-#[derive(Debug, Deserialize)]
-pub struct SessionsResponse {
-    pub sessions: Vec<SessionInfo>,
-}
+// Wire DTOs come from the shared `api-types` crate (single source of truth).
+pub use api_types::{
+    LoginRequest, LoginResponse, MessageResponse, RegisterRequest, RegisterResponse, SessionInfo,
+    SessionsResponse, UserInfo, UserRole,
+};
 
 impl ApiClient {
     /// Register a new user

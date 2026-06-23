@@ -1,66 +1,22 @@
 //! Userscript management API calls
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::auth::MessageResponse;
 use super::client::{ApiClient, ApiError};
 
-/// Userscript info
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Userscript {
-    pub id: String,
-    pub name: String,
-    pub namespace: Option<String>,
-    pub version: Option<String>,
-    pub description: Option<String>,
-    pub author: Option<String>,
-    pub enabled: bool,
-    pub execution_count: u64,
-    pub last_executed: Option<String>,
-    pub match_patterns: Vec<String>,
-}
+// Wire DTOs come from the shared `api-types` crate (single source of truth).
+// Aliases preserve the names the UI pages already use.
+pub use api_types::{InstallUserscriptRequest, SetEnabledRequest, UpdateUserscriptRequest};
+pub use api_types::UserscriptResponse as Userscript;
+pub use api_types::UserscriptStatsResponse as UserscriptStats;
+pub type UserscriptsResponse = api_types::PaginatedResponse<Userscript>;
 
-/// Request to install a userscript
-#[derive(Debug, Serialize)]
-pub struct InstallUserscriptRequest {
-    pub source: String,
-}
-
-/// Request to update a userscript
-#[derive(Debug, Serialize)]
-pub struct UpdateUserscriptRequest {
-    pub source: String,
-}
-
-/// Request to set enabled status
-#[derive(Debug, Serialize)]
-pub struct SetEnabledRequest {
-    pub enabled: bool,
-}
-
-/// Paginated userscript response
-#[derive(Debug, Deserialize)]
-pub struct UserscriptsResponse {
-    pub data: Vec<Userscript>,
-    pub total: usize,
-    pub page: u32,
-    pub limit: u32,
-}
-
-/// Userscript source response
+/// Userscript source response (server returns an ad-hoc `{id, source}` object)
 #[derive(Debug, Deserialize)]
 pub struct UserscriptSourceResponse {
     pub id: String,
     pub source: String,
-}
-
-/// Userscript statistics
-#[derive(Debug, Clone, Deserialize)]
-pub struct UserscriptStats {
-    pub total_scripts: usize,
-    pub enabled_scripts: usize,
-    pub disabled_scripts: usize,
-    pub total_executions: u64,
 }
 
 impl ApiClient {

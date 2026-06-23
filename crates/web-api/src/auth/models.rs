@@ -1,42 +1,16 @@
 //! Authentication models
 //!
-//! Defines user structures, claims, and request/response types.
+//! Server-side user/token structures. The wire-facing request/response DTOs
+//! (`UserRole`, `UserInfo`, `LoginRequest`, `RegisterRequest`, `LoginResponse`)
+//! live in the shared `api-types` crate and are re-exported here so existing
+//! paths (`crate::auth::models::UserInfo`, …) keep working.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
 
-/// User role for authorization
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum UserRole {
-    /// Full administrative access
-    Admin,
-    /// Read/write access to configurations
-    User,
-    /// Read-only access (dashboard viewing)
-    Viewer,
-}
-
-impl Default for UserRole {
-    fn default() -> Self {
-        Self::Viewer
-    }
-}
-
-impl UserRole {
-    /// Check if role has admin privileges
-    pub fn is_admin(&self) -> bool {
-        matches!(self, Self::Admin)
-    }
-
-    /// Check if role can modify settings
-    pub fn can_modify(&self) -> bool {
-        matches!(self, Self::Admin | Self::User)
-    }
-}
+pub use api_types::{LoginRequest, LoginResponse, RegisterRequest, UserInfo, UserRole};
 
 /// User account (stored in database)
 /// Note: password_hash is serialized for database storage but should never be
@@ -102,69 +76,15 @@ pub enum TokenType {
     Refresh,
 }
 
-/// Login request payload
-#[derive(Debug, Deserialize, Validate, ToSchema)]
-pub struct LoginRequest {
-    #[validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))]
-    pub username: String,
-
-    #[validate(length(min = 8, max = 128, message = "Password must be 8-128 characters"))]
-    pub password: String,
-}
-
-/// Register request payload
-#[derive(Debug, Deserialize, Validate, ToSchema)]
-pub struct RegisterRequest {
-    #[validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))]
-    #[validate(custom(function = "validate_username"))]
-    pub username: String,
-
-    #[validate(length(min = 8, max = 128, message = "Password must be 8-128 characters"))]
-    pub password: String,
-
-    #[validate(must_match(other = "password", message = "Passwords must match"))]
-    pub password_confirm: String,
-}
-
-/// Validate username: must be alphanumeric with underscores only
-fn validate_username(username: &str) -> Result<(), validator::ValidationError> {
-    if username.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        Ok(())
-    } else {
-        let mut err = validator::ValidationError::new("invalid_username");
-        err.message = Some("Username must be alphanumeric with underscores only".into());
-        Err(err)
-    }
-}
-
-/// Login response with tokens
-#[derive(Debug, Serialize, ToSchema)]
-pub struct LoginResponse {
-    pub user: UserInfo,
-    pub expires_in: u64,
-    pub message: String,
-}
-
-/// Safe user info (no sensitive data)
-#[derive(Debug, Serialize, ToSchema)]
-pub struct UserInfo {
-    pub id: Uuid,
-    pub username: String,
-    pub role: UserRole,
-    #[schema(value_type = String)]
-    pub created_at: DateTime<Utc>,
-    #[schema(value_type = Option<String>)]
-    pub last_login: Option<DateTime<Utc>>,
-}
-
+/// Build the safe, wire-facing `UserInfo` from an internal `User`.
 impl From<&User> for UserInfo {
     fn from(user: &User) -> Self {
         Self {
-            id: user.id,
+            id: user.id.to_string(),
             username: user.username.clone(),
             role: user.role,
-            created_at: user.created_at,
-            last_login: user.last_login,
+            created_at: user.created_at.to_rfc3339(),
+            last_login: user.last_login.map(|t| t.to_rfc3339()),
         }
     }
 }

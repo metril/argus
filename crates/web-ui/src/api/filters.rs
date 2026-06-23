@@ -1,48 +1,17 @@
 //! Filter list management API calls
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::auth::MessageResponse;
 use super::client::{ApiClient, ApiError};
 
-/// Filter list info
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct FilterList {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-    pub enabled: bool,
-    pub rule_count: usize,
-    pub last_updated: Option<String>,
-}
+// Wire DTOs come from the shared `api-types` crate (single source of truth).
+// Aliases preserve the names the UI pages already use.
+pub use api_types::{AddFilterListRequest, UpdateFilterListRequest};
+pub use api_types::FilterListResponse as FilterList;
+pub type FilterListsResponse = api_types::PaginatedResponse<FilterList>;
 
-/// Request to add a filter list
-#[derive(Debug, Serialize)]
-pub struct AddFilterListRequest {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-    pub enabled: bool,
-}
-
-/// Request to update a filter list
-#[derive(Debug, Serialize)]
-pub struct UpdateFilterListRequest {
-    pub name: Option<String>,
-    pub url: Option<String>,
-    pub enabled: Option<bool>,
-}
-
-/// Paginated filter list response
-#[derive(Debug, Deserialize)]
-pub struct FilterListsResponse {
-    pub data: Vec<FilterList>,
-    pub total: usize,
-    pub page: u32,
-    pub limit: u32,
-}
-
-/// Filter blocking statistics (matches backend BlockingStats)
+/// Filter blocking statistics (mirrors filter_engine::BlockingStats, server-only)
 #[derive(Debug, Clone, Deserialize)]
 pub struct FilterStats {
     pub total_requests: u64,
@@ -82,7 +51,7 @@ impl ApiClient {
             id: id.to_string(),
             name: name.to_string(),
             url: url.to_string(),
-            enabled,
+            enabled: Some(enabled),
         };
         self.post("/api/filters/lists", &req).await
     }

@@ -16,33 +16,26 @@ use axum::{
     Extension, Json,
 };
 use filter_engine::BlockingStats;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::info;
 use validator::Validate;
 
-/// Filter list response
-#[derive(Debug, Serialize)]
-pub struct FilterListResponse {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-    pub enabled: bool,
-    pub last_updated: Option<String>,
-    pub rule_count: usize,
-}
+// Wire-facing DTOs live in the shared `api-types` crate.
+pub use api_types::{
+    AddFilterListRequest, FilterListResponse, PaginatedResponse, UpdateFilterListRequest,
+};
 
-impl From<&filter_engine::FilterList> for FilterListResponse {
-    fn from(list: &filter_engine::FilterList) -> Self {
-        Self {
-            id: list.id.clone(),
-            name: list.name.clone(),
-            url: list.url.clone(),
-            enabled: list.enabled,
-            last_updated: list.last_updated.map(|dt| dt.to_rfc3339()),
-            rule_count: list.rule_count,
-        }
+/// Build a wire response from an engine filter list.
+fn filter_list_response(list: &filter_engine::FilterList) -> FilterListResponse {
+    FilterListResponse {
+        id: list.id.clone(),
+        name: list.name.clone(),
+        url: list.url.clone(),
+        enabled: list.enabled,
+        last_updated: list.last_updated.map(|dt| dt.to_rfc3339()),
+        rule_count: list.rule_count,
     }
 }
 
@@ -52,44 +45,6 @@ pub struct ListFiltersQuery {
     pub enabled: Option<bool>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
-}
-
-/// Request to add a new filter list
-#[derive(Debug, Deserialize, Validate)]
-pub struct AddFilterListRequest {
-    #[validate(length(min = 1, max = 100))]
-    pub id: String,
-
-    #[validate(length(min = 1, max = 200))]
-    pub name: String,
-
-    #[validate(url(message = "Invalid URL"))]
-    #[validate(length(max = 2000))]
-    pub url: String,
-
-    pub enabled: Option<bool>,
-}
-
-/// Request to update a filter list
-#[derive(Debug, Deserialize, Validate)]
-pub struct UpdateFilterListRequest {
-    #[validate(length(min = 1, max = 200))]
-    pub name: Option<String>,
-
-    #[validate(url(message = "Invalid URL"))]
-    #[validate(length(max = 2000))]
-    pub url: Option<String>,
-
-    pub enabled: Option<bool>,
-}
-
-/// Paginated response wrapper
-#[derive(Debug, Serialize)]
-pub struct PaginatedResponse<T> {
-    pub data: Vec<T>,
-    pub total: usize,
-    pub page: u32,
-    pub limit: u32,
 }
 
 /// List all filter lists
@@ -157,7 +112,7 @@ pub async fn add_filter_list(
 
     info!("Filter list added by {}: {} ({})", auth_user.username(), req.name, req.id);
 
-    Ok(Json(FilterListResponse::from(&list)))
+    Ok(Json(filter_list_response(&list)))
 }
 
 /// Get a specific filter list

@@ -8,6 +8,7 @@ members = [
     "crates/web-api",
     "crates/web-ui",
     "crates/common",
+    "crates/api-types",
 ]
 
 [workspace.package]
@@ -117,6 +118,9 @@ publicsuffix = "2.0"
 
 # Input validation
 validator = { version = "0.19", features = ["derive"] }
+
+# Shared API DTOs (single source of truth for web-api + web-ui)
+api-types = { path = "crates/api-types" }
 
 # Concurrency
 dashmap = "6.1"
