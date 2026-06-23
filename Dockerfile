@@ -85,7 +85,8 @@ RUN trunk build --release
 # Stage 5: Runtime
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates libgcc
+# Pull the latest security patches for base packages, then add runtime deps.
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates libgcc
 
 # Create non-root user
 RUN adduser -D -u 1000 -h /app adblocker

@@ -13,13 +13,16 @@ services:
       - "8443:8443"   # HTTPS proxy
       - "3000:3000"   # Web API + WebUI
     volumes:
-      # Persist generated certificates
-      - ./certs:/app/certs
+      # Named volumes (not host bind mounts) so Docker initializes them with the
+      # image's adblocker:adblocker (UID 1000) ownership — required for the
+      # non-root, read-only-rootfs container to write. The CA certificate is
+      # downloadable from the Web UI, so host access to ./certs isn't needed.
+      - certs:/app/certs
       # Persist filter lists and userscripts
-      - ./data:/app/data
+      - data:/app/data
       # Persist logs
-      - ./logs:/app/logs
-      # Custom configuration
+      - logs:/app/logs
+      # Custom configuration (read-only host bind mount; no writes/ownership concern)
       - ./config:/app/config:ro
     environment:
       - RUST_LOG=info
@@ -27,6 +30,16 @@ services:
       - WEBUI_DIST_PATH=/app/webui
     networks:
       - adblocker-net
+    # Security hardening: drop all capabilities, forbid privilege escalation,
+    # and run with a read-only root filesystem (writes go to the mounted
+    # volumes below; transient scratch goes to a tmpfs).
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     # Resource limits
     deploy:
       resources:
@@ -40,3 +53,8 @@ services:
 networks:
   adblocker-net:
     driver: bridge
+
+volumes:
+  certs:
+  data:
+  logs:
