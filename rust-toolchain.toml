@@ -1,0 +1,7 @@
+# Pinned stable toolchain (was previously nightly in the Dockerfile - no nightly
+# features are used anywhere in the workspace). Keep RUST_VERSION in Dockerfile in sync.
+[toolchain]
+channel = "1.92"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

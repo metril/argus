@@ -78,7 +78,7 @@ impl ConnectionHandler {
     }
 
     /// Handle a single HTTP request
-    async fn handle_request(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let method = req.method();
         let uri = req.uri().clone();
         let version = req.version();
@@ -109,7 +109,6 @@ impl ConnectionHandler {
                 };
 
                 // Spawn WebSocket proxy task with hyper upgrade
-                let enable_ws = self.enable_websockets;
                 tokio::spawn(async move {
                     match hyper::upgrade::on(&mut req).await {
                         Ok(upgraded) => {

@@ -1,30 +1,36 @@
 # Multi-stage Dockerfile for Adblocker MITM Proxy
-# Supports multi-arch builds: amd64, arm64
-# Build with: docker buildx build --platform linux/amd64,linux/arm64 -t adblocker .
+# Multi-arch: linux/amd64, linux/arm64
+# Build:  docker build -t adblocker .
+#         docker buildx build --platform linux/amd64,linux/arm64 -t adblocker .
 #
-# Uses cargo-chef for dependency caching - incremental builds are ~10x faster
+# Uses cargo-chef for dependency caching - incremental builds are ~10x faster.
+# Pure-rustls (no OpenSSL): the build is fully static musl with no system TLS libs.
 
-# Stage 1: Chef base - install Rust and cargo-chef
-FROM alpine:3.21 AS chef
+# Pinned toolchain version - keep in sync with rust-toolchain.toml
+ARG RUST_VERSION=1.92
+ARG CARGO_CHEF_VERSION=0.1.77
+ARG TRUNK_VERSION=0.21.14
 
-# Install build dependencies
-RUN apk add --no-cache \
-    musl-dev \
-    openssl-dev \
-    openssl-libs-static \
-    pkgconfig \
-    perl \
-    make \
-    curl \
-    libgcc \
-    gcc
+# Stage 1: Chef base - stable Rust on musl + cargo-chef
+FROM rust:${RUST_VERSION}-alpine3.21 AS chef
 
-# Install Rust nightly via rustup (needed for tag_ptr 0.1.0 which requires Rust 1.88+)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
-ENV PATH="/root/.cargo/bin:${PATH}"
+# Build dependencies (ring needs a C toolchain + perl/make; xz unpacks cargo-chef)
+RUN apk add --no-cache musl-dev gcc make perl pkgconfig curl xz
 
-# Download pre-built cargo-chef binary (x86_64 only - much faster than compiling)
-RUN curl -sSL "https://github.com/LukeMathWalker/cargo-chef/releases/latest/download/cargo-chef-x86_64-unknown-linux-musl.tar.gz" | tar -xzf - -C /root/.cargo/bin
+# Download the pre-built cargo-chef binary (arch-aware, pinned - much faster than compiling)
+ARG CARGO_CHEF_VERSION
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) CHEF_ARCH=x86_64 ;; \
+      arm64) CHEF_ARCH=aarch64 ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    mkdir -p /tmp/chef && \
+    curl -fsSL "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-${CHEF_ARCH}-unknown-linux-musl.tar.xz" \
+      | tar -xJf - -C /tmp/chef --strip-components=1 && \
+    mv /tmp/chef/cargo-chef "$CARGO_HOME/bin/cargo-chef" && \
+    chmod +x "$CARGO_HOME/bin/cargo-chef" && \
+    rm -rf /tmp/chef
 
 WORKDIR /build
 
@@ -37,30 +43,34 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Builder - build dependencies (cached) then source
 FROM chef AS builder
 
-# Copy recipe and build dependencies only (this layer is cached!)
+# Build dependencies only (this layer is cached until Cargo.toml/lock change)
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json --features webui
 
-# Now copy source and build (only your code compiles, deps are cached)
+# Now copy source and build (only our code compiles; deps are cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker --features webui
 
-# Copy binary to known location and verify
+# Copy binary to a known location and verify
 RUN cp /build/target/release/adblocker /build/adblocker && \
     ls -lh /build/adblocker
 
-# Stage 4: WebUI build (WASM is architecture-independent, use x86_64 for speed)
-FROM --platform=$BUILDPLATFORM node:20-alpine AS webui-builder
+# Stage 4: WebUI build (WASM is architecture-independent -> always built on the
+# build host's platform via $BUILDPLATFORM for speed)
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-alpine3.21 AS webui-builder
 
-# Install build dependencies and trunk
-RUN apk add --no-cache curl musl-dev gcc && \
-    curl -sSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz | tar -xzf - -C /usr/local/bin
-
-# Install Rust for WASM compilation
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN rustup target add wasm32-unknown-unknown
+ARG TRUNK_VERSION
+ARG BUILDARCH
+RUN apk add --no-cache musl-dev gcc curl && \
+    case "$BUILDARCH" in \
+      amd64) TRUNK_ARCH=x86_64 ;; \
+      arm64) TRUNK_ARCH=aarch64 ;; \
+      *) echo "unsupported BUILDARCH: $BUILDARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${TRUNK_ARCH}-unknown-linux-musl.tar.gz" \
+      | tar -xzf - -C /usr/local/bin && \
+    rustup target add wasm32-unknown-unknown
 
 WORKDIR /build
 
@@ -68,28 +78,22 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build WebUI (wasm-opt disabled via index.html to avoid compatibility issues)
+# Build WebUI (wasm-opt disabled via index.html data-wasm-opt="0")
 WORKDIR /build/crates/web-ui
 RUN trunk build --release
 
 # Stage 5: Runtime
 FROM alpine:3.21
 
-# Install runtime dependencies
-RUN apk add --no-cache \
-    ca-certificates \
-    libgcc
+RUN apk add --no-cache ca-certificates libgcc
 
 # Create non-root user
 RUN adduser -D -u 1000 -h /app adblocker
 
-# Set working directory
 WORKDIR /app
 
-# Copy binary from builder
+# Copy binary and WebUI dist
 COPY --from=builder /build/adblocker /app/adblocker
-
-# Copy WebUI dist from webui-builder
 COPY --from=webui-builder /build/crates/web-ui/dist /app/webui
 
 # Copy default configuration
@@ -99,13 +103,11 @@ COPY config/default.toml /app/config/default.toml
 RUN mkdir -p /app/certs /app/data /app/logs && \
     chown -R adblocker:adblocker /app
 
-# Switch to non-root user
 USER adblocker
 
-# Expose ports: 8080 (proxy), 8443 (HTTPS proxy), 3000 (Web API)
+# Expose ports: 8080 (proxy), 8443 (HTTPS proxy), 3000 (Web API + WebUI)
 EXPOSE 8080 8443 3000
 
-# Set environment variables
 ENV RUST_LOG=info
 ENV CONFIG_PATH=/app/config/default.toml
 ENV WEBUI_DIST_PATH=/app/webui
@@ -114,5 +116,4 @@ ENV WEBUI_DIST_PATH=/app/webui
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD nc -z localhost 8080 && nc -z localhost 3000 || exit 1
 
-# Run the proxy
 ENTRYPOINT ["/app/adblocker"]
