@@ -2,7 +2,7 @@
 
 use leptos::prelude::*;
 use uuid::Uuid;
-use web_sys::HtmlInputElement;
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 
 use crate::api::filters::FilterList;
 use crate::api::ApiClient;
@@ -25,6 +25,11 @@ pub fn FiltersPage() -> impl IntoView {
     // Stats
     let total_requests = RwSignal::new(0u64);
     let requests_blocked = RwSignal::new(0u64);
+
+    // Custom rules editor
+    let custom_rules = RwSignal::new(String::new());
+    let saving_rules = RwSignal::new(false);
+    let do_save_rules = RwSignal::new(false);
 
     // Action signals
     let do_add = RwSignal::new(false);
@@ -50,6 +55,10 @@ pub fn FiltersPage() -> impl IntoView {
                 if let Ok(stats) = client.get_filter_stats().await {
                     total_requests.set(stats.total_requests);
                     requests_blocked.set(stats.blocked_requests);
+                }
+
+                if let Ok(resp) = client.get_custom_rules().await {
+                    custom_rules.set(resp.rules);
                 }
 
                 loading.set(false);
@@ -83,6 +92,27 @@ pub fn FiltersPage() -> impl IntoView {
                         }
                     }
                     do_add.set(false);
+                });
+            }
+        });
+    }
+
+    // Save custom rules effect
+    {
+        let app_state = app_state.clone();
+        Effect::new(move || {
+            if do_save_rules.get() {
+                saving_rules.set(true);
+                let app_state = app_state.clone();
+                let rules = custom_rules.get();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let client = ApiClient::new();
+                    match client.update_custom_rules(&rules).await {
+                        Ok(_) => app_state.success("Custom rules saved"),
+                        Err(e) => app_state.error(format!("Failed to save rules: {}", e)),
+                    }
+                    saving_rules.set(false);
+                    do_save_rules.set(false);
                 });
             }
         });
@@ -172,6 +202,35 @@ pub fn FiltersPage() -> impl IntoView {
                         </div>
                     </Show>
                 </Show>
+            </Card>
+
+            <Card title="Custom Rules" class="filters-card">
+                <p class="form-help">
+                    "One rule per line in Adblock Plus / uBlock syntax. Use "
+                    <code>"||ads.example^"</code>" to block, "<code>"@@||good.example^"</code>
+                    " to allow (exceptions win over blocklists), or "<code>"example.com##.banner"</code>
+                    " to hide elements. Changes apply after saving."
+                </p>
+                <textarea
+                    class="form-input"
+                    rows="8"
+                    style="font-family: monospace; width: 100%;"
+                    placeholder="||ads.example^&#10;@@||good.example^&#10;example.com##.sponsored"
+                    prop:value=move || custom_rules.get()
+                    on:input=move |ev| {
+                        let target = event_target::<HtmlTextAreaElement>(&ev);
+                        custom_rules.set(target.value());
+                    }
+                ></textarea>
+                <div class="modal-actions">
+                    <button
+                        class="btn btn-primary"
+                        disabled=move || saving_rules.get()
+                        on:click=move |_| do_save_rules.set(true)
+                    >
+                        {move || if saving_rules.get() { "Saving..." } else { "Save Rules" }}
+                    </button>
+                </div>
             </Card>
 
             <Modal

@@ -4,6 +4,7 @@ use crate::{
     ca::CertificateAuthority,
     config::ProxyConfig,
     connection::ConnectionHandler,
+    filtering::ProxyContext,
     load_manager::{AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig},
     mitm::MitmHandler,
     Error, Result,
@@ -18,11 +19,13 @@ pub struct ProxyServer {
     config: ProxyConfig,
     mitm_handler: Option<Arc<MitmHandler>>,
     load_manager: Arc<LoadManager>,
+    /// Shared filtering + upstream-forwarding context handed to each connection.
+    ctx: Arc<ProxyContext>,
 }
 
 impl ProxyServer {
-    /// Create a new proxy server with the given configuration
-    pub fn new(config: ProxyConfig) -> Result<Self> {
+    /// Create a new proxy server with the given configuration and filtering context.
+    pub fn new(config: ProxyConfig, ctx: Arc<ProxyContext>) -> Result<Self> {
         // Initialize MITM handler if enabled
         let mitm_handler = if config.mitm.enabled {
             info!("Initializing MITM support");
@@ -66,12 +69,17 @@ impl ProxyServer {
             config,
             mitm_handler,
             load_manager,
+            ctx,
         })
     }
 
     /// Create a new proxy server with custom load manager configuration
-    pub fn with_load_manager(config: ProxyConfig, load_manager_config: LoadManagerConfig) -> Result<Self> {
-        let mut server = Self::new(config)?;
+    pub fn with_load_manager(
+        config: ProxyConfig,
+        load_manager_config: LoadManagerConfig,
+        ctx: Arc<ProxyContext>,
+    ) -> Result<Self> {
+        let mut server = Self::new(config, ctx)?;
         server.load_manager = Arc::new(LoadManager::new(load_manager_config));
         Ok(server)
     }
@@ -154,13 +162,14 @@ impl ProxyServer {
                             let enable_websockets = self.config.proxy.enable_websockets;
                             let mut shutdown_rx = shutdown_tx.subscribe();
                             let load_manager = self.load_manager.clone();
+                            let ctx = self.ctx.clone();
 
                             // Spawn a new task to handle this connection
                             tokio::spawn(async move {
                                 // Create connection guard for automatic cleanup
                                 let _guard = ConnectionGuard::new(load_manager);
 
-                                let handler = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets);
+                                let handler = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets, ctx);
                                 tokio::select! {
                                     result = handler.handle(stream) => {
                                         if let Err(e) = result {
@@ -218,7 +227,7 @@ impl ProxyServer {
     /// Start HTTP/3 server (optional feature)
     #[cfg(feature = "http3")]
     async fn start_http3_server(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
-        use proxy_http3::{Http3Server, QuicConfig};
+        use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
 
         // HTTP/3 requires MITM to be enabled for certificate generation
         let mitm_handler = self.mitm_handler.as_ref()
@@ -260,8 +269,13 @@ impl ProxyServer {
 
         info!("HTTP/3 server will start on UDP {}", udp_addr);
 
-        // Spawn HTTP/3 server in background
-        let http3_server = Http3Server::new(endpoint);
+        // Spawn HTTP/3 server in background, sharing the same filtering engine + upstream client.
+        let h3_filter = Arc::new(Http3Filter::new(
+            self.ctx.engine().clone(),
+            self.ctx.client(),
+            self.ctx.adblock_enabled(),
+        ));
+        let http3_server = Http3Server::new(endpoint, h3_filter);
         tokio::spawn(async move {
             if let Err(e) = http3_server.start(shutdown_rx).await {
                 warn!("HTTP/3 server error: {}", e);

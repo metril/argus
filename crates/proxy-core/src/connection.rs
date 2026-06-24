@@ -1,8 +1,9 @@
 //! Connection handling and management
 
+use crate::filtering::ProxyContext;
+use crate::inject::{full_body, ProxyBody};
 use crate::{mitm::MitmHandler, tls, Error, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -21,6 +22,8 @@ pub struct ConnectionHandler {
     enable_http2: bool,
     #[allow(dead_code)] // Reserved for future WebSocket support
     enable_websockets: bool,
+    /// Shared filtering + upstream-forwarding context (engine handle + pooled HTTP client).
+    ctx: Arc<ProxyContext>,
 }
 
 impl ConnectionHandler {
@@ -29,12 +32,14 @@ impl ConnectionHandler {
         mitm_handler: Option<Arc<MitmHandler>>,
         enable_http2: bool,
         enable_websockets: bool,
+        ctx: Arc<ProxyContext>,
     ) -> Self {
         Self {
             client_addr,
             mitm_handler,
             enable_http2,
             enable_websockets,
+            ctx,
         }
     }
 
@@ -78,7 +83,7 @@ impl ConnectionHandler {
     }
 
     /// Handle a single HTTP request
-    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<ProxyBody>> {
         let method = req.method();
         let uri = req.uri().clone();
         let version = req.version();
@@ -103,10 +108,30 @@ impl ConnectionHandler {
                         error!("Failed to extract WebSocket target: {}", e);
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
-                            .body(Full::new(Bytes::from("Invalid WebSocket target")))
+                            .body(full_body(Bytes::from_static(b"Invalid WebSocket target")))
                             .unwrap());
                     }
                 };
+
+                // Filter the WebSocket target. adblock matches http(s) URLs, so normalize the
+                // scheme; `$websocket` rules still match on host/path.
+                let check_url = target_url
+                    .replacen("wss://", "https://", 1)
+                    .replacen("ws://", "http://", 1);
+                let origin = req
+                    .headers()
+                    .get(hyper::header::ORIGIN)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or(&check_url)
+                    .to_string();
+                if self.ctx.should_block(&check_url, &origin, "websocket") {
+                    info!("Blocked WebSocket to {}", target_url);
+                    return Ok(Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("x-adblock", "blocked")
+                        .body(full_body(Bytes::from_static(b"Blocked")))
+                        .unwrap());
+                }
 
                 // Spawn WebSocket proxy task with hyper upgrade
                 tokio::spawn(async move {
@@ -126,7 +151,7 @@ impl ConnectionHandler {
                     .status(StatusCode::SWITCHING_PROTOCOLS)
                     .header(hyper::header::UPGRADE, "websocket")
                     .header(hyper::header::CONNECTION, "Upgrade")
-                    .body(Full::new(Bytes::new()))
+                    .body(full_body(Bytes::new()))
                     .unwrap());
             }
         }
@@ -139,19 +164,19 @@ impl ConnectionHandler {
                 error!("CONNECT method reached handle_request - should use upgrade path");
                 Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("CONNECT must use upgrade path")))
+                    .body(full_body(Bytes::from_static(b"CONNECT must use upgrade path")))
                     .unwrap())
             }
             Method::GET | Method::POST | Method::PUT | Method::DELETE | Method::HEAD
             | Method::OPTIONS | Method::PATCH => {
-                // Standard HTTP proxy
-                Self::proxy_request_static(req).await
+                // Standard (plaintext) HTTP proxy: absolute-form URI carries scheme + host.
+                self.ctx.forward(req, "http", None).await
             }
             _ => {
                 warn!("Unsupported method: {}", method);
                 Ok(Response::builder()
                     .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(Full::new(Bytes::from("Method not allowed")))
+                    .body(full_body(Bytes::from_static(b"Method not allowed")))
                     .unwrap())
             }
         }
@@ -259,14 +284,28 @@ impl ConnectionHandler {
             false
         };
 
+        // MITM traffic is decrypted HTTPS: the upstream scheme is https and the authority comes
+        // from the CONNECT target (origin-form request URIs have no host of their own).
+        let authority = (domain.to_string(), port);
+
         if use_http2 {
             info!("Using HTTP/2 for {}:{}", domain, port);
-            let service = |req| async move { Self::proxy_request_static(req).await };
+            let ctx = self.ctx.clone();
+            let service = move |req| {
+                let ctx = ctx.clone();
+                let authority = authority.clone();
+                async move { ctx.forward(req, "https", Some(authority)).await }
+            };
             crate::http2::serve_http2(tls_stream, service).await
         } else {
             info!("Using HTTP/1.1 for {}:{}", domain, port);
             let io = TokioIo::new(tls_stream);
-            let service = service_fn(|req| async move { Self::proxy_request_static(req).await });
+            let ctx = self.ctx.clone();
+            let service = service_fn(move |req| {
+                let ctx = ctx.clone();
+                let authority = authority.clone();
+                async move { ctx.forward(req, "https", Some(authority)).await }
+            });
 
             // Serve HTTP/1.1 over the TLS connection
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -315,76 +354,4 @@ impl ConnectionHandler {
         }
     }
 
-    /// Proxy a standard HTTP request (static method)
-    async fn proxy_request_static(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        let uri = req.uri();
-
-        // Extract host and port from the request
-        let host = match uri.host() {
-            Some(h) => h,
-            None => {
-                // Try to get host from headers
-                match req.headers().get("host") {
-                    Some(h) => match h.to_str() {
-                        Ok(s) => s,
-                        Err(_) => {
-                            return Ok(Response::builder()
-                                .status(StatusCode::BAD_REQUEST)
-                                .body(Full::new(Bytes::from("Invalid host header")))
-                                .unwrap())
-                        }
-                    },
-                    None => {
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(Full::new(Bytes::from("Missing host")))
-                            .unwrap())
-                    }
-                }
-            }
-        };
-
-        let port = uri.port_u16().unwrap_or(80);
-
-        debug!("Proxying request to {}:{}", host, port);
-
-        // Create a client to forward the request
-        let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http();
-
-        // Forward the request
-        match client.request(req).await {
-            Ok(response) => {
-                let status = response.status();
-                debug!("Response status: {}", status);
-
-                // Collect the response body
-                let body = match response.collect().await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(e) => {
-                        error!("Error collecting response body: {}", e);
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(Full::new(Bytes::from("Error reading response")))
-                            .unwrap());
-                    }
-                };
-
-                Ok(Response::builder()
-                    .status(status)
-                    .body(Full::new(body))
-                    .unwrap())
-            }
-            Err(e) => {
-                error!("Error forwarding request: {}", e);
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Full::new(Bytes::from(format!(
-                        "Error forwarding request: {}",
-                        e
-                    ))))
-                    .unwrap())
-            }
-        }
-    }
 }

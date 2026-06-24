@@ -1,8 +1,16 @@
 //! Integration tests for HTTP/3 server
 
-use proxy_http3::{Http3Server, QuicConfig};
+use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+
+fn test_filter() -> Arc<Http3Filter> {
+    Arc::new(Http3Filter::new(
+        Arc::new(filter_engine::SharedEngine::new()),
+        reqwest::Client::new(),
+        false,
+    ))
+}
 
 fn create_test_tls_config() -> Arc<rustls::ServerConfig> {
     // Install ring crypto provider for tests
@@ -32,7 +40,7 @@ async fn test_http3_server_starts() {
     let quic_config = QuicConfig::new("127.0.0.1:0".parse().unwrap(), tls_config);
     let endpoint = quic_config.create_endpoint().unwrap();
 
-    let server = Http3Server::new(endpoint);
+    let server = Http3Server::new(endpoint, test_filter());
     let addr = server.local_addr().unwrap();
 
     // Verify server is bound
@@ -45,7 +53,7 @@ async fn test_http3_server_shutdown() {
     let quic_config = QuicConfig::new("127.0.0.1:0".parse().unwrap(), tls_config);
     let endpoint = quic_config.create_endpoint().unwrap();
 
-    let server = Http3Server::new(endpoint);
+    let server = Http3Server::new(endpoint, test_filter());
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     // Start server in background

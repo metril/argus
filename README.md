@@ -31,6 +31,14 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - Extended CSS selectors (`#?#`, `#@?#`) with `:has()`, `:contains()`, `:xpath()`, etc.
   - CSS injection rules (`#$#`, `#@$#`) for style modifications
   - Domain-specific and exception rules
+  - Injected into HTML responses via the MITM proxy (streaming, gzip/br aware), with a
+    dynamic class/id helper and a procedural-filter evaluator (`:has-text`, `:matches-css`, …)
+- ✅ Scriptlet injection (`##+js(...)`): uBlock Origin's scriptlets are fetched at runtime
+  (GPLv3, not vendored), converted to adblock-rust resources, and cached under `data/filters`.
+  Configurable (or disabled with `""`) via `[adblock] scriptlet_resources_url`.
+- ✅ Custom user rules: block/allow (`@@`)/cosmetic rules editable in the Web UI, compiled into
+  the engine alongside subscribed lists
+- ✅ Filtering across HTTP/1.1, HTTP/2, WebSocket, and HTTP/3 (build with `--features full`)
 - ✅ Scriptlet injection (`#%#`, `#@%#`)
   - JavaScript injection for complex filtering scenarios
   - Built-in scriptlet library (abort-on-property-read, set-constant, remove-class, etc.)
@@ -45,7 +53,7 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 - 30-second timeout enforcement
 
 ### Web Management UI (Phase 5 - v1.0.0)
-- Leptos-based WebUI on port 8081
+- Leptos-based WebUI on port 3000
 - Authentication with bcrypt + JWT (httpOnly cookies)
 - Real-time statistics and request logging
 - Filter list and userscript management
@@ -74,7 +82,7 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 ## Quick Start
 
 ### Prerequisites
-- Rust 1.85+ (2021 edition)
+- Rust stable (pinned via `rust-toolchain.toml`; MSRV 1.88+)
 - Docker (optional, for containerized deployment)
 
 ### Build from Source
@@ -96,7 +104,7 @@ cargo build --release --features http3
 # Build with all features (HTTP/3, WebSockets, and Adblocking)
 cargo build --release --features "http3,websockets,adblock"
 
-# Run the proxy
+# Run the proxy (the prebuilt binary / Docker image enables the full feature set)
 ./target/release/adblocker
 ```
 
@@ -110,22 +118,26 @@ docker build -t adblocker .
 docker-compose up -d
 ```
 
-### Install Root CA Certificate
+### Getting started (end-to-end)
 
-1. Start the proxy and navigate to `http://localhost:8081`
-2. Download the root CA certificate
-3. Install it in your browser/system:
+The three ports: **8080** (HTTP proxy), **8443** (HTTPS proxy), **3000** (Web UI + API).
+
+1. **Start it** — `./target/release/adblocker` (or `docker-compose up -d`).
+2. **Create your account** — open `http://localhost:3000` and register. The **first** user
+   registered automatically becomes the admin.
+3. **Install the root CA** — download it from the Web UI (Settings → CA certificate, served at
+   `http://localhost:3000`), then trust it so MITM'd HTTPS pages validate:
    - **Chrome/Edge**: Settings > Privacy and security > Security > Manage certificates
    - **Firefox**: Settings > Privacy & Security > Certificates > View Certificates > Authorities > Import
    - **macOS**: Keychain Access > System > Import
    - **Linux**: `sudo cp root-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`
+4. **Point your device/browser at the proxy** — HTTP proxy `localhost:8080`, HTTPS proxy
+   `localhost:8080` (SOCKS not supported).
+5. **Manage blocklists** — the default lists (EasyList, EasyPrivacy, AdGuard Base/Tracking) are
+   seeded and downloaded automatically; add your own under **Filters**. Lists are **persisted**
+   (Sled) and survive restarts, and the engine recompiles automatically when you change them.
 
-### Configure Browser Proxy
-
-Set your browser to use the proxy:
-- **HTTP Proxy**: `localhost:8080`
-- **HTTPS Proxy**: `localhost:8080`
-- **SOCKS Proxy**: Not supported
+That's it — ad/tracker requests matching your enabled lists are now blocked at the proxy.
 
 ## Configuration
 
@@ -147,27 +159,20 @@ ca_key_path = "certs/root-ca.key"
 cert_cache_size = 1000
 
 [adblock]
-enabled = false           # Requires building with --features adblock
-data_dir = "data/filters"
-auto_update = true
-update_interval_hours = 24
-
-[filters]
-enabled = true
+enabled = true            # Network/cosmetic blocking via the bundled filter engine
+data_dir = "data/filters" # Filter lists + cached content are persisted here (Sled)
 auto_update = true
 update_interval_hours = 24
 
 [userscripts]
 enabled = true
-auto_update = true
-script_timeout_secs = 30
-max_concurrent_isolates = 10
+data_dir = "data/userscripts"
 
 [webui]
 enabled = true
-port = 8081
-username = "admin"
-password_hash = "$2b$12$..."  # Generate with: bcrypt-cli hash "your-password"
+host = "0.0.0.0"
+port = 3000                # Web UI + API
+# Accounts are created by registering in the Web UI; the first user becomes admin.
 ```
 
 ## AdGuard Filter Syntax

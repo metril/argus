@@ -560,6 +560,105 @@ async fn test_add_filter_list_valid_url() {
     assert_eq!(body["name"], "EasyList");
 }
 
+/// Regression test for the reported bug: a list added by the user must still be there when the
+/// listing is reloaded (it used to vanish because the handlers were stubs).
+#[tokio::test]
+async fn test_added_filter_list_appears_in_listing() {
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
+
+    let reg_response = server
+        .post("/api/auth/register")
+        .json(&json!({
+            "username": "persist_test",
+            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
+        }))
+        .await;
+    let access_token = extract_access_token(&reg_response).expect("No access token");
+
+    // Add a list.
+    let add = server
+        .post("/api/filters/lists")
+        .add_cookie(Cookie::new("access_token", access_token.clone()))
+        .json(&json!({
+            "id": "my-list",
+            "name": "My Custom List",
+            "url": "https://example.com/custom.txt"
+        }))
+        .await;
+    add.assert_status_ok();
+
+    // Re-list: the added list must be present (the original symptom was it disappearing).
+    let list = server
+        .get("/api/filters/lists")
+        .add_cookie(Cookie::new("access_token", access_token.clone()))
+        .await;
+    list.assert_status_ok();
+    let body: serde_json::Value = list.json();
+    let arr = body["data"].as_array().expect("data is array");
+    assert!(
+        arr.iter().any(|l| l["id"] == "my-list"),
+        "the added list must appear in the listing, got: {body}"
+    );
+
+    // Fetch it directly too.
+    let one = server
+        .get("/api/filters/lists/my-list")
+        .add_cookie(Cookie::new("access_token", access_token.clone()))
+        .await;
+    one.assert_status_ok();
+    assert_eq!(one.json::<serde_json::Value>()["name"], "My Custom List");
+
+    // Adding the same id again must conflict, not silently clobber.
+    let dup = server
+        .post("/api/filters/lists")
+        .add_cookie(Cookie::new("access_token", access_token))
+        .json(&json!({"id": "my-list", "name": "Dup", "url": "https://example.com/x.txt"}))
+        .await;
+    assert_eq!(dup.status_code(), 409, "duplicate id should conflict");
+}
+
+#[tokio::test]
+async fn test_custom_rules_get_and_update() {
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
+
+    let reg = server
+        .post("/api/auth/register")
+        .json(&json!({
+            "username": "rules_test",
+            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
+        }))
+        .await;
+    let token = extract_access_token(&reg).expect("No access token");
+
+    // Initially empty.
+    let got = server
+        .get("/api/filters/custom-rules")
+        .add_cookie(Cookie::new("access_token", token.clone()))
+        .await;
+    got.assert_status_ok();
+    assert_eq!(got.json::<serde_json::Value>()["rules"], "");
+
+    // Update.
+    let put = server
+        .put("/api/filters/custom-rules")
+        .add_cookie(Cookie::new("access_token", token.clone()))
+        .json(&json!({ "rules": "||my.ads^\n@@||good.example^" }))
+        .await;
+    put.assert_status_ok();
+
+    // Persisted and returned.
+    let got2 = server
+        .get("/api/filters/custom-rules")
+        .add_cookie(Cookie::new("access_token", token))
+        .await;
+    assert_eq!(
+        got2.json::<serde_json::Value>()["rules"],
+        "||my.ads^\n@@||good.example^"
+    );
+}
+
 #[tokio::test]
 async fn test_get_filter_stats() {
     let ctx = TestContext::new().await.expect("Failed to create test context");

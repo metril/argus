@@ -65,6 +65,8 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
         .route("/lists/{id}", get(handlers::filters::get_filter_list)
             .put(handlers::filters::update_filter_list)
             .delete(handlers::filters::delete_filter_list))
+        .route("/custom-rules", get(handlers::filters::get_custom_rules)
+            .put(handlers::filters::update_custom_rules))
         .route("/stats", get(handlers::filters::get_stats))
         .route("/stats/reset", post(handlers::filters::reset_stats))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))

@@ -181,36 +181,40 @@ impl FilterListManager {
 
     /// Load default filter lists
     pub fn load_defaults(&self) {
-        // EasyList
-        self.add_list(FilterList::new(
+        for list in default_filter_lists() {
+            self.add_list(list);
+        }
+        info!("Loaded {} default filter lists", self.lists.read().len());
+    }
+}
+
+/// The default filter lists seeded for a fresh install.
+///
+/// Single source of truth, shared by the in-memory manager and the persistent store so both agree
+/// on what "the defaults" are.
+pub fn default_filter_lists() -> Vec<FilterList> {
+    vec![
+        FilterList::new(
             "easylist".to_string(),
             "EasyList".to_string(),
             "https://easylist.to/easylist/easylist.txt".to_string(),
-        ));
-
-        // EasyPrivacy
-        self.add_list(FilterList::new(
+        ),
+        FilterList::new(
             "easyprivacy".to_string(),
             "EasyPrivacy".to_string(),
             "https://easylist.to/easylist/easyprivacy.txt".to_string(),
-        ));
-
-        // AdGuard Base Filter
-        self.add_list(FilterList::new(
+        ),
+        FilterList::new(
             "adguard-base".to_string(),
             "AdGuard Base Filter".to_string(),
             "https://filters.adtidy.org/extension/chromium/filters/2.txt".to_string(),
-        ));
-
-        // AdGuard Tracking Protection
-        self.add_list(FilterList::new(
+        ),
+        FilterList::new(
             "adguard-tracking".to_string(),
             "AdGuard Tracking Protection".to_string(),
             "https://filters.adtidy.org/extension/chromium/filters/3.txt".to_string(),
-        ));
-
-        info!("Loaded {} default filter lists", self.lists.read().len());
-    }
+        ),
+    ]
 }
 
 #[cfg(test)]

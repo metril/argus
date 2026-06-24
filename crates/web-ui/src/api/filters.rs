@@ -7,7 +7,9 @@ use super::client::{ApiClient, ApiError};
 
 // Wire DTOs come from the shared `api-types` crate (single source of truth).
 // Aliases preserve the names the UI pages already use.
-pub use api_types::{AddFilterListRequest, UpdateFilterListRequest};
+pub use api_types::{
+    AddFilterListRequest, CustomRulesResponse, UpdateCustomRulesRequest, UpdateFilterListRequest,
+};
 pub use api_types::FilterListResponse as FilterList;
 pub type FilterListsResponse = api_types::PaginatedResponse<FilterList>;
 
@@ -78,5 +80,21 @@ impl ApiClient {
     /// Reset filter statistics
     pub async fn reset_filter_stats(&self) -> Result<MessageResponse, ApiError> {
         self.post("/api/filters/stats/reset", &()).await
+    }
+
+    /// Get the user's custom filter rules
+    pub async fn get_custom_rules(&self) -> Result<CustomRulesResponse, ApiError> {
+        self.get("/api/filters/custom-rules").await
+    }
+
+    /// Replace the user's custom filter rules
+    pub async fn update_custom_rules(
+        &self,
+        rules: &str,
+    ) -> Result<CustomRulesResponse, ApiError> {
+        let req = UpdateCustomRulesRequest {
+            rules: rules.to_string(),
+        };
+        self.put("/api/filters/custom-rules", &req).await
     }
 }

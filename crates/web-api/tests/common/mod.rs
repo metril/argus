@@ -4,11 +4,12 @@
 
 use axum::Router;
 use common::config::ProxyConfig;
-use filter_engine::FilterEngine;
+use filter_engine::SharedEngine;
 use std::sync::Arc;
 use tempfile::TempDir;
 use userscript_engine::{UserscriptManager, UserscriptRuntime, UserscriptStorage};
 use web_api::config::ApiConfig;
+use web_api::open_filter_store;
 use web_api::state::build_state;
 use web_api::{create_router, ApiResult, AppState};
 
@@ -41,9 +42,11 @@ impl TestContext {
             toml::to_string_pretty(&proxy_config).expect("Failed to serialize proxy config");
         std::fs::write(&config_path, config_str).expect("Failed to write proxy config");
 
-        // Create filter engine (for stats only)
-        let filter_engine =
-            FilterEngine::new(temp_path.join("filters")).expect("Failed to create filter engine");
+        // Create shared filter engine + persistent list store (empty for tests)
+        let shared_engine = Arc::new(SharedEngine::new());
+        let filter_store =
+            open_filter_store(&temp_path.join("filters")).expect("Failed to open filter store");
+        let http_client = reqwest::Client::new();
 
         // Create userscript manager, storage and runtime
         let userscript_manager = Arc::new(
@@ -61,7 +64,9 @@ impl TestContext {
         let state = build_state(
             api_config.clone(),
             proxy_config,
-            filter_engine,
+            shared_engine,
+            filter_store,
+            http_client,
             userscript_manager,
             userscript_runtime,
             config_path,

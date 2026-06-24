@@ -1,6 +1,6 @@
 //! Statistics tracking for filter engine
 
-use parking_lot::RwLock;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,14 +33,18 @@ impl Default for BlockingStats {
     }
 }
 
-/// Thread-safe filter statistics tracker
+/// Thread-safe filter statistics tracker.
+///
+/// The hot path (`record_blocked`/`record_allowed`) is lock-free: totals are atomics and the
+/// per-type / per-domain tallies use sharded `DashMap`s, so hundreds of concurrent worker threads
+/// can record without serializing on a global lock. The (rare) `snapshot` does the sort/top-N.
 #[derive(Debug, Clone)]
 pub struct FilterStats {
     total_requests: Arc<AtomicU64>,
     blocked_requests: Arc<AtomicU64>,
     allowed_requests: Arc<AtomicU64>,
-    blocked_by_type: Arc<RwLock<HashMap<String, u64>>>,
-    blocked_domains: Arc<RwLock<HashMap<String, u64>>>,
+    blocked_by_type: Arc<DashMap<String, u64>>,
+    blocked_domains: Arc<DashMap<String, u64>>,
 }
 
 impl Default for FilterStats {
@@ -56,25 +60,19 @@ impl FilterStats {
             total_requests: Arc::new(AtomicU64::new(0)),
             blocked_requests: Arc::new(AtomicU64::new(0)),
             allowed_requests: Arc::new(AtomicU64::new(0)),
-            blocked_by_type: Arc::new(RwLock::new(HashMap::new())),
-            blocked_domains: Arc::new(RwLock::new(HashMap::new())),
+            blocked_by_type: Arc::new(DashMap::new()),
+            blocked_domains: Arc::new(DashMap::new()),
         }
     }
 
-    /// Record a blocked request
+    /// Record a blocked request (lock-free).
     pub fn record_blocked(&self, resource_type: &str, domain: &str) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.blocked_requests.fetch_add(1, Ordering::Relaxed);
 
-        // Update blocked by type
-        let mut blocked_by_type = self.blocked_by_type.write();
-        *blocked_by_type.entry(resource_type.to_string()).or_insert(0) += 1;
-        drop(blocked_by_type);
-
-        // Update blocked domains
-        let mut blocked_domains = self.blocked_domains.write();
-        *blocked_domains.entry(domain.to_string()).or_insert(0) += 1;
-        drop(blocked_domains);
+        // Sharded concurrent maps: only the touched shard is locked, never a global lock.
+        *self.blocked_by_type.entry(resource_type.to_string()).or_insert(0) += 1;
+        *self.blocked_domains.entry(domain.to_string()).or_insert(0) += 1;
     }
 
     /// Record an allowed request
@@ -85,19 +83,25 @@ impl FilterStats {
 
     /// Get current statistics snapshot
     pub fn snapshot(&self) -> BlockingStats {
-        let blocked_domains = self.blocked_domains.read();
-        let mut top_blocked: Vec<(String, u64)> = blocked_domains
+        let mut top_blocked: Vec<(String, u64)> = self
+            .blocked_domains
             .iter()
-            .map(|(k, v)| (k.clone(), *v))
+            .map(|e| (e.key().clone(), *e.value()))
             .collect();
         top_blocked.sort_by(|a, b| b.1.cmp(&a.1));
         top_blocked.truncate(10); // Top 10
+
+        let blocked_by_type: HashMap<String, u64> = self
+            .blocked_by_type
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
 
         BlockingStats {
             total_requests: self.total_requests.load(Ordering::Relaxed),
             blocked_requests: self.blocked_requests.load(Ordering::Relaxed),
             allowed_requests: self.allowed_requests.load(Ordering::Relaxed),
-            blocked_by_type: self.blocked_by_type.read().clone(),
+            blocked_by_type,
             top_blocked_domains: top_blocked,
         }
     }
@@ -107,8 +111,8 @@ impl FilterStats {
         self.total_requests.store(0, Ordering::Relaxed);
         self.blocked_requests.store(0, Ordering::Relaxed);
         self.allowed_requests.store(0, Ordering::Relaxed);
-        self.blocked_by_type.write().clear();
-        self.blocked_domains.write().clear();
+        self.blocked_by_type.clear();
+        self.blocked_domains.clear();
     }
 }
 

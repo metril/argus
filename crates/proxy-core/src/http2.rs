@@ -2,8 +2,7 @@
 
 use crate::{Error, Result};
 use bytes::Bytes;
-use http_body_util::Full;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -12,14 +11,16 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, error};
 
 /// Serve HTTP/2 over a connection
-pub async fn serve_http2<IO, S, F>(
+pub async fn serve_http2<IO, S, F, B>(
     io: IO,
     service: S,
 ) -> Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Fn(Request<Incoming>) -> F + Clone + Send + 'static,
-    F: std::future::Future<Output = Result<Response<Full<Bytes>>>> + Send + 'static,
+    F: std::future::Future<Output = Result<Response<B>>> + Send + 'static,
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     debug!("Starting HTTP/2 connection");
 

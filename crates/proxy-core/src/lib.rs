@@ -16,7 +16,9 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod connection;
 pub mod error;
+pub mod filtering;
 pub mod http2;
+pub mod inject;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
@@ -31,6 +33,7 @@ pub use ca_encryption::{
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitCheck, CircuitState};
 pub use config::ProxyConfig;
 pub use error::{Error, Result};
+pub use filtering::ProxyContext;
 pub use load_manager::{
     AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig, LoadManagerStatsSnapshot,
     SharedLoadManager,
