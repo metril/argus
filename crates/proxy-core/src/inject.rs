@@ -41,6 +41,65 @@ function schedule(){if(pending)return;pending=true;if(timer)clearTimeout(timer);
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',request);else request();
 try{new MutationObserver(schedule).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class','id']});}catch(e){}})();"#;
 
+/// Procedural pseudo-classes that aren't valid CSS and must be evaluated in JS. Note `:has()` is
+/// deliberately excluded — modern browsers support it natively, so it stays in the stylesheet.
+const PROC_MARKERS: &[&str] = &[
+    ":has-text(",
+    ":matches-css(",
+    ":matches-css-before(",
+    ":matches-css-after(",
+    ":matches-attr(",
+    ":matches-path(",
+    ":min-text-length(",
+    ":upward(",
+    ":xpath(",
+    ":-abp-contains(",
+    ":contains(",
+];
+
+/// Whether a selector contains a procedural pseudo-class (needs JS, not CSS).
+fn is_procedural(sel: &str) -> bool {
+    PROC_MARKERS.iter().any(|m| sel.contains(m))
+}
+
+/// Client-side evaluator for procedural cosmetic filters. It parses a raw procedural selector
+/// (e.g. `.box:has-text(Ad):upward(2)`) into a CSS anchor plus operators, evaluates them against
+/// the DOM, and applies the filter's action. The work-list is spliced in at `__AB_PROC__`; each
+/// item is `{s: "<raw selector>", a: "<action>", g: "<action arg>"}`.
+const PROCEDURAL_JS: &str = r#"(function(){if(window.__abPr)return;var items=__AB_PROC__;if(!items||!items.length)return;window.__abPr=1;
+var NAMES=['has-text','matches-css-before','matches-css-after','matches-css','matches-attr','matches-path','min-text-length','upward','xpath','-abp-contains','contains'];
+function parseSel(sel){var ops=[],out='',n=sel.length,i=0;
+while(i<n){if(sel[i]===':'){var matched=null;for(var k=0;k<NAMES.length;k++){var nm=NAMES[k];if(sel.substr(i+1,nm.length)===nm&&sel.charAt(i+1+nm.length)==='('){matched=nm;break;}}
+if(matched){var start=i+1+matched.length+1,depth=1,j=start;while(j<n){var c=sel[j];if(c==='(')depth++;else if(c===')'){depth--;if(depth===0)break;}j++;}
+ops.push({n:(matched==='-abp-contains'||matched==='contains')?'has-text':matched,a:sel.slice(start,j)});i=j+1;continue;}}
+out+=sel[i];i++;}
+return{css:out.trim(),ops:ops};}
+function rx(s){if(s&&s.length>1&&s[0]==='/'){var i=s.lastIndexOf('/');if(i>0){try{return new RegExp(s.slice(1,i),s.slice(i+1));}catch(e){}}}return null;}
+function applyOp(nodes,op){var nm=op.n,a=op.a,out=[];
+for(var i=0;i<nodes.length;i++){var el=nodes[i];
+if(nm==='has-text'){var re=rx(a),t=el.textContent||'';if(re?re.test(t):t.indexOf(a)!==-1)out.push(el);}
+else if(nm==='min-text-length'){if((el.textContent||'').length>=parseInt(a,10))out.push(el);}
+else if(nm==='matches-path'){var re=rx(a);if(re?re.test(location.pathname):location.pathname.indexOf(a)!==-1)out.push(el);}
+else if(nm==='matches-css'||nm==='matches-css-before'||nm==='matches-css-after'){var p=nm==='matches-css'?null:(nm==='matches-css-before'?'::before':'::after');var ix=a.indexOf(':');if(ix>=0){var pr=a.slice(0,ix).trim(),v=a.slice(ix+1).trim();var cs=getComputedStyle(el,p);var ac=cs.getPropertyValue(pr)||'';var re=rx(v);if(re?re.test(ac):ac.trim()===v)out.push(el);}}
+else if(nm==='matches-attr'){var m=a.match(/^([^=]+)(?:=([\s\S]*))?$/);if(m){var name=m[1].trim();if(el.hasAttribute(name)){if(m[2]===undefined)out.push(el);else{var v=el.getAttribute(name)||'';var re=rx(m[2]);if(re?re.test(v):v===m[2].replace(/^"|"$/g,''))out.push(el);}}}}
+else if(nm==='upward'){var num=parseInt(a,10);if(!isNaN(num)&&String(num)===a.trim()){var e=el;while(num-->0&&e)e=e.parentElement;if(e)out.push(e);}else{try{var c=el.closest(a);if(c)out.push(c);}catch(e){}}}
+else if(nm==='xpath'){try{var r=document.evaluate(a,el,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);for(var q=0;q<r.snapshotLength;q++){var nd=r.snapshotItem(q);if(nd.nodeType===1)out.push(nd);}}catch(e){}}
+else out.push(el);}
+return out.filter(function(v,ix){return out.indexOf(v)===ix;});}
+function evalItem(it){var ps=parseSel(it.s),nodes;
+try{nodes=ps.css?[].slice.call(document.querySelectorAll(ps.css)):[].slice.call(document.querySelectorAll('*'));}catch(e){return[];}
+for(var i=0;i<ps.ops.length;i++){nodes=applyOp(nodes,ps.ops[i]);if(!nodes.length)break;}return nodes;}
+function run(){for(var f=0;f<items.length;f++){var it=items[f],nodes;try{nodes=evalItem(it);}catch(e){continue;}
+for(var i=0;i<nodes.length;i++){var el=nodes[i];try{
+if(it.a==='remove')el.remove();
+else if(it.a==='style')el.style.cssText+=';'+(it.g||'');
+else if(it.a==='remove-attr')el.removeAttribute(it.g||'');
+else if(it.a==='remove-class')el.classList.remove(it.g||'');
+else el.style.setProperty('display','none','important');}catch(e){}}}}
+var t=null;function sch(){if(t)clearTimeout(t);t=setTimeout(run,200);}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',run);else run();
+try{new MutationObserver(sch).observe(document.documentElement,{childList:true,subtree:true,attributes:true});}catch(e){}})();"#;
+
 /// Build the HTML snippet to inject for a page, or `None` if there's nothing to do.
 ///
 /// `include_helper` adds the dynamic class/id hiding helper (skipped when the page is generic-hide
@@ -48,9 +107,16 @@ try{new MutationObserver(schedule).observe(document.documentElement,{childList:t
 pub fn build_payload(cos: &Cosmetics, include_helper: bool) -> Option<Bytes> {
     let mut out = String::new();
 
-    if !cos.hide_selectors.is_empty() {
-        // Selectors come from the engine and are valid CSS; guard only against breaking the tag.
-        let css = cos.hide_selectors.join(",");
+    // Partition element-hiding selectors: plain CSS goes in a stylesheet; procedural selectors are
+    // evaluated in JS (mixing them into CSS would invalidate the whole rule).
+    let plain: Vec<&str> = cos
+        .hide_selectors
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !is_procedural(s))
+        .collect();
+    if !plain.is_empty() {
+        let css = plain.join(",");
         if !css.contains("</style") {
             out.push_str("<style id=\"__adblock_cosmetic\">");
             out.push_str(&css);
@@ -62,6 +128,34 @@ pub fn build_payload(cos: &Cosmetics, include_helper: bool) -> Option<Bytes> {
         out.push_str("<script>");
         out.push_str(&cos.injected_script);
         out.push_str("</script>");
+    }
+
+    // Build the procedural work-list: procedural hide selectors + parsed action filters.
+    let mut proc_items: Vec<serde_json::Value> = Vec::new();
+    for sel in cos.hide_selectors.iter().filter(|s| is_procedural(s)) {
+        proc_items.push(serde_json::json!({ "s": sel, "a": "hide" }));
+    }
+    for raw in &cos.procedural_actions {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            let sel = v["selector"]
+                .get(0)
+                .and_then(|s| s["arg"].as_str())
+                .unwrap_or("");
+            if sel.is_empty() {
+                continue;
+            }
+            let act = v["action"]["type"].as_str().unwrap_or("hide");
+            let arg = v["action"]["arg"].as_str().unwrap_or("");
+            proc_items.push(serde_json::json!({ "s": sel, "a": act, "g": arg }));
+        }
+    }
+    if !proc_items.is_empty() {
+        let array = serde_json::to_string(&proc_items).unwrap_or_else(|_| "[]".to_string());
+        if !array.contains("</script") {
+            out.push_str("<script id=\"__adblock_procedural\">");
+            out.push_str(&PROCEDURAL_JS.replace("__AB_PROC__", &array));
+            out.push_str("</script>");
+        }
     }
 
     if include_helper {
@@ -192,8 +286,8 @@ mod tests {
     fn payload_builds_style_and_helper() {
         let cos = Cosmetics {
             hide_selectors: vec![".ad".into(), "#banner".into()],
-            injected_script: String::new(),
             generichide: false,
+            ..Default::default()
         };
         let p = build_payload(&cos, true).expect("payload");
         let s = String::from_utf8(p.to_vec()).unwrap();
@@ -205,6 +299,40 @@ mod tests {
     fn payload_empty_when_nothing_to_do() {
         let cos = Cosmetics::default();
         assert!(build_payload(&cos, false).is_none());
+    }
+
+    #[test]
+    fn procedural_hide_selector_kept_out_of_stylesheet() {
+        // A procedural selector must NOT leak into the <style> (it would be invalid CSS and break
+        // the whole rule); it goes to the procedural evaluator instead.
+        let cos = Cosmetics {
+            hide_selectors: vec![".real-ad".into(), ".box:has-text(Sponsored)".into()],
+            generichide: true, // skip the helper to isolate this
+            ..Default::default()
+        };
+        let s = String::from_utf8(build_payload(&cos, false).unwrap().to_vec()).unwrap();
+        // Plain selector is in the stylesheet; procedural one is not.
+        assert!(s.contains(".real-ad{display:none!important}"));
+        assert!(!s.contains("<style id=\"__adblock_cosmetic\">.box:has-text"));
+        // The procedural selector is handed to the evaluator (JSON key order is not significant).
+        assert!(s.contains("__adblock_procedural"));
+        assert!(s.contains(r#""s":".box:has-text(Sponsored)""#));
+        assert!(s.contains(r#""a":"hide""#));
+        assert!(!s.contains("__AB_PROC__"), "placeholder must be replaced");
+    }
+
+    #[test]
+    fn payload_parses_action_filter() {
+        let cos = Cosmetics {
+            procedural_actions: vec![
+                r#"{"selector":[{"type":"css-selector","arg":".ad:has-text(Ad)"}],"action":{"type":"remove"}}"#.to_string(),
+            ],
+            generichide: true,
+            ..Default::default()
+        };
+        let s = String::from_utf8(build_payload(&cos, false).unwrap().to_vec()).unwrap();
+        assert!(s.contains(r#""s":".ad:has-text(Ad)""#));
+        assert!(s.contains(r#""a":"remove""#));
     }
 
     #[test]

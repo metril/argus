@@ -34,6 +34,9 @@ pub struct Cosmetics {
     pub hide_selectors: Vec<String>,
     /// JavaScript scriptlet code to inject (empty unless the scriptlet resource library is loaded).
     pub injected_script: String,
+    /// JSON-encoded procedural cosmetic filters (`:has-text`, `:matches-css`, `:upward`, actions,
+    /// etc.) to be evaluated client-side.
+    pub procedural_actions: Vec<String>,
     /// True if this page is excepted from generic (class/id) hiding.
     pub generichide: bool,
 }
@@ -134,6 +137,7 @@ impl SharedEngine {
             Cosmetics {
                 hide_selectors: res.hide_selectors.into_iter().collect(),
                 injected_script: res.injected_script,
+                procedural_actions: res.procedural_actions.into_iter().collect(),
                 generichide: res.generichide,
             }
         })
@@ -271,6 +275,32 @@ mod tests {
             dyn_sel.iter().any(|s| s.contains(".generic-ad")),
             "expected generic selector from dynamic lookup, got {dyn_sel:?}"
         );
+    }
+
+    #[test]
+    fn procedural_filters_exposed() {
+        let shared = SharedEngine::new();
+        shared.install(compile_engine(&[
+            // A procedural *selector* (no action) → comes back in hide_selectors as a raw string.
+            "example.com##.box:has-text(Sponsored)\n\
+             // An *action* filter → comes back in procedural_actions as JSON.\n\
+             example.com##.ad:remove()\n"
+                .to_string(),
+        ]));
+
+        let cos = shared.cosmetic_for("https://example.com/");
+        assert!(
+            cos.hide_selectors.iter().any(|s| s.contains(":has-text(")),
+            "procedural selector should appear in hide_selectors, got {:?}",
+            cos.hide_selectors
+        );
+        assert!(
+            !cos.procedural_actions.is_empty(),
+            "action filter should populate procedural_actions"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&cos.procedural_actions[0]).expect("procedural action is JSON");
+        assert_eq!(v["action"]["type"], "remove");
     }
 
     #[test]
