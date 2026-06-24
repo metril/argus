@@ -27,6 +27,17 @@ thread_local! {
     static LOCAL_ENGINE: RefCell<Option<(u64, AdblockEngine)>> = const { RefCell::new(None) };
 }
 
+/// Cosmetic resources for a page: element-hiding selectors + scriptlet JS to inject.
+#[derive(Debug, Clone, Default)]
+pub struct Cosmetics {
+    /// CSS selectors to hide with `{ display: none !important; }`.
+    pub hide_selectors: Vec<String>,
+    /// JavaScript scriptlet code to inject (empty unless the scriptlet resource library is loaded).
+    pub injected_script: String,
+    /// True if this page is excepted from generic (class/id) hiding.
+    pub generichide: bool,
+}
+
 /// A `Send + Sync` handle to a compiled adblock engine, shared as serialized bytes.
 ///
 /// Clone-free sharing is done via `Arc<SharedEngine>`; the type itself is intentionally not
@@ -107,6 +118,47 @@ impl SharedEngine {
             let guard = cell.borrow();
             let (_, engine) = guard.as_ref().expect("engine just ensured present");
             f(engine)
+        })
+    }
+
+    /// Cosmetic resources (element-hiding CSS + scriptlet JS) for a page URL.
+    ///
+    /// Lock-free thread-local, same engine as [`Self::check`]. `generichide` is true when the page
+    /// is excepted from generic (class/id) hiding — callers can use it to skip the dynamic helper.
+    pub fn cosmetic_for(&self, url: &str) -> Cosmetics {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Cosmetics::default();
+        }
+        self.with_engine(|engine| {
+            let res = engine.url_cosmetic_resources(url);
+            Cosmetics {
+                hide_selectors: res.hide_selectors.into_iter().collect(),
+                injected_script: res.injected_script,
+                generichide: res.generichide,
+            }
+        })
+    }
+
+    /// Generic element-hiding selectors triggered by the given class/id tokens on a page.
+    ///
+    /// Used by the dynamic (MutationObserver) hiding path: the page reports the classes/ids it
+    /// contains and gets back any generic hide selectors that apply. Recomputes the page's
+    /// cosmetic exceptions/`generichide` so it stays stateless.
+    pub fn dynamic_hide_selectors(
+        &self,
+        page_url: &str,
+        classes: &[String],
+        ids: &[String],
+    ) -> Vec<String> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        self.with_engine(|engine| {
+            let res = engine.url_cosmetic_resources(page_url);
+            if res.generichide {
+                return Vec::new();
+            }
+            engine.hidden_class_id_selectors(classes, ids, &res.exceptions)
         })
     }
 
@@ -193,6 +245,32 @@ mod tests {
             "script",
         );
         assert!(!allowed.blocked, "unrelated host should be allowed");
+    }
+
+    #[test]
+    fn cosmetic_hide_selectors_for_domain() {
+        let shared = SharedEngine::new();
+        // A generic + a domain-specific element-hiding rule.
+        let list = "##.generic-ad\nexample.com##.sponsored\n".to_string();
+        shared.install(compile_engine(&[list]));
+
+        let cos = shared.cosmetic_for("https://example.com/page");
+        assert!(
+            cos.hide_selectors.iter().any(|s| s.contains(".sponsored")),
+            "expected domain-specific selector, got {:?}",
+            cos.hide_selectors
+        );
+
+        // Dynamic: reporting the generic class yields its hide selector.
+        let dyn_sel = shared.dynamic_hide_selectors(
+            "https://example.com/page",
+            &["generic-ad".to_string()],
+            &[],
+        );
+        assert!(
+            dyn_sel.iter().any(|s| s.contains(".generic-ad")),
+            "expected generic selector from dynamic lookup, got {dyn_sel:?}"
+        );
     }
 
     #[test]

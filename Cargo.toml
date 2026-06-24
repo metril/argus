@@ -25,6 +25,9 @@ repository = "https://github.com/yourusername/adblocker"
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
 tokio-util = { version = "0.7", features = ["full"] }
+futures-util = "0.3"
+async-stream = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zlib", "deflate"] }
 
 # HTTP
 hyper = { version = "1.5", features = ["full"] }

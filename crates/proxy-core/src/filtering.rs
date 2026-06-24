@@ -5,12 +5,13 @@
 //! [`reqwest::Client`] for forwarding requests upstream over real TLS (replacing the previous
 //! per-request plaintext `build_http()` client, which broke HTTPS origins).
 
+use crate::inject::{build_payload, full_body, inject_body, passthrough_body, ProxyBody};
 use crate::{Error, Result};
 use bytes::Bytes;
 use filter_engine::SharedEngine;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::header::{HeaderName, HOST, REFERER};
+use hyper::header::{HeaderName, CONTENT_TYPE, HOST, REFERER};
 use hyper::{Request, Response, StatusCode};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -64,10 +65,16 @@ impl ProxyContext {
         req: Request<Incoming>,
         scheme: &str,
         fallback_authority: Option<(String, u16)>,
-    ) -> Result<Response<Full<Bytes>>> {
+    ) -> Result<Response<ProxyBody>> {
         let method = req.method().clone();
+        let is_head = method == hyper::Method::HEAD;
         let uri = req.uri().clone();
         let headers = req.headers().clone();
+
+        // Internal endpoints (dynamic cosmetic hiding callback) are answered locally, not forwarded.
+        if uri.path().starts_with("/__adblock__/") {
+            return Ok(self.handle_internal(req, &uri).await);
+        }
 
         // Resolve target host/port from absolute-form URI, Host header, or the MITM fallback.
         let host = uri
@@ -147,28 +154,88 @@ impl ProxyContext {
 
         let status = resp.status();
         let resp_headers = resp.headers().clone();
-        let body_bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("Error reading upstream body for {}: {}", url, e);
-                return Ok(bad_gateway("Error reading upstream response"));
-            }
+
+        // Decide whether to inject cosmetics into an HTML document.
+        let is_html = resp_headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.to_ascii_lowercase().contains("text/html"))
+            .unwrap_or(false);
+
+        // Only inject into responses that actually carry an HTML body.
+        let body_allowed = !is_head
+            && status.as_u16() >= 200
+            && status != StatusCode::NO_CONTENT
+            && status != StatusCode::NOT_MODIFIED;
+        let payload = if self.adblock_enabled && is_html && body_allowed {
+            let cos = self.engine.cosmetic_for(&url);
+            build_payload(&cos, !cos.generichide)
+        } else {
+            None
         };
+
+        let inject = payload.is_some();
+        let content_encoding = resp_headers
+            .get(hyper::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
 
         let mut builder = Response::builder().status(status);
         for (name, value) in resp_headers.iter() {
-            // Drop framing headers — hyper recomputes Content-Length from the buffered body.
-            if is_hop_by_hop(name)
-                || name.as_str().eq_ignore_ascii_case("content-length")
-            {
+            // Always drop Content-Length (bodies are streamed/chunked). For injected HTML we also
+            // drop Content-Encoding because the body is re-emitted as identity.
+            if is_hop_by_hop(name) || name.as_str().eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            if inject && name == hyper::header::CONTENT_ENCODING {
                 continue;
             }
             builder = builder.header(name, value);
         }
 
+        let body = match payload {
+            Some(p) => inject_body(resp, p, content_encoding.as_deref()),
+            None => passthrough_body(resp),
+        };
+
         builder
-            .body(Full::new(body_bytes))
+            .body(body)
             .map_err(|e| Error::Connection(format!("build response: {e}")))
+    }
+
+    /// Handle a `/__adblock__/...` internal request (never forwarded upstream).
+    async fn handle_internal(&self, req: Request<Incoming>, uri: &hyper::Uri) -> Response<ProxyBody> {
+        if uri.path() == "/__adblock__/cc" && req.method() == hyper::Method::POST {
+            let bytes = match req.into_body().collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(_) => return bad_request("body"),
+            };
+            #[derive(serde::Deserialize)]
+            struct CcReq {
+                url: String,
+                #[serde(default)]
+                classes: Vec<String>,
+                #[serde(default)]
+                ids: Vec<String>,
+            }
+            let parsed: CcReq = match serde_json::from_slice(&bytes) {
+                Ok(p) => p,
+                Err(_) => return bad_request("json"),
+            };
+            let selectors = self
+                .engine
+                .dynamic_hide_selectors(&parsed.url, &parsed.classes, &parsed.ids);
+            let json = serde_json::json!({ "selectors": selectors }).to_string();
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(full_body(Bytes::from(json)))
+                .expect("internal json response");
+        }
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(full_body(Bytes::new()))
+            .expect("internal 404")
     }
 }
 
@@ -212,24 +279,24 @@ fn resource_type_for(headers: &hyper::HeaderMap, path: &str) -> &'static str {
 }
 
 /// Response returned for blocked requests: an empty `204 No Content`.
-fn blocked_response() -> Response<Full<Bytes>> {
+fn blocked_response() -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header("x-adblock", "blocked")
-        .body(Full::new(Bytes::new()))
+        .body(full_body(Bytes::new()))
         .expect("static blocked response")
 }
 
-fn bad_request(msg: &str) -> Response<Full<Bytes>> {
+fn bad_request(msg: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
-        .body(Full::new(Bytes::from(msg.to_string())))
+        .body(full_body(Bytes::from(msg.to_string())))
         .expect("static bad-request response")
 }
 
-fn bad_gateway(msg: &str) -> Response<Full<Bytes>> {
+fn bad_gateway(msg: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
-        .body(Full::new(Bytes::from(msg.to_string())))
+        .body(full_body(Bytes::from(msg.to_string())))
         .expect("static bad-gateway response")
 }

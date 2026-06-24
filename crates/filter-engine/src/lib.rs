@@ -30,7 +30,7 @@ pub use matcher::{MatchResult, RequestMatcher};
 pub use modifiers::{RemoveHeaderModifier, RemoveParamModifier, ReplaceModifier};
 pub use safety::{FilterSafetyConfig, FilterValidator, validate_filter_rule, validate_filter_rules};
 pub use scriptlets::{ScriptletManager, ScriptletRule};
-pub use shared::{compile_engine, SharedEngine};
+pub use shared::{compile_engine, Cosmetics, SharedEngine};
 pub use stats::{BlockingStats, FilterStats};
 pub use update::{
     ListUpdateStats, UpdateAttempt, UpdateConfig, UpdateScheduler, UpdateStats,

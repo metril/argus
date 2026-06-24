@@ -26,6 +26,10 @@ h2 = { workspace = true }
 http-body-util = { workspace = true }
 # Shared pooled upstream client for forwarding proxied requests (TLS-capable, streaming).
 reqwest = { workspace = true, features = ["stream"] }
+# Streaming response bodies + HTML cosmetic injection.
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+async-compression = { workspace = true }
 
 # TLS
 rustls = { workspace = true }

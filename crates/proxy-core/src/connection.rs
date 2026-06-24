@@ -1,9 +1,9 @@
 //! Connection handling and management
 
 use crate::filtering::ProxyContext;
+use crate::inject::{full_body, ProxyBody};
 use crate::{mitm::MitmHandler, tls, Error, Result};
 use bytes::Bytes;
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -83,7 +83,7 @@ impl ConnectionHandler {
     }
 
     /// Handle a single HTTP request
-    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_request(&self, mut req: Request<Incoming>) -> Result<Response<ProxyBody>> {
         let method = req.method();
         let uri = req.uri().clone();
         let version = req.version();
@@ -108,7 +108,7 @@ impl ConnectionHandler {
                         error!("Failed to extract WebSocket target: {}", e);
                         return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
-                            .body(Full::new(Bytes::from("Invalid WebSocket target")))
+                            .body(full_body(Bytes::from_static(b"Invalid WebSocket target")))
                             .unwrap());
                     }
                 };
@@ -131,7 +131,7 @@ impl ConnectionHandler {
                     .status(StatusCode::SWITCHING_PROTOCOLS)
                     .header(hyper::header::UPGRADE, "websocket")
                     .header(hyper::header::CONNECTION, "Upgrade")
-                    .body(Full::new(Bytes::new()))
+                    .body(full_body(Bytes::new()))
                     .unwrap());
             }
         }
@@ -144,7 +144,7 @@ impl ConnectionHandler {
                 error!("CONNECT method reached handle_request - should use upgrade path");
                 Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("CONNECT must use upgrade path")))
+                    .body(full_body(Bytes::from_static(b"CONNECT must use upgrade path")))
                     .unwrap())
             }
             Method::GET | Method::POST | Method::PUT | Method::DELETE | Method::HEAD
@@ -156,7 +156,7 @@ impl ConnectionHandler {
                 warn!("Unsupported method: {}", method);
                 Ok(Response::builder()
                     .status(StatusCode::METHOD_NOT_ALLOWED)
-                    .body(Full::new(Bytes::from("Method not allowed")))
+                    .body(full_body(Bytes::from_static(b"Method not allowed")))
                     .unwrap())
             }
         }

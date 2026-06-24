@@ -18,6 +18,7 @@ pub mod connection;
 pub mod error;
 pub mod filtering;
 pub mod http2;
+pub mod inject;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
