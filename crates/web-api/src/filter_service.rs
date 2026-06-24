@@ -107,6 +107,13 @@ pub async fn reload_now(
         }
     }
 
+    // Append the user's custom rules (block/allow/cosmetic) as an extra source so they compile in
+    // like any list. `@@` allow rules in here override blocks from the public lists.
+    match store.get_custom_rules() {
+        Ok(rules) if !rules.trim().is_empty() => contents.push(rules),
+        _ => {}
+    }
+
     // Compile off the async runtime — pure CPU, and the !Send engine lives entirely inside.
     let bytes = tokio::task::spawn_blocking(move || compile_engine(&contents))
         .await

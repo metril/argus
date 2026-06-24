@@ -25,7 +25,8 @@ use validator::Validate;
 
 // Wire-facing DTOs live in the shared `api-types` crate.
 pub use api_types::{
-    AddFilterListRequest, FilterListResponse, PaginatedResponse, UpdateFilterListRequest,
+    AddFilterListRequest, CustomRulesResponse, FilterListResponse, PaginatedResponse,
+    UpdateCustomRulesRequest, UpdateFilterListRequest,
 };
 
 /// Build a wire response from an engine filter list.
@@ -217,6 +218,42 @@ pub async fn delete_filter_list(
     trigger_reload(&state);
 
     Ok(Json(json!({ "message": format!("Filter list '{}' deleted", id) })))
+}
+
+/// Get the user's custom filter rules
+///
+/// GET /api/filters/custom-rules
+pub async fn get_custom_rules(
+    State(state): State<Arc<AppState>>,
+    Extension(_auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<CustomRulesResponse>> {
+    let rules = state.filter_store.get_custom_rules()?;
+    Ok(Json(CustomRulesResponse { rules }))
+}
+
+/// Replace the user's custom filter rules
+///
+/// PUT /api/filters/custom-rules
+pub async fn update_custom_rules(
+    State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<UpdateCustomRulesRequest>,
+) -> ApiResult<Json<CustomRulesResponse>> {
+    if !auth_user.role().can_modify() {
+        return Err(ApiError::AuthorizationFailed(
+            "Requires user or admin role to edit custom rules".to_string(),
+        ));
+    }
+    req.validate()
+        .map_err(|e| ApiError::ValidationError(e.to_string()))?;
+
+    state.filter_store.set_custom_rules(&req.rules)?;
+    info!("Custom filter rules updated by {}", auth_user.username());
+
+    // Recompile so the new rules take effect immediately.
+    trigger_reload(&state);
+
+    Ok(Json(CustomRulesResponse { rules: req.rules }))
 }
 
 /// Get blocking statistics

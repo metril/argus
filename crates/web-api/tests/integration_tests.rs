@@ -619,6 +619,47 @@ async fn test_added_filter_list_appears_in_listing() {
 }
 
 #[tokio::test]
+async fn test_custom_rules_get_and_update() {
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
+
+    let reg = server
+        .post("/api/auth/register")
+        .json(&json!({
+            "username": "rules_test",
+            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
+        }))
+        .await;
+    let token = extract_access_token(&reg).expect("No access token");
+
+    // Initially empty.
+    let got = server
+        .get("/api/filters/custom-rules")
+        .add_cookie(Cookie::new("access_token", token.clone()))
+        .await;
+    got.assert_status_ok();
+    assert_eq!(got.json::<serde_json::Value>()["rules"], "");
+
+    // Update.
+    let put = server
+        .put("/api/filters/custom-rules")
+        .add_cookie(Cookie::new("access_token", token.clone()))
+        .json(&json!({ "rules": "||my.ads^\n@@||good.example^" }))
+        .await;
+    put.assert_status_ok();
+
+    // Persisted and returned.
+    let got2 = server
+        .get("/api/filters/custom-rules")
+        .add_cookie(Cookie::new("access_token", token))
+        .await;
+    assert_eq!(
+        got2.json::<serde_json::Value>()["rules"],
+        "||my.ads^\n@@||good.example^"
+    );
+}
+
+#[tokio::test]
 async fn test_get_filter_stats() {
     let ctx = TestContext::new().await.expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");

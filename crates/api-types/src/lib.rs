@@ -262,6 +262,20 @@ pub struct UpdateFilterListRequest {
     pub enabled: Option<bool>,
 }
 
+/// The user's custom filter rules (raw adblock syntax).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomRulesResponse {
+    pub rules: String,
+}
+
+/// Replace the user's custom filter rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(validator::Validate))]
+pub struct UpdateCustomRulesRequest {
+    #[cfg_attr(feature = "server", validate(length(max = 1_000_000)))]
+    pub rules: String,
+}
+
 // ---------------------------------------------------------------------------
 // Userscripts
 // ---------------------------------------------------------------------------

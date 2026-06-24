@@ -14,6 +14,8 @@ use tracing::info;
 
 const LISTS_TREE: &str = "filter_lists";
 const CONTENT_TREE: &str = "filter_content";
+const META_TREE: &str = "filter_meta";
+const CUSTOM_RULES_KEY: &str = "custom_rules";
 
 /// Sled-backed persistent store of [`FilterList`] metadata, keyed by list id.
 pub struct FilterListStore {
@@ -37,6 +39,26 @@ impl FilterListStore {
 
     fn content_tree(&self) -> ApiResult<sled::Tree> {
         Ok(self.db.open_tree(CONTENT_TREE)?)
+    }
+
+    fn meta_tree(&self) -> ApiResult<sled::Tree> {
+        Ok(self.db.open_tree(META_TREE)?)
+    }
+
+    /// Get the user's custom filter rules (raw adblock syntax, one per line; may include `@@`
+    /// allow rules and cosmetic rules). Empty string if unset.
+    pub fn get_custom_rules(&self) -> ApiResult<String> {
+        match self.meta_tree()?.get(CUSTOM_RULES_KEY.as_bytes())? {
+            Some(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// Replace the user's custom filter rules.
+    pub fn set_custom_rules(&self, rules: &str) -> ApiResult<()> {
+        self.meta_tree()?
+            .insert(CUSTOM_RULES_KEY.as_bytes(), rules.as_bytes())?;
+        Ok(())
     }
 
     /// Cache the downloaded raw text of a list (used to rebuild the engine on a `304`/failure).
@@ -157,6 +179,22 @@ mod tests {
         assert!(store.remove("l1").unwrap());
         assert!(!store.exists("l1").unwrap());
         assert!(!store.remove("l1").unwrap());
+    }
+
+    #[test]
+    fn custom_rules_roundtrip_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lists");
+        {
+            let store = FilterListStore::new(path.clone()).unwrap();
+            assert_eq!(store.get_custom_rules().unwrap(), "");
+            store.set_custom_rules("||my.ads^\n@@||good.example^\n").unwrap();
+        }
+        let store = FilterListStore::new(path).unwrap();
+        assert_eq!(
+            store.get_custom_rules().unwrap(),
+            "||my.ads^\n@@||good.example^\n"
+        );
     }
 
     #[test]

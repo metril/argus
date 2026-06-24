@@ -304,6 +304,27 @@ mod tests {
     }
 
     #[test]
+    fn allow_exception_overrides_block() {
+        // A custom `@@` exception (a separate source, like user custom rules) wins over a block.
+        let shared = SharedEngine::new();
+        shared.install(compile_engine(&[
+            "||ads.example^\n".to_string(),
+            "@@||ads.example/ok^\n".to_string(),
+        ]));
+        assert!(
+            shared
+                .check("https://ads.example/track", "https://site/", "image")
+                .blocked
+        );
+        assert!(
+            !shared
+                .check("https://ads.example/ok", "https://site/", "image")
+                .blocked,
+            "@@ exception should allow this URL"
+        );
+    }
+
+    #[test]
     fn disabled_allows_everything() {
         let shared = SharedEngine::new();
         shared.install(compile_engine(&["||ad.example.com^\n".to_string()]));
