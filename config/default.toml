@@ -23,7 +23,7 @@ connection_timeout_secs = 30
 request_timeout_secs = 60
 
 [adblock]
-enabled = false
+enabled = true
 data_dir = "data/filters"
 auto_update = true
 update_interval_hours = 24

@@ -43,6 +43,7 @@ arc-swap = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
+dashmap = { workspace = true }
 
 # Time
 chrono = { workspace = true }

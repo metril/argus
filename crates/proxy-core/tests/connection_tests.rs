@@ -1,7 +1,17 @@
 //! Tests for connection handling
 
 use proxy_core::config::{MitmSettings, PerformanceSettings, AdblockSettings, ProxyConfig, UserscriptSettings, WebUiSettings};
-use proxy_core::ProxyServer;
+use proxy_core::{ProxyContext, ProxyServer};
+use std::sync::Arc;
+
+/// A minimal filtering context for server-construction tests (filtering disabled).
+fn test_ctx() -> Arc<ProxyContext> {
+    Arc::new(ProxyContext::new(
+        Arc::new(filter_engine::SharedEngine::new()),
+        reqwest::Client::new(),
+        false,
+    ))
+}
 
 #[tokio::test]
 async fn test_server_with_mitm_enabled() {
@@ -39,7 +49,7 @@ async fn test_server_with_mitm_enabled() {
     let _ = std::fs::remove_file(&config.mitm.ca_key_path);
 
     // Create server with MITM enabled
-    let server = ProxyServer::new(config).expect("Failed to create server with MITM");
+    let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server with MITM");
 
     // Verify MITM handler exists
     assert!(
@@ -90,7 +100,7 @@ async fn test_server_with_mitm_disabled() {
     };
 
     // Create server with MITM disabled
-    let server = ProxyServer::new(config).expect("Failed to create server without MITM");
+    let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server without MITM");
 
     // Verify MITM handler does not exist
     assert!(
@@ -135,7 +145,7 @@ async fn test_certificate_generation() {
     let _ = std::fs::remove_file(&config.mitm.ca_key_path);
 
     // Create server
-    let server = ProxyServer::new(config).expect("Failed to create server");
+    let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server");
 
     // Get MITM handler
     let mitm = server.mitm_handler().expect("MITM handler should exist");
@@ -209,7 +219,7 @@ async fn test_load_manager_integration() {
     };
 
     // Create server
-    let server = ProxyServer::new(config).expect("Failed to create server");
+    let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server");
 
     // Verify load manager is initialized
     let load_stats = server.load_stats();

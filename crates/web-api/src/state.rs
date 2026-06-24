@@ -6,10 +6,11 @@ use crate::auth::models::User;
 use crate::auth::session::SessionManager;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
+use crate::filter_store::FilterListStore;
 use chrono::Utc;
 use common::config::ProxyConfig;
 use dashmap::DashMap;
-use filter_engine::{FilterEngine, FilterStats};
+use filter_engine::{FilterStats, SharedEngine};
 use governor::{Quota, RateLimiter};
 use parking_lot::RwLock;
 use std::net::IpAddr;
@@ -25,10 +26,17 @@ pub struct AppState {
     /// Proxy state wrapper
     pub proxy_state: Arc<ProxyState>,
 
-    /// Filter engine statistics (thread-safe, shared with the filter engine)
-    /// The actual FilterEngine is not stored here because adblock::Engine is not Send/Sync.
-    /// Instead, we share just the stats which are already thread-safe via Arc.
+    /// Filter engine statistics (thread-safe handle into `shared_engine`'s stats).
     pub filter_stats: FilterStats,
+
+    /// Shared compiled adblock engine (Send/Sync handle; the real engine is thread-local).
+    pub shared_engine: Arc<SharedEngine>,
+
+    /// Persistent store of filter-list metadata + cached content.
+    pub filter_store: Arc<FilterListStore>,
+
+    /// Shared pooled HTTP client for downloading filter lists.
+    pub http_client: reqwest::Client,
 
     /// Userscript manager
     pub userscript_manager: Arc<UserscriptManager>,
@@ -309,10 +317,13 @@ impl RateLimiters {
 }
 
 /// Build the application state from components
+#[allow(clippy::too_many_arguments)]
 pub async fn build_state(
     api_config: ApiConfig,
     proxy_config: ProxyConfig,
-    filter_engine: FilterEngine,
+    shared_engine: Arc<SharedEngine>,
+    filter_store: Arc<FilterListStore>,
+    http_client: reqwest::Client,
     userscript_manager: Arc<UserscriptManager>,
     userscript_runtime: Arc<UserscriptRuntime>,
     config_path: PathBuf,
@@ -348,13 +359,15 @@ pub async fn build_state(
         mitm_cached_certs: Arc::new(AtomicU64::new(0)),
     });
 
-    // Get a cloneable stats handle from the filter engine
-    // The FilterEngine itself cannot be stored in AppState because adblock::Engine is not Send/Sync
-    let filter_stats = filter_engine.stats_handle();
+    // Stats live in the shared engine; the handle is cheap to clone and thread-safe.
+    let filter_stats = shared_engine.stats_handle();
 
     Ok(Arc::new(AppState {
         proxy_state,
         filter_stats,
+        shared_engine,
+        filter_store,
+        http_client,
         userscript_manager,
         userscript_runtime,
         session_store,

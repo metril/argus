@@ -46,6 +46,8 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod filter_service;
+pub mod filter_store;
 pub mod handlers;
 pub mod middleware;
 pub mod openapi;
@@ -55,6 +57,8 @@ pub mod state;
 // Re-export commonly used items
 pub use config::ApiConfig;
 pub use error::{ApiError, ApiResult};
+pub use filter_service::{reload_now, trigger_reload};
+pub use filter_store::{open_filter_store, FilterListStore};
 pub use openapi::ApiDoc;
 pub use server::{create_router, start_server};
 pub use state::{build_state, AppState, ProxyState, ProxyStats};

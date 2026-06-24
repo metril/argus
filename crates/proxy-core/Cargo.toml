@@ -24,6 +24,8 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 h2 = { workspace = true }
 http-body-util = { workspace = true }
+# Shared pooled upstream client for forwarding proxied requests (TLS-capable, streaming).
+reqwest = { workspace = true, features = ["stream"] }
 
 # TLS
 rustls = { workspace = true }
@@ -84,8 +86,8 @@ common = { path = "../common" }
 # HTTP/3 support (optional)
 proxy-http3 = { path = "../proxy-http3", optional = true }
 
-# Filter engine (optional)
-filter-engine = { path = "../filter-engine", optional = true }
+# Filter engine (always on — request filtering is the core of the proxy)
+filter-engine = { path = "../filter-engine" }
 
 # Userscript engine (optional)
 userscript-engine = { path = "../userscript-engine", optional = true }
@@ -97,9 +99,9 @@ web-api = { path = "../web-api", optional = true }
 default = []
 http3 = ["proxy-http3"]
 websockets = ["proxy-http3"]
-adblock = ["filter-engine"]
+adblock = []
 userscripts = ["userscript-engine"]
-webui = ["web-api", "filter-engine", "userscript-engine"]
+webui = ["web-api", "userscript-engine"]
 full = ["http3", "websockets", "adblock", "userscripts", "webui"]
 
 [dev-dependencies]

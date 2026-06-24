@@ -10,6 +10,7 @@
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{ApiError, ApiResult};
+use crate::filter_service::trigger_reload;
 use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -51,31 +52,27 @@ pub struct ListFiltersQuery {
 ///
 /// GET /api/filters/lists
 pub async fn list_filter_lists(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(_auth_user): Extension<AuthUser>,
     Query(query): Query<ListFiltersQuery>,
 ) -> ApiResult<Json<PaginatedResponse<FilterListResponse>>> {
-    // Note: FilterListManager is not stored in AppState because adblock::Engine is !Send
-    // For now, return empty list - in a real implementation, we'd need a different approach
-    // such as storing filter list metadata separately
-
-    let lists: Vec<FilterListResponse> = Vec::new();
+    let lists = state.filter_store.get_all()?;
 
     let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
 
     // Filter by enabled status if specified
-    let filtered_lists: Vec<_> = if let Some(enabled) = query.enabled {
-        lists.into_iter().filter(|l| l.enabled == enabled).collect()
-    } else {
-        lists
-    };
+    let filtered: Vec<FilterListResponse> = lists
+        .into_iter()
+        .filter(|l| query.enabled.is_none_or(|e| l.enabled == e))
+        .map(|l| filter_list_response(&l))
+        .collect();
 
-    let total = filtered_lists.len();
+    let total = filtered.len();
 
     // Paginate
     let start = ((page - 1) * limit) as usize;
-    let paginated: Vec<_> = filtered_lists.into_iter().skip(start).take(limit as usize).collect();
+    let paginated: Vec<_> = filtered.into_iter().skip(start).take(limit as usize).collect();
 
     Ok(Json(PaginatedResponse {
         data: paginated,
@@ -89,7 +86,7 @@ pub async fn list_filter_lists(
 ///
 /// POST /api/filters/lists
 pub async fn add_filter_list(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<AddFilterListRequest>,
 ) -> ApiResult<Json<FilterListResponse>> {
@@ -107,10 +104,23 @@ pub async fn add_filter_list(
     // Validate URL for SSRF protection
     validate_filter_url(&req.url)?;
 
-    // Create filter list
-    let list = filter_engine::FilterList::new(req.id.clone(), req.name.clone(), req.url.clone());
+    // Reject duplicate ids so an add can't silently clobber an existing list.
+    if state.filter_store.exists(&req.id)? {
+        return Err(ApiError::AlreadyExists(format!(
+            "Filter list '{}'",
+            req.id
+        )));
+    }
+
+    // Create and persist the filter list.
+    let mut list = filter_engine::FilterList::new(req.id.clone(), req.name.clone(), req.url.clone());
+    list.enabled = req.enabled.unwrap_or(true);
+    state.filter_store.upsert(&list)?;
 
     info!("Filter list added by {}: {} ({})", auth_user.username(), req.name, req.id);
+
+    // Recompile the engine in the background so the new list takes effect (and downloads).
+    trigger_reload(&state);
 
     Ok(Json(filter_list_response(&list)))
 }
@@ -119,19 +129,21 @@ pub async fn add_filter_list(
 ///
 /// GET /api/filters/lists/:id
 pub async fn get_filter_list(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(_auth_user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<FilterListResponse>> {
-    // For now, return not found since we can't access FilterListManager
-    Err(ApiError::NotFound(format!("Filter list '{}' not found", id)))
+    match state.filter_store.get(&id)? {
+        Some(list) => Ok(Json(filter_list_response(&list))),
+        None => Err(ApiError::NotFound(format!("Filter list '{}' not found", id))),
+    }
 }
 
 /// Update a filter list
 ///
 /// PUT /api/filters/lists/:id
 pub async fn update_filter_list(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Path(id): Path<String>,
     Json(req): Json<UpdateFilterListRequest>,
@@ -152,15 +164,40 @@ pub async fn update_filter_list(
         validate_filter_url(url)?;
     }
 
-    // For now, return not found since we can't access FilterListManager
-    Err(ApiError::NotFound(format!("Filter list '{}' not found", id)))
+    let mut list = state
+        .filter_store
+        .get(&id)?
+        .ok_or_else(|| ApiError::NotFound(format!("Filter list '{}' not found", id)))?;
+
+    // Apply changes. A changed URL invalidates the cached content/etag.
+    if let Some(name) = req.name {
+        list.name = name;
+    }
+    if let Some(url) = req.url {
+        if url != list.url {
+            list.url = url;
+            list.etag = None;
+            list.last_updated = None;
+            list.rule_count = 0;
+        }
+    }
+    if let Some(enabled) = req.enabled {
+        list.enabled = enabled;
+    }
+
+    state.filter_store.upsert(&list)?;
+    info!("Filter list '{}' updated by {}", id, auth_user.username());
+
+    trigger_reload(&state);
+
+    Ok(Json(filter_list_response(&list)))
 }
 
 /// Delete a filter list
 ///
 /// DELETE /api/filters/lists/:id
 pub async fn delete_filter_list(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
@@ -171,7 +208,13 @@ pub async fn delete_filter_list(
         ));
     }
 
+    if !state.filter_store.remove(&id)? {
+        return Err(ApiError::NotFound(format!("Filter list '{}' not found", id)));
+    }
+
     info!("Filter list '{}' deleted by {}", id, auth_user.username());
+
+    trigger_reload(&state);
 
     Ok(Json(json!({ "message": format!("Filter list '{}' deleted", id) })))
 }
