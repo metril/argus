@@ -84,7 +84,10 @@ async fn start_webui_server(
 ) -> Result<tokio::task::JoinHandle<()>> {
     use tracing::warn;
     use userscript_engine::{UserscriptManager, UserscriptRuntime};
-    use web_api::{build_state, open_filter_store, reload_now, start_server, ApiConfig};
+    use web_api::{
+        build_state, ensure_scriptlet_resources, open_filter_store, reload_now, start_server,
+        ApiConfig,
+    };
 
     info!("Initializing Web UI server...");
 
@@ -106,7 +109,15 @@ async fn start_webui_server(
     if config.adblock.enabled {
         let (store, engine, client) =
             (filter_store.clone(), shared_engine.clone(), list_client.clone());
+        let data_dir = config.adblock.data_dir.clone();
+        let resources_url = config.adblock.scriptlet_resources_url.clone();
+        let resource_engine = shared_engine.clone();
+        let resource_client = list_client.clone();
         tokio::spawn(async move {
+            // Load the scriptlet resource library first so `##+js(...)` rules can inject, then
+            // compile the lists.
+            ensure_scriptlet_resources(data_dir, resource_engine, resource_client, resources_url)
+                .await;
             info!("Performing initial filter list load...");
             if let Err(e) = reload_now(store, engine, client).await {
                 warn!("Initial filter load failed: {}", e);

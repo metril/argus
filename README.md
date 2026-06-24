@@ -31,6 +31,14 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - Extended CSS selectors (`#?#`, `#@?#`) with `:has()`, `:contains()`, `:xpath()`, etc.
   - CSS injection rules (`#$#`, `#@$#`) for style modifications
   - Domain-specific and exception rules
+  - Injected into HTML responses via the MITM proxy (streaming, gzip/br aware), with a
+    dynamic class/id helper and a procedural-filter evaluator (`:has-text`, `:matches-css`, …)
+- ✅ Scriptlet injection (`##+js(...)`): uBlock Origin's scriptlets are fetched at runtime
+  (GPLv3, not vendored), converted to adblock-rust resources, and cached under `data/filters`.
+  Configurable (or disabled with `""`) via `[adblock] scriptlet_resources_url`.
+- ✅ Custom user rules: block/allow (`@@`)/cosmetic rules editable in the Web UI, compiled into
+  the engine alongside subscribed lists
+- ✅ Filtering across HTTP/1.1, HTTP/2, WebSocket, and HTTP/3 (build with `--features full`)
 - ✅ Scriptlet injection (`#%#`, `#@%#`)
   - JavaScript injection for complex filtering scenarios
   - Built-in scriptlet library (abort-on-property-read, set-constant, remove-class, etc.)

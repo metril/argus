@@ -43,14 +43,16 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Stage 3: Builder - build dependencies (cached) then source
 FROM chef AS builder
 
-# Build dependencies only (this layer is cached until Cargo.toml/lock change)
+# Build dependencies only (this layer is cached until Cargo.toml/lock change).
+# `full` compiles in the Web UI, ad blocking, userscripts, WebSocket, and HTTP/3 support so they
+# are present in the shipped binary (HTTP/3 still only starts when enabled in config).
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --features webui
+RUN cargo chef cook --release --recipe-path recipe.json --features full
 
 # Now copy source and build (only our code compiles; deps are cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker --features webui
+RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker --features full
 
 # Copy binary to a known location and verify
 RUN cp /build/target/release/adblocker /build/adblocker && \

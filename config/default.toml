@@ -27,6 +27,11 @@ enabled = true
 data_dir = "data/filters"
 auto_update = true
 update_interval_hours = 24
+# uBlock Origin scriptlet source directory (GitHub contents API). Fetched once, converted to
+# adblock-rust resources, and cached so `##+js(...)` scriptlet rules can inject. May also point to
+# a single uBO scriptlets.js (.js) or a pre-built adblock-rust resources array (.json). Set to ""
+# to disable scriptlet injection.
+scriptlet_resources_url = "https://api.github.com/repos/gorhill/uBlock/contents/src/js/resources"
 
 [webui]
 enabled = true

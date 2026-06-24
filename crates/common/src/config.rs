@@ -52,6 +52,17 @@ pub struct AdblockSettings {
     pub data_dir: PathBuf,
     pub auto_update: bool,
     pub update_interval_hours: u64,
+    /// URL of a uBO-compatible scriptlet/redirect resource library (JSON array of resources).
+    /// Downloaded once and cached so `##+js(...)` scriptlet rules can inject. Empty disables it.
+    #[serde(default = "default_scriptlet_resources_url")]
+    pub scriptlet_resources_url: String,
+}
+
+fn default_scriptlet_resources_url() -> String {
+    // uBlock Origin's scriptlet source directory (GitHub contents API). Every `.js` file is
+    // downloaded, concatenated, and converted to adblock-rust resources at runtime. Fetched on the
+    // user's machine (not vendored) since uBO's scriptlets are GPLv3.
+    "https://api.github.com/repos/gorhill/uBlock/contents/src/js/resources".to_string()
 }
 
 impl Default for AdblockSettings {
@@ -61,6 +72,7 @@ impl Default for AdblockSettings {
             data_dir: PathBuf::from("data/filters"),
             auto_update: true,
             update_interval_hours: 24,
+            scriptlet_resources_url: default_scriptlet_resources_url(),
         }
     }
 }

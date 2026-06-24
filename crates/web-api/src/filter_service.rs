@@ -123,6 +123,106 @@ pub async fn reload_now(
     Ok(())
 }
 
+/// Ensure the scriptlet resource library is loaded into `shared_engine`.
+///
+/// Uses a cached `<data_dir>/resources.json` (already in adblock-rust format) if present. Otherwise
+/// fetches from `url` and caches the converted result. `url` may be:
+/// - a GitHub *contents* API URL of uBlock Origin's `src/js/resources/` directory — every `.js`
+///   file is downloaded, concatenated, and converted (this is the default, giving the full set);
+/// - a single uBO `scriptlets.js` file (`.js`) — fetched and converted;
+/// - a pre-built adblock-rust resources array (`.json`) — used directly.
+///
+/// No-op if `url` is empty. This is what makes `##+js(...)` scriptlet rules actually inject;
+/// without it, scriptlets degrade to no-ops (CSS hiding still works).
+pub async fn ensure_scriptlet_resources(
+    data_dir: std::path::PathBuf,
+    shared_engine: Arc<SharedEngine>,
+    http_client: Client,
+    url: String,
+) {
+    if url.trim().is_empty() {
+        return;
+    }
+    let cache = data_dir.join("resources.json");
+
+    // Prefer the cached (already-converted) copy.
+    if let Ok(json) = tokio::fs::read_to_string(&cache).await {
+        match shared_engine.set_resources_from_json(&json) {
+            Ok(n) => {
+                info!("Loaded {n} scriptlet resources from cache");
+                return;
+            }
+            Err(e) => warn!("Cached resources.json invalid ({e}); re-fetching"),
+        }
+    }
+
+    // Fetch + (if needed) convert to the adblock-rust resources JSON.
+    let json = match fetch_resources_json(&http_client, &url).await {
+        Some(j) => j,
+        None => return,
+    };
+
+    match shared_engine.set_resources_from_json(&json) {
+        Ok(n) => {
+            info!("Loaded {n} scriptlet resources");
+            if let Some(parent) = cache.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Err(e) = tokio::fs::write(&cache, &json).await {
+                warn!("Failed to cache resources.json: {e}");
+            }
+        }
+        Err(e) => warn!("Scriptlet resources invalid after conversion: {e}"),
+    }
+}
+
+/// Fetch resources from `url` and return them as an adblock-rust resources JSON array.
+async fn fetch_resources_json(client: &Client, url: &str) -> Option<String> {
+    if url.contains("api.github.com") && url.contains("/contents/") {
+        // Directory listing: download every `.js` file, concatenate, convert.
+        let listing = client.get(url).send().await.ok()?;
+        if !listing.status().is_success() {
+            warn!("Scriptlet resource listing HTTP {}", listing.status());
+            return None;
+        }
+        let entries: serde_json::Value = listing.json().await.ok()?;
+        let mut combined = String::new();
+        for entry in entries.as_array()?.iter() {
+            let name = entry["name"].as_str().unwrap_or("");
+            let dl = entry["download_url"].as_str().unwrap_or("");
+            if !name.ends_with(".js") || dl.is_empty() {
+                continue;
+            }
+            match client.get(dl).send().await {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(text) = r.text().await {
+                        combined.push('\n');
+                        combined.push_str(&text);
+                    }
+                }
+                _ => warn!("Failed to fetch scriptlet file {name}"),
+            }
+        }
+        if combined.trim().is_empty() {
+            return None;
+        }
+        filter_engine::ubo_scriptlets_to_json(&combined).ok()
+    } else {
+        // Single file.
+        let resp = client.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            warn!("Scriptlet resources HTTP {}", resp.status());
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        if url.ends_with(".json") {
+            Some(body) // already adblock-rust format
+        } else {
+            filter_engine::ubo_scriptlets_to_json(&body).ok()
+        }
+    }
+}
+
 /// Fire-and-forget reload using the handles in [`AppState`]; logs failures.
 ///
 /// Called after any list mutation so the running engine reflects the change without blocking the

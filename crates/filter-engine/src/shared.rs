@@ -12,6 +12,7 @@
 //! deserialize. This scales linearly across worker threads to hundreds of concurrent clients.
 
 use adblock::lists::{FilterSet, ParseOptions};
+use adblock::resources::Resource;
 use adblock::Engine as AdblockEngine;
 use arc_swap::ArcSwap;
 use std::cell::RefCell;
@@ -52,6 +53,9 @@ pub struct SharedEngine {
     generation: AtomicU64,
     /// Master on/off switch (independent of the compiled ruleset).
     enabled: AtomicBool,
+    /// Scriptlet/redirect resource library (uBO-compatible). Empty until loaded; applied to each
+    /// worker's engine after deserialize so `##+js(...)` scriptlets resolve.
+    resources: ArcSwap<Vec<Resource>>,
     /// Shared, thread-safe blocking statistics.
     stats: FilterStats,
 }
@@ -69,8 +73,21 @@ impl SharedEngine {
             blob: ArcSwap::new(Arc::new(Vec::new())),
             generation: AtomicU64::new(0),
             enabled: AtomicBool::new(true),
+            resources: ArcSwap::new(Arc::new(Vec::new())),
             stats: FilterStats::new(),
         }
+    }
+
+    /// Load the scriptlet/redirect resource library from a JSON array of uBO-compatible resources
+    /// (e.g. Brave's `resources.json`). Bumps the generation so every worker re-applies them.
+    /// Returns the number of resources loaded.
+    pub fn set_resources_from_json(&self, json: &str) -> Result<usize, serde_json::Error> {
+        let resources: Vec<Resource> = serde_json::from_str(json)?;
+        let n = resources.len();
+        self.resources.store(Arc::new(resources));
+        self.generation.fetch_add(1, Ordering::Release);
+        info!("Loaded {n} scriptlet/redirect resources");
+        Ok(n)
     }
 
     /// Install a freshly compiled, serialized engine and make every worker rebuild on next use.
@@ -114,6 +131,12 @@ impl SharedEngine {
                         if let Err(e) = engine.deserialize(&blob) {
                             warn!("Failed to deserialize filter engine (generation {current_gen}): {e:?}; using empty engine");
                         }
+                    }
+                    // Re-apply the scriptlet resource library so `##+js(...)` rules resolve. Not
+                    // part of the serialized blob, so it must be set on each worker's engine.
+                    let resources = self.resources.load();
+                    if !resources.is_empty() {
+                        engine.use_resources(resources.iter().cloned());
                     }
                     *cell.borrow_mut() = Some((current_gen, engine));
                 }
@@ -301,6 +324,38 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&cos.procedural_actions[0]).expect("procedural action is JSON");
         assert_eq!(v["action"]["type"], "remove");
+    }
+
+    #[test]
+    fn scriptlet_injects_only_after_resources_loaded() {
+        use base64::Engine as _;
+        let shared = SharedEngine::new();
+        shared.install(compile_engine(&["example.com##+js(noopjs)\n".to_string()]));
+
+        // Without the resource library, scriptlets resolve to nothing (graceful degradation).
+        assert!(
+            shared
+                .cosmetic_for("https://example.com/")
+                .injected_script
+                .is_empty()
+        );
+
+        // Load a uBO-style resource named `noopjs.js` (lookup applies a `.js` extension).
+        let content = base64::engine::general_purpose::STANDARD.encode("(function(){})();");
+        let json = serde_json::json!([{
+            "name": "noopjs.js",
+            "aliases": [],
+            "kind": {"mime": "application/javascript"},
+            "content": content,
+        }])
+        .to_string();
+        assert_eq!(shared.set_resources_from_json(&json).unwrap(), 1);
+
+        let cos = shared.cosmetic_for("https://example.com/");
+        assert!(
+            !cos.injected_script.is_empty(),
+            "scriptlet should inject once the resource library is loaded"
+        );
     }
 
     #[test]

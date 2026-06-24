@@ -57,7 +57,7 @@ pub mod state;
 // Re-export commonly used items
 pub use config::ApiConfig;
 pub use error::{ApiError, ApiResult};
-pub use filter_service::{reload_now, trigger_reload};
+pub use filter_service::{ensure_scriptlet_resources, reload_now, trigger_reload};
 pub use filter_store::{open_filter_store, FilterListStore};
 pub use openapi::ApiDoc;
 pub use server::{create_router, start_server};
