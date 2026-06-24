@@ -113,6 +113,26 @@ impl ConnectionHandler {
                     }
                 };
 
+                // Filter the WebSocket target. adblock matches http(s) URLs, so normalize the
+                // scheme; `$websocket` rules still match on host/path.
+                let check_url = target_url
+                    .replacen("wss://", "https://", 1)
+                    .replacen("ws://", "http://", 1);
+                let origin = req
+                    .headers()
+                    .get(hyper::header::ORIGIN)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or(&check_url)
+                    .to_string();
+                if self.ctx.should_block(&check_url, &origin, "websocket") {
+                    info!("Blocked WebSocket to {}", target_url);
+                    return Ok(Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("x-adblock", "blocked")
+                        .body(full_body(Bytes::from_static(b"Blocked")))
+                        .unwrap());
+                }
+
                 // Spawn WebSocket proxy task with hyper upgrade
                 tokio::spawn(async move {
                     match hyper::upgrade::on(&mut req).await {

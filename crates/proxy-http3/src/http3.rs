@@ -1,21 +1,25 @@
 //! HTTP/3 server implementation
 
+use crate::filter::Http3Filter;
 use crate::{Error, Result};
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use h3::server::Connection;
 use quinn::Endpoint;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
-/// HTTP/3 server that handles QUIC connections
+/// HTTP/3 server that handles QUIC connections, applying ad-block filtering and forwarding
+/// requests upstream (over the shared pooled client) — the same engine the HTTP/1.1/2 paths use.
 pub struct Http3Server {
     endpoint: Endpoint,
+    filter: Arc<Http3Filter>,
 }
 
 impl Http3Server {
-    /// Create a new HTTP/3 server
-    pub fn new(endpoint: Endpoint) -> Self {
-        Self { endpoint }
+    /// Create a new HTTP/3 server with the shared filtering context.
+    pub fn new(endpoint: Endpoint, filter: Arc<Http3Filter>) -> Self {
+        Self { endpoint, filter }
     }
 
     /// Start the HTTP/3 server with graceful shutdown
@@ -33,10 +37,11 @@ impl Http3Server {
 
                     // Clone shutdown receiver for this connection
                     let conn_shutdown = shutdown_rx.resubscribe();
+                    let filter = self.filter.clone();
 
                     // Spawn task to handle this connection
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(incoming, conn_shutdown).await {
+                        if let Err(e) = handle_connection(incoming, conn_shutdown, filter).await {
                             error!("Connection error: {}", e);
                         }
                     });
@@ -67,6 +72,7 @@ impl Http3Server {
 async fn handle_connection(
     incoming: quinn::Incoming,
     mut shutdown_rx: broadcast::Receiver<()>,
+    filter: Arc<Http3Filter>,
 ) -> Result<()> {
     // Accept the QUIC connection
     let connection = incoming.await.map_err(Error::QuicConnection)?;
@@ -88,11 +94,12 @@ async fn handle_connection(
                 match result {
                     Ok(Some(resolver)) => {
                         // Spawn task to resolve and handle this request
+                        let filter = filter.clone();
                         tokio::spawn(async move {
                             match resolver.resolve_request().await {
                                 Ok((req, stream)) => {
                                     debug!("HTTP/3 request: {} {}", req.method(), req.uri());
-                                    if let Err(e) = handle_request(req, stream).await {
+                                    if let Err(e) = handle_request(req, stream, &filter).await {
                                         error!("Request handling error: {}", e);
                                     }
                                 }
@@ -124,38 +131,87 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Handle a single HTTP/3 request
+/// Handle a single HTTP/3 request: filter, then forward upstream and relay the response.
 async fn handle_request(
     req: http::Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    filter: &Http3Filter,
 ) -> Result<()> {
-    debug!("Handling request: {} {}", req.method(), req.uri());
+    let method = req.method().clone();
+    let url = req.uri().to_string();
 
-    // For now, just return a simple response
-    // In the future, this will integrate with the proxy pipeline
-    let response = http::Response::builder()
-        .status(200)
-        .header("content-type", "text/plain")
-        .body(())
-        .map_err(|e| Error::Http3Protocol(format!("Failed to build response: {}", e)))?;
-
-    stream
-        .send_response(response)
+    // Read the (buffered) request body.
+    let mut body = Vec::new();
+    while let Some(mut buf) = stream
+        .recv_data()
         .await
-        .map_err(|e| Error::Http3Protocol(format!("Failed to send response: {}", e)))?;
+        .map_err(|e| Error::Http3Protocol(format!("recv body: {e}")))?
+    {
+        while buf.remaining() > 0 {
+            let chunk = buf.chunk();
+            body.extend_from_slice(chunk);
+            let n = chunk.len();
+            buf.advance(n);
+        }
+    }
 
-    let body = Bytes::from("HTTP/3 Proxy - Coming Soon\n");
-    stream
-        .send_data(body)
-        .await
-        .map_err(|e| Error::Http3Protocol(format!("Failed to send data: {}", e)))?;
+    // Filter decision (network-level). Blocked requests get a 204 and never reach the origin.
+    if filter.is_blocked(&method, &url, req.headers()) {
+        debug!("HTTP/3 blocked {}", url);
+        let response = http::Response::builder()
+            .status(204)
+            .header("x-adblock", "blocked")
+            .body(())
+            .map_err(|e| Error::Http3Protocol(format!("build response: {e}")))?;
+        stream
+            .send_response(response)
+            .await
+            .map_err(|e| Error::Http3Protocol(format!("send response: {e}")))?;
+        stream
+            .finish()
+            .await
+            .map_err(|e| Error::Http3Protocol(format!("finish: {e}")))?;
+        return Ok(());
+    }
+
+    // Forward upstream and relay the response back over HTTP/3.
+    match filter.forward(method, &url, req.headers(), body).await {
+        Ok((status, headers, payload)) => {
+            let mut builder = http::Response::builder().status(status);
+            for (name, value) in headers.iter() {
+                builder = builder.header(name, value);
+            }
+            let response = builder
+                .body(())
+                .map_err(|e| Error::Http3Protocol(format!("build response: {e}")))?;
+            stream
+                .send_response(response)
+                .await
+                .map_err(|e| Error::Http3Protocol(format!("send response: {e}")))?;
+            if !payload.is_empty() {
+                stream
+                    .send_data(payload)
+                    .await
+                    .map_err(|e| Error::Http3Protocol(format!("send data: {e}")))?;
+            }
+        }
+        Err(e) => {
+            error!("HTTP/3 upstream error for {}: {}", url, e);
+            let response = http::Response::builder()
+                .status(502)
+                .body(())
+                .map_err(|e| Error::Http3Protocol(format!("build response: {e}")))?;
+            stream
+                .send_response(response)
+                .await
+                .map_err(|e| Error::Http3Protocol(format!("send response: {e}")))?;
+        }
+    }
 
     stream
         .finish()
         .await
-        .map_err(|e| Error::Http3Protocol(format!("Failed to finish stream: {}", e)))?;
-
-    debug!("Request completed successfully");
+        .map_err(|e| Error::Http3Protocol(format!("finish: {e}")))?;
     Ok(())
 }
 
@@ -192,7 +248,12 @@ mod tests {
         );
 
         let endpoint = quic_config.create_endpoint().unwrap();
-        let server = Http3Server::new(endpoint);
+        let filter = Arc::new(Http3Filter::new(
+            Arc::new(filter_engine::SharedEngine::new()),
+            reqwest::Client::new(),
+            false,
+        ));
+        let server = Http3Server::new(endpoint, filter);
 
         // Verify server was created
         assert!(server.local_addr().is_ok());

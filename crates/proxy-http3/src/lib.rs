@@ -6,11 +6,13 @@
 //! This module also provides WebSocket proxying capabilities.
 
 pub mod error;
+pub mod filter;
 pub mod http3;
 pub mod quic;
 pub mod websocket;
 
 pub use error::{Error, Result};
+pub use filter::Http3Filter;
 pub use http3::Http3Server;
 pub use quic::QuicConfig;
 pub use websocket::{extract_ws_target, is_websocket_upgrade, proxy_websocket};

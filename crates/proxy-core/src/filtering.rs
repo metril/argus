@@ -55,6 +55,23 @@ impl ProxyContext {
         &self.engine
     }
 
+    /// The shared pooled upstream client.
+    pub fn client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
+
+    /// Whether ad blocking is enabled.
+    pub fn adblock_enabled(&self) -> bool {
+        self.adblock_enabled
+    }
+
+    /// Whether a request should be blocked (respects the master adblock toggle, records stats).
+    ///
+    /// Shared by the HTTP, WebSocket, and HTTP/3 paths.
+    pub fn should_block(&self, url: &str, source_url: &str, resource_type: &str) -> bool {
+        self.adblock_enabled && self.engine.check(url, source_url, resource_type).blocked
+    }
+
     /// Forward a proxied request upstream, blocking it first if the filter engine says so.
     ///
     /// `scheme` is the upstream scheme (`http` for plain proxying, `https` for MITM'd traffic).

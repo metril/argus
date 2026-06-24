@@ -227,7 +227,7 @@ impl ProxyServer {
     /// Start HTTP/3 server (optional feature)
     #[cfg(feature = "http3")]
     async fn start_http3_server(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
-        use proxy_http3::{Http3Server, QuicConfig};
+        use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
 
         // HTTP/3 requires MITM to be enabled for certificate generation
         let mitm_handler = self.mitm_handler.as_ref()
@@ -269,8 +269,13 @@ impl ProxyServer {
 
         info!("HTTP/3 server will start on UDP {}", udp_addr);
 
-        // Spawn HTTP/3 server in background
-        let http3_server = Http3Server::new(endpoint);
+        // Spawn HTTP/3 server in background, sharing the same filtering engine + upstream client.
+        let h3_filter = Arc::new(Http3Filter::new(
+            self.ctx.engine().clone(),
+            self.ctx.client(),
+            self.ctx.adblock_enabled(),
+        ));
+        let http3_server = Http3Server::new(endpoint, h3_filter);
         tokio::spawn(async move {
             if let Err(e) = http3_server.start(shutdown_rx).await {
                 warn!("HTTP/3 server error: {}", e);
