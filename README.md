@@ -125,17 +125,31 @@ The three ports: **8080** (HTTP proxy), **8443** (HTTPS proxy), **3000** (Web UI
 1. **Start it** — `./target/release/adblocker` (or `docker-compose up -d`).
 2. **Create your account** — open `http://localhost:3000` and register. The **first** user
    registered automatically becomes the admin.
-3. **Install the root CA** — download it from the Web UI (Settings → CA certificate, served at
-   `http://localhost:3000`), then trust it so MITM'd HTTPS pages validate:
+3. **Install the root CA** — in the Web UI go to **Settings → CA Certificate → Download CA
+   Certificate**, or fetch it directly from any device at `http://<server>:3000/api/ca.crt` (this
+   endpoint is public so phones and other machines can grab it by URL). Then trust it so MITM'd
+   HTTPS pages validate:
+   - **macOS**: open the downloaded file → add to the **System** keychain in Keychain Access →
+     double-click it → expand **Trust** → set **When using this certificate: Always Trust**.
    - **Chrome/Edge**: Settings > Privacy and security > Security > Manage certificates
    - **Firefox**: Settings > Privacy & Security > Certificates > View Certificates > Authorities > Import
-   - **macOS**: Keychain Access > System > Import
-   - **Linux**: `sudo cp root-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`
-4. **Point your device/browser at the proxy** — HTTP proxy `localhost:8080`, HTTPS proxy
-   `localhost:8080` (SOCKS not supported).
+   - **Linux**: `sudo cp adblocker-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`
+
+   Full per-OS/browser instructions: [docs/CA-INSTALLATION.md](docs/CA-INSTALLATION.md).
+4. **Point your device/browser at the proxy** — set **both** the HTTP and HTTPS proxy to the
+   server on port **8080** (SOCKS not supported). The proxy binds `0.0.0.0`, so from another
+   machine use the server's LAN IP (e.g. `192.168.1.50:8080`), **not** `localhost`.
+   - **macOS**: System Settings → Network → (your interface) → Details → Proxies → enable **Web
+     Proxy (HTTP)** and **Secure Web Proxy (HTTPS)**, both `Server: <server-ip>`, `Port: 8080`.
 5. **Manage blocklists** — the default lists (EasyList, EasyPrivacy, AdGuard Base/Tracking) are
    seeded and downloaded automatically; add your own under **Filters**. Lists are **persisted**
    (Sled) and survive restarts, and the engine recompiles automatically when you change them.
+6. **Verify it's working**:
+   - `curl http://<server>:3000/api/health` returns `{"status":"healthy",...}`.
+   - With your device browsing through the proxy, the **Requests Checked / Blocked** counters on
+     the **Filters** page climb, and the proxy logs show per-connection lines.
+   - **#1 gotcha:** if HTTPS pages error with a certificate warning, the CA from step 3 isn't
+     trusted yet — that's almost always why "the proxy doesn't seem to work."
 
 That's it — ad/tracker requests matching your enabled lists are now blocked at the proxy.
 
