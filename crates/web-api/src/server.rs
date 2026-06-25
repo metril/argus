@@ -45,10 +45,12 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
         .merge(protected_auth_routes)
         .with_state(state.clone());
 
-    // Health routes (public)
+    // Health + public download routes (no authentication required)
     let health_router = Router::new()
         .route("/health", get(handlers::health::health_check))
         .route("/metrics", get(handlers::health::metrics))
+        // CA certificate is public so any device can fetch and trust it by URL.
+        .route("/ca.crt", get(handlers::certificate::download_ca))
         .with_state(state.clone());
 
     // Proxy management routes (protected)

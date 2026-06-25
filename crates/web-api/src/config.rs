@@ -69,7 +69,7 @@ pub struct AuthConfig {
     /// Path to JWT secret file
     pub jwt_secret_path: PathBuf,
 
-    /// Access token expiry in seconds (15 minutes)
+    /// Access token expiry in seconds (1 hour)
     pub access_token_expiry_seconds: u64,
 
     /// Refresh token expiry in seconds (7 days)
@@ -89,7 +89,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             jwt_secret_path: PathBuf::from("data/jwt_secret"),
-            access_token_expiry_seconds: 900,    // 15 minutes
+            access_token_expiry_seconds: 3600,    // 1 hour
             refresh_token_expiry_seconds: 604800, // 7 days
             bcrypt_cost: 12,
             issuer: "adblocker-api".to_string(),

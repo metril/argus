@@ -6,6 +6,7 @@ use crate::api::auth::SessionInfo;
 use crate::api::ApiClient;
 use crate::components::{Card, Layout};
 use crate::state::{use_app_state, use_auth_state};
+use crate::utils::api_base_url;
 
 /// Settings page component
 #[component]
@@ -18,6 +19,9 @@ pub fn SettingsPage() -> impl IntoView {
 
     let user = auth_state.user;
     let theme = app_state.theme;
+
+    // Public URL of the root CA certificate (same origin as the API).
+    let ca_url = format!("{}/api/ca.crt", api_base_url());
 
     // Action signal for session revocation
     let revoke_id = RwSignal::new(Option::<String>::None);
@@ -104,6 +108,29 @@ pub fn SettingsPage() -> impl IntoView {
                             }}
                         </button>
                     </div>
+                </Card>
+
+                <Card title="CA Certificate" class="settings-card">
+                    <p class="form-help">
+                        "Install this root certificate on each device, then point that device's "
+                        "HTTP and HTTPS proxy at this server on port 8080. Without it, MITM'd "
+                        "HTTPS pages will fail to load."
+                    </p>
+                    <div class="modal-actions">
+                        <a class="btn btn-primary" href=ca_url.clone() download="adblocker-ca.crt">
+                            "Download CA Certificate"
+                        </a>
+                    </div>
+                    <p class="form-help">
+                        "Or fetch it directly from any device at: "
+                        <code>{ca_url.clone()}</code>
+                    </p>
+                    <p class="form-help">
+                        "macOS: open the downloaded file, add it to the System keychain in "
+                        "Keychain Access, then double-click it, expand \"Trust\", and set "
+                        "\"When using this certificate\" to \"Always Trust\". See "
+                        "docs/CA-INSTALLATION.md for Windows, Linux, iOS, Android and browsers."
+                    </p>
                 </Card>
 
                 <Card title="Sessions" class="settings-card">

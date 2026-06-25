@@ -17,7 +17,7 @@ leptos_router = { workspace = true }
 
 # HTTP client for browser
 gloo-net = "0.6"
-gloo-timers = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
 gloo-storage = "0.3"
 
 # Serialization

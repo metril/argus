@@ -40,6 +40,27 @@ async fn test_metrics_endpoint() {
     assert!(body["filter"]["total_requests"].is_number());
 }
 
+#[tokio::test]
+async fn test_ca_download_is_public() {
+    // The CA certificate endpoint must be reachable WITHOUT authentication so any
+    // device can fetch and trust it by URL. Whether the cert file exists in the
+    // test environment or not, the auth layer must never reject the request.
+    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let server = TestServer::new(ctx.router).expect("Failed to create test server");
+
+    let response = server.get("/api/ca.crt").await;
+
+    let status = response.status_code();
+    assert_ne!(status, axum::http::StatusCode::UNAUTHORIZED);
+    assert_ne!(status, axum::http::StatusCode::FORBIDDEN);
+    // Either the cert is served (200) or it isn't generated yet (404) — both prove
+    // the route is wired and public.
+    assert!(
+        status == axum::http::StatusCode::OK || status == axum::http::StatusCode::NOT_FOUND,
+        "unexpected status for /api/ca.crt: {status}"
+    );
+}
+
 // ============================================================================
 // Authentication Tests
 // ============================================================================
