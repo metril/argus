@@ -1,15 +1,11 @@
-//! Userscript engine for Greasemonkey-compatible script execution
+//! Userscript engine for Greasemonkey-compatible userscript management
 //!
 //! Provides a complete Greasemonkey/Tampermonkey-compatible userscript engine with:
 //! - Metadata parsing (@name, @match, @grant, etc.)
 //! - Script storage and management
 //! - Persistent data storage (GM_setValue/GM_getValue)
-//! - JavaScript execution via Boa engine
-//! - Full GM_* API (xmlhttpRequest, notification, addStyle, etc.)
 
 pub mod error;
-pub mod executor;
-pub mod gm_api;
 pub mod manager;
 pub mod metadata;
 pub mod runtime;
@@ -18,13 +14,9 @@ pub mod security;
 pub mod storage;
 
 pub use error::{Error, Result};
-pub use executor::ScriptExecutor;
-pub use gm_api::GmApi;
 pub use manager::{UserscriptManager, UserscriptStats};
 pub use metadata::{RunAt, UserscriptMetadata};
-pub use runtime::{
-    CacheStats, DocumentReadyState, ExecutionResults, PageContext, UserscriptRuntime,
-};
+pub use runtime::{CacheStats, UserscriptRuntime};
 pub use script::Userscript;
 pub use security::{
     AuditEntry, AuditEvent, AuditStatistics, ScriptValidator, SecurityAuditor, SecurityPolicy,

@@ -10,10 +10,6 @@ license.workspace = true
 # Async runtime
 tokio = { workspace = true }
 
-# JavaScript engine
-boa_engine = { workspace = true }
-boa_parser = { workspace = true }
-boa_gc = { workspace = true }
 
 # Database
 sled = { workspace = true }
@@ -30,7 +26,6 @@ tracing = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Utilities
 url = { workspace = true }
@@ -38,20 +33,17 @@ regex = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
-crossbeam = { workspace = true }
 
 # Time
 chrono = { workspace = true }
 
 # Security
-publicsuffix = { workspace = true }
 validator = { workspace = true }
 
 # Encoding
 base64 = "0.22"
 
 # Common utilities
-common = { path = "../common" }
 
 [dev-dependencies]
 tempfile = "3.15"

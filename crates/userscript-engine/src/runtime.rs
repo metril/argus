@@ -1,12 +1,9 @@
 //! Userscript runtime and execution orchestration
 //!
-//! Manages script execution lifecycle, timing, and resource loading.
+//! Prepares userscripts for delivery: validation and @require/@resource loading.
 
 use crate::{
-    executor::ScriptExecutor,
-    gm_api::GmApi,
     manager::UserscriptManager,
-    metadata::RunAt,
     script::Userscript,
     security::{AuditEvent, ScriptValidator, SecurityAuditor, SecurityPolicy},
     storage::UserscriptStorage,
@@ -15,7 +12,7 @@ use crate::{
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Userscript runtime for managing script execution
 pub struct UserscriptRuntime {
@@ -78,72 +75,33 @@ impl UserscriptRuntime {
         &self.security_policy
     }
 
-    /// Execute userscripts for a given URL at a specific timing
-    pub async fn execute_for_url(&self, url: &str, run_at: RunAt) -> Result<ExecutionResults> {
-        info!("Executing userscripts for {} at {:?}", url, run_at);
-
-        let scripts = self.manager.get_scripts_for_url(url);
-        let mut results = ExecutionResults::new();
-
-        for script in scripts {
-            // Check if script should run at this timing
-            if script.metadata.run_at != run_at {
-                debug!(
-                    "Skipping {} (runs at {:?}, not {:?})",
-                    script.name(),
-                    script.metadata.run_at,
-                    run_at
-                );
-                continue;
-            }
-
-            match self.execute_script(&script, url).await {
-                Ok(_) => {
-                    info!("Successfully executed: {}", script.name());
-                    results.executed.push(script.name().to_string());
-
-                    // Record execution
-                    if let Err(e) = self.manager.record_execution(&script.id) {
-                        warn!("Failed to record execution: {}", e);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to execute {}: {}", script.name(), e);
-                    results
-                        .failed
-                        .push((script.name().to_string(), e.to_string()));
-                }
-            }
-        }
-
-        info!(
-            "Execution complete: {} succeeded, {} failed",
-            results.executed.len(),
-            results.failed.len()
-        );
-
-        Ok(results)
+    /// Userscript manager
+    pub fn manager(&self) -> &Arc<UserscriptManager> {
+        &self.manager
     }
 
-    /// Execute a single userscript
-    async fn execute_script(&self, script: &Userscript, url: &str) -> Result<()> {
-        debug!("Executing userscript: {}", script.name());
+    /// Userscript storage
+    pub fn storage(&self) -> &Arc<UserscriptStorage> {
+        &self.storage
+    }
 
-        // Security audit: log execution start
+    /// Validate a script and build its deliverable source: all `@require`
+    /// dependencies (fetched and cached) followed by the script itself.
+    pub async fn prepare_script(&self, script: &Userscript, url: &str) -> Result<String> {
+        debug!("Preparing userscript: {}", script.name());
+
         self.auditor.log_event(
             AuditEvent::ExecutionStart,
             &script.id,
-            &format!("Executing on {}", url),
+            &format!("Preparing for {}", url),
         );
 
-        // Validate script metadata
         self.validator
             .validate_requires(&script.metadata.requires)?;
         self.validator
             .validate_resources(&script.metadata.resources)?;
         self.validator.validate_grants(&script.metadata.grants)?;
 
-        // Validate script source
         if let Err(e) = self.validator.validate_source(&script.source) {
             self.auditor.log_event(
                 AuditEvent::PolicyViolation,
@@ -153,19 +111,14 @@ impl UserscriptRuntime {
             return Err(e);
         }
 
-        // Load @require dependencies
         let mut full_source = String::new();
-
         for require_url in &script.metadata.requires {
-            // Validate URL
             match self.security_policy.validate_url(require_url) {
-                Ok(_) => {
-                    self.auditor.log_event(
-                        AuditEvent::ResourceLoaded,
-                        &script.id,
-                        &format!("Loading @require: {}", require_url),
-                    );
-                }
+                Ok(_) => self.auditor.log_event(
+                    AuditEvent::ResourceLoaded,
+                    &script.id,
+                    &format!("Loading @require: {}", require_url),
+                ),
                 Err(e) => {
                     self.auditor.log_event(
                         AuditEvent::PermissionDenied,
@@ -175,44 +128,11 @@ impl UserscriptRuntime {
                     return Err(e);
                 }
             }
-
-            let code = self.load_require(require_url).await?;
-            full_source.push_str(&code);
+            full_source.push_str(&self.load_require(require_url).await?);
             full_source.push('\n');
         }
-
-        // Add the script itself
         full_source.push_str(&script.source);
-
-        // Create GM API context
-        let gm_api = Arc::new(GmApi::new(
-            script.id.clone(),
-            self.storage.clone(),
-            script.metadata.grants.clone(),
-        ));
-
-        // Create executor
-        let mut executor = ScriptExecutor::new(gm_api)?;
-
-        // Execute with proper error handling
-        match executor.execute(&full_source, &script.name()) {
-            Ok(_) => {
-                self.auditor.log_event(
-                    AuditEvent::ExecutionComplete,
-                    &script.id,
-                    "Script executed successfully",
-                );
-                Ok(())
-            }
-            Err(e) => {
-                self.auditor.log_event(
-                    AuditEvent::ExecutionFailed,
-                    &script.id,
-                    &format!("Execution failed: {}", e),
-                );
-                Err(e)
-            }
-        }
+        Ok(full_source)
     }
 
     /// Load a @require dependency
@@ -377,88 +297,11 @@ impl UserscriptRuntime {
     }
 }
 
-/// Results from executing userscripts
-#[derive(Debug, Clone)]
-pub struct ExecutionResults {
-    /// Successfully executed scripts
-    pub executed: Vec<String>,
-    /// Failed scripts with error messages
-    pub failed: Vec<(String, String)>,
-}
-
-impl ExecutionResults {
-    fn new() -> Self {
-        Self {
-            executed: Vec::new(),
-            failed: Vec::new(),
-        }
-    }
-
-    /// Check if all scripts executed successfully
-    pub fn is_success(&self) -> bool {
-        self.failed.is_empty()
-    }
-
-    /// Get total number of scripts attempted
-    pub fn total(&self) -> usize {
-        self.executed.len() + self.failed.len()
-    }
-}
-
 /// Cache statistics
 #[derive(Debug, Clone)]
 pub struct CacheStats {
     pub require_cached: usize,
     pub resource_cached: usize,
-}
-
-/// Execution context for a page
-pub struct PageContext {
-    /// URL of the page
-    pub url: String,
-    /// Document ready state
-    pub ready_state: DocumentReadyState,
-    /// Injected CSS from GM_addStyle
-    pub injected_css: Vec<String>,
-}
-
-impl PageContext {
-    /// Create a new page context
-    pub fn new(url: String) -> Self {
-        Self {
-            url,
-            ready_state: DocumentReadyState::Loading,
-            injected_css: Vec::new(),
-        }
-    }
-
-    /// Get CSS to inject into the page
-    pub fn get_css(&self) -> String {
-        self.injected_css.join("\n")
-    }
-}
-
-/// Document ready state
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DocumentReadyState {
-    /// Document is still loading
-    Loading,
-    /// DOM is ready but resources may still be loading
-    Interactive,
-    /// Everything is loaded
-    Complete,
-}
-
-impl DocumentReadyState {
-    /// Check if scripts with given RunAt should execute
-    pub fn should_execute(&self, run_at: &RunAt) -> bool {
-        match run_at {
-            RunAt::DocumentStart => true, // Always run, as early as possible
-            RunAt::DocumentEnd => matches!(self, DocumentReadyState::Interactive | DocumentReadyState::Complete),
-            RunAt::DocumentIdle => matches!(self, DocumentReadyState::Complete),
-            RunAt::ContextMenu => false, // Special case, not automatic
-        }
-    }
 }
 
 #[cfg(test)]
@@ -478,74 +321,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_for_url() {
+    async fn test_prepare_script_without_requires() {
         let (runtime, _temp_dir) = create_test_runtime();
-
-        // Install a test script
-        let script = r#"
-// ==UserScript==
-// @name         Test Script
-// @match        *://example.com/*
-// @run-at       document-start
-// @grant        GM_setValue
-// ==/UserScript==
-
-GM.setValue('test', 'value');
-"#;
-
-        runtime
-            .manager
-            .install(script.to_string())
-            .unwrap();
-
-        // Execute scripts for URL
-        let results = runtime
-            .execute_for_url("https://example.com/page", RunAt::DocumentStart)
+        let script = Userscript::new(
+            "// ==UserScript==\n// @name Test\n// @match *://example.com/*\n// ==/UserScript==\nvar x = 1;".to_string(),
+        )
+        .unwrap();
+        let out = runtime
+            .prepare_script(&script, "https://example.com/")
             .await
             .unwrap();
-
-        assert_eq!(results.executed.len(), 1);
-        assert_eq!(results.failed.len(), 0);
-        assert!(results.is_success());
-    }
-
-    #[tokio::test]
-    async fn test_run_at_filtering() {
-        let (runtime, _temp_dir) = create_test_runtime();
-
-        // Install script that runs at document-end
-        let script = r#"
-// ==UserScript==
-// @name         End Script
-// @match        *://example.com/*
-// @run-at       document-end
-// ==/UserScript==
-
-// Simple script that doesn't require console
-var x = 1 + 1;
-"#;
-
-        runtime
-            .manager
-            .install(script.to_string())
-            .unwrap();
-
-        // Execute at document-start should skip this script
-        let results = runtime
-            .execute_for_url("https://example.com/page", RunAt::DocumentStart)
-            .await
-            .unwrap();
-
-        assert_eq!(results.executed.len(), 0);
-
-        // Execute at document-end should run it
-        let results = runtime
-            .execute_for_url("https://example.com/page", RunAt::DocumentEnd)
-            .await
-            .unwrap();
-
-        assert_eq!(results.executed.len(), 1);
-        assert_eq!(results.failed.len(), 0);
+        assert!(out.ends_with("var x = 1;"));
     }
 
     #[test]
@@ -557,49 +343,6 @@ var x = 1 + 1;
         assert_eq!(runtime.detect_mime_type("script.js"), "application/javascript");
         assert_eq!(runtime.detect_mime_type("data.json"), "application/json");
         assert_eq!(runtime.detect_mime_type("unknown.xyz"), "application/octet-stream");
-    }
-
-    #[test]
-    fn test_document_ready_state() {
-        assert!(DocumentReadyState::Loading.should_execute(&RunAt::DocumentStart));
-        assert!(!DocumentReadyState::Loading.should_execute(&RunAt::DocumentEnd));
-        assert!(!DocumentReadyState::Loading.should_execute(&RunAt::DocumentIdle));
-
-        assert!(DocumentReadyState::Interactive.should_execute(&RunAt::DocumentStart));
-        assert!(DocumentReadyState::Interactive.should_execute(&RunAt::DocumentEnd));
-        assert!(!DocumentReadyState::Interactive.should_execute(&RunAt::DocumentIdle));
-
-        assert!(DocumentReadyState::Complete.should_execute(&RunAt::DocumentStart));
-        assert!(DocumentReadyState::Complete.should_execute(&RunAt::DocumentEnd));
-        assert!(DocumentReadyState::Complete.should_execute(&RunAt::DocumentIdle));
-    }
-
-    #[test]
-    fn test_execution_results() {
-        let mut results = ExecutionResults::new();
-        assert!(results.is_success());
-        assert_eq!(results.total(), 0);
-
-        results.executed.push("script1".to_string());
-        assert!(results.is_success());
-        assert_eq!(results.total(), 1);
-
-        results.failed.push(("script2".to_string(), "error".to_string()));
-        assert!(!results.is_success());
-        assert_eq!(results.total(), 2);
-    }
-
-    #[test]
-    fn test_page_context() {
-        let mut ctx = PageContext::new("https://example.com".to_string());
-        assert_eq!(ctx.ready_state, DocumentReadyState::Loading);
-
-        ctx.injected_css.push("body { color: red; }".to_string());
-        ctx.injected_css.push("a { color: blue; }".to_string());
-
-        let css = ctx.get_css();
-        assert!(css.contains("color: red"));
-        assert!(css.contains("color: blue"));
     }
 
     #[test]
