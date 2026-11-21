@@ -1,6 +1,8 @@
 //! Integration tests for WebSocket proxying
 
-use proxy_http3::{extract_ws_target, is_websocket_upgrade};
+#![cfg(feature = "websockets")]
+
+use proxy_core::websocket::{extract_ws_target, is_websocket_upgrade};
 
 #[test]
 fn test_websocket_upgrade_detection() {

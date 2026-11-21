@@ -31,7 +31,7 @@ pub fn extract_ws_target(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> Result
                 .get(hyper::header::HOST)
                 .and_then(|v| v.to_str().ok())
         })
-        .ok_or_else(|| Error::Http3Protocol("Missing host in WebSocket request".to_string()))?;
+        .ok_or_else(|| Error::Http("Missing host in WebSocket request".to_string()))?;
 
     let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
@@ -57,10 +57,10 @@ where
 
     // Parse target URL to extract host and port
     let url = target_url.parse::<hyper::Uri>()
-        .map_err(|e| Error::Http3Protocol(format!("Invalid WebSocket URL: {}", e)))?;
+        .map_err(|e| Error::Http(format!("Invalid WebSocket URL: {}", e)))?;
 
     let host = url.host()
-        .ok_or_else(|| Error::Http3Protocol("Missing host in WebSocket URL".to_string()))?;
+        .ok_or_else(|| Error::Http("Missing host in WebSocket URL".to_string()))?;
 
     let port = url.port_u16().unwrap_or_else(|| {
         if url.scheme_str() == Some("wss") { 443 } else { 80 }
@@ -77,14 +77,14 @@ where
     // Accept WebSocket connection from client
     let client_ws = accept_async(client_stream)
         .await
-        .map_err(|e| Error::Http3Protocol(format!("Failed to accept WebSocket: {}", e)))?;
+        .map_err(|e| Error::Http(format!("Failed to accept WebSocket: {}", e)))?;
 
     debug!("Client WebSocket handshake complete");
 
     // Connect to target WebSocket server
     let (server_ws, _) = client_async(target_url, target_stream)
         .await
-        .map_err(|e| Error::Http3Protocol(format!("Failed to connect to target WebSocket: {}", e)))?;
+        .map_err(|e| Error::Http(format!("Failed to connect to target WebSocket: {}", e)))?;
 
     debug!("Server WebSocket connection established");
 

@@ -19,27 +19,21 @@ http = "1.1"
 # TLS
 rustls = { workspace = true }
 
-# WebSocket
-tokio-tungstenite = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
-futures-util = "0.3"
-hyper = { workspace = true }
 
 # Filtering + upstream forwarding for the HTTP/3 proxy path
 filter-engine = { path = "../filter-engine" }
 reqwest = { workspace = true }
 
 # Common utilities
-common = { path = "../common" }
 
 [dev-dependencies]
 rcgen = { workspace = true }

@@ -22,8 +22,6 @@ pub enum Error {
     #[error("Connection error: {0}")]
     Connection(String),
 
-    #[error("Pipeline error: {0}")]
-    Pipeline(String),
 
     #[error("Timeout error")]
     Timeout,

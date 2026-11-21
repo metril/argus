@@ -96,7 +96,7 @@ impl ConnectionHandler {
         // Check for WebSocket upgrade
         #[cfg(feature = "websockets")]
         if self.enable_websockets {
-            use proxy_http3::{is_websocket_upgrade, extract_ws_target};
+            use crate::websocket::{extract_ws_target, is_websocket_upgrade};
 
             if is_websocket_upgrade(req.headers()) {
                 info!("WebSocket upgrade request detected from {}", self.client_addr);
@@ -138,7 +138,7 @@ impl ConnectionHandler {
                     match hyper::upgrade::on(&mut req).await {
                         Ok(upgraded) => {
                             let upgraded_io = hyper_util::rt::TokioIo::new(upgraded);
-                            if let Err(e) = proxy_http3::proxy_websocket(upgraded_io, &target_url).await {
+                            if let Err(e) = crate::websocket::proxy_websocket(upgraded_io, &target_url).await {
                                 error!("WebSocket proxy error: {}", e);
                             }
                         }
