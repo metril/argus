@@ -1,6 +1,9 @@
 //! Tests for connection handling
 
-use proxy_core::config::{MitmSettings, PerformanceSettings, AdblockSettings, ProxyConfig, UserscriptSettings, WebUiSettings};
+use proxy_core::config::{
+    AdblockSettings, MitmSettings, PerformanceSettings, ProxyConfig, UserscriptSettings,
+    WebUiSettings,
+};
 use proxy_core::{ProxyContext, ProxyServer};
 use std::sync::Arc;
 
@@ -100,7 +103,8 @@ async fn test_server_with_mitm_disabled() {
     };
 
     // Create server with MITM disabled
-    let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server without MITM");
+    let server =
+        ProxyServer::new(config, test_ctx()).expect("Failed to create server without MITM");
 
     // Verify MITM handler does not exist
     assert!(

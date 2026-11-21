@@ -24,8 +24,8 @@ pub struct MemoryMonitorConfig {
 impl Default for MemoryMonitorConfig {
     fn default() -> Self {
         Self {
-            warning_threshold: 2 * 1024 * 1024 * 1024,      // 2.0 GB
-            critical_threshold: 2560 * 1024 * 1024,          // 2.5 GB
+            warning_threshold: 2 * 1024 * 1024 * 1024, // 2.0 GB
+            critical_threshold: 2560 * 1024 * 1024,    // 2.5 GB
             check_interval: Duration::from_secs(5),
             recovery_cooldown: Duration::from_secs(30),
         }
@@ -161,7 +161,8 @@ impl MemoryMonitor {
         let old_pressure = MemoryPressure::from_u64(self.pressure.load(Ordering::Relaxed));
 
         // Update pressure level
-        self.pressure.store(stats.pressure as u64, Ordering::Relaxed);
+        self.pressure
+            .store(stats.pressure as u64, Ordering::Relaxed);
 
         // Track pressure level transitions
         if stats.pressure != old_pressure {
@@ -207,7 +208,9 @@ impl MemoryMonitor {
     pub fn should_accept_connection(&self) -> bool {
         let action = self.should_shed_load();
         if action == LoadSheddingAction::RejectConnections {
-            self.stats.connections_rejected.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_rejected
+                .fetch_add(1, Ordering::Relaxed);
             false
         } else {
             true

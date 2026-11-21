@@ -230,7 +230,9 @@ impl ProxyServer {
         use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
 
         // HTTP/3 requires MITM to be enabled for certificate generation
-        let mitm_handler = self.mitm_handler.as_ref()
+        let mitm_handler = self
+            .mitm_handler
+            .as_ref()
             .ok_or_else(|| Error::Config("HTTP/3 requires MITM to be enabled".to_string()))?;
 
         // Get CA reference for QUIC/TLS
@@ -264,7 +266,8 @@ impl ProxyServer {
             .map_err(|e| Error::Connection(format!("Invalid address: {}", e)))?;
 
         let quic_config = QuicConfig::new(udp_addr, Arc::new(tls_config));
-        let endpoint = quic_config.create_endpoint()
+        let endpoint = quic_config
+            .create_endpoint()
             .map_err(|e| Error::Connection(format!("Failed to create QUIC endpoint: {}", e)))?;
 
         info!("HTTP/3 server will start on UDP {}", udp_addr);

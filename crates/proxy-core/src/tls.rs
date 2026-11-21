@@ -4,8 +4,8 @@ use crate::{mitm::CertificateData, Error, Result};
 use rustls::ServerConfig;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 
 /// Create a TLS server configuration from certificate data
@@ -18,10 +18,7 @@ pub fn create_server_config_with_alpn(
     cert_data: &CertificateData,
     enable_http2: bool,
 ) -> Result<Arc<ServerConfig>> {
-    debug!(
-        "Creating TLS server config (HTTP/2: {})",
-        enable_http2
-    );
+    debug!("Creating TLS server config (HTTP/2: {})", enable_http2);
 
     // Create certificate chain with just the server cert
     let cert_chain = vec![cert_data.cert.clone()];
@@ -79,9 +76,14 @@ mod tests {
             .expect("Failed to create CA");
 
         // Generate a certificate
-        let (cert, key) = ca.generate_cert("test.com").expect("Failed to generate cert");
+        let (cert, key) = ca
+            .generate_cert("test.com")
+            .expect("Failed to generate cert");
 
-        let cert_data = CertificateData { cert, key: Arc::new(key) };
+        let cert_data = CertificateData {
+            cert,
+            key: Arc::new(key),
+        };
 
         // Create server config
         let config = create_server_config(&cert_data);

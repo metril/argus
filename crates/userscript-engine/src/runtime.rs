@@ -164,10 +164,7 @@ impl UserscriptRuntime {
             )));
         }
 
-        let code = response
-            .text()
-            .await
-            .map_err(|e| Error::HttpRequest(e))?;
+        let code = response.text().await.map_err(|e| Error::HttpRequest(e))?;
 
         // Cache for future use
         {
@@ -248,11 +245,7 @@ impl UserscriptRuntime {
     }
 
     /// Get data URL for a resource
-    pub async fn get_resource_data_url(
-        &self,
-        script: &Userscript,
-        name: &str,
-    ) -> Result<String> {
+    pub async fn get_resource_data_url(&self, script: &Userscript, name: &str) -> Result<String> {
         let data = self.load_resource(script, name).await?;
 
         // Detect MIME type from extension
@@ -340,9 +333,15 @@ mod tests {
 
         assert_eq!(runtime.detect_mime_type("icon.png"), "image/png");
         assert_eq!(runtime.detect_mime_type("style.css"), "text/css");
-        assert_eq!(runtime.detect_mime_type("script.js"), "application/javascript");
+        assert_eq!(
+            runtime.detect_mime_type("script.js"),
+            "application/javascript"
+        );
         assert_eq!(runtime.detect_mime_type("data.json"), "application/json");
-        assert_eq!(runtime.detect_mime_type("unknown.xyz"), "application/octet-stream");
+        assert_eq!(
+            runtime.detect_mime_type("unknown.xyz"),
+            "application/octet-stream"
+        );
     }
 
     #[test]

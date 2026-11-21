@@ -75,9 +75,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             ApiError::AlreadyExists(_) => (StatusCode::CONFLICT, self.to_string()),
-            ApiError::RateLimitExceeded(_) => {
-                (StatusCode::TOO_MANY_REQUESTS, self.to_string())
-            }
+            ApiError::RateLimitExceeded(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             ApiError::CsrfValidationFailed => (StatusCode::FORBIDDEN, self.to_string()),
             ApiError::Internal(_)
             | ApiError::Config(_)

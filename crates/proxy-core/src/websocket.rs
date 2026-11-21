@@ -46,24 +46,27 @@ pub fn extract_ws_target(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> Result
 }
 
 /// Proxy WebSocket connection between client and server
-pub async fn proxy_websocket<S>(
-    client_stream: S,
-    target_url: &str,
-) -> Result<()>
+pub async fn proxy_websocket<S>(client_stream: S, target_url: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     info!("Establishing WebSocket proxy to {}", target_url);
 
     // Parse target URL to extract host and port
-    let url = target_url.parse::<hyper::Uri>()
+    let url = target_url
+        .parse::<hyper::Uri>()
         .map_err(|e| Error::Http(format!("Invalid WebSocket URL: {}", e)))?;
 
-    let host = url.host()
+    let host = url
+        .host()
         .ok_or_else(|| Error::Http("Missing host in WebSocket URL".to_string()))?;
 
     let port = url.port_u16().unwrap_or_else(|| {
-        if url.scheme_str() == Some("wss") { 443 } else { 80 }
+        if url.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        }
     });
 
     // Connect to target server

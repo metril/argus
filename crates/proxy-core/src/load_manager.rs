@@ -127,7 +127,9 @@ impl LoadManager {
     pub fn check_admission(&self) -> AdmissionResult {
         // 1. Check memory pressure first (most critical)
         if !self.memory_monitor.should_accept_connection() {
-            self.stats.connections_rejected.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_rejected
+                .fetch_add(1, Ordering::Relaxed);
             self.stats
                 .connections_rejected_memory
                 .fetch_add(1, Ordering::Relaxed);
@@ -140,7 +142,9 @@ impl LoadManager {
             let active = self.stats.active_connections.load(Ordering::Relaxed) as usize;
             let effective_max = self.effective_max_connections();
             if active >= effective_max {
-                self.stats.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .connections_rejected
+                    .fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .connections_rejected_max
                     .fetch_add(1, Ordering::Relaxed);
@@ -163,7 +167,9 @@ impl LoadManager {
             timestamps.retain(|&t| t > one_second_ago);
 
             if timestamps.len() >= self.config.connection_rate_limit as usize {
-                self.stats.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .connections_rejected
+                    .fetch_add(1, Ordering::Relaxed);
                 self.stats
                     .connections_rejected_rate
                     .fetch_add(1, Ordering::Relaxed);
@@ -175,15 +181,21 @@ impl LoadManager {
         }
 
         // Connection admitted
-        self.stats.active_connections.fetch_add(1, Ordering::Relaxed);
-        self.stats.connections_accepted.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .connections_accepted
+            .fetch_add(1, Ordering::Relaxed);
 
         AdmissionResult::Admitted
     }
 
     /// Release a connection (call when connection ends)
     pub fn release_connection(&self) {
-        self.stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.stats
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Effective max connections based on memory pressure
@@ -241,10 +253,7 @@ impl LoadManager {
                 .connections_rejected_memory
                 .load(Ordering::Relaxed),
             connections_rejected_max: self.stats.connections_rejected_max.load(Ordering::Relaxed),
-            connections_rejected_rate: self
-                .stats
-                .connections_rejected_rate
-                .load(Ordering::Relaxed),
+            connections_rejected_rate: self.stats.connections_rejected_rate.load(Ordering::Relaxed),
             circuit_breaker: self.circuit_breaker.stats(),
             memory: self.memory_monitor.stats_snapshot(),
         }

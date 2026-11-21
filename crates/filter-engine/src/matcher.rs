@@ -82,12 +82,8 @@ impl RequestMatcher {
         );
 
         // Create adblock request
-        let request = AdblockRequest::new(
-            url,
-            source_url,
-            resource_type,
-        )
-        .map_err(|e| Error::InvalidSyntax(format!("Invalid request: {}", e)))?;
+        let request = AdblockRequest::new(url, source_url, resource_type)
+            .map_err(|e| Error::InvalidSyntax(format!("Invalid request: {}", e)))?;
 
         // Check against the engine
         let result = engine.check_network_request(&request);
@@ -118,10 +114,7 @@ impl RequestMatcher {
     /// Extract domain from URL
     pub fn extract_domain(url: &str) -> Result<String> {
         let parsed = url::Url::parse(url)?;
-        Ok(parsed
-            .host_str()
-            .unwrap_or("unknown")
-            .to_string())
+        Ok(parsed.host_str().unwrap_or("unknown").to_string())
     }
 }
 
@@ -149,7 +142,8 @@ mod tests {
         let domain = RequestMatcher::extract_domain("https://example.com/path").unwrap();
         assert_eq!(domain, "example.com");
 
-        let domain2 = RequestMatcher::extract_domain("http://subdomain.example.com:8080/path").unwrap();
+        let domain2 =
+            RequestMatcher::extract_domain("http://subdomain.example.com:8080/path").unwrap();
         assert_eq!(domain2, "subdomain.example.com");
     }
 }

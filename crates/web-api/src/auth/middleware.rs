@@ -90,7 +90,9 @@ pub async fn auth_middleware(
 
     // Check if token is revoked
     if state.session_manager.is_token_revoked(&claims.jti) {
-        return Err(ApiError::AuthenticationFailed("Token has been revoked".to_string()));
+        return Err(ApiError::AuthenticationFailed(
+            "Token has been revoked".to_string(),
+        ));
     }
 
     // Add authenticated user to request extensions
@@ -116,7 +118,9 @@ pub async fn require_role(
     let claims = validate_access_token(&token, &state.jwt_config)?;
 
     if state.session_manager.is_token_revoked(&claims.jti) {
-        return Err(ApiError::AuthenticationFailed("Token has been revoked".to_string()));
+        return Err(ApiError::AuthenticationFailed(
+            "Token has been revoked".to_string(),
+        ));
     }
 
     // Check role

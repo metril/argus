@@ -23,10 +23,7 @@ impl Http3Server {
     }
 
     /// Start the HTTP/3 server with graceful shutdown
-    pub async fn start(
-        self,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) -> Result<()> {
+    pub async fn start(self, mut shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
         info!("HTTP/3 server started on {}", self.endpoint.local_addr()?);
 
         loop {
@@ -227,7 +224,8 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Create a test TLS config
-        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certified_key =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = certified_key.cert.der().clone();
         let key_der = certified_key.signing_key.serialize_der();
 
@@ -242,10 +240,8 @@ mod tests {
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
         // Create QUIC config
-        let quic_config = crate::quic::QuicConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Arc::new(tls_config),
-        );
+        let quic_config =
+            crate::quic::QuicConfig::new("127.0.0.1:0".parse().unwrap(), Arc::new(tls_config));
 
         let endpoint = quic_config.create_endpoint().unwrap();
         let filter = Arc::new(Http3Filter::new(

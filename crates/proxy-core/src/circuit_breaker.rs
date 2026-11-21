@@ -125,7 +125,8 @@ impl CircuitBreaker {
 
     /// Check if a request to the given host should be allowed
     pub fn check(&self, host: &str) -> CircuitCheck {
-        let circuit_entry = self.circuits
+        let circuit_entry = self
+            .circuits
             .entry(host.to_string())
             .or_insert_with(|| RwLock::new(HostCircuit::default()));
 
@@ -175,7 +176,10 @@ impl CircuitBreaker {
                 CircuitState::HalfOpen => {
                     circuit.successes_in_half_open += 1;
                     if circuit.successes_in_half_open >= self.config.success_threshold {
-                        info!("Circuit for {} closing after {} successes", host, circuit.successes_in_half_open);
+                        info!(
+                            "Circuit for {} closing after {} successes",
+                            host, circuit.successes_in_half_open
+                        );
                         circuit.state = CircuitState::Closed;
                         circuit.failures.clear();
                         circuit.opened_at = None;
@@ -191,7 +195,8 @@ impl CircuitBreaker {
 
     /// Record a failed request to the given host
     pub fn record_failure(&self, host: &str) {
-        let circuit_entry = self.circuits
+        let circuit_entry = self
+            .circuits
             .entry(host.to_string())
             .or_insert_with(|| RwLock::new(HostCircuit::default()));
 
@@ -223,7 +228,10 @@ impl CircuitBreaker {
             }
             CircuitState::HalfOpen => {
                 // Failure in half-open state - back to open
-                warn!("Circuit for {} re-opening due to failure in half-open state", host);
+                warn!(
+                    "Circuit for {} re-opening due to failure in half-open state",
+                    host
+                );
                 circuit.state = CircuitState::Open;
                 circuit.opened_at = Some(now);
                 circuit.successes_in_half_open = 0;

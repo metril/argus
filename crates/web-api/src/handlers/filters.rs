@@ -73,7 +73,11 @@ pub async fn list_filter_lists(
 
     // Paginate
     let start = ((page - 1) * limit) as usize;
-    let paginated: Vec<_> = filtered.into_iter().skip(start).take(limit as usize).collect();
+    let paginated: Vec<_> = filtered
+        .into_iter()
+        .skip(start)
+        .take(limit as usize)
+        .collect();
 
     Ok(Json(PaginatedResponse {
         data: paginated,
@@ -107,18 +111,21 @@ pub async fn add_filter_list(
 
     // Reject duplicate ids so an add can't silently clobber an existing list.
     if state.filter_store.exists(&req.id)? {
-        return Err(ApiError::AlreadyExists(format!(
-            "Filter list '{}'",
-            req.id
-        )));
+        return Err(ApiError::AlreadyExists(format!("Filter list '{}'", req.id)));
     }
 
     // Create and persist the filter list.
-    let mut list = filter_engine::FilterList::new(req.id.clone(), req.name.clone(), req.url.clone());
+    let mut list =
+        filter_engine::FilterList::new(req.id.clone(), req.name.clone(), req.url.clone());
     list.enabled = req.enabled.unwrap_or(true);
     state.filter_store.upsert(&list)?;
 
-    info!("Filter list added by {}: {} ({})", auth_user.username(), req.name, req.id);
+    info!(
+        "Filter list added by {}: {} ({})",
+        auth_user.username(),
+        req.name,
+        req.id
+    );
 
     // Recompile the engine in the background so the new list takes effect (and downloads).
     trigger_reload(&state);
@@ -136,7 +143,10 @@ pub async fn get_filter_list(
 ) -> ApiResult<Json<FilterListResponse>> {
     match state.filter_store.get(&id)? {
         Some(list) => Ok(Json(filter_list_response(&list))),
-        None => Err(ApiError::NotFound(format!("Filter list '{}' not found", id))),
+        None => Err(ApiError::NotFound(format!(
+            "Filter list '{}' not found",
+            id
+        ))),
     }
 }
 
@@ -210,14 +220,19 @@ pub async fn delete_filter_list(
     }
 
     if !state.filter_store.remove(&id)? {
-        return Err(ApiError::NotFound(format!("Filter list '{}' not found", id)));
+        return Err(ApiError::NotFound(format!(
+            "Filter list '{}' not found",
+            id
+        )));
     }
 
     info!("Filter list '{}' deleted by {}", id, auth_user.username());
 
     trigger_reload(&state);
 
-    Ok(Json(json!({ "message": format!("Filter list '{}' deleted", id) })))
+    Ok(Json(
+        json!({ "message": format!("Filter list '{}' deleted", id) }),
+    ))
 }
 
 /// Get the user's custom filter rules
@@ -290,7 +305,8 @@ pub async fn reset_stats(
 /// Validate filter list URL for SSRF protection
 fn validate_filter_url(url: &str) -> ApiResult<()> {
     // Parse URL
-    let parsed = url::Url::parse(url).map_err(|_| ApiError::ValidationError("Invalid URL".to_string()))?;
+    let parsed =
+        url::Url::parse(url).map_err(|_| ApiError::ValidationError("Invalid URL".to_string()))?;
 
     // Only allow HTTPS
     if parsed.scheme() != "https" {
@@ -343,9 +359,6 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
                 || ipv4.is_documentation()
                 || ipv4.is_unspecified()
         }
-        std::net::IpAddr::V6(ipv6) => {
-            ipv6.is_loopback()
-                || ipv6.is_unspecified()
-        }
+        std::net::IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified(),
     }
 }

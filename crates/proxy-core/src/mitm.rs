@@ -74,7 +74,10 @@ impl MitmHandler {
 
         // Double-check cache after acquiring permit (another task might have generated it)
         if let Some(cert_data) = self.cert_cache.get(&domain) {
-            debug!("Cache hit after semaphore acquisition for domain: {}", domain);
+            debug!(
+                "Cache hit after semaphore acquisition for domain: {}",
+                domain
+            );
             return Ok(cert_data);
         }
 
@@ -82,7 +85,10 @@ impl MitmHandler {
         info!("Generating certificate for domain: {}", domain);
         let (cert, key) = self.ca.generate_cert(&domain)?;
 
-        let cert_data = Arc::new(CertificateData { cert, key: Arc::new(key) });
+        let cert_data = Arc::new(CertificateData {
+            cert,
+            key: Arc::new(key),
+        });
 
         // Cache the certificate
         self.cert_cache.insert(domain.clone(), cert_data.clone());

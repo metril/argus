@@ -57,8 +57,10 @@ impl TestContext {
             UserscriptStorage::new(temp_path.join("userscript-storage"))
                 .expect("Failed to create userscript storage"),
         );
-        let userscript_runtime =
-            Arc::new(UserscriptRuntime::new(userscript_manager.clone(), userscript_storage));
+        let userscript_runtime = Arc::new(UserscriptRuntime::new(
+            userscript_manager.clone(),
+            userscript_storage,
+        ));
 
         // Build state
         let state = build_state(

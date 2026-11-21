@@ -74,7 +74,8 @@ pub fn encrypt_ca_key_with_config(
     }
 
     // Create age encryptor with passphrase
-    let encryptor = age::Encryptor::with_user_passphrase(SecretString::from(passphrase.to_string()));
+    let encryptor =
+        age::Encryptor::with_user_passphrase(SecretString::from(passphrase.to_string()));
 
     // Encrypt the private key
     let mut encrypted = Vec::new();
@@ -83,10 +84,12 @@ pub fn encrypt_ca_key_with_config(
             .wrap_output(&mut encrypted)
             .map_err(|e| Error::Certificate(format!("Failed to wrap output: {}", e)))?;
 
-        writer.write_all(key_pem.as_bytes())
+        writer
+            .write_all(key_pem.as_bytes())
             .map_err(|e| Error::Certificate(format!("Failed to encrypt key: {}", e)))?;
 
-        writer.finish()
+        writer
+            .finish()
             .map_err(|e| Error::Certificate(format!("Failed to finish encryption: {}", e)))?;
     }
 
@@ -140,7 +143,8 @@ pub fn decrypt_ca_key_with_config(
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .map_err(|e| Error::Certificate(format!("Failed to decrypt: {}", e)))?;
 
-    reader.read_to_end(&mut decrypted)
+    reader
+        .read_to_end(&mut decrypted)
         .map_err(|e| Error::Certificate(format!("Failed to read decrypted data: {}", e)))?;
 
     let key_pem = String::from_utf8(decrypted)
@@ -165,11 +169,7 @@ pub fn read_encrypted_key<P: AsRef<Path>>(path: P, passphrase: &str) -> Result<S
 }
 
 /// Encrypt and write a CA key to a file
-pub fn write_encrypted_key<P: AsRef<Path>>(
-    path: P,
-    key_pem: &str,
-    passphrase: &str,
-) -> Result<()> {
+pub fn write_encrypted_key<P: AsRef<Path>>(path: P, key_pem: &str, passphrase: &str) -> Result<()> {
     let path = path.as_ref();
 
     // Create parent directories

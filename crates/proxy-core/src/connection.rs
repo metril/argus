@@ -71,10 +71,7 @@ impl ConnectionHandler {
         let service = service_fn(move |req| self.handle_request(req));
 
         // Serve HTTP/1.1 over the connection
-        if let Err(err) = http1::Builder::new()
-            .serve_connection(io, service)
-            .await
-        {
+        if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
             error!("Error serving connection: {}", err);
             return Err(Error::Connection(format!("Connection error: {}", err)));
         }
@@ -99,7 +96,10 @@ impl ConnectionHandler {
             use crate::websocket::{extract_ws_target, is_websocket_upgrade};
 
             if is_websocket_upgrade(req.headers()) {
-                info!("WebSocket upgrade request detected from {}", self.client_addr);
+                info!(
+                    "WebSocket upgrade request detected from {}",
+                    self.client_addr
+                );
 
                 // Extract target WebSocket URL
                 let target_url = match extract_ws_target(&uri, req.headers()) {
@@ -138,7 +138,9 @@ impl ConnectionHandler {
                     match hyper::upgrade::on(&mut req).await {
                         Ok(upgraded) => {
                             let upgraded_io = hyper_util::rt::TokioIo::new(upgraded);
-                            if let Err(e) = crate::websocket::proxy_websocket(upgraded_io, &target_url).await {
+                            if let Err(e) =
+                                crate::websocket::proxy_websocket(upgraded_io, &target_url).await
+                            {
                                 error!("WebSocket proxy error: {}", e);
                             }
                         }
@@ -164,11 +166,18 @@ impl ConnectionHandler {
                 error!("CONNECT method reached handle_request - should use upgrade path");
                 Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(full_body(Bytes::from_static(b"CONNECT must use upgrade path")))
+                    .body(full_body(Bytes::from_static(
+                        b"CONNECT must use upgrade path",
+                    )))
                     .unwrap())
             }
-            Method::GET | Method::POST | Method::PUT | Method::DELETE | Method::HEAD
-            | Method::OPTIONS | Method::PATCH => {
+            Method::GET
+            | Method::POST
+            | Method::PUT
+            | Method::DELETE
+            | Method::HEAD
+            | Method::OPTIONS
+            | Method::PATCH => {
                 // Standard (plaintext) HTTP proxy: absolute-form URI carries scheme + host.
                 self.ctx.forward(req, "http", None).await
             }
@@ -188,9 +197,10 @@ impl ConnectionHandler {
 
         // Read the HTTP request manually
         let mut buffer = vec![0u8; 8192];
-        let n = stream.read(&mut buffer).await.map_err(|e| {
-            Error::Connection(format!("Failed to read CONNECT request: {}", e))
-        })?;
+        let n = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|e| Error::Connection(format!("Failed to read CONNECT request: {}", e)))?;
 
         let request_data = String::from_utf8_lossy(&buffer[..n]);
         let lines: Vec<&str> = request_data.lines().collect();
@@ -226,10 +236,13 @@ impl ConnectionHandler {
                 stream
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await
-                    .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
+                    .map_err(|e| {
+                        Error::Connection(format!("Failed to send 200 response: {}", e))
+                    })?;
 
                 // Create TLS server config with ALPN
-                let server_config = tls::create_server_config_with_alpn(&cert_data, self.enable_http2)?;
+                let server_config =
+                    tls::create_server_config_with_alpn(&cert_data, self.enable_http2)?;
                 let acceptor = TlsAcceptor::from(server_config);
 
                 // Perform TLS handshake with client
@@ -280,7 +293,10 @@ impl ConnectionHandler {
             );
             is_h2
         } else {
-            debug!("No ALPN protocol negotiated for {}:{}, using HTTP/1.1", domain, port);
+            debug!(
+                "No ALPN protocol negotiated for {}:{}, using HTTP/1.1",
+                domain, port
+            );
             false
         };
 
@@ -353,5 +369,4 @@ impl ConnectionHandler {
             }
         }
     }
-
 }

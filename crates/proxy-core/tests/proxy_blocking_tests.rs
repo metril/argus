@@ -142,8 +142,14 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
         .expect("html request");
     assert_eq!(page.status(), 200);
     let html = page.text().await.unwrap();
-    assert!(html.contains("__adblock_helper"), "helper not injected: {html}");
-    assert!(html.contains("class=\"sponsored\""), "original content lost");
+    assert!(
+        html.contains("__adblock_helper"),
+        "helper not injected: {html}"
+    );
+    assert!(
+        html.contains("class=\"sponsored\""),
+        "original content lost"
+    );
 
     // The dynamic endpoint resolves generic selectors for reported class tokens, served locally.
     let cc = client
@@ -160,7 +166,8 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
     let body: serde_json::Value = cc.json().await.unwrap();
     let sels = body["selectors"].as_array().expect("selectors array");
     assert!(
-        sels.iter().any(|s| s.as_str().unwrap_or("").contains(".sponsored")),
+        sels.iter()
+            .any(|s| s.as_str().unwrap_or("").contains(".sponsored")),
         "expected .sponsored selector, got {body}"
     );
 }
@@ -208,6 +215,10 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
         .send()
         .await
         .expect("blocked request should still get a synthetic response");
-    assert_eq!(blocked.status(), 204, "blocked host must return 204 No Content");
+    assert_eq!(
+        blocked.status(),
+        204,
+        "blocked host must return 204 No Content"
+    );
     assert_eq!(blocked.headers().get("x-adblock").unwrap(), "blocked");
 }

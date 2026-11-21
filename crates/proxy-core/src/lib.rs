@@ -22,13 +22,13 @@ pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
 pub mod server;
+pub mod tls;
 #[cfg(feature = "websockets")]
 pub mod websocket;
-pub mod tls;
 
 pub use ca_encryption::{
-    decrypt_ca_key, encrypt_ca_key, is_encrypted_key, read_encrypted_key,
-    validate_passphrase, write_encrypted_key, CaEncryptionConfig,
+    decrypt_ca_key, encrypt_ca_key, is_encrypted_key, read_encrypted_key, validate_passphrase,
+    write_encrypted_key, CaEncryptionConfig,
 };
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitCheck, CircuitState};
 pub use config::ProxyConfig;

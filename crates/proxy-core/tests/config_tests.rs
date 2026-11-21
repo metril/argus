@@ -1,6 +1,9 @@
 //! Configuration tests
 
-use proxy_core::config::{ProxyConfig, ProxySettings, MitmSettings, PerformanceSettings, AdblockSettings, UserscriptSettings, WebUiSettings};
+use proxy_core::config::{
+    AdblockSettings, MitmSettings, PerformanceSettings, ProxyConfig, ProxySettings,
+    UserscriptSettings, WebUiSettings,
+};
 use std::path::PathBuf;
 
 #[test]
@@ -36,7 +39,8 @@ fn test_config_serialization() {
     let toml_str = toml::to_string(&config).expect("Failed to serialize config");
 
     // Deserialize back
-    let deserialized: ProxyConfig = toml::from_str(&toml_str).expect("Failed to deserialize config");
+    let deserialized: ProxyConfig =
+        toml::from_str(&toml_str).expect("Failed to deserialize config");
 
     // Verify values match
     assert_eq!(config.proxy.host, deserialized.proxy.host);

@@ -30,7 +30,9 @@ fn test_not_websocket_upgrade() {
 
 #[test]
 fn test_extract_ws_target_with_full_uri() {
-    let uri = "https://example.com:443/ws/chat".parse::<hyper::Uri>().unwrap();
+    let uri = "https://example.com:443/ws/chat"
+        .parse::<hyper::Uri>()
+        .unwrap();
     let headers = hyper::HeaderMap::new();
 
     let target = extract_ws_target(&uri, &headers).unwrap();

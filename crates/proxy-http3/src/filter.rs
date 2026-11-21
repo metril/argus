@@ -23,7 +23,9 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    HOP_BY_HOP.iter().any(|h| name.as_str().eq_ignore_ascii_case(h))
+    HOP_BY_HOP
+        .iter()
+        .any(|h| name.as_str().eq_ignore_ascii_case(h))
 }
 
 /// Shared filtering + forwarding context for HTTP/3 requests.

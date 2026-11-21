@@ -57,9 +57,7 @@ async fn test_http3_server_shutdown() {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     // Start server in background
-    let handle = tokio::spawn(async move {
-        server.start(shutdown_rx).await
-    });
+    let handle = tokio::spawn(async move { server.start(shutdown_rx).await });
 
     // Give server time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -68,10 +66,7 @@ async fn test_http3_server_shutdown() {
     shutdown_tx.send(()).unwrap();
 
     // Wait for server to shut down
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
-        handle
-    ).await;
+    let result = tokio::time::timeout(tokio::time::Duration::from_secs(5), handle).await;
 
     assert!(result.is_ok(), "Server should shut down gracefully");
 }

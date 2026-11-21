@@ -153,7 +153,8 @@ pub async fn get_stats(
     // Get MITM stats if enabled
     let mitm_stats = if state.proxy_state.mitm_enabled {
         Some(MitmStats {
-            cached_certificates: state.proxy_state.mitm_cached_certs.load(Ordering::Relaxed) as usize,
+            cached_certificates: state.proxy_state.mitm_cached_certs.load(Ordering::Relaxed)
+                as usize,
         })
     } else {
         None
@@ -197,8 +198,8 @@ pub async fn reload_config(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to read config file: {}", e)))?;
 
-    let new_config: ProxyConfig =
-        toml::from_str(&config_str).map_err(|e| ApiError::Internal(format!("Invalid config: {}", e)))?;
+    let new_config: ProxyConfig = toml::from_str(&config_str)
+        .map_err(|e| ApiError::Internal(format!("Invalid config: {}", e)))?;
 
     // Update configuration
     {
@@ -211,5 +212,7 @@ pub async fn reload_config(
         auth_user.username()
     );
 
-    Ok(Json(json!({ "message": "Configuration reloaded successfully" })))
+    Ok(Json(
+        json!({ "message": "Configuration reloaded successfully" }),
+    ))
 }

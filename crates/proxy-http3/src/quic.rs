@@ -32,8 +32,10 @@ impl QuicConfig {
 
     /// Build a Quinn ServerConfig from this configuration
     pub fn build_server_config(&self) -> Result<ServerConfig> {
-        let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from((*self.tls_config).clone())
-            .map_err(|e| Error::QuicEndpoint(format!("Failed to create QUIC crypto config: {}", e)))?;
+        let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(
+            (*self.tls_config).clone(),
+        )
+        .map_err(|e| Error::QuicEndpoint(format!("Failed to create QUIC crypto config: {}", e)))?;
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
 
         // Configure transport parameters
@@ -84,7 +86,8 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Create a minimal TLS config for testing
-        let certified_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certified_key =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = certified_key.cert.der().clone();
         let key_der = certified_key.signing_key.serialize_der();
 

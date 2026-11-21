@@ -190,15 +190,17 @@ impl ApiConfig {
     /// Load configuration from TOML file
     pub fn from_file(path: &str) -> crate::error::ApiResult<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: ApiConfig = toml::from_str(&content)
-            .map_err(|e| crate::error::ApiError::Internal(format!("Failed to parse config: {}", e)))?;
+        let config: ApiConfig = toml::from_str(&content).map_err(|e| {
+            crate::error::ApiError::Internal(format!("Failed to parse config: {}", e))
+        })?;
         Ok(config)
     }
 
     /// Save configuration to TOML file
     pub fn to_file(&self, path: &str) -> crate::error::ApiResult<()> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| crate::error::ApiError::Internal(format!("Failed to serialize config: {}", e)))?;
+        let content = toml::to_string_pretty(self).map_err(|e| {
+            crate::error::ApiError::Internal(format!("Failed to serialize config: {}", e))
+        })?;
         std::fs::write(path, content)?;
         Ok(())
     }

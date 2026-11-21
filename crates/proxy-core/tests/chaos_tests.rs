@@ -7,8 +7,8 @@
 //! - Memory pressure scenarios
 
 use proxy_core::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitCheck, CircuitState,
-    MemoryMonitor, MemoryMonitorConfig, MemoryPressure, LoadSheddingAction,
+    CircuitBreaker, CircuitBreakerConfig, CircuitCheck, CircuitState, LoadSheddingAction,
+    MemoryMonitor, MemoryMonitorConfig, MemoryPressure,
 };
 use std::sync::Arc;
 use std::thread;

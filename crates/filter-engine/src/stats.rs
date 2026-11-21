@@ -3,8 +3,8 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Statistics for blocked and allowed requests
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +71,10 @@ impl FilterStats {
         self.blocked_requests.fetch_add(1, Ordering::Relaxed);
 
         // Sharded concurrent maps: only the touched shard is locked, never a global lock.
-        *self.blocked_by_type.entry(resource_type.to_string()).or_insert(0) += 1;
+        *self
+            .blocked_by_type
+            .entry(resource_type.to_string())
+            .or_insert(0) += 1;
         *self.blocked_domains.entry(domain.to_string()).or_insert(0) += 1;
     }
 

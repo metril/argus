@@ -1,7 +1,7 @@
 //! Application-wide state
 
-use leptos::prelude::*;
 use gloo_storage::{LocalStorage, Storage};
+use leptos::prelude::*;
 
 /// Application theme
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

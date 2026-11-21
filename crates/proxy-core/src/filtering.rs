@@ -30,7 +30,9 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
-    HOP_BY_HOP.iter().any(|h| name.as_str().eq_ignore_ascii_case(h))
+    HOP_BY_HOP
+        .iter()
+        .any(|h| name.as_str().eq_ignore_ascii_case(h))
 }
 
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
@@ -221,7 +223,11 @@ impl ProxyContext {
     }
 
     /// Handle a `/__adblock__/...` internal request (never forwarded upstream).
-    async fn handle_internal(&self, req: Request<Incoming>, uri: &hyper::Uri) -> Response<ProxyBody> {
+    async fn handle_internal(
+        &self,
+        req: Request<Incoming>,
+        uri: &hyper::Uri,
+    ) -> Response<ProxyBody> {
         if uri.path() == "/__adblock__/cc" && req.method() == hyper::Method::POST {
             let bytes = match req.into_body().collect().await {
                 Ok(c) => c.to_bytes(),
@@ -239,9 +245,9 @@ impl ProxyContext {
                 Ok(p) => p,
                 Err(_) => return bad_request("json"),
             };
-            let selectors = self
-                .engine
-                .dynamic_hide_selectors(&parsed.url, &parsed.classes, &parsed.ids);
+            let selectors =
+                self.engine
+                    .dynamic_hide_selectors(&parsed.url, &parsed.classes, &parsed.ids);
             let json = serde_json::json!({ "selectors": selectors }).to_string();
             return Response::builder()
                 .status(StatusCode::OK)
@@ -272,7 +278,10 @@ fn resource_type_for(headers: &hyper::HeaderMap, path: &str) -> &'static str {
             _ => {}
         }
     }
-    if let Some(accept) = headers.get(hyper::header::ACCEPT).and_then(|v| v.to_str().ok()) {
+    if let Some(accept) = headers
+        .get(hyper::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+    {
         if accept.contains("text/html") {
             return "document";
         }

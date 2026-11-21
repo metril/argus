@@ -236,9 +236,8 @@ impl UserscriptMetadata {
             }
         }
 
-        let name = name.ok_or_else(|| {
-            Error::MetadataParsing("Missing required @name field".to_string())
-        })?;
+        let name =
+            name.ok_or_else(|| Error::MetadataParsing("Missing required @name field".to_string()))?;
 
         Ok(Self {
             name,

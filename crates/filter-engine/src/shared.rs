@@ -246,7 +246,11 @@ mod tests {
     #[test]
     fn empty_engine_allows_everything() {
         let shared = SharedEngine::new();
-        let r = shared.check("https://ads.example.com/banner.jpg", "https://example.com", "image");
+        let r = shared.check(
+            "https://ads.example.com/banner.jpg",
+            "https://example.com",
+            "image",
+        );
         assert!(!r.blocked);
     }
 
@@ -333,12 +337,10 @@ mod tests {
         shared.install(compile_engine(&["example.com##+js(noopjs)\n".to_string()]));
 
         // Without the resource library, scriptlets resolve to nothing (graceful degradation).
-        assert!(
-            shared
-                .cosmetic_for("https://example.com/")
-                .injected_script
-                .is_empty()
-        );
+        assert!(shared
+            .cosmetic_for("https://example.com/")
+            .injected_script
+            .is_empty());
 
         // Load a uBO-style resource named `noopjs.js` (lookup applies a `.js` extension).
         let content = base64::engine::general_purpose::STANDARD.encode("(function(){})();");

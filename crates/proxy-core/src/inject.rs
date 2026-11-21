@@ -190,18 +190,16 @@ pub fn inject_body(
     payload: Bytes,
     content_encoding: Option<&str>,
 ) -> ProxyBody {
-    let io_stream = resp
-        .bytes_stream()
-        .map(|res| res.map_err(io::Error::other));
+    let io_stream = resp.bytes_stream().map(|res| res.map_err(io::Error::other));
     let reader = StreamReader::new(io_stream);
 
     let decoded: Pin<Box<dyn AsyncRead + Send>> = match content_encoding {
         Some(e) if e.eq_ignore_ascii_case("gzip") || e.eq_ignore_ascii_case("x-gzip") => {
             Box::pin(async_compression::tokio::bufread::GzipDecoder::new(reader))
         }
-        Some(e) if e.eq_ignore_ascii_case("br") => {
-            Box::pin(async_compression::tokio::bufread::BrotliDecoder::new(reader))
-        }
+        Some(e) if e.eq_ignore_ascii_case("br") => Box::pin(
+            async_compression::tokio::bufread::BrotliDecoder::new(reader),
+        ),
         Some(e) if e.eq_ignore_ascii_case("deflate") => {
             Box::pin(async_compression::tokio::bufread::ZlibDecoder::new(reader))
         }
@@ -273,9 +271,7 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

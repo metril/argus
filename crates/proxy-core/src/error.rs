@@ -22,7 +22,6 @@ pub enum Error {
     #[error("Connection error: {0}")]
     Connection(String),
 
-
     #[error("Timeout error")]
     Timeout,
 
