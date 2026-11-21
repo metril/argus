@@ -16,14 +16,6 @@ pub struct MatchResult {
     pub exception_rule: Option<String>,
     /// Redirect URL if the request should be redirected
     pub redirect: Option<String>,
-    /// Query parameters to remove from URL
-    pub remove_params: Vec<String>,
-    /// Request headers to remove
-    pub remove_request_headers: Vec<String>,
-    /// Response headers to remove
-    pub remove_response_headers: Vec<String>,
-    /// Content replacement patterns (regex, replacement)
-    pub content_replacements: Vec<(String, String)>,
 }
 
 impl MatchResult {
@@ -34,10 +26,6 @@ impl MatchResult {
             matched_rule: Some(rule.into()),
             exception_rule: None,
             redirect: None,
-            remove_params: Vec::new(),
-            remove_request_headers: Vec::new(),
-            remove_response_headers: Vec::new(),
-            content_replacements: Vec::new(),
         }
     }
 
@@ -48,10 +36,6 @@ impl MatchResult {
             matched_rule: None,
             exception_rule: None,
             redirect: None,
-            remove_params: Vec::new(),
-            remove_request_headers: Vec::new(),
-            remove_response_headers: Vec::new(),
-            content_replacements: Vec::new(),
         }
     }
 
@@ -62,10 +46,6 @@ impl MatchResult {
             matched_rule: None,
             exception_rule: Some(rule.into()),
             redirect: None,
-            remove_params: Vec::new(),
-            remove_request_headers: Vec::new(),
-            remove_response_headers: Vec::new(),
-            content_replacements: Vec::new(),
         }
     }
 
@@ -76,19 +56,7 @@ impl MatchResult {
             matched_rule: Some(rule.into()),
             exception_rule: None,
             redirect: Some(url.into()),
-            remove_params: Vec::new(),
-            remove_request_headers: Vec::new(),
-            remove_response_headers: Vec::new(),
-            content_replacements: Vec::new(),
         }
-    }
-
-    /// Check if any modifiers are present
-    pub fn has_modifiers(&self) -> bool {
-        !self.remove_params.is_empty()
-            || !self.remove_request_headers.is_empty()
-            || !self.remove_response_headers.is_empty()
-            || !self.content_replacements.is_empty()
     }
 }
 
@@ -155,40 +123,6 @@ impl RequestMatcher {
             .unwrap_or("unknown")
             .to_string())
     }
-
-    /// Determine if request is third-party
-    pub fn is_third_party(url: &str, source_url: &str) -> bool {
-        let url_domain = Self::extract_domain(url).ok();
-        let source_domain = Self::extract_domain(source_url).ok();
-
-        match (url_domain, source_domain) {
-            (Some(url_d), Some(source_d)) => url_d != source_d,
-            _ => false,
-        }
-    }
-
-    /// Convert HTTP header content-type to resource type
-    pub fn content_type_to_resource_type(content_type: &str) -> &'static str {
-        let ct = content_type.to_lowercase();
-
-        if ct.contains("text/html") {
-            "document"
-        } else if ct.contains("text/css") {
-            "stylesheet"
-        } else if ct.contains("javascript") || ct.contains("application/javascript") {
-            "script"
-        } else if ct.contains("image/") {
-            "image"
-        } else if ct.contains("font/") || ct.contains("application/font") {
-            "font"
-        } else if ct.contains("video/") {
-            "media"
-        } else if ct.contains("audio/") {
-            "media"
-        } else {
-            "other"
-        }
-    }
 }
 
 #[cfg(test)]
@@ -217,40 +151,5 @@ mod tests {
 
         let domain2 = RequestMatcher::extract_domain("http://subdomain.example.com:8080/path").unwrap();
         assert_eq!(domain2, "subdomain.example.com");
-    }
-
-    #[test]
-    fn test_is_third_party() {
-        let is_third_party = RequestMatcher::is_third_party(
-            "https://ads.example.com/script.js",
-            "https://example.com/page.html",
-        );
-        assert!(is_third_party);
-
-        let is_first_party = RequestMatcher::is_third_party(
-            "https://example.com/script.js",
-            "https://example.com/page.html",
-        );
-        assert!(!is_first_party);
-    }
-
-    #[test]
-    fn test_content_type_mapping() {
-        assert_eq!(
-            RequestMatcher::content_type_to_resource_type("text/html; charset=utf-8"),
-            "document"
-        );
-        assert_eq!(
-            RequestMatcher::content_type_to_resource_type("text/css"),
-            "stylesheet"
-        );
-        assert_eq!(
-            RequestMatcher::content_type_to_resource_type("application/javascript"),
-            "script"
-        );
-        assert_eq!(
-            RequestMatcher::content_type_to_resource_type("image/png"),
-            "image"
-        );
     }
 }

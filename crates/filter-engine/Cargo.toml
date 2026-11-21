@@ -8,16 +8,12 @@ license.workspace = true
 
 [dependencies]
 # Async runtime
-tokio = { workspace = true }
 
 # Adblocking
 adblock = { workspace = true }
 
 # HTML/CSS parsing
-html5ever = { workspace = true }
-cssparser = { workspace = true }
 selectors = { workspace = true }
-ammonia = { workspace = true }
 
 # HTTP client
 reqwest = { workspace = true }
@@ -31,33 +27,21 @@ tracing = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Utilities
 url = { workspace = true }
-regex = { workspace = true }
 
 # Caching
-moka = { workspace = true }
 arc-swap = { workspace = true }
 
 # Concurrency
-parking_lot = { workspace = true }
 dashmap = { workspace = true }
 
 # Time
 chrono = { workspace = true }
 
 # Cryptography (for checksums)
-md-5 = "0.10"
 base64 = "0.22"
 
 # Common utilities
 common = { path = "../common" }
-
-[dev-dependencies]
-criterion = { workspace = true }
-
-[[bench]]
-name = "filter_bench"
-harness = false
