@@ -39,7 +39,9 @@ pub const MENU_HOOK: &str = "adblock.userscript.menu";
 pub fn runtime_script() -> String {
     format!(
         "({})(window);\n",
-        SHARED_JS.replace("/*RUNTIME*/null", RUNTIME_JS.trim()).trim()
+        SHARED_JS
+            .replace("/*RUNTIME*/null", RUNTIME_JS.trim())
+            .trim()
     )
 }
 
@@ -494,11 +496,12 @@ mod tests {
             .collect();
         assert_eq!(order, ["start", "body", "end", "idle"]);
         assert_eq!(b.counts, [1, 1, 1, 1]);
+        assert!(b.js.starts_with("(function (W)") || b.js.starts_with("(/*"));
         assert!(
-            b.js.starts_with("(function (W)") || b.js.starts_with("(/*")
-        );
-        assert!(
-            b.js.contains(RUNTIME_HOOK) && b.js.trim_end().ends_with("(window[Symbol.for(\"adblock.userscript.runtime\")]);")
+            b.js.contains(RUNTIME_HOOK)
+                && b.js
+                    .trim_end()
+                    .ends_with("(window[Symbol.for(\"adblock.userscript.runtime\")]);")
         );
         assert!(generate(&[], &opts(&key, &vals)).js.is_empty());
     }

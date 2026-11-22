@@ -93,13 +93,19 @@ async fn main() -> Result<()> {
         let sc = &config.script_control;
         let dashboard = if !sc.dashboard_url.is_empty() {
             sc.dashboard_url.clone()
-        } else if config.webui.enabled && !matches!(config.webui.host.as_str(), "0.0.0.0" | "::" | "[::]") {
+        } else if config.webui.enabled
+            && !matches!(config.webui.host.as_str(), "0.0.0.0" | "::" | "[::]")
+        {
             format!("http://{}:{}", config.webui.host, config.webui.port)
         } else {
             String::new()
         };
-        let host = proxy_core::authority::normalize_host(&sc.panel_host)
-            .ok_or_else(|| Error::Config(format!("script_control.panel_host '{}' is not a host name", sc.panel_host)))?;
+        let host = proxy_core::authority::normalize_host(&sc.panel_host).ok_or_else(|| {
+            Error::Config(format!(
+                "script_control.panel_host '{}' is not a host name",
+                sc.panel_host
+            ))
+        })?;
         if !host.ends_with(".invalid") {
             return Err(Error::Config(format!(
                 "script_control.panel_host '{host}' must end in .invalid (a name no real site can claim)"
@@ -111,7 +117,9 @@ async fn main() -> Result<()> {
                 host,
                 dashboard_url: dashboard,
             },
-            Some(Arc::new(proxy_core::panel::ListSiteBlocking(list_service.clone()))),
+            Some(Arc::new(proxy_core::panel::ListSiteBlocking(
+                list_service.clone(),
+            ))),
         );
     }
 

@@ -48,8 +48,14 @@ fn doc(cdn: &str) -> String {
 }
 
 fn routes(s: &Session) -> String {
-    s.origin.route("/own.js", MockResponse::ok("window.__own=1").header("content-type", "text/javascript"));
-    s.origin.route("/x.js", MockResponse::ok("window.__cdn=1").header("content-type", "text/javascript"));
+    s.origin.route(
+        "/own.js",
+        MockResponse::ok("window.__own=1").header("content-type", "text/javascript"),
+    );
+    s.origin.route(
+        "/x.js",
+        MockResponse::ok("window.__cdn=1").header("content-type", "text/javascript"),
+    );
     let cdn = s.url("cdn.test", "/x.js");
     s.origin.route("/", MockResponse::html(doc(&cdn)));
     cdn
@@ -65,7 +71,10 @@ fn ours(v: &[Value]) -> Vec<Value> {
                 || eff.starts_with("style-src")
                 || eff.starts_with("connect-src")
                 || (eff.starts_with("script-src")
-                    && !(uri == "inline" || uri == "eval" || uri.contains("/own.js") || uri.contains("/x.js")))
+                    && !(uri == "inline"
+                        || uri == "eval"
+                        || uri.contains("/own.js")
+                        || uri.contains("/x.js")))
         })
         .cloned()
         .collect()
@@ -77,20 +86,48 @@ sp_test!(untrusted_blocks_page_scripts_while_ours_run, |s| {
     );
     routes(&s);
     let (store, _) = s.proxy.script_control();
-    store.create_site_rule(P, scope("sp.test"), Preset::Untrusted, None).unwrap();
+    store
+        .create_site_rule(P, scope("sp.test"), Preset::Untrusted, None)
+        .unwrap();
     enable(&s, |_| {});
     s.goto(&s.url("sp.test", "/")).await;
-    assert_eq!(s.eval("typeof window.__inline").await, "undefined", "inline script blocked");
-    assert_eq!(s.eval("typeof window.__own").await, "undefined", "external script blocked");
+    assert_eq!(
+        s.eval("typeof window.__inline").await,
+        "undefined",
+        "inline script blocked"
+    );
+    assert_eq!(
+        s.eval("typeof window.__own").await,
+        "undefined",
+        "external script blocked"
+    );
     assert_eq!(s.eval("typeof window.__cdn").await, "undefined");
-    assert_eq!(s.eval("getComputedStyle(document.getElementById('ns')).display").await, "block", "<noscript> content visible");
+    assert_eq!(
+        s.eval("getComputedStyle(document.getElementById('ns')).display")
+            .await,
+        "block",
+        "<noscript> content visible"
+    );
     assert_eq!(s.display(".ad").await, "none", "our cosmetics still apply");
     assert_eq!(s.eval("window.__us").await, 1, "userscripts still run");
     let loads = s.internal_loads().await;
-    assert!(loads.iter().any(|(p, st)| p.contains("/__adblock__/boot.") && *st == 200), "{loads:?}");
+    assert!(
+        loads
+            .iter()
+            .any(|(p, st)| p.contains("/__adblock__/boot.") && *st == 200),
+        "{loads:?}"
+    );
     let v = s.violations().await;
-    assert!(v.iter().any(|v| v["eff"].as_str().unwrap_or("").starts_with("script-src")), "page scripts were refused by the browser: {v:?}");
-    assert_eq!(ours(&v), Vec::<Value>::new(), "no violation attributable to our resources");
+    assert!(
+        v.iter()
+            .any(|v| v["eff"].as_str().unwrap_or("").starts_with("script-src")),
+        "page scripts were refused by the browser: {v:?}"
+    );
+    assert_eq!(
+        ours(&v),
+        Vec::<Value>::new(),
+        "no violation attributable to our resources"
+    );
 });
 
 sp_test!(default_preset_blocks_third_party_until_allowed, |s| {
@@ -100,52 +137,98 @@ sp_test!(default_preset_blocks_third_party_until_allowed, |s| {
     s.goto(&s.url("sp.test", "/")).await;
     assert_eq!(s.eval("window.__own").await, 1, "first-party script runs");
     assert_eq!(s.eval("window.__inline").await, 1);
-    assert_eq!(s.eval("typeof window.__cdn").await, "undefined", "third-party script blocked");
+    assert_eq!(
+        s.eval("typeof window.__cdn").await,
+        "undefined",
+        "third-party script blocked"
+    );
     let rep = store.report_for(P, "sp.test").expect("report");
-    assert!(rep.items.iter().any(|i| i.source.as_deref() == Some("cdn.test") && i.cap == C::Script), "{rep:?}");
+    assert!(
+        rep.items
+            .iter()
+            .any(|i| i.source.as_deref() == Some("cdn.test") && i.cap == C::Script),
+        "{rep:?}"
+    );
     assert_eq!(ours(&s.violations().await), Vec::<Value>::new());
     store
-        .create_source_rule(P, scope("sp.test"), scope("cdn.test"), CapSet::of(&[C::Script]), Effect::Allow, None)
+        .create_source_rule(
+            P,
+            scope("sp.test"),
+            scope("cdn.test"),
+            CapSet::of(&[C::Script]),
+            Effect::Allow,
+            None,
+        )
         .unwrap();
     s.goto(&s.url("sp.test", "/")).await;
     assert_eq!(s.eval("window.__cdn").await, 1, "allowed after reload");
 });
 
-sp_test!(csp_enforces_when_network_hints_are_off_and_reports_back, |s| {
-    routes(&s);
-    let (store, _) = s.proxy.script_control();
-    enable(&s, |st| st.network_hints = false);
-    s.goto(&s.url("sp.test", "/")).await;
-    assert_eq!(s.eval("typeof window.__cdn").await, "undefined", "CSP blocked it");
-    assert!(s.origin.requests_for("/x.js").is_empty(), "the browser never even asked: {:?}", s.origin.requests_for("/x.js").len());
-    let v = s.violations().await;
-    assert!(v.iter().any(|v| v["uri"].as_str().unwrap_or("").contains("cdn.test")), "{v:?}");
-    // The browser's report-uri beacon reaches the proxy and is recorded as a CSP block.
-    let mut ok = false;
-    for _ in 0..200 {
-        if store.report_for(P, "sp.test").is_some_and(|r| r.items.iter().any(|i| i.via_csp && i.source.as_deref() == Some("cdn.test"))) {
-            ok = true;
-            break;
+sp_test!(
+    csp_enforces_when_network_hints_are_off_and_reports_back,
+    |s| {
+        routes(&s);
+        let (store, _) = s.proxy.script_control();
+        enable(&s, |st| st.network_hints = false);
+        s.goto(&s.url("sp.test", "/")).await;
+        assert_eq!(
+            s.eval("typeof window.__cdn").await,
+            "undefined",
+            "CSP blocked it"
+        );
+        assert!(
+            s.origin.requests_for("/x.js").is_empty(),
+            "the browser never even asked: {:?}",
+            s.origin.requests_for("/x.js").len()
+        );
+        let v = s.violations().await;
+        assert!(
+            v.iter()
+                .any(|v| v["uri"].as_str().unwrap_or("").contains("cdn.test")),
+            "{v:?}"
+        );
+        // The browser's report-uri beacon reaches the proxy and is recorded as a CSP block.
+        let mut ok = false;
+        for _ in 0..200 {
+            if store.report_for(P, "sp.test").is_some_and(|r| {
+                r.items
+                    .iter()
+                    .any(|i| i.via_csp && i.source.as_deref() == Some("cdn.test"))
+            }) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            ok,
+            "violation report recorded: {:?}",
+            store.report_for(P, "sp.test")
+        );
     }
-    assert!(ok, "violation report recorded: {:?}", store.report_for(P, "sp.test"));
-});
+);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn temporary_allow_then_expiry() {
-    let Some(s) = Session::start(&["sp.test##.ad"]).await else { return };
+    let Some(s) = Session::start(&["sp.test##.ad"]).await else {
+        return;
+    };
     run_known("temporary_allow_then_expiry", async move {
         let now = Arc::new(AtomicU64::new(5_000_000));
         let n2 = now.clone();
-        let (store, control) = s.proxy.script_control_with(Some(Arc::new(move || n2.load(Ordering::SeqCst))));
+        let (store, control) = s
+            .proxy
+            .script_control_with(Some(Arc::new(move || n2.load(Ordering::SeqCst))));
         routes(&s);
         enable(&s, |_| {});
         store
             .grant_temp(
                 P,
                 scope("sp.test"),
-                GrantKind::Source { source: scope("cdn.test"), caps: CapSet::of(&[C::Script]) },
+                GrantKind::Source {
+                    source: scope("cdn.test"),
+                    caps: CapSet::of(&[C::Script]),
+                },
                 Some(120),
                 false,
                 false,
@@ -156,7 +239,11 @@ async fn temporary_allow_then_expiry() {
         now.store(5_000_121, Ordering::SeqCst);
         control.refresh();
         s.goto(&s.url("sp.test", "/")).await;
-        assert_eq!(s.eval("typeof window.__cdn").await, "undefined", "blocked after expiry");
+        assert_eq!(
+            s.eval("typeof window.__cdn").await,
+            "undefined",
+            "blocked after expiry"
+        );
         s.finish().await;
     })
     .await;

@@ -10,7 +10,7 @@
 //! confirms on that origin, a top-level page the site cannot script, frame, or overlay:
 //!
 //! * served with `frame-ancestors 'none'` and `X-Frame-Options: DENY`, no JavaScript at all;
-//! * opened with `noopener`, `Cross-Origin-Opener-Policy: same-origin`, `Referrer-Policy: no-referrer`;
+//! * opened with `noopener`, `Cross-Origin-Opener-Policy: same-origin`, `Referrer-Policy: same-origin` (`no-referrer` would make the browser send `Origin: null` on the form post);
 //! * `/apply` accepts only a same-origin, user-activated form post (`Sec-Fetch-Site`,
 //!   `Sec-Fetch-User`, `Origin`), a single-use-by-expiry HMAC nonce bound to the proposal and the
 //!   profile, and, by default, the profile's PIN (with lockout).
@@ -801,7 +801,7 @@ fn page_response(status: StatusCode, title: &str, body: &str) -> Response<ProxyB
         )
         .header("x-frame-options", "DENY")
         .header("x-content-type-options", "nosniff")
-        .header("referrer-policy", "no-referrer")
+        .header("referrer-policy", "same-origin")
         .header("cross-origin-opener-policy", "same-origin")
         .header("cross-origin-resource-policy", "same-origin")
         .header("cache-control", "no-store")

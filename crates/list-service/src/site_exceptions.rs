@@ -80,7 +80,17 @@ mod tests {
 
     #[test]
     fn nothing_but_host_names_reach_the_rules() {
-        for bad in ["", "a b.test", "a.test\n||x^", "A.test", "a.test/", "*.test", "-a.test", "a.test^$x", "é.test"] {
+        for bad in [
+            "",
+            "a b.test",
+            "a.test\n||x^",
+            "A.test",
+            "a.test/",
+            "*.test",
+            "-a.test",
+            "a.test^$x",
+            "é.test",
+        ] {
             assert!(set("", bad, true).is_none(), "{bad:?}");
         }
     }
