@@ -8,7 +8,7 @@ license.workspace = true
 description = "Pure parser, index and evaluator for extended (uBO/AdGuard) filter rules the network engine cannot run"
 
 [dependencies]
-filter-engine = { path = "../filter-engine" }
+filter-engine = { path = "../filter-engine", default-features = false }
 adblock = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

@@ -2,32 +2,29 @@
 
 The workspace is `MIT OR Apache-2.0`.
 
-## uBlock Origin scriptlet snapshot (GPL-3.0)
+## uBlock Origin resource library (GPL-3.0)
 
-`crates/filter-engine/resources/ubo-resources.json` is converted from uBlock Origin's scriptlet
-library, which is **GPL-3.0-or-later**. Distributing a binary that embeds it makes that binary
-subject to the GPL, which conflicts with the workspace licence. The project owner has not decided
-how to handle this, so the snapshot is opt-in:
+The default build embeds the uBlock Origin resource library (GPL-3.0-or-later):
+`crates/filter-engine/resources/ubo-resources.json`, converted from uBlock Origin's scriptlet
+library. Provenance (upstream commit, date, how to regenerate) is in
+`crates/filter-engine/resources/SOURCE.txt`.
 
-- Cargo feature `bundled-ubo-resources` (crates `filter-engine` and `list-service`), **off by
-  default**, and not part of `proxy-core`'s `full` feature. Without it nothing GPL is compiled in
-  (the JSON file stays in the source tree but is never `include_str!`-ed).
-- Enable it deliberately: `cargo build -p proxy-core --features list-service/bundled-ubo-resources`
-  (or add the feature to the crate you build).
+To build without it, disable default features:
 
-### Default build behaviour
+- `cargo build --release --no-default-features --features websockets` (add `userscripts` and
+  `webui` as needed; `full` includes the library), or
+- depend on `filter-engine` / `list-service` with `default-features = false`.
 
-- Scriptlets (`+js(...)`) need a resource library. It is fetched at runtime from
-  `scriptlet_resources_url` and cached as `<data_dir>/resources.json`; the cache is the offline
-  fallback after the first successful fetch. Until then, scriptlet rules inject nothing.
-- `$redirect` resources still work offline: the built-ins (`noop.js`, `noop.css`, `noop.html`,
+Without the library nothing GPL is compiled in; the file stays in the source tree but is never
+`include_str!`-ed.
+
+### Runtime behaviour
+
+- Scriptlets (`+js(...)`) need a resource library. The order is: the freshest successfully fetched
+  copy (from `scriptlet_resources_url`), else the on-disk cache `<data_dir>/resources.json`, else
+  the embedded copy. Every library, whatever its origin, is validated before it is served (see
+  `GET /engine/status`).
+- `$redirect` resources work offline: the built-ins (`noop.js`, `noop.css`, `noop.html`,
   `noop.txt`, `noop.json`, `noop-vmap1.0.xml`, `1x1.gif`, `1x1.png`, `noop-0.1s.mp3`) are original:
   text bodies are trivial and the binary files are assembled in code from the GIF, PNG/zlib and
   MPEG specifications. Only the resource names follow uBO conventions so existing rules resolve.
-- Fetching the library at runtime does not embed GPL code in the binary; whether using it
-  at runtime has licence implications for your deployment is for the owner to decide.
-
-### Reverting
-
-Remove the feature and the JSON file (and `bundled.rs`'s `cfg` branch) to drop the snapshot
-entirely, or enable the feature to restore the previous behaviour.

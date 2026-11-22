@@ -3,17 +3,15 @@ resources by `convert_ubo_scriptlets` (see examples/gen_resources.rs).
 
 Upstream:   uBlockOrigin/uBlock, src/js/resources/*.js (32 files) + src/js/urlskip.js
 Commit:     5934db2a0437a50182c4a8f3da2e0941cf806253 (2026-11-21)
-Licence:    GPL-3.0-or-later (uBlock Origin). These scriptlets are third-party code under the GPL;
-            check compatibility before distributing a binary that embeds them.
+Licence:    GPL-3.0-or-later (uBlock Origin).
 
-EMBEDDED ONLY WITH THE CARGO FEATURE `bundled-ubo-resources` (off by default; enable it via
-`filter-engine/bundled-ubo-resources` or `list-service/bundled-ubo-resources`). The default build
-does not include this file's content. See docs/LICENSING.md for the licence implication.
-
-Offline fallback only: a copy fetched at runtime (or cached in the data dir) takes precedence.
+Embedded by the default build (cargo feature `bundled-ubo-resources`, on by default; build with
+`--no-default-features` to leave it out). See docs/LICENSING.md.
 
 Result:     153 resources, all validated (0 dropped); resources with `requiresTrust` carry the
             trust permission and are only usable from trusted lists.
+
+Offline fallback only: a copy fetched at runtime (or cached in the data dir) takes precedence.
 
 Regenerate: download the files (and src/js/urlskip.js) at the desired commit into a directory, then
   cargo run -p filter-engine --example gen_resources -- <dir> crates/filter-engine/resources/ubo-resources.json

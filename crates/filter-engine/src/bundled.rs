@@ -1,10 +1,9 @@
-//! Pinned snapshot of the uBlock Origin scriptlet library (GPL-3.0), embedded as an offline
-//! fallback **only with the `bundled-ubo-resources` cargo feature** (off by default so the default
-//! build carries no GPL code). Without it these constants are empty and the offline fallback is
-//! the on-disk cache of the last successful fetch.
+//! Pinned snapshot of the uBlock Origin resource library (GPL-3.0), embedded as the offline
+//! fallback with the `bundled-ubo-resources` cargo feature (on by default; `--no-default-features`
+//! leaves it out and these constants are empty). A copy fetched at runtime (or cached on disk)
+//! takes precedence over this one.
 //!
-//! See `resources/SOURCE.txt` and `docs/LICENSING.md`. A copy fetched at runtime (or cached on
-//! disk) takes precedence over this one.
+//! See `resources/SOURCE.txt` and `docs/LICENSING.md`.
 
 /// adblock-rust resources JSON array (scriptlets with dependencies and aliases); empty unless the
 /// `bundled-ubo-resources` feature is on.

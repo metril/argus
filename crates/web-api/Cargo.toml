@@ -41,7 +41,7 @@ validator = { workspace = true }
 chrono = { workspace = true }
 
 # Database
-list-service = { path = "../list-service" }
+list-service = { path = "../list-service", default-features = false }
 ext-rules = { path = "../ext-rules" }
 
 # HTTP client (shared, for downloading filter lists)
@@ -58,7 +58,7 @@ url = "2.5"
 
 # Common utilities
 common = { path = "../common" }
-filter-engine = { path = "../filter-engine" }
+filter-engine = { path = "../filter-engine", default-features = false }
 userscript-engine = { path = "../userscript-engine" }
 api-types = { workspace = true, features = ["server"] }
 

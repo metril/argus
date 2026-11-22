@@ -57,8 +57,10 @@ oxc_span = "0.126"
 common = { path = "../common" }
 
 [features]
-# Embed the uBlock Origin scriptlet snapshot (GPL-3.0) as an offline fallback. Off by default:
-# see docs/LICENSING.md.
+default = ["bundled-ubo-resources"]
+# Embed the uBlock Origin scriptlet snapshot (GPL-3.0) as the offline fallback. On by default;
+# build with `--no-default-features` to leave it out (see docs/LICENSING.md). Dependents declare
+# `default-features = false` and forward this feature, so it can be turned off from the top.
 bundled-ubo-resources = []
 
 [dev-dependencies]

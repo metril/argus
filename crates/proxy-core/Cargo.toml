@@ -86,7 +86,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = "1.0"
 
 # Filter engine (always on — request filtering is the core of the proxy)
-filter-engine = { path = "../filter-engine" }
+filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
 chrono = { workspace = true }
 
@@ -97,7 +97,7 @@ userscript-engine = { path = "../userscript-engine", optional = true }
 web-api = { path = "../web-api", optional = true }
 
 # Filter-list service (always on — loads, compiles and refreshes the rules)
-list-service = { path = "../list-service" }
+list-service = { path = "../list-service", default-features = false }
 
 # Streaming HTML rewriting, charset handling, hashing
 lol_html = "2"
@@ -116,11 +116,13 @@ socket2 = { version = "0.6", features = ["all"] }
 
 [features]
 # Request filtering is always compiled in; WebSocket proxying is on by default.
-default = ["websockets"]
+default = ["websockets", "bundled-ubo-resources"]
+# Embed the uBlock Origin resource library (GPL-3.0) as the offline fallback; see docs/LICENSING.md.
+bundled-ubo-resources = ["list-service/bundled-ubo-resources"]
 websockets = ["dep:tokio-tungstenite"]
 userscripts = ["dep:userscript-engine"]
 webui = ["dep:web-api", "dep:userscript-engine"]
-full = ["websockets", "userscripts", "webui"]
+full = ["websockets", "userscripts", "webui", "bundled-ubo-resources"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

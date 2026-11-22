@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Real floor: tag_ptr 0.1.0 (transitive) requires Rust 1.88+. Toolchain is pinned to
+# Real floor: oxc_parser 0.126 (filter-engine) requires Rust 1.92. Toolchain is pinned to
 # stable in rust-toolchain.toml; no nightly features are used.
 rust-version = "1.92"
 authors = ["Adblocker Contributors"]

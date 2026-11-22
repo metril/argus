@@ -34,8 +34,10 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - Domain-specific and exception rules
   - Injected into HTML responses via the MITM proxy (streaming, gzip/br aware), with a
     dynamic class/id helper and a procedural-filter evaluator (`:has-text`, `:matches-css`, …)
-- ✅ Scriptlet injection (`##+js(...)`): uBlock Origin's scriptlets are fetched at runtime
-  (GPLv3, not vendored), converted to adblock-rust resources, and cached under `data/filters`.
+- ✅ Scriptlet injection (`##+js(...)`): uBlock Origin's scriptlets are fetched at runtime,
+  converted to adblock-rust resources (parsed with a real JavaScript parser and validated; a
+  resource that fails is dropped and listed in `GET /engine/status`), and cached under
+  `data/filters`; the default build also embeds a copy (see below).
   Configurable (or disabled with `""`) via `[adblock] scriptlet_resources_url`.
 - ✅ Custom user rules: block/allow (`@@`)/cosmetic rules editable in the Web UI, compiled into
   the engine alongside subscribed lists
@@ -295,10 +297,10 @@ Old sled directories are ignored (and can be deleted). `userscripts.data_dir` an
 
 ### `bundled-ubo-resources` feature
 
-Scriptlet rules (`##+js(...)`) need the uBlock Origin resource library. It is fetched at runtime and
-cached as `<data_dir>/resources.json`. Building with `--features bundled-ubo-resources` (on
-`filter-engine` or `list-service`) also embeds a pinned snapshot as an offline fallback. It is **off
-by default** because the snapshot is GPL-3.0; see `docs/LICENSING.md`.
+Scriptlet rules (`##+js(...)`) need the uBlock Origin resource library. The default build embeds a
+pinned copy of it (GPL-3.0; see `docs/LICENSING.md`). At runtime the freshest fetched copy wins,
+then the on-disk cache `<data_dir>/resources.json`, then the embedded copy. To build without it:
+`cargo build --release --no-default-features --features websockets` (the `full` feature includes it).
 
 ## Rule support
 
