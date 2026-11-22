@@ -451,11 +451,11 @@ async fn gm_values_are_namespaced_per_profile() {
     let src = "// ==UserScript==\n// @name n\n// @namespace t\n// @version 1.0\n// @match *://hit.test/*\n// @grant GM_getValue\n// @grant GM_setValue\n// ==/UserScript==\n1;\n";
     let plan = plan_install(src, None).unwrap();
     let s = finish_install(plan, Fetched::default(), Approvals::default()).unwrap();
-    // The live index holds the default profile's scripts; the caller's profile name only
-    // selects the token and value namespace.
-    m.install_script(userscript_engine::DEFAULT_PROFILE, s)
-        .unwrap();
-    let script = m.live_index().iter().next().unwrap().script.clone();
+    // Each profile namespace holds its own copy; the caller's profile selects the index, the
+    // token and the value namespace.
+    m.install_script("p2", s.clone()).unwrap();
+    m.install_script("p1", s).unwrap();
+    let script = m.index_for("p1").iter().next().unwrap().script.clone();
     let caps = token::caps_hash(&script.metadata, script.allow_connect_all);
     let origin = "https://hit.test";
     let tok = |profile: &str| {

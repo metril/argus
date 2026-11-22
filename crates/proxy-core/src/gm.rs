@@ -415,13 +415,18 @@ impl GmHost {
 
     /// Must service workers be kept off `host`? (`block`: always; `block_when_privileged`: when a
     /// script with network, download or cookie grants may run there.)
-    pub fn blocks_service_workers(&self, manager: &UserscriptManager, host: &str) -> bool {
+    pub fn blocks_service_workers(
+        &self,
+        manager: &UserscriptManager,
+        profile: &str,
+        host: &str,
+    ) -> bool {
         use common::config::ServiceWorkerPolicy::*;
         match self.sw_policy() {
             Allow => false,
-            Block => !manager.live_index().is_empty(),
+            Block => !manager.index_for(profile).is_empty(),
             BlockWhenPrivileged => manager
-                .live_index()
+                .index_for(profile)
                 .for_host(host)
                 .any(|c| is_privileged(&c.script)),
         }
@@ -429,17 +434,18 @@ impl GmHost {
 
     // ---- delivery ---------------------------------------------------------------------------
 
-    /// Match `url` against the profile's scripts and register the document. `None` (no
-    /// allocation beyond the index probe) when nothing applies.
+    /// Match `url` against the scripts of storage namespace `profile` and register the document.
+    /// `None` (no allocation beyond the index probe) when nothing applies.
     pub fn plan_document(
         &self,
         manager: &UserscriptManager,
+        profile: &str,
         host: &str,
         url: &str,
         origin: &str,
         is_top_frame: bool,
     ) -> Option<DocPlan> {
-        let guard = manager.live_index();
+        let guard = manager.index_for(profile);
         if guard.is_empty() {
             return None;
         }
@@ -555,7 +561,7 @@ impl GmHost {
     ) -> GmResult<Authed> {
         let unauth = |m: &str| GmError::new(ErrorCode::Unauthorized, m);
         let id = token::claimed_script_id(tok).ok_or_else(|| unauth("bad token"))?;
-        let idx: Arc<ScriptIndex> = Arc::clone(&manager.live_index());
+        let idx: Arc<ScriptIndex> = Arc::clone(&manager.index_for(c.profile));
         let cs = idx.get(&id).ok_or_else(|| unauth("unknown script"))?;
         let caps = token::caps_hash(&cs.script.metadata, cs.script.allow_connect_all);
         let version = cs.script.metadata.version.clone().unwrap_or_default();

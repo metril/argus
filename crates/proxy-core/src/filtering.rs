@@ -440,11 +440,12 @@ impl ProxyContext {
         // privileged userscript may run: refuse, so registration fails and the worker never sees
         // the page's bundles or GM traffic (see docs/USERSCRIPT-PROTOCOL.md section 6).
         if is_service_worker_fetch(req.headers()) {
-            let refuse = rctx
-                .profile
-                .load()
-                .userscript_manager()
-                .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+            let prof = rctx.profile.load();
+            let refuse = prof.userscript_manager().is_some_and(|m| {
+                self.internal
+                    .gm
+                    .blocks_service_workers(m, &prof.name, &host)
+            });
             if refuse {
                 debug!("Refused a service worker script fetch for {host}");
                 return Ok(Response::builder()
@@ -801,12 +802,14 @@ impl ProxyContext {
                 let us = if blocks_scripts || !enabled {
                     None
                 } else {
-                    rctx.profile.load().userscript_manager().and_then(|m| {
-                        if m.live_index().is_empty() {
+                    let prof = rctx.profile.load();
+                    prof.userscript_manager().and_then(|m| {
+                        if m.index_for(&prof.name).is_empty() {
                             return None; // zero cost: no allocation, no probe
                         }
                         self.internal.gm.plan_document(
                             m,
+                            &prof.name,
                             &host,
                             &url,
                             &origin_of(scheme, &url_host, port),
@@ -822,11 +825,11 @@ impl ProxyContext {
                 };
                 let unregister_sw = !blocks_scripts
                     && us.is_some()
-                    && rctx
-                        .profile
-                        .load()
-                        .userscript_manager()
-                        .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+                    && rctx.profile.load().userscript_manager().is_some_and(|m| {
+                        self.internal
+                            .gm
+                            .blocks_service_workers(m, &rctx.profile.load().name, &host)
+                    });
                 let head = if enabled {
                     build_head(&PageSpec {
                         unregister_sw,

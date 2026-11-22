@@ -511,6 +511,7 @@ async fn deleting_a_profile_removes_its_data_and_stops_its_expiry_task() {
     use script_policy::{Preset, Scope};
     let f = fixture().await;
     let a = f.store.put(profile("doomed", &["ads"], "")).unwrap();
+    let ns = common::profile_store::namespace(a.id);
     let d = f.store.put_device(device("phone", a.id, &[])).unwrap();
     f.builder.sync().await;
     let control = f
@@ -523,41 +524,47 @@ async fn deleting_a_profile_removes_its_data_and_stops_its_expiry_task() {
         .script_control
         .clone()
         .expect("script control");
-    assert_eq!(control.profile_name(), "doomed");
+    assert_eq!(control.profile_name(), &ns);
     assert!(control.expiry_running());
-    install_script(&f.manager, "doomed");
+    install_script(&f.manager, &ns);
     f.policy
         .create_site_rule(
-            "doomed",
+            &ns,
             Scope::parse("example.com").unwrap(),
             Preset::Trusted,
             None,
         )
         .unwrap();
     for _ in 0..8 {
-        f.policy.pin_failed("doomed", "10.0.0.1").unwrap();
+        f.policy.pin_failed(&ns, "10.0.0.1").unwrap();
     }
-    assert_eq!(f.manager.get_all_in("doomed").len(), 1);
+    assert_eq!(f.manager.get_all_in(&ns).len(), 1);
 
     // Devices first (the store refuses to delete a profile in use), then the profile.
     f.store.delete_device(d.id).unwrap();
     assert!(f.store.delete(a.id).unwrap());
     f.builder.sync().await;
 
-    assert!(f.manager.get_all_in("doomed").is_empty());
-    assert!(f.manager.index_for("doomed").is_empty());
-    assert!(f.policy.rules("doomed").unwrap().site_rules.is_empty());
-    assert_eq!(f.policy.pin_wait("doomed", "10.0.0.1").unwrap(), 0);
+    assert!(f.manager.get_all_in(&ns).is_empty());
+    assert!(f.manager.index_for(&ns).is_empty());
+    assert!(f.policy.rules(&ns).unwrap().site_rules.is_empty());
+    assert_eq!(f.policy.pin_wait(&ns, "10.0.0.1").unwrap(), 0);
     assert!(f.ctx.profiles().table().slot(a.id).is_none());
     assert!(!f.builder.status().contains_key(&a.id));
     wait_until("the expiry task to end", || !control.expiry_running()).await;
+    assert_eq!(
+        f.policy.listener_count(),
+        0,
+        "deleted profile's listener removed"
+    );
 
-    // Recreated under the same name: starts empty.
+    // Recreated under the same name: a new id, so a new empty namespace.
     let again = f.store.put(profile("doomed", &["ads"], "")).unwrap();
+    assert_ne!(again.id, a.id);
     f.store.put_device(device("phone", again.id, &[])).unwrap();
     f.builder.sync().await;
-    assert!(f.manager.get_all_in("doomed").is_empty());
-    assert!(f.policy.rules("doomed").unwrap().site_rules.is_empty());
+    assert!(f.manager.get_all_in(&ns).is_empty());
+    assert!(f.policy.rules(&ns).unwrap().site_rules.is_empty());
 }
 
 #[tokio::test]

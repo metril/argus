@@ -5,13 +5,13 @@
 //!
 //! * each stored profile becomes an `Arc<Profile>`: base engine from
 //!   `ListService::engine_for(lists)` (profiles with the same lists share it), an overlay engine
-//!   from its rules, the shared userscript manager and a script control keyed by its name;
+//!   from its rules, the shared userscript manager and a script control keyed by its stable namespace (`p<id>`, so renames keep the data);
 //! * a change to a profile's contents swaps the `Arc<Profile>` inside its existing slot
 //!   (`Profiles::edit`, no epoch bump); a change to the set of profiles or to the device mapping
 //!   publishes a new table (`Profiles::publish`) that reuses every unchanged slot;
 //! * a profile whose build fails keeps its previous compiled state (or the default profile's
 //!   engine if it was never built) and the error is recorded, see [`ProfileBuilder::status`];
-//! * a profile that disappears from the store (or is renamed) has its data removed, see
+//! * a profile that disappears from the store has its data removed, see
 //!   [`delete_profile_data`].
 //!
 //! Bursts of changes are debounced and builds are single-flight.
@@ -21,7 +21,7 @@ use crate::profiles::{ProfileTable, Profiles};
 use crate::request_ctx::{Profile, ProfileSlot, DEFAULT_PROFILE_ID};
 use crate::scriptctl::ScriptControl;
 use chrono::{DateTime, Utc};
-use common::profile_store::{DeviceRecord, ProfileRecord, ProfileStore};
+use common::profile_store::{namespace, DeviceRecord, ProfileRecord, ProfileStore};
 use filter_engine::{overlay_from_rules_shared, ArcSwap, SharedEngine};
 use ipnet::IpNet;
 use list_service::ListService;
@@ -54,7 +54,7 @@ pub struct BuilderDeps {
     pub ctx: Arc<ProxyContext>,
     pub store: Arc<ProfileStore>,
     pub lists: Arc<ListService>,
-    /// The shared userscript manager (all profiles' scripts live in it, keyed by profile name).
+    /// The shared userscript manager (all profiles' scripts live in it, keyed by profile namespace).
     pub manager: Option<Arc<UserscriptManager>>,
     /// Script-policy storage; `None` leaves profiles without script control.
     pub policy: Option<Arc<PolicyStore>>,
@@ -255,7 +255,8 @@ impl Inner {
         let union: BTreeSet<String> = records.iter().flat_map(|r| r.lists.clone()).collect();
         self.lists.set_profile_lists(union);
 
-        // Data of profiles that are gone is removed after the new table is live.
+        // Data of profiles that are gone is removed after the new table is live. Ids are never
+        // reused, so a namespace is purged at most once and a rename never touches data.
         let mut cleanup: Vec<(String, Option<Arc<ScriptControl>>)> = Vec::new();
         let live: HashSet<u64> = records.iter().map(|r| r.id).collect();
         let gone: Vec<u64> = st
@@ -266,7 +267,7 @@ impl Inner {
             .collect();
         for id in gone {
             if let Some(t) = st.profiles.remove(&id) {
-                cleanup.push((t.name, t.control));
+                cleanup.push((namespace(id), t.control));
             }
             self.status.lock().remove(&id);
         }
@@ -292,16 +293,11 @@ impl Inner {
                 }
                 continue;
             }
-            if renamed {
-                if let Some(t) = st.profiles.get_mut(&rec.id) {
-                    cleanup.push((t.name.clone(), t.control.take()));
-                }
-            }
             let result = self.compile(&sig, &default.engine).await;
             let prev = st.profiles.get_mut(&rec.id);
             match (result, prev) {
                 // Failed again: keep what is serving (unless the name changed, below).
-                (Err(e), Some(t)) if !renamed => {
+                (Err(e), Some(t)) => {
                     warn!(
                         "profile {} ({}): build failed, keeping previous state: {e}",
                         rec.id, rec.name
@@ -329,11 +325,11 @@ impl Inner {
                     };
                     let control = match prev.as_ref().and_then(|t| t.control.clone()) {
                         Some(c) => Some(c),
-                        None => self.new_control(&rec.name).await,
+                        None => self.new_control(&namespace(rec.id)).await,
                     };
                     let profile = Arc::new(
                         Profile::new(rec.id, generation, compiled.engine)
-                            .with(|p| p.name = Arc::from(rec.name.as_str()))
+                            .with(|p| p.display_name = Arc::from(rec.name.as_str()))
                             .with_overlay(compiled.overlay)
                             .with_userscripts(default.userscripts.clone())
                             .with_script_control(control.clone()),
@@ -389,17 +385,19 @@ impl Inner {
                 b = b.profile(*id, t.slot.clone());
             }
             for d in &devices {
+                let seen = Some(profiles.seen_cell(d.id));
                 for net in &d.ips {
                     b = if net.prefix_len() == net.max_prefix_len() {
-                        b.ip(net.addr(), d.profile_id)
+                        b.ip_for(net.addr(), d.profile_id, seen.clone())
                     } else {
-                        b.prefix(*net, d.profile_id)
+                        b.prefix_for(*net, d.profile_id, seen.clone())
                     };
                 }
                 if let Some(digest) = d.token_digest {
-                    b = b.token(digest, d.profile_id);
+                    b = b.token_for(digest, d.profile_id, seen.clone());
                 }
             }
+            profiles.retain_seen(&devices.iter().map(|d| d.id).collect());
             profiles.publish(b.build());
             st.map = map;
         }
@@ -475,10 +473,10 @@ impl Inner {
     }
 }
 
-/// Remove everything a deleted (or renamed-away) profile name owns: its userscripts, stored
+/// Remove everything a deleted profile's namespace owns: its userscripts, stored
 /// values, cookies and live index; its script-policy rules, temporary grants, panel settings,
-/// PIN and lockout state; and stop its script control's expiry task. A profile created later
-/// under the same name starts empty. The default profile is refused. Blocking: call from
+/// PIN and lockout state; and stop its script control's expiry task. Ids are never reused, so
+/// nothing later inherits it. The default profile is refused. Blocking: call from
 /// `spawn_blocking`.
 pub fn delete_profile_data(
     name: &str,

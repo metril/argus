@@ -49,6 +49,7 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             black_box(host.plan_document(
                 &m,
+                "default",
                 "miss.test",
                 "https://miss.test/page?x=1",
                 "https://miss.test",
@@ -58,7 +59,14 @@ fn bench(c: &mut Criterion) {
     });
     c.bench_function("plan_document/3_matching_of_503", |b| {
         b.iter(|| {
-            black_box(host.plan_document(&m, "hit.test", "https://hit.test/page?x=1", origin, true))
+            black_box(host.plan_document(
+                &m,
+                "default",
+                "hit.test",
+                "https://hit.test/page?x=1",
+                origin,
+                true,
+            ))
         })
     });
     let caller = Caller {
@@ -70,7 +78,7 @@ fn bench(c: &mut Criterion) {
     c.bench_function("bundle/serve_3_scripts", |b| {
         b.iter(|| {
             let plan = host
-                .plan_document(&m, "hit.test", "https://hit.test/", origin, true)
+                .plan_document(&m, "default", "hit.test", "https://hit.test/", origin, true)
                 .unwrap();
             for src in &plan.srcs {
                 let rest = src.strip_prefix("/__adblock__/us/").unwrap();

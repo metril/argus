@@ -17,8 +17,10 @@ pub struct Profile {
     /// Bumped on every edit of the profile (cache key for per-host caches).
     pub generation: u64,
     /// GM / script-policy namespace: `"default"` for id 0 (so stored data keeps working), else
-    /// the profile's own name.
+    /// `p<id>`. Stable across renames.
     pub name: Arc<str>,
+    /// Display label (the profile's current name); never used as a storage key.
+    pub display_name: Arc<str>,
     pub engine: Arc<SharedEngine>,
     /// Small second engine checked after `engine`: an overlay exception or block wins; cosmetic
     /// resources are merged from both.
@@ -49,11 +51,12 @@ impl Profile {
         let name: Arc<str> = if id == DEFAULT_PROFILE_ID {
             Arc::from(userscript_engine::DEFAULT_PROFILE)
         } else {
-            Arc::from(id.to_string())
+            Arc::from(common::profile_store::namespace(id))
         };
         Self {
             id,
             generation,
+            display_name: name.clone(),
             name,
             engine,
             overlay: None,
