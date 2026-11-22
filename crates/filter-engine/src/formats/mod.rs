@@ -26,7 +26,7 @@ pub use iplist::{IpRange, IpSet};
 
 /// Bumped whenever conversion output could change for the same input (part of the persisted
 /// engine's cache key).
-pub const CONVERTER_VERSION: u32 = 1;
+pub const CONVERTER_VERSION: u32 = 2;
 
 /// Max number of per-line errors kept in [`ConvertStats::errors`].
 pub const MAX_ERRORS: usize = 50;

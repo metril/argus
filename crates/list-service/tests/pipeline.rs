@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use filter_engine::{FilterList, ListFormat, SharedEngine};
-use list_service::{ListService, ListServiceConfig, ListStore};
+use list_service::{BuildState, ListService, ListServiceConfig, ListStore};
 use tokio::sync::Notify;
 
 /// A tiny file server: path -> body, request log, failure switch and a gate.
@@ -243,11 +243,23 @@ async fn persisted_engine_serves_before_and_without_the_network() {
     svc2.trigger();
     f.arrived.notified().await;
     assert!(blocked(&engine2, "http://ads.test/x.js"));
+    assert_eq!(engine2.domains().len(), 1, "domain set restored from disk");
     assert!(svc2.summary().from_persisted);
+    // Mid-build: busy, fetching 0 of 1.
+    assert!(svc2.is_building());
+    assert_eq!(
+        svc2.summary().state,
+        BuildState::Fetching { done: 0, total: 1 }
+    );
     f.gated.store(false, Ordering::SeqCst);
     f.fail.store(true, Ordering::SeqCst);
     f.gate.notify_one();
     svc2.wait_idle().await;
+    assert!(!svc2.is_building());
+    let s = svc2.summary();
+    assert_eq!(s.state, BuildState::Idle);
+    assert!(s.last_build_at.is_some());
+    assert_eq!(s.domain_set, 1);
     // Server down (500): still blocking, still the same engine (nothing changed, no recompile).
     assert!(blocked(&engine2, "http://ads.test/x.js"));
     assert!(svc2.summary().from_persisted);
