@@ -94,7 +94,8 @@ arc-swap = "1.7"
 sled = "0.34"
 
 # Adblocking
-adblock = "0.12"
+# No `single-thread`: makes `adblock::Engine` Send + Sync so one Arc<Engine> is shared by all workers.
+adblock = { version = "0.12", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 
 # HTML/CSS parsing
 html5ever = "0.28"

@@ -1439,6 +1439,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "common",
+ "criterion",
  "dashmap 6.2.1",
  "reqwest",
  "selectors",
