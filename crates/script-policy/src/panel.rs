@@ -152,7 +152,7 @@ mod tests {
         // The old single SHA-256 format no longer verifies (the PIN must be set again).
         let legacy = format!("salty${}", {
             use sha2::{Digest, Sha256};
-            Sha256::digest(b"salty\0123456")
+            Sha256::digest(b"salty\x00123456")
                 .iter()
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()

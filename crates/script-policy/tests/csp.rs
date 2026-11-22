@@ -470,7 +470,7 @@ proptest! {
         let preset = match preset { 0 => Preset::Default, 1 => Preset::Untrusted, _ => Preset::Trusted };
         // Rules are built from user-typed scopes: whatever parses must render safely.
         if let Ok(p) = Scope::parse(&page) {
-            r.site_rules.insert("s".into(), SiteRule { id: "s".into(), scope: p, preset: preset.clone(), note: None });
+            r.site_rules.insert("s".into(), SiteRule { id: "s".into(), scope: p, preset, note: None });
             if let Ok(sc) = Scope::parse(&src) {
                 r.source_rules.insert("r".into(), SourceRule {
                     id: "r".into(), page: Scope::parse(&page).unwrap(), source: sc,

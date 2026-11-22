@@ -476,7 +476,12 @@ us_test!(hostile_page_cannot_use_or_steal_a_scripts_authority, |s| {
     let arr = calls.as_array().unwrap();
     assert_eq!(&arr[..3], &[json!(401), json!(401), json!(401)], "{calls}");
     for st in &arr[4..] {
-        assert_eq!(st, &json!(404), "bundle URLs are single use: {calls}");
+        // A fetch() is refused (403: bundles load only as script elements); had it passed, the
+        // single-use record would answer 404.
+        assert!(
+            st == &json!(403) || st == &json!(404),
+            "bundle URLs are not readable by the page: {calls}"
+        );
     }
 });
 
@@ -770,56 +775,6 @@ us_test!(
             r.as_str().unwrap().starts_with("failed"),
             "registration must be refused: {r}"
         );
-    }
-);
-
-us_test!(
-    service_workers_are_allowed_and_can_read_bundles_only_when_policy_is_allow,
-    |s| {
-        use common::config::ServiceWorkerPolicy as P;
-        s.origin.route(
-            "/sw.js",
-            MockResponse::ok(SW_JS).header("content-type", "text/javascript"),
-        );
-        s.proxy.install_userscript(&script(
-            "priv",
-            "// @grant GM_xmlhttpRequest\n// @grant GM_setValue\n// @connect api.test",
-            "window.__ran = 1; setInterval(() => GM_setValue('t', Date.now()), 200);",
-        ));
-        html(
-        &s,
-        "/",
-        page(
-            "<script>window.__stolen = []; navigator.serviceWorker.addEventListener('message', (e) => __stolen.push(e.data.stolen));</script>",
-            "x",
-        ),
-    );
-        s.proxy.ctx.set_service_worker_policy(P::Allow);
-        s.goto(&s.url("us.test", "/")).await;
-        s.wait_for("script ran", "window.__ran === 1").await;
-        assert_eq!(sw_register(&s).await, "registered");
-        s.wait_for(
-        "worker active",
-        "navigator.serviceWorker.getRegistration().then((r) => { window.__act = !!(r && r.active); }) && window.__act === true",
-    )
-    .await;
-        // Reload: the worker now controls the page and sees the bundle request. Documented limitation.
-        s.goto(&s.url("us.test", "/")).await;
-        s.wait_for(
-            "worker saw a token",
-            "(window.__stolen || []).some((t) => typeof t === 'string' && t.startsWith('v1.'))",
-        )
-        .await;
-        // Tightening the policy: the next load unregisters the worker.
-        s.proxy
-            .ctx
-            .set_service_worker_policy(P::BlockWhenPrivileged);
-        s.goto(&s.url("us.test", "/")).await;
-        s.wait_for(
-        "worker unregistered",
-        "navigator.serviceWorker.getRegistrations().then((r) => { window.__regs = r.length; }) && window.__regs === 0",
-    )
-    .await;
     }
 );
 

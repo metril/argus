@@ -1114,3 +1114,62 @@ e2e_test!(
         assert_eq!(b.status(), 200);
     }
 );
+
+e2e_test!(
+    service_worker_policy_decides_script_fetches_and_the_unregister_flag,
+    rules = [],
+    |env| {
+        use common::config::ServiceWorkerPolicy as P;
+        env.proxy.install_userscript(&script(
+            "swp",
+            "// @grant GM_xmlhttpRequest\n// @connect api.test",
+        ));
+        env.origin.route("/sw.js", MockResponse::ok("// sw"));
+        let c = env.client();
+        let sw_fetch = |path: &'static str| {
+            let url = env.origin.https_url("app.test", path);
+            let c = &c;
+            async move {
+                c.request(reqwest::Method::GET, &url)
+                    .header("service-worker", "script")
+                    .header("sec-fetch-dest", "serviceworker")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            }
+        };
+        // Default: a privileged script applies on app.test: refused, and the page unregisters.
+        assert_eq!(sw_fetch("/sw.js").await, 403);
+        assert!(load_page(&env, &c, "app.test", "/p")
+            .await
+            .contains("\"sw\":1"));
+        // Another host has no script: untouched.
+        env.origin.route("/sw.js", MockResponse::ok("// sw"));
+        let other = env.origin.https_url("other.test", "/sw.js");
+        let r = c
+            .request(reqwest::Method::GET, &other)
+            .header("service-worker", "script")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        // allow: nothing is refused and nothing is unregistered.
+        env.proxy.ctx.set_service_worker_policy(P::Allow);
+        assert_eq!(sw_fetch("/sw.js").await, 200);
+        assert!(!load_page(&env, &c, "app.test", "/p")
+            .await
+            .contains("\"sw\":1"));
+        // block: every host with userscripts installed.
+        env.proxy.ctx.set_service_worker_policy(P::Block);
+        assert_eq!(sw_fetch("/sw.js").await, 403);
+        let r = c
+            .request(reqwest::Method::GET, &other)
+            .header("service-worker", "script")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+    }
+);

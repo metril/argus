@@ -1103,6 +1103,17 @@ fn bad_gateway(msg: &str) -> Response<ProxyBody> {
     status_response(StatusCode::BAD_GATEWAY, msg)
 }
 
+/// A request that fetches a service worker's script: `Service-Worker: script` (set by the browser
+/// for the main script and its updates) or `Sec-Fetch-Dest: serviceworker`.
+fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
+    h.get("service-worker")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("script"))
+        || h.get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("serviceworker"))
+}
+
 #[cfg(test)]
 mod url_tests {
     use super::request_url;
@@ -1153,15 +1164,4 @@ mod url_tests {
             "http://example.com:8080/x"
         );
     }
-}
-
-/// A request that fetches a service worker's script: `Service-Worker: script` (set by the browser
-/// for the main script and its updates) or `Sec-Fetch-Dest: serviceworker`.
-fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
-    h.get("service-worker")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("script"))
-        || h.get("sec-fetch-dest")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("serviceworker"))
 }

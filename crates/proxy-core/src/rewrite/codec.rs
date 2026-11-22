@@ -729,7 +729,7 @@ mod tests {
     /// --ignored --nocapture`): CPU time of one encoder write, which is what a single poll of the
     /// response stream spends on compression.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "manual timing measurement; run in release with --ignored --nocapture"]
     async fn encode_chunk_timing() {
         let mut x = 0x2545_f491_4f6c_dd1du64;
         let mut doc = String::new();
