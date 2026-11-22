@@ -547,6 +547,7 @@ impl ProxyContext {
             .map(str::to_string);
 
         let mut csp_values: Vec<Option<String>> = Vec::new();
+        let mut csp_ro_values: Vec<Option<String>> = Vec::new();
         let mut rewritten = false;
         let mut utf8_charset = false;
         let mut text_changed = false;
@@ -627,6 +628,15 @@ impl ProxyContext {
                     passthrough_body(resp)
                 } else {
                     csp_values = csp::adapt_headers(&csp_headers, &origin, &nonce, needs).0;
+                    // Report-Only policies get the same allowances so that our own tags do not
+                    // produce violation reports (they are not enforced: nothing is weakened).
+                    let ro_headers: Vec<&str> = resp_headers
+                        .get_all("content-security-policy-report-only")
+                        .iter()
+                        .filter_map(|v| v.to_str().ok())
+                        .collect();
+                    csp_ro_values =
+                        csp::adapt_report_only(&ro_headers, &origin, &nonce, needs, blocks_scripts);
                     match transform_html(resp, codings, out_coding, content_type.clone(), plan, pre)
                         .await
                     {
@@ -641,6 +651,7 @@ impl ProxyContext {
                         }
                         Outcome::Untouched(b) => {
                             csp_values.clear();
+                            csp_ro_values.clear();
                             b
                         }
                         Outcome::Text { body } => body,
@@ -671,6 +682,7 @@ impl ProxyContext {
         let listed_resp = connection_listed(&resp_headers);
         let mut builder = Response::builder().status(status);
         let mut csp_idx = 0usize;
+        let mut csp_ro_idx = 0usize;
         let mut vary_seen = false;
         for (name, value) in resp_headers.iter() {
             if is_hop_by_hop(name) || listed_resp.contains(name) {
@@ -733,6 +745,14 @@ impl ProxyContext {
             if rewritten && name.as_str() == "content-security-policy" {
                 let adapted = csp_values.get(csp_idx).cloned().flatten();
                 csp_idx += 1;
+                if let Some(v) = adapted.and_then(|v| HeaderValue::from_str(&v).ok()) {
+                    builder = builder.header(name, v);
+                    continue;
+                }
+            }
+            if rewritten && name.as_str() == "content-security-policy-report-only" {
+                let adapted = csp_ro_values.get(csp_ro_idx).cloned().flatten();
+                csp_ro_idx += 1;
                 if let Some(v) = adapted.and_then(|v| HeaderValue::from_str(&v).ok()) {
                     builder = builder.header(name, v);
                     continue;

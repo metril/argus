@@ -3,7 +3,20 @@
 //! Policies are parsed into ordered directives (first occurrence wins, like browsers). For one
 //! policy, [`adapt`] adds only what is required for (a) our same-origin external script, (b) our
 //! inline `<style>`, (c) the `/__adblock__/` beacon and (d) a Trusted Types policy name. It never
-//! removes a directive or source, and adds at most one source per need.
+//! removes a source, and adds at most one source per need.
+//!
+//! What we add must never change what the page's own resources may load:
+//!
+//! * A need that falls back to `default-src` (no `script-src-elem`/`script-src`, `style-src-elem`/
+//!   `style-src`, `connect-src`) is granted by a new, narrower directive (`script-src-elem`,
+//!   `style-src-elem`, `connect-src`) that copies the fallback list and adds our source;
+//!   `default-src` itself is left as written, so images, fonts, workers, `script-src-attr`, ...
+//!   keep their policy.
+//! * A source list that is `'none'` (or empty) allows nothing; appending to it would make browsers
+//!   ignore the `'none'`. The new directive then holds only our source, or, when the effective
+//!   directive is already the narrow one, our source replaces the `'none'`.
+//! * Report-Only policies get the same additions as enforced ones (they are not enforced, so this
+//!   cannot weaken anything) so that our own resources produce no violation reports.
 //!
 //! The nonce pitfall: a `'nonce-…'` or hash in a source list makes browsers ignore
 //! `'unsafe-inline'` in that list (so does `'strict-dynamic'` for scripts). Adding our nonce to a
@@ -71,6 +84,9 @@ pub struct Needs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyKind {
     Header,
+    /// `Content-Security-Policy-Report-Only`: adapted like [`Self::Header`], but its `sandbox`
+    /// (ignored by browsers in report-only mode) says nothing about scripts or the origin.
+    ReportOnly,
     Meta,
 }
 
@@ -160,6 +176,43 @@ fn is_nonce_or_hash(tok: &str) -> bool {
         || t.starts_with("'sha256-")
         || t.starts_with("'sha384-")
         || t.starts_with("'sha512-")
+}
+
+/// A source list that matches nothing: empty, or only `'none'`.
+fn is_none_list(list: &[String]) -> bool {
+    list.iter().all(|t| is_kw(t, "none"))
+}
+
+/// Add `token` to the policy for a request kind whose fallback chain is `chain` (narrowest
+/// first). `list` is the effective directive's current list, `effective` its name.
+///
+/// * effective is the narrowest directive: add in place (replacing a lone `'none'`);
+/// * effective is a fallback (`script-src`, `style-src`, `default-src`): add to it in place only
+///   while that is no wider than needed, i.e. never for `default-src` or a `'none'` list: there a
+///   new narrow directive is created holding the fallback's sources (none for `'none'`) plus ours.
+fn grant(p: &mut Policy, chain: &[&'static str], effective: &str, token: &str) {
+    let narrow = chain[0];
+    let list = p.get(effective).cloned().unwrap_or_default();
+    if effective == narrow {
+        let l = p.get_mut(narrow).expect("exists");
+        if is_none_list(&list) {
+            *l = vec![token.to_string()];
+        } else {
+            l.push(token.to_string());
+        }
+    } else if effective != "default-src" && !is_none_list(&list) {
+        p.get_mut(effective)
+            .expect("exists")
+            .push(token.to_string());
+    } else {
+        let mut l = if is_none_list(&list) {
+            Vec::new()
+        } else {
+            list
+        };
+        l.push(token.to_string());
+        p.directives.push((narrow.to_string(), l));
+    }
 }
 
 /// Whether a source list permits inline code of this kind.
@@ -297,7 +350,7 @@ pub fn adapt(
     let nonce_tok = format!("'nonce-{nonce}'");
     let host_tok = format!("{}{INTERNAL_PREFIX}", origin.serialize());
 
-    if needs.script && kind == PolicyKind::Header && !blocks_scripts {
+    if needs.script && kind != PolicyKind::Meta && !blocks_scripts {
         if let Some(name) = p.effective(SCRIPT_ELEM) {
             let list = p.get(name).cloned().unwrap_or_default();
             if !allows_url(&list, origin, &our_path, true) {
@@ -309,7 +362,7 @@ pub fn adapt(
                 } else {
                     &nonce_tok
                 };
-                p.get_mut(name).expect("exists").push(add.clone());
+                grant(&mut p, SCRIPT_ELEM, name, add);
             }
         }
         // Trusted Types: name our policy if the directive restricts names.
@@ -329,13 +382,13 @@ pub fn adapt(
         }
     }
 
-    if needs.style && kind == PolicyKind::Header {
+    if needs.style && kind != PolicyKind::Meta {
         if let Some(name) = p.effective(STYLE_ELEM) {
             let list = p.get(name).cloned().unwrap_or_default();
             if !allows_inline(&list, false, Some(nonce)) {
                 // No `'unsafe-inline'` to preserve here (it would have allowed us), or it is
                 // already ignored because of other nonces/hashes: our nonce is safe to add.
-                p.get_mut(name).expect("exists").push(nonce_tok.clone());
+                grant(&mut p, STYLE_ELEM, name, &nonce_tok);
             }
         }
     }
@@ -345,7 +398,7 @@ pub fn adapt(
         if let Some(name) = p.effective(CONNECT) {
             let list = p.get(name).cloned().unwrap_or_default();
             if !allows_url(&list, origin, &beacon, false) {
-                p.get_mut(name).expect("exists").push(host_tok);
+                grant(&mut p, CONNECT, name, &host_tok);
             }
         }
     }
@@ -417,6 +470,37 @@ pub fn adapt_headers(
     (out, blocks, opaque)
 }
 
+/// Adapt every `Content-Security-Policy-Report-Only` value like [`adapt_headers`] adapts enforced
+/// ones. `blocks_scripts` is the enforced policies' sandbox verdict (from [`adapt_headers`]): when
+/// scripts cannot run, no script or beacon allowance is needed here either.
+pub fn adapt_report_only(
+    values: &[&str],
+    origin: &PageOrigin,
+    nonce: &str,
+    needs: Needs,
+    blocks_scripts: bool,
+) -> Vec<Option<String>> {
+    let mut needs = needs;
+    if blocks_scripts {
+        needs.script = false;
+        needs.connect = false;
+    }
+    values
+        .iter()
+        .map(|v| {
+            let mut any = false;
+            let adapted: Vec<String> = split_policies(v)
+                .map(|pol| {
+                    let a = adapt(pol, PolicyKind::ReportOnly, origin, nonce, needs);
+                    any |= a.changed;
+                    a.text
+                })
+                .collect();
+            any.then(|| adapted.join(", "))
+        })
+        .collect()
+}
+
 fn split_policies(value: &str) -> impl Iterator<Item = &str> {
     value.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
@@ -452,7 +536,8 @@ mod tests {
             // default-src fallback is used for script, style and connect.
             (
                 "default-src 'none'",
-                "default-src 'none' 'nonce-N0nce' https://example.test/__adblock__/",
+                "default-src 'none'; script-src-elem 'nonce-N0nce'; style-src-elem 'nonce-N0nce'; \
+                 connect-src https://example.test/__adblock__/",
             ),
             // script-src-elem wins over script-src.
             (
@@ -649,6 +734,164 @@ mod tests {
             "host-source without port means default port only"
         );
         assert_eq!(o.serialize(), "https://example.test:8443");
+    }
+
+    /// `'none'` must stay alone: no policy we produce may hold `'none'` next to another source.
+    fn assert_no_none_mixed(text: &str) {
+        for (n, v) in &Policy::parse(text).directives {
+            assert!(
+                !(v.len() > 1 && v.iter().any(|t| is_kw(t, "none"))),
+                "{n} mixes 'none' with other sources: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn none_lists_are_never_edited_only_narrowed() {
+        const N: &str = "'nonce-N0nce'";
+        const H: &str = "https://example.test/__adblock__/";
+        let cases: &[(&str, &str, Needs)] = &[
+            // default-src 'none' stays byte-for-byte; narrow directives are added.
+            (
+                "default-src 'none'",
+                &format!(
+                    "default-src 'none'; script-src-elem {N}; style-src-elem {N}; connect-src {H}"
+                ),
+                ALL,
+            ),
+            (
+                "default-src 'none'; img-src 'self'",
+                &format!(
+                    "default-src 'none'; img-src 'self'; script-src-elem {N}; style-src-elem {N}; connect-src {H}"
+                ),
+                ALL,
+            ),
+            // `default-src;` is an empty list, equivalent to 'none'.
+            (
+                "default-src",
+                &format!(
+                    "default-src; script-src-elem {N}; style-src-elem {N}; connect-src {H}"
+                ),
+                ALL,
+            ),
+            // script-src 'none': script-src-elem narrows it, script-src stays.
+            (
+                "script-src 'none'",
+                &format!("script-src 'none'; script-src-elem {N}"),
+                ALL,
+            ),
+            // The narrow directive itself is 'none': our source replaces it.
+            (
+                "script-src-elem 'none'; script-src 'self'",
+                &format!("script-src-elem {N}; script-src 'self'"),
+                ALL,
+            ),
+            (
+                "style-src-elem 'none'",
+                &format!("style-src-elem {N}"),
+                ALL,
+            ),
+            ("style-src 'none'", &format!("style-src 'none'; style-src-elem {N}"), ALL),
+            ("connect-src 'none'", &format!("connect-src {H}"), ALL),
+            // default-src with sources: copied into the narrow directive, default-src untouched.
+            (
+                "default-src https://cdn.test",
+                &format!(
+                    "default-src https://cdn.test; script-src-elem https://cdn.test {N}; \
+                     style-src-elem https://cdn.test {N}; connect-src https://cdn.test {H}"
+                ),
+                ALL,
+            ),
+            // default-src 'self' already covers script and beacon; only style needs a narrow one.
+            (
+                "default-src 'self'",
+                &format!("default-src 'self'; style-src-elem 'self' {N}"),
+                ALL,
+            ),
+            // script-src 'none' with an unrelated default-src: still just script-src-elem.
+            (
+                "default-src 'self'; script-src 'none'",
+                &format!("default-src 'self'; script-src 'none'; script-src-elem {N}"),
+                Needs {
+                    script: true,
+                    ..Needs::default()
+                },
+            ),
+        ];
+        for (input, want, needs) in cases {
+            let got = run(input, *needs);
+            assert_no_none_mixed(&got.text);
+            assert_eq!(
+                Policy::parse(&got.text).serialize(),
+                Policy::parse(want).serialize(),
+                "input: {input}"
+            );
+            // Every directive that was in the input is still there with the same sources, except
+            // a lone 'none' in the narrow directive that we replaced.
+            let before = Policy::parse(input);
+            let after = Policy::parse(&got.text);
+            for (n, v) in &before.directives {
+                let a = after.get(n).unwrap_or_else(|| panic!("{n} lost: {input}"));
+                let replaced = is_none_list(v)
+                    && matches!(
+                        n.as_str(),
+                        "script-src-elem" | "style-src-elem" | "connect-src"
+                    );
+                assert!(replaced || a == v, "{n} edited: {input} -> {}", got.text);
+            }
+        }
+    }
+
+    #[test]
+    fn default_src_is_never_edited() {
+        for p in [
+            "default-src 'none'",
+            "default-src 'self'",
+            "default-src https://cdn.test 'unsafe-inline'",
+            "default-src 'nonce-abc'",
+            "default-src 'self'; img-src *",
+        ] {
+            let got = run(p, ALL);
+            assert_eq!(
+                Policy::parse(&got.text).get("default-src"),
+                Policy::parse(p).get("default-src"),
+                "{p} -> {}",
+                got.text
+            );
+        }
+    }
+
+    #[test]
+    fn report_only_is_adapted_like_enforced() {
+        let ro = |p: &str| adapt(p, PolicyKind::ReportOnly, &origin(), "N0nce", ALL);
+        let a = ro("default-src 'none'; report-uri /r; report-to grp");
+        assert!(a.changed);
+        assert!(a.text.contains("report-uri /r") && a.text.contains("report-to grp"));
+        assert!(a.text.contains("script-src-elem 'nonce-N0nce'"));
+        assert!(a
+            .text
+            .contains("connect-src https://example.test/__adblock__/"));
+        assert_no_none_mixed(&a.text);
+        // sandbox in a report-only policy is not enforced: no facts come from it.
+        let a = ro("sandbox; script-src 'none'");
+        assert!(!a.blocks_scripts && !a.opaque_origin);
+        assert!(a.text.contains("script-src-elem 'nonce-N0nce'"));
+        let out = adapt_report_only(
+            &["script-src 'nonce-abc', default-src 'none'", "img-src *"],
+            &origin(),
+            "N0nce",
+            ALL,
+            false,
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out[0]
+            .as_deref()
+            .unwrap()
+            .contains("'nonce-abc' 'nonce-N0nce'"));
+        assert_eq!(out[1], None);
+        // Enforced sandbox without allow-scripts: nothing script-ish to allow.
+        let out = adapt_report_only(&["script-src 'self'"], &origin(), "N", ALL, true);
+        assert_eq!(out[0], None);
     }
 
     #[test]
