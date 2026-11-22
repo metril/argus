@@ -541,3 +541,82 @@ async fn scopes_are_enforced_and_writes_are_audited() {
         .expect("denied write is audited");
     assert_eq!(denied["outcome"], "denied");
 }
+
+#[tokio::test]
+async fn panel_settings_validate_and_never_return_the_pin() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let cur: Value = admin.get(&format!("{B}/panel")).await.json();
+    assert_eq!(cur["enabled"], false, "off until switched on");
+    assert_eq!(cur["auth"], "pin", "the default is never 'none'");
+    assert_eq!(cur["hotkey"], "Alt+Shift+A");
+    assert_eq!(cur["pin_set"], false);
+    assert_eq!(cur["reserved_host"], "adblock.invalid");
+    let r: Value = admin
+        .put(&format!("{B}/panel"))
+        .json(&json!({"enabled": true, "hotkey": "Ctrl+Alt+P", "pin": "123456"}))
+        .await
+        .json();
+    assert_eq!(
+        (r["enabled"].as_bool(), r["pin_set"].as_bool()),
+        (Some(true), Some(true))
+    );
+    assert!(!r.to_string().contains("123456") && !r.to_string().contains("pin_hash"));
+    for bad in [
+        json!({"hotkey": "Shift+A"}),
+        json!({"hotkey": "Alt+Alt+A"}),
+        json!({"auth": "open"}),
+        json!({"pin": "12"}),
+    ] {
+        admin
+            .put(&format!("{B}/panel"))
+            .json(&bad)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    let r: Value = admin
+        .put(&format!("{B}/panel"))
+        .json(&json!({"clear_pin": true, "auth": "session"}))
+        .await
+        .json();
+    assert_eq!(
+        (r["pin_set"].as_bool(), r["auth"].as_str()),
+        (Some(false), Some("session"))
+    );
+    // The store sees what the API wrote (the proxy path reads the same store).
+    let p = ctx
+        .state
+        .policy
+        .panel_settings(script_policy::DEFAULT_PROFILE)
+        .unwrap();
+    assert!(p.enabled && p.hotkey == "Ctrl+Alt+P" && p.pin_hash.is_none());
+}
+
+#[tokio::test]
+async fn site_exceptions_edit_the_custom_rules() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let r: Value = admin.get("/api/v1/rules/site-exceptions").await.json();
+    assert_eq!(r["sites"], json!([]));
+    let r: Value = admin
+        .put("/api/v1/rules/site-exceptions/shop.test")
+        .await
+        .json();
+    assert_eq!(r["sites"], json!(["shop.test"]));
+    let rules: Value = admin.get("/api/v1/rules/custom").await.json();
+    assert!(rules["rules"]
+        .as_str()
+        .unwrap()
+        .contains("@@$domain=shop.test"));
+    admin
+        .put("/api/v1/rules/site-exceptions/Bad%0A%7C%7Cx")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    let r: Value = admin
+        .delete("/api/v1/rules/site-exceptions/shop.test")
+        .await
+        .json();
+    assert_eq!(r["sites"], json!([]));
+    let rules: Value = admin.get("/api/v1/rules/custom").await.json();
+    assert!(!rules["rules"].as_str().unwrap().contains("shop.test"));
+}

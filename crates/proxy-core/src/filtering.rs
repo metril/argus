@@ -395,6 +395,9 @@ impl ProxyContext {
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
         let mut csp: Option<String> = None;
+        // A document the user switched ad blocking off for (see `SharedEngine::site_off`): no
+        // cosmetics, scriptlets or extended rules for it.
+        let mut page_off = false;
         // The engine generation this request is judged by (carries the ext-rule index); the
         // response is judged by the same one.
         let mut generation: Option<Arc<filter_engine::Generation>> = None;
@@ -417,6 +420,7 @@ impl ProxyContext {
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
+                page_off = rtype.is_frame() && engine.site_off(&url);
                 if let Some(new_url) = verdict.rewritten_url {
                     let navigation =
                         rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
@@ -612,13 +616,13 @@ impl ProxyContext {
         let (enabled, cosmetics) = {
             let profile = rctx.profile.load();
             let enabled = profile.engine.is_enabled();
-            let cos = (enabled && kind == BodyKind::Html && body_allowed)
+            let cos = (enabled && !page_off && kind == BodyKind::Html && body_allowed)
                 .then(|| profile.engine.cosmetic_for(&url));
             (enabled, cos)
         };
         // Lock-free read (no refcount traffic); held only across the synchronous lookup.
         let source = self.transform_source.load();
-        let mut transforms: ResponseTransforms = if enabled {
+        let mut transforms: ResponseTransforms = if enabled && !page_off {
             source
                 .as_ref()
                 .as_ref()

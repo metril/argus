@@ -68,6 +68,7 @@ pub fn PolicyPage() -> impl IntoView {
                  when it can tell which page made them."
             </p>
             <SettingsCard reload=reload />
+            <PanelCard />
             <SitesCard reload=reload />
             <TempCard reload=reload />
             <ExplainCard />
@@ -760,6 +761,129 @@ fn ExplainCard() -> impl IntoView {
                     </div>
                 })}
             </Show>
+        </Card>
+    }
+}
+
+/// The in-page panel (hotkey) and per-site "ad blocking off".
+#[component]
+fn PanelCard() -> impl IntoView {
+    let app = use_app_state();
+    let cur = RwSignal::new(Option::<PanelSettingsDto>::None);
+    let pin = RwSignal::new(String::new());
+    let sites = RwSignal::new(Vec::<String>::new());
+    let new_site = RwSignal::new(String::new());
+
+    {
+        let app = app.clone();
+        Effect::new(move || {
+            let app = app.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().get_panel_settings().await {
+                    Ok(r) => cur.set(Some(r)),
+                    Err(e) => app.error(format!("Failed to load panel settings: {e}")),
+                }
+                if let Ok(r) = ApiClient::new().get_site_exceptions().await {
+                    sites.set(r.sites);
+                }
+            });
+        });
+    }
+    let save = {
+        let app = app.clone();
+        Callback::new(move |clear_pin: bool| {
+            let Some(c) = cur.get_untracked() else { return };
+            let p = pin.get_untracked();
+            let input = PanelSettingsInput {
+                enabled: Some(c.enabled),
+                hotkey: Some(c.hotkey),
+                auth: Some(c.auth),
+                pin: (!p.is_empty()).then_some(p),
+                clear_pin,
+            };
+            run(&app, async move {
+                cur.set(Some(ApiClient::new().put_panel_settings(&input).await?));
+                pin.set(String::new());
+                Ok("Panel settings saved".into())
+            });
+        })
+    };
+    let edit = move |f: Box<dyn Fn(&mut PanelSettingsDto)>| {
+        cur.update(|s| {
+            if let Some(s) = s {
+                f(s)
+            }
+        })
+    };
+    let toggle_site = {
+        let app = app.clone();
+        Callback::new(move |(site, off): (String, bool)| {
+            run(&app, async move {
+                sites.set(ApiClient::new().set_site_exception(&site, off).await?.sites);
+                Ok(String::new())
+            });
+        })
+    };
+
+    view! {
+        <Card title="In-page panel">
+            <p class="modal-help">
+                "A hotkey opens a read-only panel on the page itself (no toolbar button on a proxy). \
+                 It cannot change anything: a change is confirmed on the proxy-owned host, which a \
+                 page cannot script. Needs the master switch above only for presets and sources."
+            </p>
+            <Show when=move || cur.get().is_some() fallback=|| view! { <div class="loading">"Loading..."</div> }>
+                <div class="form-toggles">
+                    <label class="form-checkbox">
+                        <input type="checkbox" class="checkbox-input"
+                            prop:checked=move || cur.get().is_some_and(|s| s.enabled)
+                            on:change=move |ev| { let v = event_target_checked(&ev); edit(Box::new(move |s| s.enabled = v)); } />
+                        <span>"Offer the panel on pages (off by default)"</span>
+                    </label>
+                </div>
+                <div class="form-field">
+                    <label class="form-label">"Hotkey"</label>
+                    <input class="form-input" prop:value=move || cur.get().map(|s| s.hotkey).unwrap_or_default()
+                        on:input=move |ev| { let v = event_target_value(&ev); edit(Box::new(move |s| s.hotkey = v.clone())); } />
+                </div>
+                <div class="form-field">
+                    <label class="form-label">"Confirm changes with"</label>
+                    <select class="form-select" prop:value=move || cur.get().map(|s| s.auth).unwrap_or_default()
+                        on:change=move |ev| { let v = event_target_value(&ev); edit(Box::new(move |s| s.auth = v.clone())); }>
+                        <option value="pin">"A PIN entered on the confirmation page"</option>
+                        <option value="session">"The dashboard only (the panel links here)"</option>
+                        <option value="none">"A click (trusted LAN only)"</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label class="form-label">
+                        {move || if cur.get().is_some_and(|s| s.pin_set) { "New PIN (a PIN is set)" } else { "PIN (none set)" }}
+                    </label>
+                    <input class="form-input" type="password" autocomplete="new-password"
+                        prop:value=move || pin.get() on:input=move |ev| pin.set(event_target_value(&ev)) />
+                </div>
+                <div class="form-actions">
+                    <button class="btn btn-primary" on:click=move |_| save.run(false)>"Save"</button>
+                    <button class="btn" on:click=move |_| save.run(true)>"Remove PIN"</button>
+                    <span class="stat-label">" confirmation host: "{move || cur.get().map(|s| s.reserved_host).unwrap_or_default()}</span>
+                </div>
+            </Show>
+            <h3>"Ad blocking off for"</h3>
+            <ul>
+                <For each=move || sites.get() key=|s| s.clone() let:site>
+                    {
+                        let s2 = site.clone();
+                        view! { <li>{site} " " <button class="btn" on:click=move |_| toggle_site.run((s2.clone(), false))>"Turn on"</button></li> }
+                    }
+                </For>
+            </ul>
+            <div class="form-field">
+                <input class="form-input" placeholder="example.com" prop:value=move || new_site.get()
+                    on:input=move |ev| new_site.set(event_target_value(&ev)) />
+                <button class="btn" on:click=move |_| { let s = new_site.get_untracked(); if !s.is_empty() { toggle_site.run((s, true)); new_site.set(String::new()); } }>
+                    "Turn ad blocking off"
+                </button>
+            </div>
         </Card>
     }
 }

@@ -252,3 +252,90 @@ mod tests {
             .any(|l| l.rule.contains("##.banner") && l.accepted));
     }
 }
+
+// ---- per-site ad blocking off (document exceptions in the custom rules) ----
+
+fn site_exception_error(site: &str) -> ApiError {
+    ApiError::ValidationError(format!(
+        "'{site}' is not a plain lowercase host name (letters, digits, '-' and '.')"
+    ))
+}
+
+/// Sites for which ad blocking is switched off. These are `@@||site^$document` lines in the
+/// custom rules, so they also show up (and can be edited) there.
+#[utoipa::path(
+    get, path = "/rules/site-exceptions", tag = "rules",
+    security(("bearer_auth" = ["rules:read"])),
+    responses((status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse))
+)]
+pub async fn list_site_exceptions(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
+    let rules = state.filter_store.get_custom_rules()?;
+    Ok(Json(api_types::SiteExceptionsResponse {
+        sites: list_service::site_exceptions::list(&rules),
+    }))
+}
+
+async fn set_site_exception(
+    state: Arc<AppState>,
+    p: Principal,
+    site: String,
+    disabled: bool,
+) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
+    let st = state.clone();
+    let s = site.clone();
+    blocking(move || {
+        let rules = st.filter_store.get_custom_rules()?;
+        let new = list_service::site_exceptions::set(&rules, &s, disabled)
+            .ok_or_else(|| site_exception_error(&s))?;
+        if new != rules {
+            st.filter_store.set_custom_rules(&new)?;
+        }
+        Ok(())
+    })
+    .await?;
+    info!(
+        "Ad blocking {} for {site} by {}",
+        if disabled { "disabled" } else { "enabled" },
+        p.username
+    );
+    state.list_service.trigger();
+    list_site_exceptions(State(state)).await
+}
+
+/// Switch ad blocking off for a site (document exception in the custom rules).
+#[utoipa::path(
+    put, path = "/rules/site-exceptions/{site}", tag = "rules",
+    security(("bearer_auth" = ["rules:write"])),
+    params(("site" = String, Path, description = "Host name, lowercase punycode")),
+    responses(
+        (status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse),
+        (status = 400, description = "Not a plain host name"),
+    )
+)]
+pub async fn put_site_exception(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    crate::error::ApiPath(site): crate::error::ApiPath<String>,
+) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
+    set_site_exception(state, p, site, true).await
+}
+
+/// Switch ad blocking back on for a site.
+#[utoipa::path(
+    delete, path = "/rules/site-exceptions/{site}", tag = "rules",
+    security(("bearer_auth" = ["rules:write"])),
+    params(("site" = String, Path, description = "Host name, lowercase punycode")),
+    responses(
+        (status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse),
+        (status = 400, description = "Not a plain host name"),
+    )
+)]
+pub async fn delete_site_exception(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    crate::error::ApiPath(site): crate::error::ApiPath<String>,
+) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
+    set_site_exception(state, p, site, false).await
+}

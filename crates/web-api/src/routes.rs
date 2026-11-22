@@ -75,6 +75,11 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         // rules
         .routes(routes!(rules::get_custom_rules, rules::update_custom_rules))
         .routes(routes!(rules::get_custom_report))
+        .routes(routes!(rules::list_site_exceptions))
+        .routes(routes!(
+            rules::put_site_exception,
+            rules::delete_site_exception
+        ))
         .routes(routes!(lists::list_ext_rules))
         .routes(routes!(rules::validate))
         .routes(routes!(rules::test_url))
@@ -137,6 +142,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(policy::export))
         .routes(routes!(policy::import))
         .routes(routes!(policy::reports))
+        .routes(routes!(policy::get_panel, policy::put_panel))
         // audit
         .routes(routes!(audit::list_audit))
 }

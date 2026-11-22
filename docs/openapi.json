@@ -2653,6 +2653,73 @@
         ],
         "type": "object"
       },
+      "PanelSettingsDto": {
+        "description": "How the panel's confirmation page authenticates a change: `pin` (default), `session` (the panel\nonly links to the dashboard) or `none` (a click is enough; trusted LAN only).",
+        "properties": {
+          "auth": {
+            "description": "`pin`, `session` or `none`.",
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Offer the in-page panel on pages of this profile (off by default).",
+            "type": "boolean"
+          },
+          "hotkey": {
+            "description": "Hotkey, for example `Alt+Shift+A`.",
+            "type": "string"
+          },
+          "pin_set": {
+            "description": "Whether a PIN is set (the PIN itself is never returned).",
+            "type": "boolean"
+          },
+          "reserved_host": {
+            "description": "The deployment switch `script_control.panel_enabled` is separate; this is per profile.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "hotkey",
+          "auth",
+          "pin_set"
+        ],
+        "type": "object"
+      },
+      "PanelSettingsInput": {
+        "description": "Change panel settings. Omitted fields keep their value.",
+        "properties": {
+          "auth": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clear_pin": {
+            "description": "Remove the PIN.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "hotkey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pin": {
+            "description": "Set a new PIN (4 to 64 characters).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "PendingUpdateDto": {
         "description": "An update waiting for approval.",
         "properties": {
@@ -3390,6 +3457,21 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "SiteExceptionsResponse": {
+        "description": "Sites for which ad blocking is switched off (document exceptions in the custom rules).",
+        "properties": {
+          "sites": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sites"
         ],
         "type": "object"
       },
@@ -7822,6 +7904,163 @@
         ]
       }
     },
+    "/api/v1/policy/panel": {
+      "get": {
+        "operationId": "get_panel",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PanelSettingsDto"
+                }
+              }
+            },
+            "description": "Panel settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "The in-page panel settings of the default profile.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "put": {
+        "operationId": "put_panel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PanelSettingsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PanelSettingsDto"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "400": {
+            "description": "Invalid hotkey, auth mode or PIN"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Change the in-page panel settings (enable, hotkey, authentication mode, PIN). The panel is\nread-only in the page; the authentication mode decides how a change is confirmed on the proxy's\nreserved host. A PIN is required for `pin` mode before changes can be applied from the panel.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
     "/api/v1/policy/preview": {
       "post": {
         "operationId": "preview",
@@ -9567,6 +9806,251 @@
           }
         ],
         "summary": "Rules the network engine cannot run (handed off) and what the extended-rule index did with\neach, read-only.",
+        "tags": [
+          "rules"
+        ]
+      }
+    },
+    "/api/v1/rules/site-exceptions": {
+      "get": {
+        "operationId": "list_site_exceptions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteExceptionsResponse"
+                }
+              }
+            },
+            "description": "Sites with ad blocking off"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:read"
+            ]
+          }
+        ],
+        "summary": "Sites for which ad blocking is switched off. These are `@@||site^$document` lines in the\ncustom rules, so they also show up (and can be edited) there.",
+        "tags": [
+          "rules"
+        ]
+      }
+    },
+    "/api/v1/rules/site-exceptions/{site}": {
+      "delete": {
+        "operationId": "delete_site_exception",
+        "parameters": [
+          {
+            "description": "Host name, lowercase punycode",
+            "in": "path",
+            "name": "site",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteExceptionsResponse"
+                }
+              }
+            },
+            "description": "Sites with ad blocking off"
+          },
+          "400": {
+            "description": "Not a plain host name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:write"
+            ]
+          }
+        ],
+        "summary": "Switch ad blocking back on for a site.",
+        "tags": [
+          "rules"
+        ]
+      },
+      "put": {
+        "operationId": "put_site_exception",
+        "parameters": [
+          {
+            "description": "Host name, lowercase punycode",
+            "in": "path",
+            "name": "site",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteExceptionsResponse"
+                }
+              }
+            },
+            "description": "Sites with ad blocking off"
+          },
+          "400": {
+            "description": "Not a plain host name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:write"
+            ]
+          }
+        ],
+        "summary": "Switch ad blocking off for a site (document exception in the custom rules).",
         "tags": [
           "rules"
         ]

@@ -916,3 +916,103 @@ pub async fn reports(
         .collect();
     Ok(Json(Page::from_vec(all, q.page, q.limit)))
 }
+
+// ---- in-page panel settings ----
+
+fn panel_out(p: &script_policy::panel::PanelSettings) -> api_types::PanelSettingsDto {
+    api_types::PanelSettingsDto {
+        enabled: p.enabled,
+        hotkey: p.hotkey.clone(),
+        auth: match p.auth {
+            script_policy::panel::PanelAuth::Session => "session",
+            script_policy::panel::PanelAuth::Pin => "pin",
+            script_policy::panel::PanelAuth::None => "none",
+        }
+        .into(),
+        pin_set: p.pin_hash.is_some(),
+        reserved_host: String::new(),
+    }
+}
+
+/// The in-page panel settings of the default profile.
+#[utoipa::path(
+    get, path = "/policy/panel", tag = "policy",
+    security(("bearer_auth" = ["policy:read"])),
+    responses((status = 200, description = "Panel settings", body = api_types::PanelSettingsDto))
+)]
+pub async fn get_panel(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<api_types::PanelSettingsDto>> {
+    let st = state.policy.clone();
+    let p = blocking(move || st.panel_settings(PROFILE).map_err(store_err)).await?;
+    let mut dto = panel_out(&p);
+    dto.reserved_host = state
+        .proxy_state
+        .config
+        .read()
+        .script_control
+        .panel_host
+        .clone();
+    Ok(Json(dto))
+}
+
+/// Change the in-page panel settings (enable, hotkey, authentication mode, PIN). The panel is
+/// read-only in the page; the authentication mode decides how a change is confirmed on the proxy's
+/// reserved host. A PIN is required for `pin` mode before changes can be applied from the panel.
+#[utoipa::path(
+    put, path = "/policy/panel", tag = "policy",
+    security(("bearer_auth" = ["policy:write"])),
+    request_body = api_types::PanelSettingsInput,
+    responses(
+        (status = 200, description = "Saved", body = api_types::PanelSettingsDto),
+        (status = 400, description = "Invalid hotkey, auth mode or PIN"),
+    )
+)]
+pub async fn put_panel(
+    State(state): State<Arc<AppState>>,
+    ApiJson(req): ApiJson<api_types::PanelSettingsInput>,
+) -> ApiResult<Json<api_types::PanelSettingsDto>> {
+    use script_policy::panel::{hash_pin, valid_hotkey, PanelAuth};
+    let st = state.policy.clone();
+    let out = blocking(move || {
+        let mut p = st.panel_settings(PROFILE).map_err(store_err)?;
+        if let Some(e) = req.enabled {
+            p.enabled = e;
+        }
+        if let Some(h) = &req.hotkey {
+            if !valid_hotkey(h) {
+                return Err(ApiError::ValidationError(
+                    "hotkey must be modifiers plus one key, with Alt, Ctrl or Meta, e.g. Alt+Shift+A".into(),
+                ));
+            }
+            p.hotkey = h.clone();
+        }
+        if let Some(a) = &req.auth {
+            p.auth = match a.as_str() {
+                "pin" => PanelAuth::Pin,
+                "session" => PanelAuth::Session,
+                "none" => PanelAuth::None,
+                _ => return Err(ApiError::ValidationError("auth must be pin, session or none".into())),
+            };
+        }
+        if req.clear_pin {
+            p.pin_hash = None;
+        }
+        if let Some(pin) = &req.pin {
+            let salt = uuid::Uuid::new_v4().simple().to_string();
+            p.pin_hash = Some(hash_pin(pin, &salt).map_err(|e| ApiError::ValidationError(e.into()))?);
+        }
+        st.set_panel_settings(PROFILE, &p).map_err(store_err)?;
+        Ok(p)
+    })
+    .await?;
+    let mut dto = panel_out(&out);
+    dto.reserved_host = state
+        .proxy_state
+        .config
+        .read()
+        .script_control
+        .panel_host
+        .clone();
+    Ok(Json(dto))
+}

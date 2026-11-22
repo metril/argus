@@ -13,6 +13,7 @@ filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
 userscript-engine = { path = "../userscript-engine" }
 script-policy = { path = "../script-policy", features = ["store"] }
+list-service = { path = "../list-service", default-features = false }
 common = { path = "../common" }
 tokio = { workspace = true }
 hyper = { workspace = true }

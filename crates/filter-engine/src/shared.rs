@@ -161,6 +161,9 @@ fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Ar
     Arc::new(engine)
 }
 
+/// URL probed by [`SharedEngine::site_off`]; the sentinel rule `||adblock.invalid^` blocks it.
+pub const SITE_OFF_PROBE: &str = "https://adblock.invalid/__site_off__";
+
 impl SharedEngine {
     /// Create an empty shared engine (allows everything until rules are installed).
     pub fn new() -> Self {
@@ -436,6 +439,18 @@ impl SharedEngine {
             }
             engine.hidden_class_id_selectors(classes, ids, &res.exceptions)
         })
+    }
+
+    /// Has the user switched ad blocking off for the page at `page_url`? Probes a sentinel rule
+    /// (`||adblock.invalid^`, kept in the custom rules next to the per-site `@@$domain=` lines)
+    /// as if the page requested it: an exception matching means the page is excepted. Records
+    /// nothing. One engine lookup; call it for documents only.
+    pub fn site_off(&self, page_url: &str) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+            && self
+                .decide(SITE_OFF_PROBE, page_url, "other")
+                .exception_rule
+                .is_some()
     }
 
     /// Check whether a network request should be blocked, recording statistics and (on a block)

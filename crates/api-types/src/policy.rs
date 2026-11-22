@@ -291,3 +291,42 @@ pub struct PolicyReportDto {
     pub events: u64,
     pub last_seen: u64,
 }
+
+/// How the panel's confirmation page authenticates a change: `pin` (default), `session` (the panel
+/// only links to the dashboard) or `none` (a click is enough; trusted LAN only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PanelSettingsDto {
+    /// Offer the in-page panel on pages of this profile (off by default).
+    pub enabled: bool,
+    /// Hotkey, for example `Alt+Shift+A`.
+    pub hotkey: String,
+    /// `pin`, `session` or `none`.
+    pub auth: String,
+    /// Whether a PIN is set (the PIN itself is never returned).
+    pub pin_set: bool,
+    /// The deployment switch `script_control.panel_enabled` is separate; this is per profile.
+    #[serde(default)]
+    pub reserved_host: String,
+}
+
+/// Change panel settings. Omitted fields keep their value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PanelSettingsInput {
+    pub enabled: Option<bool>,
+    pub hotkey: Option<String>,
+    pub auth: Option<String>,
+    /// Set a new PIN (4 to 64 characters).
+    pub pin: Option<String>,
+    /// Remove the PIN.
+    #[serde(default)]
+    pub clear_pin: bool,
+}
+
+/// Sites for which ad blocking is switched off (document exceptions in the custom rules).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SiteExceptionsResponse {
+    pub sites: Vec<String>,
+}

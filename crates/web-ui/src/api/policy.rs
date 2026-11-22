@@ -4,9 +4,9 @@ use super::auth::MessageResponse;
 use super::client::{ApiClient, ApiError};
 
 pub use api_types::{
-    ExplainResponse, Page, PolicySettingsDto, PolicySettingsResponse, PresetDto, SiteRuleDto,
-    SiteRuleInput, SiteRuleUpdate, SourceRuleDto, SourceRuleInput, SourceRuleUpdate, TempGrantDto,
-    TempGrantInput,
+    ExplainResponse, Page, PanelSettingsDto, PanelSettingsInput, PolicySettingsDto,
+    PolicySettingsResponse, PresetDto, SiteExceptionsResponse, SiteRuleDto, SiteRuleInput,
+    SiteRuleUpdate, SourceRuleDto, SourceRuleInput, SourceRuleUpdate, TempGrantDto, TempGrantInput,
 };
 
 /// Percent-encode a query value.
@@ -24,6 +24,34 @@ fn enc(s: &str) -> String {
 }
 
 impl ApiClient {
+    pub async fn get_panel_settings(&self) -> Result<PanelSettingsDto, ApiError> {
+        self.get("/policy/panel").await
+    }
+
+    pub async fn put_panel_settings(
+        &self,
+        s: &PanelSettingsInput,
+    ) -> Result<PanelSettingsDto, ApiError> {
+        self.put("/policy/panel", s).await
+    }
+
+    pub async fn get_site_exceptions(&self) -> Result<SiteExceptionsResponse, ApiError> {
+        self.get("/rules/site-exceptions").await
+    }
+
+    pub async fn set_site_exception(
+        &self,
+        site: &str,
+        blocking_off: bool,
+    ) -> Result<SiteExceptionsResponse, ApiError> {
+        let path = format!("/rules/site-exceptions/{}", enc(site));
+        if blocking_off {
+            self.put(&path, &serde_json::json!({})).await
+        } else {
+            self.delete(&path).await
+        }
+    }
+
     pub async fn get_policy_settings(&self) -> Result<PolicySettingsResponse, ApiError> {
         self.get("/policy/settings").await
     }

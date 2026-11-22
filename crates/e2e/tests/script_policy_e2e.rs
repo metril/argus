@@ -536,3 +536,53 @@ e2e_test!(
         );
     }
 );
+
+e2e_test!(
+    site_exception_line_switches_ad_blocking_off_for_that_site,
+    rules = ["||ads.test^", "app.test##.ad"],
+    |env| {
+        env.origin.route("/x.js", MockResponse::ok("1"));
+        env.origin.route(
+            "/p",
+            MockResponse::html(
+                "<!doctype html><html><head></head><body><div class=ad>x</div></body></html>",
+            ),
+        );
+        let c = env.client();
+        let blocked =
+            |r: &reqwest::Response| r.headers().get("x-adblock").is_some_and(|v| v == "blocked");
+        assert!(blocked(
+            &sub(&env, &c, "app.test", "ads.test", "/x.js", "script").await
+        ));
+        assert!(page(&env, &c, "app.test", "/p")
+            .await
+            .text()
+            .await
+            .unwrap()
+            .contains("display:none"));
+        // The very line the panel and the API write.
+        let rules =
+            list_service::site_exceptions::set("||ads.test^\napp.test##.ad\n", "app.test", true)
+                .unwrap();
+        assert!(rules.contains("@@$domain=app.test") && rules.contains("||adblock.invalid^"));
+        let lines: Vec<&str> = rules.lines().collect();
+        env.proxy.install_rules(&lines);
+        assert!(
+            !blocked(&sub(&env, &c, "app.test", "ads.test", "/x.js", "script").await),
+            "requests from the site are not blocked"
+        );
+        assert!(
+            !page(&env, &c, "app.test", "/p")
+                .await
+                .text()
+                .await
+                .unwrap()
+                .contains("display:none"),
+            "no cosmetic hiding either"
+        );
+        // Other sites are unaffected.
+        assert!(blocked(
+            &sub(&env, &c, "other.test", "ads.test", "/x.js", "script").await
+        ));
+    }
+);
