@@ -301,19 +301,19 @@ impl ProxyContext {
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
         // Absolute URL: prefer the request's own absolute form, else synthesize one.
-        // The host in it is the normalised one, never the client's spelling.
-        let mut url = if let (None, Some(scheme_str), Some(_)) =
-            (&fallback_authority, uri.scheme_str(), uri.authority())
-        {
-            let port_part = named
-                .as_ref()
-                .and_then(|(_, p)| *p)
-                .map(|p| format!(":{p}"))
-                .unwrap_or_default();
-            format!("{scheme_str}://{url_host}{port_part}{path_and_query}")
-        } else {
-            format!("{scheme}://{url_host}:{port}{path_and_query}")
-        };
+        // The host in it is the normalised one, never the client's spelling. The scheme's default
+        // port is never spelled (see `ext::rule_url`): every filter engine matches patterns such
+        // as `||example.com/path` against the URL text, so `https://example.com:443/path` would
+        // slip past them on every path (CONNECT, transparent, plain HTTP, WebSocket upgrades).
+        let mut url = request_url(
+            fallback_authority.is_none() && uri.authority().is_some(),
+            uri.scheme_str(),
+            scheme,
+            &url_host,
+            named.as_ref().and_then(|(_, p)| *p),
+            port,
+            path_and_query,
+        );
 
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
@@ -795,6 +795,29 @@ impl ProxyContext {
     }
 }
 
+/// The absolute URL the filters judge. `absolute_form`: the request carried its own scheme and
+/// authority outside any CONNECT / transparent entry, so its own scheme and (optional) port are
+/// kept; otherwise the URL is synthesized from the accepted target. The scheme's default port is
+/// never spelled (see `ext::rule_url` for why).
+fn request_url(
+    absolute_form: bool,
+    uri_scheme: Option<&str>,
+    scheme: &str,
+    url_host: &str,
+    named_port: Option<u16>,
+    port: u16,
+    path_and_query: &str,
+) -> String {
+    let url = match (absolute_form, uri_scheme) {
+        (true, Some(s)) => {
+            let port_part = named_port.map(|p| format!(":{p}")).unwrap_or_default();
+            format!("{s}://{url_host}{port_part}{path_and_query}")
+        }
+        _ => format!("{scheme}://{url_host}:{port}{path_and_query}"),
+    };
+    ext::rule_url(&url).into_owned()
+}
+
 /// `Vary` members added to a rewritten response: the body depends on the request type and on
 /// the negotiated coding.
 fn vary_additions(encoded: bool) -> &'static str {
@@ -818,4 +841,56 @@ fn bad_request(msg: &str) -> Response<ProxyBody> {
 
 fn bad_gateway(msg: &str) -> Response<ProxyBody> {
     status_response(StatusCode::BAD_GATEWAY, msg)
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::request_url;
+
+    #[test]
+    fn default_ports_are_never_spelled_on_any_entry_path() {
+        // CONNECT / transparent (synthesized from the accepted target).
+        assert_eq!(
+            request_url(false, None, "https", "example.com", None, 443, "/ads.js"),
+            "https://example.com/ads.js"
+        );
+        assert_eq!(
+            request_url(false, None, "http", "example.com", None, 80, "/a?b=1"),
+            "http://example.com/a?b=1"
+        );
+        // Plain proxy, absolute-form, explicit default port.
+        assert_eq!(
+            request_url(
+                true,
+                Some("http"),
+                "http",
+                "example.com",
+                Some(80),
+                80,
+                "/x"
+            ),
+            "http://example.com/x"
+        );
+        assert_eq!(
+            request_url(true, Some("http"), "http", "[::1]", Some(80), 80, "/x"),
+            "http://[::1]/x"
+        );
+        // Non-default ports stay, so `||example.com/ads.js` does not match them (as in uBO).
+        assert_eq!(
+            request_url(false, None, "https", "example.com", None, 8443, "/ads.js"),
+            "https://example.com:8443/ads.js"
+        );
+        assert_eq!(
+            request_url(
+                true,
+                Some("http"),
+                "http",
+                "example.com",
+                Some(8080),
+                8080,
+                "/x"
+            ),
+            "http://example.com:8080/x"
+        );
+    }
 }

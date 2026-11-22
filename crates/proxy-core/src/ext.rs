@@ -42,10 +42,17 @@ pub fn resource_type(t: RequestType) -> ResourceType {
     }
 }
 
-/// The URL as rules see it: the proxy spells every URL with an explicit port, but patterns like
-/// `||example.com/path` are written against the default-port form (`https://example.com/path`).
+/// The URL as rules see it: the default port of the scheme is dropped (`https://a.test:443/x` ->
+/// `https://a.test/x`), because patterns like `||example.com/path` are written against that form
+/// and the engines match them literally. Other ports stay: like uBO, `||example.com/path` does
+/// not match `https://example.com:8443/path` (`||example.com^` does).
 pub fn rule_url(url: &str) -> std::borrow::Cow<'_, str> {
-    for (scheme, port) in [("https://", ":443"), ("http://", ":80")] {
+    for (scheme, port) in [
+        ("https://", ":443"),
+        ("http://", ":80"),
+        ("wss://", ":443"),
+        ("ws://", ":80"),
+    ] {
         if let Some(rest) = url.strip_prefix(scheme) {
             let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
             if let Some(host) = rest[..end].strip_suffix(port) {
@@ -263,6 +270,9 @@ mod tests {
         assert_eq!(rule_url("http://a.test:80/"), "http://a.test/");
         assert_eq!(rule_url("https://a.test:443"), "https://a.test");
         assert_eq!(rule_url("https://a.test:8443/x"), "https://a.test:8443/x");
+        assert_eq!(rule_url("wss://a.test:443/s"), "wss://a.test/s");
+        assert_eq!(rule_url("ws://[::1]:80/s"), "ws://[::1]/s");
+        assert_eq!(rule_url("https://[::1]:443/s"), "https://[::1]/s");
         assert_eq!(rule_url("http://a.test:443/x"), "http://a.test:443/x");
         assert_eq!(rule_url("https://a.test/x:443/"), "https://a.test/x:443/");
     }
