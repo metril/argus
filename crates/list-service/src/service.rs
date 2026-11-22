@@ -132,6 +132,9 @@ pub struct ListService {
     /// Test hook: make the next build panic.
     #[cfg(test)]
     panic_next: AtomicBool,
+    /// Test hook: make the next engine load fail (as an over-limit rule count does).
+    #[cfg(test)]
+    fail_compile: AtomicBool,
 }
 
 /// Clears the single-flight state on drop, so a build that panics (or a cancelled build task)
@@ -210,6 +213,8 @@ impl ListService {
             bundled_tried: AtomicBool::new(false),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_compile: AtomicBool::new(false),
         })
     }
 
@@ -378,7 +383,7 @@ impl ListService {
                 match tokio::spawn(async move { build.build_once(force).await }).await {
                     Ok(Ok(())) => this.set_state(BuildState::Idle),
                     Ok(Err(e)) => {
-                        warn!("Filter reload failed: {e}");
+                        warn!("Filter reload failed; the previous engine stays installed: {e}");
                         this.set_state(BuildState::Failed {
                             error: e.to_string(),
                         });
@@ -538,6 +543,8 @@ impl ListService {
         let ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
         let resources = self.engine.resources();
         let started = Instant::now();
+        #[cfg(test)]
+        let fail = self.fail_compile.swap(false, Ordering::AcqRel);
         let (built, engine) = tokio::task::spawn_blocking(move || {
             let list_inputs: Vec<ListInput> = inputs
                 .into_iter()
@@ -552,6 +559,10 @@ impl ListService {
             let built = build_set(&list_inputs);
             // A blob the engine cannot load back (for example more rules than its flatbuffer
             // verifier allows) must fail the build, not silently install an empty engine.
+            #[cfg(test)]
+            if fail {
+                return Err(Error::Other("injected engine load failure".into()));
+            }
             let engine = try_build_engine(&built.blob, &resources).map_err(Error::Other)?;
             Ok::<_, Error>((built, engine))
         })
@@ -785,13 +796,25 @@ impl ListService {
                 status.last_modified = last_modified;
                 status.last_success = status.last_checked;
                 status.last_error = None;
-                if let Err(e) = self.store.put_content(&list.id, &text) {
-                    warn!("Failed to cache content for {}: {e}", list.name);
+                // Store writes (content file, metadata, status) are blocking IO: off the async
+                // threads.
+                let store = self.store.clone();
+                let (l, st, t) = (list.clone(), status.clone(), text.clone());
+                let res = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = store.put_content(&l.id, &t) {
+                        warn!("Failed to cache content for {}: {e}", l.name);
+                    }
+                    if let Err(e) = store.upsert(&l) {
+                        warn!("Failed to persist metadata for {}: {e}", l.name);
+                    }
+                    if let Err(e) = store.set_status(&l.id, &st) {
+                        warn!("Failed to persist status for {}: {e}", l.name);
+                    }
+                })
+                .await;
+                if let Err(e) = res {
+                    warn!("Store write task for {} failed: {e}", list.name);
                 }
-                if let Err(e) = self.store.upsert(&list) {
-                    warn!("Failed to persist metadata for {}: {e}", list.name);
-                }
-                self.record(&list, &status);
                 info!("Downloaded {} ({} rules)", list.name, list.rule_count);
                 text
             }
@@ -970,5 +993,49 @@ mod tests {
         assert!(matches!(svc.summary().state, BuildState::Failed { .. }));
         // The flight state is clean: a later trigger can run.
         assert!(!svc.flight.lock().running);
+    }
+
+    #[tokio::test]
+    async fn failed_build_keeps_serving_the_old_rules_and_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListStore::open(dir.path()).unwrap();
+        let mut l = FilterList::new(
+            "one".into(),
+            "One".into(),
+            "https://127.0.0.1:1/one.txt".into(),
+        );
+        l.enabled = true;
+        store.upsert(&l).unwrap();
+        store.put_content("one", "||old-ad.test^\n").unwrap();
+        let cfg = ListServiceConfig {
+            data_dir: dir.path().to_path_buf(),
+            persist_engine: false,
+            ..Default::default()
+        };
+        let engine = Arc::new(SharedEngine::new());
+        let svc = ListService::new(cfg, store, engine.clone(), reqwest::Client::new());
+        svc.reload_now().await;
+        assert_eq!(svc.summary().state, BuildState::Idle);
+        let blocked = |u: &str| engine.check(u, "https://page.test/", "script").blocked;
+        assert!(blocked("https://old-ad.test/a.js"));
+
+        // New rules, but the engine cannot be built from them.
+        svc.store().set_custom_rules("||new-ad.test^\n").unwrap();
+        svc.fail_compile.store(true, Ordering::Release);
+        svc.reload_now().await;
+        match svc.summary().state {
+            BuildState::Failed { error } => assert!(error.contains("injected"), "{error}"),
+            s => panic!("expected Failed, got {s:?}"),
+        }
+        assert!(blocked("https://old-ad.test/a.js"), "old rules still block");
+        assert!(
+            !blocked("https://new-ad.test/a.js"),
+            "failed build not installed"
+        );
+
+        // The next good build recovers.
+        svc.reload_now().await;
+        assert_eq!(svc.summary().state, BuildState::Idle);
+        assert!(blocked("https://new-ad.test/a.js"));
     }
 }
