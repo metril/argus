@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{client_async, WebSocketStream};
 
-use crate::TestProxy;
+use crate::{EntryMode, TestProxy};
 
 /// Object-safe duplex stream so plain and TLS connections share one type.
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -18,9 +18,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub type WsStream = WebSocketStream<Box<dyn Io>>;
 
 /// `ws://host:port/path` through the proxy's plain-HTTP path (the proxy gets the upgrade request
-/// directly, with a Host header).
+/// directly, with a Host header; in transparent mode through the transparent listener).
 pub async fn connect_ws(proxy: &TestProxy, host: &str, port: u16, path: &str) -> WsStream {
-    let tcp = TcpStream::connect(proxy.addr).await.expect("connect proxy");
+    let tcp = TcpStream::connect(proxy.entry_addr())
+        .await
+        .expect("connect proxy");
     let io: Box<dyn Io> = Box::new(tcp);
     let (ws, resp) = client_async(format!("ws://{host}:{port}{path}"), io)
         .await
@@ -29,26 +31,30 @@ pub async fn connect_ws(proxy: &TestProxy, host: &str, port: u16, path: &str) ->
     ws
 }
 
-/// `wss://host:port/path` through CONNECT + the proxy's TLS interception (client trusts only the
-/// proxy CA).
+/// `wss://host:port/path` through the proxy's TLS interception (client trusts only the proxy
+/// CA): CONNECT first in explicit mode, straight to the transparent listener otherwise.
 pub async fn connect_wss(proxy: &TestProxy, host: &str, port: u16, path: &str) -> WsStream {
     crate::init_crypto();
-    let mut tcp = TcpStream::connect(proxy.addr).await.expect("connect proxy");
-    tcp.write_all(
-        format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes(),
-    )
-    .await
-    .unwrap();
-    // Read the CONNECT reply byte by byte so no TLS bytes are consumed.
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        head.push(tcp.read_u8().await.expect("connect reply"));
+    let mut tcp = TcpStream::connect(proxy.entry_addr())
+        .await
+        .expect("connect proxy");
+    if proxy.mode == EntryMode::Explicit {
+        tcp.write_all(
+            format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        // Read the CONNECT reply byte by byte so no TLS bytes are consumed.
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(tcp.read_u8().await.expect("connect reply"));
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
     }
-    assert!(
-        head.starts_with(b"HTTP/1.1 200"),
-        "{}",
-        String::from_utf8_lossy(&head)
-    );
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(&proxy.ca_pem) {

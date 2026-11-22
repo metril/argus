@@ -5,8 +5,7 @@ use e2e::{e2e_test, MockResponse, TestEnv};
 
 async fn get_as(env: &TestEnv, url: &str, dest: &str) -> reqwest::Response {
     env.client()
-        .reqwest()
-        .get(url)
+        .request(reqwest::Method::GET, url)
         .header("sec-fetch-dest", dest)
         .header("sec-fetch-site", "cross-site")
         .header("referer", "https://page.test/")
@@ -210,8 +209,7 @@ e2e_test!(
             let c = env.client();
             let url = url.clone();
             async move {
-                c.reqwest()
-                    .get(&url)
+                c.request(reqwest::Method::GET, &url)
                     .header("sec-fetch-dest", "script")
                     .header("referer", referer)
                     .send()
@@ -238,8 +236,10 @@ e2e_test!(
         let payload: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         let resp = env
             .client()
-            .reqwest()
-            .post(env.origin.https_url("up.test", "/echo"))
+            .request(
+                reqwest::Method::POST,
+                &env.origin.https_url("up.test", "/echo"),
+            )
             .body(payload.clone())
             .send()
             .await

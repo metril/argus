@@ -211,15 +211,21 @@ impl ProxyContext {
             None => return Ok(bad_request("Missing host")),
         };
 
-        let port = uri
-            .port_u16()
-            .or_else(|| fallback_authority.as_ref().map(|(_, p)| *p))
+        // Behind a CONNECT / transparent entry the port was fixed when the connection was
+        // accepted; a port the client puts in the request (h2 `:authority`) must not redirect it.
+        let port = fallback_authority
+            .as_ref()
+            .map(|(_, p)| *p)
+            .or_else(|| uri.port_u16())
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
         // Absolute URL: prefer the request's own absolute form, else synthesize one.
-        let mut url = if uri.scheme().is_some() && uri.authority().is_some() {
+        let mut url = if fallback_authority.is_none()
+            && uri.scheme().is_some()
+            && uri.authority().is_some()
+        {
             uri.to_string()
         } else {
             format!("{scheme}://{host}:{port}{path_and_query}")

@@ -56,6 +56,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
 # Utilities
+async-trait = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
 

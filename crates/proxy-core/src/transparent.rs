@@ -31,8 +31,9 @@ use tracing::debug;
 const MAX_CLIENT_HELLO: usize = 32 * 1024;
 
 /// Where an accepted (redirected) connection was originally headed.
+#[async_trait::async_trait]
 pub trait OriginalDst: Send + Sync + 'static {
-    fn original_dst(&self, stream: &TcpStream) -> io::Result<SocketAddr>;
+    async fn original_dst(&self, stream: &TcpStream) -> io::Result<SocketAddr>;
 }
 
 /// Production implementation: reads `SO_ORIGINAL_DST` (IPv4) or `IP6T_SO_ORIGINAL_DST` (IPv6) from
@@ -45,8 +46,9 @@ pub struct KernelOriginalDst;
 pub const KERNEL_ORIGINAL_DST_SUPPORTED: bool = cfg!(target_os = "linux");
 
 #[cfg(target_os = "linux")]
+#[async_trait::async_trait]
 impl OriginalDst for KernelOriginalDst {
-    fn original_dst(&self, stream: &TcpStream) -> io::Result<SocketAddr> {
+    async fn original_dst(&self, stream: &TcpStream) -> io::Result<SocketAddr> {
         let sock = socket2::SockRef::from(stream);
         // A dual-stack IPv6 listener sees redirected IPv4 as v4-mapped; the option family follows
         // the original packet, not the socket.
@@ -61,8 +63,9 @@ impl OriginalDst for KernelOriginalDst {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[async_trait::async_trait]
 impl OriginalDst for KernelOriginalDst {
-    fn original_dst(&self, _stream: &TcpStream) -> io::Result<SocketAddr> {
+    async fn original_dst(&self, _stream: &TcpStream) -> io::Result<SocketAddr> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "transparent mode needs Linux SO_ORIGINAL_DST",
@@ -178,6 +181,7 @@ impl TransparentEntry {
         let dst = self
             .original_dst
             .original_dst(&stream)
+            .await
             .map_err(|e| Error::Connection(format!("original destination unavailable: {e}")))?;
         let local = stream.local_addr()?;
         if is_self(dst, local, &self.own_ports) {

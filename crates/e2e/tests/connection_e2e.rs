@@ -1,6 +1,6 @@
 //! Connection-level behaviour: WebSocket, IP-literal CONNECT, cold-host concurrency.
 
-use e2e::{connect_ws, connect_wss, e2e_test, HttpVersion, MockResponse};
+use e2e::{connect_ws, connect_wss, e2e_test, HttpVersion, MockResponse, TestClient};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -26,7 +26,9 @@ e2e_test!(wss_echo_via_mitm, rules = [], |env| {
     ws.close(None).await.unwrap();
 });
 
-e2e_test!(connect_to_ip_literal, rules = [], |env| {
+// CONNECT-specific: in transparent mode an IP-literal client sends no SNI and is tunnelled
+// (see `no_sni_tls_passes_through_untouched`).
+e2e_test!(connect_to_ip_literal, rules = [], explicit_only, |env| {
     env.origin.route("/ip", MockResponse::ok("ip-ok"));
     let url = env.origin.https_url("127.0.0.1", "/ip");
     let resp = env.client_with(HttpVersion::Http1).get(&url).await;
@@ -39,7 +41,7 @@ e2e_test!(concurrent_first_connections_one_cert, rules = [], |env| {
     let url = env.origin.https_url("cold-host.test", "/burst");
     let tasks: Vec<_> = (0..24)
         .map(|_| {
-            // One client per task so every request opens its own CONNECT.
+            // One client per task so every request opens its own connection (CONNECT / redirect).
             let client = env.client_with(HttpVersion::Http1);
             let url = url.clone();
             tokio::spawn(async move { client.get(&url).await.status() })
@@ -56,7 +58,7 @@ e2e_test!(
     ws_blocked_by_filter_never_reaches_origin,
     rules = ["||blocked-ws.test^$websocket"],
     |env| {
-        let tcp = tokio::net::TcpStream::connect(env.proxy.addr)
+        let tcp = tokio::net::TcpStream::connect(env.proxy.entry_addr())
             .await
             .unwrap();
         let url = format!("ws://blocked-ws.test:{}/ws", env.origin.http_port());
@@ -65,3 +67,30 @@ e2e_test!(
         assert!(env.origin.requests_for("/ws").is_empty());
     }
 );
+
+// No SNI (IP-literal client): nothing to mint a certificate for, so the transparent listener
+// tunnels to the original destination and the client sees the ORIGIN's certificate.
+e2e_test!(
+    no_sni_tls_passes_through_untouched,
+    rules = ["||127.0.0.1^"],
+    transparent_only,
+    |env| {
+        env.origin.route("/ip", MockResponse::ok("origin-direct"));
+        let ca = env.origin.ca_pem().as_bytes();
+        let client = TestClient::trusting(&env.proxy, HttpVersion::Http1, &[ca]);
+        let resp = client.get(&env.origin.https_url("127.0.0.1", "/ip")).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "origin-direct");
+        assert_eq!(env.origin.requests_for("/ip").len(), 1);
+        // Not filtered either (the rule above would block an intercepted request).
+        assert_eq!(env.proxy.mitm.as_ref().unwrap().generation_count(), 0);
+    }
+);
+
+// WebSocket upgrade through the transparent listener, plain and TLS.
+e2e_test!(ws_echo_plain_and_tls_via_either_entry, rules = [], |env| {
+    let mut ws = connect_ws(&env.proxy, "ws2.test", env.origin.http_port(), "/ws").await;
+    echo(&mut ws, "plain").await;
+    let mut wss = connect_wss(&env.proxy, "wss2.test", env.origin.https_port(), "/ws").await;
+    echo(&mut wss, "tls").await;
+});
