@@ -14,12 +14,14 @@
 //! / [`TestOrigin::http_url`] to build them.
 
 mod client;
+mod codec;
 mod origin;
 mod proxy;
 mod ws;
 
 pub use client::{HttpVersion, TestClient};
-pub use origin::{MockResponse, RecordedRequest, TestOrigin};
+pub use codec::{decode, encode, encode_stacked, Coding};
+pub use origin::{MockResponse, RecordedRequest, StreamSpec, TestOrigin};
 pub use proxy::{TestDst, TestProxy};
 pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
 

@@ -29,7 +29,7 @@ reqwest = { workspace = true, features = ["stream"] }
 # Streaming response bodies + HTML cosmetic injection.
 futures-util = { workspace = true }
 async-stream = { workspace = true }
-async-compression = { workspace = true }
+async-compression = { workspace = true, features = ["zstd"] }
 
 # TLS
 rustls = { workspace = true }
@@ -97,6 +97,13 @@ web-api = { path = "../web-api", optional = true }
 # Filter-list service (always on — loads, compiles and refreshes the rules)
 list-service = { path = "../list-service" }
 
+# Streaming HTML rewriting, charset handling, hashing
+lol_html = "2"
+encoding_rs = "0.8"
+sha2 = { workspace = true }
+base64 = "0.22"
+regex = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 # getifaddrs: the proxy host's own interface addresses (destination policy).
 libc = "0.2"
@@ -117,7 +124,12 @@ full = ["websockets", "userscripts", "webui"]
 tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
+proptest = "1.5"
 
 [[bench]]
 name = "proxy_bench"
+harness = false
+
+[[bench]]
+name = "rewrite_bench"
 harness = false

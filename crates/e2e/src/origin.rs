@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -35,6 +35,39 @@ pub struct MockResponse {
     pub body: Vec<u8>,
     /// Wait this long before answering (for timeout tests).
     pub delay: std::time::Duration,
+    /// Stream a generated body instead of `body` (large and endless bodies).
+    pub stream: Option<StreamSpec>,
+}
+
+/// A generated body: `chunk` repeated until `total` bytes have been produced, polling-driven so
+/// the origin only generates what the connection actually pulls.
+#[derive(Clone, Debug)]
+pub struct StreamSpec {
+    pub chunk: Bytes,
+    /// Bytes to send in all (`usize::MAX` for an endless body).
+    pub total: usize,
+    /// Bytes generated so far (counts what was pulled by the connection).
+    pub sent: Arc<std::sync::atomic::AtomicUsize>,
+    /// Pause between chunks.
+    pub pause: std::time::Duration,
+    /// Raw bytes sent before the repeated chunk (e.g. an HTML head).
+    pub prefix: Bytes,
+}
+
+impl StreamSpec {
+    pub fn new(prefix: impl Into<Bytes>, chunk: impl Into<Bytes>, total: usize) -> Self {
+        Self {
+            chunk: chunk.into(),
+            total,
+            sent: Arc::default(),
+            pause: std::time::Duration::ZERO,
+            prefix: prefix.into(),
+        }
+    }
+    pub fn paused(mut self, pause: std::time::Duration) -> Self {
+        self.pause = pause;
+        self
+    }
 }
 
 impl MockResponse {
@@ -44,7 +77,14 @@ impl MockResponse {
             headers: Vec::new(),
             body: body.into(),
             delay: std::time::Duration::ZERO,
+            stream: None,
         }
+    }
+    /// A response whose body is generated on demand.
+    pub fn streaming(status: u16, spec: StreamSpec) -> Self {
+        let mut r = Self::new(status, Vec::new());
+        r.stream = Some(spec);
+        r
     }
     pub fn delayed(mut self, delay: std::time::Duration) -> Self {
         self.delay = delay;
@@ -296,7 +336,7 @@ async fn handle(
     state: Arc<State>,
     scheme: &'static str,
     mut req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<OriginBody>, Infallible> {
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -371,7 +411,7 @@ async fn handle(
             .header("upgrade", "websocket")
             .header("connection", "Upgrade")
             .header("sec-websocket-accept", derive_accept_key(key.as_bytes()))
-            .body(Full::new(Bytes::new()))
+            .body(full(Bytes::new()))
             .unwrap());
     }
 
@@ -387,5 +427,40 @@ async fn handle(
     for (k, v) in &mock.headers {
         b = b.header(k, v);
     }
-    Ok(b.body(Full::new(Bytes::from(mock.body))).unwrap())
+    let body = match mock.stream {
+        None => full(Bytes::from(mock.body)),
+        Some(spec) => {
+            let first = spec.prefix.clone();
+            spec.sent
+                .fetch_add(first.len(), std::sync::atomic::Ordering::Relaxed);
+            let rest = futures_util::stream::unfold(spec, |spec| async move {
+                let sent = spec.sent.load(std::sync::atomic::Ordering::Relaxed);
+                if sent >= spec.total {
+                    return None;
+                }
+                if !spec.pause.is_zero() {
+                    tokio::time::sleep(spec.pause).await;
+                }
+                let n = spec.chunk.len().min(spec.total - sent);
+                spec.sent.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                Some((
+                    Ok::<_, std::io::Error>(Frame::data(spec.chunk.slice(..n))),
+                    spec,
+                ))
+            });
+            let s =
+                futures_util::stream::once(
+                    async move { Ok::<_, std::io::Error>(Frame::data(first)) },
+                )
+                .chain(rest);
+            http_body_util::StreamBody::new(s).boxed_unsync()
+        }
+    };
+    Ok(b.body(body).unwrap())
+}
+
+type OriginBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
+
+fn full(b: Bytes) -> OriginBody {
+    Full::new(b).map_err(|e| match e {}).boxed_unsync()
 }
