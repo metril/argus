@@ -577,9 +577,11 @@ pub(crate) fn convert_snitch(content: &str, opts: &ConvertOptions) -> Converted 
             return out.finish(ListMeta::default());
         }
     };
-    let mut meta = ListMeta::default();
-    meta.title = v["name"].as_str().map(String::from);
-    meta.homepage = v["website"].as_str().map(String::from);
+    let meta = ListMeta {
+        title: v["name"].as_str().map(String::from),
+        homepage: v["website"].as_str().map(String::from),
+        ..Default::default()
+    };
     let domains = |out: &mut Out, names: Vec<String>, exact: bool, exception: bool| {
         for n in names {
             let n = n.trim_start_matches("*.").to_string();

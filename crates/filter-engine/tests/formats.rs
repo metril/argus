@@ -336,6 +336,20 @@ fn surge_domain_is_exact_and_keyword_is_host_only() {
 }
 
 #[test]
+fn surge_url_regex_matches_urls() {
+    let c = conv(
+        "URL-REGEX,^https?://x\\.example\\.com/ads/.*\\.js$,REJECT\n",
+        ListFormat::Surge,
+    );
+    let engine = SharedEngine::new();
+    engine.install(compile_lists(&[&c.rules]).blob);
+    let blocked = |u: &str| engine.check(u, "https://page.test/", "script").blocked;
+    assert!(blocked("https://x.example.com/ads/a.js"));
+    assert!(!blocked("https://x.example.com/ads/a.css"));
+    assert!(!blocked("https://x.example.com/other/a.js"));
+}
+
+#[test]
 fn ip_ranges_collected_not_hostname_rules() {
     let c = convert(&fixture("ip-list.txt"), &ConvertOptions::default());
     assert!(c.rules.is_empty());
@@ -631,7 +645,7 @@ fn conversion_never_panics_on_arbitrary_input() {
         }
         let mutated: String = chars.into_iter().collect();
         let format = ListFormat::ALL[(rng.next() as usize) % ListFormat::ALL.len()];
-        let allow = rng.next() % 2 == 0;
+        let allow = rng.next().is_multiple_of(2);
         let c = convert(
             &mutated,
             &ConvertOptions {

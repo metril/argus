@@ -529,12 +529,13 @@ pub(crate) struct Out {
 
 impl Out {
     pub fn new(content: &str, opts: &ConvertOptions) -> Self {
-        let mut stats = ConvertStats::default();
-        stats.total_lines = content.lines().count();
         Self {
             buf: String::new(),
             allow: opts.allowlist,
-            stats,
+            stats: ConvertStats {
+                total_lines: content.lines().count(),
+                ..Default::default()
+            },
             ext: Vec::new(),
             ip_block: Vec::new(),
             ip_allow: Vec::new(),

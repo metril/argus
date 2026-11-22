@@ -85,10 +85,9 @@ fn add_list(store: &ListStore, id: &str, url: String, tweak: impl FnOnce(&mut Fi
     store.upsert(&l).unwrap();
 }
 
-fn env(
-    lists: Vec<(&str, String, Box<dyn FnOnce(&mut FilterList)>)>,
-    tweak: impl FnOnce(&mut ListServiceConfig),
-) -> Env {
+type ListSpec = (&'static str, String, Box<dyn FnOnce(&mut FilterList)>);
+
+fn env(lists: Vec<ListSpec>, tweak: impl FnOnce(&mut ListServiceConfig)) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let mut c = cfg(dir.path());
     tweak(&mut c);
@@ -101,10 +100,7 @@ fn env(
     Env { svc, engine, dir }
 }
 
-fn one(
-    addr: SocketAddr,
-    path: &str,
-) -> Vec<(&'static str, String, Box<dyn FnOnce(&mut FilterList)>)> {
+fn one(addr: SocketAddr, path: &str) -> Vec<ListSpec> {
     vec![("l", format!("http://{addr}{path}"), Box::new(|_| {}))]
 }
 

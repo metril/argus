@@ -500,12 +500,9 @@ fn network_rule(t: &str) -> Rule {
         }
     }
     for t in toks.iter_mut() {
-        match t.as_str() {
-            "empty" => {
-                *t = "redirect=nooptext".into();
-                changed = true;
-            }
-            _ => {}
+        if t == "empty" {
+            *t = "redirect=nooptext".into();
+            changed = true;
         }
     }
     let join_opts = |toks: &[String]| {
