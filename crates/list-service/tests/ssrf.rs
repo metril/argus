@@ -139,12 +139,16 @@ async fn redirects_to_internal_addresses_and_long_chains_are_refused() {
 }
 
 #[tokio::test]
-async fn compressed_responses_are_not_accepted() {
+async fn mislabelled_compressed_body_is_refused() {
     let s = S::default();
     let addr = serve(s, Router::new()).await;
     let f = fixture(format!("http://{addr}/gz"), &["127.0.0.0/8"], |_| {});
     f.svc.reload_now().await;
-    assert!(last_error(&f).contains("compressed"), "{}", last_error(&f));
+    assert!(
+        last_error(&f).contains("decoding gzip"),
+        "{}",
+        last_error(&f)
+    );
 }
 
 async fn include_origin(s: S) -> (SocketAddr, SocketAddr) {

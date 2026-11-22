@@ -2715,9 +2715,11 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 name = "list-service"
 version = "0.1.0"
 dependencies = [
+ "async-compression",
  "axum",
  "chrono",
  "common",
+ "ext-rules",
  "filter-engine",
  "futures-util",
  "parking_lot",
@@ -2729,6 +2731,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -5638,6 +5641,7 @@ dependencies = [
  "common",
  "cookie",
  "dashmap 5.5.3",
+ "ext-rules",
  "filter-engine",
  "governor",
  "jsonwebtoken",

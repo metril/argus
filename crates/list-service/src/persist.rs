@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::report::BuildSummary;
 
-const MAGIC: &[u8; 6] = b"ABENG\x02";
+const MAGIC: &[u8; 6] = b"ABENG\x03";
 pub(crate) const FILE_NAME: &str = "engine.bin";
 
 pub(crate) type Key = [u8; 32];
@@ -30,6 +30,8 @@ pub(crate) struct KeyEntry<'a> {
     pub id: &'a str,
     pub format: ListFormat,
     pub allowlist: bool,
+    /// Trust changes what the extended rules may do, so it is part of the key.
+    pub trusted: bool,
     pub digest: &'a str,
 }
 
@@ -64,7 +66,7 @@ pub(crate) fn engine_key(entries: &mut [KeyEntry<'_>], custom_digest: &str) -> K
         h.update(e.id.as_bytes());
         h.update([0]);
         h.update(e.format.as_str().as_bytes());
-        h.update([e.allowlist as u8, 0]);
+        h.update([e.allowlist as u8, e.trusted as u8, 0]);
         h.update(e.digest.as_bytes());
     }
     h.update(b"\0custom\0");
@@ -345,6 +347,7 @@ mod tests {
                     id: "a",
                     format: fmt,
                     allowlist: allow,
+                    trusted: false,
                     digest: d,
                 }],
                 custom,
@@ -356,5 +359,16 @@ mod tests {
         assert_ne!(k, base("d1", ListFormat::Hosts, false, ""));
         assert_ne!(k, base("d1", ListFormat::Auto, true, ""));
         assert_ne!(k, base("d1", ListFormat::Auto, false, "x"));
+        let trusted = engine_key(
+            &mut [KeyEntry {
+                id: "a",
+                format: ListFormat::Auto,
+                allowlist: false,
+                trusted: true,
+                digest: "d1",
+            }],
+            "",
+        );
+        assert_ne!(k, trusted);
     }
 }

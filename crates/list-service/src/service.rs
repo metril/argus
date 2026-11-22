@@ -108,9 +108,34 @@ struct BuildInput {
     id: String,
     format: ListFormat,
     allowlist: bool,
+    /// Extended rules of this list may run code / rewrite content (custom rules always do).
+    trusted: bool,
     content: String,
     includes: HashMap<String, String>,
     digest: String,
+}
+
+/// Stamp [`ExtRule::trusted`] on every rule of a trusted list.
+fn mark_trusted(ext: &mut [filter_engine::ExtRule], trusted: &std::collections::HashSet<String>) {
+    for e in ext {
+        if trusted.contains(&e.list) {
+            e.trusted = true;
+        }
+    }
+}
+
+/// Build the shared extended-rule index (trust comes from [`ExtRule::trusted`] and `trusted`).
+fn build_ext_index(
+    ext: &[filter_engine::ExtRule],
+    trusted: &std::collections::HashSet<String>,
+) -> Arc<ext_rules::ExtIndex> {
+    Arc::new(ext_rules::ExtIndex::build_with(
+        ext,
+        &ext_rules::BuildOptions {
+            trusted_lists: trusted.clone(),
+            ..Default::default()
+        },
+    ))
 }
 
 /// Owns lists, content, compile and install for one [`SharedEngine`].
@@ -182,29 +207,83 @@ fn send_error(e: &reqwest::Error) -> String {
     }
 }
 
-/// Read a response body, failing once it exceeds `cap` bytes.
+/// Compressed-to-decoded ratio beyond which a download is treated as a decompression bomb.
+const MAX_RATIO: usize = 100;
+/// The ratio cap only applies once this many decoded bytes were produced.
+const RATIO_FLOOR: usize = 1024 * 1024;
+
+/// Read a response body, failing once its DECODED size exceeds `cap` bytes. gzip, deflate, br
+/// and zstd are decoded as a stream; the decoded-to-encoded ratio is capped too.
 pub(crate) async fn read_capped(
-    mut resp: reqwest::Response,
+    resp: reqwest::Response,
     cap: usize,
 ) -> std::result::Result<Vec<u8>, String> {
-    // Lists are fetched with `Accept-Encoding: identity`; a compressed reply would make the cap
-    // apply to the wrong bytes, so it is refused outright.
-    if resp
-        .headers()
-        .get(reqwest::header::CONTENT_ENCODING)
-        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
-    {
-        return Err("compressed responses are not accepted".into());
-    }
-    if resp.content_length().is_some_and(|n| n > cap as u64) {
-        return Err(format!("response exceeds size cap of {cap} bytes"));
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        if body.len() + chunk.len() > cap {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
+    use tokio::io::AsyncReadExt;
+
+    let coding = match resp.headers().get(reqwest::header::CONTENT_ENCODING) {
+        None => String::new(),
+        Some(v) => v
+            .to_str()
+            .map_err(|_| "unreadable Content-Encoding".to_string())?
+            .trim()
+            .to_ascii_lowercase(),
+    };
+    if matches!(coding.as_str(), "" | "identity") {
+        let mut resp = resp;
+        if resp.content_length().is_some_and(|n| n > cap as u64) {
             return Err(format!("response exceeds size cap of {cap} bytes"));
         }
-        body.extend_from_slice(&chunk);
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            if body.len() + chunk.len() > cap {
+                return Err(format!("response exceeds size cap of {cap} bytes"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Ok(body);
+    }
+    if !matches!(
+        coding.as_str(),
+        "gzip" | "x-gzip" | "deflate" | "br" | "zstd"
+    ) {
+        return Err(format!("unsupported Content-Encoding \"{coding}\""));
+    }
+    let read = Arc::new(AtomicUsize::new(0));
+    let counter = read.clone();
+    let stream = resp.bytes_stream().map(move |r| {
+        r.inspect(|b| {
+            counter.fetch_add(b.len(), Ordering::Relaxed);
+        })
+        .map_err(std::io::Error::other)
+    });
+    let input = tokio_util::io::StreamReader::new(stream);
+    let mut dec: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>> = match coding.as_str() {
+        "gzip" | "x-gzip" => Box::pin(GzipDecoder::new(input)),
+        "deflate" => Box::pin(ZlibDecoder::new(input)),
+        "br" => Box::pin(BrotliDecoder::new(input)),
+        _ => Box::pin(ZstdDecoder::new(input)),
+    };
+    let mut body: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = dec
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("decoding {coding} body: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if body.len() + n > cap {
+            return Err(format!("response exceeds size cap of {cap} bytes"));
+        }
+        body.extend_from_slice(&buf[..n]);
+        let enc = read.load(Ordering::Relaxed).max(1);
+        if body.len() >= RATIO_FLOOR && body.len() / enc > MAX_RATIO {
+            return Err(format!(
+                "compression ratio exceeds {MAX_RATIO}:1 (decompression bomb?)"
+            ));
+        }
     }
     Ok(body)
 }
@@ -518,6 +597,7 @@ impl ListService {
                 id: &i.id,
                 format: i.format,
                 allowlist: i.allowlist,
+                trusted: i.trusted,
                 digest: &i.digest,
             })
             .collect();
@@ -542,6 +622,7 @@ impl ListService {
                 id: &l.id,
                 format: l.format,
                 allowlist: l.allowlist,
+                trusted: l.trusted,
                 digest: d,
             })
             .collect();
@@ -570,6 +651,7 @@ impl ListService {
             id: CUSTOM_REPORT_ID.to_string(),
             format: ListFormat::Abp,
             allowlist: false,
+            trusted: true,
             digest: Self::custom_digest(Some(&c)),
             content: c,
             includes: HashMap::new(),
@@ -594,6 +676,7 @@ impl ListService {
             id: list.id.clone(),
             format: list.format,
             allowlist: list.allowlist,
+            trusted: list.trusted,
             content,
             includes,
             digest,
@@ -605,11 +688,16 @@ impl ListService {
         self.set_state(BuildState::Compiling);
         let key = Self::key_of(&inputs);
         let ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
+        let trusted_lists: std::collections::HashSet<String> = inputs
+            .iter()
+            .filter(|i| i.trusted)
+            .map(|i| i.id.clone())
+            .collect();
         let resources = self.engine.resources();
         let started = Instant::now();
         #[cfg(test)]
         let fail = self.fail_compile.swap(false, Ordering::AcqRel);
-        let (built, engine) = tokio::task::spawn_blocking(move || {
+        let (built, engine, index) = tokio::task::spawn_blocking(move || {
             let list_inputs: Vec<ListInput> = inputs
                 .into_iter()
                 .map(|i| ListInput {
@@ -620,7 +708,8 @@ impl ListService {
                     includes: i.includes,
                 })
                 .collect();
-            let built = build_set(&list_inputs);
+            let mut built = build_set(&list_inputs);
+            mark_trusted(&mut built.ext, &trusted_lists);
             // A blob the engine cannot load back (for example more rules than its flatbuffer
             // verifier allows) must fail the build, not silently install an empty engine.
             #[cfg(test)]
@@ -628,7 +717,8 @@ impl ListService {
                 return Err(Error::Other("injected engine load failure".into()));
             }
             let engine = try_build_engine(&built.blob, &resources).map_err(Error::Other)?;
-            Ok::<_, Error>((built, engine))
+            let index = build_ext_index(&built.ext, &trusted_lists);
+            Ok::<_, Error>((built, engine, index))
         })
         .await
         .map_err(|e| Error::Other(format!("compile task failed: {e}")))??;
@@ -665,6 +755,7 @@ impl ListService {
             warn!("build produced fewer reports than lists");
         }
         summary.domain_set = built.domains.len();
+        summary.ext_stats = Some(index.stats().clone());
         let (ext, ip, blob, domains) = (
             Arc::new(built.ext),
             Arc::new(built.ip),
@@ -676,9 +767,11 @@ impl ListService {
             summary.lists, summary.network, summary.cosmetic, summary.ext, summary.rejected,
             summary.duplicates, summary.duration_ms
         );
-        self.engine.install_set(
+        // Engine and extended-rule index are one generation: swapped together.
+        self.engine.install_set_with(
             blob.clone(),
             engine,
+            Some(index),
             ext.clone(),
             ip.clone(),
             domains.clone(),
@@ -713,11 +806,14 @@ impl ListService {
             let existed = path.exists();
             let p = persist::load(&path, &key).map_err(|e| (e, existed))?;
             let engine = try_build_engine(&p.blob, &resources).map_err(|e| (e, true))?;
-            Ok::<_, (String, bool)>((p, engine))
+            // The index is derived data: rebuilt from the persisted rules (their trust flags
+            // are part of the cache key, so they are exactly what the build used).
+            let index = build_ext_index(&p.ext, &std::collections::HashSet::new());
+            Ok::<_, (String, bool)>((p, engine, index))
         })
         .await;
         match res {
-            Ok(Ok((p, engine))) => {
+            Ok(Ok((p, engine, index))) => {
                 let mut summary = p.summary;
                 summary.from_persisted = true;
                 summary.domain_set = p.domains.len();
@@ -725,9 +821,11 @@ impl ListService {
                     "Loaded persisted filter engine ({} network, {} cosmetic rules)",
                     summary.network, summary.cosmetic
                 );
-                self.engine.install_set(
+                summary.ext_stats = Some(index.stats().clone());
+                self.engine.install_set_with(
                     Arc::new(p.blob),
                     engine,
+                    Some(index),
                     Arc::new(p.ext),
                     Arc::new(p.ip),
                     Arc::new(p.domains),
@@ -1003,7 +1101,7 @@ impl ListService {
         let resp = self
             .client
             .get(url)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip, br, zstd")
             .timeout(self.cfg.fetch_timeout)
             .send()
             .await
@@ -1027,7 +1125,7 @@ impl ListService {
         let mut req = self
             .client
             .get(&list.url)
-            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip, br, zstd")
             .timeout(self.cfg.fetch_timeout);
         // Validators are only useful when there is cached content to reuse on a 304.
         if have_cache {

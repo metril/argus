@@ -50,6 +50,9 @@ pub struct BuildSummary {
     pub from_persisted: bool,
     /// Hex cache key of the live engine.
     pub engine_key: String,
+    /// What the extended-rule index did with the handed-off rules (per kind, per list).
+    #[serde(default)]
+    pub ext_stats: Option<ext_rules::ExtStats>,
 }
 
 /// Longest echoed source text kept in a stored report.
