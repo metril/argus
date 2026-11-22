@@ -125,6 +125,19 @@ impl IpSet {
         self.v4.is_empty() && self.v6.is_empty()
     }
 
+    /// The merged ranges (for persistence).
+    pub fn ranges(&self) -> Vec<IpRange> {
+        let v4 = self.v4.iter().map(|(a, b)| IpRange {
+            start: IpAddr::V4(Ipv4Addr::from(*a)),
+            end: IpAddr::V4(Ipv4Addr::from(*b)),
+        });
+        let v6 = self.v6.iter().map(|(a, b)| IpRange {
+            start: IpAddr::V6(Ipv6Addr::from(*a)),
+            end: IpAddr::V6(Ipv6Addr::from(*b)),
+        });
+        v4.chain(v6).collect()
+    }
+
     /// Number of merged ranges.
     pub fn len(&self) -> usize {
         self.v4.len() + self.v6.len()

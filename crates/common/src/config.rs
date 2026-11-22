@@ -122,10 +122,10 @@ fn default_max_list_bytes() -> usize {
 }
 
 fn default_scriptlet_resources_url() -> String {
-    // uBlock Origin's scriptlet source directory (GitHub contents API). Every `.js` file is
-    // downloaded, concatenated, and converted to adblock-rust resources at runtime. Fetched on the
-    // user's machine (not vendored) since uBO's scriptlets are GPLv3.
-    "https://api.github.com/repos/gorhill/uBlock/contents/src/js/resources".to_string()
+    // Raw-file base URL of uBlock Origin's scriptlet directory. A fixed list of files is fetched
+    // from it, concatenated and converted to adblock-rust resources; a pinned snapshot is bundled
+    // in the binary as the offline fallback and this copy replaces it when available.
+    "https://raw.githubusercontent.com/gorhill/uBlock/master/src/js/resources".to_string()
 }
 
 impl Default for AdblockSettings {

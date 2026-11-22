@@ -7,17 +7,22 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use filter_engine::{default_filter_lists, FilterList};
+use filter_engine::{default_filter_lists, FilterList, ListReport};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::report::BuildSummary;
 use crate::{Error, Result};
 
 const LISTS_TREE: &str = "filter_lists";
 const CONTENT_TREE: &str = "filter_content";
 const META_TREE: &str = "filter_meta";
 const STATUS_TREE: &str = "filter_status";
+const REPORT_TREE: &str = "filter_reports";
 const CUSTOM_RULES_KEY: &str = "custom_rules";
+const SUMMARY_KEY: &str = "build_summary";
+/// Report key for the custom rules (not a list id: list ids cannot contain NUL).
+pub(crate) const CUSTOM_REPORT_ID: &str = "\0custom";
 
 /// Fetch outcome of a list, surfaced through the filters API.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -30,6 +35,9 @@ pub struct ListStatus {
     pub last_error: Option<String>,
     /// `Last-Modified` header of the cached copy, for conditional requests.
     pub last_modified: Option<String>,
+    /// SHA-256 of the cached content plus its resolved includes (persisted-engine cache key).
+    #[serde(default)]
+    pub content_sha: Option<String>,
 }
 
 /// Sled-backed store.
@@ -92,6 +100,42 @@ impl ListStore {
             .map(|b| String::from_utf8_lossy(&b).into_owned()))
     }
 
+    /// Cache a resolved `!#include` target of `list_id`.
+    pub fn put_include(&self, list_id: &str, path: &str, content: &str) -> Result<()> {
+        self.tree(CONTENT_TREE)?
+            .insert(format!("{list_id}\0include\0{path}"), content.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn get_include(&self, list_id: &str, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .tree(CONTENT_TREE)?
+            .get(format!("{list_id}\0include\0{path}"))?
+            .map(|b| String::from_utf8_lossy(&b).into_owned()))
+    }
+
+    /// What the last build made of this list (format, counts, first errors, metadata).
+    pub fn get_report(&self, id: &str) -> Result<Option<ListReport>> {
+        self.tree(REPORT_TREE)?.get(id)?.map(|b| de(&b)).transpose()
+    }
+
+    pub fn set_report(&self, id: &str, report: &ListReport) -> Result<()> {
+        self.tree(REPORT_TREE)?.insert(id, ser(report)?)?;
+        Ok(())
+    }
+
+    pub fn get_summary(&self) -> Result<BuildSummary> {
+        Ok(match self.tree(META_TREE)?.get(SUMMARY_KEY)? {
+            Some(b) => de(&b)?,
+            None => BuildSummary::default(),
+        })
+    }
+
+    pub fn set_summary(&self, summary: &BuildSummary) -> Result<()> {
+        self.tree(META_TREE)?.insert(SUMMARY_KEY, ser(summary)?)?;
+        Ok(())
+    }
+
     pub fn upsert(&self, list: &FilterList) -> Result<()> {
         self.tree(LISTS_TREE)?
             .insert(list.id.as_bytes(), ser(list)?)?;
@@ -133,6 +177,11 @@ impl ListStore {
         let removed = self.tree(LISTS_TREE)?.remove(id)?.is_some();
         self.tree(CONTENT_TREE)?.remove(id)?;
         self.tree(STATUS_TREE)?.remove(id)?;
+        self.tree(REPORT_TREE)?.remove(id)?;
+        let content = self.tree(CONTENT_TREE)?;
+        for item in content.scan_prefix(format!("{id}\0include\0")) {
+            content.remove(item?.0)?;
+        }
         Ok(removed)
     }
 

@@ -85,12 +85,31 @@ impl Default for SharedEngine {
 /// Deserialize `blob` (if non-empty) and apply built-in plus user resources. CPU-bound: call it
 /// from `spawn_blocking` for large lists.
 pub fn build_engine(blob: &[u8], user_resources: &[Resource]) -> Arc<AdblockEngine> {
-    let mut engine = AdblockEngine::default();
-    if !blob.is_empty() {
-        if let Err(e) = engine.deserialize(blob) {
-            warn!("Failed to deserialize filter engine: {e:?}; using empty engine");
+    match try_build_engine(blob, user_resources) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("{e}; using empty engine");
+            apply_resources(AdblockEngine::default(), user_resources)
         }
     }
+}
+
+/// Like [`build_engine`] but reports a blob that fails to deserialize instead of falling back to
+/// an empty engine.
+pub fn try_build_engine(
+    blob: &[u8],
+    user_resources: &[Resource],
+) -> Result<Arc<AdblockEngine>, String> {
+    let mut engine = AdblockEngine::default();
+    if !blob.is_empty() {
+        engine
+            .deserialize(blob)
+            .map_err(|e| format!("failed to deserialize filter engine: {e:?}"))?;
+    }
+    Ok(apply_resources(engine, user_resources))
+}
+
+fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Arc<AdblockEngine> {
     let mut all: Vec<Resource> = user_resources.to_vec();
     for b in builtin_redirect_resources() {
         let taken = all

@@ -154,6 +154,16 @@ fn explicit_format_overrides_detection() {
 }
 
 #[test]
+fn adblock_version_constant_matches_lockfile() {
+    let lock = std::fs::read_to_string(dir().join("../../../../Cargo.lock")).unwrap();
+    let want = format!(
+        "name = \"adblock\"\nversion = \"{}\"",
+        filter_engine::ADBLOCK_CRATE_VERSION
+    );
+    assert!(lock.contains(&want), "update ADBLOCK_CRATE_VERSION");
+}
+
+#[test]
 fn format_names_round_trip() {
     for f in ListFormat::ALL {
         assert_eq!(f.as_str().parse::<ListFormat>().unwrap(), f);

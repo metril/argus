@@ -54,3 +54,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "check"
 harness = false
+
+[[bench]]
+name = "formats"
+harness = false
