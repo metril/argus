@@ -95,6 +95,7 @@ fn bench_real(c: &mut Criterion) {
         rss_kib().saturating_sub(rss0)
     );
     let shared = SharedEngine::new();
+    let stage_engine = try_build_engine(&built.blob, &[]).expect("engine");
     shared.install_set(
         Arc::new(built.blob),
         engine,
@@ -128,7 +129,76 @@ fn bench_real(c: &mut Criterion) {
         });
     }
     g.finish();
+
+    // Where the time of one check goes: URL parse, request construction (what the check path
+    // builds per call) and the adblock-rust match on a prebuilt request.
+    let source = "https://page.example.com/";
+    let mut g = c.benchmark_group("check_real_stages");
+    for (name, url, ty) in cases {
+        g.bench_function(format!("{name}/url_parse"), |b| {
+            b.iter(|| black_box(adblock::url_parser::parse_url(black_box(url))))
+        });
+        g.bench_function(format!("{name}/request_new"), |b| {
+            b.iter(|| black_box(adblock::request::Request::new(black_box(url), source, ty)))
+        });
+        let req = adblock::request::Request::new(url, source, ty).expect("request");
+        g.bench_function(format!("{name}/engine_match"), |b| {
+            b.iter(|| black_box(stage_engine.check_network_request(black_box(&req))))
+        });
+        g.bench_function(format!("{name}/check_deferred"), |b| {
+            b.iter(|| black_box(shared.check_deferred(black_box(url), source, ty)))
+        });
+    }
+    g.finish();
 }
 
-criterion_group!(benches, bench_check, bench_real);
+/// Loadgen's generated list (same mix), `n` rules.
+fn loadgen_list(n: u64) -> String {
+    fn splitmix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    let mut s = String::from("||ads0.test^\nwww0.test##.ad-banner\n");
+    for i in 0..n {
+        let h = splitmix(1_000_003u64.wrapping_add(i));
+        let k = h % 100;
+        let id = (h >> 8) % 10_000_000;
+        match k {
+            0..=54 => s += &format!("||ad{id}.tracker{}.example^\n", k % 7),
+            55..=74 => s += &format!("/ads{}/banner{id}*.js$script,third-party\n", k % 13),
+            75..=84 => s += &format!("@@||ok{id}.example^$image\n"),
+            85..=94 => s += &format!("site{}.example##.ad-{id}\n", id % 5000),
+            _ => s += &format!("##.sponsored-{id}\n"),
+        }
+    }
+    s
+}
+
+/// The engine work one rewritten HTML response does, against lists of growing size.
+fn bench_html_path(c: &mut Criterion) {
+    let mut g = c.benchmark_group("html_response_path");
+    g.sample_size(30);
+    for n in [100u64, 50_000, 500_000] {
+        let engine = SharedEngine::new();
+        engine.install(compile_engine(&[loadgen_list(n)]));
+        let url = "https://www0.test/page.html";
+        g.bench_function(format!("{n}/check_document"), |b| {
+            b.iter(|| black_box(engine.check_deferred(black_box(url), url, "document")))
+        });
+        g.bench_function(format!("{n}/site_off"), |b| {
+            b.iter(|| black_box(engine.site_off(black_box(url))))
+        });
+        g.bench_function(format!("{n}/csp_for"), |b| {
+            b.iter(|| black_box(engine.csp_for(black_box(url), url, "document")))
+        });
+        g.bench_function(format!("{n}/cosmetic_for"), |b| {
+            b.iter(|| black_box(engine.cosmetic_for(black_box(url))))
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench_check, bench_real, bench_html_path);
 criterion_main!(benches);
