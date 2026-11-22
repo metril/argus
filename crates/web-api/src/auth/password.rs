@@ -5,7 +5,8 @@
 use crate::error::{ApiError, ApiResult};
 
 /// bcrypt cost factor (12 is recommended for production)
-const BCRYPT_COST: u32 = 12;
+/// Debug builds (tests, dev) use the minimum cost: unoptimized bcrypt at 12 takes seconds.
+const BCRYPT_COST: u32 = if cfg!(debug_assertions) { 4 } else { 12 };
 
 /// Hash a password using bcrypt
 ///

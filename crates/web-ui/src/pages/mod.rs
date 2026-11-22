@@ -6,6 +6,7 @@ pub mod login;
 pub mod proxy;
 pub mod register;
 pub mod settings;
+pub mod tokens;
 pub mod userscripts;
 
 pub use dashboard::DashboardPage;
@@ -14,4 +15,5 @@ pub use login::LoginPage;
 pub use proxy::ProxyPage;
 pub use register::RegisterPage;
 pub use settings::SettingsPage;
+pub use tokens::TokensPage;
 pub use userscripts::UserscriptsPage;

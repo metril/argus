@@ -18,6 +18,8 @@ use uuid::Uuid;
 pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
+    /// JTI of `refresh_token` (stored on the session for rotation).
+    pub refresh_jti: String,
     pub access_expires_in: u64,
     pub refresh_expires_in: u64,
 }
@@ -36,6 +38,7 @@ pub fn generate_access_token(
     user_id: &Uuid,
     username: &str,
     role: UserRole,
+    sid: &Uuid,
     config: &JwtConfig,
 ) -> ApiResult<String> {
     let now = Utc::now().timestamp();
@@ -48,6 +51,7 @@ pub fn generate_access_token(
         iat: now,
         exp,
         jti: Uuid::new_v4().to_string(),
+        sid: sid.to_string(),
         token_type: TokenType::Access,
     };
 
@@ -73,6 +77,7 @@ pub fn generate_refresh_token(
     user_id: &Uuid,
     username: &str,
     role: UserRole,
+    sid: &Uuid,
     config: &JwtConfig,
 ) -> ApiResult<String> {
     let now = Utc::now().timestamp();
@@ -85,6 +90,7 @@ pub fn generate_refresh_token(
         iat: now,
         exp,
         jti: Uuid::new_v4().to_string(),
+        sid: sid.to_string(),
         token_type: TokenType::Refresh,
     };
 
@@ -110,14 +116,17 @@ pub fn generate_token_pair(
     user_id: &Uuid,
     username: &str,
     role: UserRole,
+    sid: &Uuid,
     config: &JwtConfig,
 ) -> ApiResult<TokenPair> {
-    let access_token = generate_access_token(user_id, username, role, config)?;
-    let refresh_token = generate_refresh_token(user_id, username, role, config)?;
+    let access_token = generate_access_token(user_id, username, role, sid, config)?;
+    let refresh_token = generate_refresh_token(user_id, username, role, sid, config)?;
+    let refresh_jti = validate_refresh_token(&refresh_token, config)?.jti;
 
     Ok(TokenPair {
         access_token,
         refresh_token,
+        refresh_jti,
         access_expires_in: config.access_token_expiry_secs,
         refresh_expires_in: config.refresh_token_expiry_secs,
     })
@@ -207,7 +216,14 @@ mod tests {
         let config = test_config();
         let user_id = Uuid::new_v4();
 
-        let token = generate_access_token(&user_id, "testuser", UserRole::User, &config).unwrap();
+        let token = generate_access_token(
+            &user_id,
+            "testuser",
+            UserRole::User,
+            &Uuid::new_v4(),
+            &config,
+        )
+        .unwrap();
 
         let claims = validate_access_token(&token, &config).unwrap();
         assert_eq!(claims.sub, user_id.to_string());
@@ -221,7 +237,14 @@ mod tests {
         let config = test_config();
         let user_id = Uuid::new_v4();
 
-        let token = generate_refresh_token(&user_id, "testuser", UserRole::Admin, &config).unwrap();
+        let token = generate_refresh_token(
+            &user_id,
+            "testuser",
+            UserRole::Admin,
+            &Uuid::new_v4(),
+            &config,
+        )
+        .unwrap();
 
         let claims = validate_refresh_token(&token, &config).unwrap();
         assert_eq!(claims.sub, user_id.to_string());

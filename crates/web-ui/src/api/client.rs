@@ -27,6 +27,9 @@ pub enum ApiError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Rate limited - please try again later")]
     RateLimited,
 
@@ -37,12 +40,46 @@ pub enum ApiError {
     Parse(String),
 }
 
+/// Versioned API prefix; every path passed to the client is relative to it.
+pub const API_PREFIX: &str = "/api/v1";
+
+/// Read a cookie from `document.cookie` (used for the CSRF token cookie, which is not HttpOnly).
+fn read_cookie(name: &str) -> Option<String> {
+    use wasm_bindgen::JsCast;
+    let doc = web_sys::window()?.document()?;
+    let cookies = doc
+        .dyn_into::<web_sys::HtmlDocument>()
+        .ok()?
+        .cookie()
+        .ok()?;
+    let prefix = format!("{name}=");
+    cookies
+        .split(';')
+        .find_map(|c| c.trim().strip_prefix(&prefix).map(str::to_string))
+}
+
+/// Turn a response body into a readable message: the `error.message` of the standard envelope
+/// (with field details), or the raw text.
+fn error_message(text: &str) -> String {
+    match serde_json::from_str::<api_types::ErrorEnvelope>(text) {
+        Ok(env) => {
+            let mut msg = env.error.message;
+            for d in env.error.details {
+                msg.push_str(&format!("; {}: {}", d.field, d.message));
+            }
+            msg
+        }
+        Err(_) => text.to_string(),
+    }
+}
+
 /// HTTP method for the internal request helper.
 #[derive(Clone, Copy)]
 enum HttpMethod {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
 }
 
@@ -50,7 +87,7 @@ enum HttpMethod {
 //
 // The browser runs a single-threaded cooperative executor, so a synchronous
 // check-and-set on these cells (no `.await` in between) is effectively atomic:
-// exactly one in-flight `/api/auth/refresh` happens even when several requests
+// exactly one in-flight `/auth/refresh` happens even when several requests
 // 401 at the same moment. This matters because the server *rotates* refresh
 // tokens (it revokes the old `jti` on every refresh), so two parallel refreshes
 // would revoke each other and force a spurious logout.
@@ -86,12 +123,45 @@ impl ApiClient {
 
     /// Build a full URL from a path
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
+        format!("{}{}{}", self.base_url, API_PREFIX, path)
     }
 
     /// Make a GET request
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
-        self.request(HttpMethod::Get, path, None).await
+        Ok(self.request(HttpMethod::Get, path, None, None).await?.0)
+    }
+
+    /// GET returning the response `ETag` as well (for `If-Match` on the next update).
+    pub async fn get_etag<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<(T, Option<String>), ApiError> {
+        self.request(HttpMethod::Get, path, None, None).await
+    }
+
+    /// PUT with `If-Match`; returns the new `ETag`.
+    pub async fn put_if_match<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        etag: &str,
+    ) -> Result<(T, Option<String>), ApiError> {
+        let json = serde_json::to_string(body).map_err(|e| ApiError::Parse(e.to_string()))?;
+        self.request(HttpMethod::Put, path, Some(json), Some(etag))
+            .await
+    }
+
+    /// Make a PATCH request with JSON body
+    pub async fn patch<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let json = serde_json::to_string(body).map_err(|e| ApiError::Parse(e.to_string()))?;
+        Ok(self
+            .request(HttpMethod::Patch, path, Some(json), None)
+            .await?
+            .0)
     }
 
     /// Make a POST request with JSON body
@@ -101,7 +171,10 @@ impl ApiClient {
         body: &B,
     ) -> Result<T, ApiError> {
         let json = serde_json::to_string(body).map_err(|e| ApiError::Parse(e.to_string()))?;
-        self.request(HttpMethod::Post, path, Some(json)).await
+        Ok(self
+            .request(HttpMethod::Post, path, Some(json), None)
+            .await?
+            .0)
     }
 
     /// Make a PUT request with JSON body
@@ -111,12 +184,15 @@ impl ApiClient {
         body: &B,
     ) -> Result<T, ApiError> {
         let json = serde_json::to_string(body).map_err(|e| ApiError::Parse(e.to_string()))?;
-        self.request(HttpMethod::Put, path, Some(json)).await
+        Ok(self
+            .request(HttpMethod::Put, path, Some(json), None)
+            .await?
+            .0)
     }
 
     /// Make a DELETE request
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
-        self.request(HttpMethod::Delete, path, None).await
+        Ok(self.request(HttpMethod::Delete, path, None, None).await?.0)
     }
 
     /// Send a request, transparently refreshing the access token and retrying
@@ -125,7 +201,7 @@ impl ApiClient {
     /// The access token is short-lived; the refresh token lives for days. Rather
     /// than bouncing the user to the login page the instant the access token
     /// expires, a `401` triggers a single (coordinated) call to
-    /// `/api/auth/refresh` and a replay of the original request. Only a *failed*
+    /// `/auth/refresh` and a replay of the original request. Only a *failed*
     /// refresh — i.e. the refresh token is genuinely dead — surfaces as
     /// `Unauthorized`.
     async fn request<T: DeserializeOwned>(
@@ -133,13 +209,18 @@ impl ApiClient {
         method: HttpMethod,
         path: &str,
         body: Option<String>,
-    ) -> Result<T, ApiError> {
-        let response = self.send_once(method, path, body.as_deref()).await?;
+        if_match: Option<&str>,
+    ) -> Result<(T, Option<String>), ApiError> {
+        let response = self
+            .send_once(method, path, body.as_deref(), if_match)
+            .await?;
 
         if response.status() == 401 && !is_no_retry(path) {
             // Access token likely expired — refresh once and replay.
             self.ensure_refreshed().await?;
-            let retried = self.send_once(method, path, body.as_deref()).await?;
+            let retried = self
+                .send_once(method, path, body.as_deref(), if_match)
+                .await?;
             return self.handle_response(retried).await;
         }
 
@@ -152,15 +233,26 @@ impl ApiClient {
         method: HttpMethod,
         path: &str,
         body: Option<&str>,
+        if_match: Option<&str>,
     ) -> Result<gloo_net::http::Response, ApiError> {
         let url = self.url(path);
         let builder = match method {
             HttpMethod::Get => Request::get(&url),
             HttpMethod::Post => Request::post(&url),
             HttpMethod::Put => Request::put(&url),
+            HttpMethod::Patch => Request::patch(&url),
             HttpMethod::Delete => Request::delete(&url),
         }
         .credentials(RequestCredentials::Include);
+        // Cookie-authenticated writes must echo the CSRF cookie in a header.
+        let builder = match (method, read_cookie("csrf_token")) {
+            (HttpMethod::Get, _) | (_, None) => builder,
+            (_, Some(t)) => builder.header("X-CSRF-Token", &t),
+        };
+        let builder = match if_match {
+            Some(etag) => builder.header("If-Match", etag),
+            None => builder,
+        };
 
         let result = match body {
             Some(b) => {
@@ -178,7 +270,7 @@ impl ApiClient {
     }
 
     /// Ensure the access token has been refreshed, coordinating so that
-    /// concurrent callers share a single `/api/auth/refresh` call.
+    /// concurrent callers share a single `/auth/refresh` call.
     async fn ensure_refreshed(&self) -> Result<(), ApiError> {
         // A refresh is already running — wait for it instead of starting another
         // (parallel refreshes would revoke each other's rotated token).
@@ -208,7 +300,7 @@ impl ApiClient {
 
     /// Perform the actual token refresh request.
     async fn do_refresh(&self) -> Result<(), ApiError> {
-        let response = Request::post(&self.url("/api/auth/refresh"))
+        let response = Request::post(&self.url("/auth/refresh"))
             .credentials(RequestCredentials::Include)
             .send()
             .await
@@ -225,38 +317,44 @@ impl ApiClient {
     async fn handle_response<T: DeserializeOwned>(
         &self,
         response: gloo_net::http::Response,
-    ) -> Result<T, ApiError> {
+    ) -> Result<(T, Option<String>), ApiError> {
         let status = response.status();
+        let etag = response.headers().get("etag");
 
         match status {
             200..=299 => response
                 .json::<T>()
                 .await
+                .map(|v| (v, etag))
                 .map_err(|e| ApiError::Parse(e.to_string())),
             400 => {
-                let text = response.text().await.unwrap_or_default();
+                let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Validation(text))
             }
             401 => Err(ApiError::Unauthorized),
             403 => {
-                let text = response.text().await.unwrap_or_default();
+                let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Forbidden(text))
             }
             404 => {
-                let text = response.text().await.unwrap_or_default();
+                let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::NotFound(text))
             }
             422 => {
-                let text = response.text().await.unwrap_or_default();
+                let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Validation(text))
+            }
+            412 | 428 => {
+                let text = error_message(&response.text().await.unwrap_or_default());
+                Err(ApiError::Conflict(text))
             }
             429 => Err(ApiError::RateLimited),
             500..=599 => {
-                let text = response.text().await.unwrap_or_default();
+                let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Server(text))
             }
             _ => {
-                let text = response.text().await.unwrap_or_default();
+                let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Network(format!(
                     "Unexpected status {}: {}",
                     status, text
@@ -270,8 +368,8 @@ impl ApiClient {
 /// (would recurse) and the credential endpoints (a `401` there is a real
 /// authentication failure, not an expired access token).
 fn is_no_retry(path: &str) -> bool {
-    path.starts_with("/api/auth/refresh")
-        || path.starts_with("/api/auth/login")
-        || path.starts_with("/api/auth/register")
-        || path.starts_with("/api/auth/logout")
+    path.starts_with("/auth/refresh")
+        || path.starts_with("/auth/login")
+        || path.starts_with("/auth/register")
+        || path.starts_with("/auth/logout")
 }

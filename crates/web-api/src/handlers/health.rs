@@ -1,69 +1,151 @@
-//! Health check and metrics handlers
+//! Health, system status and metrics handlers.
 
-use axum::{extract::State, Json};
-use serde_json::{json, Value};
+use std::fmt::Write;
 use std::sync::Arc;
 
+use api_types::{HealthResponse, MetricsResponse, SystemStatusResponse};
+use axum::{extract::State, http::header, response::IntoResponse, Json};
+
+use super::lists::engine_status;
+use super::stats::{filter_stats, proxy_stats};
 use crate::state::AppState;
 
-/// Health check endpoint
-///
-/// GET /api/health
-///
-/// Returns the health status and version of the API.
+/// Liveness probe (public; no internals).
 #[utoipa::path(
-    get,
-    path = "/api/health",
-    tag = "health",
-    responses(
-        (status = 200, description = "API is healthy", body = Value)
-    )
+    get, path = "/health", tag = "system",
+    security(()),
+    responses((status = 200, description = "API is healthy", body = HealthResponse))
 )]
-pub async fn health_check() -> Json<Value> {
-    Json(json!({
-        "status": "healthy",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
+pub async fn health_check() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "healthy".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    })
 }
 
-/// Metrics endpoint
-///
-/// GET /api/metrics
-///
-/// Returns proxy and filter statistics.
+/// The OpenAPI document for this API.
 #[utoipa::path(
-    get,
-    path = "/api/metrics",
-    tag = "health",
-    responses(
-        (status = 200, description = "Current metrics", body = Value)
-    )
+    get, path = "/openapi.json", tag = "system",
+    security(()),
+    responses((status = 200, description = "OpenAPI 3.1 document", body = serde_json::Value))
 )]
-pub async fn metrics(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let proxy_stats = state.proxy_state.stats.snapshot();
-    let filter_stats = state.filter_stats.snapshot();
+pub async fn openapi_json(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        state.spec_json.get().cloned().unwrap_or_default(),
+    )
+}
 
-    Json(json!({
-        "proxy": {
-            "connections": {
-                "total": proxy_stats.connections_total,
-                "active": proxy_stats.connections_active,
-            },
-            "requests": {
-                "total": proxy_stats.requests_total,
-            },
-            "bytes": {
-                "received": proxy_stats.bytes_received,
-                "sent": proxy_stats.bytes_sent,
-            },
-            "errors": {
-                "total": proxy_stats.errors_total,
-            },
-        },
-        "filter": {
-            "total_requests": filter_stats.total_requests,
-            "blocked_requests": filter_stats.blocked_requests,
-            "allowed_requests": filter_stats.allowed_requests,
-        },
-    }))
+/// Version, uptime and engine state.
+#[utoipa::path(
+    get, path = "/system/status", tag = "system",
+    security(("bearer_auth" = ["system:read"])),
+    responses((status = 200, description = "System status", body = SystemStatusResponse))
+)]
+pub async fn system_status(State(state): State<Arc<AppState>>) -> Json<SystemStatusResponse> {
+    Json(SystemStatusResponse {
+        version: env!("CARGO_PKG_VERSION").into(),
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        mitm_enabled: state.proxy_state.mitm_enabled,
+        active_sessions: state.session_manager.active_session_count(),
+        engine: engine_status(&state).await,
+    })
+}
+
+/// Proxy and filter metrics as JSON.
+#[utoipa::path(
+    get, path = "/system/metrics", tag = "system",
+    security(("bearer_auth" = ["system:read"])),
+    responses((status = 200, description = "Metrics", body = MetricsResponse))
+)]
+pub async fn metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
+    Json(MetricsResponse {
+        proxy: proxy_stats(&state),
+        filter: filter_stats(&state),
+    })
+}
+
+/// The same metrics in Prometheus text exposition format.
+#[utoipa::path(
+    get, path = "/system/metrics/prometheus", tag = "system",
+    security(("bearer_auth" = ["system:read"])),
+    responses((status = 200, description = "Prometheus text format", content_type = "text/plain", body = String))
+)]
+pub async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let p = proxy_stats(&state);
+    let f = filter_stats(&state);
+    let mut out = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, v: u64| {
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}"
+        );
+    };
+    metric(
+        "adblocker_proxy_connections_total",
+        "counter",
+        "Connections accepted.",
+        p.connections.total,
+    );
+    metric(
+        "adblocker_proxy_connections_active",
+        "gauge",
+        "Open connections.",
+        p.connections.active,
+    );
+    metric(
+        "adblocker_proxy_requests_total",
+        "counter",
+        "Requests processed.",
+        p.requests.total,
+    );
+    metric(
+        "adblocker_proxy_received_bytes_total",
+        "counter",
+        "Bytes received.",
+        p.requests.bytes_received,
+    );
+    metric(
+        "adblocker_proxy_sent_bytes_total",
+        "counter",
+        "Bytes sent.",
+        p.requests.bytes_sent,
+    );
+    metric(
+        "adblocker_proxy_errors_total",
+        "counter",
+        "Proxy errors.",
+        p.requests.errors,
+    );
+    metric(
+        "adblocker_filter_requests_total",
+        "counter",
+        "Requests checked by the filter.",
+        f.total_requests,
+    );
+    metric(
+        "adblocker_filter_blocked_total",
+        "counter",
+        "Requests blocked.",
+        f.blocked_requests,
+    );
+    metric(
+        "adblocker_filter_allowed_total",
+        "counter",
+        "Requests allowed.",
+        f.allowed_requests,
+    );
+    metric(
+        "adblocker_uptime_seconds",
+        "gauge",
+        "Seconds since API start.",
+        state.started_at.elapsed().as_secs(),
+    );
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
 }

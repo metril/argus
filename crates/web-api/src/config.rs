@@ -25,6 +25,49 @@ pub struct ApiConfig {
 
     /// WebUI settings
     pub webui: WebUiConfig,
+
+    /// Audit log retention.
+    #[serde(default)]
+    pub audit: AuditConfig,
+
+    /// Client-address handling and auth-endpoint limits.
+    #[serde(default)]
+    pub network: NetworkConfig,
+}
+
+/// Audit log bounds: whichever limit is hit first prunes the oldest entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    pub max_entries: usize,
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            retention_days: 90,
+        }
+    }
+}
+
+/// Network-facing settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Reverse proxies whose `X-Forwarded-For` / `X-Real-IP` headers are trusted. Empty means
+    /// the socket peer address is always used.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// Per-IP limit for login/register/refresh.
+    pub auth_requests_per_minute: u32,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            auth_requests_per_minute: 10,
+        }
+    }
 }
 
 /// Server configuration
@@ -128,9 +171,9 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             enable_csrf: true,
-            require_https: false, // Development default
-            cors_origins: vec!["http://localhost:5173".to_string()],
-            cookie_secure: false, // Development default
+            require_https: false,     // Development default
+            cors_origins: Vec::new(), // same-origin only unless allowlisted
+            cookie_secure: false,     // Development default
         }
     }
 }

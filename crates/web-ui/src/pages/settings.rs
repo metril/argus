@@ -21,7 +21,7 @@ pub fn SettingsPage() -> impl IntoView {
     let theme = app_state.theme;
 
     // Public URL of the root CA certificate (same origin as the API).
-    let ca_url = format!("{}/api/ca.crt", api_base_url());
+    let ca_url = format!("{}/api/v1/ca.crt", api_base_url());
 
     // Action signal for session revocation
     let revoke_id = RwSignal::new(Option::<String>::None);
@@ -36,7 +36,7 @@ pub fn SettingsPage() -> impl IntoView {
 
                 match client.list_sessions().await {
                     Ok(response) => {
-                        sessions.set(response.sessions);
+                        sessions.set(response.items);
                     }
                     Err(e) => {
                         app_state.error(format!("Failed to load sessions: {}", e));

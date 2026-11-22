@@ -178,6 +178,7 @@ async fn start_webui_server(
                 .unwrap_or_else(|_| "webui".to_string())
                 .into(),
         },
+        ..Default::default()
     };
 
     // Build the application state
