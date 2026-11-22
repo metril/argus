@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{compile_lists, route_domain_rules};
+use crate::compile::{compile_lists_with, route_domain_rules};
 use crate::domainset::DomainSet;
 use crate::formats::{
     convert, dedupe, ConvertOptions, Converted, ExtRule, IpRange, ListFormat, ListMeta, MAX_ERRORS,
@@ -21,6 +21,8 @@ pub struct ListInput {
     /// Format override; `Auto` detects.
     pub format: ListFormat,
     pub allowlist: bool,
+    /// The list may inject scriptlets that require trust (`trusted-*`), like uBO's trusted lists.
+    pub trusted: bool,
     /// Resolved `!#include` targets (see [`crate::formats::find_includes`]).
     pub includes: HashMap<String, String>,
 }
@@ -135,7 +137,8 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
     drop(routed.engine_text);
 
     let texts: Vec<&str> = deduped.iter().map(|(t, _)| t.as_str()).collect();
-    let compiled = compile_lists(&texts);
+    let trusted: Vec<bool> = inputs.iter().map(|i| i.trusted).collect();
+    let compiled = compile_lists_with(&texts, &trusted);
     drop(texts);
     let engine_network = compiled.per_list.iter().any(|c| c.network > 0);
     let domain_build = routed
@@ -222,6 +225,7 @@ mod tests {
             content: content.into(),
             format,
             allowlist,
+            trusted: false,
             includes: HashMap::new(),
         }
     }

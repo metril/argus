@@ -44,7 +44,17 @@ fn parse_format(f: &str) -> ApiResult<filter_engine::ListFormat> {
 
 /// Engine build state.
 pub async fn engine_status(state: &AppState) -> EngineStatusResponse {
+    let report = state.shared_engine.resource_report();
     EngineStatusResponse {
+        scriptlet_resources: report.loaded,
+        scriptlet_resources_dropped: report
+            .dropped
+            .iter()
+            .map(|d| api_types::DroppedScriptletResource {
+                name: d.name.clone(),
+                reason: d.reason.clone(),
+            })
+            .collect(),
         building: state.list_service.is_building(),
         build_count: state.list_service.build_count(),
         enabled: state.shared_engine.is_enabled(),

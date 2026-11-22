@@ -281,6 +281,7 @@ mod tests {
             content: "||ads.example.com^\n||blocked.test^\n##.banner\n".into(),
             format: ListFormat::Auto,
             allowlist: false,
+            trusted: false,
             includes: Default::default(),
         };
         let built = filter_engine::build_set(&[list]);

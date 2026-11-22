@@ -148,6 +148,20 @@ pub struct EngineStatusResponse {
     pub build_count: u64,
     pub enabled: bool,
     pub scriptlets_ready: bool,
+    /// Scriptlet/redirect resources currently served (after validation).
+    #[serde(default)]
+    pub scriptlet_resources: usize,
+    /// Resources of the loaded library that failed validation and are not served, with why.
+    #[serde(default)]
+    pub scriptlet_resources_dropped: Vec<DroppedScriptletResource>,
+}
+
+/// A scriptlet resource that failed validation (syntax error, unresolved dependency, ...).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DroppedScriptletResource {
+    pub name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

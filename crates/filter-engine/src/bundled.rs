@@ -57,4 +57,29 @@ mod tests {
         }
         assert!(BUNDLED_RESOURCES_JSON.len() < 400_000);
     }
+
+    /// The whole snapshot passes the serve-time validation: every script parses and every
+    /// dependency resolves, so nothing is dropped.
+    #[cfg(feature = "bundled-ubo-resources")]
+    #[test]
+    fn bundled_snapshot_validates_completely() {
+        let all: Vec<adblock::resources::Resource> =
+            serde_json::from_str(BUNDLED_RESOURCES_JSON).unwrap();
+        let total = all.len();
+        let v = crate::validate_resources(all);
+        assert!(v.dropped.is_empty(), "{:?}", v.dropped);
+        assert_eq!(v.resources.len(), total);
+        // `requiresTrust` scriptlets carry the trust permission; the common ones do not.
+        let trusted = |n: &str| {
+            v.resources
+                .iter()
+                .find(|r| r.name == n)
+                .unwrap_or_else(|| panic!("{n} missing"))
+                .permission
+                .to_bits()
+                != 0
+        };
+        assert!(trusted("trusted-set-cookie.js") && trusted("trusted-replace-fetch-response.js"));
+        assert!(!trusted("set-constant.js") && !trusted("abort-on-property-read.js"));
+    }
 }

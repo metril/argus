@@ -46,6 +46,13 @@ base64 = "0.22"
 rayon = { workspace = true }
 regex = { workspace = true }
 
+# JavaScript parser (MIT): validates and extracts scriptlet sources. 0.126 is the newest line
+# that builds on the pinned 1.92 toolchain.
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_parser = "0.126"
+oxc_span = "0.126"
+
 # Common utilities
 common = { path = "../common" }
 

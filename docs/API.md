@@ -111,6 +111,10 @@ disabled or the password is wrong.
   other lists they are dropped at build time. Changing `trusted` needs `lists:write` like every
   list edit and is recorded as its own audit entry (route `/api/v1/lists/{id}#trusted=<bool>`);
   it triggers a rebuild (trust is part of the engine cache key). Every list DTO carries `trusted`.
+- `GET /engine/status`: besides the build state it reports `scriptlet_resources` (resources
+  served) and `scriptlet_resources_dropped` (name and reason of each resource of the library that
+  failed validation and is not served: syntax error, unresolved dependency). Scriptlets that
+  `requiresTrust` (uBO's `trusted-*`) only run for rules of trusted lists.
 - `GET /lists/{id}/report`, `GET /rules/custom/report`: `ListReport` of the last build (detected
   format, network/cosmetic/ext/skipped/deduped/rejected counts, first parse issues, header metadata,
   content SHA).

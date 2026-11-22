@@ -12,6 +12,7 @@ fn engine(lists: &[&str]) -> SharedEngine {
             content: c.to_string(),
             format: ListFormat::Auto,
             allowlist: false,
+            trusted: false,
             includes: Default::default(),
         })
         .collect();

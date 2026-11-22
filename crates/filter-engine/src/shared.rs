@@ -60,6 +60,14 @@ impl IpFilter {
     }
 }
 
+/// Outcome of loading a resource library: how many resources are served and which were dropped
+/// by validation (see [`crate::validate_resources`]), with the reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceReport {
+    pub loaded: usize,
+    pub dropped: Vec<crate::scriptlet_resources::DroppedResource>,
+}
+
 /// Handle to the live compiled engine, shared by all workers via `Arc<SharedEngine>`.
 pub struct SharedEngine {
     /// The live engine generation (engine + opaque companion data). Readers do one `load()`;
@@ -81,6 +89,8 @@ pub struct SharedEngine {
     enabled: Arc<AtomicBool>,
     /// User-loaded scriptlet/redirect resource library (overrides built-ins by name).
     resources: ArcSwap<Vec<Resource>>,
+    /// What the last [`Self::set_resources_from_json`] kept and dropped.
+    resource_report: ArcSwap<ResourceReport>,
     /// Serializes writers (install / resource load); never taken on the request path.
     write_lock: Mutex<()>,
     /// Shared, thread-safe blocking statistics.
@@ -173,17 +183,34 @@ impl SharedEngine {
             block_log: BlockLog::new(capacity),
             enabled: Arc::new(AtomicBool::new(true)),
             resources: ArcSwap::new(Arc::new(Vec::new())),
+            resource_report: ArcSwap::new(Arc::new(ResourceReport::default())),
             write_lock: Mutex::new(()),
             stats: FilterStats::new(),
         }
     }
 
     /// Load the scriptlet/redirect resource library from a JSON array of uBO-compatible resources
-    /// (e.g. Brave's `resources.json`) and rebuild the engine. Returns the number loaded.
+    /// (e.g. Brave's `resources.json`) and rebuild the engine. Returns the number served.
+    ///
+    /// Every JavaScript resource is validated first (see [`crate::validate_resources`]): one that
+    /// does not parse, or whose dependencies do not resolve, is dropped and listed in
+    /// [`Self::resource_report`] instead of being served.
     pub fn set_resources_from_json(&self, json: &str) -> Result<usize, serde_json::Error> {
-        let resources: Vec<Resource> = serde_json::from_str(json)?;
+        let parsed: Vec<Resource> = serde_json::from_str(json)?;
+        let v = crate::scriptlet_resources::validate_resources(parsed);
+        let resources = v.resources;
         let n = resources.len();
+        for d in v.dropped.iter().take(20) {
+            warn!("Dropped scriptlet resource `{}`: {}", d.name, d.reason);
+        }
+        if v.dropped.len() > 20 {
+            warn!("... and {} more dropped resources", v.dropped.len() - 20);
+        }
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.resource_report.store(Arc::new(ResourceReport {
+            loaded: n,
+            dropped: v.dropped,
+        }));
         self.resources.store(Arc::new(resources));
         let cur = self.engine.load_full();
         self.engine.store(Arc::new(Generation {
@@ -193,6 +220,11 @@ impl SharedEngine {
         }));
         info!("Loaded {n} scriptlet/redirect resources");
         Ok(n)
+    }
+
+    /// What the last resource-library load kept and dropped.
+    pub fn resource_report(&self) -> Arc<ResourceReport> {
+        self.resource_report.load_full()
     }
 
     /// The scriptlet/redirect resources currently loaded (pass to [`build_engine`] off-thread).

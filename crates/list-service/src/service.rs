@@ -705,6 +705,7 @@ impl ListService {
                     content: i.content,
                     format: i.format,
                     allowlist: i.allowlist,
+                    trusted: i.trusted,
                     includes: i.includes,
                 })
                 .collect();

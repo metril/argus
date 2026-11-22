@@ -11,8 +11,7 @@ use tracing::{info, warn};
 
 use crate::service::ListService;
 
-/// uBlock Origin `src/js/resources/` files, in name order (the converter concatenates them in this
-/// order). Fetched individually from a raw-file base URL instead of listing the directory through
+/// uBlock Origin `src/js/resources/` files, in name order (the converter parses each separately). Fetched individually from a raw-file base URL instead of listing the directory through
 /// the rate-limited contents API; a file that no longer exists upstream is skipped with a warning.
 const UBO_RESOURCE_FILES: &[&str] = &[
     "abort-current-script",
@@ -135,18 +134,33 @@ impl ListService {
 
     async fn load_scriptlets_once(&self) -> Result<(), String> {
         let cache = self.cfg.data_dir.join("resources.json");
+        let mut cached = false;
         if let Ok(json) = tokio::fs::read_to_string(&cache).await {
             match self.set_resources(json).await {
                 Ok(n) => {
                     info!("Loaded {n} scriptlet resources from cache");
-                    return Ok(());
+                    if self.engine.resource_report().dropped.is_empty() {
+                        return Ok(());
+                    }
+                    // The cache (e.g. written by an older converter) held resources that fail
+                    // validation: they are not served; try to refresh from the source.
+                    warn!("Cached resources.json had invalid entries; refreshing");
+                    cached = true;
                 }
                 Err(e) => warn!("Cached resources.json invalid ({e}); re-fetching"),
             }
         }
-        let json = self
+        let json = match self
             .fetch_resources_json(&self.cfg.scriptlet_resources_url)
-            .await?;
+            .await
+        {
+            Ok(j) => j,
+            Err(e) if cached => {
+                warn!("Refreshing scriptlet resources failed ({e}); keeping the validated cache");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
         let n = self
             .set_resources(json.clone())
             .await
@@ -168,8 +182,8 @@ impl ListService {
         if url.ends_with(".json") {
             return self.get_text(&url).await;
         }
-        let combined = if url.ends_with(".js") {
-            self.get_text(&url).await?
+        let sources: Vec<String> = if url.ends_with(".js") {
+            vec![self.get_text(&url).await?]
         } else {
             let base = url.trim_end_matches('/').to_string();
             // ~30 small files: fetch them all concurrently.
@@ -182,24 +196,35 @@ impl ListService {
                 .copied()
                 .zip(futures_util::future::join_all(fetches).await)
                 .collect();
-            let mut combined = String::new();
+            let mut sources = Vec::new();
             for (name, res) in results {
                 match res {
-                    Ok(text) => {
-                        combined.push('\n');
-                        combined.push_str(&text);
-                    }
+                    Ok(text) => sources.push(text),
                     // The scriptlet definitions themselves are required; helpers may have moved.
                     Err(e) if name == "scriptlets" => return Err(e),
                     Err(e) => warn!("Skipping resource file {name}.js: {e}"),
                 }
             }
-            combined
+            // `href-sanitizer` imports `urlSkip` from the sibling `src/js/urlskip.js`.
+            if let Some(parent) = base.strip_suffix("/resources") {
+                match self.get_text(format!("{parent}/urlskip.js")).await {
+                    Ok(text) => sources.push(text),
+                    Err(e) => warn!("Skipping urlskip.js: {e}"),
+                }
+            }
+            sources
         };
-        if combined.trim().is_empty() {
+        if sources.iter().all(|s| s.trim().is_empty()) {
             return Err("no scriptlet files found".into());
         }
-        filter_engine::ubo_scriptlets_to_json(&combined).map_err(|e| e.to_string())
+        // Each module is parsed on its own (a real JS parser, not text scanning); resources that
+        // fail validation are dropped here and again, with reasons, when the library is loaded.
+        let (json, dropped) =
+            filter_engine::ubo_sources_to_json(&sources).map_err(|e| e.to_string())?;
+        for d in &dropped {
+            warn!("Scriptlet `{}` not converted: {}", d.name, d.reason);
+        }
+        Ok(json)
     }
 }
 

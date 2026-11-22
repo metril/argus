@@ -58,6 +58,7 @@ pub fn install_rules(engine: &SharedEngine, rules: &[&str]) {
         content: text,
         format: filter_engine::ListFormat::Abp,
         allowlist: false,
+        trusted,
         includes: Default::default(),
     }]);
     let mut ext = built.ext;

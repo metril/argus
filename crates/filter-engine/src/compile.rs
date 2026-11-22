@@ -10,6 +10,7 @@
 use adblock::filters::cosmetic::CosmeticFilter;
 use adblock::filters::network::{NetworkFilter, NetworkFilterMask};
 use adblock::lists::{parse_filter, FilterParseError, FilterSet, ParseOptions, ParsedFilter};
+use adblock::resources::PermissionMask;
 use adblock::Engine;
 use rayon::prelude::*;
 
@@ -51,7 +52,12 @@ struct ChunkOut {
     overrides: bool,
 }
 
-fn parse_chunk(list: usize, first_line: usize, lines: &[&str]) -> ChunkOut {
+fn parse_chunk(
+    list: usize,
+    first_line: usize,
+    lines: &[&str],
+    permissions: PermissionMask,
+) -> ChunkOut {
     let mut out = ChunkOut {
         list,
         net: Vec::new(),
@@ -64,7 +70,11 @@ fn parse_chunk(list: usize, first_line: usize, lines: &[&str]) -> ChunkOut {
         if line.is_empty() || line.starts_with('!') {
             continue;
         }
-        match parse_filter(line, true, ParseOptions::default()) {
+        let opts = ParseOptions {
+            permissions,
+            ..Default::default()
+        };
+        match parse_filter(line, true, opts) {
             Ok(ParsedFilter::Network(f)) => {
                 out.overrides |= f.mask.intersects(
                     NetworkFilterMask::IS_EXCEPTION
@@ -96,8 +106,15 @@ fn parse_chunk(list: usize, first_line: usize, lines: &[&str]) -> ChunkOut {
     out
 }
 
-/// Parse and compile `lists` (each: converted rule text, one rule per line).
+/// Parse and compile `lists` (each: converted rule text, one rule per line); no list is trusted.
 pub fn compile_lists(lists: &[&str]) -> Compiled {
+    compile_lists_with(lists, &[])
+}
+
+/// Like [`compile_lists`]; `trusted[i]` marks list `i` as trusted (missing entries are untrusted).
+/// Rules of a trusted list may inject scriptlets that require trust (`trusted-*`); rules of any
+/// other list cannot, whatever the resource library holds.
+pub fn compile_lists_with(lists: &[&str], trusted: &[bool]) -> Compiled {
     let line_vecs: Vec<Vec<&str>> = lists.iter().map(|t| t.lines().collect()).collect();
     let chunks: Vec<(usize, usize, &[&str])> = line_vecs
         .iter()
@@ -110,7 +127,14 @@ pub fn compile_lists(lists: &[&str]) -> Compiled {
         .collect();
     let outs: Vec<ChunkOut> = chunks
         .par_iter()
-        .map(|(li, first, c)| parse_chunk(*li, *first, c))
+        .map(|(li, first, c)| {
+            let perm = if trusted.get(*li).copied().unwrap_or(false) {
+                crate::scriptlet_resources::TRUSTED_PERMISSION
+            } else {
+                PermissionMask::default()
+            };
+            parse_chunk(*li, *first, c, perm)
+        })
         .collect();
 
     let mut per_list = vec![ListCompileStats::default(); lists.len()];

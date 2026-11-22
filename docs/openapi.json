@@ -641,6 +641,22 @@
         ],
         "type": "object"
       },
+      "DroppedScriptletResource": {
+        "description": "A scriptlet resource that failed validation (syntax error, unresolved dependency, ...).",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "reason"
+        ],
+        "type": "object"
+      },
       "EngineStatusResponse": {
         "properties": {
           "build_count": {
@@ -655,6 +671,18 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "scriptlet_resources": {
+            "description": "Scriptlet/redirect resources currently served (after validation).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scriptlet_resources_dropped": {
+            "description": "Resources of the loaded library that failed validation and are not served, with why.",
+            "items": {
+              "$ref": "#/components/schemas/DroppedScriptletResource"
+            },
+            "type": "array"
           },
           "scriptlets_ready": {
             "type": "boolean"
