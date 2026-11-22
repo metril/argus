@@ -662,7 +662,11 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                     "cookie" => Action::Cookie(CookieSpec::parse(v).map_err(RuleError::Invalid)?),
                     "permissions" => {
                         need_val()?;
-                        Action::Permissions(v.replace("\\,", ","))
+                        let v = v.replace("\\,", ",");
+                        if !crate::permissions::is_valid(&v) {
+                            return inv(format!("`{v}` is not a Permissions-Policy value"));
+                        }
+                        Action::Permissions(v)
                     }
                     "removeheader" => {
                         need_val()?;

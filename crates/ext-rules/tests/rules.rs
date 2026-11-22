@@ -368,9 +368,9 @@ fn removeheader_permissions_header() {
     assert!(p
         .header_edits
         .contains(&HeaderEdit::Remove("refresh".into())));
-    assert!(p.header_edits.contains(&HeaderEdit::Append(
+    assert!(p.header_edits.contains(&HeaderEdit::SetAll(
         "permissions-policy".into(),
-        "geolocation=(), camera=()".into()
+        vec!["geolocation=(), camera=()".into()]
     )));
     assert!(p.block.is_none());
     // permissions only on documents
@@ -590,4 +590,101 @@ fn quick_exit_flags() {
 fn index_is_send_sync() {
     fn ok<T: Send + Sync>() {}
     ok::<ExtIndex>();
+}
+
+// ---- $permissions must never loosen the site's own policy -------------------------------------
+
+/// Header lines the browser would see after the plan's edits.
+fn pp_after(site: &[&str], edits: &[HeaderEdit]) -> Vec<String> {
+    let mut lines: Vec<String> = site.iter().map(|s| s.to_string()).collect();
+    for e in edits.iter().filter(|e| e.name() == "permissions-policy") {
+        match e {
+            HeaderEdit::Append(_, v) => lines.push(v.clone()),
+            HeaderEdit::SetAll(_, v) => lines = v.clone(),
+            HeaderEdit::Remove(_) => lines.clear(),
+        }
+    }
+    lines
+}
+
+fn pp_plan(trusted: bool, raw: &str, site: &[&str]) -> Vec<String> {
+    let i = ExtIndex::build(&[rule(raw, trusted)]);
+    let extra: Vec<(&str, &str)> = site.iter().map(|v| ("Permissions-Policy", *v)).collect();
+    let p = plan(
+        &i,
+        &get("https://site.example/", ResourceType::Document),
+        "text/html",
+        &extra,
+    );
+    pp_after(site, &p.header_edits)
+}
+
+#[test]
+fn untrusted_permissions_cannot_loosen_the_site_policy() {
+    // A widening member from an untrusted list is dropped outright.
+    let i = ExtIndex::build(&[rule("||site.example^$permissions=camera=*", false)]);
+    assert_eq!(i.len(), 0);
+    assert_eq!(i.stats().dropped_untrusted_by_list["L"], 1);
+    let out = pp_plan(
+        false,
+        "||site.example^$permissions=camera=*",
+        &["camera=()"],
+    );
+    assert_eq!(out, vec!["camera=()"]);
+    // Restrictive members tighten, in ONE header, and keep the site's other members.
+    let out = pp_plan(
+        false,
+        "||site.example^$permissions=camera=()",
+        &["camera=self, geolocation=(self)"],
+    );
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].contains("camera=()") && out[0].contains("geolocation=(self)"),
+        "{out:?}"
+    );
+    // Several site header lines collapse into the one merged header.
+    let out = pp_plan(
+        false,
+        "||site.example^$permissions=camera=()",
+        &["camera=*", "microphone=self"],
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(
+        out[0].contains("camera=()") && out[0].contains("microphone=self"),
+        "{out:?}"
+    );
+    // No site header: the restriction is added.
+    assert_eq!(
+        pp_plan(false, "||site.example^$permissions=camera=()", &[]),
+        vec!["camera=()"]
+    );
+}
+
+#[test]
+fn permissions_values_are_validated() {
+    for bad in [
+        "||site.example^$permissions=camera",
+        "||site.example^$permissions=Camera=(",
+        "||site.example^$permissions=camera=(foo)",
+        "||site.example^$permissions=cam era=()",
+    ] {
+        assert!(
+            matches!(parse_rule(&rule(bad, true)), Err(RuleError::Invalid(_))),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn trusted_permissions_may_set_any_member() {
+    let out = pp_plan(
+        true,
+        "||site.example^$permissions=camera=*",
+        &["camera=()", "fullscreen=self"],
+    );
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].contains("camera=*") && out[0].contains("fullscreen=self"),
+        "{out:?}"
+    );
 }

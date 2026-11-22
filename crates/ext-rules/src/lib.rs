@@ -24,6 +24,7 @@ mod index;
 mod jsonprune;
 mod parse;
 mod pattern;
+mod permissions;
 mod replace;
 mod types;
 mod util;

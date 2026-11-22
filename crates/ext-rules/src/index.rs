@@ -121,6 +121,10 @@ impl Default for BuildOptions {
 /// Rules that run code in pages or rewrite content arbitrarily; honoured only from trusted
 /// sources (uBO "trusted-only" modifiers). Exceptions never need trust: they only disable.
 fn needs_trust(r: &ParsedRule) -> bool {
+    // `$permissions` is honoured from any list only while it can merely restrict.
+    if let Action::Permissions(v) = &r.action {
+        return !r.exception && !crate::permissions::is_restrictive(v);
+    }
     !r.exception
         && matches!(
             r.action,
@@ -656,6 +660,8 @@ impl ExtIndex {
         let live = self.survivors(&ids, target::ALL);
         let clen = resp.content_length();
         let mut set_cookies: Vec<&CookieSpec> = Vec::new();
+        let (mut perm_restrict, mut perm_trusted): (Vec<&str>, Vec<&str>) =
+            (Vec::new(), Vec::new());
         for id in live {
             let r = &self.rules[id as usize];
             let mut used = true;
@@ -672,9 +678,13 @@ impl ExtIndex {
                     request: false,
                 } => plan.header_edits.push(HeaderEdit::Remove(name.clone())),
                 Action::Cookie(c) => set_cookies.push(c),
-                Action::Permissions(v) if is_doc => plan
-                    .header_edits
-                    .push(HeaderEdit::Append("permissions-policy".into(), v.clone())),
+                Action::Permissions(v) if is_doc => {
+                    if r.trusted && !crate::permissions::is_restrictive(v) {
+                        perm_trusted.push(v)
+                    } else {
+                        perm_restrict.push(v)
+                    }
+                }
                 Action::Replace(s)
                     if is_textual_content_type(&mime)
                         && fits(clen, crate::replace::MAX_REPLACE_BYTES) =>
@@ -734,6 +744,22 @@ impl ExtIndex {
             if used {
                 plan.matched.push(id);
             }
+        }
+        if !perm_restrict.is_empty() || !perm_trusted.is_empty() {
+            let site: Vec<&str> = resp
+                .headers
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("permissions-policy"))
+                .map(|(_, v)| *v)
+                .collect();
+            plan.header_edits.push(HeaderEdit::SetAll(
+                "permissions-policy".into(),
+                vec![crate::permissions::merge(
+                    &site,
+                    &perm_restrict,
+                    &perm_trusted,
+                )],
+            ));
         }
         if !set_cookies.is_empty() {
             let old: Vec<&str> = resp
