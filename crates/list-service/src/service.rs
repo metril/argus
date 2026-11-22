@@ -90,6 +90,22 @@ pub struct ListService {
     pub(crate) scriptlets_tx: watch::Sender<bool>,
     /// Live auto-update schedule: `(auto_update, interval)`.
     schedule: watch::Sender<(bool, Duration)>,
+    /// Test hook: make the next build panic.
+    #[cfg(test)]
+    panic_next: AtomicBool,
+}
+
+/// Clears the single-flight state on drop, so a build that panics (or a cancelled build task)
+/// cannot leave `running`/`busy` stuck and hang [`ListService::wait_idle`].
+struct FlightGuard(Arc<ListService>);
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let mut f = self.0.flight.lock();
+        f.running = false;
+        f.pending = false;
+        self.0.busy.send_replace(false);
+    }
 }
 
 /// Read a response body, failing once it exceeds `cap` bytes.
@@ -139,6 +155,8 @@ impl ListService {
             builds: AtomicU64::new(0),
             installed_once: AtomicBool::new(false),
             scriptlets_tx: watch::channel(false).0,
+            #[cfg(test)]
+            panic_next: AtomicBool::new(false),
         })
     }
 
@@ -228,9 +246,17 @@ impl ListService {
         }
         let this = self.clone();
         tokio::spawn(async move {
+            let _guard = FlightGuard(this.clone());
             loop {
-                if let Err(e) = this.build_once().await {
-                    warn!("Filter reload failed: {e}");
+                // Run the build as its own task so a panic surfaces as a `JoinError` here.
+                let build = this.clone();
+                match tokio::spawn(async move { build.build_once().await }).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Filter reload failed: {e}"),
+                    Err(e) => {
+                        warn!("Filter reload panicked: {e}");
+                        this.record_build_failure("filter reload panicked");
+                    }
                 }
                 let mut f = this.flight.lock();
                 if f.pending {
@@ -242,6 +268,18 @@ impl ListService {
                 }
             }
         });
+    }
+
+    /// Record a whole-build failure on every enabled list's status.
+    fn record_build_failure(&self, msg: &str) {
+        for list in self.store.get_all().unwrap_or_default() {
+            if list.enabled {
+                let mut status = self.store.get_status(&list.id).unwrap_or_default();
+                status.last_checked = Some(Utc::now());
+                status.last_error = Some(msg.to_string());
+                self.record(&list, &status);
+            }
+        }
     }
 
     /// Trigger a rebuild and wait until the service is idle again.
@@ -278,6 +316,10 @@ impl ListService {
     }
 
     async fn build_once(&self) -> Result<()> {
+        #[cfg(test)]
+        if self.panic_next.swap(false, Ordering::AcqRel) {
+            panic!("injected build panic");
+        }
         self.builds.fetch_add(1, Ordering::AcqRel);
         let enabled: Vec<FilterList> = self
             .store
@@ -416,4 +458,40 @@ enum Fetched {
         etag: Option<String>,
         last_modified: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panicking_build_does_not_hang_and_records_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ListStore::open(dir.path()).unwrap();
+        store.seed_defaults_if_empty().unwrap();
+        let list = store
+            .get_all()
+            .unwrap()
+            .into_iter()
+            .find(|l| l.enabled)
+            .unwrap();
+        let cfg = ListServiceConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let svc = ListService::new(
+            cfg,
+            store,
+            Arc::new(SharedEngine::new()),
+            reqwest::Client::new(),
+        );
+        svc.panic_next.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(5), svc.reload_now())
+            .await
+            .expect("reload_now must not hang after a panic");
+        let status = svc.store().get_status(&list.id).unwrap();
+        assert!(status.last_error.unwrap().contains("panicked"));
+        // The flight state is clean: a later trigger can run.
+        assert!(!svc.flight.lock().running);
+    }
 }
