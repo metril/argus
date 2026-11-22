@@ -127,6 +127,19 @@ answered `421 Misdirected Request` unless the connection's certificate covers th
 Address-only caveat: names are checked when they resolve, so a name that resolves to one of the
 proxy host's own interface addresses is refused on the proxy's own ports only.
 
+### DNS resolution
+
+Every name the proxy dials (intercepted HTTP, CONNECT and transparent tunnels, WebSocket) and
+every control-plane fetch (filter lists, resources) is resolved through one caching resolver
+(`[dns]`): TTL-clamped, single-flight, and the destination policy is applied to the cached
+addresses on every use (control-plane fetches keep their own, stricter policy). Only NXDOMAIN and
+"no records" answers are cached negatively (`negative_ttl_secs`); timeouts (retried once),
+SERVFAIL and I/O errors never are. When the resolver answers "does not exist", the operating
+system resolver is asked once before the lookup fails, so names only the OS knows (mDNS `.local`,
+NSS sources) still work; the policy judges those addresses too. This is the same on every path.
+Failures (upstream timeouts and errors, DNS failures, refused destinations) are counted in
+`GET /api/v1/stats/proxy` (`faults`) and summarized in one warning per 10 s.
+
 ### Getting started (end-to-end)
 
 The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API), and optionally the transparent-mode port (`proxy.transparent_port`, off by default).

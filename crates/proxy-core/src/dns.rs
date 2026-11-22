@@ -181,6 +181,23 @@ impl CachedResolver {
     }
 }
 
+/// A [`CachedResolver`] as the address source of destination policies (`NetPolicy`).
+#[derive(Clone)]
+pub struct DnsHandle(pub Arc<CachedResolver>);
+
+impl common::net_policy::NameResolver for DnsHandle {
+    fn lookup(&self, name: &str) -> common::net_policy::AddrFuture {
+        let name = name.to_string();
+        let this = self.0.clone();
+        Box::pin(async move {
+            this.resolve(&name)
+                .await
+                .map(|a| a.to_vec())
+                .map_err(std::io::Error::other)
+        })
+    }
+}
+
 impl std::fmt::Debug for CachedResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedResolver").finish_non_exhaustive()
@@ -464,6 +481,38 @@ mod tests {
         let r = CachedResolver::new(g.clone(), cfg(5_000, 60_000));
         assert!(r.resolve("slow2.test").await.is_ok());
         assert_eq!(g.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// CONNECT, WebSocket and transparent dials go through `DestPolicy::resolve`; it must use the
+    /// cache, apply the policy to the cached answer, and see OS-only names.
+    #[tokio::test]
+    async fn policy_dials_use_the_cache_and_the_os_fallback() {
+        use crate::policy::DestPolicy;
+        let ok = fake("203.0.113.7", Duration::from_secs(60));
+        let backend = Arc::new(FallbackBackend {
+            primary: failing(FailKind::NotFound),
+            secondary: ok.clone(),
+        });
+        let dns = Arc::new(CachedResolver::new(backend, cfg(5_000, 60_000)));
+        let policy = DestPolicy::new(false, &[])
+            .unwrap()
+            .with_resolver(Arc::new(DnsHandle(dns.clone())));
+        for _ in 0..3 {
+            let a = policy.resolve("printer.local", 9100, None).await.unwrap();
+            assert_eq!(a, "203.0.113.7:9100".parse::<SocketAddr>().unwrap());
+        }
+        assert_eq!(ok.calls.load(Ordering::SeqCst), 1, "resolved once, cached");
+        // The policy still judges cached answers.
+        let loopback = Arc::new(CachedResolver::new(
+            fake("127.0.0.1", Duration::from_secs(60)),
+            cfg(5_000, 60_000),
+        ));
+        let p = DestPolicy::new(false, &[])
+            .unwrap()
+            .with_resolver(Arc::new(DnsHandle(loopback)));
+        for _ in 0..2 {
+            assert!(p.resolve("rebind.test", 80, None).await.is_err());
+        }
     }
 
     #[tokio::test]

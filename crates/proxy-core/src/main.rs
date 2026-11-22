@@ -41,9 +41,17 @@ async fn main() -> Result<()> {
     shared_engine.set_recent_keep_query(config.adblock.recent_blocked_keep_query);
 
     // One pooled upstream client (connect/read timeouts from config, no redirect following).
+    let upstream_opts = UpstreamOptions::from_config(&config);
+    // The same caching resolver also serves the control plane (list and resource fetches); each
+    // fetch still applies its own, stricter policy to the addresses.
+    if let Some(dns) = &upstream_opts.dns {
+        common::net_policy::install_shared_resolver(Arc::new(proxy_core::dns::DnsHandle(
+            dns.clone(),
+        )));
+    }
     let ctx = Arc::new(ProxyContext::with_upstream(
         shared_engine.clone(),
-        &UpstreamOptions::from_config(&config),
+        &upstream_opts,
         config.adblock.enabled,
     )?);
 

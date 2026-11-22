@@ -33,6 +33,9 @@ pub struct UpstreamOptions {
 impl UpstreamOptions {
     /// Options derived from the proxy configuration.
     pub fn from_config(config: &crate::ProxyConfig) -> Self {
+        // One caching resolver for every dial: the HTTP client, CONNECT and transparent
+        // tunnels and WebSocket (through the policy) share it.
+        let dns = Arc::new(CachedResolver::from_settings(&config.dns));
         Self {
             extra_ca_paths: config.proxy.extra_upstream_ca_paths.clone(),
             resolve_all_to: None,
@@ -42,18 +45,22 @@ impl UpstreamOptions {
             read_timeout: Some(Duration::from_secs(
                 config.performance.request_timeout_secs.max(1),
             )),
-            dns: Some(Arc::new(CachedResolver::from_settings(&config.dns))),
+            dns: Some(dns.clone()),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
                 match config.performance.max_connections {
                     0 => common::config::derive_max_connections(),
                     n => n,
                 },
             )),
-            policy: Arc::new(DestPolicy::from_config(config).unwrap_or_else(|e| {
-                // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
-                tracing::warn!("destination policy config invalid: {e}");
-                DestPolicy::default()
-            })),
+            policy: Arc::new(
+                DestPolicy::from_config(config)
+                    .unwrap_or_else(|e| {
+                        // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
+                        tracing::warn!("destination policy config invalid: {e}");
+                        DestPolicy::default()
+                    })
+                    .with_resolver(Arc::new(crate::dns::DnsHandle(dns))),
+            ),
         }
     }
 }
