@@ -466,3 +466,78 @@ async fn cached_resources_work_offline_without_bundled_snapshot() {
         .injected_script
         .is_empty());
 }
+
+fn ext_active(e: &SharedEngine, kind: &str) -> usize {
+    let g = e.generation();
+    let idx = g.aux::<ext_rules::ExtIndex>().expect("ext index installed");
+    idx.stats().per_kind.get(kind).map_or(0, |k| k.active)
+}
+
+const REPLACE_RULE: &str = "||a.test^$replace=/x/y/\n##.ad\n";
+
+#[tokio::test]
+async fn list_trust_decides_whether_code_running_ext_rules_are_active() {
+    let f = Arc::new(Files::default());
+    f.set("/l", REPLACE_RULE);
+    let addr = serve(f.clone()).await;
+
+    // Untrusted (the default): the rule is parsed but dropped, and counted per list.
+    let e = env(one(addr, "/l"), |_| {});
+    e.svc.reload_now().await;
+    assert_eq!(ext_active(&e.engine, "replace"), 0);
+    let s = e.svc.summary();
+    let stats = s.ext_stats.expect("ext stats in the summary");
+    assert_eq!(stats.per_kind["replace"].dropped_untrusted, 1);
+    assert_eq!(stats.dropped_untrusted_by_list["l"], 1);
+
+    // Trusting the list changes the cache key: a rebuild makes the rule active.
+    let mut l = e.svc.store().get("l").unwrap().unwrap();
+    l.trusted = true;
+    e.svc.store().upsert(&l).unwrap();
+    e.svc.reload_now().await;
+    assert_eq!(ext_active(&e.engine, "replace"), 1);
+    assert!(e.engine.ext_rules().iter().all(|r| r.trusted));
+}
+
+#[tokio::test]
+async fn custom_rules_are_always_trusted() {
+    let f = Arc::new(Files::default());
+    f.set("/l", "||ads.test^\n");
+    let addr = serve(f.clone()).await;
+    let e = env(one(addr, "/l"), |_| {});
+    e.svc.store().set_custom_rules(REPLACE_RULE).unwrap();
+    e.svc.reload_now().await;
+    assert_eq!(ext_active(&e.engine, "replace"), 1);
+}
+
+#[tokio::test]
+async fn persisted_ext_index_is_live_after_a_restart_without_the_network() {
+    let f = Arc::new(Files::default());
+    f.set("/l", REPLACE_RULE);
+    let addr = serve(f.clone()).await;
+    let e = env(
+        vec![(
+            "l",
+            format!("http://{addr}/l"),
+            Box::new(|l| l.trusted = true),
+        )],
+        |_| {},
+    );
+    e.svc.reload_now().await;
+    assert_eq!(ext_active(&e.engine, "replace"), 1);
+
+    f.gated.store(true, Ordering::SeqCst);
+    let (svc2, engine2) = restart(&e);
+    svc2.trigger();
+    f.arrived.notified().await;
+    // Served from disk while the fetch hangs.
+    assert!(svc2.summary().from_persisted);
+    assert_eq!(ext_active(&engine2, "replace"), 1);
+    assert_eq!(
+        svc2.summary().ext_stats.unwrap().per_kind["replace"].active,
+        1
+    );
+    f.gated.store(false, Ordering::SeqCst);
+    f.gate.notify_one();
+    svc2.wait_idle().await;
+}
