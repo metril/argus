@@ -239,7 +239,7 @@ function (cfg, entries, W) {
     function openChan() {
       if (chan || !BC) { return; }
       try {
-        chan = new BC("adblock-gm:" + d.id);
+        chan = new BC("adblock-gm:" + d.chan);
         chan.onmessage = function (ev) {
           var m = ev && ev.data;
           if (!m || m.tab === tabId || m.t !== "set") { return; }
@@ -763,7 +763,7 @@ function (cfg, entries, W) {
         var out = {}; out[tabId] = getTabObj();
         if (!BC) { res(out); return; }
         var c2;
-        try { c2 = new BC("adblock-gm-tabs:" + d.id); } catch (e) { res(out); return; }
+        try { c2 = new BC("adblock-gm-tabs:" + d.chan); } catch (e) { res(out); return; }
         c2.onmessage = function (ev) {
           var m = ev.data;
           if (m && m.t === "tab") { out[m.tab] = m.obj; }
@@ -777,7 +777,7 @@ function (cfg, entries, W) {
     function ensureTabResponder() {
       if (tabResponder || !BC) { return; }
       try {
-        tabResponder = new BC("adblock-gm-tabs:" + d.id);
+        tabResponder = new BC("adblock-gm-tabs:" + d.chan);
         tabResponder.onmessage = function (ev) {
           var m = ev.data;
           if (m && m.t === "ask" && m.tab !== tabId) { tabResponder.postMessage({ t: "tab", tab: tabId, obj: getTabObj() }); }

@@ -95,6 +95,17 @@ fn mac(key: &TokenKey, c: &TokenClaims<'_>) -> Vec<u8> {
     m.finalize().into_bytes().to_vec()
 }
 
+/// Name suffix for the same-origin `BroadcastChannel`s one script's tabs share. Derived from the
+/// server key, so a hostile page on the same origin cannot name (listen on or post to) them.
+pub fn channel_secret(key: &TokenKey, profile: &str, script_id: &str, origin: &str) -> String {
+    let mut m = HmacSha256::new_from_slice(&key.0).expect("hmac accepts any key length");
+    for part in ["adblock-gm-chan-v1", profile, script_id, origin] {
+        m.update(part.as_bytes());
+        m.update(&[0]);
+    }
+    B64.encode(&m.finalize().into_bytes()[..18])
+}
+
 /// Mint a token for one script in one document.
 pub fn mint(key: &TokenKey, c: &TokenClaims<'_>) -> String {
     format!(
@@ -301,5 +312,15 @@ mod tests {
             caps_hash(&m("// @grant GM_getValue\n// @connect a.com"), false)
         );
         assert_ne!(a, caps_hash(&m("// @grant GM_getValue"), true));
+    }
+
+    #[test]
+    fn channel_secret_is_per_script_and_origin_and_not_the_token() {
+        let k = TokenKey::new(vec![7u8; 32]);
+        let a = channel_secret(&k, "default", "s1", "https://a.test");
+        assert_eq!(a, channel_secret(&k, "default", "s1", "https://a.test"));
+        assert_ne!(a, channel_secret(&k, "default", "s2", "https://a.test"));
+        assert_ne!(a, channel_secret(&k, "default", "s1", "https://b.test"));
+        assert!(!a.contains("v1."));
     }
 }

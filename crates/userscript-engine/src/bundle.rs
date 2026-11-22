@@ -287,6 +287,15 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
     d.insert("grants".into(), json!(grants));
     d.insert("params".into(), json!(params));
     d.insert("token".into(), json!(tok));
+    d.insert(
+        "chan".into(),
+        json!(token::channel_secret(
+            opts.key,
+            opts.profile,
+            &s.id,
+            opts.page_origin
+        )),
+    );
     d.insert("meta".into(), meta_json(m));
     d.insert("metaStr".into(), json!(meta_str(m)));
     d.insert("unwrap".into(), json!(m.unwrap));

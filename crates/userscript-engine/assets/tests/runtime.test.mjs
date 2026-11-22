@@ -227,7 +227,7 @@ test("resources: inline (sync) and fetched (promise) forms", async () => {
   assert.match(await api.GM.getResourceUrl("big"), /^data:text\/css;base64,/);
   await assert.rejects(api.GM.getResourceText("nope"));
   const r = env.backend.calls.find((c) => c.path.startsWith("resource"));
-  assert.ok(r.url.includes("&t=v1."), "image-style fetches carry the token in the query for <img src> use only");
+  assert.ok(!r.url.includes("v1."), "the token never travels in the URL");
   assert.match(r.headers["X-GM-Token"], /^v1\./);
 });
 

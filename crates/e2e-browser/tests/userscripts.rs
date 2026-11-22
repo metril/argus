@@ -670,3 +670,67 @@ us_test!(real_world_script_installed_through_the_api_runs, |s| {
     );
     s.assert_clean().await;
 });
+
+us_test!(
+    no_token_or_channel_secret_is_observable_after_every_gm_api,
+    |s| {
+        s.origin.route("/data", MockResponse::ok("payload"));
+        let api = s.url("api.test", "/data");
+        let mut f = Fetched::default();
+        f.resources.insert(
+            "big".into(),
+            (vec![b'a'; 300 * 1024], Some("text/plain".into())),
+        );
+        let id = s.proxy.install_userscript_with(
+        &script(
+            "everything",
+            "// @run-at document-start\n// @connect api.test\n// @grant GM_getValue\n// @grant GM_setValue\n// @grant GM_deleteValue\n// @grant GM_listValues\n// @grant GM_addValueChangeListener\n// @grant GM_xmlhttpRequest\n// @grant GM_cookie\n// @grant GM.getResourceText\n// @grant GM_saveTab\n// @grant GM_getTabs\n// @grant GM_registerMenuCommand\n// @resource big https://cdn.test/big.txt",
+            &format!(
+                "GM_setValue('k', 'v1'); GM_registerMenuCommand('m', () => {{}}); GM_saveTab({{ a: 1 }}); GM_getTabs(() => {{}});\n\
+                 GM_addValueChangeListener('k', (n, o, nv) => {{ window.__chg = nv; }});\n\
+                 GM.getResourceText('big').then((t) => {{ window.__big = t.length; }});\n\
+                 GM_cookie.set({{ url: location.href, name: 'c', value: '1' }}, () => {{}});\n\
+                 GM_xmlhttpRequest({{ method: 'GET', url: '{api}', onload: (r) => {{ window.__x = r.status; }} }});\n\
+                 window.__listed = GM_listValues().length; GM_deleteValue('zz');"
+            ),
+        ),
+        f,
+        false,
+    );
+        html(&s, "/", page("", "x"));
+        s.goto(&s.url("us.test", "/")).await;
+        s.wait_for("script done", "window.__x === 200 && window.__big > 0")
+            .await;
+        // Forged channel traffic from a hostile page must not change what the script sees.
+        let forged = s
+        .eval(&format!(
+            "(async () => {{ for (const n of ['adblock-gm:{id}', 'adblock-gm-tabs:{id}']) {{ const c = new BroadcastChannel(n);\
+               c.postMessage({{ t: 'set', tab: 'evil', name: 'k', new: 'FORGED', old: 'v1', has: true }}); c.close(); }}\
+             await new Promise((r) => setTimeout(r, 300)); return window.__chg || null; }})()"
+        ))
+        .await;
+        assert!(
+            forged.is_null(),
+            "forged value-change message was acted on: {forged}"
+        );
+        // Nothing a page can look at holds a token, and no channel listener hears anything.
+        let leaks = s
+        .eval(&format!(
+            "(async () => {{ const re = /v1\\.[A-Za-z0-9_-]{{4,}}\\.\\d{{6,}}\\./; const out = [];\
+             const heard = []; const chans = ['adblock-gm:{id}', 'adblock-gm-tabs:{id}'].map((n) => {{ const c = new BroadcastChannel(n); c.onmessage = (e) => heard.push(JSON.stringify(e.data)); return c; }});\
+             if (re.test(document.documentElement.outerHTML)) out.push('dom');\
+             for (const e of performance.getEntries()) {{ if (re.test(e.name)) out.push('perf:' + e.name); if (/[?&]t=/.test(e.name)) out.push('query-token:' + e.name); }}\
+             for (const st of [localStorage, sessionStorage]) for (let i = 0; i < st.length; i++) if (re.test(st.getItem(st.key(i)) + st.key(i))) out.push('storage');\
+             if (re.test(window.name)) out.push('window.name');\
+             for (const k of Reflect.ownKeys(window)) {{ try {{ const v = window[k]; if (typeof v === 'string' && re.test(v)) out.push('win:' + String(k)); }} catch (_) {{}} }}\
+             if (document.cookie && re.test(document.cookie)) out.push('cookie');\
+             await new Promise((r) => setTimeout(r, 400));\
+             if (heard.length) out.push('channel:' + heard.join(','));\
+             const r = await fetch('/__adblock__/gm/v1/resource?name=big&t=v1.x.9999999999.y'); if (r.status === 200) out.push('resource-open');\
+             return out; }})()"
+        ))
+        .await;
+        assert_eq!(leaks, json!([]), "{leaks}");
+        let _ = id;
+    }
+);

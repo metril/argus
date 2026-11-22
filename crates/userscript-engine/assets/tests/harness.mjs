@@ -188,7 +188,7 @@ export function runScript(env, { grants = [], runAt = "document-start", id = "s1
   };
   const params = (grants.length ? gm : []).concat(grants.filter((g) => table[g]).map((g) => table[g]), ["unsafeWindow"]);
   const d = {
-    id, name, runAt, grants, params, token: token(id), unwrap,
+    id, name, runAt, grants, params, token: token(id), chan: "chan-" + id, unwrap,
     meta: { name, version: "1.0", grants, ...meta }, metaStr: "// ==UserScript==\n// @name " + name + "\n// ==/UserScript==\n",
   };
   if (values) d.values = values;
