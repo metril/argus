@@ -55,6 +55,9 @@ pub struct ListServiceConfig {
     /// private; loopback, link-local and other reserved addresses stay refused unless listed as
     /// a CIDR/IP.
     pub allowed_fetch_destinations: Vec<String>,
+    /// Threads of the dedicated list-build pool (parse, convert, compile); 0 = half the cores,
+    /// at least 1. Kept below the core count so a rebuild does not starve the proxy workers.
+    pub build_threads: usize,
 }
 
 impl Default for ListServiceConfig {
@@ -72,6 +75,7 @@ impl Default for ListServiceConfig {
             scriptlet_retry_max: Duration::from_secs(15 * 60),
             persist_engine: false,
             allowed_fetch_destinations: Vec::new(),
+            build_threads: 0,
         }
     }
 }
@@ -141,6 +145,16 @@ pub(crate) fn build_ext_index(
     ))
 }
 
+/// Nice the calling thread (Linux only; a no-op elsewhere or on failure).
+fn lower_thread_priority() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: gettid has no arguments; setpriority on a thread id affects that thread only.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
 /// Owns lists, content, compile and install for one [`SharedEngine`].
 pub struct ListService {
     pub(crate) cfg: ListServiceConfig,
@@ -172,6 +186,8 @@ pub struct ListService {
     profile_lists: Mutex<std::collections::HashSet<String>>,
     /// Per-list-set engines (see [`ListService::engine_for`]).
     pub(crate) sets: crate::sets::SetRegistry,
+    /// Dedicated rayon pool for list builds, created on first use.
+    pool: std::sync::OnceLock<Arc<rayon::ThreadPool>>,
     /// Test hook: make the next build panic.
     #[cfg(test)]
     panic_next: AtomicBool,
@@ -313,6 +329,31 @@ fn sorted_includes(m: &HashMap<String, String>) -> Vec<(&String, &String)> {
 }
 
 impl ListService {
+    /// The build pool: `cfg.build_threads` (default cores/2, min 1) low-priority threads, so
+    /// list builds neither take every core nor win scheduling against request workers.
+    pub(crate) fn build_pool(&self) -> Arc<rayon::ThreadPool> {
+        self.pool
+            .get_or_init(|| {
+                let n = match self.cfg.build_threads {
+                    0 => (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1),
+                    n => n,
+                };
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .thread_name(|i| format!("list-build-{i}"))
+                    .start_handler(|_| lower_thread_priority())
+                    .build()
+                    .unwrap_or_else(|_| {
+                        rayon::ThreadPoolBuilder::new()
+                            .num_threads(1)
+                            .build()
+                            .expect("rayon pool")
+                    });
+                Arc::new(pool)
+            })
+            .clone()
+    }
+
     /// Build a service over an existing store (no seeding).
     pub fn new(
         cfg: ListServiceConfig,
@@ -336,6 +377,7 @@ impl ListService {
         let summary = store.get_summary().unwrap_or_default();
         Arc::new(Self {
             schedule,
+            pool: Default::default(),
             sets: Default::default(),
             profile_lists: Mutex::default(),
             cfg,
@@ -715,6 +757,7 @@ impl ListService {
             .map(|i| i.id.clone())
             .collect();
         let resources = self.engine.resources();
+        let pool = self.build_pool();
         let started = Instant::now();
         #[cfg(test)]
         let fail = self.fail_compile.swap(false, Ordering::AcqRel);
@@ -730,7 +773,8 @@ impl ListService {
                     includes: i.includes,
                 })
                 .collect();
-            let mut built = build_set(&list_inputs);
+            let mut built = pool.install(|| build_set(&list_inputs));
+            drop(list_inputs);
             mark_trusted(&mut built.ext, &trusted_lists);
             // A blob the engine cannot load back (for example more rules than its flatbuffer
             // verifier allows) must fail the build, not silently install an empty engine.
