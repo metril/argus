@@ -4,24 +4,27 @@
 //! answers `101`, both upgraded streams are spliced byte-for-byte. Extensions and subprotocols
 //! negotiated end to end therefore keep working, and the proxy never re-frames messages.
 
-use crate::filtering::ProxyContext;
+use crate::authority;
+use crate::connection::IdleIo;
+use crate::filtering::{refused_response, ProxyContext};
 use crate::inject::{full_body, ProxyBody};
+use crate::policy::DestPolicy;
 use crate::request_ctx::RequestCtx;
 use crate::{Error, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use hyper::header::{HeaderMap, HeaderName, HOST};
-use hyper::http::uri::Authority;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
@@ -71,13 +74,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> WsIo for T {}
 /// `UpstreamOptions::resolve_all_to`.
 pub struct WsUpstream {
     tls: TlsConnector,
+    policy: Arc<DestPolicy>,
     resolve_all_to: Option<IpAddr>,
     dial_timeout: Duration,
+    /// Spliced connections close after this long without traffic.
+    idle_timeout: Duration,
+    /// Spliced connections end when the proxy shuts down.
+    shutdown: Option<broadcast::Sender<()>>,
 }
 
 impl WsUpstream {
     pub fn new(
         extra_ca_paths: &[PathBuf],
+        policy: Arc<DestPolicy>,
         resolve_all_to: Option<IpAddr>,
         dial_timeout: Duration,
     ) -> Result<Self> {
@@ -91,18 +100,26 @@ impl WsUpstream {
         .with_no_client_auth();
         Ok(Self {
             tls: TlsConnector::from(Arc::new(config)),
+            policy,
             resolve_all_to,
             dial_timeout,
+            idle_timeout: Duration::from_secs(300),
+            shutdown: None,
         })
+    }
+
+    /// Idle timeout for spliced connections, and the proxy shutdown signal that ends them.
+    pub fn with_lifecycle(mut self, idle: Duration, shutdown: broadcast::Sender<()>) -> Self {
+        self.idle_timeout = idle;
+        self.shutdown = Some(shutdown);
+        self
     }
 
     async fn dial(&self, host: &str, port: u16, tls: bool) -> Result<Box<dyn WsIo>> {
         let connect = async {
-            let tcp = match self.resolve_all_to {
-                Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await,
-                None => TcpStream::connect((host, port)).await,
-            }
-            .map_err(Error::Io)?;
+            // Resolve once, check the policy on the resolved address, connect to exactly that.
+            let addr = self.policy.resolve(host, port, self.resolve_all_to).await?;
+            let tcp = TcpStream::connect(addr).await.map_err(Error::Io)?;
             let _ = tcp.set_nodelay(true);
             if !tls {
                 return Ok::<Box<dyn WsIo>, Error>(Box::new(tcp));
@@ -162,23 +179,15 @@ fn resolve_target(
         Some("http") | Some("ws") => false,
         _ => default_tls,
     };
-    let host_hdr: Option<Authority> = headers
-        .get(HOST)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok());
-    let authority = uri.authority().cloned().or(host_hdr);
-    let (host, port) = match authority {
-        Some(a) => (a.host().to_string(), a.port_u16()),
-        None => {
-            let (h, p) = fallback?;
-            (h.clone(), Some(*p))
-        }
+    let named = authority::of_request(uri, headers);
+    // Behind CONNECT / transparent entry the accepted target fixes the port; the host the request
+    // names was already checked against the connection's certificate.
+    let (host, port) = match (named, fallback) {
+        (Some((h, _)), Some((_, fp))) => (h, Some(*fp)),
+        (Some((h, p)), None) => (h, p),
+        (None, Some((fh, fp))) => (fh.clone(), Some(*fp)),
+        (None, None) => return None,
     };
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(&host)
-        .to_string();
     let port = port.unwrap_or(if tls { 443 } else { 80 });
     let path_and_query = uri
         .path_and_query()
@@ -190,6 +199,29 @@ fn resolve_target(
         tls,
         path_and_query,
     })
+}
+
+/// Copy both ways until either side closes, `idle` passes with no traffic, or the proxy shuts
+/// down.
+async fn splice<C, U>(
+    client: C,
+    mut upstream: U,
+    idle: Duration,
+    shutdown: Option<broadcast::Receiver<()>>,
+) -> std::io::Result<(u64, u64)>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut client = IdleIo::new(client, idle);
+    let copy = tokio::io::copy_bidirectional(&mut client, &mut upstream);
+    match shutdown {
+        Some(mut rx) => tokio::select! {
+            r = copy => r,
+            _ = rx.recv() => Err(std::io::Error::other("proxy shutting down")),
+        },
+        None => copy.await,
+    }
 }
 
 fn status_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody> {
@@ -237,6 +269,10 @@ pub async fn proxy_upgrade(
 
     let io = match ws.dial(&target.host, target.port, target.tls).await {
         Ok(io) => io,
+        Err(Error::DestinationRefused(why)) => {
+            debug!("Refused WebSocket to {}: {}", check_url, why);
+            return Ok(refused_response());
+        }
         Err(e) => {
             warn!("WebSocket upstream dial to {} failed: {}", check_url, e);
             return Ok(status_response(
@@ -262,28 +298,28 @@ pub async fn proxy_upgrade(
     {
         let headers = up_req.headers_mut();
         for (name, value) in req.headers() {
+            // The forwarded request has no body: framing headers of the client's request would
+            // make the origin wait for one.
             if name == HeaderName::from_static("proxy-authorization")
                 || name == HeaderName::from_static("proxy-connection")
+                || name == HOST
+                || name == hyper::header::CONTENT_LENGTH
+                || name == hyper::header::TRANSFER_ENCODING
             {
                 continue;
             }
             headers.append(name.clone(), value.clone());
         }
-        if !headers.contains_key(HOST) {
-            let default = if target.tls { 443 } else { 80 };
-            let host = if target.host.contains(':') {
-                format!("[{}]", target.host)
-            } else {
-                target.host.clone()
-            };
-            let value = if target.port == default {
-                host
-            } else {
-                format!("{host}:{}", target.port)
-            };
-            if let Ok(v) = value.parse() {
-                headers.insert(HOST, v);
-            }
+        // Host is rebuilt from the accepted target, never taken from the client.
+        let default = if target.tls { 443 } else { 80 };
+        let host = authority::url_host(&target.host);
+        let value = if target.port == default {
+            host
+        } else {
+            format!("{host}:{}", target.port)
+        };
+        if let Ok(v) = value.parse() {
+            headers.insert(HOST, v);
         }
     }
 
@@ -312,12 +348,14 @@ pub async fn proxy_upgrade(
     let up_upgrade = hyper::upgrade::on(&mut resp);
     let client_upgrade = hyper::upgrade::on(&mut req);
     let desc = check_url.clone();
+    let idle = ws.idle_timeout;
+    let shutdown = ws.shutdown.as_ref().map(|tx| tx.subscribe());
     tokio::spawn(async move {
         match tokio::try_join!(client_upgrade, up_upgrade) {
             Ok((client, upstream)) => {
-                let mut client = TokioIo::new(client);
-                let mut upstream = TokioIo::new(upstream);
-                match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                let client = TokioIo::new(client);
+                let upstream = TokioIo::new(upstream);
+                match splice(client, upstream, idle, shutdown).await {
                     Ok((up, down)) => debug!("WebSocket {} closed (up {up}B, down {down}B)", desc),
                     Err(e) => debug!("WebSocket {} ended: {}", desc, e),
                 }
@@ -407,5 +445,54 @@ mod tests {
         assert!(!t.tls);
         assert_eq!(t.host, "::1");
         assert_eq!(t.check_url(), "http://[::1]:9000/s");
+    }
+
+    #[test]
+    fn accepted_target_port_beats_hostile_host_port() {
+        let uri: Uri = "/ws".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(HOST, "example.com:6379".parse().unwrap());
+        let fb = ("example.com".to_string(), 443);
+        let t = resolve_target(&uri, &h, true, Some(&fb)).unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("example.com", 443));
+        // Same for an absolute-form URI naming another port.
+        let abs: Uri = "wss://example.com:22/ws".parse().unwrap();
+        let t = resolve_target(&abs, &HeaderMap::new(), true, Some(&fb)).unwrap();
+        assert_eq!(t.port, 443);
+        // Without an accepted target the request's own port is used.
+        let t = resolve_target(&uri, &h, true, None).unwrap();
+        assert_eq!(t.port, 6379);
+    }
+
+    #[test]
+    fn bracketed_ipv6_host_header() {
+        let uri: Uri = "/ws".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(HOST, "[2001:db8::1]:8443".parse().unwrap());
+        let t = resolve_target(&uri, &h, true, None).unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("2001:db8::1", 8443));
+    }
+
+    #[tokio::test]
+    async fn splice_ends_after_idle_timeout() {
+        let (client, _client_peer) = tokio::io::duplex(64);
+        let (upstream, _upstream_peer) = tokio::io::duplex(64);
+        let r = splice(client, upstream, Duration::from_millis(100), None).await;
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn splice_ends_on_shutdown() {
+        let (client, _client_peer) = tokio::io::duplex(64);
+        let (upstream, _upstream_peer) = tokio::io::duplex(64);
+        let (tx, rx) = broadcast::channel(1);
+        let task = tokio::spawn(splice(
+            client,
+            upstream,
+            Duration::from_secs(3600),
+            Some(rx),
+        ));
+        tx.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
     }
 }

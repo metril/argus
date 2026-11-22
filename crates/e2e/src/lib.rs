@@ -21,9 +21,13 @@ mod ws;
 pub use client::{HttpVersion, TestClient};
 pub use origin::{MockResponse, RecordedRequest, TestOrigin};
 pub use proxy::{TestDst, TestProxy};
-pub use ws::{connect_ws, connect_wss, WsStream};
+pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
 
 use std::sync::Once;
+
+/// An IP literal the destination policy accepts (TEST-NET-3), usable as a CONNECT / URL host: the
+/// origin's no-SNI certificate covers it and the proxy's resolve override sends it to the origin.
+pub const PUBLIC_TEST_IP: &str = "203.0.113.9";
 
 /// How traffic reaches the proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,23 @@ impl TestEnv {
     pub async fn start_with(mode: EntryMode, rules: &[&str], passthrough: &[&str]) -> Self {
         let origin = TestOrigin::start().await;
         let proxy = TestProxy::start_with(mode, &origin, rules, passthrough)
+            .await
+            .expect("start proxy");
+        Self {
+            origin,
+            proxy,
+            mode,
+        }
+    }
+
+    /// Like [`Self::start`] with the proxy configuration edited by `tweak`.
+    pub async fn start_tweaked(
+        mode: EntryMode,
+        rules: &[&str],
+        tweak: &dyn Fn(&mut proxy_core::config::ProxyConfig),
+    ) -> Self {
+        let origin = TestOrigin::start().await;
+        let proxy = TestProxy::start_tweaked(mode, &origin, rules, tweak)
             .await
             .expect("start proxy");
         Self {

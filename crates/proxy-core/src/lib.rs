@@ -9,6 +9,7 @@
 //! - Unified load management for production hardening
 //! - CA private key encryption at rest
 
+pub mod authority;
 pub mod ca;
 pub mod ca_encryption;
 pub mod circuit_breaker;
@@ -22,6 +23,7 @@ pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
 pub mod passthrough;
+pub mod policy;
 pub mod redirect;
 pub mod request_ctx;
 pub mod request_type;

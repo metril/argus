@@ -22,6 +22,9 @@ pub enum Error {
     #[error("Connection error: {0}")]
     Connection(String),
 
+    #[error("Destination refused: {0}")]
+    DestinationRefused(String),
+
     #[error("Timeout error")]
     Timeout,
 

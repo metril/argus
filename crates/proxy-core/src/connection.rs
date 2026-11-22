@@ -10,6 +10,7 @@
 //!    terminates TLS (MITM) and serves HTTP/1.1 or h2, or tunnels bytes. It does not care how the
 //!    connection arrived.
 
+use crate::authority;
 use crate::filtering::ProxyContext;
 use crate::inject::{full_body, ProxyBody};
 use crate::mitm::MitmHandler;
@@ -85,6 +86,9 @@ pub struct ConnectionTarget {
 pub(crate) struct Origin {
     scheme: &'static str,
     authority: Option<(String, u16)>,
+    /// Intercepted TLS: requests may only name the connection's host or a name its leaf
+    /// certificate covers (answered with 421 otherwise).
+    strict_host: bool,
 }
 
 impl Origin {
@@ -93,6 +97,7 @@ impl Origin {
         Self {
             scheme: "http",
             authority: Some((dst.ip().to_string(), dst.port())),
+            strict_host: false,
         }
     }
 }
@@ -167,12 +172,38 @@ impl ConnectionHandler {
         let leftover = buf.split_off(head_len);
 
         debug!("CONNECT {}:{} from {}", host, port, self.client_addr);
+        let intercept_tls = self.shared.mitm.is_some() && !self.shared.passthrough.matches(&host);
+
+        // Destination policy, answered with a 403 before the tunnel is established. Intercepted
+        // connections only need the literal check here (every request is checked again when it
+        // is forwarded); opaque tunnels resolve now. The dial itself re-resolves and re-checks.
+        let ctx = &self.shared.ctx;
+        let refused = if intercept_tls {
+            ctx.policy().check_literal(&host, port).is_err()
+        } else {
+            matches!(
+                tokio::time::timeout(
+                    limit,
+                    ctx.policy().resolve(&host, port, ctx.resolve_all_to())
+                )
+                .await,
+                Ok(Err(Error::DestinationRefused(_)))
+            )
+        };
+        if refused {
+            debug!("Refused CONNECT to {host}:{port} from {}", self.client_addr);
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nx-adblock: destination-refused\r\nconnection: close\r\ncontent-length: 19\r\n\r\nDestination refused",
+                )
+                .await;
+            return Err(Error::DestinationRefused(format!("{host}:{port}")));
+        }
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await
             .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
 
-        let intercept_tls = self.shared.mitm.is_some() && !self.shared.passthrough.matches(&host);
         let target = ConnectionTarget {
             host,
             port,
@@ -226,6 +257,7 @@ impl ConnectionHandler {
         let origin = Origin {
             scheme: "https",
             authority: Some((target.host.clone(), target.port)),
+            strict_host: true,
         };
 
         if use_http2 {
@@ -276,15 +308,22 @@ impl ConnectionHandler {
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let t = &self.shared.timeouts;
-        // Same resolution as the HTTP client: normal DNS unless a code-only override is set.
+        // Resolve once, check the policy on the resolved address and connect to exactly that
+        // address (DNS rebinding cannot swap it afterwards).
+        let ctx = &self.shared.ctx;
         let dial = async {
-            match self.shared.ctx.resolve_all_to() {
-                Some(ip) => TcpStream::connect((ip, target.port)).await,
-                None => TcpStream::connect((target.host.as_str(), target.port)).await,
-            }
+            let addr = ctx
+                .policy()
+                .resolve(&target.host, target.port, ctx.resolve_all_to())
+                .await?;
+            TcpStream::connect(addr).await.map_err(Error::from)
         };
         let mut server = match tokio::time::timeout(t.handshake, dial).await {
             Ok(Ok(s)) => s,
+            Ok(Err(e @ Error::DestinationRefused(_))) => {
+                debug!("Refused tunnel to {}:{}: {e}", target.host, target.port);
+                return Err(e);
+            }
             Ok(Err(e)) => {
                 return Err(Error::Connection(format!(
                     "Failed to connect to {}:{}: {}",
@@ -312,6 +351,7 @@ fn plain_origin() -> Origin {
     Origin {
         scheme: "http",
         authority: None,
+        strict_host: false,
     }
 }
 
@@ -329,6 +369,27 @@ async fn handle_request(
         req.uri(),
         req.version()
     );
+
+    // An intercepted connection serves its own host and the names its certificate covers (what
+    // browsers coalesce onto one h2 connection); anything else must use a fresh connection.
+    if origin.strict_host {
+        if let Some((cert_host, _)) = &origin.authority {
+            let covered = authority::named_hosts(req.uri(), req.headers())
+                .iter()
+                .all(|h| authority::covered_by_cert(cert_host, h));
+            if !covered {
+                debug!(
+                    "421 for {:?} on connection to {cert_host} from {}",
+                    req.uri().authority(),
+                    rctx.client_addr
+                );
+                return Ok(Response::builder()
+                    .status(StatusCode::MISDIRECTED_REQUEST)
+                    .body(full_body(Bytes::from_static(b"Misdirected Request")))
+                    .expect("static response"));
+            }
+        }
+    }
 
     #[cfg(feature = "websockets")]
     if shared.enable_websockets && crate::websocket::is_websocket_upgrade(req.headers()) {

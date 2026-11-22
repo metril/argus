@@ -60,6 +60,9 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
             enable_http2: false,
             transparent_port: None,
             tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },
@@ -118,7 +121,11 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
     // Generic class-hiding rule (delivered via the dynamic class/id path).
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["##.sponsored\n".to_string()]));
-    let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+    let ctx = Arc::new(
+        ProxyContext::new(engine, reqwest::Client::new(), true).with_policy(Arc::new(
+            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+        )),
+    );
 
     let proxy_port = spawn_proxy(ctx).await;
 
@@ -177,7 +184,11 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["||blocked.test^\n".to_string()]));
 
-    let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+    let ctx = Arc::new(
+        ProxyContext::new(engine, reqwest::Client::new(), true).with_policy(Arc::new(
+            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+        )),
+    );
 
     // Real proxy server.
     let proxy_port = spawn_proxy(ctx).await;

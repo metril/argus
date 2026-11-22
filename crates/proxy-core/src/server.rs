@@ -8,6 +8,7 @@ use crate::{
     load_manager::{AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig},
     mitm::MitmHandler,
     passthrough::PassthroughList,
+    policy::{ClientAcl, DestPolicy},
     transparent::{
         KernelOriginalDst, OriginalDst, TransparentEntry, KERNEL_ORIGINAL_DST_SUPPORTED,
     },
@@ -28,11 +29,16 @@ pub struct ProxyServer {
     /// Original-destination source for the transparent listener. Code-only (never from config);
     /// `None` means the kernel's `SO_ORIGINAL_DST`.
     original_dst: Option<Arc<dyn OriginalDst>>,
+    /// Who may connect (checked at accept, before any parsing).
+    client_acl: Arc<ClientAcl>,
 }
 
 impl ProxyServer {
     /// Create a new proxy server with the given configuration and filtering context.
     pub fn new(config: ProxyConfig, ctx: Arc<ProxyContext>) -> Result<Self> {
+        // Reject invalid CIDR lists at startup instead of silently ignoring entries.
+        DestPolicy::from_config(&config)?;
+        let client_acl = Arc::new(ClientAcl::new(&config.proxy.allowed_clients)?);
         ctx.set_request_timeout(std::time::Duration::from_secs(
             config.performance.request_timeout_secs,
         ));
@@ -83,6 +89,7 @@ impl ProxyServer {
             load_manager,
             ctx,
             original_dst: None,
+            client_acl,
         })
     }
 
@@ -156,6 +163,25 @@ impl ProxyServer {
             .map(|a| a.to_string())
             .unwrap_or_default();
         info!("Proxy server listening on {}", addr);
+
+        // Tell the destination policy which listeners are the proxy's own (loop protection).
+        let mut own_ports: Vec<u16> = Vec::new();
+        let mut own_addrs: Vec<std::net::IpAddr> = Vec::new();
+        for l in std::iter::once(&listener).chain(transparent.as_ref()) {
+            if let Ok(a) = l.local_addr() {
+                own_ports.push(a.port());
+                own_addrs.push(a.ip());
+            }
+        }
+        if self.config.webui.enabled {
+            own_ports.push(self.config.webui.port);
+            if let Ok(ip) = self.config.webui.host.parse() {
+                own_addrs.push(ip);
+            }
+        }
+        own_ports.sort_unstable();
+        own_ports.dedup();
+        self.ctx.policy().set_own_listeners(&own_ports, &own_addrs);
         info!("HTTP/2: {}", self.config.proxy.enable_http2);
         info!("WebSockets: {}", self.config.proxy.enable_websockets);
         info!("MITM: {}", self.config.mitm.enabled);
@@ -182,11 +208,15 @@ impl ProxyServer {
             passthrough: PassthroughList::new(&self.config.proxy.tls_passthrough_hosts),
             #[cfg(feature = "websockets")]
             ws: if self.config.proxy.enable_websockets {
-                Some(Arc::new(crate::websocket::WsUpstream::new(
-                    &self.config.proxy.extra_upstream_ca_paths,
-                    self.ctx.resolve_all_to(),
-                    timeouts.handshake,
-                )?))
+                Some(Arc::new(
+                    crate::websocket::WsUpstream::new(
+                        &self.config.proxy.extra_upstream_ca_paths,
+                        self.ctx.policy().clone(),
+                        self.ctx.resolve_all_to(),
+                        timeouts.handshake,
+                    )?
+                    .with_lifecycle(timeouts.tunnel_idle, shutdown_tx.clone()),
+                ))
             } else {
                 None
             },
@@ -203,12 +233,11 @@ impl ProxyServer {
                         ))
                     }
                 };
-                let mut own_ports: Vec<u16> = [listener.local_addr(), t.local_addr()]
+                let own_ports: Vec<u16> = [listener.local_addr(), t.local_addr()]
                     .into_iter()
                     .flatten()
                     .map(|a| a.port())
                     .collect();
-                own_ports.dedup();
                 info!(
                     "Transparent listener on {}",
                     t.local_addr().map(|a| a.to_string()).unwrap_or_default()
@@ -257,6 +286,12 @@ impl ProxyServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, client_addr)) => {
+                            // Access control first: nothing from a disallowed source is read.
+                            if !self.client_acl.allows(client_addr.ip()) {
+                                debug!("Connection from {} refused: not an allowed client", client_addr);
+                                drop(stream);
+                                continue;
+                            }
                             // Check if connection should be admitted
                             match self.load_manager.check_admission() {
                                 AdmissionResult::Admitted => {

@@ -31,9 +31,14 @@ pub async fn connect_ws(proxy: &TestProxy, host: &str, port: u16, path: &str) ->
     ws
 }
 
-/// `wss://host:port/path` through the proxy's TLS interception (client trusts only the proxy
+/// A TLS session with the proxy's interception for `host:port` (client trusts only the proxy
 /// CA): CONNECT first in explicit mode, straight to the transparent listener otherwise.
-pub async fn connect_wss(proxy: &TestProxy, host: &str, port: u16, path: &str) -> WsStream {
+pub async fn tls_via_proxy(
+    proxy: &TestProxy,
+    host: &str,
+    port: u16,
+    alpn: &[&[u8]],
+) -> tokio_rustls::client::TlsStream<TcpStream> {
     crate::init_crypto();
     let mut tcp = TcpStream::connect(proxy.entry_addr())
         .await
@@ -63,12 +68,17 @@ pub async fn connect_wss(proxy: &TestProxy, host: &str, port: u16, path: &str) -
     let mut cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    cfg.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let name = ServerName::try_from(host.to_string()).expect("server name");
-    let tls = TlsConnector::from(Arc::new(cfg))
+    TlsConnector::from(Arc::new(cfg))
         .connect(name, tcp)
         .await
-        .expect("tls to proxy");
+        .expect("tls to proxy")
+}
+
+/// `wss://host:port/path` through the proxy's TLS interception.
+pub async fn connect_wss(proxy: &TestProxy, host: &str, port: u16, path: &str) -> WsStream {
+    let tls = tls_via_proxy(proxy, host, port, &[b"http/1.1"]).await;
     let io: Box<dyn Io> = Box::new(tls);
     let (ws, resp) = client_async(format!("wss://{host}:{port}{path}"), io)
         .await

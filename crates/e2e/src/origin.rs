@@ -121,10 +121,12 @@ impl SniResolver {
         params.subject_alt_names = if let Ok(ip) = name.parse::<IpAddr>() {
             vec![SanType::IpAddress(ip)]
         } else if name == "localhost" {
-            // Clients dialing an IP literal send no SNI; cover loopback too.
+            // Clients dialing an IP literal send no SNI; cover loopback and the public-looking
+            // test literal too.
             vec![
                 SanType::DnsName(name.try_into().expect("dns name")),
                 SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                SanType::IpAddress(crate::PUBLIC_TEST_IP.parse().expect("test ip")),
             ]
         } else {
             vec![SanType::DnsName(name.try_into().expect("dns name"))]

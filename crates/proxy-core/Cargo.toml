@@ -60,6 +60,9 @@ async-trait = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
 
+# CIDR matching for the destination policy and client ACL
+ipnet = "2.9"
+
 # Caching
 moka = { workspace = true }
 
@@ -93,6 +96,10 @@ web-api = { path = "../web-api", optional = true }
 
 # Filter-list service (always on — loads, compiles and refreshes the rules)
 list-service = { path = "../list-service" }
+
+[target.'cfg(unix)'.dependencies]
+# getifaddrs: the proxy host's own interface addresses (destination policy).
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # SO_ORIGINAL_DST / IP6T_SO_ORIGINAL_DST for transparent mode.

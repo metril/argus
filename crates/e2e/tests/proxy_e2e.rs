@@ -180,7 +180,7 @@ e2e_test!(
                 "GET /h HTTP/1.1\r\nHost: route.test\r\nConnection: close\r\n\r\n".to_string(),
                 "route.test",
             ),
-            ("GET /h HTTP/1.0\r\n\r\n".to_string(), "127.0.0.1"),
+            ("GET /h HTTP/1.0\r\n\r\n".to_string(), "203.0.113.7"),
         ] {
             let mut tcp = tokio::net::TcpStream::connect(env.proxy.entry_addr())
                 .await

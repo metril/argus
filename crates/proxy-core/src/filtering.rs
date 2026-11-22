@@ -8,18 +8,20 @@
 //! block / `$redirect` resource / `$removeparam` rewrite -> stream upstream -> `$csp` header and
 //! cosmetic injection on the way back.
 
+use crate::authority;
 use crate::inject::{build_payload, full_body, inject_body, passthrough_body, ProxyBody};
+use crate::policy::{is_refusal, DestPolicy};
 use crate::redirect::{block_response, redirect_response, rewrite_redirect};
 use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url, RequestType};
-use crate::upstream::{build_upstream_client, UpstreamOptions};
+use crate::upstream::{build_strict_upstream_client, build_upstream_client, UpstreamOptions};
 use crate::{Error, Result};
 use bytes::Bytes;
 use filter_engine::SharedEngine;
 use futures_util::TryStreamExt;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body, Incoming};
-use hyper::header::{HeaderName, CONTENT_TYPE, HOST};
+use hyper::header::{HeaderMap, HeaderName, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HOST};
 use hyper::{Request, Response, StatusCode};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,10 +45,83 @@ const HOP_BY_HOP: &[&str] = &[
 /// Default cap on time-to-response-headers for an upstream call (includes uploading the body).
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
+/// Largest `/__adblock__/cc` request body accepted.
+const MAX_INTERNAL_BODY: usize = 64 * 1024;
+
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP
         .iter()
         .any(|h| name.as_str().eq_ignore_ascii_case(h))
+}
+
+/// Headers named by the `Connection` header (hop-by-hop for this hop only, RFC 9110 §7.6.1).
+fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|t| HeaderName::from_bytes(t.trim().as_bytes()).ok())
+        .collect()
+}
+
+/// Encodings the HTML injector can decode.
+fn injector_can_decode(token: &str) -> bool {
+    ["gzip", "x-gzip", "br", "deflate", "identity"]
+        .iter()
+        .any(|e| token.eq_ignore_ascii_case(e))
+}
+
+/// `Accept-Encoding` restricted to what the injector can decode (entries keep their q-values);
+/// `None` when the client sent none. Falls back to `identity` when nothing is left.
+fn restricted_accept_encoding(headers: &HeaderMap) -> Option<String> {
+    if !headers.contains_key(ACCEPT_ENCODING) {
+        return None;
+    }
+    let kept: Vec<&str> = headers
+        .get_all(ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|e| injector_can_decode(e.split(';').next().unwrap_or("").trim()))
+        .collect();
+    Some(if kept.is_empty() {
+        "identity".to_string()
+    } else {
+        kept.join(", ")
+    })
+}
+
+/// Whether the response body can be decoded by the injector: no encoding, or exactly one of the
+/// supported ones (stacked encodings are not).
+fn response_encoding_supported(headers: &HeaderMap) -> bool {
+    let mut tokens = headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .map(|v| v.to_str().ok())
+        .flat_map(|v| {
+            v.unwrap_or("?")
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>()
+        })
+        .filter(|t| !t.is_empty());
+    match (tokens.next(), tokens.next()) {
+        (None, _) => true,
+        (Some(t), None) => injector_can_decode(t),
+        _ => false,
+    }
+}
+
+/// The 403 answer for a destination the policy refuses.
+pub fn refused_response() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("x-adblock", "destination-refused")
+        .header("cache-control", "no-store")
+        .body(full_body(Bytes::from_static(b"Destination refused")))
+        .expect("static response")
 }
 
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
@@ -60,6 +135,10 @@ pub struct ProxyContext {
     /// Code-only upstream dial override (tests/controlled setups); shared by the HTTP client and
     /// the WebSocket dialer. Never read from config.
     resolve_all_to: Option<IpAddr>,
+    /// Destination policy for every upstream dial.
+    policy: Arc<DestPolicy>,
+    /// Client for requests aimed at the proxy's own ports (see [`build_strict_upstream_client`]).
+    strict_client: reqwest::Client,
 }
 
 impl ProxyContext {
@@ -72,6 +151,8 @@ impl ProxyContext {
         let default_ctx = RequestCtx::anonymous(default_profile_slot(engine.clone()));
         Self {
             engine,
+            strict_client: client.clone(),
+            policy: Arc::default(),
             client,
             default_ctx,
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
@@ -88,8 +169,21 @@ impl ProxyContext {
     ) -> Result<Self> {
         let client = build_upstream_client(opts)?;
         let mut ctx = Self::new(engine, client, adblock_enabled);
+        ctx.strict_client = build_strict_upstream_client(opts)?;
+        ctx.policy = opts.policy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
         Ok(ctx)
+    }
+
+    /// Replace the destination policy (for contexts built from a ready-made client).
+    pub fn with_policy(mut self, policy: Arc<DestPolicy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// The destination policy every upstream dial is checked against.
+    pub fn policy(&self) -> &Arc<DestPolicy> {
+        &self.policy
     }
 
     /// The upstream dial override, if any (code-only).
@@ -194,19 +288,14 @@ impl ProxyContext {
             return Ok(self.handle_internal(req, &uri, rctx).await);
         }
 
-        // Resolve target host/port from absolute-form URI, Host header, or the MITM fallback.
-        let host = uri
-            .host()
-            .map(|h| h.to_string())
-            .or_else(|| {
-                headers
-                    .get(HOST)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|h| h.split(':').next().unwrap_or(h).to_string())
-            })
-            .or_else(|| fallback_authority.as_ref().map(|(h, _)| h.clone()));
-
-        let host = match host {
+        // Target host/port: absolute-form URI / `:authority`, else the `Host` header, else the
+        // MITM fallback. Authorities are parsed properly (bracketed IPv6, userinfo rejected).
+        let named = authority::of_request(&uri, &headers);
+        let host = match named
+            .as_ref()
+            .map(|(h, _)| h.clone())
+            .or_else(|| fallback_authority.as_ref().map(|(h, _)| h.clone()))
+        {
             Some(h) => h,
             None => return Ok(bad_request("Missing host")),
         };
@@ -216,8 +305,9 @@ impl ProxyContext {
         let port = fallback_authority
             .as_ref()
             .map(|(_, p)| *p)
-            .or_else(|| uri.port_u16())
+            .or(named.as_ref().and_then(|(_, p)| *p))
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
+        let url_host = authority::url_host(&host);
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -228,7 +318,7 @@ impl ProxyContext {
         {
             uri.to_string()
         } else {
-            format!("{scheme}://{host}:{port}{path_and_query}")
+            format!("{scheme}://{url_host}:{port}{path_and_query}")
         };
 
         // Filter decision. The profile guard is dropped before any `.await`.
@@ -266,18 +356,56 @@ impl ProxyContext {
         let has_body = !req.body().is_end_stream();
         let body = req.into_body();
 
-        let mut rb = self.client.request(method, &url);
+        // Destination policy. reqwest skips its resolver for IP-literal hosts, so literals are
+        // judged here; names are judged on what they resolve to, inside the client's resolver.
+        if let Err(r) = self.policy.check_literal(&host, port) {
+            debug!("Refused destination {host}:{port}: {r}");
+            return Ok(refused_response());
+        }
+        let client = if self.policy.is_own_port(port) {
+            &self.strict_client
+        } else {
+            &self.client
+        };
+
+        let listed = connection_listed(&headers);
+        let restrict_encoding = rtype.is_frame();
+        // Code-only resolve override: reqwest never resolves IP literals, so aim those at the
+        // override explicitly (the policy has already judged the requested literal) and keep the
+        // original authority in `Host`.
+        let mut dial_url = url.clone();
+        let mut host_override = None;
+        if let (Some(over), Ok(_)) = (self.resolve_all_to, host.parse::<IpAddr>()) {
+            if let Ok(mut u) = reqwest::Url::parse(&url) {
+                if u.set_ip_host(over).is_ok() {
+                    dial_url = u.to_string();
+                    host_override = Some(format!("{url_host}:{port}"));
+                }
+            }
+        }
+        let mut rb = client.request(method, &dial_url);
+        if let Some(h) = host_override {
+            rb = rb.header(HOST, h);
+        }
         for (name, value) in headers.iter() {
             // reqwest sets Host itself; don't forward hop-by-hop headers. Content-Length is only
             // kept for streamed bodies (it keeps the upload un-chunked); reqwest derives it
             // otherwise.
             if is_hop_by_hop(name)
+                || listed.contains(name)
                 || name == HOST
+                || (restrict_encoding && name == ACCEPT_ENCODING)
                 || (!has_body && name.as_str().eq_ignore_ascii_case("content-length"))
             {
                 continue;
             }
             rb = rb.header(name, value);
+        }
+        // Documents may be injected: only ask for encodings the injector can decode.
+        if restrict_encoding {
+            if let Some(v) = restricted_accept_encoding(&headers) {
+                rb = rb.header(ACCEPT_ENCODING, v);
+            }
         }
         if has_body {
             let stream = body
@@ -288,10 +416,10 @@ impl ProxyContext {
 
         let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);
         let sent = if timeout_ms == 0 {
-            rb.send().await.map_err(|e| e.to_string())
+            rb.send().await
         } else {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), rb.send()).await {
-                Ok(r) => r.map_err(|e| e.to_string()),
+                Ok(r) => r,
                 Err(_) => {
                     warn!("Upstream timeout for {url}");
                     return Ok(status_response(
@@ -303,6 +431,10 @@ impl ProxyContext {
         };
         let resp = match sent {
             Ok(r) => r,
+            Err(e) if is_refusal(&e) => {
+                debug!("Refused destination {host}:{port} (resolved): {e}");
+                return Ok(refused_response());
+            }
             Err(e) => {
                 warn!("Upstream error for {}: {}", url, e);
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
@@ -324,7 +456,8 @@ impl ProxyContext {
             && status.as_u16() >= 200
             && status != StatusCode::NO_CONTENT
             && status != StatusCode::NOT_MODIFIED;
-        let payload = if is_html && body_allowed {
+        // A body the injector cannot decode (zstd, stacked encodings) is passed through untouched.
+        let payload = if is_html && body_allowed && response_encoding_supported(&resp_headers) {
             let profile = rctx.profile.load();
             if profile.engine.is_enabled() {
                 let cos = profile.engine.cosmetic_for(&url);
@@ -342,11 +475,17 @@ impl ProxyContext {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
+        let listed_resp = connection_listed(&resp_headers);
         let mut builder = Response::builder().status(status);
         for (name, value) in resp_headers.iter() {
-            // Always drop Content-Length (bodies are streamed/chunked). For injected HTML we also
-            // drop Content-Encoding because the body is re-emitted as identity.
-            if is_hop_by_hop(name) || name.as_str().eq_ignore_ascii_case("content-length") {
+            // Content-Length is kept (HEAD and 304 answers must report the origin's length, and
+            // passed-through bodies are byte-identical); it is dropped only for injected HTML,
+            // whose length changes. That body also drops Content-Encoding: it is re-emitted as
+            // identity.
+            if is_hop_by_hop(name)
+                || listed_resp.contains(name)
+                || (inject && name == hyper::header::CONTENT_LENGTH)
+            {
                 continue;
             }
             // Never advertise HTTP/3 (QUIC bypasses the proxy): clients keep using TCP.
@@ -368,6 +507,8 @@ impl ProxyContext {
 
         let body = match payload {
             Some(p) => inject_body(resp, p, content_encoding.as_deref()),
+            // HEAD / 204 / 304 never carry a body, whatever the origin's length header says.
+            None if !body_allowed => full_body(Bytes::new()),
             None => passthrough_body(resp),
         };
 
@@ -384,8 +525,17 @@ impl ProxyContext {
         rctx: &RequestCtx,
     ) -> Response<ProxyBody> {
         if uri.path() == "/__adblock__/cc" && req.method() == hyper::Method::POST {
-            let bytes = match req.into_body().collect().await {
+            let bytes = match Limited::new(req.into_body(), MAX_INTERNAL_BODY)
+                .collect()
+                .await
+            {
                 Ok(c) => c.to_bytes(),
+                Err(e)
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some() =>
+                {
+                    return status_response(StatusCode::PAYLOAD_TOO_LARGE, "Body too large")
+                }
                 Err(_) => return bad_request("body"),
             };
             #[derive(serde::Deserialize)]

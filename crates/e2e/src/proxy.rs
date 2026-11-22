@@ -86,7 +86,18 @@ impl TestProxy {
         passthrough: &[&str],
     ) -> Result<Self, String> {
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-        Self::start_in_with(mode, origin, rules, passthrough, dir).await
+        Self::start_in_with(mode, origin, rules, passthrough, dir, &|_| {}).await
+    }
+
+    /// Like [`Self::start`], letting `tweak` edit the proxy configuration first.
+    pub async fn start_tweaked(
+        mode: EntryMode,
+        origin: &TestOrigin,
+        rules: &[&str],
+        tweak: &dyn Fn(&mut ProxyConfig),
+    ) -> Result<Self, String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        Self::start_in_with(mode, origin, rules, &[], dir, tweak).await
     }
 
     /// Like [`Self::start`] but on an existing data dir, so a second proxy picks up the CA the
@@ -97,7 +108,7 @@ impl TestProxy {
         rules: &[&str],
         dir: tempfile::TempDir,
     ) -> Result<Self, String> {
-        Self::start_in_with(mode, origin, rules, &[], dir).await
+        Self::start_in_with(mode, origin, rules, &[], dir, &|_| {}).await
     }
 
     async fn start_in_with(
@@ -106,6 +117,7 @@ impl TestProxy {
         rules: &[&str],
         passthrough: &[&str],
         dir: tempfile::TempDir,
+        tweak: &dyn Fn(&mut ProxyConfig),
     ) -> Result<Self, String> {
         crate::init_crypto();
 
@@ -114,13 +126,16 @@ impl TestProxy {
         let origin_ca_path = dir.path().join("origin-ca.crt");
         std::fs::write(&origin_ca_path, origin.ca_pem()).map_err(|e| e.to_string())?;
 
-        let config = ProxyConfig {
+        let mut config = ProxyConfig {
             proxy: ProxySettings {
                 host: "127.0.0.1".into(),
                 port: 0,
                 enable_http2: true,
                 transparent_port: (mode == EntryMode::Transparent).then_some(0),
                 tls_passthrough_hosts: passthrough.iter().map(|s| s.to_string()).collect(),
+                block_private_destinations: false,
+                allowed_destinations: Vec::new(),
+                allowed_clients: proxy_core::config::default_allowed_clients(),
                 enable_websockets: true,
                 extra_upstream_ca_paths: vec![origin_ca_path],
             },
@@ -148,6 +163,8 @@ impl TestProxy {
             webui: WebUiSettings::default(),
         };
 
+        tweak(&mut config);
+
         let engine = Arc::new(SharedEngine::new());
         engine.set_enabled(true);
         let lines: Vec<String> = rules.iter().map(|r| format!("{r}\n")).collect();
@@ -164,10 +181,12 @@ impl TestProxy {
             )
             .map_err(|e| e.to_string())?,
         );
-        let lo = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // A public-looking address (TEST-NET-3): the destination policy refuses loopback, and the
+        // dial is redirected to the origin by the resolve override anyway.
+        let fake = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
         let dst = Arc::new(TestDst {
-            https: SocketAddr::new(lo, origin.https_port()),
-            http: SocketAddr::new(lo, origin.http_port()),
+            https: SocketAddr::new(fake, origin.https_port()),
+            http: SocketAddr::new(fake, origin.http_port()),
             forced: Mutex::new(None),
         });
         let server = ProxyServer::new(config, ctx.clone())

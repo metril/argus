@@ -30,7 +30,7 @@ e2e_test!(wss_echo_via_mitm, rules = [], |env| {
 // (see `no_sni_tls_passes_through_untouched`).
 e2e_test!(connect_to_ip_literal, rules = [], explicit_only, |env| {
     env.origin.route("/ip", MockResponse::ok("ip-ok"));
-    let url = env.origin.https_url("127.0.0.1", "/ip");
+    let url = env.origin.https_url(e2e::PUBLIC_TEST_IP, "/ip");
     let resp = env.client_with(HttpVersion::Http1).get(&url).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ip-ok");
