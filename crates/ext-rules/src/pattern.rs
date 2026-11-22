@@ -261,17 +261,15 @@ impl Glob {
     }
 
     fn matches(&self, u: &[u8], host: (usize, usize)) -> bool {
-        let free_first = self.lead_star || self.anchor == Anchor::None;
+        let (hs, he) = host;
         match self.anchor {
-            _ if free_first => self.match_from(u, 0, true),
-            Anchor::Url => self.match_from(u, 0, false),
-            Anchor::Host => {
-                let (hs, he) = host;
-                (hs..he.max(hs))
-                    .filter(|&i| i == hs || u[i - 1] == b'.')
-                    .any(|s| self.match_from(u, s, false))
-            }
-            Anchor::None => unreachable!(),
+            Anchor::None => self.match_from(u, 0, true),
+            Anchor::Url => self.match_from(u, 0, self.lead_star),
+            // `||*...`: free scan, but only from the start of the host.
+            Anchor::Host if self.lead_star => self.match_from(u, hs, true),
+            Anchor::Host => (hs..he.max(hs))
+                .filter(|&i| i == hs || u[i - 1] == b'.')
+                .any(|s| self.match_from(u, s, false)),
         }
     }
 }
