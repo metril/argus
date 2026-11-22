@@ -88,6 +88,19 @@ async fn main() -> Result<()> {
         info!("Userscripts disabled: scripts are managed but never injected");
     }
 
+    // Script control: rules live in the shared database; the proxy path reads a compiled snapshot
+    // that is rebuilt on every edit and when a temporary grant expires.
+    let policy_store = Arc::new(script_policy::store::PolicyStore::new(
+        common::db::Db::open(&config.adblock.data_dir)
+            .map_err(|e| Error::Config(format!("Failed to open database: {e}")))?,
+    ));
+    let script_control = proxy_core::scriptctl::ScriptControl::new(
+        policy_store.clone(),
+        script_policy::DEFAULT_PROFILE,
+    );
+    script_control.spawn_expiry();
+    ctx.set_script_control(Some(script_control));
+
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
     let webui_handle = if config.webui.enabled {
@@ -101,6 +114,7 @@ async fn main() -> Result<()> {
                 userscript_manager
                     .clone()
                     .expect("manager exists when the web UI is enabled"),
+                policy_store.clone(),
             )
             .await?,
         )
@@ -141,9 +155,10 @@ async fn start_webui_server(
     list_service: Arc<ListService>,
     request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
     userscript_manager: Arc<userscript_engine::UserscriptManager>,
+    policy_store: Arc<script_policy::store::PolicyStore>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use userscript_engine::UserscriptRuntime;
-    use web_api::{build_state, start_server, ApiConfig};
+    use web_api::{build_state_with_policy, start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
 
@@ -202,7 +217,7 @@ async fn start_webui_server(
     };
 
     // Build the application state
-    let state = build_state(
+    let state = build_state_with_policy(
         api_config.clone(),
         config.clone(),
         shared_engine,
@@ -212,6 +227,7 @@ async fn start_webui_server(
         userscript_runtime,
         config_path.into(),
         request_timeout_ms,
+        Some(policy_store),
     )
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;

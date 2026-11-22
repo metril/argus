@@ -14,7 +14,7 @@ use crate::ext;
 use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody};
 use crate::internal::Internal;
 use crate::policy::{is_refusal, DestPolicy};
-use crate::redirect::{block_response, redirect_response, rewrite_redirect};
+use crate::redirect::{block_response, policy_block_response, redirect_response, rewrite_redirect};
 use crate::request_ctx::{default_profile_slot, Profile, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url, RequestType};
 use crate::rewrite::codec::{choose_encoding, response_codings};
@@ -145,7 +145,21 @@ impl ProxyContext {
         let slot = &self.default_ctx.profile;
         let cur = slot.load_full();
         slot.store(Arc::new(
-            Profile::new(cur.id, cur.generation, cur.engine.clone()).with_userscripts(manager),
+            Profile::new(cur.id, cur.generation, cur.engine.clone())
+                .with_userscripts(manager)
+                .with_script_control(cur.script_control.clone()),
+        ));
+    }
+
+    /// Attach the script control of the default profile (see [`crate::scriptctl`]). Live, like
+    /// [`Self::set_userscripts`].
+    pub fn set_script_control(&self, control: Option<Arc<crate::scriptctl::ScriptControl>>) {
+        let slot = &self.default_ctx.profile;
+        let cur = slot.load_full();
+        slot.store(Arc::new(
+            Profile::new(cur.id, cur.generation, cur.engine.clone())
+                .with_userscripts(cur.userscripts.clone())
+                .with_script_control(control),
         ));
     }
 
@@ -373,6 +387,9 @@ impl ProxyContext {
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
+                    if let Some(sc) = &profile.script_control {
+                        count_page_block(sc, source_url(&headers, &url, rtype));
+                    }
                     if let Some(res) = verdict.redirect_resource() {
                         return Ok(redirect_response(res));
                     }
@@ -400,6 +417,9 @@ impl ProxyContext {
                             let rule = idx.rule(id).map(|r| r.raw.clone()).unwrap_or_default();
                             debug!("Blocked {} by extended rule {}", url, rule);
                             let list = idx.rule(id).map(|r| r.list.clone());
+                            if let Some(sc) = &profile.script_control {
+                                count_page_block(sc, source_url(&headers, &url, rtype));
+                            }
                             engine.stats_handle().record_blocked(rtype.as_str(), &host);
                             engine.record_block(&filter_engine::BlockEvent {
                                 timestamp: chrono::Utc::now(),
@@ -423,6 +443,21 @@ impl ProxyContext {
                 }
                 if rtype.is_frame() {
                     csp = engine.csp_for(&url, source_url(&headers, &url, rtype), rtype.as_str());
+                }
+            }
+            // Script policy network hints: one atomic load when the master switch is off.
+            if let Some(sc) = profile.script_control.as_ref().filter(|sc| sc.enabled()) {
+                if sc
+                    .check_request(
+                        &headers,
+                        if scheme == "http" { "http" } else { "https" },
+                        &url_host,
+                        port,
+                    )
+                    .is_some()
+                {
+                    debug!("Blocked {} by script policy", url);
+                    return Ok(policy_block_response(rtype, &url));
                 }
             }
         }
@@ -518,6 +553,21 @@ impl ProxyContext {
         let mut resp = resp;
         let resp_headers = std::mem::take(resp.headers_mut());
         let mut kind = classify_body(is_head, status, rtype, &resp_headers);
+        // Script policy applies to every HTML document, `no-transform` or not: it adds headers
+        // only, never rewrites a body the origin asked us to leave alone.
+        let spol: Option<Arc<crate::scriptctl::DocEntry>> =
+            if kind == BodyKind::Html && !is_head && status.as_u16() >= 200 {
+                rctx.profile.load().script_control.as_ref().and_then(|sc| {
+                    sc.document(
+                        if scheme == "http" { "http" } else { "https" },
+                        &url_host,
+                        port,
+                    )
+                })
+            } else {
+                None
+            };
+        let policy_nonce = spol.as_ref().map(|_| crate::inject::new_nonce());
         // `Cache-Control: no-transform`: no body rewriting at all (header edits still apply).
         if self.respect_no_transform.load(Ordering::Relaxed)
             && resp_headers
@@ -597,13 +647,15 @@ impl ProxyContext {
         let mut utf8_charset = false;
         let mut text_changed = false;
         let body: ProxyBody = match (kind, codings) {
-            (BodyKind::Html, Ok(codings)) if enabled && body_allowed => {
+            (BodyKind::Html, Ok(codings)) if (enabled || spol.is_some()) && body_allowed => {
                 let origin = csp::PageOrigin::new(
                     if scheme == "http" { "http" } else { "https" },
                     &url_host,
                     port,
                 );
-                let nonce = crate::inject::new_nonce();
+                let nonce = policy_nonce
+                    .clone()
+                    .unwrap_or_else(crate::inject::new_nonce);
                 let csp_headers: Vec<&str> = resp_headers
                     .get_all("content-security-policy")
                     .iter()
@@ -625,7 +677,7 @@ impl ProxyContext {
                 let ext_script = transforms.scripts.join(";\n");
                 // Userscripts: matched against the profile's index (one atomic load and an
                 // emptiness check when there are none); nothing at all under `sandbox`.
-                let us = if blocks_scripts {
+                let us = if blocks_scripts || !enabled {
                     None
                 } else {
                     rctx.profile.load().userscript_manager().and_then(|m| {
@@ -642,16 +694,20 @@ impl ProxyContext {
                     })
                 };
                 let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
-                let head = build_head(&PageSpec {
-                    userscripts: us_srcs,
-                    ext_script: &ext_script,
-                    cosmetics: &cos,
-                    internal: &self.internal,
-                    host: &host,
-                    nonce: &nonce,
-                    script_ok: !blocks_scripts,
-                    observer_ok: !opaque,
-                });
+                let head = if enabled {
+                    build_head(&PageSpec {
+                        userscripts: us_srcs,
+                        ext_script: &ext_script,
+                        cosmetics: &cos,
+                        internal: &self.internal,
+                        host: &host,
+                        nonce: &nonce,
+                        script_ok: !blocks_scripts,
+                        observer_ok: !opaque,
+                    })
+                } else {
+                    Default::default()
+                };
                 let needs = csp::Needs {
                     script: head.has_script,
                     style: head.has_style || us.as_ref().is_some_and(|p| p.style),
@@ -682,6 +738,7 @@ impl ProxyContext {
                     replacements: transforms.text_replacements.clone(),
                     element_filters: transforms.element_filters.clone(),
                     meta_csp,
+                    policy: spol.as_ref().and_then(|e| e.html.clone()),
                 };
                 // `$replace` & co. on a document run on the decoded text first; the HTML stages
                 // (removals, injections, cosmetics) then see the result.
@@ -856,7 +913,62 @@ impl ProxyContext {
                 }
             }
         }
+        if let Some(e) = &spol {
+            self.add_policy_headers(
+                &mut response,
+                e,
+                policy_nonce.as_deref().unwrap_or(""),
+                &host,
+            );
+        }
         Ok(response)
+    }
+
+    /// Add the generated policy as separate headers (never merged into the site's own: browsers
+    /// intersect, so it can only restrict). Runs after the extended-rule header edits so that
+    /// a `$removeheader` rule cannot strip it.
+    fn add_policy_headers(
+        &self,
+        response: &mut Response<ProxyBody>,
+        entry: &crate::scriptctl::DocEntry,
+        nonce: &str,
+        host: &str,
+    ) {
+        if let Some(c) = entry.csp_for(nonce, &self.internal.doc_token(host)) {
+            if let Ok(v) = HeaderValue::from_str(&c) {
+                response.headers_mut().append("content-security-policy", v);
+            }
+        }
+        if let Some(pp) = entry.permissions.as_deref() {
+            let site: Vec<String> = response
+                .headers()
+                .get_all("permissions-policy")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect();
+            let site_refs: Vec<&str> = site.iter().map(String::as_str).collect();
+            let merged = ext_rules::merge_permissions_policy(&site_refs, &[pp], &[]);
+            if let Ok(v) = HeaderValue::from_str(&merged) {
+                response.headers_mut().insert("permissions-policy", v);
+            }
+        }
+    }
+}
+
+/// Count a blocked request against the page named by `source` (a page URL).
+fn count_page_block(sc: &crate::scriptctl::ScriptControl, source: &str) {
+    let host = source
+        .split_once("://")
+        .map(|(_, r)| r)
+        .and_then(|r| r.split(['/', '?', '#']).next())
+        .map(|a| a.rsplit_once('@').map_or(a, |(_, h)| h))
+        .map(|a| {
+            a.rsplit_once(':')
+                .filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit()))
+                .map_or(a, |(h, _)| h)
+        });
+    if let Some(h) = host {
+        sc.count_blocked(h);
     }
 }
 

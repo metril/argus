@@ -96,7 +96,14 @@ pub struct TestProxy {
     shutdown: broadcast::Sender<()>,
     dir: Option<tempfile::TempDir>,
     userscripts: Mutex<Option<Arc<userscript_engine::UserscriptManager>>>,
+    script: Mutex<Option<ScriptHandles>>,
 }
+
+/// The script-policy store and the control attached to the proxy.
+pub type ScriptHandles = (
+    Arc<script_policy::store::PolicyStore>,
+    Arc<proxy_core::scriptctl::ScriptControl>,
+);
 
 impl TestProxy {
     /// Replace the installed rules (engine and extended-rule index swap as one generation).
@@ -196,6 +203,7 @@ impl TestProxy {
                 ..AdblockSettings::default()
             },
             userscripts: UserscriptSettings::default(),
+            script_control: Default::default(),
             webui: WebUiSettings::default(),
         };
 
@@ -265,6 +273,7 @@ impl TestProxy {
             shutdown,
             dir: Some(dir),
             userscripts: Mutex::new(None),
+            script: Mutex::new(None),
         })
     }
 
@@ -286,6 +295,32 @@ impl TestProxy {
         self.ctx.set_userscripts(Some(m.clone()));
         *g = Some(m.clone());
         m
+    }
+
+    /// The script-policy store and control of the default profile (created and attached on
+    /// first use, in a database inside the proxy's data dir). `clock` replaces the system clock.
+    pub fn script_control_with(&self, clock: Option<script_policy::store::Clock>) -> ScriptHandles {
+        let mut g = self.script.lock();
+        if let Some(h) = g.as_ref() {
+            return h.clone();
+        }
+        let dir = self.dir.as_ref().expect("data dir").path().join("pol");
+        let db = common::db::Db::open(&dir).expect("policy db");
+        let store = Arc::new(match clock {
+            Some(c) => script_policy::store::PolicyStore::with_clock(db, c),
+            None => script_policy::store::PolicyStore::new(db),
+        });
+        let control = proxy_core::scriptctl::ScriptControl::new(
+            store.clone(),
+            script_policy::DEFAULT_PROFILE,
+        );
+        self.ctx.set_script_control(Some(control.clone()));
+        *g = Some((store, control));
+        g.as_ref().expect("set").clone()
+    }
+
+    pub fn script_control(&self) -> ScriptHandles {
+        self.script_control_with(None)
     }
 
     /// Install `source` for the default profile (no dependencies; `@connect *` not approved).

@@ -32,6 +32,7 @@ pub mod redirect;
 pub mod request_ctx;
 pub mod request_type;
 pub mod rewrite;
+pub mod scriptctl;
 pub mod server;
 pub mod tls;
 pub mod transparent;

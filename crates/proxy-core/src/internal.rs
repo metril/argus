@@ -89,7 +89,14 @@ pub struct Internal {
     unsupported: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
     /// Userscript delivery and backend state.
     pub gm: Arc<crate::gm::GmHost>,
+    /// Policy-violation reports accepted so far per document (rate limit).
+    pv_counts: moka::sync::Cache<String, Arc<std::sync::atomic::AtomicU32>>,
 }
+
+/// Violation reports accepted per document.
+const PV_PER_DOC: u32 = 64;
+/// Largest violation report accepted.
+const PV_MAX_BODY: usize = 8 * 1024;
 
 impl Default for Internal {
     fn default() -> Self {
@@ -109,7 +116,176 @@ impl Internal {
                 .build(),
             unsupported: Default::default(),
             gm: Arc::new(crate::gm::GmHost::new()),
+            pv_counts: moka::sync::Cache::builder()
+                .max_capacity(16_384)
+                .time_to_idle(Duration::from_secs(600))
+                .build(),
         }
+    }
+
+    /// Per-document token for the violation report endpoint: `exp.doc.mac`, bound to `host`.
+    pub fn doc_token(&self, host: &str) -> String {
+        let mut r = [0u8; 8];
+        rand::rngs::OsRng.fill_bytes(&mut r);
+        let doc: String = r.iter().map(|b| format!("{b:02x}")).collect();
+        let exp = now_secs() + TOKEN_TTL.as_secs();
+        format!("{exp:x}.{doc}.{}", self.mac(&format!("{host}\n{doc}"), exp))
+    }
+
+    /// Validate a [`Self::doc_token`]; returns the document id.
+    fn doc_token_valid<'a>(&self, token: &'a str, host: &str) -> Option<&'a str> {
+        let mut it = token.splitn(3, '.');
+        let (exp_hex, doc, mac) = (it.next()?, it.next()?, it.next()?);
+        let exp = u64::from_str_radix(exp_hex, 16).ok()?;
+        if exp < now_secs() || doc.len() != 16 || !doc.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let want = self.mac(&format!("{host}\n{doc}"), exp);
+        (want.len() == mac.len()
+            && want
+                .bytes()
+                .zip(mac.bytes())
+                .fold(0u8, |a, (x, y)| a | (x ^ y))
+                == 0)
+            .then_some(doc)
+    }
+
+    /// `POST /__adblock__/pv?d=<doc token>`: a browser `report-uri` report for the policy the
+    /// proxy added. Accepted only when the token is ours for this host, the report names that
+    /// host, and its `original-policy` is the very header we generated for the page (the site's
+    /// own policy is never forwarded). Bounded: 8 KiB, 64 reports per document.
+    async fn pv(
+        &self,
+        req: Request<Incoming>,
+        host: &str,
+        rctx: &crate::request_ctx::RequestCtx,
+    ) -> Response<ProxyBody> {
+        let deny = |s| plain(s, "no-store", "same-origin");
+        if req.method() != Method::POST {
+            return deny(StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let Some(sc) = rctx
+            .profile
+            .load()
+            .script_control
+            .clone()
+            .filter(|sc| sc.enabled())
+        else {
+            return deny(StatusCode::NOT_FOUND);
+        };
+        let h: &HeaderMap = req.headers();
+        if h.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site") {
+            return deny(StatusCode::FORBIDDEN);
+        }
+        let ctype_ok = h
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(|m| m.trim().to_ascii_lowercase())
+            .is_some_and(|m| {
+                matches!(
+                    m.as_str(),
+                    "application/csp-report" | "application/json" | "application/reports+json"
+                )
+            });
+        if !ctype_ok {
+            return deny(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        if h.get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > PV_MAX_BODY)
+        {
+            return deny(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let token = req
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("d=")))
+            .unwrap_or("")
+            .to_string();
+        let Some(doc) = self.doc_token_valid(&token, host).map(str::to_string) else {
+            return deny(StatusCode::FORBIDDEN);
+        };
+        let n = self
+            .pv_counts
+            .get_with(doc, || Arc::new(std::sync::atomic::AtomicU32::new(0)))
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n >= PV_PER_DOC {
+            return deny(StatusCode::TOO_MANY_REQUESTS);
+        }
+        let bytes = match Limited::new(req.into_body(), PV_MAX_BODY).collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return deny(StatusCode::PAYLOAD_TOO_LARGE),
+        };
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            #[serde(rename = "csp-report")]
+            r: Report,
+        }
+        #[derive(serde::Deserialize)]
+        struct Report {
+            #[serde(rename = "document-uri", default)]
+            document_uri: String,
+            #[serde(rename = "blocked-uri", default)]
+            blocked_uri: String,
+            #[serde(rename = "effective-directive", default)]
+            effective_directive: String,
+            #[serde(rename = "violated-directive", default)]
+            violated_directive: String,
+            #[serde(rename = "original-policy", default)]
+            original_policy: String,
+            #[serde(default)]
+            disposition: String,
+        }
+        let Ok(Wrap { r }) = serde_json::from_slice::<Wrap>(&bytes) else {
+            return deny(StatusCode::BAD_REQUEST);
+        };
+        let Some(u) = url::Url::parse(&r.document_uri)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+        else {
+            return deny(StatusCode::FORBIDDEN);
+        };
+        let same_host = u
+            .host_str()
+            .and_then(crate::authority::normalize_host)
+            .is_some_and(|h| h == host);
+        if !same_host {
+            return deny(StatusCode::FORBIDDEN);
+        }
+        let port = u.port_or_known_default().unwrap_or(443);
+        let ours = sc
+            .document(u.scheme(), &crate::authority::url_host(host), port)
+            .and_then(|e| e.csp.clone())
+            .is_some_and(|t| normalize_policy(&r.original_policy) == t);
+        if !ours {
+            // The site's own policy (or a stale copy of ours): not ours to report.
+            return deny(StatusCode::NO_CONTENT);
+        }
+        let effective = if r.effective_directive.is_empty() {
+            r.violated_directive
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            r.effective_directive
+        };
+        sc.store().record_violation(
+            sc.profile_name(),
+            &script_policy::CspViolation {
+                document_uri: r.document_uri,
+                effective_directive: effective,
+                blocked_uri: r.blocked_uri,
+                disposition: if r.disposition.is_empty() {
+                    "enforce".into()
+                } else {
+                    r.disposition
+                },
+            },
+        );
+        deny(StatusCode::NO_CONTENT)
     }
 
     /// Per-page token for the beacon, bound to `host` (name without port) and an expiry.
@@ -189,6 +365,9 @@ impl Internal {
     ) -> Response<ProxyBody> {
         let profile = rctx.profile.load_full();
         let engine: &SharedEngine = &profile.engine;
+        if req.uri().path() == format!("{}pv", crate::csp::INTERNAL_PREFIX) {
+            return self.pv(req, host, rctx).await;
+        }
         // Refused outright while ad blocking is off for the profile.
         if !engine.is_enabled() {
             return plain(StatusCode::NOT_FOUND, "no-store", "same-origin");
@@ -358,6 +537,34 @@ impl Internal {
             .header("cross-origin-resource-policy", "same-origin")
             .body(full_body(Bytes::from(json)))
             .expect("internal json response")
+    }
+}
+
+/// A reported policy with the per-document nonce and token replaced by the cache markers, so it
+/// can be compared with the cached header text.
+fn normalize_policy(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    let mut rest = p;
+    while let Some(i) = rest.find("'nonce-") {
+        out.push_str(&rest[..i + 7]);
+        let after = &rest[i + 7..];
+        let end = after.find('\'').unwrap_or(after.len());
+        out.push_str(crate::scriptctl::NONCE_MARK);
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    match out.find("/pv?d=") {
+        Some(i) => {
+            let tail = &out[i + 6..];
+            let end = tail.find([';', ' ']).unwrap_or(tail.len());
+            format!(
+                "{}{}{}",
+                &out[..i + 6],
+                crate::scriptctl::DOC_MARK,
+                &tail[end..]
+            )
+        }
+        None => out,
     }
 }
 

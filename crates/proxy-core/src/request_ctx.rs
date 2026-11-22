@@ -20,6 +20,10 @@ pub struct Profile {
     pub label: Arc<str>,
     /// Userscripts of this profile (live index, GM backend, token key). `None`: no userscripts.
     pub userscripts: Option<Arc<userscript_engine::UserscriptManager>>,
+    /// Script control of this profile (compiled policy, header cache, panel settings). `None`:
+    /// script control is not available; when present and its master switch is off, the request
+    /// path does one atomic load and nothing else.
+    pub script_control: Option<Arc<crate::scriptctl::ScriptControl>>,
 }
 
 impl Profile {
@@ -40,6 +44,7 @@ impl Profile {
             engine,
             label: Arc::from(id.to_string()),
             userscripts: None,
+            script_control: None,
         }
     }
 
@@ -49,6 +54,15 @@ impl Profile {
         manager: Option<Arc<userscript_engine::UserscriptManager>>,
     ) -> Self {
         self.userscripts = manager;
+        self
+    }
+
+    /// The same profile with script control attached.
+    pub fn with_script_control(
+        mut self,
+        control: Option<Arc<crate::scriptctl::ScriptControl>>,
+    ) -> Self {
+        self.script_control = control;
         self
     }
 

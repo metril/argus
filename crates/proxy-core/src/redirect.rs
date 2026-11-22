@@ -87,6 +87,17 @@ pub fn block_response(ty: RequestType, verdict: &MatchResult, url: &str) -> Resp
     b.body(full_body(body)).expect("static block response")
 }
 
+/// Response for a request the script policy refused: the shape of [`block_response`], tagged
+/// `x-adblock: policy`.
+pub fn policy_block_response(ty: RequestType, url: &str) -> Response<ProxyBody> {
+    let mut r = block_response(ty, &MatchResult::blocked("script-policy"), url);
+    r.headers_mut().insert(
+        "x-adblock",
+        hyper::header::HeaderValue::from_static("policy"),
+    );
+    r
+}
+
 /// Serve a `$redirect` resource in place of the original response.
 pub fn redirect_response(res: RedirectResource) -> Response<ProxyBody> {
     base(StatusCode::OK, "redirected")

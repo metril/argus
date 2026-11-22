@@ -12,6 +12,8 @@ proxy-core = { path = "../proxy-core", default-features = false, features = ["we
 filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
 userscript-engine = { path = "../userscript-engine" }
+script-policy = { path = "../script-policy", features = ["store"] }
+common = { path = "../common" }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

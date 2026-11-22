@@ -53,6 +53,15 @@ recent_blocked_keep_query = false
 # edits still apply). Many CDNs send it on everything; set false to rewrite those pages anyway.
 respect_no_transform = true
 
+[script_control]
+# NoScript-style script policy (rules and the master switch are managed in the dashboard / API;
+# off until enabled there). The in-page panel is opened with a hotkey and is read-only: changes are
+# confirmed on the reserved host below, which only the proxy answers.
+panel_enabled = true
+panel_host = "adblock.invalid"
+# Base URL of the dashboard the panel links to; empty derives it from [webui].
+dashboard_url = ""
+
 [webui]
 enabled = true
 host = "0.0.0.0"

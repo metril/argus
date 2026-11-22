@@ -80,6 +80,7 @@ fn test_custom_config() {
         },
         adblock: AdblockSettings::default(),
         userscripts: UserscriptSettings::default(),
+        script_control: Default::default(),
         webui: WebUiSettings::default(),
     };
 
