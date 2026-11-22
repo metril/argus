@@ -8,7 +8,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
-proxy-core = { path = "../proxy-core", default-features = false, features = ["websockets"] }
+proxy-core = { path = "../proxy-core", default-features = false, features = ["websockets", "webui"] }
+web-api = { path = "../web-api" }
+axum-test = "18"
+cookie = "0.18"
+toml = { workspace = true }
+chrono = { workspace = true }
+ipnet = { version = "2.9", features = ["serde"] }
 filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
 userscript-engine = { path = "../userscript-engine" }
