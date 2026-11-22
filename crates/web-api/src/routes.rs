@@ -114,7 +114,6 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(userscripts::delete_storage_value))
         .routes(routes!(
             userscripts::get_userscript,
-            userscripts::update_userscript,
             userscripts::uninstall_userscript
         ))
         .routes(routes!(userscripts::get_userscript_source))

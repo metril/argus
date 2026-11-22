@@ -31,6 +31,21 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct StoredPlan {
     pub plan: InstallPlan,
     pub fetched: Fetched,
+    /// Fingerprint of the installed script this plan updates (None for a new install).
+    pub base: Option<String>,
+}
+
+/// Identifies the installed script's source and assets, so a stale plan is refused.
+pub fn source_fingerprint(s: &Userscript) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.source.as_bytes());
+    for r in &s.assets.requires {
+        h.update(r.url.as_bytes());
+        h.update(r.content.as_bytes());
+    }
+    h.update([s.allow_connect_all as u8]);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl StoredPlan {
@@ -249,7 +264,11 @@ pub async fn build_plan(
 ) -> ApiResult<StoredPlan> {
     let plan = install::plan_install(&source, origin).map_err(invalid)?;
     let fetched = fetch_assets(state, &plan).await?;
-    Ok(StoredPlan { plan, fetched })
+    Ok(StoredPlan {
+        plan,
+        fetched,
+        base: None,
+    })
 }
 
 /// A pattern that matches (nearly) every site.
@@ -336,6 +355,8 @@ pub fn stage_update(
     now: chrono::DateTime<chrono::Utc>,
 ) -> ApiResult<CheckOutcome> {
     let id = script.id.as_str();
+    let mut up = up;
+    up.absorb_fetched(script, &fetched);
     let diff = up.diff.clone();
     let needs = diff.needs_reapproval();
     let new_version = up.new_version.clone();

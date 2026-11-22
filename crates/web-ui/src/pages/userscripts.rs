@@ -829,6 +829,7 @@ mod tests {
             name: None,
             status: s.into(),
             error: None,
+            pending_approval: false,
         };
         let resp = ImportUserscriptsResponse {
             results: vec![r("installed"), r("replaced"), r("skipped"), r("error")],

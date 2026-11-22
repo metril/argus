@@ -1426,6 +1426,10 @@
               "null"
             ]
           },
+          "pending_approval": {
+            "description": "Imported disabled / without approvals; enable it from the script's page.",
+            "type": "boolean"
+          },
           "status": {
             "description": "`installed`, `replaced`, `skipped` or `error`.",
             "type": "string"
@@ -2793,6 +2797,27 @@
         ],
         "type": "object"
       },
+      "PlanUpdateDto": {
+        "description": "What confirming the plan of an already installed script would change.",
+        "properties": {
+          "diff": {
+            "$ref": "#/components/schemas/UpdateDiffDto"
+          },
+          "is_newer": {
+            "type": "boolean"
+          },
+          "needs_reapproval": {
+            "description": "The change widens what the script can match, reach or run; confirming approves it.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "diff",
+          "needs_reapproval",
+          "is_newer"
+        ],
+        "type": "object"
+      },
       "PlanUserscriptRequest": {
         "description": "Start an install: exactly one of `source` or `url`.",
         "properties": {
@@ -3972,6 +3997,13 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "widened": {
+            "description": "Other widening: removed `@exclude`, dropped `@noframes`, injection mode, earlier\n`@run-at`, new or changed `@require`/`@resource`, changed required code.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -4226,18 +4258,6 @@
         },
         "type": "object"
       },
-      "UpdateUserscriptRequest": {
-        "description": "Update a userscript's source.",
-        "properties": {
-          "source": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "source"
-        ],
-        "type": "object"
-      },
       "UserInfo": {
         "description": "Safe user info (no sensitive data). `id`/`created_at`/`last_login` are wire\nstrings (UUID / RFC 3339).",
         "properties": {
@@ -4290,6 +4310,10 @@
       "UserscriptBundle": {
         "description": "Export / import bundle (JSON).",
         "properties": {
+          "approve": {
+            "description": "Import only: approve the bundle as written (enabled state and `@connect *` approvals).\nWithout it every imported script arrives disabled and unapproved.",
+            "type": "boolean"
+          },
           "format": {
             "type": "string"
           },
@@ -4406,6 +4430,17 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "update": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlanUpdateDto",
+                "description": "Set when the script is already installed: confirming replaces it with this plan."
+              }
+            ]
           },
           "version": {
             "type": [
@@ -11944,6 +11979,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptResponse"
+                }
+              }
+            },
+            "description": "Updated an installed script"
+          },
           "201": {
             "content": {
               "application/json": {
@@ -11978,7 +12023,7 @@
             "description": "Unknown or expired plan"
           },
           "409": {
-            "description": "Already installed"
+            "description": "The installed script changed since the plan"
           },
           "429": {
             "content": {
@@ -12253,98 +12298,6 @@
           }
         ],
         "summary": "Get one userscript.",
-        "tags": [
-          "userscripts"
-        ]
-      },
-      "put": {
-        "operationId": "update_userscript",
-        "parameters": [
-          {
-            "description": "Userscript id",
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateUserscriptRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UserscriptResponse"
-                }
-              }
-            },
-            "description": "Updated"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing, invalid, expired or revoked credentials"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing scope, or CSRF check failed"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Rate limit exceeded"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Internal error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": [
-              "scripts:write"
-            ]
-          },
-          {
-            "cookie_auth": [
-              "scripts:write"
-            ]
-          }
-        ],
-        "summary": "Replace a userscript's source.",
         "tags": [
           "userscripts"
         ]

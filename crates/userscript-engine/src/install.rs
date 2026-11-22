@@ -16,6 +16,7 @@ use chrono::Utc;
 use md5::Md5;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::{cmp::Ordering, collections::HashMap};
+
 use url::Url;
 
 pub const MAX_REQUIRES: usize = 32;
@@ -294,6 +295,11 @@ pub struct UpdateDiff {
     pub removed_matches: Vec<String>,
     pub removed_connect: Vec<String>,
     pub removed_grants: Vec<String>,
+    /// Other changes that widen where, when or with what code the script runs (removed
+    /// `@exclude`, dropped `@noframes`, injection mode, earlier `@run-at`, new or changed
+    /// `@require`/`@resource` URLs or integrity hashes, changed required code).
+    #[serde(default)]
+    pub widened: Vec<String>,
 }
 
 impl UpdateDiff {
@@ -301,8 +307,85 @@ impl UpdateDiff {
     pub fn needs_reapproval(&self) -> bool {
         !(self.added_matches.is_empty()
             && self.added_connect.is_empty()
-            && self.added_grants.is_empty())
+            && self.added_grants.is_empty()
+            && self.widened.is_empty())
     }
+}
+
+fn run_at_rank(r: crate::metadata::RunAt) -> u8 {
+    use crate::metadata::RunAt::*;
+    match r {
+        DocumentStart => 0,
+        DocumentBody => 1,
+        DocumentEnd => 2,
+        DocumentIdle => 3,
+        ContextMenu => 4,
+    }
+}
+
+fn sri_key(s: &[Sri]) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<_> = s
+        .iter()
+        .map(|x| (x.algo.clone(), x.digest.clone()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Non-capability changes that widen what the script can reach or run.
+fn widening(old: &UserscriptMetadata, new: &UserscriptMetadata) -> Vec<String> {
+    let mut w = Vec::new();
+    for (kind, o, n) in [
+        ("@exclude", &old.excludes, &new.excludes),
+        ("@exclude-match", &old.exclude_matches, &new.exclude_matches),
+    ] {
+        for x in o.iter().filter(|x| !n.contains(x)) {
+            w.push(format!("removed or changed {kind} {x}"));
+        }
+    }
+    if old.noframes && !new.noframes {
+        w.push("dropped @noframes: now runs in subframes".into());
+    }
+    if old.inject_into != new.inject_into {
+        w.push("@inject-into changed".into());
+    }
+    if old.sandbox != new.sandbox {
+        w.push("@sandbox changed".into());
+    }
+    let (mut a, mut b) = (old.run_in.clone(), new.run_in.clone());
+    a.sort();
+    b.sort();
+    if a != b {
+        w.push("@run-in changed".into());
+    }
+    if run_at_rank(new.run_at) < run_at_rank(old.run_at) {
+        w.push("@run-at moved earlier".into());
+    }
+    for r in &new.requires {
+        match old.requires.iter().find(|o| o.url == r.url) {
+            None => w.push(format!("new or changed @require {}", r.url)),
+            Some(o) if !o.sri.is_empty() && sri_key(&o.sri) != sri_key(&r.sri) => w.push(format!(
+                "integrity hash of @require {} changed or dropped",
+                r.url
+            )),
+            _ => {}
+        }
+    }
+    for r in &new.resources {
+        match old
+            .resources
+            .iter()
+            .find(|o| o.name == r.name && o.url == r.url)
+        {
+            None => w.push(format!("new or changed @resource {} {}", r.name, r.url)),
+            Some(o) if !o.sri.is_empty() && sri_key(&o.sri) != sri_key(&r.sri) => w.push(format!(
+                "integrity hash of @resource {} changed or dropped",
+                r.name
+            )),
+            _ => {}
+        }
+    }
+    w
 }
 
 fn set_diff(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
@@ -341,6 +424,7 @@ pub fn diff(old: &UserscriptMetadata, new: &UserscriptMetadata) -> UpdateDiff {
         removed_matches,
         removed_connect,
         removed_grants,
+        widened: widening(old, new),
     };
     let was_scoped = !(old.matches.is_empty() && old.includes.is_empty());
     if was_scoped && new.matches.is_empty() && new.includes.is_empty() {
@@ -358,6 +442,37 @@ pub struct UpdatePlan {
     pub new_version: Option<String>,
     /// The new version is newer per [`is_newer`].
     pub is_newer: bool,
+}
+
+impl UpdatePlan {
+    /// Fold what the fetch revealed into the diff: an `@require` without a pinned hash whose
+    /// downloaded content differs from what was approved (or that was never approved) is code
+    /// the user has not seen, so the update needs re-approval. Pinned ones are covered by SRI.
+    pub fn absorb_fetched(&mut self, installed: &Userscript, fetched: &Fetched) {
+        let h = |b: &[u8]| {
+            let b = b.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(b);
+            Sha256::digest(b).to_vec()
+        };
+        for r in &self.plan.requires {
+            if !r.sri.is_empty() {
+                continue;
+            }
+            let Some(new) = fetched.requires.get(r.url.as_str()) else {
+                continue;
+            };
+            let approved = installed
+                .assets
+                .requires
+                .iter()
+                .find(|a| a.url == r.url.as_str())
+                .map(|a| h(a.content.as_bytes()));
+            if approved.as_deref() != Some(h(new).as_slice()) {
+                self.diff
+                    .widened
+                    .push(format!("@require {} content changed", r.url));
+            }
+        }
+    }
 }
 
 /// Plan an update of `installed` to `new_source`. The script identity (name+namespace) must match.
@@ -684,5 +799,202 @@ mod tests {
         )
         .unwrap();
         assert!(update_check_url(&m).is_none()); // no @version: never auto-updated
+    }
+
+    fn installed(extra: &str, fetched: Fetched) -> Userscript {
+        finish_install(
+            plan_install(&src("1", extra), None).unwrap(),
+            fetched,
+            Approvals::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn non_capability_widening_needs_reapproval() {
+        let base = "// @match https://a.com/*\n// @exclude https://a.com/admin/*\n// @noframes\n// @run-at document-end\n// @inject-into content\n// @grant none";
+        let old = installed(base, Fetched::default());
+        let cases = [
+            ("dropped @exclude", "// @match https://a.com/*\n// @noframes\n// @run-at document-end\n// @inject-into content\n// @grant none"),
+            ("narrowed @exclude", "// @match https://a.com/*\n// @exclude https://a.com/adm/*\n// @noframes\n// @run-at document-end\n// @inject-into content\n// @grant none"),
+            ("dropped @noframes", "// @match https://a.com/*\n// @exclude https://a.com/admin/*\n// @run-at document-end\n// @inject-into content\n// @grant none"),
+            ("inject-into", "// @match https://a.com/*\n// @exclude https://a.com/admin/*\n// @noframes\n// @run-at document-end\n// @inject-into page\n// @grant none"),
+            ("run-at earlier", "// @match https://a.com/*\n// @exclude https://a.com/admin/*\n// @noframes\n// @run-at document-start\n// @inject-into content\n// @grant none"),
+            ("new @require", "// @match https://a.com/*\n// @exclude https://a.com/admin/*\n// @noframes\n// @run-at document-end\n// @inject-into content\n// @require https://cdn.test/x.js\n// @grant none"),
+            ("new @resource", "// @match https://a.com/*\n// @exclude https://a.com/admin/*\n// @noframes\n// @run-at document-end\n// @inject-into content\n// @resource r https://cdn.test/r.css\n// @grant none"),
+        ];
+        for (what, extra) in cases {
+            let up = plan_update(&old, &src("2", extra), None).unwrap();
+            assert!(up.diff.needs_reapproval(), "{what} must need re-approval");
+        }
+        // Pinned @require: dropping or changing the hash needs approval, keeping it does not.
+        let pinned = |h: &str| {
+            format!("// @match https://a.com/*\n// @require https://cdn.test/x.js#sha256={h}\n// @grant none")
+        };
+        let body = b"lib();".to_vec();
+        let h1 = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        let h2 = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b"other();"));
+        let mut f = Fetched::default();
+        f.requires
+            .insert("https://cdn.test/x.js".into(), body.clone());
+        let old = installed(&pinned(&h1), f);
+        assert!(!plan_update(&old, &src("2", &pinned(&h1)), None)
+            .unwrap()
+            .diff
+            .needs_reapproval());
+        assert!(plan_update(&old, &src("2", &pinned(&h2)), None)
+            .unwrap()
+            .diff
+            .needs_reapproval());
+        assert!(plan_update(
+            &old,
+            &src(
+                "2",
+                "// @match https://a.com/*\n// @require https://cdn.test/x.js\n// @grant none"
+            ),
+            None
+        )
+        .unwrap()
+        .diff
+        .needs_reapproval());
+    }
+
+    #[test]
+    fn unpinned_require_content_change_is_widening() {
+        let extra = "// @match https://a.com/*\n// @require https://cdn.test/x.js\n// @grant none";
+        let mut f = Fetched::default();
+        f.requires
+            .insert("https://cdn.test/x.js".into(), b"v1();".to_vec());
+        let old = installed(extra, f);
+        let mut same = plan_update(&old, &src("2", extra), None).unwrap();
+        let mut f = Fetched::default();
+        f.requires
+            .insert("https://cdn.test/x.js".into(), b"v1();".to_vec());
+        same.absorb_fetched(&old, &f);
+        assert!(
+            !same.diff.needs_reapproval(),
+            "identical code is not a widening"
+        );
+        let mut changed = plan_update(&old, &src("2", extra), None).unwrap();
+        let mut f = Fetched::default();
+        f.requires
+            .insert("https://cdn.test/x.js".into(), b"evil();".to_vec());
+        changed.absorb_fetched(&old, &f);
+        assert!(
+            changed.diff.needs_reapproval(),
+            "swapped code needs approval"
+        );
+    }
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::BTreeSet;
+
+        // Page atoms each pattern covers.
+        fn pages_of(pat: &str) -> BTreeSet<u8> {
+            match pat {
+                "https://a.com/*" => [1, 2].into(),
+                "https://a.com/x/*" => [1].into(),
+                "https://b.com/*" => [3, 4].into(),
+                "https://b.com/y/*" => [3].into(),
+                _ => [1, 2, 3, 4].into(),
+            }
+        }
+        const PATS: &[&str] = &[
+            "https://a.com/*",
+            "https://a.com/x/*",
+            "https://b.com/*",
+            "https://b.com/y/*",
+            "*://*/*",
+        ];
+        const GRANTS: &[&str] = &[
+            "GM_getValue",
+            "GM_setValue",
+            "GM_xmlhttpRequest",
+            "GM_cookie",
+        ];
+        const CONNECTS: &[&str] = &["a.com", "b.com", "c.com"];
+        const REQS: &[&str] = &["https://cdn.test/a.js", "https://cdn.test/b.js"];
+
+        #[derive(Debug, Clone)]
+        struct M {
+            matches: BTreeSet<usize>,
+            excludes: BTreeSet<usize>,
+            grants: BTreeSet<usize>,
+            connect: BTreeSet<usize>,
+            reqs: BTreeSet<usize>,
+        }
+
+        fn subset(n: usize) -> impl Strategy<Value = BTreeSet<usize>> {
+            proptest::collection::btree_set(0..n, 0..=n)
+        }
+        fn model() -> impl Strategy<Value = M> {
+            (
+                subset(PATS.len()),
+                subset(PATS.len()),
+                subset(GRANTS.len()),
+                subset(CONNECTS.len()),
+                subset(REQS.len()),
+            )
+                .prop_map(|(matches, excludes, grants, connect, reqs)| M {
+                    matches,
+                    excludes,
+                    grants,
+                    connect,
+                    reqs,
+                })
+        }
+        fn text(m: &M) -> String {
+            let mut s = String::new();
+            for i in &m.matches {
+                s += &format!("// @match {}\n", PATS[*i]);
+            }
+            if m.matches.is_empty() {
+                s += "// @match https://zzz.test/*\n";
+            }
+            for i in &m.excludes {
+                s += &format!("// @exclude {}\n", PATS[*i]);
+            }
+            for i in &m.grants {
+                s += &format!("// @grant {}\n", GRANTS[*i]);
+            }
+            if m.grants.is_empty() {
+                s += "// @grant none\n";
+            }
+            for i in &m.connect {
+                s += &format!("// @connect {}\n", CONNECTS[*i]);
+            }
+            for i in &m.reqs {
+                s += &format!("// @require {}\n", REQS[*i]);
+            }
+            s
+        }
+        fn pages(m: &M) -> BTreeSet<u8> {
+            let ex: BTreeSet<u8> = m.excludes.iter().flat_map(|i| pages_of(PATS[*i])).collect();
+            m.matches
+                .iter()
+                .flat_map(|i| pages_of(PATS[*i]))
+                .filter(|p| !ex.contains(p))
+                .collect()
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(300))]
+            #[test]
+            fn needs_reapproval_whenever_the_effective_set_grows(a in model(), b in model()) {
+                let mut f = Fetched::default();
+                for r in REQS { f.requires.insert((*r).into(), format!("code({r});").into_bytes()); }
+                let old = installed(&text(&a), f);
+                let up = plan_update(&old, &src("2", &text(&b)), None).unwrap();
+                let grows = !pages(&b).is_subset(&pages(&a))
+                    || !b.grants.is_subset(&a.grants)
+                    || !b.connect.is_subset(&a.connect)
+                    || !b.reqs.is_subset(&a.reqs);
+                if grows {
+                    prop_assert!(up.diff.needs_reapproval(), "old {a:?} new {b:?}");
+                }
+            }
+        }
     }
 }

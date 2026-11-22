@@ -8,9 +8,9 @@ use api_types::{
     ApproveUpdateRequest, CheckUpdateRequest, CheckUpdateResponse, ConfirmPlanRequest,
     ExportedAssets, ExportedRequire, ExportedResource, ExportedUserscript, ImportResultDto,
     ImportUserscriptsResponse, InstallUserscriptRequest, MessageResponse, Page, PendingUpdateDto,
-    PlanRequireDto, PlanResourceDto, PlanUserscriptRequest, Scope, SetEnabledRequest,
-    StorageValueDto, UpdateDiffDto, UpdateUserscriptRequest, UserscriptBundle,
-    UserscriptPlanResponse, UserscriptResponse, UserscriptSourceResponse, UserscriptStatsResponse,
+    PlanRequireDto, PlanResourceDto, PlanUpdateDto, PlanUserscriptRequest, Scope,
+    SetEnabledRequest, StorageValueDto, UpdateDiffDto, UserscriptBundle, UserscriptPlanResponse,
+    UserscriptResponse, UserscriptSourceResponse, UserscriptStatsResponse,
     UserscriptStorageResponse, USERSCRIPT_BUNDLE_FORMAT,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
@@ -39,6 +39,7 @@ fn diff_dto(d: &install::UpdateDiff) -> UpdateDiffDto {
         removed_matches: d.removed_matches.clone(),
         removed_connect: d.removed_connect.clone(),
         removed_grants: d.removed_grants.clone(),
+        widened: d.widened.clone(),
     }
 }
 
@@ -166,9 +167,13 @@ pub async fn install_userscript(
     ApiJson(req): ApiJson<InstallUserscriptRequest>,
 ) -> ApiResult<(StatusCode, Json<UserscriptResponse>)> {
     require_source(&req.source)?;
+    // Same fetch and integrity checks as plan/confirm, with no `@connect *` approval.
+    let sp = ops::build_plan(&state, req.source, None).await?;
+    let script = install::finish_install(sp.plan, sp.fetched, Approvals::default())
+        .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
     let id = state
         .userscript_manager
-        .install(req.source)
+        .install_script(DEFAULT_PROFILE, script)
         .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
     let script = get_script(&state, &id)?;
     info!("Userscript {} installed by {}", id, p.username);
@@ -221,32 +226,6 @@ pub async fn get_userscript_source(
         id: s.id,
         source: s.source,
     }))
-}
-
-/// Replace a userscript's source.
-#[utoipa::path(
-    put, path = "/userscripts/{id}", tag = "userscripts",
-    security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
-    request_body = UpdateUserscriptRequest,
-    responses((status = 200, description = "Updated", body = UserscriptResponse))
-)]
-pub async fn update_userscript(
-    State(state): State<Arc<AppState>>,
-    Extension(p): Extension<Principal>,
-    ApiPath(id): ApiPath<String>,
-    ApiJson(req): ApiJson<UpdateUserscriptRequest>,
-) -> ApiResult<Json<UserscriptResponse>> {
-    require_source(&req.source)?;
-    state
-        .userscript_manager
-        .update(&id, req.source)
-        .map_err(|e| match e {
-            userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
-            _ => ApiError::ValidationError(format!("Invalid userscript: {e}")),
-        })?;
-    info!("Userscript {id} updated by {}", p.username);
-    Ok(Json(respond(&state, &get_script(&state, &id)?)))
 }
 
 /// Uninstall a userscript.
@@ -349,6 +328,15 @@ fn plan_response(state: &AppState, plan_id: String, sp: &StoredPlan) -> Userscri
             })
             .collect(),
         already_installed: existing.is_some(),
+        update: existing.as_ref().and_then(|e| {
+            let mut up = install::plan_update(e, &p.source, p.origin_url.as_ref()).ok()?;
+            up.absorb_fetched(e, &sp.fetched);
+            Some(PlanUpdateDto {
+                needs_reapproval: up.diff.needs_reapproval(),
+                diff: diff_dto(&up.diff),
+                is_newer: up.is_newer,
+            })
+        }),
         installed_version: existing.and_then(|s| s.metadata.version),
     }
 }
@@ -386,7 +374,11 @@ pub async fn plan_userscript(
             ))
         }
     };
-    let sp = ops::build_plan(&state, source, origin.as_ref()).await?;
+    let mut sp = ops::build_plan(&state, source, origin.as_ref()).await?;
+    sp.base = state
+        .userscript_manager
+        .get(&sp.plan.metadata.unique_id())
+        .map(|e| ops::source_fingerprint(&e));
     let name = sp.plan.metadata.name.clone();
     let resp_plan = plan_response(&state, String::new(), &sp);
     let id = state.userscript_plans.insert(sp);
@@ -405,8 +397,9 @@ pub async fn plan_userscript(
     request_body = ConfirmPlanRequest,
     responses(
         (status = 201, description = "Installed", body = UserscriptResponse),
+        (status = 200, description = "Updated an installed script", body = UserscriptResponse),
         (status = 404, description = "Unknown or expired plan"),
-        (status = 409, description = "Already installed")
+        (status = 409, description = "The installed script changed since the plan")
     )
 )]
 pub async fn confirm_plan(
@@ -428,11 +421,39 @@ pub async fn confirm_plan(
         ));
     }
     let id = sp.plan.metadata.unique_id();
-    if state.userscript_manager.get(&id).is_some() {
-        return Err(ApiError::conflict(
-            "already_installed",
-            format!("Userscript '{id}' is already installed; use its check-update route"),
-        ));
+    if let Some(existing) = state.userscript_manager.get(&id) {
+        // Updating: confirming is the approval of the diff the plan showed, provided the
+        // installed script is still the one that diff was computed against.
+        if sp.base.as_deref() != Some(ops::source_fingerprint(&existing).as_str()) {
+            return Err(ApiError::conflict(
+                "plan_stale",
+                "The installed script changed since this plan; plan again",
+            ));
+        }
+        let origin = sp.plan.origin_url.clone();
+        let mut up = install::plan_update(&existing, &sp.plan.source, origin.as_ref())
+            .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
+        up.absorb_fetched(&existing, &sp.fetched);
+        let mut new = install::finish_update(
+            &existing,
+            up,
+            sp.fetched_clone(),
+            true,
+            req.allow_connect_all,
+        )
+        .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
+        new.pending_update = None;
+        state
+            .userscript_manager
+            .replace_script(DEFAULT_PROFILE, new)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        state.userscript_plans.remove(&plan_id);
+        info!(
+            "Userscript {id} updated from plan by {} (connect_all={})",
+            p.username, req.allow_connect_all
+        );
+        let script = get_script(&state, &id)?;
+        return Ok((StatusCode::OK, Json(respond(&state, &script))));
     }
     let mut script = install::finish_install(
         sp.plan.clone(),
@@ -730,6 +751,7 @@ pub async fn export_userscripts(
         format: USERSCRIPT_BUNDLE_FORMAT.into(),
         scripts,
         on_conflict: None,
+        approve: false,
     }))
 }
 
@@ -781,6 +803,7 @@ pub async fn import_userscripts(
                         name: None,
                         status: "error".into(),
                         error: Some(e.to_string()),
+                        pending_approval: false,
                     });
                     continue;
                 }
@@ -791,6 +814,7 @@ pub async fn import_userscripts(
             name: Some(name.clone()),
             status: status.into(),
             error,
+            pending_approval: !bundle.approve,
         };
         let existing = mgr.get(&id);
         if existing.is_some() && !replace {
@@ -812,7 +836,12 @@ pub async fn import_userscripts(
             results.push(result("error", Some(e)));
             continue;
         }
-        script.enabled = entry.enabled;
+        // A file cannot approve itself: without `approve`, scripts arrive disabled and without
+        // `@connect *` approval, whatever the bundle says.
+        script.enabled = entry.enabled && bundle.approve;
+        if !bundle.approve {
+            script.allow_connect_all = false;
+        }
         let status = if let Some(old) = existing {
             script.installed_at = old.installed_at;
             script.execution_count = old.execution_count;

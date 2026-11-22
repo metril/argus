@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cb94a2549154f1709a962f63c290a9513317d0804dfb13ce0da00f58c11c1696 # shrinks to a = M { matches: {}, excludes: {}, grants: {}, connect: {}, reqs: {0} }, b = M { matches: {}, excludes: {}, grants: {}, connect: {}, reqs: {} }

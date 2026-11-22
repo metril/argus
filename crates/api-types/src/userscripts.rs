@@ -64,6 +64,9 @@ pub struct UserscriptPlanResponse {
     pub resources: Vec<PlanResourceDto>,
     pub already_installed: bool,
     pub installed_version: Option<String>,
+    /// Set when the script is already installed: confirming replaces it with this plan.
+    #[serde(default)]
+    pub update: Option<PlanUpdateDto>,
 }
 
 /// Confirm a plan.
@@ -87,6 +90,20 @@ pub struct UpdateDiffDto {
     pub removed_matches: Vec<String>,
     pub removed_connect: Vec<String>,
     pub removed_grants: Vec<String>,
+    /// Other widening: removed `@exclude`, dropped `@noframes`, injection mode, earlier
+    /// `@run-at`, new or changed `@require`/`@resource`, changed required code.
+    #[serde(default)]
+    pub widened: Vec<String>,
+}
+
+/// What confirming the plan of an already installed script would change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PlanUpdateDto {
+    pub diff: UpdateDiffDto,
+    /// The change widens what the script can match, reach or run; confirming approves it.
+    pub needs_reapproval: bool,
+    pub is_newer: bool,
 }
 
 /// An update waiting for approval.
@@ -205,6 +222,10 @@ pub struct UserscriptBundle {
     /// Import only: `skip` (default) or `replace` existing scripts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_conflict: Option<String>,
+    /// Import only: approve the bundle as written (enabled state and `@connect *` approvals).
+    /// Without it every imported script arrives disabled and unapproved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approve: bool,
 }
 
 /// Per-script import outcome.
@@ -216,6 +237,9 @@ pub struct ImportResultDto {
     /// `installed`, `replaced`, `skipped` or `error`.
     pub status: String,
     pub error: Option<String>,
+    /// Imported disabled / without approvals; enable it from the script's page.
+    #[serde(default)]
+    pub pending_approval: bool,
 }
 
 /// Import outcome.

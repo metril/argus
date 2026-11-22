@@ -482,13 +482,6 @@ pub struct InstallUserscriptRequest {
     pub source: String,
 }
 
-/// Update a userscript's source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct UpdateUserscriptRequest {
-    pub source: String,
-}
-
 /// Toggle a userscript's enabled state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

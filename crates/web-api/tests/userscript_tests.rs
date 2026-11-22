@@ -72,7 +72,7 @@ async fn plan_confirm_happy_path_and_summary() {
     assert_eq!(s["enabled"], false);
     assert_eq!(s["version"], "1.0");
     assert_eq!(s["connect_all_approved"], false);
-    // Planning again reports the installed one; confirming it conflicts.
+    // Planning again reports the installed one; confirming it updates it.
     let p2 = plan(&admin, &src("1.0", "")).await;
     assert_eq!(p2["already_installed"], true);
     assert_eq!(p2["installed_version"], "1.0");
@@ -83,7 +83,7 @@ async fn plan_confirm_happy_path_and_summary() {
         ))
         .json(&json!({}))
         .await
-        .assert_status(StatusCode::CONFLICT);
+        .assert_status_ok(); // confirming a plan for an installed script is an update
 }
 
 #[tokio::test]
@@ -498,4 +498,146 @@ fn broad_match_detection() {
     ] {
         assert!(!is_broad_match(p), "{p}");
     }
+}
+
+fn data_js(code: &str) -> String {
+    use base64::Engine;
+    format!(
+        "data:text/javascript;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(code)
+    )
+}
+
+#[tokio::test]
+async fn direct_source_replacement_route_is_gone() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let id = install_plain(&admin, &src("1.0", "")).await;
+    let r = admin
+        .put(&format!("/api/v1/userscripts/{}", enc(&id)))
+        .json(&json!({"source": src("2.0", "// @grant GM_xmlhttpRequest\n// @connect *")}))
+        .await;
+    assert_ne!(
+        r.status_code(),
+        StatusCode::OK,
+        "PUT swapped code without the plan/confirm contract"
+    );
+    let cur: Value = admin
+        .get(&format!("/api/v1/userscripts/{}", enc(&id)))
+        .await
+        .json();
+    assert_eq!(cur["version"], "1.0");
+}
+
+#[tokio::test]
+async fn updating_an_installed_script_goes_through_plan_and_confirm() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    // Installed with @connect * approved.
+    let p = plan(
+        &admin,
+        &src("1.0", "// @grant GM_xmlhttpRequest\n// @connect *"),
+    )
+    .await;
+    let r = admin
+        .post(&format!(
+            "/api/v1/userscripts/plan/{}/confirm",
+            p["plan_id"].as_str().unwrap()
+        ))
+        .json(&json!({"allow_connect_all": true}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::CREATED);
+    let id = r.json::<Value>()["id"].as_str().unwrap().to_string();
+    // The new source adds a @require: the plan reports the update and that it needs approval,
+    // and confirming fetches and stores the dependency.
+    let up = src(
+        "2.0",
+        &format!(
+            "// @grant GM_xmlhttpRequest\n// @connect *\n// @require {}",
+            data_js("window.__lib = 1;")
+        ),
+    );
+    let p = plan(&admin, &up).await;
+    assert_eq!(p["already_installed"], true);
+    assert_eq!(p["update"]["needs_reapproval"], true, "{p}");
+    let r = admin
+        .post(&format!(
+            "/api/v1/userscripts/plan/{}/confirm",
+            p["plan_id"].as_str().unwrap()
+        ))
+        .json(&json!({}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let s: Value = r.json();
+    assert_eq!(s["version"], "2.0");
+    assert_eq!(s["require_count"], 1, "the @require was fetched and stored");
+    assert_eq!(
+        s["connect_all_approved"], true,
+        "an unchanged @connect * approval survives"
+    );
+    // A confirm built for an older state of the script is refused.
+    let p = plan(&admin, &src("3.0", "")).await;
+    let stale = plan(&admin, &src("3.1", "")).await;
+    admin
+        .post(&format!(
+            "/api/v1/userscripts/plan/{}/confirm",
+            p["plan_id"].as_str().unwrap()
+        ))
+        .json(&json!({}))
+        .await
+        .assert_status_ok();
+    admin
+        .post(&format!(
+            "/api/v1/userscripts/plan/{}/confirm",
+            stale["plan_id"].as_str().unwrap()
+        ))
+        .json(&json!({}))
+        .await
+        .assert_status(StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn imported_scripts_arrive_disabled_and_unapproved_unless_confirmed() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let bundle = json!({
+        "format": "adblocker-userscripts-v1",
+        "scripts": [{
+            "source": src("1.0", "// @grant GM_xmlhttpRequest\n// @connect *"),
+            "enabled": true,
+            "allow_connect_all": true,
+            "assets": {"requires": [], "resources": []}
+        }]
+    });
+    let res: Value = admin
+        .post("/api/v1/userscripts/import")
+        .json(&bundle)
+        .await
+        .json();
+    let id = res["results"][0]["id"].as_str().unwrap().to_string();
+    let s: Value = admin
+        .get(&format!("/api/v1/userscripts/{}", enc(&id)))
+        .await
+        .json();
+    assert_eq!(s["enabled"], false, "{res}");
+    assert_eq!(s["connect_all_approved"], false);
+    assert_eq!(res["results"][0]["pending_approval"], true);
+    // Explicitly confirmed import keeps what the file says.
+    admin
+        .delete(&format!("/api/v1/userscripts/{}", enc(&id)))
+        .await
+        .assert_status_ok();
+    let mut b = bundle.clone();
+    b["approve"] = json!(true);
+    admin
+        .post("/api/v1/userscripts/import")
+        .json(&b)
+        .await
+        .assert_status_ok();
+    let s: Value = admin
+        .get(&format!("/api/v1/userscripts/{}", enc(&id)))
+        .await
+        .json();
+    assert_eq!(s["enabled"], true);
+    assert_eq!(s["connect_all_approved"], true);
 }

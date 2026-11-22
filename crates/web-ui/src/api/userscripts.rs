@@ -7,7 +7,7 @@ use super::client::{ApiClient, ApiError};
 // Aliases preserve the names the UI pages already use.
 pub use api_types::UserscriptResponse as Userscript;
 pub use api_types::UserscriptStatsResponse as UserscriptStats;
-pub use api_types::{InstallUserscriptRequest, SetEnabledRequest, UpdateUserscriptRequest};
+pub use api_types::{InstallUserscriptRequest, SetEnabledRequest};
 pub type UserscriptsResponse = api_types::Page<Userscript>;
 
 pub use api_types::UserscriptSourceResponse;
@@ -51,14 +51,6 @@ impl ApiClient {
             source: source.to_string(),
         };
         self.post("/userscripts", &req).await
-    }
-
-    /// Update a userscript
-    pub async fn update_userscript(&self, id: &str, source: &str) -> Result<Userscript, ApiError> {
-        let req = UpdateUserscriptRequest {
-            source: source.to_string(),
-        };
-        self.put(&format!("/userscripts/{}", id), &req).await
     }
 
     /// Uninstall a userscript
