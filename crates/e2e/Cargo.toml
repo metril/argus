@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 proxy-core = { path = "../proxy-core", features = ["websockets"] }
 filter-engine = { path = "../filter-engine" }
+ext-rules = { path = "../ext-rules" }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
