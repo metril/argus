@@ -167,6 +167,22 @@ impl Default for AdblockSettings {
     }
 }
 
+/// What the proxy does about service workers on sites that get userscripts. A service worker
+/// sees every same-origin request of its pages, including the userscript bundles (and their
+/// tokens) and GM responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceWorkerPolicy {
+    /// Do nothing: service workers work everywhere and can read what the page can.
+    Allow,
+    /// Refuse service-worker script fetches (registration fails) and unregister existing
+    /// workers, on hosts where a userscript with network, download or cookie grants applies.
+    #[default]
+    BlockWhenPrivileged,
+    /// Same, for every host the proxy filters.
+    Block,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
@@ -176,6 +192,9 @@ pub struct UserscriptSettings {
     /// Apply found updates automatically, only when they do not widen `@match`/`@connect`/`@grant`.
     #[serde(default)]
     pub auto_apply_updates: bool,
+    /// `allow`, `block_when_privileged` (default) or `block`; see [`ServiceWorkerPolicy`].
+    #[serde(default)]
+    pub service_worker_policy: ServiceWorkerPolicy,
 }
 
 /// Script control (NoScript-style policy) and its in-page panel. The rules and the master switch

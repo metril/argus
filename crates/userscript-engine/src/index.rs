@@ -119,6 +119,30 @@ impl ScriptIndex {
         self.by_id.get(id).map(|&n| &self.scripts[n as usize])
     }
 
+    /// Scripts whose `@match`/`@include` host buckets could apply to some page of `host` (the
+    /// path is ignored, so this over-approximates: used for conservative decisions).
+    pub fn for_host<'a>(&'a self, host: &str) -> impl Iterator<Item = &'a CompiledScript> + 'a {
+        let host = host.to_ascii_lowercase();
+        let mut ids: Vec<u32> = Vec::new();
+        if let Some(v) = self.exact.get(host.as_str()) {
+            ids.extend_from_slice(v);
+        }
+        let mut rest = host.as_str();
+        loop {
+            if let Some(v) = self.suffix.get(rest) {
+                ids.extend_from_slice(v);
+            }
+            match rest.find('.') {
+                Some(p) => rest = &rest[p + 1..],
+                None => break,
+            }
+        }
+        ids.extend_from_slice(&self.any);
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().map(move |i| &self.scripts[i as usize])
+    }
+
     /// Scripts that run on this document. `host` is the document's hostname, `url` its full
     /// URL (normalised form). Allocation-free unless candidates are found (or `host` has
     /// uppercase letters).

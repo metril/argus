@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    ctx.set_service_worker_policy(config.userscripts.service_worker_policy);
     if config.userscripts.enabled {
         ctx.set_userscripts(userscript_manager.clone());
     } else {

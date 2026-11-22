@@ -52,6 +52,7 @@ fn cosmetics() -> Cosmetics {
 fn plan(internal: &Internal) -> HtmlPlan {
     let cos = cosmetics();
     let head = build_head(&PageSpec {
+        unregister_sw: false,
         cosmetics: &cos,
         internal,
         host: "example.test",
@@ -226,6 +227,7 @@ fn benches(c: &mut Criterion) {
     f.bench_function("build_head_small", |b| {
         b.iter(|| {
             build_head(&PageSpec {
+                unregister_sw: false,
                 cosmetics: &cos,
                 internal: &internal,
                 host: "example.test",
@@ -260,6 +262,7 @@ fn benches(c: &mut Criterion) {
                 },
             );
             let head = build_head(&PageSpec {
+                unregister_sw: false,
                 cosmetics: &cos,
                 internal: &internal,
                 host: "example.test",

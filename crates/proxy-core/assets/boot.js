@@ -17,6 +17,8 @@ rt.run=function(kind,name,args){var f=Object.prototype.hasOwnProperty.call(NATIV
 rt.q=[];self.__adblockerRuntime=rt;
 for(var i=0;i<q.length;i++){try{rt.run(q[i][0],q[i][1],q[i][2]);}catch(e){}}
 })();
+/* Sites with a privileged userscript: drop any service worker already registered for this origin (a worker can read the page's bundles and GM traffic). New registrations are refused by the proxy. */
+if(cfg.sw){try{if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations){navigator.serviceWorker.getRegistrations().then(function(rs){for(var i=0;i<rs.length;i++){try{rs[i].unregister();}catch(e){}}}).catch(function(){});}}catch(e){}}
 var me=document.currentScript,nonce=(me&&me.nonce)||'';
 var tt=null;
 try{if(window.trustedTypes&&trustedTypes.createPolicy){tt=trustedTypes.createPolicy('adblock-proxy',{createScriptURL:function(u){if(typeof u==='string'&&u.indexOf('/__adblock__/')===0)return u;throw new TypeError('adblock-proxy: refused');}});}}catch(e){}

@@ -114,6 +114,8 @@ pub fn unsafe_styles_dropped() -> u64 {
 
 /// Inputs for [`build_head`].
 pub struct PageSpec<'a> {
+    /// Unregister the page's service workers at document start (see [`crate::gm`]).
+    pub unregister_sw: bool,
     pub cosmetics: &'a Cosmetics,
     pub internal: &'a Internal,
     /// Host name the beacon token is bound to.
@@ -215,6 +217,9 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                 "o": observer,
                 "t": spec.internal.token_for(spec.host),
             });
+            if spec.unregister_sw {
+                cfg["sw"] = serde_json::Value::from(1);
+            }
             if let Some(k) = spec.panel {
                 cfg["k"] = k.clone();
                 cfg["pn"] = serde_json::Value::String(crate::internal::panel_path().to_string());
@@ -278,6 +283,7 @@ mod tests {
 
     fn spec<'a>(cos: &'a Cosmetics, internal: &'a Internal) -> PageSpec<'a> {
         PageSpec {
+            unregister_sw: false,
             cosmetics: cos,
             internal,
             host: "example.test",

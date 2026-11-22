@@ -1089,3 +1089,28 @@ e2e_test!(
         );
     }
 );
+
+e2e_test!(
+    bundles_load_only_as_script_elements_not_through_fetch,
+    rules = [],
+    |env| {
+        env.proxy
+            .install_userscript(&script("dst", "// @grant GM_getValue"));
+        let c = env.client();
+        let html = load_page(&env, &c, "app.test", "/d").await;
+        let s = srcs(&html);
+        let u = env.origin.https_url("app.test", &s[0]);
+        // What a service worker's `fetch()` of the URL looks like: destination "empty".
+        let r = c
+            .request(reqwest::Method::GET, &u)
+            .header("sec-fetch-site", "same-origin")
+            .header("sec-fetch-dest", "empty")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        // ... and it did not consume the single-use bundle.
+        let b = fetch_bundle(&env, &c, "app.test", &s[0]).await;
+        assert_eq!(b.status(), 200);
+    }
+);

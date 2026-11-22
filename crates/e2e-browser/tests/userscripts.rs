@@ -734,3 +734,123 @@ us_test!(
         let _ = id;
     }
 );
+
+// A worker that watches what its pages send to the GM backend and reports any token it sees.
+const SW_JS: &str = "self.addEventListener('fetch', (e) => { const u = new URL(e.request.url);\
+   if (u.pathname.startsWith('/__adblock__/gm/v1/')) { const t = e.request.headers.get('x-gm-token');\
+     self.clients.matchAll().then((cs) => cs.forEach((c) => c.postMessage({ stolen: t }))); } });";
+
+async fn sw_register(s: &Session) -> serde_json::Value {
+    s.eval(
+        "(async () => { let rej = null; navigator.serviceWorker.register('/sw.js').catch((e) => { rej = e.name; });\
+           for (let i = 0; i < 80; i++) { await new Promise((r) => setTimeout(r, 100)); if (rej) return 'failed:' + rej;\
+             const rs = await navigator.serviceWorker.getRegistrations(); if (rs.length) return 'registered'; }\
+           return 'timeout'; })()",
+    )
+    .await
+}
+
+us_test!(
+    service_worker_cannot_register_on_a_site_with_a_privileged_script,
+    |s| {
+        s.origin.route(
+            "/sw.js",
+            MockResponse::ok(SW_JS).header("content-type", "text/javascript"),
+        );
+        s.proxy.install_userscript(&script(
+            "priv",
+            "// @grant GM_xmlhttpRequest\n// @connect api.test",
+            "window.__ran = 1;",
+        ));
+        html(&s, "/", page("", "x"));
+        s.goto(&s.url("us.test", "/")).await;
+        s.wait_for("script ran", "window.__ran === 1").await;
+        let r = sw_register(&s).await;
+        assert!(
+            r.as_str().unwrap().starts_with("failed"),
+            "registration must be refused: {r}"
+        );
+    }
+);
+
+us_test!(
+    service_workers_are_allowed_and_can_read_bundles_only_when_policy_is_allow,
+    |s| {
+        use common::config::ServiceWorkerPolicy as P;
+        s.origin.route(
+            "/sw.js",
+            MockResponse::ok(SW_JS).header("content-type", "text/javascript"),
+        );
+        s.proxy.install_userscript(&script(
+            "priv",
+            "// @grant GM_xmlhttpRequest\n// @grant GM_setValue\n// @connect api.test",
+            "window.__ran = 1; setInterval(() => GM_setValue('t', Date.now()), 200);",
+        ));
+        html(
+        &s,
+        "/",
+        page(
+            "<script>window.__stolen = []; navigator.serviceWorker.addEventListener('message', (e) => __stolen.push(e.data.stolen));</script>",
+            "x",
+        ),
+    );
+        s.proxy.ctx.set_service_worker_policy(P::Allow);
+        s.goto(&s.url("us.test", "/")).await;
+        s.wait_for("script ran", "window.__ran === 1").await;
+        assert_eq!(sw_register(&s).await, "registered");
+        s.wait_for(
+        "worker active",
+        "navigator.serviceWorker.getRegistration().then((r) => { window.__act = !!(r && r.active); }) && window.__act === true",
+    )
+    .await;
+        // Reload: the worker now controls the page and sees the bundle request. Documented limitation.
+        s.goto(&s.url("us.test", "/")).await;
+        s.wait_for(
+            "worker saw a token",
+            "(window.__stolen || []).some((t) => typeof t === 'string' && t.startsWith('v1.'))",
+        )
+        .await;
+        // Tightening the policy: the next load unregisters the worker.
+        s.proxy
+            .ctx
+            .set_service_worker_policy(P::BlockWhenPrivileged);
+        s.goto(&s.url("us.test", "/")).await;
+        s.wait_for(
+        "worker unregistered",
+        "navigator.serviceWorker.getRegistrations().then((r) => { window.__regs = r.length; }) && window.__regs === 0",
+    )
+    .await;
+    }
+);
+
+us_test!(
+    service_workers_still_work_where_no_privileged_script_applies,
+    |s| {
+        s.origin.route(
+            "/sw.js",
+            MockResponse::ok(SW_JS).header("content-type", "text/javascript"),
+        );
+        s.proxy.install_userscript(&script(
+            "plain",
+            "// @grant GM_xmlhttpRequest\n// @connect api.test",
+            "window.__ran = 1;",
+        ));
+        html(&s, "/", page("", "x"));
+        s.proxy
+            .ctx
+            .set_service_worker_policy(common::config::ServiceWorkerPolicy::Allow);
+        s.goto(&s.url("us.test", "/")).await;
+        s.wait_for("script ran", "window.__ran === 1").await;
+        assert_eq!(sw_register(&s).await, "registered");
+    }
+);
+
+us_test!(tmp_sw_baseline, |s| {
+    s.origin.route(
+        "/sw.js",
+        MockResponse::ok(SW_JS).header("content-type", "text/javascript"),
+    );
+    html(&s, "/", page("", "x"));
+    s.goto(&s.url("us.test", "/")).await;
+    assert_eq!(sw_register(&s).await, "registered");
+});

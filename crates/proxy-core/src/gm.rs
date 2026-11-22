@@ -256,7 +256,18 @@ impl Drop for Permit {
 
 type Held = (Permit, OwnedSemaphorePermit);
 
+/// Grants that give a script network, download or cookie reach beyond the page.
+pub fn is_privileged(s: &userscript_engine::Userscript) -> bool {
+    s.metadata.effective_grants().iter().any(|g| {
+        matches!(
+            g.as_str(),
+            "gm_xmlhttprequest" | "gm_download" | "gm_cookie"
+        )
+    })
+}
+
 pub struct GmHost {
+    sw_policy: std::sync::atomic::AtomicU8,
     pub docs: DocStore,
     limits: Mutex<Limits>,
     budget: Arc<Semaphore>,
@@ -372,9 +383,40 @@ fn single_error_frame(kind: &str, code: &str, msg: &str) -> Response<ProxyBody> 
 impl GmHost {
     pub fn new() -> Self {
         Self {
+            sw_policy: std::sync::atomic::AtomicU8::new(
+                common::config::ServiceWorkerPolicy::default() as u8,
+            ),
             docs: DocStore::new(DOC_CAP, DOC_TTL),
             limits: Mutex::new(Limits::default()),
             budget: Arc::new(Semaphore::new(BODY_BUDGET)),
+        }
+    }
+
+    pub fn set_sw_policy(&self, p: common::config::ServiceWorkerPolicy) {
+        self.sw_policy
+            .store(p as u8, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn sw_policy(&self) -> common::config::ServiceWorkerPolicy {
+        use common::config::ServiceWorkerPolicy::*;
+        match self.sw_policy.load(std::sync::atomic::Ordering::Relaxed) {
+            x if x == Allow as u8 => Allow,
+            x if x == Block as u8 => Block,
+            _ => BlockWhenPrivileged,
+        }
+    }
+
+    /// Must service workers be kept off `host`? (`block`: always; `block_when_privileged`: when a
+    /// script with network, download or cookie grants may run there.)
+    pub fn blocks_service_workers(&self, manager: &UserscriptManager, host: &str) -> bool {
+        use common::config::ServiceWorkerPolicy::*;
+        match self.sw_policy() {
+            Allow => false,
+            Block => !manager.live_index().is_empty(),
+            BlockWhenPrivileged => manager
+                .live_index()
+                .for_host(host)
+                .any(|c| is_privileged(&c.script)),
         }
     }
 
@@ -446,6 +488,12 @@ impl GmHost {
         // A script element sends `Sec-Fetch-Site: same-origin`; anything else is a foreign page
         // that somehow learned the URL.
         if header(headers, "sec-fetch-site").is_some_and(|v| v != "same-origin") {
+            return forbidden();
+        }
+        // Only a `<script>` element loads a bundle; a `fetch()` (a service worker reading a URL
+        // it learned from the markup, say) carries another destination, which the browser sets
+        // and page code cannot change.
+        if header(headers, "sec-fetch-dest").is_some_and(|v| v != "script") {
             return forbidden();
         }
         let parsed = rest

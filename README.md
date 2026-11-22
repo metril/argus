@@ -879,12 +879,25 @@ the DOM, an attribute or a URL), serves each bundle once, and deletes its own `<
 page that overrides `fetch`, `JSON.parse` or `Function.prototype.call` after load cannot read a
 token or hijack a script's calls, and its own calls to the endpoints are refused (browser tests
 assert this). What it can still do: poison built-ins before they are captured if it runs before
-the proxy's script (not possible for an inline script in the document, but for a service worker, an
-extension or an earlier same-origin frame); tamper with objects it receives later, for example
+the proxy's script (not possible for an inline script in the document, but for an extension or an
+earlier same-origin frame); tamper with objects it receives later, for example
 observe the values a script reads through `Promise.prototype.then` or anything a script writes to
 the DOM or exposes on `window`; and, with a token it somehow stole, act as that one script on that
 one origin until the token expires (one hour), within that script's approved grants and `@connect`.
 Only install scripts you trust with the data of the sites they run on.
+
+**Service workers.** A service worker sees every same-origin request of its pages, so it can read
+the `X-GM-Token` header of a script's backend calls and answer any request, including the boot
+script and bundle URLs, with its own content. No header or token scheme can stop that: a worker's
+`fetch` handler is always in the path. `userscripts.service_worker_policy` therefore acts on the
+workers themselves: `block_when_privileged` (default) refuses service-worker script fetches
+(registration fails with a 403) and unregisters existing workers, on hosts where a script with
+`GM_xmlhttpRequest`, `GM_download` or `GM_cookie` may run; `block` does so for every host the
+proxy serves userscripts on; `allow` leaves workers alone, and then they can read those tokens
+and GM traffic. Residual exposure with the default: a worker that already controls a page keeps
+doing so until the first load that unregisters it, and a worker on a host with only
+non-privileged scripts can still see their calls. Bundle URLs are additionally refused unless
+fetched by a `<script>` element, which stops a worker from fetching one itself with `fetch()`.
 
 ### Configuration
 
@@ -893,6 +906,7 @@ Only install scripts you trust with the data of the sites they run on.
 enabled = true                 # inject scripts and serve the GM backend
 update_check_interval_hours = 0  # scheduled update checks (0 = off)
 auto_apply_updates = false     # apply only updates that do not widen grants/@match/@connect
+service_worker_policy = "block_when_privileged"  # allow | block_when_privileged | block
 ```
 
 Stored scripts from before the rewrite (`resources` map format) cannot be read; they are dropped

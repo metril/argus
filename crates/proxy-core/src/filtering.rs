@@ -151,6 +151,11 @@ impl ProxyContext {
         ));
     }
 
+    /// What to do about service workers on sites that get userscripts.
+    pub fn set_service_worker_policy(&self, p: common::config::ServiceWorkerPolicy) {
+        self.internal.gm.set_sw_policy(p);
+    }
+
     /// Configure the in-page panel (reserved host, global switch, dashboard link) and the
     /// per-site blocking backend.
     pub fn configure_panel(
@@ -369,6 +374,26 @@ impl ProxyContext {
                 resolve_all_to: self.resolve_all_to,
             };
             return Ok(self.internal.handle(req, &host, &origin, rctx, &up).await);
+        }
+
+        // A service-worker script fetch (also `importScripts` inside one) on a host where a
+        // privileged userscript may run: refuse, so registration fails and the worker never sees
+        // the page's bundles or GM traffic (see docs/USERSCRIPT-PROTOCOL.md section 6).
+        if is_service_worker_fetch(req.headers()) {
+            let refuse = rctx
+                .profile
+                .load()
+                .userscript_manager()
+                .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+            if refuse {
+                debug!("Refused a service worker script fetch for {host}");
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::FORBIDDEN)
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "service workers are blocked on this site")
+                    .body(crate::inject::full_body(bytes::Bytes::new()))
+                    .expect("sw refusal"));
+            }
         }
 
         // Take the request apart: the header map is moved, not copied, from here on.
@@ -725,8 +750,16 @@ impl ProxyContext {
                 } else {
                     None
                 };
+                let unregister_sw = !blocks_scripts
+                    && us.is_some()
+                    && rctx
+                        .profile
+                        .load()
+                        .userscript_manager()
+                        .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
                 let head = if enabled {
                     build_head(&PageSpec {
+                        unregister_sw,
                         userscripts: us_srcs,
                         panel: panel_key.as_ref(),
                         ext_script: &ext_script,
@@ -1120,4 +1153,15 @@ mod url_tests {
             "http://example.com:8080/x"
         );
     }
+}
+
+/// A request that fetches a service worker's script: `Service-Worker: script` (set by the browser
+/// for the main script and its updates) or `Sec-Fetch-Dest: serviceworker`.
+fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
+    h.get("service-worker")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("script"))
+        || h.get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("serviceworker"))
 }

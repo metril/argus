@@ -170,7 +170,11 @@ loopback/private/link-local/the proxy's own listeners unless the policy explicit
 them; `@connect` is a script-level allowance, not a substitute). For each redirect response
 call `backend::next_hop(ctx, &prev, status, location)` (re-checks `@connect`, strips
 `Authorization`/`Cookie` cross-origin, rewrites method for 301/302/303) unless
-`redirect != follow`. `use_cookie_jar` (= not `anonymous`) selects the profile's GM cookie jar
+`redirect != follow`. `use_cookie_jar` (= not `anonymous`) selects the script's own GM cookie jar (one per profile and
+script: a script never sees or replays cookies another script obtained; HttpOnly cookies the
+script itself stored or received are listed to that script, as Tampermonkey's `GM_cookie` does with
+its `httpOnly` field; scoping follows RFC 6265: domain-match, path-match, host-only, `Secure` only
+over https, `Domain=` refused for public suffixes and unlisted single-label TLDs)
 for send and `Set-Cookie`; the browser's own cookies for third-party sites are not available to
 a proxy.
 
@@ -200,12 +204,12 @@ The runtime shares a world with the page. Mitigations: all built-ins are capture
 (`fetch`, `JSON`, `Promise`, `Object.*`, `Function.prototype.call/apply/bind`, DOM
 prototype methods, `Response`/`Headers`/stream readers, typed-array methods, timers);
 capability tokens live only in closures (never on `window`, the DOM, attributes or
-URLs, except `resource?t=`); GM objects handed to scripts are frozen; the injected `<script>`
+URLs); GM objects handed to scripts are frozen; the injected `<script>`
 element is removed after it runs.
 
 Still possible, so **backend checks must never rely on page-side secrecy**:
 * a page that runs *before* us in the same frame (inline script ahead of `<head>`'s first
-  child, a service worker, a browser extension, a pre-existing same-origin frame) can poison
+  child, a browser extension, a pre-existing same-origin frame) can poison
   built-ins before they are captured; we cannot detect it;
 * it can tamper with prototypes of objects created later (script-visible results such as
   `Promise.prototype.then` on promises we return, `Array.prototype` seen by user code),
@@ -214,6 +218,43 @@ Still possible, so **backend checks must never rely on page-side secrecy**:
   token is usable only from that origin (the `Origin` header is checked), for that script, until
   expiry, with that script's server-side grants;
 * it can call the endpoints itself with a stolen token, or replace `window.fetch`.
+
+### 6.1 Service workers
+
+A service worker registered for the page's origin is in the path of every same-origin request
+the page makes. Nothing the proxy can add changes that: a `fetch` handler sees page-initiated
+requests whatever their headers, and it can answer any of them. In particular, with
+`service_worker_policy = "allow"` a worker can (a) read the `X-GM-Token` header and body of each
+GM backend call and the responses (values, `xhr` payloads, resources), and so act as the script
+until the token expires; (b) answer the boot script, the runtime or a bundle URL with code of
+its own; (c) `importScripts()` a bundle URL it learned from intercepted markup, which consumes
+the single-use URL and runs the bundle inside the worker. It **cannot** read a bundle through
+`fetch()`: a bundle is served only when `Sec-Fetch-Dest: script` (the browser sets that header and
+page or worker code cannot), and a worker's `fetch()` carries `empty`. Detecting interception from
+the page is not possible either: anything the page could check (a header, a timing, a marker in the
+response) the worker controls, since it can answer the check itself.
+
+What is done about it, per `userscripts.service_worker_policy`:
+
+* `block_when_privileged` (default): on hosts where an enabled userscript with
+  `GM_xmlhttpRequest`, `GM_download` or `GM_cookie` could match (host buckets only, so this
+  over-approximates), a service-worker script fetch (`Service-Worker: script` or
+  `Sec-Fetch-Dest: serviceworker`) is answered 403 and registration fails; and documents of such
+  hosts that get userscripts run `navigator.serviceWorker.getRegistrations()` at document start
+  (in the boot script) and unregister every registration.
+* `block`: the same on every host with at least one userscript installed.
+* `allow`: neither; (a) to (c) above apply.
+
+Still exposed with the default: a worker that was already controlling a page keeps doing so for
+the document load that unregisters it; hosts with only non-privileged scripts keep their workers,
+which can then see those scripts' calls and values; a worker script served from the HTTP cache
+without a request never reaches the proxy, but any update check does; `importScripts` inside an
+already-running worker (not a registration) is not distinguishable by the proxy from the worker's
+own fetches for `Sec-Fetch-Dest` purposes and is covered only by unregistering. The backend still
+checks `Origin`, token, per-script grants and quotas on every call, so a stolen token stays limited
+to that script on that origin for its lifetime.
+
+### 6.2 Authority checks
 
 Hence the server enforces everything itself: authority comes from the stored script, not from
 the token; `@connect`, `@grant`, quotas and the destination policy are checked per request;

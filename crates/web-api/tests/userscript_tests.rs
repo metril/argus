@@ -547,7 +547,7 @@ async fn updating_an_installed_script_goes_through_plan_and_confirm() {
         .json(&json!({"allow_connect_all": true}))
         .await;
     assert_eq!(r.status_code(), StatusCode::CREATED);
-    let id = r.json::<Value>()["id"].as_str().unwrap().to_string();
+    let _id = r.json::<Value>()["id"].as_str().unwrap().to_string();
     // The new source adds a @require: the plan reports the update and that it needs approval,
     // and confirming fetches and stores the dependency.
     let up = src(
