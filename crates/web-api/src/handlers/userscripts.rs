@@ -1,33 +1,20 @@
-//! Userscript management handlers
-//!
-//! Provides endpoints for:
-//! - GET /api/userscripts - List all userscripts
-//! - POST /api/userscripts - Install new userscript
-//! - GET /api/userscripts/:id - Get userscript details
-//! - PUT /api/userscripts/:id - Update userscript
-//! - DELETE /api/userscripts/:id - Uninstall userscript
-//! - PUT /api/userscripts/:id/enabled - Enable/disable userscript
-//! - GET /api/userscripts/stats - Get userscript statistics
+//! Userscript management handlers.
 
-use crate::auth::middleware::AuthUser;
-use crate::error::{ApiError, ApiResult};
-use crate::state::AppState;
-use axum::{
-    extract::{Path, Query, State},
-    Extension, Json,
-};
-use serde::Deserialize;
-use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::info;
 
-// Wire-facing DTOs live in the shared `api-types` crate.
-pub use api_types::{
-    InstallUserscriptRequest, PaginatedResponse, SetEnabledRequest, UpdateUserscriptRequest,
-    UserscriptResponse, UserscriptStatsResponse,
+use api_types::{
+    InstallUserscriptRequest, MessageResponse, Page, SetEnabledRequest, UpdateUserscriptRequest,
+    UserscriptResponse, UserscriptSourceResponse, UserscriptStatsResponse,
 };
+use axum::{extract::State, http::StatusCode, Extension, Json};
+use serde::Deserialize;
+use tracing::info;
+use utoipa::IntoParams;
 
-/// Build a wire response from an engine userscript.
+use crate::auth::authz::Principal;
+use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
+use crate::state::AppState;
+
 fn userscript_response(script: &userscript_engine::Userscript) -> UserscriptResponse {
     UserscriptResponse {
         id: script.id.clone(),
@@ -43,277 +30,198 @@ fn userscript_response(script: &userscript_engine::Userscript) -> UserscriptResp
     }
 }
 
-/// Query params for listing userscripts
-#[derive(Debug, Deserialize)]
+fn not_found(id: &str) -> ApiError {
+    ApiError::NotFound(format!("Userscript '{id}' not found"))
+}
+
+fn get_script(state: &AppState, id: &str) -> ApiResult<userscript_engine::Userscript> {
+    state
+        .userscript_manager
+        .get(id)
+        .ok_or_else(|| not_found(id))
+}
+
+fn require_source(source: &str) -> ApiResult<()> {
+    if source.trim().is_empty() {
+        return Err(ApiError::ValidationError(
+            "Userscript source cannot be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListUserscriptsQuery {
+    /// Only enabled / only disabled scripts.
     pub enabled: Option<bool>,
     pub page: Option<u32>,
     pub limit: Option<u32>,
 }
 
-/// List all userscripts
-///
-/// GET /api/userscripts
+/// List userscripts.
+#[utoipa::path(
+    get, path = "/userscripts", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:read"])),
+    params(ListUserscriptsQuery),
+    responses((status = 200, description = "Userscripts", body = Page<UserscriptResponse>))
+)]
 pub async fn list_userscripts(
     State(state): State<Arc<AppState>>,
-    Extension(_auth_user): Extension<AuthUser>,
-    Query(query): Query<ListUserscriptsQuery>,
-) -> ApiResult<Json<PaginatedResponse<UserscriptResponse>>> {
-    let scripts = state.userscript_manager.get_all();
-
-    let page = query.page.unwrap_or(1).max(1);
-    let limit = query.limit.unwrap_or(50).min(100);
-
-    // Convert to responses
-    let script_responses: Vec<UserscriptResponse> =
-        scripts.iter().map(userscript_response).collect();
-
-    // Filter by enabled status if specified
-    let filtered: Vec<_> = if let Some(enabled) = query.enabled {
-        script_responses
-            .into_iter()
-            .filter(|s| s.enabled == enabled)
-            .collect()
-    } else {
-        script_responses
-    };
-
-    let total = filtered.len();
-
-    // Paginate
-    let start = ((page - 1) * limit) as usize;
-    let paginated: Vec<_> = filtered
-        .into_iter()
-        .skip(start)
-        .take(limit as usize)
+    ApiQuery(q): ApiQuery<ListUserscriptsQuery>,
+) -> ApiResult<Json<Page<UserscriptResponse>>> {
+    let all = state
+        .userscript_manager
+        .get_all()
+        .iter()
+        .map(userscript_response)
+        .filter(|s| q.enabled.is_none_or(|e| s.enabled == e))
         .collect();
+    Ok(Json(Page::from_vec(all, q.page, q.limit)))
+}
 
-    Ok(Json(PaginatedResponse {
-        data: paginated,
-        total,
-        page,
-        limit,
+/// Install a userscript from its source.
+#[utoipa::path(
+    post, path = "/userscripts", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:write"])),
+    request_body = InstallUserscriptRequest,
+    responses((status = 201, description = "Installed", body = UserscriptResponse))
+)]
+pub async fn install_userscript(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    ApiJson(req): ApiJson<InstallUserscriptRequest>,
+) -> ApiResult<(StatusCode, Json<UserscriptResponse>)> {
+    require_source(&req.source)?;
+    let id = state
+        .userscript_manager
+        .install(req.source)
+        .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
+    let script = get_script(&state, &id)?;
+    info!("Userscript {} installed by {}", id, p.username);
+    Ok((StatusCode::CREATED, Json(userscript_response(&script))))
+}
+
+/// Userscript statistics.
+#[utoipa::path(
+    get, path = "/userscripts/stats", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:read"])),
+    responses((status = 200, description = "Statistics", body = UserscriptStatsResponse))
+)]
+pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<UserscriptStatsResponse> {
+    let s = state.userscript_manager.stats();
+    Json(UserscriptStatsResponse {
+        total_scripts: s.total_scripts,
+        enabled_scripts: s.enabled_scripts,
+        disabled_scripts: s.disabled_scripts,
+        total_executions: s.total_executions,
+    })
+}
+
+/// Get one userscript.
+#[utoipa::path(
+    get, path = "/userscripts/{id}", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:read"])),
+    params(("id" = String, Path, description = "Userscript id")),
+    responses((status = 200, description = "Userscript", body = UserscriptResponse))
+)]
+pub async fn get_userscript(
+    State(state): State<Arc<AppState>>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<Json<UserscriptResponse>> {
+    Ok(Json(userscript_response(&get_script(&state, &id)?)))
+}
+
+/// Get a userscript's source.
+#[utoipa::path(
+    get, path = "/userscripts/{id}/source", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:read"])),
+    params(("id" = String, Path, description = "Userscript id")),
+    responses((status = 200, description = "Source", body = UserscriptSourceResponse))
+)]
+pub async fn get_userscript_source(
+    State(state): State<Arc<AppState>>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<Json<UserscriptSourceResponse>> {
+    let s = get_script(&state, &id)?;
+    Ok(Json(UserscriptSourceResponse {
+        id: s.id,
+        source: s.source,
     }))
 }
 
-/// Install a new userscript
-///
-/// POST /api/userscripts
-pub async fn install_userscript(
-    State(state): State<Arc<AppState>>,
-    Extension(auth_user): Extension<AuthUser>,
-    Json(req): Json<InstallUserscriptRequest>,
-) -> ApiResult<Json<UserscriptResponse>> {
-    // Check authorization
-    if !auth_user.role().can_modify() {
-        return Err(ApiError::AuthorizationFailed(
-            "Requires user or admin role to install userscripts".to_string(),
-        ));
-    }
-
-    // Validate source not empty
-    if req.source.trim().is_empty() {
-        return Err(ApiError::ValidationError(
-            "Userscript source cannot be empty".to_string(),
-        ));
-    }
-
-    // Install the userscript
-    let script_id = state
-        .userscript_manager
-        .install(req.source)
-        .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {}", e)))?;
-
-    // Get the installed script
-    let script = state
-        .userscript_manager
-        .get(&script_id)
-        .ok_or_else(|| ApiError::Internal("Failed to get installed script".to_string()))?;
-
-    info!(
-        "Userscript installed by {}: {} ({})",
-        auth_user.username(),
-        script.metadata.name,
-        script_id
-    );
-
-    Ok(Json(userscript_response(&script)))
-}
-
-/// Get a specific userscript
-///
-/// GET /api/userscripts/:id
-pub async fn get_userscript(
-    State(state): State<Arc<AppState>>,
-    Extension(_auth_user): Extension<AuthUser>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<UserscriptResponse>> {
-    let script = state
-        .userscript_manager
-        .get(&id)
-        .ok_or_else(|| ApiError::NotFound(format!("Userscript '{}' not found", id)))?;
-
-    Ok(Json(userscript_response(&script)))
-}
-
-/// Get userscript source code
-///
-/// GET /api/userscripts/:id/source
-pub async fn get_userscript_source(
-    State(state): State<Arc<AppState>>,
-    Extension(_auth_user): Extension<AuthUser>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
-    let script = state
-        .userscript_manager
-        .get(&id)
-        .ok_or_else(|| ApiError::NotFound(format!("Userscript '{}' not found", id)))?;
-
-    Ok(Json(json!({
-        "id": script.id,
-        "source": script.source
-    })))
-}
-
-/// Update a userscript
-///
-/// PUT /api/userscripts/:id
+/// Replace a userscript's source.
+#[utoipa::path(
+    put, path = "/userscripts/{id}", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:write"])),
+    params(("id" = String, Path, description = "Userscript id")),
+    request_body = UpdateUserscriptRequest,
+    responses((status = 200, description = "Updated", body = UserscriptResponse))
+)]
 pub async fn update_userscript(
     State(state): State<Arc<AppState>>,
-    Extension(auth_user): Extension<AuthUser>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateUserscriptRequest>,
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(req): ApiJson<UpdateUserscriptRequest>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    // Check authorization
-    if !auth_user.role().can_modify() {
-        return Err(ApiError::AuthorizationFailed(
-            "Requires user or admin role to update userscripts".to_string(),
-        ));
-    }
-
-    // Validate source not empty
-    if req.source.trim().is_empty() {
-        return Err(ApiError::ValidationError(
-            "Userscript source cannot be empty".to_string(),
-        ));
-    }
-
-    // Update the userscript
+    require_source(&req.source)?;
     state
         .userscript_manager
         .update(&id, req.source)
         .map_err(|e| match e {
-            userscript_engine::Error::ScriptNotFound(_) => {
-                ApiError::NotFound(format!("Userscript '{}' not found", id))
-            }
-            _ => ApiError::ValidationError(format!("Invalid userscript: {}", e)),
+            userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
+            _ => ApiError::ValidationError(format!("Invalid userscript: {e}")),
         })?;
-
-    // Get the updated script
-    let script = state
-        .userscript_manager
-        .get(&id)
-        .ok_or_else(|| ApiError::Internal("Failed to get updated script".to_string()))?;
-
-    info!(
-        "Userscript updated by {}: {} ({})",
-        auth_user.username(),
-        script.metadata.name,
-        id
-    );
-
-    Ok(Json(userscript_response(&script)))
+    info!("Userscript {id} updated by {}", p.username);
+    Ok(Json(userscript_response(&get_script(&state, &id)?)))
 }
 
-/// Uninstall a userscript
-///
-/// DELETE /api/userscripts/:id
+/// Uninstall a userscript.
+#[utoipa::path(
+    delete, path = "/userscripts/{id}", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:write"])),
+    params(("id" = String, Path, description = "Userscript id")),
+    responses((status = 200, description = "Uninstalled", body = MessageResponse))
+)]
 pub async fn uninstall_userscript(
     State(state): State<Arc<AppState>>,
-    Extension(auth_user): Extension<AuthUser>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<Value>> {
-    // Check authorization
-    if !auth_user.role().can_modify() {
-        return Err(ApiError::AuthorizationFailed(
-            "Requires user or admin role to uninstall userscripts".to_string(),
-        ));
-    }
-
-    // Uninstall the userscript
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<Json<MessageResponse>> {
     state
         .userscript_manager
         .uninstall(&id)
         .map_err(|e| match e {
-            userscript_engine::Error::ScriptNotFound(_) => {
-                ApiError::NotFound(format!("Userscript '{}' not found", id))
-            }
-            _ => ApiError::Internal(format!("Failed to uninstall: {}", e)),
+            userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
+            _ => ApiError::Internal(format!("Failed to uninstall: {e}")),
         })?;
-
-    info!("Userscript uninstalled by {}: {}", auth_user.username(), id);
-
-    Ok(Json(
-        json!({ "message": format!("Userscript '{}' uninstalled", id) }),
-    ))
+    info!("Userscript {id} uninstalled by {}", p.username);
+    Ok(Json(MessageResponse {
+        message: format!("Userscript '{id}' uninstalled"),
+    }))
 }
 
-/// Enable or disable a userscript
-///
-/// PUT /api/userscripts/:id/enabled
+/// Enable or disable a userscript.
+#[utoipa::path(
+    put, path = "/userscripts/{id}/enabled", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:write"])),
+    params(("id" = String, Path, description = "Userscript id")),
+    request_body = SetEnabledRequest,
+    responses((status = 200, description = "Updated", body = UserscriptResponse))
+)]
 pub async fn set_enabled(
     State(state): State<Arc<AppState>>,
-    Extension(auth_user): Extension<AuthUser>,
-    Path(id): Path<String>,
-    Json(req): Json<SetEnabledRequest>,
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(req): ApiJson<SetEnabledRequest>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    // Check authorization
-    if !auth_user.role().can_modify() {
-        return Err(ApiError::AuthorizationFailed(
-            "Requires user or admin role to modify userscripts".to_string(),
-        ));
-    }
-
-    // Set enabled status
     state
         .userscript_manager
         .set_enabled(&id, req.enabled)
         .map_err(|e| match e {
-            userscript_engine::Error::ScriptNotFound(_) => {
-                ApiError::NotFound(format!("Userscript '{}' not found", id))
-            }
-            _ => ApiError::Internal(format!("Failed to update: {}", e)),
+            userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
+            _ => ApiError::Internal(format!("Failed to update: {e}")),
         })?;
-
-    // Get the updated script
-    let script = state
-        .userscript_manager
-        .get(&id)
-        .ok_or_else(|| ApiError::Internal("Failed to get updated script".to_string()))?;
-
-    info!(
-        "Userscript {} {} by {}",
-        if req.enabled { "enabled" } else { "disabled" },
-        script.metadata.name,
-        auth_user.username()
-    );
-
-    Ok(Json(userscript_response(&script)))
-}
-
-/// Get userscript statistics
-///
-/// GET /api/userscripts/stats
-pub async fn get_stats(
-    State(state): State<Arc<AppState>>,
-    Extension(_auth_user): Extension<AuthUser>,
-) -> ApiResult<Json<UserscriptStatsResponse>> {
-    let stats = state.userscript_manager.stats();
-
-    Ok(Json(UserscriptStatsResponse {
-        total_scripts: stats.total_scripts,
-        enabled_scripts: stats.enabled_scripts,
-        disabled_scripts: stats.disabled_scripts,
-        total_executions: stats.total_executions,
-    }))
+    info!("Userscript {id} enabled={} by {}", req.enabled, p.username);
+    Ok(Json(userscript_response(&get_script(&state, &id)?)))
 }
