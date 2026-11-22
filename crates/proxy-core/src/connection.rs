@@ -187,7 +187,7 @@ impl ConnectionHandler {
                     ctx.policy().resolve(&host, port, ctx.resolve_all_to())
                 )
                 .await,
-                Ok(Err(Error::DestinationRefused(_)))
+                Ok(Err(crate::policy::ResolveError::Refused(_)))
             )
         };
         if refused {
