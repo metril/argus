@@ -399,23 +399,117 @@ pub async fn run_phase(client: Arc<TestClient>, cfg: &PhaseCfg, t0: Instant) -> 
                 }
             })
             .await;
-            let drain = Instant::now() + Duration::from_secs(35);
-            while inflight.load(Ordering::Relaxed) > 0 && Instant::now() < drain {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            drain(&inflight, DRAIN, &sink).await;
         }
     }
-    let wall = t0.elapsed();
-    let samples = std::mem::take(&mut *sink.samples.lock());
-    let errors = sink.errors.lock().clone();
+    collect(&sink, t0.elapsed())
+}
+
+/// How long a phase waits for outstanding requests after the last one was sent.
+pub const DRAIN: Duration = Duration::from_secs(35);
+
+/// Error key under which requests still outstanding when the drain gave up are counted.
+pub const UNFINISHED: &str = "request still in flight when the drain gave up";
+
+/// Wait up to `wait` for `inflight` to reach zero; whatever is still outstanding is a failure
+/// (those requests neither succeeded nor were measured), never silently nothing.
+async fn drain(inflight: &AtomicUsize, wait: Duration, sink: &Sink) {
+    let deadline = Instant::now() + wait;
+    while inflight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let left = inflight.load(Ordering::Relaxed) as u64;
+    if left > 0 {
+        *sink
+            .errors
+            .lock()
+            .entry(UNFINISHED.to_string())
+            .or_default() += left;
+    }
+}
+
+fn collect(sink: &Sink, wall: Duration) -> PhaseOut {
     PhaseOut {
-        samples,
+        samples: std::mem::take(&mut *sink.samples.lock()),
         ok: sink.ok.load(Ordering::Relaxed),
         rejected: sink.rejected.load(Ordering::Relaxed),
         dropped: sink.dropped.load(Ordering::Relaxed),
-        errors,
+        errors: sink.errors.lock().clone(),
         wall,
     }
+}
+
+/// Drive the direct and the proxied path in the same run: open loop, and on every scheduled tick
+/// the same request (same class and host) goes out on both paths, in alternating order, timed
+/// from the same scheduled instant. Both see the same host load and the same stalls, so the
+/// per-percentile difference between them is the proxy's cost, not drift between runs. Needs
+/// `Model::Open`; the rate is per path.
+pub async fn run_paired(
+    direct: (Arc<TestClient>, &PhaseCfg),
+    proxy: (Arc<TestClient>, &PhaseCfg),
+    t0: Instant,
+) -> (PhaseOut, PhaseOut) {
+    let Model::Open { rate, max_inflight } = proxy.1.model else {
+        panic!("paired runs need the open-loop model");
+    };
+    let (dsink, psink) = (Arc::new(Sink::default()), Arc::new(Sink::default()));
+    let (dcfg, pcfg) = (Arc::new(direct.1.clone()), Arc::new(proxy.1.clone()));
+    let total = (rate as f64 * pcfg.duration.as_secs_f64()) as u64;
+    let gap = 1e9 / rate as f64;
+    let inflight = Arc::new(AtomicUsize::new(0));
+    let handle = tokio::runtime::Handle::current();
+    let (dc, pc) = (direct.0, proxy.0);
+    let (ds, ps, inf) = (dsink.clone(), psink.clone(), inflight.clone());
+    let _ = tokio::task::spawn_blocking(move || {
+        for i in 0..total {
+            let sched = t0 + Duration::from_nanos((i as f64 * gap) as u64);
+            let wait = sched.saturating_duration_since(Instant::now());
+            if wait > Duration::from_micros(300) {
+                std::thread::sleep(wait - Duration::from_micros(200));
+            }
+            while Instant::now() < sched {
+                std::hint::spin_loop();
+            }
+            // `max_inflight` is per path; a pair is two requests.
+            if inf.load(Ordering::Relaxed) + 2 > 2 * max_inflight {
+                ds.dropped.fetch_add(1, Ordering::Relaxed);
+                ps.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            inf.fetch_add(2, Ordering::Relaxed);
+            let spawn_direct = |handle: &tokio::runtime::Handle| {
+                let (c, g, s, f) = (dc.clone(), dcfg.clone(), ds.clone(), inf.clone());
+                handle.spawn(async move {
+                    one(&c, &g, &s, i, t0, Some(sched)).await;
+                    f.fetch_sub(1, Ordering::Relaxed);
+                });
+            };
+            let spawn_proxy = |handle: &tokio::runtime::Handle| {
+                let (c, g, s, f) = (pc.clone(), pcfg.clone(), ps.clone(), inf.clone());
+                handle.spawn(async move {
+                    one(&c, &g, &s, i, t0, Some(sched)).await;
+                    f.fetch_sub(1, Ordering::Relaxed);
+                });
+            };
+            // Alternate who goes first so neither path owns the head of every pair.
+            if i % 2 == 0 {
+                spawn_direct(&handle);
+                spawn_proxy(&handle);
+            } else {
+                spawn_proxy(&handle);
+                spawn_direct(&handle);
+            }
+        }
+    })
+    .await;
+    // Unfinished requests are charged to both paths' failure counts (we cannot tell which).
+    drain(&inflight, DRAIN, &psink).await;
+    let left = psink.errors.lock().get(UNFINISHED).copied();
+    if let Some(n) = left {
+        dsink.errors.lock().insert(UNFINISHED.to_string(), n);
+    }
+    let wall = t0.elapsed();
+    (collect(&dsink, wall), collect(&psink, wall))
 }
 
 /// Touch every (class, host) once and fill the pools, then run the model for `warm` and drop
@@ -565,6 +659,8 @@ pub struct Measured {
     pub warm: PhaseOut,
     pub out: PhaseOut,
     pub reloads: Vec<ReloadEvent>,
+    /// Measured in a paired run (see [`run_paired`]) alongside the other path.
+    pub paired: bool,
 }
 
 impl Measured {
@@ -658,7 +754,43 @@ pub async fn measure(
         warm: warm_out,
         out,
         reloads,
+        paired: false,
     }
+}
+
+/// Warm both paths up, then measure direct and proxy in one paired open-loop run (see
+/// [`run_paired`]) with the optional reload scenario acting on the proxy. Returns
+/// `(direct, proxy)`.
+pub async fn measure_paired(
+    direct: (Arc<TestClient>, PhaseCfg),
+    proxy: (Arc<TestClient>, PhaseCfg),
+    warm: Duration,
+    reload: Option<ReloadCfg>,
+) -> (Measured, Measured) {
+    let dwarm = warm_up(direct.0.clone(), &direct.1, warm).await;
+    let pwarm = warm_up(proxy.0.clone(), &proxy.1, warm).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t0 = Instant::now();
+    let duration = proxy.1.duration;
+    let ctl = reload.map(|r| tokio::spawn(reload_loop(r, t0, duration)));
+    let (dout, pout) = run_paired((direct.0, &direct.1), (proxy.0, &proxy.1), t0).await;
+    let reloads = match ctl {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let mk = |path, cfg: PhaseCfg, warm, out, reloads| Measured {
+        proto: cfg.proto,
+        path,
+        cfg,
+        warm,
+        out,
+        reloads,
+        paired: true,
+    };
+    (
+        mk("direct", direct.1, dwarm, dout, Vec::new()),
+        mk("proxy", proxy.1, pwarm, pout, reloads),
+    )
 }
 
 /// Pin the calling thread to `cpus` (Linux only; a no-op elsewhere).
@@ -685,4 +817,23 @@ pub fn runtime(name: &str, threads: usize, cpus: Vec<usize>) -> tokio::runtime::
         b.on_thread_start(move || pin_current_thread(&cpus));
     }
     b.build().expect("runtime")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn requests_still_in_flight_when_the_drain_gives_up_are_failures() {
+        let sink = Sink::default();
+        let inflight = AtomicUsize::new(3);
+        drain(&inflight, Duration::from_millis(30), &sink).await;
+        let out = collect(&sink, Duration::ZERO);
+        assert_eq!(out.errors.get(UNFINISHED), Some(&3));
+        assert!(out.failed());
+        // Nothing outstanding: nothing counted.
+        let sink = Sink::default();
+        drain(&AtomicUsize::new(0), Duration::from_millis(30), &sink).await;
+        assert!(!collect(&sink, Duration::ZERO).failed());
+    }
 }

@@ -4,21 +4,33 @@
 latency direct (client to origin) and through the MITM proxy (client, CONNECT, interception, origin)
 over HTTP/1.1 and HTTP/2. Output is one JSON object with `--json`.
 
-## Reproduce `baseline-2026-11-22.json`
+## Method: paired runs
+
+Added latency is measured with `--paired`: direct and proxy are driven in the **same run**. On every
+scheduled tick the same request (same class and host) goes out on both paths, in alternating order,
+timed from the same scheduled instant, so both see the same host load and the same stalls. The
+quoted number is the per-percentile delta (proxy minus direct) inside the run. Subtracting the p99
+of two separate runs (the earlier method, still available without `--paired`) mixes in whatever
+the host did between them and is not used for conclusions. `--paired` needs `--model open`; the
+rate is per path (so the host carries twice that load) and `--max-inflight` is per path.
 
 Quiet machine, nothing else running (not alongside the test suite):
 
     cargo build --release -p e2e --bin loadgen
-    # steady state: open loop 3000 req/s, 10 s measured after 3 s warm-up, 3 runs
-    cargo run --release -p e2e --bin loadgen -- --model open --rate 3000 --duration 10 \
-        --warmup 3 --repeat 3 --json > steady.json
+    # steady state: open loop 3000 req/s per path, 10 s measured after 3 s warm-up, 5 rounds
+    cargo run --release -p e2e --bin loadgen -- --paired --model open --rate 3000 --duration 10 \
+        --warmup 3 --repeat 5 --json > steady.json
     # list reload: 100k-rule list rebuilt and swapped in every 5 s under the same load; each
     # reload stores the list as custom rules and runs the real list service's `reload_now`, so
     # parse, compile and install run on its dedicated build pool (`--build-threads N` sizes it)
-    cargo run --release -p e2e --bin loadgen -- --scenario reload --model open --rate 3000 \
-        --duration 32 --warmup 3 --reload-interval 5 --json > reload.json
+    cargo run --release -p e2e --bin loadgen -- --scenario reload --paired --model open \
+        --rate 3000 --duration 32 --warmup 3 --reload-interval 5 --repeat 5 --json > reload.json
 
-The file holds `{"steady": <steady.json>, "reload": <reload.json>}`.
+The in-process proxy runs with the shipped admission settings (`connection_rate_limit` 10000/s,
+`max_connections` derived from the descriptor limit), so the real admission path is part of what
+is measured; `--connection-rate-limit N` raises or removes the limit (0 = unlimited).
+A request still outstanding when the 35 s drain gives up is counted as an error (the run fails);
+it is never dropped silently.
 
 ## How it measures
 
@@ -74,25 +86,48 @@ reads the process memory from `/proc` per connection (it refreshes at most once 
 * Micro-benchmark: `cargo bench -p proxy-core --bench proxy_bench -- admission`: 12.5 us before
   the `/proc` fix, 0.70 us after, per admit+release per thread with 8 threads contending.
 
-## Results 2026-11-22 (`results-2026-11-22.json`)
+## Results 2026-11-22 (`results-2026-11-22.json`, key `paired_rerun`)
 
-`master` (phase 5) vs `p6-performance`, binaries interleaved, 5 rounds, open loop 3000 req/s, 10 s
-measured, 3 s warm-up, 50k generated rules. Medians with min..max. The host was **not quiet** (about
-35% CPU of other projects' niced processes, load average 3-6, spikes above 10): single runs show
-50-350 ms stalls even on the direct path, which is where the wide ranges come from.
+Paired method, 10 rounds (two batches of 5), open loop 3000 req/s per path, 10 s measured (32 s for
+reload), 3 s warm-up, 50k generated rules, shipped admission settings. Medians with min..max.
+"Quiet rounds" are those where the **direct** path's own p99 stayed under 2 ms and nothing was
+dropped; in the other rounds the direct path itself showed 100-250 ms stalls, i.e. the host, not
+the proxy. Every request in every round succeeded (0 errors, 0 rejected); 3 steady and 4 reload
+rounds (all h1) dropped requests during such stalls and are flagged failed by loadgen.
 
-| Measurement | Target | master | p6-performance | |
+**The host was not quiet**: unrelated background workloads (about 1% CPU
+each, 8-12% nice, 23-28% system), load average 2.1-9.3 during the
+runs; `uptime` and the top CPU consumers before and after every batch are in the JSON. Nothing
+was stopped or paused.
+
+| Measurement | Target | All rounds | Quiet rounds | Verdict |
 |---|---|---|---|---|
-| Added p99, h1 (proxy - direct, ms) | < 2 | 0.76 (0.41..73) | 0.35 (-77..58) | met at the median |
-| Added p99, h2 (ms) | < 2 | 0.55 (0.46..0.86) | 0.59 (0.40..3.6) | met |
-| Proxy p99.9, h1 / h2 (ms) | | 13.2 (3.8..130) / 4.0 (2.5..10.2) | 3.0 (1.6..111) / 11.6 (1.9..25) | noise-dominated |
-| Reload, around p99 / steady p99, h1 | <= 1.2 | 1.51 (1.12..1.85) | 0.92 (0.04..2.16); second run 0.62 | met at the median |
-| Reload, around p99 / steady p99, h2 | <= 1.2 | 1.41 (1.18..1.94) | 1.61 (0.91..1.80); second run 1.11 (0.98..1.86) | not met reliably |
-| Reload, around-window max, h1 / h2 (ms) | < 10 | 6.7 / 6.3 | 5.9 (3.2..17) / 8.4 (3.9..25) | median met, range not |
-| Engine check, real lists (EasyList + EasyPrivacy) | < 5 us | | blocked 3.4-3.8 us, allowed miss 5.0, long URL 5.9, third-party script 6.1 | not met for allowed requests |
-| Admission, 8 threads (bench) | | | 0.71 us per admit+release | |
-| Admission e2e (release, ignored tests) | | | 2 passed | |
-| `profiles_bench` resolve / per request | ~20 / ~27 ns | | 21.0 / 28.3 ns | no regression |
+| Added p99, h1 (ms) | < 2 | 23.7 (0.34..54.9) | 0.44 (0.34..0.45), 3 of 10 rounds | met when the host is quiet; **cannot be decided on this machine** (7 of 10 rounds contain 100+ ms host stalls on the direct path) |
+| Added p99, h2 (ms) | < 2 | 0.59 (0.42..3.8) | 0.49 (0.42..1.26), 6 of 10 | met at the median; one round (3.8, direct p99 11 ms) missed by noise |
+| Added p50 / p90, h1 (ms) | | 0.18 / 0.30 | | stable across all rounds (0.16..0.19 / 0.27..0.32) |
+| Added p50 / p90, h2 (ms) | | 0.18 / 0.28 | | stable across all rounds |
+| Proxy p99.9, h1 / h2 (ms) | | 216 (3.9..409) / 24 (2.0..43) | 7.0 / 16 | noise-dominated; quiet-round values are 3-8x the direct path's |
+| Reload, around p99 / steady p99, h1 | <= 1.2 | 0.06 (0.01..1.73) | 1.09 (0.08..1.73), 5 of 10 | **not met reliably**; steady p99 in noisy rounds is host stalls, so the ratio is meaningless there |
+| Reload, around p99 / steady p99, h2 | <= 1.2 | 0.99 (0.83..1.21) | 1.00 (0.83..1.21), 9 of 10 | met at the median, top of range just above |
+| Reload, around-window max, h1 (ms) | < 10 | 6.6 (2.9..15.2) | 6.5 (2.9..10.1) | median met; range not |
+| Reload, around-window max, h2 (ms) | < 10 | 11.2 (3.2..17.1) | 10.8 (3.2..16.5) | **missed** (median above 10) |
+| Reload, added p99 during the scenario, h1 / h2 (ms) | < 2 | 1.37 (0.43..3.7) / 0.55 (0.46..0.89) | 0.49 / 0.55 | h2 met; h1 met when quiet |
+| Reload build, 100k rules (ms) | | 223 (212..232) h1 / 227 (222..238) h2 | | |
+| Engine check, real lists (EasyList + EasyPrivacy) | < 5 us | blocked 3.5-3.8 us; allowed miss 5.2, long URL 6.0, third-party script 6.1 | | **missed** for allowed requests (5.0-6.1 us against 5 us); 60-75% of it is inside adblock-rust's matcher, which this project does not control |
+| Overlay profile, check path (criterion) | | allowed 2.60 -> 1.82 us, base-blocked 3.75 -> 2.02, document 5.49 -> 4.81 | | one adblock request per check instead of two or three |
+| Admission, 8 threads (bench) | | 0.71 us per admit+release | | carried over from the earlier run, not re-measured |
+| Admission e2e (release, ignored tests) | | 2 passed | | carried over, not re-run |
+| `profiles_bench` resolve / per request | ~20 / ~27 ns | 21.0 / 28.3 ns | | carried over, not re-measured |
+
+Summary. **Met**: added p99 on h2; added p99 on h1 whenever the host is quiet; reload ratio on h2
+at the median. **Missed**: reload around-window max on h2 (< 10 ms); engine check on allowed
+requests (5.0-6.1 us vs 5 us). **Not decidable here**: added p99 h1 in the presence of the other
+project's load (the direct path alone shows 100+ ms p99 in 7 of 10 rounds), reload ratio on h1,
+p99.9 on both. They need a quiet machine; rerun the commands above there.
+
+The earlier unpaired table (master vs p6-performance, separate direct and proxy runs) is kept in the
+JSON under `steady`/`reload` but superseded: its "added p99" subtracted p99 values from different
+runs.
 
 Reload build time (100k rules, through the list service's build pool) is about 230 ms on both
 commits. A sweep of `--build-threads 1/2/4` (h2, 4 rounds) gave ratios 0.92 / 0.81 / 1.19 and the

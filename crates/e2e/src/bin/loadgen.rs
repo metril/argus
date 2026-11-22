@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use e2e::loadgen::{
-    generate_list, measure, pin_current_thread, runtime, setup_origin, Measured, Model, PhaseCfg,
-    Proto, ReloadCfg, Workload, CLASSES,
+    generate_list, measure, measure_paired, pin_current_thread, runtime, setup_origin, Measured,
+    Model, PhaseCfg, Proto, ReloadCfg, Workload, CLASSES,
 };
 use e2e::{EntryMode, TestClient, TestOrigin, TestProxy};
 use serde_json::{json, Value};
@@ -19,6 +19,12 @@ const HELP: &str = "loadgen: proxy latency load generator
   --model closed|open      load model (default closed)
   --conns N                closed loop: connections (h1) / concurrent streams (h2) (default 16)
   --rate R                 open loop: requests per second (default 2000)
+  --paired                 measure direct and proxy in the SAME run: every scheduled request goes
+                           out on both paths, interleaved; added latency is the per-percentile
+                           delta of that run (needs --model open; the rate is per path). This is
+                           the method to quote: separate runs drift with host load
+  --connection-rate-limit N  in-process proxy admission rate (default: the shipped 10000/s, so the
+                           real admission path is measured; 0 = unlimited)
   --max-inflight N         open loop: outstanding cap, beyond it requests count as dropped (512)
   --duration S             measured seconds (default 10)
   --warmup S               warm-up seconds, excluded (default 3)
@@ -67,6 +73,8 @@ struct Args {
     pin: bool,
     json: bool,
     print_list: bool,
+    paired: bool,
+    rate_limit: Option<u32>,
 }
 
 fn parse() -> Result<Args, String> {
@@ -94,6 +102,8 @@ fn parse() -> Result<Args, String> {
         pin: true,
         json: false,
         print_list: false,
+        paired: false,
+        rate_limit: None,
     };
     let (mut open, mut conns, mut rate, mut inflight) = (false, 16usize, 2000u32, 512usize);
     let mut it = std::env::args().skip(1);
@@ -105,6 +115,8 @@ fn parse() -> Result<Args, String> {
             "--json" => a.json = true,
             "--print-list" => a.print_list = true,
             "--no-pin" => a.pin = false,
+            "--paired" => a.paired = true,
+            "--connection-rate-limit" => a.rate_limit = Some(num(val()?)? as u32),
             "--proto" => {
                 a.protos = val()?
                     .split(',')
@@ -181,7 +193,12 @@ fn parse() -> Result<Args, String> {
     if a.proxy_addr.is_some() && (a.reload || a.mode == EntryMode::Transparent) {
         return Err("external proxy: explicit mode, no reload scenario".into());
     }
-    if a.reload {
+    if a.paired {
+        if !open {
+            return Err("--paired needs --model open".into());
+        }
+        a.paths = vec!["direct", "proxy"];
+    } else if a.reload {
         a.paths = vec!["proxy"];
     }
     Ok(a)
@@ -269,8 +286,13 @@ fn run(a: Args) -> i32 {
     let inproc = if want_proxy && a.proxy_addr.is_none() {
         let p = proxy_rt
             .block_on(TestProxy::start_tweaked(a.mode, &origin, &[], &|c| {
-                c.performance.max_connections = 10_000;
-                c.performance.connection_rate_limit = Some(1_000_000);
+                // The shipped admission settings unless asked otherwise: the real admission
+                // path is part of what is measured.
+                c.performance.max_connections = 0;
+                c.performance.connection_rate_limit = Some(
+                    a.rate_limit
+                        .unwrap_or(proxy_core::load_manager::DEFAULT_CONNECTION_RATE_LIMIT),
+                );
             }))
             .expect("start proxy");
         let t = Instant::now();
@@ -320,6 +342,44 @@ fn run(a: Args) -> i32 {
     for run in 0..a.repeat {
         let mut results: Vec<Measured> = Vec::new();
         for proto in &a.protos {
+            if a.paired {
+                eprintln!("run {} {} paired ...", run + 1, proto.name());
+                let mk_cfg = |proxied: bool| PhaseCfg {
+                    proto: *proto,
+                    model: a.model,
+                    duration: Duration::from_secs(a.duration),
+                    workload: workload.clone(),
+                    port: origin.https_port(),
+                    proxied,
+                };
+                let direct = Arc::new(TestClient::direct(&origin, proto.version()));
+                let proxy = Arc::new(match &inproc {
+                    Some(p) => TestClient::new(p, proto.version()),
+                    None => TestClient::explicit(
+                        &format!("http://{}", a.proxy_addr.as_ref().unwrap()),
+                        ext_ca.as_ref().unwrap(),
+                        proto.version(),
+                    ),
+                });
+                let (d, p) = load_rt.block_on(measure_paired(
+                    (direct, mk_cfg(false)),
+                    (proxy, mk_cfg(true)),
+                    Duration::from_secs(a.warmup),
+                    reload.clone(),
+                ));
+                for m in [&d, &p] {
+                    if m.failed() {
+                        failed = true;
+                        eprintln!(
+                            "  FAILED {}: errors {:?} rejected {} dropped {} warmup {:?}",
+                            m.path, m.out.errors, m.out.rejected, m.out.dropped, m.warm.errors
+                        );
+                    }
+                }
+                results.push(d);
+                results.push(p);
+                continue;
+            }
             for path in &a.paths {
                 eprintln!("run {} {} {path} ...", run + 1, proto.name());
                 let client = Arc::new(match (*path, &inproc) {
@@ -372,6 +432,9 @@ fn run(a: Args) -> i32 {
             Model::Open { rate, max_inflight } =>
                 json!({"kind": "open", "rate": rate, "max_inflight": max_inflight}),
         },
+        "paired": a.paired,
+        "connection_rate_limit": a.rate_limit
+            .unwrap_or(proxy_core::load_manager::DEFAULT_CONNECTION_RATE_LIMIT),
         "duration_s": a.duration, "warmup_s": a.warmup, "repeat": a.repeat,
         "mix": CLASSES.iter().map(|c| (c.name(), a.mix[*c as usize])).collect::<std::collections::BTreeMap<_, _>>(),
         "hosts_per_class": a.hosts, "list_lines": list_text.lines().count(),
@@ -439,6 +502,7 @@ fn run_json(run: usize, results: &[Measured]) -> Value {
             deltas.push(
                 json!({"proto": proto.name(), "added_latency": p.lat().delta_json(&d.lat()),
                 "added_latency_by_class": by_class,
+                "method": if d.paired { "paired (same run, interleaved)" } else { "separate runs" },
                 "note": "blocked: proxy answers locally; direct goes to the origin"}),
             );
         }

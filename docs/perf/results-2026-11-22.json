@@ -943,5 +943,530 @@
   "master = 7f9efb7 (phase 5 merge) with the loadgen crate sources overlaid (bin, loadgen.rs, client/origin/proxy helpers) and two e2e helper lines removed (dns, load_manager); the reload scenario runs through the real list service on both.",
   "Engine check was not changed: a request-parse bypass was tried and measured at no gain, the matcher itself is 3.4-4.3 us of the 5-6 us on misses and is out of scope.",
   "mimalloc left out: +8% closed-loop throughput, but +24% peak RSS (beyond the spread); open-loop p99 is noise-dominated."
- ]
+ ],
+ "superseded_note": "'steady' and 'reload' above are the earlier separate-run (unpaired) measurements; the paired method below replaces them as the quoted numbers",
+ "paired_rerun": {
+  "date": "2026-11-22",
+  "method": "loadgen --paired: direct and proxy driven in the same run, every scheduled request sent on both paths (alternating order, same scheduled instant); added latency = per-percentile delta within the run. Open loop 3000 req/s per path, 10 s measured (steady) / 32 s with a 100k-rule reload every 5 s (reload), 3 s warm-up, 50k generated rules, in-process proxy with the shipped admission settings (rate limit 10000/s, max_connections derived). 10 rounds each (two batches of 5). Commit: p6-performance after the review fixes. 'quiet rounds' = rounds whose direct-path p99 stayed under 2 ms and no request was dropped; the other rounds contain host stalls of 100+ ms on the direct path itself.",
+  "machine": "8 logical CPUs (4 cores, SMT), shared host; unrelated background workloads running throughout (none of it touched); load average 2.1-9.3 during the runs, CPU about 60-69% idle, 23-28% system, 8-12% nice",
+  "machine_load": [
+   {
+    "at": "before-steady 17:26:48",
+    "top_cpu": [
+     "other process 7.9%cpu",
+     "kworker+ pid 4139541 nice 0 3.4%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:26:48 up 8 days,  5:40,  6 users,  load average: 9.33, 6.95, 7.70"
+   },
+   {
+    "at": "after-steady 17:29:33",
+    "top_cpu": [
+     "top pid 183102 nice 17 1.9%cpu",
+     "other process 1.5%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:29:33 up 8 days,  5:43,  6 users,  load average: 4.02, 5.55, 7.04"
+   },
+   {
+    "at": "before-reload 17:29:35",
+    "top_cpu": [
+     "other process 1.0%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:29:35 up 8 days,  5:43,  6 users,  load average: 4.26, 5.58, 7.03"
+   },
+   {
+    "at": "after-reload 17:36:00",
+    "top_cpu": [
+     "other process 8.8%cpu",
+     "kworker+ pid 3070240 nice 0 4.4%cpu",
+     "kworker+ pid 1347017 nice 0 3.9%cpu",
+     "top pid 738979 nice 17 2.0%cpu"
+    ],
+    "uptime": "17:36:00 up 8 days,  5:49,  6 users,  load average: 4.41, 4.25, 5.89"
+   },
+   {
+    "at": "before-steady 17:36:13",
+    "top_cpu": [
+     "other process 11.8%cpu",
+     "top pid 756636 nice 17 1.0%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:36:13 up 8 days,  5:49,  6 users,  load average: 3.98, 4.16, 5.84"
+   },
+   {
+    "at": "after-steady 17:38:58",
+    "top_cpu": [
+     "top pid 993199 nice 17 1.0%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:38:58 up 8 days,  5:52,  6 users,  load average: 3.38, 3.59, 5.33"
+   },
+   {
+    "at": "before-reload 17:39:00",
+    "top_cpu": [
+     "top pid 996314 nice 17 2.0%cpu",
+     "other process 1.5%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:39:00 up 8 days,  5:52,  6 users,  load average: 3.43, 3.59, 5.32"
+   },
+   {
+    "at": "after-reload 17:45:25",
+    "top_cpu": [
+     "top pid 1548690 nice 17 2.0%cpu",
+     "other process 1.5%cpu",
+     "other process 1.0%cpu",
+     "other process 1.0%cpu"
+    ],
+    "uptime": "17:45:25 up 8 days,  5:58,  6 users,  load average: 2.75, 3.33, 4.61"
+   }
+  ],
+  "results": {
+   "steady": {
+    "h1": {
+     "all_rounds": {
+      "rounds": 10,
+      "added_p50_ms": {
+       "median": 0.176,
+       "min": 0.163,
+       "max": 0.191,
+       "runs": 10
+      },
+      "added_p90_ms": {
+       "median": 0.304,
+       "min": 0.266,
+       "max": 0.316,
+       "runs": 10
+      },
+      "added_p99_ms": {
+       "median": 23.68,
+       "min": 0.338,
+       "max": 54.912,
+       "runs": 10
+      },
+      "added_p99_9_ms": {
+       "median": 26.112,
+       "min": 1.044,
+       "max": 40.448,
+       "runs": 10
+      },
+      "direct_p99_ms": {
+       "median": 109.791,
+       "min": 0.816,
+       "max": 248.447,
+       "runs": 10
+      },
+      "proxy_p99_ms": {
+       "median": 135.743,
+       "min": 1.255,
+       "max": 303.359,
+       "runs": 10
+      },
+      "proxy_p99_9_ms": {
+       "median": 215.679,
+       "min": 3.943,
+       "max": 409.087,
+       "runs": 10
+      },
+      "proxy_max_ms": {
+       "median": 279.807,
+       "min": 6.695,
+       "max": 475.647,
+       "runs": 10
+      },
+      "rounds_with_dropped_requests": 3,
+      "errors_total": 0
+     },
+     "quiet_rounds_direct_p99_lt_2ms": {
+      "rounds": 3,
+      "added_p50_ms": {
+       "median": 0.169,
+       "min": 0.163,
+       "max": 0.177,
+       "runs": 3
+      },
+      "added_p90_ms": {
+       "median": 0.267,
+       "min": 0.266,
+       "max": 0.269,
+       "runs": 3
+      },
+      "added_p99_ms": {
+       "median": 0.439,
+       "min": 0.338,
+       "max": 0.446,
+       "runs": 3
+      },
+      "added_p99_9_ms": {
+       "median": 1.078,
+       "min": 1.044,
+       "max": 1.196,
+       "runs": 3
+      },
+      "direct_p99_ms": {
+       "median": 0.866,
+       "min": 0.816,
+       "max": 1.2,
+       "runs": 3
+      },
+      "proxy_p99_ms": {
+       "median": 1.312,
+       "min": 1.255,
+       "max": 1.538,
+       "runs": 3
+      },
+      "proxy_p99_9_ms": {
+       "median": 7.027,
+       "min": 3.943,
+       "max": 8.067,
+       "runs": 3
+      },
+      "proxy_max_ms": {
+       "median": 12.247,
+       "min": 6.695,
+       "max": 13.303,
+       "runs": 3
+      },
+      "rounds_with_dropped_requests": 0,
+      "errors_total": 0
+     }
+    },
+    "h2": {
+     "all_rounds": {
+      "rounds": 10,
+      "added_p50_ms": {
+       "median": 0.178,
+       "min": 0.173,
+       "max": 0.215,
+       "runs": 10
+      },
+      "added_p90_ms": {
+       "median": 0.283,
+       "min": 0.26,
+       "max": 0.485,
+       "runs": 10
+      },
+      "added_p99_ms": {
+       "median": 0.594,
+       "min": 0.421,
+       "max": 3.792,
+       "runs": 10
+      },
+      "added_p99_9_ms": {
+       "median": 4.856,
+       "min": 0.819,
+       "max": 14.2,
+       "runs": 10
+      },
+      "direct_p99_ms": {
+       "median": 1.404,
+       "min": 0.82,
+       "max": 11.319,
+       "runs": 10
+      },
+      "proxy_p99_ms": {
+       "median": 2.346,
+       "min": 1.241,
+       "max": 15.111,
+       "runs": 10
+      },
+      "proxy_p99_9_ms": {
+       "median": 23.983,
+       "min": 2.025,
+       "max": 42.847,
+       "runs": 10
+      },
+      "proxy_max_ms": {
+       "median": 35.063,
+       "min": 4.827,
+       "max": 55.327,
+       "runs": 10
+      },
+      "rounds_with_dropped_requests": 0,
+      "errors_total": 0
+     },
+     "quiet_rounds_direct_p99_lt_2ms": {
+      "rounds": 6,
+      "added_p50_ms": {
+       "median": 0.179,
+       "min": 0.176,
+       "max": 0.215,
+       "runs": 6
+      },
+      "added_p90_ms": {
+       "median": 0.283,
+       "min": 0.26,
+       "max": 0.485,
+       "runs": 6
+      },
+      "added_p99_ms": {
+       "median": 0.493,
+       "min": 0.421,
+       "max": 1.257,
+       "runs": 6
+      },
+      "added_p99_9_ms": {
+       "median": 2.26,
+       "min": 0.819,
+       "max": 11.96,
+       "runs": 6
+      },
+      "direct_p99_ms": {
+       "median": 1.096,
+       "min": 0.82,
+       "max": 1.658,
+       "runs": 6
+      },
+      "proxy_p99_ms": {
+       "median": 1.56,
+       "min": 1.241,
+       "max": 2.915,
+       "runs": 6
+      },
+      "proxy_p99_9_ms": {
+       "median": 16.067,
+       "min": 2.025,
+       "max": 27.183,
+       "runs": 6
+      },
+      "proxy_max_ms": {
+       "median": 25.543,
+       "min": 4.827,
+       "max": 42.623,
+       "runs": 6
+      },
+      "rounds_with_dropped_requests": 0,
+      "errors_total": 0
+     }
+    }
+   },
+   "reload": {
+    "h1": {
+     "all_rounds": {
+      "rounds": 10,
+      "added_p99_ms": {
+       "median": 1.367,
+       "min": 0.433,
+       "max": 3.712,
+       "runs": 10
+      },
+      "around_p99_over_steady_p99": {
+       "median": 0.055,
+       "min": 0.01,
+       "max": 1.733,
+       "runs": 10
+      },
+      "steady_p99_ms": {
+       "median": 44.671,
+       "min": 1.188,
+       "max": 117.887,
+       "runs": 10
+      },
+      "around_p99_ms": {
+       "median": 1.309,
+       "min": 1.228,
+       "max": 2.523,
+       "runs": 10
+      },
+      "around_max_ms": {
+       "median": 6.565,
+       "min": 2.949,
+       "max": 15.231,
+       "runs": 10
+      },
+      "swap_max_ms": {
+       "median": 8.801,
+       "min": 2.949,
+       "max": 25.791,
+       "runs": 10
+      },
+      "build_ms": {
+       "median": 222.632,
+       "min": 212.27,
+       "max": 231.817,
+       "runs": 10
+      },
+      "rounds_with_dropped_requests": 4,
+      "errors_total": 0
+     },
+     "quiet_rounds_direct_p99_lt_2ms": {
+      "rounds": 5,
+      "added_p99_ms": {
+       "median": 0.486,
+       "min": 0.433,
+       "max": 0.814,
+       "runs": 5
+      },
+      "around_p99_over_steady_p99": {
+       "median": 1.092,
+       "min": 0.076,
+       "max": 1.733,
+       "runs": 5
+      },
+      "steady_p99_ms": {
+       "median": 1.332,
+       "min": 1.188,
+       "max": 16.575,
+       "runs": 5
+      },
+      "around_p99_ms": {
+       "median": 1.351,
+       "min": 1.247,
+       "max": 2.309,
+       "runs": 5
+      },
+      "around_max_ms": {
+       "median": 6.471,
+       "min": 2.949,
+       "max": 10.127,
+       "runs": 5
+      },
+      "swap_max_ms": {
+       "median": 6.471,
+       "min": 2.949,
+       "max": 25.791,
+       "runs": 5
+      },
+      "build_ms": {
+       "median": 221.6,
+       "min": 212.27,
+       "max": 225.108,
+       "runs": 5
+      },
+      "rounds_with_dropped_requests": 0,
+      "errors_total": 0
+     }
+    },
+    "h2": {
+     "all_rounds": {
+      "rounds": 10,
+      "added_p99_ms": {
+       "median": 0.548,
+       "min": 0.464,
+       "max": 0.888,
+       "runs": 10
+      },
+      "around_p99_over_steady_p99": {
+       "median": 0.986,
+       "min": 0.83,
+       "max": 1.214,
+       "runs": 10
+      },
+      "steady_p99_ms": {
+       "median": 1.638,
+       "min": 1.324,
+       "max": 3.721,
+       "runs": 10
+      },
+      "around_p99_ms": {
+       "median": 1.493,
+       "min": 1.272,
+       "max": 3.099,
+       "runs": 10
+      },
+      "around_max_ms": {
+       "median": 11.175,
+       "min": 3.167,
+       "max": 17.087,
+       "runs": 10
+      },
+      "swap_max_ms": {
+       "median": 11.175,
+       "min": 3.875,
+       "max": 18.287,
+       "runs": 10
+      },
+      "build_ms": {
+       "median": 227.097,
+       "min": 221.681,
+       "max": 237.923,
+       "runs": 10
+      },
+      "rounds_with_dropped_requests": 0,
+      "errors_total": 0
+     },
+     "quiet_rounds_direct_p99_lt_2ms": {
+      "rounds": 9,
+      "added_p99_ms": {
+       "median": 0.55,
+       "min": 0.464,
+       "max": 0.888,
+       "runs": 9
+      },
+      "around_p99_over_steady_p99": {
+       "median": 0.997,
+       "min": 0.83,
+       "max": 1.214,
+       "runs": 9
+      },
+      "steady_p99_ms": {
+       "median": 1.461,
+       "min": 1.324,
+       "max": 2.399,
+       "runs": 9
+      },
+      "around_p99_ms": {
+       "median": 1.479,
+       "min": 1.272,
+       "max": 2.667,
+       "runs": 9
+      },
+      "around_max_ms": {
+       "median": 10.791,
+       "min": 3.167,
+       "max": 16.495,
+       "runs": 9
+      },
+      "swap_max_ms": {
+       "median": 10.791,
+       "min": 3.875,
+       "max": 18.287,
+       "runs": 9
+      },
+      "build_ms": {
+       "median": 227.471,
+       "min": 221.681,
+       "max": 237.923,
+       "runs": 9
+      },
+      "rounds_with_dropped_requests": 0,
+      "errors_total": 0
+     }
+    }
+   }
+  },
+  "engine_check_real_lists_us": {
+   "blocked_host": 3.85,
+   "blocked_path": 3.53,
+   "allowed_miss": 5.16,
+   "allowed_long": 6.0,
+   "third_party_script": 6.08,
+   "note": "criterion medians, EasyList + EasyPrivacy, load average 3.5-4.3; 60-75% of an allowed check is adblock-rust's matcher"
+  },
+  "overlay_path_us": {
+   "allowed_script": {
+    "separate": 2.6,
+    "shared": 1.82
+   },
+   "base_blocked_image": {
+    "separate": 3.75,
+    "shared": 2.02
+   },
+   "document": {
+    "separate": 5.49,
+    "shared": 4.81
+   },
+   "note": "criterion, filter-engine bench overlay_path: base + overlay + exception probe + site_off pair built with one adblock request per layer (separate) vs one shared Query (shared)"
+  }
+ }
 }
