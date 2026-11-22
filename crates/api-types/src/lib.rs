@@ -20,6 +20,9 @@ pub use more::*;
 mod policy;
 pub use policy::*;
 
+pub mod profiles;
+pub use profiles::*;
+
 mod userscripts;
 pub use userscripts::*;
 

@@ -29,7 +29,10 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 
 # Destination policy: CIDRs, interface addresses, guarded DNS resolver for reqwest
-ipnet = "2.9"
+ipnet = { version = "2.9", features = ["serde"] }
+blake3 = "1.5"
+base64 = "0.22"
+rand = { workspace = true }
 libc = "0.2"
 reqwest = { workspace = true }
 tokio = { workspace = true }
