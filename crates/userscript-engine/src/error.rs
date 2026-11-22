@@ -31,6 +31,9 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Database error: {0}")]
+    Db(#[from] common::db::DbError),
+
     #[error("URL parse error: {0}")]
     UrlParse(#[from] url::ParseError),
 }
