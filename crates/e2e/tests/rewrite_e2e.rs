@@ -927,6 +927,36 @@ e2e_test!(
     }
 );
 
+// The HTML rewriter has a fixed memory budget. A tag it must inspect that outgrows it (a
+// multi-megabyte attribute on an element a rule selects) cannot be rewritten, and the part of the
+// document already sent cannot be taken back: the response is aborted (the browser sees a failed
+// load), never ended as a complete-looking 200 with a truncated body.
+e2e_test!(
+    rewriter_memory_limit_aborts_the_response,
+    rules = ["rw.test##^div.ad"],
+    |env| {
+        let huge = "a".repeat(4 * 1024 * 1024);
+        let page = format!(
+            "<!DOCTYPE html><html><head></head><body><p>before</p><div class=\"ad\" data-x=\"{huge}\">x</div><p>after</p></body></html>"
+        );
+        env.origin.route("/big", MockResponse::html(page.clone()));
+        env.origin.route("/p", MockResponse::html(PAGE));
+        for v in VERSIONS {
+            let outcome = match get_doc(&env, v, "/big", &[]).await {
+                r if r.status() == 200 => r.bytes().await.map(|b| b.len()),
+                r => panic!("unexpected status {}", r.status()),
+            };
+            assert!(
+                outcome.is_err(),
+                "{v:?}: truncated body delivered as success: {outcome:?}"
+            );
+            // The proxy carries on serving.
+            let ok = body_text(get_doc(&env, v, "/p", &[]).await).await;
+            assert!(ok.contains("<p>hello</p>"), "{v:?}");
+        }
+    }
+);
+
 e2e_test!(
     internal_endpoints_refused_when_blocking_is_off,
     rules = AD,
@@ -990,6 +1020,56 @@ e2e_test!(
         assert!(String::from_utf8_lossy(&first.unwrap()).contains("__adblock_cosmetic"));
         let peak = proxy_core::rewrite::pipeline::peak_buffered_bytes();
         assert!(peak > 0 && peak < 256 * 1024, "peak buffered {peak} bytes");
+    }
+);
+
+// An origin that drips the start of a document slowly (longer than the sniffing wait) must not be
+// able to make the proxy give up and skip injection: for a document navigation answered as
+// text/html, the first bytes decide, however they are paced.
+e2e_test!(
+    slow_drip_start_cannot_disable_injection,
+    rules = AD,
+    |env| {
+        let doc = "<!DOCTYPE html><html><head><title>t</title></head><body><p>hi</p></body></html>";
+        // Splits inside the first token: "<", "<!", "<!DOCT", "<h"-style prefixes.
+        let doc2 = "<html><head></head><body><p>hi</p></body></html>";
+        let cases = [
+            (doc, 1usize),
+            (doc, 2),
+            (doc, 6),
+            (doc2, 1),
+            (doc2, 3),
+            (doc, 12),
+        ];
+        for (i, (d, at)) in cases.iter().enumerate() {
+            let spec = StreamSpec::new(d[..*at].to_string(), d[*at..].to_string(), d.len())
+                .paused(Duration::from_millis(400));
+            env.origin.route(
+                &format!("/drip{i}"),
+                MockResponse::streaming(200, spec).header("content-type", "text/html"),
+            );
+        }
+        let reqs = cases.iter().enumerate().map(|(i, _)| {
+            get_doc(
+                &env,
+                HttpVersion::Http1,
+                Box::leak(format!("/drip{i}").into_boxed_str()),
+                &[],
+            )
+        });
+        for (i, r) in futures_util::future::join_all(reqs)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            let html = body_text(r).await;
+            assert!(
+                html.contains("__adblock_cosmetic"),
+                "case {i} {:?}: {html}",
+                cases[i].1
+            );
+            assert!(html.contains("<p>hi</p></body></html>"), "case {i}: {html}");
+        }
     }
 );
 

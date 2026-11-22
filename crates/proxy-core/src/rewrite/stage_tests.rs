@@ -456,3 +456,40 @@ fn element_filters_remove_by_content_and_length() {
     }]);
     assert!(!out.contains("<img"), "{out}");
 }
+
+#[test]
+fn prefix_sniffing_separates_not_yet_from_not_html() {
+    use super::html::{sniff_prefix, Sniff};
+    for undecided in [
+        "",
+        "  \n",
+        "<",
+        "<!",
+        "<!D",
+        "<!DOCT",
+        "<!-",
+        "\u{feff}",
+        "<!--x--> <",
+    ] {
+        assert_eq!(
+            sniff_prefix(undecided.as_bytes()),
+            Sniff::Undecided,
+            "{undecided:?}"
+        );
+    }
+    for html in ["<h", "<!DOCTYPE html>", "<!-- unterminated", "<html"] {
+        assert_eq!(sniff_prefix(html.as_bytes()), Sniff::Html, "{html:?}");
+    }
+    for no in [
+        "{",
+        "[1]",
+        "hello",
+        "<?xml version",
+        "<svg",
+        "<3",
+        "<!x",
+        "<rss",
+    ] {
+        assert_eq!(sniff_prefix(no.as_bytes()), Sniff::NotHtml, "{no:?}");
+    }
+}

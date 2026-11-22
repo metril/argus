@@ -2,7 +2,7 @@
 
 use super::charset::{self, Detected};
 use super::codec::{decode_chain, Coding, DynBufRead, Encoder};
-use super::html::{sniff_html, RewriteStage};
+use super::html::{sniff_html, sniff_prefix, RewriteStage, Sniff};
 use super::{BodyTransform, HtmlPlan};
 use crate::inject::{full_body, ProxyBody};
 use bytes::Bytes;
@@ -262,20 +262,28 @@ pub async fn transform_html(
         }
     }
     let mut peek = Vec::with_capacity(PEEK_LEN + 512);
-    match fill_peek(&mut reader, &mut peek).await {
-        Ok(_) => {}
+    let eof = match fill_peek(&mut reader, &mut peek).await {
+        Ok(eof) => eof,
         Err(_) => return Outcome::Untouched(raw.replay()),
-    }
+    };
 
     let det = charset::detect(content_type.as_deref(), &peek);
     if charset::is_unusable(det.encoding) {
         return Outcome::Untouched(raw.replay());
     }
     let transcode = charset::needs_transcode(det.encoding);
-    let is_html = if transcode {
-        sniff_html(&utf8_prefix(&det, &peek))
+    // This is a document navigation answered as `text/html`: sniffing only vetoes bodies that are
+    // plainly something else (JSON, XML, text...). A start that has not fully arrived when the
+    // wait expires is not a veto, so an origin cannot drip bytes to make us skip injection.
+    let verdict = if transcode {
+        sniff_prefix(&utf8_prefix(&det, &peek))
     } else {
-        sniff_html(&peek)
+        sniff_prefix(&peek)
+    };
+    let is_html = match verdict {
+        Sniff::Html => true,
+        Sniff::NotHtml => false,
+        Sniff::Undecided => !eof,
     };
     if !is_html {
         return Outcome::Untouched(raw.replay());

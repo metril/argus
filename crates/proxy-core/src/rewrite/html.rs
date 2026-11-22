@@ -81,6 +81,63 @@ pub fn sniff_html(b: &[u8]) -> bool {
     }
 }
 
+/// Verdict of [`sniff_prefix`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sniff {
+    Html,
+    NotHtml,
+    /// Too few bytes to tell (only whitespace, or the first token is cut off).
+    Undecided,
+}
+
+/// [`sniff_html`] for a possibly short prefix of the body: distinguishes "obviously not HTML"
+/// from "not enough bytes yet", so that a slowly arriving document start is never mistaken for
+/// non-HTML.
+pub fn sniff_prefix(b: &[u8]) -> Sniff {
+    if sniff_html(b) {
+        return Sniff::Html;
+    }
+    let mut i = if b.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
+    loop {
+        while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | b'\r' | 0x0c) {
+            i += 1;
+        }
+        let Some(&c) = b.get(i) else {
+            return Sniff::Undecided;
+        };
+        if c != b'<' {
+            return Sniff::NotHtml;
+        }
+        let rest = &b[i + 1..];
+        if rest.starts_with(b"!--") {
+            // A complete comment (an incomplete one already counted as HTML): look past it.
+            if let Some(p) = rest[3..].windows(3).position(|w| w == b"-->") {
+                i += 1 + 3 + p + 3;
+                continue;
+            }
+            return Sniff::Html;
+        }
+        if rest.is_empty() {
+            return Sniff::Undecided;
+        }
+        if rest[0] == b'!' {
+            let lower = rest.to_ascii_lowercase();
+            let cut_off =
+                rest.len() < 8 && (b"!doctype".starts_with(&lower) || b"!--".starts_with(&lower));
+            return if cut_off {
+                Sniff::Undecided
+            } else {
+                Sniff::NotHtml
+            };
+        }
+        return Sniff::NotHtml;
+    }
+}
+
 /// One document's rewriter plus (for non-ASCII-compatible encodings) its decoder.
 pub struct RewriteStage {
     rewriter: Option<Rewriter>,
