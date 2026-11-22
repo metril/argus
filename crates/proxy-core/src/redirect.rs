@@ -153,6 +153,27 @@ mod tests {
         assert_eq!(sub.status(), 200);
     }
 
+    #[test]
+    fn every_synthetic_response_is_tagged_and_uncacheable() {
+        use RequestType::*;
+        let v = MatchResult::blocked("||a.test^");
+        for ty in [Document, Subdocument, Image, Script, Stylesheet, Xhr, Ping, Media, Other] {
+            let r = block_response(ty, &v, "u");
+            assert_eq!(r.headers()["x-adblock"], "blocked", "{ty:?}");
+            assert_eq!(r.headers()["cache-control"], "no-store", "{ty:?}");
+        }
+        let r = redirect_response(RedirectResource {
+            mime: "text/javascript".into(),
+            body: vec![],
+        });
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        assert_eq!(
+            rewrite_redirect("https://a.test/")
+                .headers()["cache-control"],
+            "no-store"
+        );
+    }
+
     #[tokio::test]
     async fn redirect_and_rewrite_responses() {
         let r = redirect_response(RedirectResource {

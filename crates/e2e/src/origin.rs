@@ -33,6 +33,8 @@ pub struct MockResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Wait this long before answering (for timeout tests).
+    pub delay: std::time::Duration,
 }
 
 impl MockResponse {
@@ -41,7 +43,12 @@ impl MockResponse {
             status,
             headers: Vec::new(),
             body: body.into(),
+            delay: std::time::Duration::ZERO,
         }
+    }
+    pub fn delayed(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
     }
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
         Self::new(200, body)
@@ -371,6 +378,9 @@ async fn handle(
         Some(h) => h(&rec),
         None => MockResponse::new(404, "not found"),
     };
+    if !mock.delay.is_zero() {
+        tokio::time::sleep(mock.delay).await;
+    }
     let mut b = Response::builder().status(mock.status);
     for (k, v) in &mock.headers {
         b = b.header(k, v);

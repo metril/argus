@@ -6,7 +6,7 @@ use proxy_core::config::{
     AdblockSettings, MitmSettings, PerformanceSettings, ProxyConfig, ProxySettings,
     UserscriptSettings, WebUiSettings,
 };
-use proxy_core::upstream::{build_upstream_client, UpstreamOptions};
+use proxy_core::upstream::UpstreamOptions;
 use proxy_core::{ProxyContext, ProxyServer};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -22,8 +22,10 @@ pub struct TestProxy {
     pub engine: Arc<SharedEngine>,
     /// The proxy's MITM handler (cert cache / generation counter).
     pub mitm: Option<Arc<proxy_core::mitm::MitmHandler>>,
+    /// The proxy's filtering/forwarding context (live settings).
+    pub ctx: Arc<ProxyContext>,
     shutdown: broadcast::Sender<()>,
-    _dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
 }
 
 impl TestProxy {
@@ -34,12 +36,23 @@ impl TestProxy {
         origin: &TestOrigin,
         rules: &[&str],
     ) -> Result<Self, String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        Self::start_in(mode, origin, rules, dir).await
+    }
+
+    /// Like [`Self::start`] but on an existing data dir, so a second proxy picks up the CA the
+    /// first one generated (a restart).
+    pub async fn start_in(
+        mode: EntryMode,
+        origin: &TestOrigin,
+        rules: &[&str],
+        dir: tempfile::TempDir,
+    ) -> Result<Self, String> {
         if mode == EntryMode::Transparent {
             return Err("transparent entry mode is not implemented yet".into());
         }
         crate::init_crypto();
 
-        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let ca_cert_path = dir.path().join("ca.crt");
         let ca_key_path = dir.path().join("ca.key");
         let origin_ca_path = dir.path().join("origin-ca.crt");
@@ -83,15 +96,18 @@ impl TestProxy {
         let lines: Vec<String> = rules.iter().map(|r| format!("{r}\n")).collect();
         engine.install(compile_engine(&lines));
 
-        let client = build_upstream_client(&UpstreamOptions {
-            resolve_all_to: Some(origin.ip()),
-            ..UpstreamOptions::from_config(&config)
-        })
-        .map_err(|e| e.to_string())?;
-        let ctx = Arc::new(ProxyContext::new(engine.clone(), client, true));
-        let server = ProxyServer::new(config, ctx)
-            .map_err(|e| e.to_string())?
-            .with_ws_resolve_all_to(origin.ip());
+        let ctx = Arc::new(
+            ProxyContext::with_upstream(
+                engine.clone(),
+                &UpstreamOptions {
+                    resolve_all_to: Some(origin.ip()),
+                    ..UpstreamOptions::from_config(&config)
+                },
+                true,
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        let server = ProxyServer::new(config, ctx.clone()).map_err(|e| e.to_string())?;
         let mitm = server.mitm_handler().cloned();
         let ca_pem = std::fs::read(&ca_cert_path).map_err(|e| e.to_string())?;
 
@@ -113,14 +129,23 @@ impl TestProxy {
             ca_pem,
             engine,
             mitm,
+            ctx,
             shutdown,
-            _dir: dir,
+            dir: Some(dir),
         })
     }
 
     /// `http://127.0.0.1:<port>` of the proxy.
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+impl TestProxy {
+    /// Stop the proxy and hand back its data dir (CA included) for a restart.
+    pub fn stop(mut self) -> tempfile::TempDir {
+        let _ = self.shutdown.send(());
+        self.dir.take().expect("data dir")
     }
 }
 

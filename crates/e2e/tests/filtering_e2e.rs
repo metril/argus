@@ -180,6 +180,7 @@ e2e_test!(
             let resp = get_as(&env, &env.origin.https_url("blk.test", "/r"), dest).await;
             assert_eq!(resp.status(), status, "dest={dest}");
             assert_eq!(resp.headers()["x-adblock"], "blocked", "dest={dest}");
+            assert_eq!(resp.headers()["cache-control"], "no-store", "dest={dest}");
             match ctype {
                 Some(c) => assert_eq!(resp.headers()["content-type"], c, "dest={dest}"),
                 None => assert!(resp.headers().get("content-type").is_none(), "dest={dest}"),
