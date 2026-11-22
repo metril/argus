@@ -11,7 +11,7 @@ use validator::Validate;
 use super::PageQuery;
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
-use crate::state::AppState;
+use crate::state::{blocking, AppState};
 
 /// Create an API token. The secret is returned once and cannot be retrieved again. Requested
 /// scopes must all be held by the caller (a token can never mint more than it has).
@@ -56,14 +56,13 @@ pub async fn create_token(
     let expires = req
         .expires_in_days
         .map(|d| Utc::now() + Duration::days(d as i64));
-    let (token, secret) = state.tokens.create(
-        req.name,
-        scopes,
-        profiles,
-        p.user_id,
-        p.username.clone(),
-        expires,
-    )?;
+    let st = state.clone();
+    let (user_id, username) = (p.user_id, p.username.clone());
+    let (token, secret) = blocking(move || {
+        st.tokens
+            .create(req.name, scopes, profiles, user_id, username, expires)
+    })
+    .await?;
     info!("API token {} created for {}", token.id, p.username);
     Ok((
         StatusCode::CREATED,
@@ -104,7 +103,8 @@ pub async fn revoke_token(
 ) -> ApiResult<Json<MessageResponse>> {
     match state.tokens.get(&id) {
         Some(t) if t.stored.created_by == p.user_id => {
-            state.tokens.revoke(&id)?;
+            let st = state.clone();
+            blocking(move || st.tokens.revoke(&id)).await?;
             Ok(Json(MessageResponse {
                 message: "Token revoked".into(),
             }))
@@ -142,7 +142,8 @@ pub async fn admin_revoke_token(
     State(state): State<Arc<AppState>>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
-    if state.tokens.revoke(&id)? {
+    let st = state.clone();
+    if blocking(move || st.tokens.revoke(&id)).await? {
         Ok(Json(MessageResponse {
             message: "Token revoked".into(),
         }))

@@ -17,7 +17,7 @@ use validator::Validate;
 use super::proxy::apply_update;
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
-use crate::state::AppState;
+use crate::state::{blocking, AppState};
 
 fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> FilterListResponse {
     let status = state.filter_store.get_status(&list.id).unwrap_or_default();
@@ -97,7 +97,8 @@ pub async fn add_filter_list(
     let mut list =
         filter_engine::FilterList::new(req.id.clone(), req.name.clone(), req.url.clone());
     list.enabled = req.enabled.unwrap_or(true);
-    state.filter_store.upsert(&list)?;
+    let (st, l) = (state.clone(), list.clone());
+    blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
     info!("Filter list '{}' added by {}", req.id, p.username);
     state.list_service.trigger();
     Ok((
@@ -160,7 +161,8 @@ pub async fn update_filter_list(
     if let Some(enabled) = req.enabled {
         list.enabled = enabled;
     }
-    state.filter_store.upsert(&list)?;
+    let (st, l) = (state.clone(), list.clone());
+    blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
     info!("Filter list '{id}' updated by {}", p.username);
     state.list_service.trigger();
     Ok(Json(filter_list_response(&state, &list)))
@@ -178,7 +180,8 @@ pub async fn delete_filter_list(
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
-    if !state.filter_store.remove(&id)? {
+    let (st, rid) = (state.clone(), id.clone());
+    if !blocking(move || Ok(st.filter_store.remove(&rid)?)).await? {
         return Err(ApiError::NotFound(format!("Filter list '{id}' not found")));
     }
     info!("Filter list '{id}' deleted by {}", p.username);

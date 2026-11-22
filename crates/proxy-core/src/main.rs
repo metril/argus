@@ -110,24 +110,25 @@ async fn start_webui_server(
 
     info!("Initializing Web UI server...");
 
+    // One database file per process: users, sessions, tokens, audit and userscripts share
+    // `<adblock.data_dir>/adblocker.redb` with the filter lists. (`userscripts.data_dir` and
+    // `webui.session_storage_path` are no longer used for storage.)
+    let data_dir = config.adblock.data_dir.clone();
+
     // Initialize userscript manager
     let userscript_manager = if config.userscripts.enabled {
         info!(
             "Initializing userscript manager with data dir: {:?}",
-            config.userscripts.data_dir
+            data_dir
         );
-        Arc::new(
-            UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
-                proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-            })?,
-        )
+        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
+            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
+        })?)
     } else {
         info!("Userscripts disabled, using empty userscript manager");
-        Arc::new(
-            UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
-                proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-            })?,
-        )
+        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
+            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
+        })?)
     };
 
     // Load existing userscripts
@@ -169,7 +170,7 @@ async fn start_webui_server(
             cookie_secure: false,
         },
         session: web_api::config::SessionConfig {
-            storage_path: config.webui.session_storage_path.clone(),
+            storage_path: data_dir.clone(),
             cleanup_interval_seconds: 3600,
         },
         webui: web_api::config::WebUiConfig {

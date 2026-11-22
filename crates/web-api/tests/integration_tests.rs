@@ -286,6 +286,7 @@ async fn sessions_survive_restart_and_revocation_is_durable() {
     // Re-open the same on-disk stores in a fresh state.
     let mut cfg = web_api::config::ApiConfig::default();
     cfg.session.storage_path = path;
+    cfg.auth.bcrypt_cost = 4;
     cfg.auth.jwt_secret_path = secret_path;
     let engine = std::sync::Arc::new(filter_engine::SharedEngine::new());
     let store = web_api::ListStore::open(&ctx.temp_dir.path().join("filters2")).unwrap();

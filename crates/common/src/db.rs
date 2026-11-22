@@ -12,8 +12,8 @@
 //!   entries, `last_used_at`, GM values, session activity. Hot-path writers use the coalescing
 //!   writer thread ([`Db::defer`]) so a burst of calls becomes one transaction.
 
-pub use redb;
 use parking_lot::Mutex;
+pub use redb;
 use redb::{
     Database, Durability, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction,
 };
@@ -403,7 +403,14 @@ mod tests {
         let rtxn = db.db.begin_read().unwrap();
         put(&db, 1).unwrap();
         // The earlier snapshot is unaffected; a fresh reader sees the commit.
-        assert_eq!(rtxn.open_table(tables::AUDIT).unwrap().iter().unwrap().count(), 0);
+        assert_eq!(
+            rtxn.open_table(tables::AUDIT)
+                .unwrap()
+                .iter()
+                .unwrap()
+                .count(),
+            0
+        );
         assert_eq!(count(&db), 1);
     }
 
@@ -420,7 +427,10 @@ mod tests {
             .unwrap();
         }
         let err = Db::open(d.path()).err().unwrap();
-        assert!(matches!(err, DbError::NewerSchema { found: 99, .. }), "{err}");
+        assert!(
+            matches!(err, DbError::NewerSchema { found: 99, .. }),
+            "{err}"
+        );
     }
 
     #[test]

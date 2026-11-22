@@ -12,7 +12,7 @@ use crate::auth::authz::Principal;
 use crate::auth::models::User;
 use crate::auth::password::{hash_password, validate_password_strength};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
-use crate::state::AppState;
+use crate::state::{blocking, AppState};
 
 fn last_admin() -> ApiError {
     ApiError::conflict(
@@ -62,11 +62,15 @@ pub async fn create_user(
         return Err(ApiError::AlreadyExists(format!("User '{}'", req.username)));
     }
     let pw = req.password.clone();
-    let hash = tokio::task::spawn_blocking(move || hash_password(&pw))
+    let cost = state.api_config.auth.bcrypt_cost;
+    let hash = tokio::task::spawn_blocking(move || hash_password(&pw, cost))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))??;
     let user = User::new(req.username, hash, req.role);
-    state.session_store.store_user(&user)?;
+    // The username index is claimed atomically inside `store_user`, so a concurrent create of
+    // the same name fails there with `AlreadyExists`.
+    let (st, u) = (state.clone(), user.clone());
+    blocking(move || st.session_store.store_user(&u)).await?;
     info!("User {} created with role {:?}", user.username, user.role);
     Ok((StatusCode::CREATED, Json(UserInfo::from(&user))))
 }
@@ -99,24 +103,30 @@ pub async fn update_user(
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<UpdateUserRequest>,
 ) -> ApiResult<Json<UserInfo>> {
-    let _g = state.session_store.admin_lock.lock();
-    let mut user = load(&state, &id)?;
-    let was_admin = user.enabled && user.role == UserRole::Admin;
-    if let Some(r) = req.role {
-        user.role = r;
-    }
-    if let Some(e) = req.enabled {
-        user.enabled = e;
-    }
-    let is_admin = user.enabled && user.role == UserRole::Admin;
-    if was_admin && !is_admin && state.session_store.enabled_admin_count()? <= 1 {
-        return Err(last_admin());
-    }
-    state.session_store.store_user(&user)?;
-    // Roles are re-resolved on every request; a disabled account is also signed out everywhere.
-    if !user.enabled {
-        state.session_manager.revoke_user_sessions(&user.id, None);
-    }
+    let st = state.clone();
+    let user = blocking(move || {
+        let _g = st.session_store.admin_lock.lock();
+        let mut user = load(&st, &id)?;
+        let was_admin = user.enabled && user.role == UserRole::Admin;
+        if let Some(r) = req.role {
+            user.role = r;
+        }
+        if let Some(e) = req.enabled {
+            user.enabled = e;
+        }
+        let is_admin = user.enabled && user.role == UserRole::Admin;
+        if was_admin && !is_admin && st.session_store.enabled_admin_count()? <= 1 {
+            return Err(last_admin());
+        }
+        st.session_store.store_user(&user)?;
+        // Roles are re-resolved on every request; a disabled account is also signed out
+        // everywhere.
+        if !user.enabled {
+            st.session_manager.revoke_user_sessions(&user.id, None)?;
+        }
+        Ok(user)
+    })
+    .await?;
     Ok(Json(UserInfo::from(&user)))
 }
 
@@ -132,17 +142,22 @@ pub async fn delete_user(
     Extension(_p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
-    let _g = state.session_store.admin_lock.lock();
-    let user = load(&state, &id)?;
-    if user.enabled
-        && user.role == UserRole::Admin
-        && state.session_store.enabled_admin_count()? <= 1
-    {
-        return Err(last_admin());
-    }
-    state.session_store.delete_user(&user.id)?;
-    state.session_manager.revoke_user_sessions(&user.id, None);
-    state.tokens.revoke_all_for_user(&user.id)?;
+    let st = state.clone();
+    let user = blocking(move || {
+        let _g = st.session_store.admin_lock.lock();
+        let user = load(&st, &id)?;
+        if user.enabled
+            && user.role == UserRole::Admin
+            && st.session_store.enabled_admin_count()? <= 1
+        {
+            return Err(last_admin());
+        }
+        st.session_store.delete_user(&user.id)?;
+        st.session_manager.revoke_user_sessions(&user.id, None)?;
+        st.tokens.revoke_all_for_user(&user.id)?;
+        Ok(user)
+    })
+    .await?;
     Ok(Json(MessageResponse {
         message: format!("User '{}' deleted", user.username),
     }))

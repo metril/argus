@@ -220,8 +220,8 @@ impl IntoResponse for ApiError {
 /// Result type using ApiError
 pub type ApiResult<T> = std::result::Result<T, ApiError>;
 
-impl From<sled::Error> for ApiError {
-    fn from(err: sled::Error) -> Self {
+impl From<common::db::DbError> for ApiError {
+    fn from(err: common::db::DbError) -> Self {
         ApiError::Database(err.to_string())
     }
 }

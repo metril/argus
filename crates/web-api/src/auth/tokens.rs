@@ -2,11 +2,16 @@
 //!
 //! The 256-bit secret is shown once; only its BLAKE3 digest is stored (a fast hash is sound for
 //! high-entropy secrets, and keeps bcrypt off the request path). Verification is a map lookup by
-//! id, one hash and a constant-time compare. All tokens are cached in memory and writes go
-//! through the cache first, so revocation takes effect on the very next request.
+//! id, one hash and a constant-time compare. All tokens are cached in memory; create and revoke
+//! commit to the database (fsync, call from a blocking context) and then update the cache, so
+//! revocation takes effect on the very next request and survives a crash. `last_used_at` is
+//! written lazily through the coalescing writer, as a read-modify-write inside the transaction
+//! that only touches an existing row, so it can neither lose nor undo a revocation.
 
 use api_types::{ApiTokenInfo, Scope};
 use chrono::{DateTime, Utc};
+use common::db::redb::{Durability, ReadableTable};
+use common::db::{tables, Db, DbError};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -90,9 +95,9 @@ pub enum TokenReject {
 }
 
 pub struct TokenStore {
-    tree: Option<sled::Tree>,
+    db: Arc<Db>,
     cache: DashMap<String, Arc<CachedToken>>,
-    /// Serialises writes so a background `last_used_at` flush cannot overwrite a revocation.
+    /// Serialises mutations so the cache always follows the committed database state.
     write_lock: Mutex<()>,
 }
 
@@ -106,31 +111,29 @@ fn digest_of(secret: &str) -> blake3::Hash {
     blake3::hash(secret.as_bytes())
 }
 
+fn json(t: &StoredToken) -> ApiResult<Vec<u8>> {
+    serde_json::to_vec(t).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
 impl TokenStore {
-    pub fn new(tree: Option<sled::Tree>) -> Self {
+    /// Load every stored token into the in-memory cache.
+    pub fn new(db: Arc<Db>) -> ApiResult<Self> {
         let cache = DashMap::new();
-        if let Some(tree) = &tree {
-            for (_, v) in tree.iter().flatten() {
-                if let Ok(t) = serde_json::from_slice::<StoredToken>(&v) {
+        db.read::<_, ApiError>(|r| {
+            let t = r.open_table(tables::API_TOKENS).map_err(DbError::from)?;
+            for item in t.iter().map_err(DbError::from)? {
+                let (_, v) = item.map_err(DbError::from)?;
+                if let Ok(t) = serde_json::from_slice::<StoredToken>(v.value()) {
                     cache.insert(t.id.clone(), Arc::new(CachedToken::new(t)));
                 }
             }
-        }
-        Self {
-            tree,
+            Ok(())
+        })?;
+        Ok(Self {
+            db,
             cache,
             write_lock: Mutex::new(()),
-        }
-    }
-
-    fn write(&self, t: &StoredToken) -> ApiResult<()> {
-        if let Some(tree) = &self.tree {
-            tree.insert(
-                t.id.as_bytes(),
-                serde_json::to_vec(t).map_err(|e| ApiError::Internal(e.to_string()))?,
-            )?;
-        }
-        Ok(())
+        })
     }
 
     /// Mint a token; returns its metadata and the one-time secret string.
@@ -160,8 +163,15 @@ impl TokenStore {
             last_used_at: None,
             revoked_at: None,
         };
+        let bytes = json(&stored)?;
         let _g = self.write_lock.lock();
-        self.write(&stored)?;
+        self.db.write::<_, ApiError>(Durability::Immediate, |t| {
+            t.open_table(tables::API_TOKENS)
+                .map_err(DbError::from)?
+                .insert(id.as_str(), bytes.as_slice())
+                .map_err(DbError::from)?;
+            Ok(())
+        })?;
         let cached = Arc::new(CachedToken::new(stored));
         let info = cached.info();
         self.cache.insert(id, cached);
@@ -196,14 +206,13 @@ impl TokenStore {
         Ok(entry)
     }
 
-    /// Note a use. The disk write happens at most once a minute per token and off the request
-    /// path (blocking pool).
-    pub fn mark_used(self: &Arc<Self>, token: &Arc<CachedToken>) {
+    /// Note a use. The disk write happens at most once a minute per token, coalesced with
+    /// other deferred writes, and never on the caller's thread.
+    pub fn mark_used(&self, token: &Arc<CachedToken>) {
         let now = Utc::now().timestamp();
         token.last_used.store(now, Ordering::Relaxed);
         let last = token.last_persisted.load(Ordering::Relaxed);
-        if self.tree.is_none()
-            || now - last < LAST_USED_INTERVAL_SECS
+        if now - last < LAST_USED_INTERVAL_SECS
             || token
                 .last_persisted
                 .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
@@ -211,22 +220,18 @@ impl TokenStore {
         {
             return;
         }
-        let this = self.clone();
         let id = token.stored.id.clone();
-        let flush = move || {
-            let _g = this.write_lock.lock();
-            if let Some(cur) = this.cache.get(&id) {
-                let mut s = cur.stored.clone();
+        self.db.defer(move |t| {
+            let mut tb = t.open_table(tables::API_TOKENS)?;
+            let cur = tb.get(id.as_str())?.map(|g| g.value().to_vec());
+            if let Some(mut s) = cur.and_then(|b| serde_json::from_slice::<StoredToken>(&b).ok()) {
                 s.last_used_at = DateTime::from_timestamp(now, 0);
-                let _ = this.write(&s);
+                if let Ok(b) = serde_json::to_vec(&s) {
+                    tb.insert(id.as_str(), b.as_slice())?;
+                }
             }
-        };
-        match tokio::runtime::Handle::try_current() {
-            Ok(h) => {
-                h.spawn_blocking(flush);
-            }
-            Err(_) => flush(),
-        }
+            Ok(())
+        });
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<CachedToken>> {
@@ -245,26 +250,51 @@ impl TokenStore {
         v.into_iter().map(|(_, i)| i).collect()
     }
 
+    /// Revoke `ids` in one transaction, then in the cache. Returns the revoked count.
+    fn revoke_many(&self, ids: &[String]) -> ApiResult<usize> {
+        let _g = self.write_lock.lock();
+        let now = Utc::now();
+        let updated: Vec<StoredToken> = ids
+            .iter()
+            .filter_map(|id| self.get(id))
+            .filter(|c| c.stored.revoked_at.is_none())
+            .map(|c| {
+                let mut s = c.stored.clone();
+                s.revoked_at = Some(now);
+                s.last_used_at = DateTime::from_timestamp(c.last_used.load(Ordering::Relaxed), 0)
+                    .filter(|t| t.timestamp() > 0);
+                s
+            })
+            .collect();
+        if updated.is_empty() {
+            return Ok(0);
+        }
+        self.db.write::<_, ApiError>(Durability::Immediate, |t| {
+            let mut tb = t.open_table(tables::API_TOKENS).map_err(DbError::from)?;
+            for s in &updated {
+                tb.insert(s.id.as_str(), json(s)?.as_slice())
+                    .map_err(DbError::from)?;
+            }
+            Ok(())
+        })?;
+        let n = updated.len();
+        for s in updated {
+            self.cache
+                .insert(s.id.clone(), Arc::new(CachedToken::new(s)));
+        }
+        Ok(n)
+    }
+
     /// Revoke a token; effective for the next request. Returns false if unknown.
     pub fn revoke(&self, id: &str) -> ApiResult<bool> {
-        let _g = self.write_lock.lock();
-        let Some(cur) = self.get(id) else {
+        if self.get(id).is_none() {
             return Ok(false);
-        };
-        if cur.stored.revoked_at.is_some() {
-            return Ok(true);
         }
-        let mut s = cur.stored.clone();
-        s.revoked_at = Some(Utc::now());
-        s.last_used_at = DateTime::from_timestamp(cur.last_used.load(Ordering::Relaxed), 0)
-            .filter(|t| t.timestamp() > 0);
-        self.write(&s)?;
-        self.cache
-            .insert(id.to_string(), Arc::new(CachedToken::new(s)));
+        self.revoke_many(&[id.to_string()])?;
         Ok(true)
     }
 
-    /// Revoke every token created by a user (account deleted).
+    /// Revoke every token created by a user (account deleted), atomically.
     pub fn revoke_all_for_user(&self, user: &Uuid) -> ApiResult<usize> {
         let ids: Vec<String> = self
             .cache
@@ -272,16 +302,19 @@ impl TokenStore {
             .filter(|e| e.stored.created_by == *user && e.stored.revoked_at.is_none())
             .map(|e| e.key().clone())
             .collect();
-        for id in &ids {
-            self.revoke(id)?;
-        }
-        Ok(ids.len())
+        self.revoke_many(&ids)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store() -> (TokenStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
+        (s, dir)
+    }
 
     fn make(store: &TokenStore) -> (ApiTokenInfo, String) {
         store
@@ -298,7 +331,7 @@ mod tests {
 
     #[test]
     fn verify_and_revoke_immediately() {
-        let store = TokenStore::new(None);
+        let (store, _d) = store();
         let (info, secret) = make(&store);
         assert!(secret.starts_with("abk_") && secret.len() > 80);
         assert!(store.verify(&secret).is_ok());
@@ -309,11 +342,12 @@ mod tests {
         assert_eq!(store.verify("abk_nope").err(), Some(TokenReject::Malformed));
         store.revoke(&info.id).unwrap();
         assert_eq!(store.verify(&secret).err(), Some(TokenReject::Revoked));
+        assert!(!store.revoke("missing").unwrap());
     }
 
     #[test]
     fn expired_token_rejected_and_secret_not_stored() {
-        let store = TokenStore::new(None);
+        let (store, _d) = store();
         let (_, secret) = store
             .create(
                 "t".into(),
@@ -332,16 +366,64 @@ mod tests {
     #[test]
     fn tokens_persist_across_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let tree = sled::open(dir.path()).unwrap().open_tree("t").unwrap();
         let (id, secret) = {
-            let s = TokenStore::new(Some(tree.clone()));
+            let s = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
             let (i, sec) = make(&s);
             (i.id, sec)
         };
-        let s2 = TokenStore::new(Some(tree));
+        let s2 = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
         assert!(s2.verify(&secret).is_ok());
         s2.revoke(&id).unwrap();
-        let s3 = TokenStore::new(s2.tree.clone());
+        drop(s2);
+        let s3 = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
         assert_eq!(s3.verify(&secret).err(), Some(TokenReject::Revoked));
+    }
+
+    #[test]
+    fn revoke_all_for_user_is_one_transaction_and_visible_at_once() {
+        let (store, dir) = store();
+        let user = Uuid::new_v4();
+        let secrets: Vec<_> = (0..3)
+            .map(|_| {
+                store
+                    .create(
+                        "t".into(),
+                        vec![Scope::ListsRead],
+                        None,
+                        user,
+                        "u".into(),
+                        None,
+                    )
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        let other = make(&store).1;
+        assert_eq!(store.revoke_all_for_user(&user).unwrap(), 3);
+        for s in &secrets {
+            assert_eq!(store.verify(s).err(), Some(TokenReject::Revoked));
+        }
+        assert!(store.verify(&other).is_ok());
+        // Durable: a fresh store from disk agrees.
+        drop(store);
+        let again = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
+        assert_eq!(again.verify(&secrets[0]).err(), Some(TokenReject::Revoked));
+        assert!(again.verify(&other).is_ok());
+    }
+
+    #[test]
+    fn last_used_is_coalesced_and_never_undoes_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let s = TokenStore::new(db.clone()).unwrap();
+        let (info, secret) = make(&s);
+        let cached = s.verify(&secret).unwrap();
+        s.mark_used(&cached); // queues a deferred write
+        s.revoke(&info.id).unwrap();
+        db.flush_deferred();
+        drop(s);
+        let s2 = TokenStore::new(db).unwrap();
+        assert_eq!(s2.verify(&secret).err(), Some(TokenReject::Revoked));
+        assert!(s2.get(&info.id).unwrap().stored.last_used_at.is_some());
     }
 }
