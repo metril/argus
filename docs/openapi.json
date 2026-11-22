@@ -235,6 +235,66 @@
         ],
         "type": "object"
       },
+      "BlockedItemDto": {
+        "properties": {
+          "capability": {
+            "type": "string"
+          },
+          "count": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "first_seen": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_seen": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sample": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "Host of the blocked source; absent for inline/eval/data:/blob:.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "suggested_allow": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SuggestedAllowDto"
+              }
+            ]
+          },
+          "via_csp": {
+            "type": "boolean"
+          },
+          "via_network": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "capability",
+          "count",
+          "first_seen",
+          "last_seen",
+          "via_network",
+          "via_csp"
+        ],
+        "type": "object"
+      },
       "BuildState": {
         "description": "Where the build pipeline is.",
         "oneOf": [
@@ -612,6 +672,24 @@
         ],
         "type": "object"
       },
+      "CspDirectiveDto": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "sources"
+        ],
+        "type": "object"
+      },
       "CustomRulesResponse": {
         "description": "The user's custom filter rules (raw adblock syntax).",
         "properties": {
@@ -727,6 +805,104 @@
         },
         "required": [
           "error"
+        ],
+        "type": "object"
+      },
+      "ExplainResponse": {
+        "description": "What the policy does to one page URL.",
+        "properties": {
+          "active_temps": {
+            "items": {
+              "$ref": "#/components/schemas/TempGrantDto"
+            },
+            "type": "array"
+          },
+          "csp": {
+            "items": {
+              "$ref": "#/components/schemas/CspDirectiveDto"
+            },
+            "type": "array"
+          },
+          "csp_header": {
+            "description": "The extra `Content-Security-Policy` header value (proxy nonce shown as `PROXY_NONCE`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective": {
+            "$ref": "#/components/schemas/PolicyProfileDto",
+            "description": "The base profile in effect before source rules."
+          },
+          "enabled": {
+            "description": "False when the master switch is off.",
+            "type": "boolean"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host": {
+            "type": "string"
+          },
+          "html_actions": {
+            "$ref": "#/components/schemas/HtmlActionsDto"
+          },
+          "matched_site_rules": {
+            "items": {
+              "$ref": "#/components/schemas/SiteRuleDto"
+            },
+            "type": "array"
+          },
+          "matched_source_rules": {
+            "items": {
+              "$ref": "#/components/schemas/SourceRuleDto"
+            },
+            "type": "array"
+          },
+          "network_enforce": {
+            "description": "Capabilities the proxy can block early for this page.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "notes": {
+            "description": "Denials CSP cannot express for this page.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "permissions_policy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "site": {
+            "description": "Registrable domain (or the host itself when it has none).",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "host",
+          "site",
+          "enabled",
+          "matched_site_rules",
+          "matched_source_rules",
+          "active_temps",
+          "effective",
+          "csp",
+          "html_actions",
+          "network_enforce",
+          "notes",
+          "generation"
         ],
         "type": "object"
       },
@@ -1019,6 +1195,49 @@
         "required": [
           "status",
           "version"
+        ],
+        "type": "object"
+      },
+      "HtmlActionsDto": {
+        "properties": {
+          "rules": {
+            "items": {
+              "$ref": "#/components/schemas/HtmlRuleDto"
+            },
+            "type": "array"
+          },
+          "strip_scripts": {
+            "type": "boolean"
+          },
+          "unwrap_noscript": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "unwrap_noscript",
+          "strip_scripts",
+          "rules"
+        ],
+        "type": "object"
+      },
+      "HtmlRuleDto": {
+        "properties": {
+          "op": {
+            "description": "`unwrap`, `remove` or `remove-attribute:<name>`.",
+            "type": "string"
+          },
+          "selector": {
+            "type": "string"
+          },
+          "when": {
+            "description": "`always` or `url-denied:<attr>:<capability>`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "selector",
+          "op",
+          "when"
         ],
         "type": "object"
       },
@@ -1695,6 +1914,77 @@
         ],
         "type": "object"
       },
+      "Page_PolicyReportDto": {
+        "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "dropped": {
+                  "description": "Distinct items discarded by the per-page bound.",
+                  "format": "int32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "events": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "items": {
+                  "items": {
+                    "$ref": "#/components/schemas/BlockedItemDto"
+                  },
+                  "type": "array"
+                },
+                "last_seen": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "page": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "page",
+                "items",
+                "dropped",
+                "events",
+                "last_seen"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total matching items across all pages.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "limit",
+          "has_more"
+        ],
+        "type": "object"
+      },
       "Page_SessionInfo": {
         "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
         "properties": {
@@ -1741,6 +2031,138 @@
                 "id",
                 "created_at",
                 "last_activity"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total matching items across all pages.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "limit",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "Page_SiteRuleDto": {
+        "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "preset": {
+                  "$ref": "#/components/schemas/PresetDto"
+                },
+                "scope": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "scope",
+                "preset"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total matching items across all pages.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "limit",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "Page_SourceRuleDto": {
+        "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "properties": {
+                "caps": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "effect": {
+                  "description": "`allow` or `deny`.",
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "page": {
+                  "description": "Page scope the rule applies on.",
+                  "type": "string"
+                },
+                "source": {
+                  "description": "Source scope (`*`, `site:...`, `host:...`, `https://host`).",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "page",
+                "source",
+                "caps",
+                "effect"
               ],
               "type": "object"
             },
@@ -1939,6 +2361,283 @@
           "page",
           "limit",
           "has_more"
+        ],
+        "type": "object"
+      },
+      "PolicyExportDto": {
+        "description": "Portable policy document (temporary grants are not exported).",
+        "properties": {
+          "settings": {
+            "$ref": "#/components/schemas/PolicySettingsDto"
+          },
+          "site_rules": {
+            "items": {
+              "$ref": "#/components/schemas/SiteRuleInput"
+            },
+            "type": "array"
+          },
+          "source_rules": {
+            "items": {
+              "$ref": "#/components/schemas/SourceRuleInput"
+            },
+            "type": "array"
+          },
+          "version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "settings",
+          "site_rules",
+          "source_rules"
+        ],
+        "type": "object"
+      },
+      "PolicyImportRequest": {
+        "properties": {
+          "document": {
+            "$ref": "#/components/schemas/PolicyExportDto"
+          },
+          "mode": {
+            "description": "`replace` (discard existing rules and settings) or `merge`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "document"
+        ],
+        "type": "object"
+      },
+      "PolicyProfileDto": {
+        "description": "Capabilities a preset allows. Page-level ones apply to the document; the two source lists\napply to first-party (same registrable domain) and third-party sources.",
+        "properties": {
+          "first_party": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "page": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "third_party": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "page",
+          "first_party",
+          "third_party"
+        ],
+        "type": "object"
+      },
+      "PolicyReportDto": {
+        "properties": {
+          "dropped": {
+            "description": "Distinct items discarded by the per-page bound.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "events": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BlockedItemDto"
+            },
+            "type": "array"
+          },
+          "last_seen": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "page",
+          "items",
+          "dropped",
+          "events",
+          "last_seen"
+        ],
+        "type": "object"
+      },
+      "PolicySettingsDto": {
+        "description": "Global policy settings.",
+        "properties": {
+          "default_profile": {
+            "$ref": "#/components/schemas/PolicyProfileDto",
+            "description": "What the `default` preset means."
+          },
+          "enabled": {
+            "description": "Master switch; nothing is enforced while false.",
+            "type": "boolean"
+          },
+          "global": {
+            "$ref": "#/components/schemas/PresetDto",
+            "description": "Preset for sites without a rule."
+          },
+          "network_hints": {
+            "description": "Let the proxy block denied third-party subresources early.",
+            "type": "boolean"
+          },
+          "strip_blocked_scripts": {
+            "description": "Remove blocked `<script>` elements from HTML (saves the download).",
+            "type": "boolean"
+          },
+          "strip_meta_refresh": {
+            "description": "Remove `<meta http-equiv=\"refresh\">` from pages whose scripts are blocked.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "global",
+          "default_profile",
+          "strip_blocked_scripts",
+          "strip_meta_refresh",
+          "network_hints"
+        ],
+        "type": "object"
+      },
+      "PolicySettingsResponse": {
+        "description": "Settings plus the change counter.",
+        "properties": {
+          "generation": {
+            "description": "Bumped on every policy change (and when a temporary grant expires).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/PolicySettingsDto"
+          }
+        },
+        "required": [
+          "settings",
+          "generation"
+        ],
+        "type": "object"
+      },
+      "PresetDto": {
+        "description": "A preset: `default`, `trusted`, `untrusted` or `custom` (with `profile`).",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "profile": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PolicyProfileDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "PreviewRequest": {
+        "description": "A proposed change, evaluated without saving.",
+        "properties": {
+          "add_site_rule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SiteRuleInput"
+              }
+            ]
+          },
+          "add_source_rule": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SourceRuleInput"
+              }
+            ]
+          },
+          "add_temp": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TempGrantInput"
+              }
+            ]
+          },
+          "remove_ids": {
+            "description": "Ids of site rules, source rules or temporary grants to drop.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "PreviewResponse": {
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/ExplainResponse"
+          },
+          "before": {
+            "$ref": "#/components/schemas/ExplainResponse"
+          },
+          "changed": {
+            "type": "boolean"
+          },
+          "csp_added": {
+            "description": "Rendered CSP directives only in `after`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "csp_removed": {
+            "description": "Rendered CSP directives only in `before`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "before",
+          "after",
+          "changed",
+          "csp_added",
+          "csp_removed"
         ],
         "type": "object"
       },
@@ -2314,6 +3013,163 @@
         ],
         "type": "object"
       },
+      "SiteRuleDto": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preset": {
+            "$ref": "#/components/schemas/PresetDto"
+          },
+          "scope": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "preset"
+        ],
+        "type": "object"
+      },
+      "SiteRuleInput": {
+        "description": "Create a site rule (also the export form).",
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preset": {
+            "$ref": "#/components/schemas/PresetDto"
+          },
+          "scope": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "preset"
+        ],
+        "type": "object"
+      },
+      "SiteRuleUpdate": {
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preset": {
+            "$ref": "#/components/schemas/PresetDto"
+          }
+        },
+        "required": [
+          "preset"
+        ],
+        "type": "object"
+      },
+      "SourceRuleDto": {
+        "properties": {
+          "caps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "effect": {
+            "description": "`allow` or `deny`.",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "description": "Page scope the rule applies on.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Source scope (`*`, `site:...`, `host:...`, `https://host`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "page",
+          "source",
+          "caps",
+          "effect"
+        ],
+        "type": "object"
+      },
+      "SourceRuleInput": {
+        "description": "Create a source rule (also the export form).",
+        "properties": {
+          "caps": {
+            "description": "Source-keyed capabilities only.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "effect": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "page",
+          "source",
+          "caps",
+          "effect"
+        ],
+        "type": "object"
+      },
+      "SourceRuleUpdate": {
+        "properties": {
+          "caps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "caps"
+        ],
+        "type": "object"
+      },
       "StorageMetrics": {
         "description": "Health of the deferred (background) database writes.",
         "properties": {
@@ -2340,6 +3196,25 @@
           "deferred_dropped",
           "deferred_failed",
           "deferred_queued"
+        ],
+        "type": "object"
+      },
+      "SuggestedAllowDto": {
+        "description": "The one-click allow for a blocked item.",
+        "properties": {
+          "caps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "caps"
         ],
         "type": "object"
       },
@@ -2370,6 +3245,134 @@
           "mitm_enabled",
           "active_sessions",
           "engine"
+        ],
+        "type": "object"
+      },
+      "TempGrantDto": {
+        "properties": {
+          "caps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expires_at": {
+            "description": "Unix seconds; absent for until-restart grants.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "description": "`site` (the page uses `preset`) or `source` (allow `caps` from `source`).",
+            "type": "string"
+          },
+          "page": {
+            "type": "string"
+          },
+          "persist": {
+            "type": "boolean"
+          },
+          "preset": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PresetDto"
+              }
+            ]
+          },
+          "remaining_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until_restart": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "page",
+          "kind",
+          "until_restart",
+          "persist",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "TempGrantInput": {
+        "properties": {
+          "caps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "description": "`site` or `source`.",
+            "type": "string"
+          },
+          "page": {
+            "type": "string"
+          },
+          "persist": {
+            "description": "Survive a restart (needs `ttl_secs`).",
+            "type": "boolean"
+          },
+          "preset": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PresetDto"
+              }
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_secs": {
+            "description": "Seconds until expiry.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "until_restart": {
+            "description": "Keep in memory only; dropped on restart.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "page",
+          "kind"
         ],
         "type": "object"
       },
@@ -2949,8 +3952,8 @@
       "engine:reload": "Trigger a rebuild of the blocking engine.",
       "lists:read": "View filter lists, their status and the update schedule.",
       "lists:write": "Add, edit, remove and refresh filter lists; change the update schedule.",
-      "policy:read": "Read the script policy (reserved).",
-      "policy:write": "Change the script policy (reserved).",
+      "policy:read": "View script policy rules, explanations, temporary permissions and blocked-source reports.",
+      "policy:write": "Change script policy settings, rules and temporary permissions; import policy.",
       "profiles:read": "Read filtering profiles (reserved).",
       "profiles:write": "Change filtering profiles (reserved).",
       "rules:read": "Read custom rules; validate rules and test URLs against the engine (no changes).",
@@ -5866,6 +6869,1648 @@
         ]
       }
     },
+    "/api/v1/policy/explain": {
+      "get": {
+        "operationId": "explain",
+        "parameters": [
+          {
+            "description": "Absolute http(s) URL of the page.",
+            "in": "query",
+            "name": "url",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExplainResponse"
+                }
+              }
+            },
+            "description": "Explanation"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "Explain what the policy does to a page URL: matched rules, effective capabilities, the exact\nCSP that would be added, and the HTML rewriter's instructions.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/export": {
+      "get": {
+        "operationId": "export",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyExportDto"
+                }
+              }
+            },
+            "description": "Policy document"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "Export the policy (settings, site rules, source rules) as a portable document.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/import": {
+      "post": {
+        "operationId": "import",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Imported"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Import a policy document, replacing or merging into the current rules.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/preview": {
+      "post": {
+        "operationId": "preview",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewResponse"
+                }
+              }
+            },
+            "description": "Before/after"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "Evaluate a proposed change against a page URL without saving it.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/reports": {
+      "get": {
+        "operationId": "reports",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only pages of this site (registrable domain or host).",
+            "in": "query",
+            "name": "site",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_PolicyReportDto"
+                }
+              }
+            },
+            "description": "Per-page blocked sources"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "Recently blocked sources per page, for one-click allow. Fed by the proxy's network blocks and\nby the CSP violation reports the in-page code forwards; empty until the proxy records them.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/settings": {
+      "get": {
+        "operationId": "get_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicySettingsResponse"
+                }
+              }
+            },
+            "description": "Settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "Get the global policy settings.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "put": {
+        "operationId": "put_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicySettingsDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicySettingsResponse"
+                }
+              }
+            },
+            "description": "Saved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Replace the global policy settings (master switch, global default preset, default profile).",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/site-rules": {
+      "get": {
+        "operationId": "list_site_rules",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the scope (e.g. a site name).",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`default`, `trusted`, `untrusted` or `custom`.",
+            "in": "query",
+            "name": "preset",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SiteRuleDto"
+                }
+              }
+            },
+            "description": "Site rules"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "List site rules, sorted by scope.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "post": {
+        "operationId": "create_site_rule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SiteRuleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteRuleDto"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Create a site rule (409 if the scope already has one).",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/site-rules/{id}": {
+      "delete": {
+        "operationId": "delete_site_rule",
+        "parameters": [
+          {
+            "description": "Site rule id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Delete a site rule.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "put": {
+        "operationId": "update_site_rule",
+        "parameters": [
+          {
+            "description": "Site rule id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SiteRuleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteRuleDto"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Change a site rule's preset or note.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/source-rules": {
+      "get": {
+        "operationId": "list_source_rules",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the page scope or the source scope.",
+            "in": "query",
+            "name": "site",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Exact page scope (e.g. `site:example.com`).",
+            "in": "query",
+            "name": "page_scope",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`allow` or `deny`.",
+            "in": "query",
+            "name": "effect",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SourceRuleDto"
+                }
+              }
+            },
+            "description": "Source rules"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "List third-party source rules (the matrix cells), sorted by page then source scope.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "post": {
+        "operationId": "create_source_rule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceRuleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceRuleDto"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Create a source rule (409 if page + source + effect already has one).",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/source-rules/{id}": {
+      "delete": {
+        "operationId": "delete_source_rule",
+        "parameters": [
+          {
+            "description": "Source rule id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Delete a source rule.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "put": {
+        "operationId": "update_source_rule",
+        "parameters": [
+          {
+            "description": "Source rule id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceRuleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceRuleDto"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Change a source rule's capabilities or note.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/temp": {
+      "delete": {
+        "operationId": "revoke_all_temp",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Revoke every temporary permission.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "get": {
+        "operationId": "list_temp",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TempGrantDto"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Active grants"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:read"
+            ]
+          }
+        ],
+        "summary": "List active temporary permissions.",
+        "tags": [
+          "policy"
+        ]
+      },
+      "post": {
+        "operationId": "grant_temp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TempGrantInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TempGrantDto"
+                }
+              }
+            },
+            "description": "Granted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Grant a temporary permission (needs `ttl_secs` or `until_restart`).",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
+    "/api/v1/policy/temp/{id}": {
+      "delete": {
+        "operationId": "revoke_temp",
+        "parameters": [
+          {
+            "description": "Grant id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "policy:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "policy:write"
+            ]
+          }
+        ],
+        "summary": "Revoke one temporary permission.",
+        "tags": [
+          "policy"
+        ]
+      }
+    },
     "/api/v1/rules/custom": {
       "get": {
         "operationId": "get_custom_rules",
@@ -8384,6 +11029,10 @@
     {
       "description": "Userscripts",
       "name": "userscripts"
+    },
+    {
+      "description": "Script policy (NoScript-style per-site capabilities)",
+      "name": "policy"
     },
     {
       "description": "Audit log",

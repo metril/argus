@@ -4620,6 +4620,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "script-policy"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "criterion",
+ "parking_lot",
+ "proptest",
+ "psl",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "scrypt"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6164,6 +6181,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "script-policy",
  "serde",
  "serde_json",
  "sha2",
