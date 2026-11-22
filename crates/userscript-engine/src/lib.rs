@@ -28,7 +28,7 @@ pub use index::{CompiledScript, ScriptIndex};
 pub use manager::{UserscriptManager, UserscriptStats};
 pub use metadata::{RunAt, UserscriptMetadata};
 pub use runtime::{CacheStats, UserscriptRuntime};
-pub use script::{Userscript, DEFAULT_PROFILE};
+pub use script::{PendingUpdate, Userscript, DEFAULT_PROFILE};
 pub use security::{
     AuditEntry, AuditEvent, AuditStatistics, ScriptValidator, SecurityAuditor, SecurityPolicy,
 };

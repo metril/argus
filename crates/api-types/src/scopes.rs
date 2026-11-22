@@ -50,7 +50,7 @@ scopes! {
     CaRead => "ca:read", "Read CA certificate details (fingerprint, expiry, subject).";
     CaAdmin => "ca:admin", "Manage the CA certificate (reserved).";
     ScriptsRead => "scripts:read", "View userscripts and their source.";
-    ScriptsWrite => "scripts:write", "Install, update, enable, disable and remove userscripts.";
+    ScriptsWrite => "scripts:write", "Install, update, enable, disable and remove userscripts; view and clear their stored values.";
     PolicyRead => "policy:read", "View script policy rules, explanations, temporary permissions and blocked-source reports.";
     PolicyWrite => "policy:write", "Change script policy settings, rules and temporary permissions; import policy.";
     ProfilesRead => "profiles:read", "Read filtering profiles (reserved).";

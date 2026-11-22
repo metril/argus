@@ -286,7 +286,7 @@ pub fn finish_install(
 }
 
 /// Capability changes between two versions of a script.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateDiff {
     pub added_matches: Vec<String>,
     pub added_connect: Vec<String>,

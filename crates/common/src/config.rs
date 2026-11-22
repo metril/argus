@@ -168,6 +168,12 @@ impl Default for AdblockSettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
+    /// Hours between scheduled update checks of scripts that have an update URL (0 = off).
+    #[serde(default)]
+    pub update_check_interval_hours: u64,
+    /// Apply found updates automatically, only when they do not widen `@match`/`@connect`/`@grant`.
+    #[serde(default)]
+    pub auto_apply_updates: bool,
 }
 
 /// When session cookies carry the `Secure` attribute.

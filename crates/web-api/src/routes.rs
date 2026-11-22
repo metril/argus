@@ -3,7 +3,11 @@
 
 use std::sync::Arc;
 
-use utoipa_axum::{router::OpenApiRouter, routes};
+use axum::extract::DefaultBodyLimit;
+use utoipa_axum::{
+    router::{OpenApiRouter, UtoipaMethodRouterExt},
+    routes,
+};
 
 use crate::handlers::{
     audit, auth, certificate, health, lists, policy, proxy, rules, stats, tokens, users,
@@ -88,6 +92,21 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             userscripts::install_userscript
         ))
         .routes(routes!(userscripts::get_stats))
+        .routes(routes!(userscripts::plan_userscript))
+        .routes(routes!(userscripts::confirm_plan))
+        .routes(routes!(userscripts::export_userscripts))
+        .routes(
+            routes!(userscripts::import_userscripts)
+                .layer(DefaultBodyLimit::max(userscripts::MAX_IMPORT_BYTES)),
+        )
+        .routes(routes!(userscripts::check_update))
+        .routes(routes!(userscripts::approve_update))
+        .routes(routes!(userscripts::discard_update))
+        .routes(routes!(
+            userscripts::get_storage,
+            userscripts::clear_storage
+        ))
+        .routes(routes!(userscripts::delete_storage_value))
         .routes(routes!(
             userscripts::get_userscript,
             userscripts::update_userscript,

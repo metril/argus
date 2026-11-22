@@ -108,6 +108,16 @@
         ],
         "type": "object"
       },
+      "ApproveUpdateRequest": {
+        "description": "Approve a pending update.",
+        "properties": {
+          "allow_connect_all": {
+            "description": "Also approve a newly requested `@connect *`.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "AuditEntry": {
         "properties": {
           "actor_id": {
@@ -579,6 +589,68 @@
         ],
         "type": "object"
       },
+      "CheckUpdateRequest": {
+        "description": "Check for an update.",
+        "properties": {
+          "apply": {
+            "description": "Apply a non-widening update immediately.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "CheckUpdateResponse": {
+        "description": "Result of an update check.",
+        "properties": {
+          "current_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "diff": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpdateDiffDto"
+              }
+            ]
+          },
+          "new_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script": {
+            "$ref": "#/components/schemas/UserscriptResponse"
+          },
+          "status": {
+            "description": "`up_to_date`, `updated` or `pending_approval`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "script"
+        ],
+        "type": "object"
+      },
+      "ConfirmPlanRequest": {
+        "description": "Confirm a plan.",
+        "properties": {
+          "allow_connect_all": {
+            "description": "Approve `@connect *` (rejected if the script does not declare it).",
+            "type": "boolean"
+          },
+          "enable": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "ConnectionStats": {
         "description": "Connection statistics.",
         "properties": {
@@ -903,6 +975,98 @@
           "network_enforce",
           "notes",
           "generation"
+        ],
+        "type": "object"
+      },
+      "ExportedAssets": {
+        "description": "Exported dependencies.",
+        "properties": {
+          "requires": {
+            "items": {
+              "$ref": "#/components/schemas/ExportedRequire"
+            },
+            "type": "array"
+          },
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/ExportedResource"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "ExportedRequire": {
+        "description": "Exported `@require`.",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "content"
+        ],
+        "type": "object"
+      },
+      "ExportedResource": {
+        "description": "Exported `@resource`.",
+        "properties": {
+          "data_b64": {
+            "type": "string"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "url",
+          "mime",
+          "data_b64"
+        ],
+        "type": "object"
+      },
+      "ExportedUserscript": {
+        "description": "One script in a bundle.",
+        "properties": {
+          "allow_connect_all": {
+            "type": "boolean"
+          },
+          "assets": {
+            "$ref": "#/components/schemas/ExportedAssets"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string"
+          },
+          "values": {
+            "additionalProperties": {
+              "type": "object"
+            },
+            "description": "GM values (only with `values=true`).",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source"
         ],
         "type": "object"
       },
@@ -1238,6 +1402,52 @@
           "selector",
           "op",
           "when"
+        ],
+        "type": "object"
+      },
+      "ImportResultDto": {
+        "description": "Per-script import outcome.",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`installed`, `replaced`, `skipped` or `error`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      "ImportUserscriptsResponse": {
+        "description": "Import outcome.",
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/ImportResultDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
         ],
         "type": "object"
       },
@@ -2283,6 +2493,16 @@
                     "null"
                   ]
                 },
+                "connect": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "connect_all_approved": {
+                  "description": "`@connect *` was approved at install.",
+                  "type": "boolean"
+                },
                 "description": {
                   "type": [
                     "string",
@@ -2297,10 +2517,28 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "grants": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "homepage": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "id": {
                   "type": "string"
                 },
                 "last_executed": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_update_check": {
                   "type": [
                     "string",
                     "null"
@@ -2321,11 +2559,62 @@
                     "null"
                   ]
                 },
+                "noframes": {
+                  "type": "boolean"
+                },
+                "pending_update": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PendingUpdateDto",
+                      "description": "A found update awaiting approval."
+                    }
+                  ]
+                },
+                "require_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "resource_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "run_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "storage_bytes": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "unsupported": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "update_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "version": {
                   "type": [
                     "string",
                     "null"
                   ]
+                },
+                "warnings": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
                 }
               },
               "required": [
@@ -2362,6 +2651,97 @@
           "limit",
           "has_more"
         ],
+        "type": "object"
+      },
+      "PendingUpdateDto": {
+        "description": "An update waiting for approval.",
+        "properties": {
+          "diff": {
+            "$ref": "#/components/schemas/UpdateDiffDto"
+          },
+          "found_at": {
+            "type": "string"
+          },
+          "needs_reapproval": {
+            "type": "boolean"
+          },
+          "new_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "diff",
+          "needs_reapproval",
+          "found_at"
+        ],
+        "type": "object"
+      },
+      "PlanRequireDto": {
+        "description": "A fetched `@require`.",
+        "properties": {
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sri_verified": {
+            "description": "An `@require` integrity hash was present and verified.",
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "size_bytes",
+          "sri_verified"
+        ],
+        "type": "object"
+      },
+      "PlanResourceDto": {
+        "description": "A fetched `@resource`.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sri_verified": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "url",
+          "size_bytes",
+          "sri_verified"
+        ],
+        "type": "object"
+      },
+      "PlanUserscriptRequest": {
+        "description": "Start an install: exactly one of `source` or `url`.",
+        "properties": {
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "PolicyExportDto": {
@@ -3199,6 +3579,28 @@
         ],
         "type": "object"
       },
+      "StorageValueDto": {
+        "description": "One stored GM value.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "preview": {
+            "description": "First 200 characters of the JSON value.",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "size_bytes",
+          "preview"
+        ],
+        "type": "object"
+      },
       "SuggestedAllowDto": {
         "description": "The one-click allow for a blocked item.",
         "properties": {
@@ -3447,6 +3849,56 @@
         },
         "required": [
           "rules"
+        ],
+        "type": "object"
+      },
+      "UpdateDiffDto": {
+        "description": "Capability changes of an update.",
+        "properties": {
+          "added_connect": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "added_grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "added_matches": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed_connect": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed_grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed_matches": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "added_matches",
+          "added_connect",
+          "added_grants",
+          "removed_matches",
+          "removed_connect",
+          "removed_grants"
         ],
         "type": "object"
       },
@@ -3753,6 +4205,161 @@
         ],
         "type": "string"
       },
+      "UserscriptBundle": {
+        "description": "Export / import bundle (JSON).",
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "on_conflict": {
+            "description": "Import only: `skip` (default) or `replace` existing scripts.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scripts": {
+            "items": {
+              "$ref": "#/components/schemas/ExportedUserscript"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "format",
+          "scripts"
+        ],
+        "type": "object"
+      },
+      "UserscriptPlanResponse": {
+        "description": "What an install would grant, to approve with `confirm`.",
+        "properties": {
+          "already_installed": {
+            "type": "boolean"
+          },
+          "broad_match": {
+            "description": "Matches (nearly) every site (`<all_urls>`, `*://*/*`, ...).",
+            "type": "boolean"
+          },
+          "clipboard": {
+            "type": "boolean"
+          },
+          "connect": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "connect_all": {
+            "description": "`@connect *`: needs `allow_connect_all` on confirm.",
+            "type": "boolean"
+          },
+          "cookies": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "downloads": {
+            "type": "boolean"
+          },
+          "expires_in_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "matches": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network": {
+            "type": "boolean"
+          },
+          "notifications": {
+            "type": "boolean"
+          },
+          "plan_id": {
+            "type": "string"
+          },
+          "requires": {
+            "items": {
+              "$ref": "#/components/schemas/PlanRequireDto"
+            },
+            "type": "array"
+          },
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/PlanResourceDto"
+            },
+            "type": "array"
+          },
+          "unsupported": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "plan_id",
+          "expires_in_secs",
+          "name",
+          "grants",
+          "connect",
+          "matches",
+          "broad_match",
+          "connect_all",
+          "network",
+          "cookies",
+          "downloads",
+          "clipboard",
+          "notifications",
+          "unsupported",
+          "warnings",
+          "requires",
+          "resources",
+          "already_installed"
+        ],
+        "type": "object"
+      },
       "UserscriptResponse": {
         "description": "Userscript description.",
         "properties": {
@@ -3761,6 +4368,16 @@
               "string",
               "null"
             ]
+          },
+          "connect": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "connect_all_approved": {
+            "description": "`@connect *` was approved at install.",
+            "type": "boolean"
           },
           "description": {
             "type": [
@@ -3776,10 +4393,28 @@
             "minimum": 0,
             "type": "integer"
           },
+          "grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "homepage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
           "last_executed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_update_check": {
             "type": [
               "string",
               "null"
@@ -3800,11 +4435,62 @@
               "null"
             ]
           },
+          "noframes": {
+            "type": "boolean"
+          },
+          "pending_update": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PendingUpdateDto",
+                "description": "A found update awaiting approval."
+              }
+            ]
+          },
+          "require_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resource_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "storage_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unsupported": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "update_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "version": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -3857,6 +4543,33 @@
           "enabled_scripts",
           "disabled_scripts",
           "total_executions"
+        ],
+        "type": "object"
+      },
+      "UserscriptStorageResponse": {
+        "description": "A script's stored values.",
+        "properties": {
+          "quota_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "values": {
+            "items": {
+              "$ref": "#/components/schemas/StorageValueDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "used_bytes",
+          "quota_bytes",
+          "values"
         ],
         "type": "object"
       },
@@ -3959,7 +4672,7 @@
       "rules:read": "Read custom rules; validate rules and test URLs against the engine (no changes).",
       "rules:write": "Replace the custom rules.",
       "scripts:read": "View userscripts and their source.",
-      "scripts:write": "Install, update, enable, disable and remove userscripts.",
+      "scripts:write": "Install, update, enable, disable and remove userscripts; view and clear their stored values.",
       "sessions:admin": "List and revoke any user's sessions.",
       "sessions:self": "Log out, change your password, list and revoke your own sessions.",
       "stats:read": "Read blocking, proxy and engine statistics.",
@@ -10469,6 +11182,359 @@
         ]
       }
     },
+    "/api/v1/userscripts/export": {
+      "get": {
+        "description": "`values=true` also exports each script's stored values (possibly sensitive; requires\n`scripts:write`). JSON only (no zip).",
+        "operationId": "export_userscripts",
+        "parameters": [
+          {
+            "description": "Include stored GM values. Values may hold secrets and need `scripts:write`.",
+            "in": "query",
+            "name": "values",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptBundle"
+                }
+              }
+            },
+            "description": "Bundle"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:read"
+            ]
+          }
+        ],
+        "summary": "Export all userscripts as a JSON bundle.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/import": {
+      "post": {
+        "description": "`on_conflict` is `skip` (default) or `replace`. Each script is validated like an install;\none bad script does not stop the others.",
+        "operationId": "import_userscripts",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserscriptBundle"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportUserscriptsResponse"
+                }
+              }
+            },
+            "description": "Per-script results"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Import a bundle produced by export (JSON, up to 16 MiB).",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/plan": {
+      "post": {
+        "description": "Parses the script, fetches its `@require`/`@resource` dependencies (integrity hashes\nverified, size capped, control-plane fetch policy) and returns what installing would grant.\nNothing is installed until `confirm`.",
+        "operationId": "plan_userscript",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanUserscriptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptPlanResponse"
+                }
+              }
+            },
+            "description": "Plan"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Plan an install from source or URL.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/plan/{plan_id}/confirm": {
+      "post": {
+        "operationId": "confirm_plan",
+        "parameters": [
+          {
+            "description": "Plan id",
+            "in": "path",
+            "name": "plan_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmPlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptResponse"
+                }
+              }
+            },
+            "description": "Installed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "404": {
+            "description": "Unknown or expired plan"
+          },
+          "409": {
+            "description": "Already installed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Confirm a plan and install the script.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
     "/api/v1/userscripts/stats": {
       "get": {
         "operationId": "get_stats",
@@ -10800,6 +11866,101 @@
         ]
       }
     },
+    "/api/v1/userscripts/{id}/check-update": {
+      "post": {
+        "description": "A newer version that widens `@match`/`@connect`/`@grant` (or any newer version when `apply`\nis false) is stored as the script's pending update for approval.",
+        "operationId": "check_update",
+        "parameters": [
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckUpdateResponse"
+                }
+              }
+            },
+            "description": "Result"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Check a script for a newer version.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
     "/api/v1/userscripts/{id}/enabled": {
       "put": {
         "operationId": "set_enabled",
@@ -10973,6 +12134,443 @@
           }
         ],
         "summary": "Get a userscript's source.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/{id}/storage": {
+      "delete": {
+        "operationId": "clear_storage",
+        "parameters": [
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Cleared"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Delete all of a script's stored values.",
+        "tags": [
+          "userscripts"
+        ]
+      },
+      "get": {
+        "operationId": "get_storage",
+        "parameters": [
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptStorageResponse"
+                }
+              }
+            },
+            "description": "Values"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "A script's stored GM values.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/{id}/storage/{name}": {
+      "delete": {
+        "operationId": "delete_storage_value",
+        "parameters": [
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Value name",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Delete one stored value.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/{id}/update": {
+      "delete": {
+        "operationId": "discard_update",
+        "parameters": [
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptResponse"
+                }
+              }
+            },
+            "description": "Discarded"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Discard a script's pending update.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/{id}/update/approve": {
+      "post": {
+        "operationId": "approve_update",
+        "parameters": [
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptResponse"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Apply a script's pending update.",
         "tags": [
           "userscripts"
         ]

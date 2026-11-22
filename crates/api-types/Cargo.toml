@@ -9,6 +9,7 @@ description = "Shared serde DTOs for the web API contract (single source of trut
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 # Server-only: validation + OpenAPI schema derives. Gated behind `server` so the
 # wasm web-ui never pulls validator/utoipa into its bundle.

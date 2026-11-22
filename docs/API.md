@@ -49,7 +49,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `ca:read` | yes | yes | yes | Read CA certificate details (fingerprint, expiry, subject). |
 | `ca:admin` | - | - | yes | Manage the CA certificate (reserved). |
 | `scripts:read` | yes | yes | yes | View userscripts and their source. |
-| `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts. |
+| `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts; view and clear their stored values. |
 | `policy:read` | yes | yes | yes | View script policy rules, explanations, temporary permissions and blocked-source reports. |
 | `policy:write` | - | yes | yes | Change script policy settings, rules and temporary permissions; import policy. |
 | `profiles:read` | yes | yes | yes | Read filtering profiles (reserved). |
@@ -140,3 +140,26 @@ host, request type, matched rule, list id (for domain-set hits) and client label
 `stats:read`. URLs are stored without their query string and fragment unless
 `adblock.recent_blocked_keep_query` is set. `GET /system/metrics` also reports `storage`
 (`deferred_dropped`, `deferred_failed`, `deferred_queued`) for the background database writer.
+
+## Userscripts
+
+All routes act on the default profile. Writes are audited.
+
+| Method and path | Scope | Purpose |
+|---|---|---|
+| `GET /userscripts`, `GET /userscripts/{id}`, `/source`, `/stats` | `scripts:read` | List, inspect, source, counters. |
+| `POST /userscripts` | `scripts:write` | Install directly from `source` (no dependencies fetched, no `@connect *` approval). |
+| `POST /userscripts/plan` | `scripts:write` | Body `{source}` or `{url}`: parse, fetch `@require`/`@resource` (integrity hashes verified, size capped, control-plane fetch policy) and return a plan summary with `plan_id` (grants, connect, matches, `broad_match`, `connect_all`, capability flags, warnings, dependencies, `already_installed`). Plans live 15 min in memory (max 32). |
+| `POST /userscripts/plan/{plan_id}/confirm` | `scripts:write` | Body `{allow_connect_all?, enable?}` installs the plan (201). `allow_connect_all` only for scripts declaring `@connect *`. 404 unknown/expired plan, 409 already installed. |
+| `POST /userscripts/{id}/check-update` | `scripts:write` | Body `{apply?}`. Fetches the update URL; result `up_to_date`, `updated` (only with `apply`, and only if the update does not widen `@match`/`@connect`/`@grant`) or `pending_approval` (stored on the script, returned with its diff). |
+| `POST /userscripts/{id}/update/approve` | `scripts:write` | Apply the pending update (`{allow_connect_all?}`). |
+| `DELETE /userscripts/{id}/update` | `scripts:write` | Discard the pending update. |
+| `GET /userscripts/{id}/storage` | `scripts:write` | Stored GM values: `used_bytes`, `quota_bytes`, per value name, size and 200-char preview. |
+| `DELETE /userscripts/{id}/storage`, `/storage/{name}` | `scripts:write` | Clear all values or one. |
+| `GET /userscripts/export?values=` | `scripts:read` | JSON bundle `adblocker-userscripts-v1` (sources, enabled, `@connect *` approval, fetched dependencies). `values=true` adds stored values, which may hold secrets, and needs `scripts:write`. JSON only (no zip). |
+| `POST /userscripts/import` | `scripts:write` | Import a bundle (max 16 MiB), `on_conflict` `skip` (default) or `replace`; per-script results `{id,name,status,error?}`. |
+
+Config (`[userscripts]`): `update_check_interval_hours` (0 = off, default) schedules checks of every
+script with an update URL; `auto_apply_updates` (default false) applies found updates only when they
+do not widen `@match`/`@connect`/`@grant`. Installing from a `.user.js` URL is `POST /userscripts/plan`
+with `url`; there is no proxy interception.

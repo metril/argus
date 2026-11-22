@@ -15,6 +15,7 @@ pub mod openapi;
 pub mod routes;
 pub mod server;
 pub mod state;
+pub mod userscript_ops;
 
 // Re-export commonly used items
 pub use config::ApiConfig;

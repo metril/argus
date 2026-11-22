@@ -49,6 +49,9 @@ pub struct AppState {
     /// Userscript manager
     pub userscript_manager: Arc<UserscriptManager>,
 
+    /// Pending two-step userscript installs.
+    pub userscript_plans: crate::userscript_ops::PlanStore,
+
     /// Userscript runtime
     pub userscript_runtime: Arc<UserscriptRuntime>,
 
@@ -546,6 +549,7 @@ pub async fn build_state(
         http_client,
         userscript_manager,
         userscript_runtime,
+        userscript_plans: Default::default(),
         session_store,
         session_manager,
         jwt_config,

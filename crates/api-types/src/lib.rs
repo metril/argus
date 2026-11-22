@@ -20,6 +20,9 @@ pub use more::*;
 mod policy;
 pub use policy::*;
 
+mod userscripts;
+pub use userscripts::*;
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -440,6 +443,36 @@ pub struct UserscriptResponse {
     pub execution_count: u64,
     pub last_executed: Option<String>,
     pub match_patterns: Vec<String>,
+    /// A found update awaiting approval.
+    #[serde(default)]
+    pub pending_update: Option<PendingUpdateDto>,
+    #[serde(default)]
+    pub last_update_check: Option<String>,
+    #[serde(default)]
+    pub grants: Vec<String>,
+    #[serde(default)]
+    pub connect: Vec<String>,
+    /// `@connect *` was approved at install.
+    #[serde(default)]
+    pub connect_all_approved: bool,
+    #[serde(default)]
+    pub unsupported: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub run_at: Option<String>,
+    #[serde(default)]
+    pub noframes: bool,
+    #[serde(default)]
+    pub storage_bytes: u64,
+    #[serde(default)]
+    pub update_url: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub require_count: usize,
+    #[serde(default)]
+    pub resource_count: usize,
 }
 
 /// Install a userscript from source.

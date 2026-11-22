@@ -186,6 +186,23 @@ impl UserscriptManager {
         Ok(())
     }
 
+    /// Mutate an installed script in place and persist it (no index refresh: only for fields
+    /// the index does not read, e.g. update-check state).
+    pub fn modify_script<R>(
+        &self,
+        profile: &str,
+        script_id: &str,
+        f: impl FnOnce(&mut Userscript) -> R,
+    ) -> Result<R> {
+        let mut scripts = self.scripts.write();
+        let script = scripts
+            .get_mut(&key(profile, script_id))
+            .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
+        let r = f(script);
+        self.save_script(script, Durability::Immediate)?;
+        Ok(r)
+    }
+
     /// Uninstall a userscript (default profile)
     pub fn uninstall(&self, script_id: &str) -> Result<()> {
         self.uninstall_in(DEFAULT_PROFILE, script_id)

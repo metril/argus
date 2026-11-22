@@ -48,6 +48,20 @@ pub struct ScriptAssets {
     pub resources: Vec<ResourceBlob>,
 }
 
+/// A newer version found by an update check, waiting for approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingUpdate {
+    pub source: String,
+    #[serde(default)]
+    pub assets: ScriptAssets,
+    pub diff: crate::install::UpdateDiff,
+    pub new_version: Option<String>,
+    pub found_at: DateTime<Utc>,
+    /// Where the new source came from (resolves relative `@require` URLs).
+    #[serde(default)]
+    pub origin_url: Option<String>,
+}
+
 /// Represents a single userscript
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Userscript {
@@ -76,6 +90,12 @@ pub struct Userscript {
     /// The user approved `@connect *` for this script at install time.
     #[serde(default)]
     pub allow_connect_all: bool,
+    /// A found update awaiting approval.
+    #[serde(default)]
+    pub pending_update: Option<PendingUpdate>,
+    /// When an update check last completed for this script.
+    #[serde(default)]
+    pub last_update_check: Option<DateTime<Utc>>,
 }
 
 impl Userscript {
@@ -97,6 +117,8 @@ impl Userscript {
             execution_count: 0,
             assets: ScriptAssets::default(),
             allow_connect_all: false,
+            pending_update: None,
+            last_update_check: None,
         })
     }
 
