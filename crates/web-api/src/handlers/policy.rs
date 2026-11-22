@@ -929,7 +929,11 @@ fn panel_out(p: &script_policy::panel::PanelSettings) -> api_types::PanelSetting
             script_policy::panel::PanelAuth::None => "none",
         }
         .into(),
-        pin_set: p.pin_hash.is_some(),
+        // A hash in the old format cannot be verified: the dashboard shows "no PIN" so a new one is set.
+        pin_set: p
+            .pin_hash
+            .as_deref()
+            .is_some_and(script_policy::panel::is_current_hash),
         reserved_host: String::new(),
     }
 }
@@ -999,8 +1003,7 @@ pub async fn put_panel(
             p.pin_hash = None;
         }
         if let Some(pin) = &req.pin {
-            let salt = uuid::Uuid::new_v4().simple().to_string();
-            p.pin_hash = Some(hash_pin(pin, &salt).map_err(|e| ApiError::ValidationError(e.into()))?);
+            p.pin_hash = Some(hash_pin(pin).map_err(|e| ApiError::ValidationError(e.into()))?);
         }
         st.set_panel_settings(PROFILE, &p).map_err(store_err)?;
         Ok(p)

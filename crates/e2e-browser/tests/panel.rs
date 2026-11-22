@@ -12,7 +12,7 @@ use script_policy::{Scope, DEFAULT_PROFILE as P};
 use serde_json::Value;
 use std::sync::Mutex;
 
-const PIN: &str = "4711";
+const PIN: &str = "471100";
 
 /// Records which sites have ad blocking off (the production backend edits the custom rules).
 #[derive(Default)]
@@ -62,7 +62,7 @@ async fn setup(s: &Session, auth: PanelAuth) -> Arc<Sites> {
             &PanelSettings {
                 enabled: true,
                 auth,
-                pin_hash: Some(hash_pin(PIN, "salt").unwrap()),
+                pin_hash: Some(hash_pin(PIN).unwrap()),
                 ..Default::default()
             },
         )

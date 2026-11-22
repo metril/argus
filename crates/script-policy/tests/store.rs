@@ -211,3 +211,41 @@ fn import_export_through_the_store_and_reports() {
     );
     assert_eq!(s.report_pages(DEFAULT_PROFILE).len(), 1);
 }
+
+#[test]
+fn pin_lockout_is_per_client_and_per_profile_backs_off_exponentially_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, c) = clock();
+    let st = open(dir.path(), c.clone());
+    let wait = |s: &PolicyStore, ip: &str| s.pin_wait("p", ip).unwrap();
+    for _ in 0..4 {
+        st.pin_failed("p", "10.0.0.1").unwrap();
+    }
+    assert_eq!(wait(&st, "10.0.0.1"), 0, "five free tries");
+    st.pin_failed("p", "10.0.0.1").unwrap();
+    let w1 = wait(&st, "10.0.0.1");
+    assert!((1..=30).contains(&w1), "{w1}");
+    assert_eq!(wait(&st, "10.0.0.2"), 0, "another client is not locked");
+    st.pin_failed("p", "10.0.0.1").unwrap();
+    let w2 = wait(&st, "10.0.0.1");
+    assert!(w2 > w1 && w2 <= 60, "backoff doubles: {w1} -> {w2}");
+    // Survives a reopen of the store.
+    drop(st);
+    let st = open(dir.path(), c.clone());
+    assert!(wait(&st, "10.0.0.1") > 0, "lock survives restart");
+    // Time passes: the lock lapses; a correct PIN clears the counters.
+    t.fetch_add(120, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(wait(&st, "10.0.0.1"), 0);
+    st.pin_failed("p", "10.0.0.1").unwrap();
+    st.pin_ok("p", "10.0.0.1").unwrap();
+    st.pin_failed("p", "10.0.0.1").unwrap();
+    assert_eq!(wait(&st, "10.0.0.1"), 0, "counter was cleared");
+    // Many clients together trip the per-profile backoff.
+    for i in 0..20 {
+        st.pin_failed("q", &format!("192.168.0.{i}")).unwrap();
+    }
+    assert!(
+        st.pin_wait("q", "192.168.9.9").unwrap() > 0,
+        "profile-wide lock"
+    );
+}

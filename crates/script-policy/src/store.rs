@@ -71,6 +71,19 @@ macro_rules! from_redb {
 }
 from_redb!(common::db::redb::TableError, common::db::redb::StorageError);
 
+const PINLOCK_PREFIX: &str = "pinlock\0";
+/// Failures are forgotten after this long without a new one.
+const PIN_LOCK_DECAY: u64 = 24 * 3600;
+const PIN_LOCK_MAX_ENTRIES: usize = 4096;
+
+/// Failed-PIN counter and the time it is locked until (unix seconds).
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+struct PinLock {
+    fails: u32,
+    last: u64,
+    until: u64,
+}
+
 fn key(profile: &str, id: &str) -> String {
     format!("{profile}\0{id}")
 }
@@ -273,6 +286,96 @@ impl PolicyStore {
         })?;
         self.notify(profile);
         Ok(())
+    }
+
+    // ---- PIN lockout (persisted so a restart does not reset it) ----
+
+    fn lock_key(profile: &str, who: &str) -> String {
+        format!("{PINLOCK_PREFIX}{profile}\0{who}")
+    }
+
+    fn lock_get(
+        meta: &impl common::db::redb::ReadableTable<&'static str, &'static [u8]>,
+        k: &str,
+        now: u64,
+    ) -> Result<PinLock, StoreError> {
+        let l: PinLock = match meta.get(k)? {
+            Some(v) => serde_json::from_slice(v.value()).unwrap_or_default(),
+            None => PinLock::default(),
+        };
+        // Old failures are forgotten.
+        Ok(if now.saturating_sub(l.last) > PIN_LOCK_DECAY {
+            PinLock::default()
+        } else {
+            l
+        })
+    }
+
+    /// Seconds a PIN attempt from `ip` on `profile` must still wait (0 = may try), from both the
+    /// per-client and the per-profile backoff.
+    pub fn pin_wait(&self, profile: &str, ip: &str) -> Result<u64, StoreError> {
+        let now = self.now();
+        self.db.read(|txn| {
+            let meta = txn.open_table(tables::POLICY_META)?;
+            let mut wait = 0;
+            for who in [format!("ip:{ip}"), "*".to_string()] {
+                let l = Self::lock_get(&meta, &Self::lock_key(profile, &who), now)?;
+                wait = wait.max(l.until.saturating_sub(now));
+            }
+            Ok(wait)
+        })
+    }
+
+    /// Record a wrong PIN from `ip`: bumps the per-client and the per-profile counters.
+    pub fn pin_failed(&self, profile: &str, ip: &str) -> Result<(), StoreError> {
+        use crate::panel::backoff_secs;
+        use common::db::redb::ReadableTable as _;
+        let now = self.now();
+        self.db.write(Durability::Immediate, |txn| {
+            let mut meta = txn.open_table(tables::POLICY_META)?;
+            // Bounded: forget stale per-client entries; past the cap only the profile counter grows.
+            let lo = format!("{PINLOCK_PREFIX}{profile}\0");
+            let hi = format!("{PINLOCK_PREFIX}{profile}\u{1}");
+            let mut stale = Vec::new();
+            let mut n = 0usize;
+            for e in meta.range(lo.as_str()..hi.as_str())? {
+                let (k, v) = e?;
+                n += 1;
+                let l: PinLock = serde_json::from_slice(v.value()).unwrap_or_default();
+                if now.saturating_sub(l.last) > PIN_LOCK_DECAY {
+                    stale.push(k.value().to_string());
+                }
+            }
+            for k in &stale {
+                meta.remove(k.as_str())?;
+            }
+            n -= stale.len();
+            for (who, free, max) in [(format!("ip:{ip}"), 5, 3600), ("*".to_string(), 15, 3600)] {
+                let k = Self::lock_key(profile, &who);
+                if who != "*" && n >= PIN_LOCK_MAX_ENTRIES && meta.get(k.as_str())?.is_none() {
+                    continue;
+                }
+                let mut l = Self::lock_get(&meta, &k, now)?;
+                l.fails += 1;
+                l.last = now;
+                l.until = now + backoff_secs(l.fails, free, 30, max);
+                let bytes =
+                    serde_json::to_vec(&l).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                meta.insert(k.as_str(), bytes.as_slice())?;
+            }
+            Ok::<_, StoreError>(())
+        })
+    }
+
+    /// A correct PIN clears the client's counter (and the profile's).
+    pub fn pin_ok(&self, profile: &str, ip: &str) -> Result<(), StoreError> {
+        self.db.write(Durability::Immediate, |txn| {
+            let mut meta = txn.open_table(tables::POLICY_META)?;
+            for who in [format!("ip:{ip}"), "*".to_string()] {
+                meta.remove(Self::lock_key(profile, &who).as_str())?;
+            }
+            Ok::<_, StoreError>(())
+        })
     }
 
     // ---- convenience edits (each is one `mutate`) ----

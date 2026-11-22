@@ -11,7 +11,7 @@ use script_policy::{Preset, Scope, DEFAULT_PROFILE as P};
 use serde_json::{json, Value};
 
 const PANEL_HOST: &str = "adblock.invalid";
-const PIN: &str = "4711";
+const PIN: &str = "471100";
 const PAGE: &str = "<!doctype html><html><head><title>t</title></head><body>hi</body></html>";
 
 fn setup(env: &TestEnv, auth: PanelAuth) -> Arc<PolicyStore> {
@@ -22,7 +22,7 @@ fn setup(env: &TestEnv, auth: PanelAuth) -> Arc<PolicyStore> {
             &PanelSettings {
                 enabled: true,
                 auth,
-                pin_hash: Some(hash_pin(PIN, "salt").unwrap()),
+                pin_hash: Some(hash_pin(PIN).unwrap()),
                 ..Default::default()
             },
         )
@@ -170,6 +170,32 @@ e2e_test!(confirm_and_apply_with_the_pin, rules = [], |env| {
         200
     );
     assert_eq!(preset_of(&store), Some(Preset::Untrusted));
+});
+
+e2e_test!(an_apply_nonce_is_single_use, rules = [], |env| {
+    let store = setup(&env, PanelAuth::None);
+    let c = env.client();
+    let p = proposal();
+    let n = field(&confirm(&env, &c, &p).await.1, "n");
+    let o = panel_origin(&env);
+    assert_eq!(
+        apply(&env, &c, &p, &n, "", "same-origin", Some(&o), true).await,
+        200
+    );
+    assert_eq!(preset_of(&store), Some(Preset::Untrusted));
+    let id = store
+        .rules(P)
+        .unwrap()
+        .site_rule_for_scope(&Scope::parse("app.test").unwrap())
+        .map(|r| r.id.clone())
+        .unwrap();
+    store.delete_site_rule(P, &id).unwrap();
+    assert_eq!(
+        apply(&env, &c, &p, &n, "", "same-origin", Some(&o), true).await,
+        403,
+        "a replayed confirmation must be refused"
+    );
+    assert!(preset_of(&store).is_none(), "replay must not re-apply");
 });
 
 e2e_test!(a_page_cannot_apply_or_forge_a_change, rules = [], |env| {

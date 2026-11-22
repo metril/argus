@@ -29,12 +29,11 @@ use hyper::header::{HeaderMap, CONTENT_TYPE};
 use hyper::{Method, Request, Response, StatusCode};
 use parking_lot::{Mutex, RwLock};
 use script_policy as sp;
-use script_policy::panel::{verify_pin, PanelAuth};
+use script_policy::panel::{is_current_hash, verify_pin, PanelAuth};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// Deployment settings of the panel (from `[script_control]`).
 #[derive(Clone, Debug)]
@@ -161,8 +160,13 @@ pub enum PanelOp {
 
 const MAX_OPS: usize = 16;
 const MAX_PROPOSAL: usize = 6 * 1024;
-const NONCE_TTL: u64 = 600;
-const PIN_FREE_TRIES: u32 = 5;
+/// A confirmation page is valid this long (seconds), and for one application only.
+const NONCE_TTL: u64 = 120;
+/// Used nonces remembered until they expire (a bound, not a tuning knob: it is only reached by
+/// someone who already holds the PIN).
+const MAX_USED_NONCES: usize = 1024;
+/// PIN checks that may run at once (each costs ~19 MiB for Argon2id).
+const MAX_PIN_CHECKS: usize = 2;
 
 pub fn encode_proposal(ops: &[PanelOp]) -> String {
     URL_SAFE_NO_PAD.encode(serde_json::to_vec(ops).unwrap_or_default())
@@ -185,8 +189,9 @@ fn decode_proposal(p: &str) -> Result<Vec<PanelOp>, &'static str> {
 pub struct PanelHost {
     cfg: RwLock<PanelConfig>,
     blocking: RwLock<Option<Arc<dyn SiteBlocking>>>,
-    /// Failed PIN attempts per profile: (count, locked until).
-    fails: Mutex<HashMap<u64, (u32, Option<Instant>)>>,
+    /// Nonces already applied, with their expiry.
+    used: Mutex<HashMap<String, u64>>,
+    pin_checks: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for PanelHost {
@@ -194,7 +199,8 @@ impl Default for PanelHost {
         PanelHost {
             cfg: RwLock::new(PanelConfig::default()),
             blocking: RwLock::new(None),
-            fails: Mutex::new(HashMap::new()),
+            used: Mutex::new(HashMap::new()),
+            pin_checks: Arc::new(tokio::sync::Semaphore::new(MAX_PIN_CHECKS)),
         }
     }
 }
@@ -368,7 +374,7 @@ impl PanelHost {
             "adblock_off": adblock_off,
             "userscripts": userscripts,
             "auth": ps.auth,
-            "pin_set": ps.pin_hash.is_some(),
+            "pin_set": ps.pin_hash.as_deref().is_some_and(script_policy::panel::is_current_hash),
             "panel_origin": panel_origin,
             "dashboard": cfg.dashboard_url,
         }))
@@ -545,14 +551,13 @@ impl PanelHost {
             return deny(StatusCode::FORBIDDEN, "The panel is turned off.");
         }
         // Nonce: bound to this profile and this exact proposal, valid for ten minutes.
-        let nonce_ok = n.split_once('.').is_some_and(|(e, mac)| {
-            u64::from_str_radix(e, 16).is_ok_and(|exp| {
-                exp >= now() && ct_eq(&internal.sign(&nonce_msg(rctx, p, exp)), mac)
-            })
+        let nonce_exp = n.split_once('.').and_then(|(e, mac)| {
+            let exp = u64::from_str_radix(e, 16).ok()?;
+            (exp >= now() && ct_eq(&internal.sign(&nonce_msg(rctx, p, exp)), mac)).then_some(exp)
         });
-        if !nonce_ok {
+        let Some(nonce_exp) = nonce_exp else {
             return deny(StatusCode::FORBIDDEN, "This confirmation expired or does not belong to this request. Start again from the panel.");
-        }
+        };
         match ps.auth {
             PanelAuth::Session => {
                 return deny(
@@ -561,23 +566,67 @@ impl PanelHost {
                 )
             }
             PanelAuth::Pin => {
-                let Some(stored) = ps.pin_hash.as_deref() else {
+                let Some(stored) = ps.pin_hash.clone() else {
                     return deny(StatusCode::FORBIDDEN, "No panel PIN is set.");
                 };
-                let id = rctx.profile.load().id;
-                if let Some(wait) = self.locked(id) {
+                if !is_current_hash(&stored) {
                     return deny(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        &format!("Too many wrong PINs. Try again in {wait} seconds."),
+                        StatusCode::FORBIDDEN,
+                        "The panel PIN has to be set again in the dashboard (Script policy, Panel).",
                     );
                 }
-                let ok = verify_pin(stored, form.get("pin").map(String::as_str).unwrap_or(""));
-                self.record_attempt(id, ok);
-                if !ok {
-                    return deny(StatusCode::FORBIDDEN, "Wrong PIN.");
+                let Ok(slot) = Arc::clone(&self.pin_checks).try_acquire_owned() else {
+                    return deny(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Busy. Try again in a moment.",
+                    );
+                };
+                let ip = rctx.client_addr.ip().to_string();
+                let profile_name = sc.profile_name().to_string();
+                let store = sc.store().clone();
+                let pin = form.get("pin").cloned().unwrap_or_default();
+                // Hashing is slow on purpose: never on an async thread. The lock check, the
+                // verification and the bookkeeping happen in one blocking task.
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let _slot = slot;
+                    match store.pin_wait(&profile_name, &ip) {
+                        Ok(0) => {}
+                        Ok(w) => return Err(Some(w)),
+                        Err(_) => return Err(None),
+                    }
+                    if verify_pin(&stored, &pin) {
+                        let _ = store.pin_ok(&profile_name, &ip);
+                        Ok(())
+                    } else {
+                        let _ = store.pin_failed(&profile_name, &ip);
+                        Err(Some(0))
+                    }
+                })
+                .await;
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(Some(0))) => return deny(StatusCode::FORBIDDEN, "Wrong PIN."),
+                    Ok(Err(Some(wait))) => {
+                        return deny(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            &format!("Too many wrong PINs. Try again in {wait} seconds."),
+                        )
+                    }
+                    _ => {
+                        return deny(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Could not check the PIN.",
+                        )
+                    }
                 }
             }
             PanelAuth::None => {}
+        }
+        if !self.consume_nonce(n, nonce_exp) {
+            return deny(
+                StatusCode::FORBIDDEN,
+                "This confirmation was already used or the server is busy. Start again from the panel.",
+            );
         }
         let ops = match decode_proposal(p) {
             Ok(o) => o,
@@ -607,26 +656,16 @@ impl PanelHost {
         )
     }
 
-    fn locked(&self, id: u64) -> Option<u64> {
-        let g = self.fails.lock();
-        let (_, until) = g.get(&id)?;
-        let left = (*until)?.checked_duration_since(Instant::now())?;
-        Some(left.as_secs() + 1)
-    }
-
-    fn record_attempt(&self, id: u64, ok: bool) {
-        let mut g = self.fails.lock();
-        if ok {
-            g.remove(&id);
-            return;
+    /// Mark a nonce as used; false if it already was (or the used-set is full of live nonces).
+    fn consume_nonce(&self, nonce: &str, exp: u64) -> bool {
+        let mut g = self.used.lock();
+        let t = now();
+        g.retain(|_, e| *e >= t);
+        if g.len() >= MAX_USED_NONCES || g.contains_key(nonce) {
+            return false;
         }
-        let e = g.entry(id).or_insert((0, None));
-        e.0 += 1;
-        if e.0 >= PIN_FREE_TRIES {
-            // 30 s, doubling per further failure, at most 15 minutes.
-            let secs = (30u64 << (e.0 - PIN_FREE_TRIES).min(5)).min(900);
-            e.1 = Some(Instant::now() + Duration::from_secs(secs));
-        }
+        g.insert(nonce.to_string(), exp);
+        true
     }
 
     fn apply_op(
@@ -845,16 +884,15 @@ mod tests {
     }
 
     #[test]
-    fn lockout_after_repeated_failures() {
+    fn nonces_are_single_use_and_bounded() {
         let h = PanelHost::default();
-        for _ in 0..PIN_FREE_TRIES - 1 {
-            h.record_attempt(1, false);
-            assert!(h.locked(1).is_none());
+        let exp = now() + 60;
+        assert!(h.consume_nonce("a", exp));
+        assert!(!h.consume_nonce("a", exp), "replay");
+        assert!(h.consume_nonce("b", exp));
+        for i in 0..MAX_USED_NONCES {
+            h.consume_nonce(&format!("n{i}"), exp);
         }
-        h.record_attempt(1, false);
-        assert!(h.locked(1).is_some());
-        assert!(h.locked(2).is_none());
-        h.record_attempt(1, true);
-        assert!(h.locked(1).is_none());
+        assert!(!h.consume_nonce("one-more", exp), "bounded");
     }
 }
