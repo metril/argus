@@ -6,6 +6,10 @@ Commit:     5934db2a0437a50182c4a8f3da2e0941cf806253 (2026-11-21)
 Licence:    GPL-3.0-or-later (uBlock Origin). These scriptlets are third-party code under the GPL;
             check compatibility before distributing a binary that embeds them.
 
+EMBEDDED ONLY WITH THE CARGO FEATURE `bundled-ubo-resources` (off by default; enable it via
+`filter-engine/bundled-ubo-resources` or `list-service/bundled-ubo-resources`). The default build
+does not include this file's content. See docs/LICENSING.md for the licence implication.
+
 Offline fallback only: a copy fetched at runtime (or cached in the data dir) takes precedence.
 
 Regenerate: download the files at the desired commit into a directory, then

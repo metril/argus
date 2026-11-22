@@ -33,6 +33,7 @@ url = { workspace = true }
 
 # Caching
 arc-swap = { workspace = true }
+crossbeam = { workspace = true }
 
 # Concurrency
 dashmap = { workspace = true }
@@ -47,6 +48,11 @@ regex = { workspace = true }
 
 # Common utilities
 common = { path = "../common" }
+
+[features]
+# Embed the uBlock Origin scriptlet snapshot (GPL-3.0) as an offline fallback. Off by default:
+# see docs/LICENSING.md.
+bundled-ubo-resources = []
 
 [dev-dependencies]
 criterion = { workspace = true }

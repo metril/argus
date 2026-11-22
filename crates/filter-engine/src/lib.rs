@@ -9,20 +9,25 @@ pub const ADBLOCK_CRATE_VERSION: &str = "0.12.5";
 
 pub mod bundled;
 pub mod compile;
+pub mod domainset;
 pub mod error;
+pub mod events;
 pub mod formats;
 pub mod list;
 pub mod matcher;
 pub mod pipeline;
+pub(crate) mod precheck;
 pub mod redirect_resources;
 pub mod scriptlet_resources;
 pub mod shared;
 pub mod stats;
 
 pub use arc_swap::{self, ArcSwap};
-pub use bundled::{BUNDLED_RESOURCES_COMMIT, BUNDLED_RESOURCES_JSON};
-pub use compile::{compile_lists, Compiled, ListCompileStats};
+pub use bundled::{BUNDLED_AVAILABLE, BUNDLED_RESOURCES_COMMIT, BUNDLED_RESOURCES_JSON};
+pub use compile::{compile_lists, route_domain_rules, Compiled, DomainRouted, ListCompileStats};
+pub use domainset::{DomainHit, DomainSet, DomainSetBuilder, Scheme};
 pub use error::{Error, Result};
+pub use events::{BlockEvent, BlockLog};
 pub use formats::{
     convert, detect, ConvertOptions, ConvertStats, Converted, ExtKind, ExtRule, IpRange, IpSet,
     ListFormat, ListMeta,

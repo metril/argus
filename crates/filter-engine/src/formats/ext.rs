@@ -33,7 +33,8 @@ pub enum ExtKind {
     Popup,
     /// `$to=` with a non-trivial pattern.
     To,
-    /// `$denyallow` that could not be translated.
+    /// `$denyallow`: no exact native translation exists (an exception would also unblock the
+    /// hosts for unrelated rules), so every such rule is handed off.
     DenyAllow,
     /// HTML filters (`##^`, `$$`).
     HtmlFilter,

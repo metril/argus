@@ -2,8 +2,9 @@
 //! when its cache key still matches, so the proxy blocks within milliseconds and works offline.
 //!
 //! File layout: `MAGIC | key[32] | body_len u64 LE | body | sha256(body)[32]`, where `body` is
-//! `blob_len u64 LE | engine blob | sidecar JSON` and the sidecar holds the extended-rule list, IP
-//! ranges and build summary.
+//! `blob_len u64 LE | engine blob | dom_len u64 LE | domain set | sidecar JSON`; the domain set is
+//! the raw table of `filter_engine::DomainSet` (loaded without re-hashing) and the sidecar holds
+//! the extended-rule list, IP ranges and build summary.
 //!
 //! The key hashes the converter version, the adblock crate version, and per list its id, format
 //! override, allowlist flag and content digest (list text plus resolved includes), plus the custom
@@ -13,13 +14,13 @@
 use std::io::Write;
 use std::path::Path;
 
-use filter_engine::{ExtRule, IpFilter, IpRange, ListFormat};
+use filter_engine::{DomainSet, ExtRule, IpFilter, IpRange, ListFormat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::report::BuildSummary;
 
-const MAGIC: &[u8; 6] = b"ABENG\x01";
+const MAGIC: &[u8; 6] = b"ABENG\x02";
 pub(crate) const FILE_NAME: &str = "engine.bin";
 
 pub(crate) type Key = [u8; 32];
@@ -83,6 +84,7 @@ struct Sidecar {
 #[derive(Debug)]
 pub(crate) struct Persisted {
     pub blob: Vec<u8>,
+    pub domains: DomainSet,
     pub ext: Vec<ExtRule>,
     pub ip: IpFilter,
     pub summary: BuildSummary,
@@ -93,6 +95,7 @@ pub(crate) fn save(
     path: &Path,
     key: &Key,
     blob: &[u8],
+    domains: &DomainSet,
     ext: &[ExtRule],
     ip: &IpFilter,
     summary: &BuildSummary,
@@ -104,9 +107,12 @@ pub(crate) fn save(
         summary: summary.clone(),
     })
     .map_err(std::io::Error::other)?;
-    let mut body = Vec::with_capacity(8 + blob.len() + sidecar.len());
+    let dom = domains.to_bytes();
+    let mut body = Vec::with_capacity(16 + blob.len() + dom.len() + sidecar.len());
     body.extend_from_slice(&(blob.len() as u64).to_le_bytes());
     body.extend_from_slice(blob);
+    body.extend_from_slice(&(dom.len() as u64).to_le_bytes());
+    body.extend_from_slice(&dom);
     body.extend_from_slice(&sidecar);
 
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -154,10 +160,20 @@ pub(crate) fn load(path: &Path, key: &Key) -> Result<Persisted, String> {
     if body.len() < 8 + blob_len {
         return Err("short engine blob".into());
     }
+    let rest = &body[8 + blob_len..];
+    if rest.len() < 8 {
+        return Err("short domain set".into());
+    }
+    let dom_len = u64::from_le_bytes(rest[..8].try_into().unwrap()) as usize;
+    if rest.len() < 8 + dom_len {
+        return Err("short domain set".into());
+    }
+    let domains = DomainSet::from_bytes(&rest[8..8 + dom_len])?;
     let side: Sidecar =
-        serde_json::from_slice(&body[8 + blob_len..]).map_err(|e| format!("sidecar: {e}"))?;
+        serde_json::from_slice(&rest[8 + dom_len..]).map_err(|e| format!("sidecar: {e}"))?;
     Ok(Persisted {
         blob: body[8..8 + blob_len].to_vec(),
+        domains,
         ext: side.ext,
         ip: IpFilter::from_ranges(&side.ip_block, &side.ip_allow),
         summary: side.summary,
@@ -181,10 +197,27 @@ mod tests {
             network: 7,
             ..Default::default()
         };
-        save(&path, &key(1), b"engine-bytes", &[], &ip, &summary).unwrap();
+        let mut db = filter_engine::DomainSetBuilder::new(vec!["l".into()]);
+        db.add_suffix("blocked.test", 0);
+        let domains = db.finish(true, true).set;
+        save(
+            &path,
+            &key(1),
+            b"engine-bytes",
+            &domains,
+            &[],
+            &ip,
+            &summary,
+        )
+        .unwrap();
         let p = load(&path, &key(1)).unwrap();
         assert_eq!(p.blob, b"engine-bytes");
         assert_eq!(p.summary.network, 7);
+        assert_eq!(p.domains.len(), 1);
+        assert!(p
+            .domains
+            .lookup("a.blocked.test", filter_engine::Scheme::Https)
+            .is_some());
         assert!(p.ip.block.contains("10.1.2.3".parse().unwrap()));
         assert!(load(&path, &key(2)).unwrap_err().contains("key"));
 

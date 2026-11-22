@@ -1,7 +1,4 @@
 ||h.example^$document
-||i.example^$script,domain=z.example
-@@||x.example^$script,domain=z.example
-@@||y.example^$script,domain=z.example
 ||t1.example^$image
 ||t2.example^$image
 ||s.example^$stealth

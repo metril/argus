@@ -6,14 +6,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use filter_engine::{
-    build_engine, build_set, formats::find_includes, try_build_engine, FilterList, ListFormat,
-    ListInput, ListReport, SharedEngine,
+    build_set, formats::find_includes, try_build_engine, FilterList, ListFormat, ListInput,
+    ListReport, SharedEngine,
 };
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::persist::{self, KeyEntry};
-use crate::report::BuildSummary;
+use crate::report::{BuildState, BuildSummary};
 use crate::store::{ListStatus, ListStore, CUSTOM_REPORT_ID};
 use crate::{Error, Result};
 
@@ -119,6 +119,10 @@ pub struct ListService {
     /// Cache key of the installed engine, to skip recompiling identical inputs.
     installed_key: Mutex<Option<persist::Key>>,
     summary: Mutex<BuildSummary>,
+    /// Live build state, progress and last cycle (see [`ListService::summary`]).
+    state: Mutex<BuildState>,
+    fetch_done: AtomicUsize,
+    last_cycle: Mutex<(Option<chrono::DateTime<Utc>>, u64)>,
     pub(crate) scriptlets_tx: watch::Sender<bool>,
     /// `true` once a fetched/cached resource library was applied (it then outranks the bundled one).
     fetched_resources: Arc<Mutex<bool>>,
@@ -198,6 +202,9 @@ impl ListService {
             installed_once: AtomicBool::new(false),
             installed_key: Mutex::new(None),
             summary: Mutex::new(summary),
+            state: Mutex::new(BuildState::Idle),
+            fetch_done: AtomicUsize::new(0),
+            last_cycle: Mutex::new((None, 0)),
             scriptlets_tx: watch::channel(false).0,
             fetched_resources: Arc::new(Mutex::new(false)),
             bundled_tried: AtomicBool::new(false),
@@ -236,9 +243,26 @@ impl ListService {
         self.builds.load(Ordering::Acquire)
     }
 
-    /// Totals of the last build (also available right after a restart).
+    /// Totals of the last build (also available right after a restart), with the live build
+    /// state and the duration and finish time of the last whole build cycle.
     pub fn summary(&self) -> BuildSummary {
-        self.summary.lock().clone()
+        let mut s = self.summary.lock().clone();
+        s.state = self.state.lock().clone();
+        let (at, ms) = *self.last_cycle.lock();
+        if at.is_some() {
+            s.last_build_at = at;
+            s.last_build_ms = ms;
+        }
+        s
+    }
+
+    /// Whether a build is running or queued (the same signal [`Self::wait_idle`] waits on).
+    pub fn is_building(&self) -> bool {
+        *self.busy.borrow()
+    }
+
+    fn set_state(&self, s: BuildState) {
+        *self.state.lock() = s;
     }
 
     /// What the last build made of list `id`: detected format, rule counts, first errors,
@@ -350,14 +374,24 @@ impl ListService {
                 let force = std::mem::take(&mut this.flight.lock().force);
                 // Run the build as its own task so a panic surfaces as a `JoinError` here.
                 let build = this.clone();
+                let started = Instant::now();
                 match tokio::spawn(async move { build.build_once(force).await }).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("Filter reload failed: {e}"),
+                    Ok(Ok(())) => this.set_state(BuildState::Idle),
+                    Ok(Err(e)) => {
+                        warn!("Filter reload failed: {e}");
+                        this.set_state(BuildState::Failed {
+                            error: e.to_string(),
+                        });
+                    }
                     Err(e) => {
                         warn!("Filter reload panicked: {e}");
                         this.record_build_failure("filter reload panicked");
+                        this.set_state(BuildState::Failed {
+                            error: "filter reload panicked".into(),
+                        });
                     }
                 }
+                *this.last_cycle.lock() = (Some(Utc::now()), started.elapsed().as_millis() as u64);
                 let mut f = this.flight.lock();
                 if f.pending {
                     f.pending = false;
@@ -499,6 +533,7 @@ impl ListService {
 
     /// Convert and compile `inputs` off the async threads, install the result and persist it.
     async fn compile_install(&self, inputs: Vec<BuildInput>) -> Result<()> {
+        self.set_state(BuildState::Compiling);
         let key = Self::key_of(&inputs);
         let ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
         let resources = self.engine.resources();
@@ -515,11 +550,13 @@ impl ListService {
                 })
                 .collect();
             let built = build_set(&list_inputs);
-            let engine = build_engine(&built.blob, &resources);
-            (built, engine)
+            // A blob the engine cannot load back (for example more rules than its flatbuffer
+            // verifier allows) must fail the build, not silently install an empty engine.
+            let engine = try_build_engine(&built.blob, &resources).map_err(Error::Other)?;
+            Ok::<_, Error>((built, engine))
         })
         .await
-        .map_err(|e| Error::Other(format!("compile task failed: {e}")))?;
+        .map_err(|e| Error::Other(format!("compile task failed: {e}")))??;
 
         let now = Utc::now();
         let mut summary = BuildSummary {
@@ -549,18 +586,25 @@ impl ListService {
         if built.reports.len() < ids.len() {
             warn!("build produced fewer reports than lists");
         }
-        let (ext, ip, blob) = (
+        summary.domain_set = built.domains.len();
+        let (ext, ip, blob, domains) = (
             Arc::new(built.ext),
             Arc::new(built.ip),
             Arc::new(built.blob),
+            Arc::new(built.domains),
         );
         info!(
             "Compiled {} list(s): {} network, {} cosmetic, {} extended, {} rejected, {} duplicate rules dropped in {} ms",
             summary.lists, summary.network, summary.cosmetic, summary.ext, summary.rejected,
             summary.duplicates, summary.duration_ms
         );
-        self.engine
-            .install_full(blob.clone(), engine, ext.clone(), ip.clone());
+        self.engine.install_set(
+            blob.clone(),
+            engine,
+            ext.clone(),
+            ip.clone(),
+            domains.clone(),
+        );
         self.installed_once.store(true, Ordering::Release);
         *self.installed_key.lock() = Some(key);
         if let Err(e) = self.store.set_summary(&summary) {
@@ -571,7 +615,7 @@ impl ListService {
         if self.cfg.persist_engine {
             let path = self.cfg.data_dir.join(persist::FILE_NAME);
             let res = tokio::task::spawn_blocking(move || {
-                persist::save(&path, &key, &blob, &ext, &ip, &summary)
+                persist::save(&path, &key, &blob, &domains, &ext, &ip, &summary)
             })
             .await;
             match res {
@@ -598,12 +642,18 @@ impl ListService {
             Ok(Ok((p, engine))) => {
                 let mut summary = p.summary;
                 summary.from_persisted = true;
+                summary.domain_set = p.domains.len();
                 info!(
                     "Loaded persisted filter engine ({} network, {} cosmetic rules)",
                     summary.network, summary.cosmetic
                 );
-                self.engine
-                    .install_full(Arc::new(p.blob), engine, Arc::new(p.ext), Arc::new(p.ip));
+                self.engine.install_set(
+                    Arc::new(p.blob),
+                    engine,
+                    Arc::new(p.ext),
+                    Arc::new(p.ip),
+                    Arc::new(p.domains),
+                );
                 self.installed_once.store(true, Ordering::Release);
                 *self.installed_key.lock() = Some(key);
                 *self.summary.lock() = summary;
@@ -659,8 +709,16 @@ impl ListService {
             }
         }
 
+        let total = enabled.len();
+        self.fetch_done.store(0, Ordering::Relaxed);
+        self.set_state(BuildState::Fetching { done: 0, total });
         let mut inputs: Vec<BuildInput> = futures_util::stream::iter(enabled)
-            .map(|l| self.fetch_one(l, force))
+            .map(|l| async move {
+                let r = self.fetch_one(l, force).await;
+                let done = self.fetch_done.fetch_add(1, Ordering::Relaxed) + 1;
+                self.set_state(BuildState::Fetching { done, total });
+                r
+            })
             .buffered(self.cfg.fetch_concurrency.max(1))
             .filter_map(|c| async move { c })
             .collect()
@@ -908,6 +966,8 @@ mod tests {
             .expect("reload_now must not hang after a panic");
         let status = svc.store().get_status(&list.id).unwrap();
         assert!(status.last_error.unwrap().contains("panicked"));
+        assert!(!svc.is_building());
+        assert!(matches!(svc.summary().state, BuildState::Failed { .. }));
         // The flight state is clean: a later trigger can run.
         assert!(!svc.flight.lock().running);
     }

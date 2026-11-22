@@ -12,7 +12,7 @@ mod service;
 mod store;
 
 pub use error::{Error, Result};
-pub use report::BuildSummary;
+pub use report::{BuildState, BuildSummary};
 pub use service::{ListService, ListServiceConfig};
 pub use store::{ListStatus, ListStore};
 

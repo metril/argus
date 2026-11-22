@@ -3,11 +3,36 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Where the list service is in its build cycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BuildState {
+    #[default]
+    Idle,
+    /// Downloading lists: `done` of `total` finished.
+    Fetching { done: usize, total: usize },
+    /// Converting and compiling.
+    Compiling,
+    /// The last build failed (the previous engine stays installed).
+    Failed { error: String },
+}
+
 /// Totals of the last build, for the filters API.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildSummary {
+    /// Live build state (filled in by `ListService::summary`; not meaningful when persisted).
+    #[serde(default)]
+    pub state: BuildState,
+    /// When the engine now installed was compiled.
     pub built_at: Option<DateTime<Utc>>,
+    /// Compile time of that engine (conversion, deduplication, indexing), excluding downloads.
     pub duration_ms: u64,
+    /// Wall-clock duration of the last whole build cycle (downloads and compile), success or not.
+    #[serde(default)]
+    pub last_build_ms: u64,
+    /// When the last build cycle finished.
+    #[serde(default)]
+    pub last_build_at: Option<DateTime<Utc>>,
     /// Lists compiled (including custom rules).
     pub lists: usize,
     pub network: usize,
@@ -16,6 +41,9 @@ pub struct BuildSummary {
     pub ext: usize,
     pub rejected: usize,
     pub ip_ranges: usize,
+    /// Pure domain rules held in the compact domain set instead of the engine.
+    #[serde(default)]
+    pub domain_set: usize,
     /// Rules dropped as duplicates across all lists.
     pub duplicates: usize,
     /// True when the live engine was loaded from the persisted blob rather than compiled.

@@ -88,7 +88,8 @@ impl ListService {
     /// Apply the bundled snapshot unless disabled (empty URL) or a fetched copy already won.
     /// Runs once, before the first build installs an engine, so the install is a cheap rebuild.
     pub(crate) async fn load_bundled_resources(&self) {
-        if self.cfg.scriptlet_resources_url.trim().is_empty()
+        if !filter_engine::BUNDLED_AVAILABLE
+            || self.cfg.scriptlet_resources_url.trim().is_empty()
             || self.bundled_tried.swap(true, Ordering::AcqRel)
         {
             return;
