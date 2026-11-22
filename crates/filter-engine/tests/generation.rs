@@ -30,7 +30,7 @@ fn verdict_and_companion_never_come_from_different_builds() {
         std::thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) && n < 2000 {
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     install(&e, "||b.test^", 2);
                 } else {
                     install(&e, "||a.test^", 1);

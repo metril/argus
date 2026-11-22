@@ -1096,6 +1096,74 @@ async fn list_format_allowlist_and_catalogue() {
 }
 
 #[tokio::test]
+async fn list_trust_is_exposed_audited_and_changes_rule_state() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let l = filter_engine::FilterList::new(
+        "ag".into(),
+        "AG".into(),
+        "https://127.0.0.1:1/ag.txt".into(),
+    );
+    ctx.state.filter_store.upsert(&l).unwrap();
+    ctx.state
+        .filter_store
+        .put_content(
+            "ag",
+            "||ads.example^\n||x.example^$replace=/a/b/\n||y.example^$stealth\n",
+        )
+        .unwrap();
+    ctx.state.list_service.reload_now().await;
+
+    let one: Value = admin.get("/api/v1/lists/ag").await.json();
+    assert_eq!(one["trusted"], false);
+    let e: Value = admin.get("/api/v1/rules/ext").await.json();
+    let states: Vec<(&str, &str)> = e["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| (i["kind"].as_str().unwrap(), i["state"].as_str().unwrap()))
+        .collect();
+    assert!(
+        states.contains(&("replace", "dropped_untrusted")),
+        "{states:?}"
+    );
+    assert!(
+        e["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["state"] == "unsupported" && i["reason"].is_string()),
+        "{e}"
+    );
+    let b: Value = admin.get("/api/v1/engine/build").await.json();
+    assert_eq!(
+        b["ext_stats"]["per_kind"]["replace"]["dropped_untrusted"],
+        1
+    );
+    assert_eq!(b["ext_stats"]["dropped_untrusted_by_list"]["ag"], 1);
+
+    let u: Value = admin
+        .put("/api/v1/lists/ag")
+        .json(&json!({"trusted": true}))
+        .await
+        .json();
+    assert_eq!(u["trusted"], true);
+    ctx.state.list_service.wait_idle().await;
+    ctx.state.list_service.reload_now().await;
+    let b: Value = admin.get("/api/v1/engine/build").await.json();
+    assert_eq!(b["ext_stats"]["per_kind"]["replace"]["active"], 1);
+    let log: Value = admin.get("/api/v1/audit?limit=100").await.json();
+    assert!(
+        log["items"].as_array().unwrap().iter().any(|a| a["route"]
+            .as_str()
+            .is_some_and(|r| r.ends_with("#trusted=true"))
+            && a["target"] == "ag"
+            && a["scope"] == "lists:write"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
 async fn reports_build_summary_and_ext_rules_reflect_a_real_build() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;

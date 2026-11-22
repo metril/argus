@@ -27,9 +27,7 @@ impl Profile {
     }
 
     /// The extended-rule index of the live generation (shares the engine's atomic swap).
-    pub fn ext_index<'g>(
-        generation: &'g filter_engine::Generation,
-    ) -> Option<&'g ext_rules::ExtIndex> {
+    pub fn ext_index(generation: &filter_engine::Generation) -> Option<&ext_rules::ExtIndex> {
         generation.aux::<ext_rules::ExtIndex>()
     }
 

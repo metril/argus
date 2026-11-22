@@ -149,6 +149,53 @@ fn benches(c: &mut Criterion) {
     }
     g.finish();
 
+    // The buffered ext path of `transform_html`, minus the network: `$replace` over the decoded
+    // document, a content-dependent HTML filter, then the streaming HTML stage.
+    let spec = ext_rules::ReplaceSpec::parse("/article/story/").unwrap();
+    let filters = vec![proxy_core::rewrite::ElementFilter {
+        selector: "script".into(),
+        accept: std::sync::Arc::new(|s: &str| s.contains("detect_adblock")),
+        min_len: 0,
+        max_len: 8192,
+    }];
+    let mut g = c.benchmark_group("ext_rewrite_500kb");
+    g.throughput(Throughput::Bytes(bytes));
+    g.bench_function("replace_filter_and_rewrite", |b| {
+        b.iter(|| {
+            let replaced = ext_rules::apply_replace(&html, &spec);
+            let filtered = proxy_core::rewrite::html::apply_element_filters(
+                &replaced,
+                encoding_rs::UTF_8,
+                &filters,
+            )
+            .unwrap();
+            let mut stage = RewriteStage::new(&plan, encoding_rs::UTF_8, false, 0).unwrap();
+            let mut n = 0;
+            for ch in filtered.chunks(16 * 1024) {
+                n += stage.push(ch).unwrap().len();
+            }
+            n += stage.finish().unwrap().len();
+            black_box(n)
+        })
+    });
+    g.bench_function("replace_only", |b| {
+        b.iter(|| black_box(ext_rules::apply_replace(&html, &spec).len()))
+    });
+    g.bench_function("element_filter_only", |b| {
+        b.iter(|| {
+            black_box(
+                proxy_core::rewrite::html::apply_element_filters(
+                    &html,
+                    encoding_rs::UTF_8,
+                    &filters,
+                )
+                .unwrap()
+                .len(),
+            )
+        })
+    });
+    g.finish();
+
     let mut f = c.benchmark_group("fixed_overhead");
     let origin = PageOrigin::new("https", "example.test", 443);
     let policy = "default-src 'self'; script-src 'self' 'nonce-abc' https://cdn.example.com https://*.google.com; \
