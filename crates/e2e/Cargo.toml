@@ -1,0 +1,25 @@
+[package]
+name = "e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+proxy-core = { path = "../proxy-core", features = ["websockets"] }
+filter-engine = { path = "../filter-engine" }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+tempfile = { workspace = true }

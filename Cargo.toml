@@ -9,6 +9,7 @@ members = [
     "crates/web-ui",
     "crates/common",
     "crates/api-types",
+    "crates/e2e",
 ]
 
 [workspace.package]
