@@ -235,7 +235,7 @@ pub async fn login(
     req.validate()?;
     let bad = || ApiError::AuthenticationFailed("Invalid username or password".into());
     let (st, name) = (state.clone(), req.username.clone());
-    let found = blocking(move || Ok(st.session_store.get_user_by_username(&name)?)).await?;
+    let found = blocking(move || st.session_store.get_user_by_username(&name)).await?;
     // Always run one bcrypt verification (against a dummy hash when the account is missing or
     // disabled) so response time does not reveal which usernames exist, and answer every
     // failure identically.

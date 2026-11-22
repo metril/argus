@@ -513,7 +513,7 @@ pub async fn add_from_catalogue(
     if state.filter_store.exists(&id)? {
         return Err(ApiError::AlreadyExists(format!("Filter list '{id}'")));
     }
-    validate_filter_url(&state, &entry.url).await?;
+    validate_filter_url(&state, entry.url).await?;
     let mut list = entry.to_filter_list();
     list.enabled = true;
     let (st, l) = (state.clone(), list.clone());

@@ -37,23 +37,23 @@ fn blocked(e: &SharedEngine, host: &str) -> (bool, bool) {
 #[test]
 fn exception_for_a_subdomain_unblocks_it_but_not_its_siblings() {
     let e = engine(&["||example.com^\n@@||sub.example.com^\n"]);
-    assert_eq!(blocked(&e, "example.com").0, true);
-    assert_eq!(blocked(&e, "other.example.com").0, true);
-    assert_eq!(blocked(&e, "sub.example.com").0, false);
-    assert_eq!(blocked(&e, "a.sub.example.com").0, false);
+    assert!(blocked(&e, "example.com").0);
+    assert!(blocked(&e, "other.example.com").0);
+    assert!(!blocked(&e, "sub.example.com").0);
+    assert!(!blocked(&e, "a.sub.example.com").0);
 }
 
 #[test]
 fn important_in_the_engine_beats_the_exception() {
     let e = engine(&["||example.com^\n||sub.example.com^$important\n@@||sub.example.com^\n"]);
     assert_eq!(blocked(&e, "sub.example.com"), (true, true));
-    assert_eq!(blocked(&e, "other.example.com").0, true);
+    assert!(blocked(&e, "other.example.com").0);
 }
 
 #[test]
 fn badfilter_removes_a_domain_set_entry() {
     let e = engine(&["||ads.example.com^\n||keep.example.com^\n||ads.example.com^$badfilter\n"]);
-    assert_eq!(blocked(&e, "ads.example.com").0, false);
-    assert_eq!(blocked(&e, "x.ads.example.com").0, false);
-    assert_eq!(blocked(&e, "keep.example.com").0, true);
+    assert!(!blocked(&e, "ads.example.com").0);
+    assert!(!blocked(&e, "x.ads.example.com").0);
+    assert!(blocked(&e, "keep.example.com").0);
 }

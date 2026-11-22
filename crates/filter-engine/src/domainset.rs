@@ -521,7 +521,7 @@ mod tests {
         for k in keys {
             out.extend_from_slice(&k.to_le_bytes());
         }
-        out.extend(std::iter::repeat(0u8).take(keys.len() * 2));
+        out.extend(std::iter::repeat_n(0u8, keys.len() * 2));
         out
     }
 

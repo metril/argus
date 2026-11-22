@@ -417,7 +417,7 @@ impl NetPolicy {
 
     fn host_allowed(&self, name: &str) -> bool {
         let n = name.trim_end_matches('.').to_ascii_lowercase();
-        self.allowed_hosts.iter().any(|h| *h == n)
+        self.allowed_hosts.contains(&n)
     }
 
     /// Address check for a DNS answer of `name`: an allowlisted host name may resolve to private
@@ -790,14 +790,19 @@ mod tests {
         let p = NetPolicy::control_plane(&[]).unwrap();
         let u = |s: &str| url::Url::parse(s).unwrap();
         let hop = u("https://a.example/");
-        assert!(redirect_verdict(&p, &[hop.clone()], &u("https://b.example/")).is_ok());
-        assert!(redirect_verdict(&p, &[hop.clone()], &u("http://b.example/")).is_err());
+        assert!(redirect_verdict(&p, std::slice::from_ref(&hop), &u("https://b.example/")).is_ok());
+        assert!(redirect_verdict(&p, std::slice::from_ref(&hop), &u("http://b.example/")).is_err());
         // A fetch that began on http may stay on http.
         let h = u("http://a.example/");
-        assert!(redirect_verdict(&p, &[h.clone()], &u("http://b.example/")).is_ok());
-        assert!(redirect_verdict(&p, &[hop.clone()], &u("https://[::1]/")).is_err());
-        assert!(redirect_verdict(&p, &[hop.clone()], &u("https://169.254.169.254/")).is_err());
-        assert!(redirect_verdict(&p, &[hop.clone()], &u("ftp://b.example/")).is_err());
+        assert!(redirect_verdict(&p, std::slice::from_ref(&h), &u("http://b.example/")).is_ok());
+        assert!(redirect_verdict(&p, std::slice::from_ref(&hop), &u("https://[::1]/")).is_err());
+        assert!(redirect_verdict(
+            &p,
+            std::slice::from_ref(&hop),
+            &u("https://169.254.169.254/")
+        )
+        .is_err());
+        assert!(redirect_verdict(&p, std::slice::from_ref(&hop), &u("ftp://b.example/")).is_err());
         let many = vec![hop; MAX_FETCH_REDIRECTS];
         assert!(redirect_verdict(&p, &many, &u("https://b.example/")).is_err());
     }
