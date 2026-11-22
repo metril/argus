@@ -1,12 +1,15 @@
 //! Userscript manager for handling multiple scripts
 
 use crate::{
+    backend::{GmBackend, Quotas},
     index::{BuildReport, ScriptIndex},
     matcher::Options,
     script::{Userscript, DEFAULT_PROFILE},
     storage::{ns, UserscriptStorage},
+    token::TokenKey,
     Error, Result,
 };
+use arc_swap::ArcSwap;
 use common::db::redb::{Durability, ReadableTable};
 use common::db::{tables, Db, DbError};
 use parking_lot::RwLock;
@@ -24,6 +27,13 @@ pub struct UserscriptManager {
     storage: Arc<UserscriptStorage>,
     /// Shared database (userscripts and GM values)
     db: Arc<Db>,
+    /// Live per-document index of the default profile, rebuilt (and swapped atomically) after
+    /// every change; the proxy reads it lock-free.
+    live_index: ArcSwap<ScriptIndex>,
+    /// The GM value/xhr/resource logic shared by the proxy endpoints and the management API.
+    gm: GmBackend,
+    /// Capability-token key: random per process (pages refresh tokens after a restart).
+    token_key: TokenKey,
 }
 
 fn key(profile: &str, id: &str) -> (String, String) {
@@ -52,9 +62,47 @@ impl UserscriptManager {
         let storage = Arc::new(UserscriptStorage::with_db(db.clone()));
         Ok(Self {
             scripts: Arc::new(RwLock::new(HashMap::new())),
-            storage,
             db,
+            live_index: ArcSwap::from_pointee(ScriptIndex::default()),
+            gm: GmBackend::new(storage.clone(), Quotas::default()),
+            token_key: {
+                use rand::RngCore;
+                let mut k = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut k);
+                TokenKey::new(k.to_vec())
+            },
+            storage,
         })
+    }
+
+    pub fn gm(&self) -> &GmBackend {
+        &self.gm
+    }
+
+    pub fn token_key(&self) -> &TokenKey {
+        &self.token_key
+    }
+
+    /// Delete every stored value of a script (and its in-memory accounting and change log).
+    pub fn clear_values(&self, profile: &str, script_id: &str) -> Result<()> {
+        self.storage.clear_script_storage(&ns(profile, script_id))?;
+        self.gm.forget_script(profile, script_id);
+        Ok(())
+    }
+
+    /// The current index of the default profile (one atomic load).
+    pub fn live_index(&self) -> arc_swap::Guard<Arc<ScriptIndex>> {
+        self.live_index.load()
+    }
+
+    /// Rebuild the default profile's live index from its scripts and swap it in. Called after
+    /// every mutation (never on the proxy request path).
+    pub fn refresh_index(&self) {
+        let report = self.build_index(DEFAULT_PROFILE, Options::default());
+        for (id, msg) in &report.problems {
+            warn!("userscript {id}: {msg}");
+        }
+        self.live_index.store(Arc::new(report.index));
     }
 
     /// Install a new userscript from source code (default profile; no dependencies fetched).
@@ -67,7 +115,15 @@ impl UserscriptManager {
     }
 
     /// Install a prepared script (e.g. from `install::finish_install`) into `profile`.
-    pub fn install_script(&self, profile: &str, mut script: Userscript) -> Result<String> {
+    pub fn install_script(&self, profile: &str, script: Userscript) -> Result<String> {
+        let r = self.install_script_raw(profile, script);
+        if r.is_ok() {
+            self.refresh_index();
+        }
+        r
+    }
+
+    fn install_script_raw(&self, profile: &str, mut script: Userscript) -> Result<String> {
         check_ids(profile, &script.id)?;
         script.profile = profile.to_string();
         let script_id = script.id.clone();
@@ -91,6 +147,14 @@ impl UserscriptManager {
     }
 
     pub fn update_in(&self, profile: &str, script_id: &str, new_source: String) -> Result<()> {
+        let r = self.update_in_raw(profile, script_id, new_source);
+        if r.is_ok() {
+            self.refresh_index();
+        }
+        r
+    }
+
+    fn update_in_raw(&self, profile: &str, script_id: &str, new_source: String) -> Result<()> {
         let mut scripts = self.scripts.write();
         let script = scripts
             .get_mut(&key(profile, script_id))
@@ -103,7 +167,15 @@ impl UserscriptManager {
 
     /// Replace an installed script with an already verified update (see
     /// `install::finish_update`, which enforces re-approval for widening updates).
-    pub fn replace_script(&self, profile: &str, mut script: Userscript) -> Result<()> {
+    pub fn replace_script(&self, profile: &str, script: Userscript) -> Result<()> {
+        let r = self.replace_script_raw(profile, script);
+        if r.is_ok() {
+            self.refresh_index();
+        }
+        r
+    }
+
+    fn replace_script_raw(&self, profile: &str, mut script: Userscript) -> Result<()> {
         let mut scripts = self.scripts.write();
         if !scripts.contains_key(&key(profile, &script.id)) {
             return Err(Error::ScriptNotFound(script.id));
@@ -120,6 +192,14 @@ impl UserscriptManager {
     }
 
     pub fn uninstall_in(&self, profile: &str, script_id: &str) -> Result<()> {
+        let r = self.uninstall_in_raw(profile, script_id);
+        if r.is_ok() {
+            self.refresh_index();
+        }
+        r
+    }
+
+    fn uninstall_in_raw(&self, profile: &str, script_id: &str) -> Result<()> {
         info!("Uninstalling userscript: {}", script_id);
         let script = self
             .scripts
@@ -138,6 +218,7 @@ impl UserscriptManager {
             UserscriptStorage::clear_in_txn(t, &namespace)
         })?;
         self.storage.drop_cache(&namespace);
+        self.gm.forget_script(profile, script_id);
         info!("Uninstalled userscript: {}", script.name());
         Ok(())
     }
@@ -193,6 +274,14 @@ impl UserscriptManager {
     }
 
     pub fn set_enabled_in(&self, profile: &str, script_id: &str, enabled: bool) -> Result<()> {
+        let r = self.set_enabled_in_raw(profile, script_id, enabled);
+        if r.is_ok() {
+            self.refresh_index();
+        }
+        r
+    }
+
+    fn set_enabled_in_raw(&self, profile: &str, script_id: &str, enabled: bool) -> Result<()> {
         let mut scripts = self.scripts.write();
         let script = scripts
             .get_mut(&key(profile, script_id))
@@ -225,27 +314,47 @@ impl UserscriptManager {
         Ok(())
     }
 
-    /// Load all userscripts from the database
+    /// Load all userscripts from the database. Rows that no longer parse (the pre-rewrite
+    /// format kept `@resource`s in a `resources` map) are dropped with a log line: there is
+    /// nothing to migrate them to, and a row that never loads would be re-reported forever.
     pub fn load_all(&self) -> Result<usize> {
         info!("Loading userscripts");
-        let loaded: Vec<Userscript> = self.db.read(|r| {
+        let (loaded, stale): (Vec<Userscript>, Vec<String>) = self.db.read(|r| {
             let t = r.open_table(tables::USERSCRIPTS).map_err(DbError::from)?;
-            let mut out = Vec::new();
+            let (mut out, mut stale) = (Vec::new(), Vec::new());
             for item in t.iter().map_err(DbError::from)? {
                 let (k, v) = item.map_err(DbError::from)?;
                 match serde_json::from_slice::<Userscript>(v.value()) {
                     Ok(s) => out.push(s),
-                    Err(e) => warn!("Failed to load script {}: {}", k.value(), e),
+                    Err(e) => {
+                        warn!(
+                            "Dropping stored userscript {} (old or unreadable format: {e})",
+                            k.value()
+                        );
+                        stale.push(k.value().to_string());
+                    }
                 }
             }
-            Ok::<_, Error>(out)
+            Ok::<_, Error>((out, stale))
         })?;
-        let count = loaded.len();
-        let mut scripts = self.scripts.write();
-        for script in loaded {
-            debug!("Loaded userscript: {}", script.name());
-            scripts.insert(key(&script.profile, &script.id), script);
+        if !stale.is_empty() {
+            self.db.write::<_, Error>(Durability::Immediate, |t| {
+                let mut tbl = t.open_table(tables::USERSCRIPTS).map_err(DbError::from)?;
+                for k in &stale {
+                    tbl.remove(k.as_str()).map_err(DbError::from)?;
+                }
+                Ok(())
+            })?;
         }
+        let count = loaded.len();
+        {
+            let mut scripts = self.scripts.write();
+            for script in loaded {
+                debug!("Loaded userscript: {}", script.name());
+                scripts.insert(key(&script.profile, &script.id), script);
+            }
+        }
+        self.refresh_index();
         info!("Loaded {} userscripts", count);
         Ok(count)
     }
