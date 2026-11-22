@@ -143,15 +143,9 @@ impl Default for AdblockSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
-}
-
-impl Default for UserscriptSettings {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
