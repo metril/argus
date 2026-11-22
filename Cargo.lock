@@ -2656,6 +2656,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "list-service"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "common",
+ "filter-engine",
+ "futures-util",
+ "parking_lot 0.12.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sled",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3349,6 +3369,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "list-service",
  "moka",
  "parking_lot 0.12.5",
  "pem",
@@ -5468,6 +5489,7 @@ dependencies = [
  "filter-engine",
  "governor",
  "jsonwebtoken",
+ "list-service",
  "parking_lot 0.12.5",
  "rand 0.8.6",
  "reqwest",

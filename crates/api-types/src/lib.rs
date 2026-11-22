@@ -242,6 +242,12 @@ pub struct FilterListResponse {
     pub enabled: bool,
     pub last_updated: Option<String>,
     pub rule_count: usize,
+    /// Error from the most recent fetch attempt, if it failed (cached content is still used).
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// When the list was last fetched or revalidated (RFC 3339).
+    #[serde(default)]
+    pub last_checked: Option<String>,
 }
 
 /// Add a filter list.

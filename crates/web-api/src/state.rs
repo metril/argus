@@ -6,12 +6,12 @@ use crate::auth::models::User;
 use crate::auth::session::SessionManager;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
-use crate::filter_store::FilterListStore;
 use chrono::Utc;
 use common::config::ProxyConfig;
 use dashmap::DashMap;
 use filter_engine::{FilterStats, SharedEngine};
 use governor::{Quota, RateLimiter};
+use list_service::{ListService, ListStore};
 use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -33,7 +33,9 @@ pub struct AppState {
     pub shared_engine: Arc<SharedEngine>,
 
     /// Persistent store of filter-list metadata + cached content.
-    pub filter_store: Arc<FilterListStore>,
+    pub filter_store: Arc<ListStore>,
+    /// Shared list service (fetch/compile/install); also owns `filter_store`.
+    pub list_service: Arc<ListService>,
 
     /// Shared pooled HTTP client for downloading filter lists.
     pub http_client: reqwest::Client,
@@ -354,7 +356,7 @@ pub async fn build_state(
     api_config: ApiConfig,
     proxy_config: ProxyConfig,
     shared_engine: Arc<SharedEngine>,
-    filter_store: Arc<FilterListStore>,
+    list_service: Arc<ListService>,
     http_client: reqwest::Client,
     userscript_manager: Arc<UserscriptManager>,
     userscript_runtime: Arc<UserscriptRuntime>,
@@ -398,7 +400,8 @@ pub async fn build_state(
         proxy_state,
         filter_stats,
         shared_engine,
-        filter_store,
+        filter_store: list_service.store().clone(),
+        list_service,
         http_client,
         userscript_manager,
         userscript_runtime,

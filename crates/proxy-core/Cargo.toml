@@ -92,6 +92,9 @@ userscript-engine = { path = "../userscript-engine", optional = true }
 # Web API (optional)
 web-api = { path = "../web-api", optional = true }
 
+# Filter-list service (always on — loads, compiles and refreshes the rules)
+list-service = { path = "../list-service" }
+
 [features]
 # Request filtering is always compiled in; WebSocket proxying is on by default.
 default = ["websockets"]

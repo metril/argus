@@ -10,7 +10,6 @@
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{ApiError, ApiResult};
-use crate::filter_service::trigger_reload;
 use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -30,7 +29,8 @@ pub use api_types::{
 };
 
 /// Build a wire response from an engine filter list.
-fn filter_list_response(list: &filter_engine::FilterList) -> FilterListResponse {
+fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> FilterListResponse {
+    let status = state.filter_store.get_status(&list.id).unwrap_or_default();
     FilterListResponse {
         id: list.id.clone(),
         name: list.name.clone(),
@@ -38,6 +38,8 @@ fn filter_list_response(list: &filter_engine::FilterList) -> FilterListResponse 
         enabled: list.enabled,
         last_updated: list.last_updated.map(|dt| dt.to_rfc3339()),
         rule_count: list.rule_count,
+        last_error: status.last_error,
+        last_checked: status.last_checked.map(|dt| dt.to_rfc3339()),
     }
 }
 
@@ -66,7 +68,7 @@ pub async fn list_filter_lists(
     let filtered: Vec<FilterListResponse> = lists
         .into_iter()
         .filter(|l| query.enabled.is_none_or(|e| l.enabled == e))
-        .map(|l| filter_list_response(&l))
+        .map(|l| filter_list_response(&state, &l))
         .collect();
 
     let total = filtered.len();
@@ -128,9 +130,9 @@ pub async fn add_filter_list(
     );
 
     // Recompile the engine in the background so the new list takes effect (and downloads).
-    trigger_reload(&state);
+    state.list_service.trigger();
 
-    Ok(Json(filter_list_response(&list)))
+    Ok(Json(filter_list_response(&state, &list)))
 }
 
 /// Get a specific filter list
@@ -142,7 +144,7 @@ pub async fn get_filter_list(
     Path(id): Path<String>,
 ) -> ApiResult<Json<FilterListResponse>> {
     match state.filter_store.get(&id)? {
-        Some(list) => Ok(Json(filter_list_response(&list))),
+        Some(list) => Ok(Json(filter_list_response(&state, &list))),
         None => Err(ApiError::NotFound(format!(
             "Filter list '{}' not found",
             id
@@ -190,6 +192,7 @@ pub async fn update_filter_list(
             list.etag = None;
             list.last_updated = None;
             list.rule_count = 0;
+            let _ = state.filter_store.set_status(&id, &Default::default());
         }
     }
     if let Some(enabled) = req.enabled {
@@ -199,9 +202,9 @@ pub async fn update_filter_list(
     state.filter_store.upsert(&list)?;
     info!("Filter list '{}' updated by {}", id, auth_user.username());
 
-    trigger_reload(&state);
+    state.list_service.trigger();
 
-    Ok(Json(filter_list_response(&list)))
+    Ok(Json(filter_list_response(&state, &list)))
 }
 
 /// Delete a filter list
@@ -228,7 +231,7 @@ pub async fn delete_filter_list(
 
     info!("Filter list '{}' deleted by {}", id, auth_user.username());
 
-    trigger_reload(&state);
+    state.list_service.trigger();
 
     Ok(Json(
         json!({ "message": format!("Filter list '{}' deleted", id) }),
@@ -266,7 +269,7 @@ pub async fn update_custom_rules(
     info!("Custom filter rules updated by {}", auth_user.username());
 
     // Recompile so the new rules take effect immediately.
-    trigger_reload(&state);
+    state.list_service.trigger();
 
     Ok(Json(CustomRulesResponse { rules: req.rules }))
 }
