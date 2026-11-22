@@ -28,6 +28,10 @@ pub struct FilterList {
     /// Treat every rule in this list as an exception (an allowlist).
     #[serde(default)]
     pub allowlist: bool,
+    /// Extended rules from this list may run code in pages and rewrite content (`$replace`,
+    /// `$urltransform`, `#%#`, ...). Off unless the user opts the list in.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 impl FilterList {
@@ -43,6 +47,7 @@ impl FilterList {
             etag: None,
             format: ListFormat::Auto,
             allowlist: false,
+            trusted: false,
         }
     }
 }

@@ -62,8 +62,11 @@ impl IpFilter {
 
 /// Handle to the live compiled engine, shared by all workers via `Arc<SharedEngine>`.
 pub struct SharedEngine {
-    /// The live engine. Readers do one `load()`; writers swap in a fully built engine.
-    engine: ArcSwap<AdblockEngine>,
+    /// The live engine generation (engine + opaque companion data). Readers do one `load()`;
+    /// writers swap in a fully built generation.
+    engine: ArcSwap<Generation>,
+    /// Source of [`Generation::id`].
+    next_gen: std::sync::atomic::AtomicU64,
     /// Serialized form of the installed rules (empty = empty engine).
     blob: ArcSwap<Vec<u8>>,
     /// Extended rules the engine cannot express (hand-off for later phases).
@@ -82,6 +85,23 @@ pub struct SharedEngine {
     write_lock: Mutex<()>,
     /// Shared, thread-safe blocking statistics.
     stats: FilterStats,
+}
+
+/// One installed engine together with data built from the same rules (the extended-rule index),
+/// swapped as a unit: a reader holding a `Generation` never sees a mix of builds.
+pub struct Generation {
+    pub engine: Arc<AdblockEngine>,
+    /// Companion built from the same build, opaque here (downcast by the owner of the type).
+    pub aux: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// Strictly increasing per install; equal ids mean the same build.
+    pub id: u64,
+}
+
+impl Generation {
+    /// The companion data as `T`, if present and of that type.
+    pub fn aux<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.aux.as_deref().and_then(|a| a.downcast_ref::<T>())
+    }
 }
 
 impl Default for SharedEngine {
@@ -140,7 +160,12 @@ impl SharedEngine {
     /// Like [`Self::new`] with a recent-blocked ring of `capacity` events (0 disables it).
     pub fn with_event_capacity(capacity: usize) -> Self {
         Self {
-            engine: ArcSwap::new(build_engine(&[], &[])),
+            engine: ArcSwap::new(Arc::new(Generation {
+                engine: build_engine(&[], &[]),
+                aux: None,
+                id: 0,
+            })),
+            next_gen: std::sync::atomic::AtomicU64::new(1),
             blob: ArcSwap::new(Arc::new(Vec::new())),
             ext_rules: ArcSwap::new(Arc::new(Vec::new())),
             ip_filter: ArcSwap::new(Arc::new(IpFilter::default())),
@@ -160,8 +185,12 @@ impl SharedEngine {
         let n = resources.len();
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.resources.store(Arc::new(resources));
-        self.engine
-            .store(build_engine(&self.blob.load(), &self.resources.load()));
+        let cur = self.engine.load_full();
+        self.engine.store(Arc::new(Generation {
+            engine: build_engine(&self.blob.load(), &self.resources.load()),
+            aux: cur.aux.clone(),
+            id: self.next_gen.fetch_add(1, Ordering::Relaxed),
+        }));
         info!("Loaded {n} scriptlet/redirect resources");
         Ok(n)
     }
@@ -207,10 +236,27 @@ impl SharedEngine {
         ip: Arc<IpFilter>,
         domains: Arc<DomainSet>,
     ) {
+        self.install_set_with(blob, engine, None, ext, ip, domains);
+    }
+
+    /// [`Self::install_set`] plus companion data (`aux`) swapped atomically with the engine.
+    pub fn install_set_with(
+        &self,
+        blob: Arc<Vec<u8>>,
+        engine: Arc<AdblockEngine>,
+        aux: Option<Arc<dyn std::any::Any + Send + Sync>>,
+        ext: Arc<Vec<ExtRule>>,
+        ip: Arc<IpFilter>,
+        domains: Arc<DomainSet>,
+    ) {
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = blob.len();
         self.blob.store(blob);
-        self.engine.store(engine);
+        self.engine.store(Arc::new(Generation {
+            engine,
+            aux,
+            id: self.next_gen.fetch_add(1, Ordering::Relaxed),
+        }));
         self.ext_rules.store(ext);
         self.ip_filter.store(ip);
         let n = domains.len();
@@ -269,7 +315,18 @@ impl SharedEngine {
 
     /// The live engine (one atomic load + refcount bump).
     pub fn engine(&self) -> Arc<AdblockEngine> {
+        self.engine.load().engine.clone()
+    }
+
+    /// The live generation (engine + companion), one atomic load.
+    pub fn generation(&self) -> Arc<Generation> {
         self.engine.load_full()
+    }
+
+    /// Id of the live generation (cheap; no refcount traffic). A check that reads this before
+    /// and after its work and sees the same value ran against one build throughout.
+    pub fn generation_id(&self) -> u64 {
+        self.engine.load().id
     }
 
     /// Enable or disable blocking globally.
@@ -296,7 +353,7 @@ impl SharedEngine {
     #[inline]
     fn with_engine<R>(&self, f: impl FnOnce(&AdblockEngine) -> R) -> R {
         let guard = self.engine.load();
-        f(&guard)
+        f(&guard.engine)
     }
 
     /// Extra `Content-Security-Policy` directives (`$csp`) for a document/subdocument response.
@@ -370,6 +427,34 @@ impl SharedEngine {
         self.check_inner(url, source_url, resource_type, Some(client))
     }
 
+    /// [`Self::check_for`] that also returns the [`Generation`] the verdict was computed
+    /// against: the caller can read the companion data (extended-rule index) of the very build
+    /// that produced the verdict, never one from before or after a concurrent swap.
+    pub fn check_gen(
+        &self,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: &str,
+    ) -> (MatchResult, Arc<Generation>) {
+        loop {
+            let generation = self.engine.load_full();
+            let r = if self.enabled.load(Ordering::Relaxed) {
+                self.decide(url, source_url, resource_type)
+            } else {
+                MatchResult::allowed()
+            };
+            // `decide` reads the live engine itself: if a swap slipped in meanwhile the verdict
+            // may be from the newer build, so redo it (ids only ever grow: no ABA).
+            if self.engine.load().id == generation.id {
+                return (
+                    self.record(r, url, source_url, resource_type, Some(client)),
+                    generation,
+                );
+            }
+        }
+    }
+
     fn check_inner(
         &self,
         url: &str,
@@ -377,11 +462,23 @@ impl SharedEngine {
         resource_type: &str,
         client: Option<&str>,
     ) -> MatchResult {
-        if !self.enabled.load(Ordering::Relaxed) {
-            self.stats.record_allowed();
-            return MatchResult::allowed();
-        }
-        let r = self.decide(url, source_url, resource_type);
+        let r = if self.enabled.load(Ordering::Relaxed) {
+            self.decide(url, source_url, resource_type)
+        } else {
+            MatchResult::allowed()
+        };
+        self.record(r, url, source_url, resource_type, client)
+    }
+
+    /// Statistics and block-log bookkeeping for a finished verdict.
+    fn record(
+        &self,
+        r: MatchResult,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: Option<&str>,
+    ) -> MatchResult {
         if r.blocked {
             self.stats
                 .record_blocked(resource_type, RequestMatcher::host_of(url));

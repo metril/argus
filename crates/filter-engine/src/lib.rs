@@ -38,6 +38,6 @@ pub use pipeline::{build_set, BuiltSet, ListInput, ListReport, ReportIssue};
 pub use redirect_resources::builtin_redirect_resources;
 pub use scriptlet_resources::{convert_ubo_scriptlets, ubo_scriptlets_to_json};
 pub use shared::{
-    build_engine, compile_engine, try_build_engine, Cosmetics, IpFilter, SharedEngine,
+    build_engine, compile_engine, try_build_engine, Cosmetics, Generation, IpFilter, SharedEngine,
 };
 pub use stats::{BlockingStats, FilterStats};
