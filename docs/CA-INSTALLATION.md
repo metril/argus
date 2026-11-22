@@ -35,9 +35,9 @@ The easiest way to get the certificate onto a device is to **download it from th
 - **Web UI**: log in and go to **Settings → CA Certificate → Download CA Certificate**.
 - **Direct URL** (public, no login — convenient for phones and other machines):
   ```
-  http://<server>:3000/api/ca.crt
+  http://<server>:3000/api/v1/ca.crt
   ```
-  e.g. `curl -O http://192.168.1.50:3000/api/ca.crt` (saved as `adblocker-ca.crt`).
+  e.g. `curl -O http://192.168.1.50:3000/api/v1/ca.crt` (saved as `adblocker-ca.crt`).
 
 Alternatively, the CA certificate is automatically generated on first run and stored on the server
 file system at:

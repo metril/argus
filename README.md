@@ -134,7 +134,7 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
 2. **Create your account** — open `http://localhost:3000` and register. The **first** user
    registered automatically becomes the admin.
 3. **Install the root CA** — in the Web UI go to **Settings → CA Certificate → Download CA
-   Certificate**, or fetch it directly from any device at `http://<server>:3000/api/ca.crt` (this
+   Certificate**, or fetch it directly from any device at `http://<server>:3000/api/v1/ca.crt` (this
    endpoint is public so phones and other machines can grab it by URL). Then trust it so MITM'd
    HTTPS pages validate:
    - **macOS**: open the downloaded file → add to the **System** keychain in Keychain Access →
@@ -153,7 +153,7 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
    seeded and downloaded automatically; add your own under **Filters**. Lists are **persisted**
    (Sled) and survive restarts, and the engine recompiles automatically when you change them.
 6. **Verify it's working**:
-   - `curl http://<server>:3000/api/health` returns `{"status":"healthy",...}`.
+   - `curl http://<server>:3000/api/v1/health` returns `{"status":"healthy",...}`.
    - With your device browsing through the proxy, the **Requests Checked / Blocked** counters on
      the **Filters** page climb, and the proxy logs show per-connection lines.
    - **#1 gotcha:** if HTTPS pages error with a certificate warning, the CA from step 3 isn't

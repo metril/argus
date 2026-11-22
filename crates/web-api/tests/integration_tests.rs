@@ -1,968 +1,14 @@
-//! Integration tests for the Web API
-//!
-//! Tests all API endpoints including authentication, proxy management,
-//! filter management, and userscript management.
+//! Functional tests for the v1 API: health, auth flows, config, lists, rules, stats, userscripts,
+//! users, sessions, audit and the shared conventions (error envelope, pagination, ETag).
 
 mod common;
 
-use axum_test::TestServer;
-use common::{extract_access_token, extract_refresh_token, TestContext};
+use axum::http::StatusCode;
+use common::{extract_access_token, extract_refresh_token, TestContext, PASSWORD};
 use cookie::Cookie;
-use serde_json::json;
+use serde_json::{json, Value};
 
-// ============================================================================
-// Health Endpoint Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_health_check() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server.get("/api/health").await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["status"], "healthy");
-    assert!(body["version"].is_string());
-}
-
-#[tokio::test]
-async fn test_metrics_endpoint() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server.get("/api/metrics").await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["proxy"]["connections"]["total"].is_number());
-    assert!(body["filter"]["total_requests"].is_number());
-}
-
-#[tokio::test]
-async fn test_ca_download_is_public() {
-    // The CA certificate endpoint must be reachable WITHOUT authentication so any
-    // device can fetch and trust it by URL. Whether the cert file exists in the
-    // test environment or not, the auth layer must never reject the request.
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server.get("/api/ca.crt").await;
-
-    let status = response.status_code();
-    assert_ne!(status, axum::http::StatusCode::UNAUTHORIZED);
-    assert_ne!(status, axum::http::StatusCode::FORBIDDEN);
-    // Either the cert is served (200) or it isn't generated yet (404) — both prove
-    // the route is wired and public.
-    assert!(
-        status == axum::http::StatusCode::OK || status == axum::http::StatusCode::NOT_FOUND,
-        "unexpected status for /api/ca.crt: {status}"
-    );
-}
-
-// ============================================================================
-// Authentication Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_register_first_user_becomes_admin() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "admin_user",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["user"]["username"], "admin_user");
-    assert_eq!(body["user"]["role"], "admin");
-
-    // Check cookies are set
-    let access_token = extract_access_token(&response);
-    let refresh_token = extract_refresh_token(&response);
-    assert!(access_token.is_some());
-    assert!(refresh_token.is_some());
-}
-
-#[tokio::test]
-async fn test_register_second_user_becomes_user() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register first user (admin)
-    server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "admin_user",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await
-        .assert_status_ok();
-
-    // Register second user
-    let response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "regular_user",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["user"]["username"], "regular_user");
-    assert_eq!(body["user"]["role"], "user");
-}
-
-#[tokio::test]
-async fn test_register_duplicate_username() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register first user
-    server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "test_user",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await
-        .assert_status_ok();
-
-    // Try to register with same username
-    let response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "test_user",
-            "password": "DifferentPassword123!", "password_confirm": "DifferentPassword123!"
-        }))
-        .await;
-
-    response.assert_status_bad_request();
-}
-
-#[tokio::test]
-async fn test_register_weak_password() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "test_user",
-            "password": "weak", "password_confirm": "weak"
-        }))
-        .await;
-
-    response.assert_status_bad_request();
-}
-
-#[tokio::test]
-async fn test_login_success() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "login_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await
-        .assert_status_ok();
-
-    // Login
-    let response = server
-        .post("/api/auth/login")
-        .json(&json!({
-            "username": "login_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["user"]["username"], "login_test");
-    assert!(extract_access_token(&response).is_some());
-}
-
-#[tokio::test]
-async fn test_login_wrong_password() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "login_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await
-        .assert_status_ok();
-
-    // Login with wrong password
-    let response = server
-        .post("/api/auth/login")
-        .json(&json!({
-            "username": "login_test",
-            "password": "WrongPassword123!", "password_confirm": "WrongPassword123!"
-        }))
-        .await;
-
-    response.assert_status_unauthorized();
-}
-
-#[tokio::test]
-async fn test_login_nonexistent_user() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server
-        .post("/api/auth/login")
-        .json(&json!({
-            "username": "nonexistent",
-            "password": "SomePassword123!", "password_confirm": "SomePassword123!"
-        }))
-        .await;
-
-    response.assert_status_unauthorized();
-}
-
-#[tokio::test]
-async fn test_me_endpoint() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register and get token
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "me_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    reg_response.assert_status_ok();
-
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Access me endpoint
-    let response = server
-        .get("/api/auth/me")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["username"], "me_test");
-}
-
-#[tokio::test]
-async fn test_me_endpoint_unauthorized() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server.get("/api/auth/me").await;
-
-    response.assert_status_unauthorized();
-}
-
-#[tokio::test]
-async fn test_logout() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "logout_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    reg_response.assert_status_ok();
-
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Logout
-    let response = server
-        .post("/api/auth/logout")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-
-    // Check that cookies are cleared (max-age=0)
-    let cookies: Vec<_> = response
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-
-    assert!(cookies.iter().any(|c| c.contains("Max-Age=0")));
-}
-
-#[tokio::test]
-async fn test_refresh_token() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "refresh_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    reg_response.assert_status_ok();
-
-    let refresh_token = extract_refresh_token(&reg_response).expect("No refresh token");
-
-    // Refresh token
-    let response = server
-        .post("/api/auth/refresh")
-        .add_cookie(Cookie::new("refresh_token", refresh_token))
-        .await;
-
-    response.assert_status_ok();
-    assert!(extract_access_token(&response).is_some());
-}
-
-// ============================================================================
-// Proxy Management Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_get_proxy_config_requires_auth() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router).expect("Failed to create test server");
-
-    let response = server.get("/api/proxy/config").await;
-    response.assert_status_unauthorized();
-}
-
-#[tokio::test]
-async fn test_get_proxy_config() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register and get token
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "proxy_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Get config
-    let response = server
-        .get("/api/proxy/config")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["host"].is_string());
-    assert!(body["port"].is_number());
-}
-
-#[tokio::test]
-async fn test_update_proxy_config() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register admin
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "admin_proxy",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Update config
-    let response = server
-        .put("/api/proxy/config")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "port": 9090,
-            "max_connections": 2000
-        }))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["port"], 9090);
-    assert_eq!(body["max_connections"], 2000);
-}
-
-#[tokio::test]
-async fn test_update_proxy_config_reports_network_policy_fields_as_restart_required() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "policy_cfg",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-    let put = |body: serde_json::Value| {
-        server
-            .put("/api/proxy/config")
-            .add_cookie(Cookie::new("access_token", access_token.clone()))
-            .json(&body)
-    };
-
-    let response = put(json!({
-        "transparent_port": 3129,
-        "tls_passthrough_hosts": ["bank.example", "*.pinned.example"],
-        "block_private_destinations": true,
-        "allowed_destinations": ["10.0.0.0/8"],
-        "allowed_clients": ["192.168.0.0/16", "fd00::/8"]
-    }))
-    .await;
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(
-        body["restart_required"],
-        json!([
-            "transparent_port",
-            "tls_passthrough_hosts",
-            "block_private_destinations",
-            "allowed_destinations",
-            "allowed_clients"
-        ])
-    );
-    assert_eq!(body["applied"], json!([]));
-    assert_eq!(body["transparent_port"], 3129);
-    assert_eq!(
-        body["allowed_clients"],
-        json!(["192.168.0.0/16", "fd00::/8"])
-    );
-
-    // Unchanged values are not reported; 0 clears the transparent port; bad CIDRs are rejected.
-    let again = put(json!({ "block_private_destinations": true, "transparent_port": 0 })).await;
-    again.assert_status_ok();
-    let body: serde_json::Value = again.json();
-    assert_eq!(body["restart_required"], json!(["transparent_port"]));
-    assert!(body["transparent_port"].is_null());
-    let bad = put(json!({ "allowed_clients": ["10.0.0.0/33"] })).await;
-    assert_eq!(bad.status_code(), 400);
-}
-
-#[tokio::test]
-async fn test_update_proxy_config_applies_live_settings() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "live_cfg",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-    assert!(ctx.state.shared_engine.is_enabled());
-
-    let response = server
-        .put("/api/proxy/config")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "enable_adblock": false,
-            "request_timeout_secs": 7,
-            "auto_update": false,
-            "update_interval_hours": 2,
-            "port": 9191
-        }))
-        .await;
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["port"], 9191);
-    assert_eq!(body["request_timeout_secs"], 7);
-    let applied: Vec<&str> = body["applied"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    for f in [
-        "enable_adblock",
-        "request_timeout_secs",
-        "auto_update",
-        "update_interval_hours",
-    ] {
-        assert!(applied.contains(&f), "{f} should be applied: {applied:?}");
-    }
-    assert_eq!(body["restart_required"], json!(["port"]));
-
-    // The running proxy handles actually changed.
-    assert!(!ctx.state.shared_engine.is_enabled());
-    assert_eq!(
-        ctx.state
-            .proxy_state
-            .request_timeout_ms
-            .load(std::sync::atomic::Ordering::Relaxed),
-        7000
-    );
-    assert_eq!(
-        ctx.state.list_service.schedule(),
-        (false, std::time::Duration::from_secs(2 * 3600))
-    );
-}
-
-#[tokio::test]
-async fn test_update_proxy_config_validation() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "validation_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Try invalid port
-    let response = server
-        .put("/api/proxy/config")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "port": 0
-        }))
-        .await;
-
-    response.assert_status_bad_request();
-}
-
-#[tokio::test]
-async fn test_get_proxy_stats() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "stats_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Get stats
-    let response = server
-        .get("/api/proxy/stats")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["connections"]["total"].is_number());
-    assert!(body["requests"]["total"].is_number());
-}
-
-// ============================================================================
-// Filter Management Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_list_filter_lists() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "filter_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // List filters
-    let response = server
-        .get("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["data"].is_array());
-    assert!(body["total"].is_number());
-    assert!(body["page"].is_number());
-}
-
-#[tokio::test]
-async fn test_add_filter_list_ssrf_protection() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "ssrf_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Try to add filter list with localhost URL (should fail)
-    let response = server
-        .post("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token.clone()))
-        .json(&json!({
-            "id": "test-list",
-            "name": "Test List",
-            "url": "http://localhost/filters.txt"
-        }))
-        .await;
-
-    response.assert_status_bad_request();
-
-    // Try with private IP
-    let response = server
-        .post("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token.clone()))
-        .json(&json!({
-            "id": "test-list",
-            "name": "Test List",
-            "url": "https://192.168.1.1/filters.txt"
-        }))
-        .await;
-
-    response.assert_status_bad_request();
-
-    // Try with internal hostname
-    let response = server
-        .post("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "id": "test-list",
-            "name": "Test List",
-            "url": "https://internal.corp.local/filters.txt"
-        }))
-        .await;
-
-    response.assert_status_bad_request();
-}
-
-#[tokio::test]
-async fn test_add_filter_list_valid_url() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "filter_add_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Add filter list with valid URL
-    let response = server
-        .post("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "id": "easylist",
-            "name": "EasyList",
-            "url": "https://easylist.to/easylist/easylist.txt"
-        }))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["id"], "easylist");
-    assert_eq!(body["name"], "EasyList");
-}
-
-/// Regression test for the reported bug: a list added by the user must still be there when the
-/// listing is reloaded (it used to vanish because the handlers were stubs).
-#[tokio::test]
-async fn test_added_filter_list_appears_in_listing() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "persist_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Add a list.
-    let add = server
-        .post("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token.clone()))
-        .json(&json!({
-            "id": "my-list",
-            "name": "My Custom List",
-            "url": "https://example.com/custom.txt"
-        }))
-        .await;
-    add.assert_status_ok();
-
-    // Re-list: the added list must be present (the original symptom was it disappearing).
-    let list = server
-        .get("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token.clone()))
-        .await;
-    list.assert_status_ok();
-    let body: serde_json::Value = list.json();
-    let arr = body["data"].as_array().expect("data is array");
-    assert!(
-        arr.iter().any(|l| l["id"] == "my-list"),
-        "the added list must appear in the listing, got: {body}"
-    );
-
-    // Fetch it directly too.
-    let one = server
-        .get("/api/filters/lists/my-list")
-        .add_cookie(Cookie::new("access_token", access_token.clone()))
-        .await;
-    one.assert_status_ok();
-    assert_eq!(one.json::<serde_json::Value>()["name"], "My Custom List");
-
-    // Adding the same id again must conflict, not silently clobber.
-    let dup = server
-        .post("/api/filters/lists")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({"id": "my-list", "name": "Dup", "url": "https://example.com/x.txt"}))
-        .await;
-    assert_eq!(dup.status_code(), 409, "duplicate id should conflict");
-}
-
-#[tokio::test]
-async fn test_custom_rules_get_and_update() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    let reg = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "rules_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let token = extract_access_token(&reg).expect("No access token");
-
-    // Initially empty.
-    let got = server
-        .get("/api/filters/custom-rules")
-        .add_cookie(Cookie::new("access_token", token.clone()))
-        .await;
-    got.assert_status_ok();
-    assert_eq!(got.json::<serde_json::Value>()["rules"], "");
-
-    // Update.
-    let put = server
-        .put("/api/filters/custom-rules")
-        .add_cookie(Cookie::new("access_token", token.clone()))
-        .json(&json!({ "rules": "||my.ads^\n@@||good.example^" }))
-        .await;
-    put.assert_status_ok();
-
-    // Persisted and returned.
-    let got2 = server
-        .get("/api/filters/custom-rules")
-        .add_cookie(Cookie::new("access_token", token))
-        .await;
-    assert_eq!(
-        got2.json::<serde_json::Value>()["rules"],
-        "||my.ads^\n@@||good.example^"
-    );
-}
-
-#[tokio::test]
-async fn test_get_filter_stats() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "filter_stats",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Get stats
-    let response = server
-        .get("/api/filters/stats")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["total_requests"].is_number());
-    assert!(body["blocked_requests"].is_number());
-}
-
-#[tokio::test]
-async fn test_reset_filter_stats_requires_admin() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register first user (admin)
-    server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "admin_user",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-
-    // Register second user (regular)
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "regular_user",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Try to reset stats as regular user (should fail)
-    let response = server
-        .post("/api/filters/stats/reset")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_forbidden();
-}
-
-// ============================================================================
-// Userscript Management Tests
-// ============================================================================
-
-#[tokio::test]
-async fn test_list_userscripts() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "userscript_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // List userscripts
-    let response = server
-        .get("/api/userscripts")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["data"].is_array());
-    assert!(body["total"].is_number());
-}
-
-#[tokio::test]
-async fn test_install_userscript() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "install_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    let userscript_source = r#"
+const SCRIPT: &str = r#"
 // ==UserScript==
 // @name        Test Script
 // @namespace   test
@@ -975,121 +21,963 @@ async fn test_install_userscript() {
 console.log("Hello from test script!");
 "#;
 
-    // Install userscript
-    let response = server
-        .post("/api/userscripts")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "source": userscript_source
-        }))
-        .await;
+// ---------------------------------------------------------------- health / public
 
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["name"], "Test Script");
-    assert_eq!(body["version"], "1.0.0");
+#[tokio::test]
+async fn health_and_public_routes_need_no_credentials() {
+    let ctx = TestContext::new().await.unwrap();
+    let r = ctx.server.get("/api/v1/health").await;
+    r.assert_status_ok();
+    assert_eq!(r.json::<Value>()["status"], "healthy");
+    // CA may or may not exist in the test env, but auth must never reject it.
+    let ca = ctx.server.get("/api/v1/ca.crt").await.status_code();
+    assert_ne!(ca, StatusCode::UNAUTHORIZED);
+    assert_ne!(ca, StatusCode::FORBIDDEN);
+    ctx.server
+        .get("/api/v1/openapi.json")
+        .await
+        .assert_status_ok();
+    ctx.server.get("/api/v1/docs/").await.assert_status_ok();
 }
 
 #[tokio::test]
-async fn test_install_invalid_userscript() {
-    let ctx = TestContext::new()
+async fn metrics_require_system_read() {
+    let ctx = TestContext::new().await.unwrap();
+    ctx.server
+        .get("/api/v1/system/metrics")
         .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "invalid_script_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
-        .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Try to install invalid userscript (missing metadata)
-    let response = server
-        .post("/api/userscripts")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "source": "console.log('no metadata');"
-        }))
-        .await;
-
-    response.assert_status_bad_request();
+        .assert_status_unauthorized();
+    let admin = ctx.admin().await;
+    let r = admin.get("/api/v1/system/metrics").await;
+    r.assert_status_ok();
+    assert!(r.json::<Value>()["proxy"]["connections"]["total"].is_number());
+    let p = admin.get("/api/v1/system/metrics/prometheus").await;
+    p.assert_status_ok();
+    assert!(p.text().contains("adblocker_filter_blocked_total"));
+    admin.get("/api/v1/system/status").await.assert_status_ok();
 }
 
 #[tokio::test]
-async fn test_install_empty_userscript() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
+async fn old_unversioned_paths_are_gone_with_envelope_404() {
+    let ctx = TestContext::new().await.unwrap();
+    let r = ctx.server.get("/api/health").await;
+    r.assert_status_not_found();
+    assert_eq!(r.json::<Value>()["error"]["code"], "not_found");
+}
 
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "empty_script_test",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
+// ---------------------------------------------------------------- auth
+
+#[tokio::test]
+async fn first_user_is_admin_and_registration_then_closes() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let me = admin.get("/api/v1/auth/me").await;
+    me.assert_status_ok();
+    let me: Value = me.json();
+    assert_eq!(me["role"], "admin");
+    assert!(me["scopes"].as_array().unwrap().len() > 20);
+
+    let second = ctx
+        .server
+        .post("/api/v1/auth/register")
+        .json(&json!({"username": "second", "password": PASSWORD, "password_confirm": PASSWORD}))
         .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Try to install empty userscript
-    let response = server
-        .post("/api/userscripts")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .json(&json!({
-            "source": ""
-        }))
-        .await;
-
-    response.assert_status_bad_request();
+    second.assert_status_forbidden();
+    assert_eq!(
+        second.json::<Value>()["error"]["code"],
+        "registration_closed"
+    );
 }
 
 #[tokio::test]
-async fn test_get_userscript_stats() {
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
-
-    // Register
-    let reg_response = server
-        .post("/api/auth/register")
-        .json(&json!({
-            "username": "userscript_stats",
-            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
-        }))
+async fn register_validates_with_field_details() {
+    let ctx = TestContext::new().await.unwrap();
+    let r = ctx
+        .server
+        .post("/api/v1/auth/register")
+        .json(&json!({"username": "ab", "password": "weak", "password_confirm": "weak"}))
         .await;
-    let access_token = extract_access_token(&reg_response).expect("No access token");
-
-    // Get stats
-    let response = server
-        .get("/api/userscripts/stats")
-        .add_cookie(Cookie::new("access_token", access_token))
-        .await;
-
-    response.assert_status_ok();
-    let body: serde_json::Value = response.json();
-    assert!(body["total_scripts"].is_number());
-    assert!(body["enabled_scripts"].is_number());
+    r.assert_status_bad_request();
+    let body: Value = r.json();
+    assert_eq!(body["error"]["code"], "validation_failed");
+    let fields: Vec<&str> = body["error"]["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["field"].as_str().unwrap())
+        .collect();
+    assert!(
+        fields.contains(&"username") && fields.contains(&"password"),
+        "{fields:?}"
+    );
 }
 
-// ============================================================================
-// Authorization Tests
-// ============================================================================
+#[tokio::test]
+async fn malformed_body_uses_error_envelope() {
+    let ctx = TestContext::new().await.unwrap();
+    let r = ctx
+        .server
+        .post("/api/v1/auth/login")
+        .bytes("{not json".into())
+        .content_type("application/json")
+        .await;
+    r.assert_status_bad_request();
+    assert_eq!(r.json::<Value>()["error"]["code"], "invalid_body");
+}
 
 #[tokio::test]
-async fn test_viewer_cannot_modify() {
-    // This test verifies role-based access control
-    // Since viewers don't exist yet in the registration flow,
-    // this is a placeholder for when that feature is added
-    let ctx = TestContext::new()
-        .await
-        .expect("Failed to create test context");
-    let _server = TestServer::new(ctx.router).expect("Failed to create test server");
+async fn login_wrong_password_and_unknown_user() {
+    let ctx = TestContext::new().await.unwrap();
+    ctx.admin().await;
+    for (u, p) in [
+        ("admin_user", "WrongPassword123!"),
+        ("nobody_here", PASSWORD),
+    ] {
+        let r = ctx
+            .server
+            .post("/api/v1/auth/login")
+            .json(&json!({"username": u, "password": p}))
+            .await;
+        r.assert_status_unauthorized();
+        assert_eq!(r.json::<Value>()["error"]["code"], "unauthorized");
+    }
+}
 
-    // TODO: Once viewer role can be assigned, test that viewers cannot modify
+#[tokio::test]
+async fn logout_ends_the_session_immediately() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let out = admin.post("/api/v1/auth/logout").await;
+    out.assert_status_ok();
+    assert!(out
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|c| c.to_str().unwrap().contains("Max-Age=0")));
+    admin
+        .get("/api/v1/auth/me")
+        .await
+        .assert_status_unauthorized();
+}
+
+#[tokio::test]
+async fn refresh_rotates_and_replay_revokes_the_session() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let r = ctx
+        .server
+        .post("/api/v1/auth/refresh")
+        .add_cookie(Cookie::new("refresh_token", admin.refresh.clone()))
+        .await;
+    r.assert_status_ok();
+    let new_access = extract_access_token(&r).unwrap();
+    assert!(extract_refresh_token(&r).is_some());
+    ctx.server
+        .get("/api/v1/auth/me")
+        .add_cookie(Cookie::new("access_token", new_access.clone()))
+        .await
+        .assert_status_ok();
+
+    // Replaying the old refresh token is treated as theft: the session dies.
+    let replay = ctx
+        .server
+        .post("/api/v1/auth/refresh")
+        .add_cookie(Cookie::new("refresh_token", admin.refresh.clone()))
+        .await;
+    replay.assert_status_unauthorized();
+    ctx.server
+        .get("/api/v1/auth/me")
+        .add_cookie(Cookie::new("access_token", new_access))
+        .await
+        .assert_status_unauthorized();
+}
+
+#[tokio::test]
+async fn change_password_signs_out_other_sessions() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let other = ctx.login("admin_user").await;
+
+    let bad = admin
+        .post("/api/v1/auth/password")
+        .json(&json!({"current_password": "WrongPassword123!", "new_password": "NewPassword456!"}))
+        .await;
+    bad.assert_status_forbidden();
+
+    admin
+        .post("/api/v1/auth/password")
+        .json(&json!({"current_password": PASSWORD, "new_password": "NewPassword456!"}))
+        .await
+        .assert_status_ok();
+    admin.get("/api/v1/auth/me").await.assert_status_ok();
+    other
+        .get("/api/v1/auth/me")
+        .await
+        .assert_status_unauthorized();
+    ctx.server
+        .post("/api/v1/auth/login")
+        .json(&json!({"username": "admin_user", "password": "NewPassword456!"}))
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn sessions_list_and_revoke_self_and_admin() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let bob = ctx.user(&admin, "bob_user", "user").await;
+
+    let mine: Value = bob.get("/api/v1/auth/sessions").await.json();
+    assert_eq!(mine["total"], 1);
+    assert_eq!(mine["items"][0]["current"], true);
+    let bob_sid = mine["items"][0]["id"].as_str().unwrap().to_string();
+
+    // Bob cannot use the admin listing; admin sees both users' sessions.
+    bob.get("/api/v1/admin/sessions")
+        .await
+        .assert_status_forbidden();
+    let all: Value = admin.get("/api/v1/admin/sessions").await.json();
+    assert_eq!(all["total"], 2);
+
+    // Bob cannot revoke the admin's session through the self route (404, not found for him).
+    let admin_sid = all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["username"] == "admin_user")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    bob.delete(&format!("/api/v1/auth/sessions/{admin_sid}"))
+        .await
+        .assert_status_not_found();
+
+    admin
+        .delete(&format!("/api/v1/admin/sessions/{bob_sid}"))
+        .await
+        .assert_status_ok();
+    bob.get("/api/v1/auth/me")
+        .await
+        .assert_status_unauthorized();
+}
+
+#[tokio::test]
+async fn sessions_survive_restart_and_revocation_is_durable() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let keep = ctx.login("admin_user").await;
+    let revoked = ctx.login("admin_user").await;
+    revoked.post("/api/v1/auth/logout").await.assert_status_ok();
+    let path = ctx.api_config.session.storage_path.clone();
+    let secret_path = ctx.api_config.auth.jwt_secret_path.clone();
+    let (a, k, r) = (
+        admin.access.clone(),
+        keep.access.clone(),
+        revoked.access.clone(),
+    );
+    drop(admin);
+    drop(keep);
+    drop(revoked);
+    drop(ctx.server);
+    drop(ctx.router);
+    drop(ctx.state);
+
+    // Re-open the same on-disk stores in a fresh state.
+    let mut cfg = web_api::config::ApiConfig::default();
+    cfg.session.storage_path = path;
+    cfg.auth.jwt_secret_path = secret_path;
+    let engine = std::sync::Arc::new(filter_engine::SharedEngine::new());
+    let store = web_api::ListStore::open(&ctx.temp_dir.path().join("filters2")).unwrap();
+    let client = reqwest::Client::new();
+    let svc = web_api::ListService::new(
+        web_api::ListServiceConfig::default(),
+        store,
+        engine.clone(),
+        client.clone(),
+    );
+    let mgr = std::sync::Arc::new(
+        userscript_engine::UserscriptManager::new(ctx.temp_dir.path().join("us2")).unwrap(),
+    );
+    let storage = std::sync::Arc::new(
+        userscript_engine::UserscriptStorage::new(ctx.temp_dir.path().join("uss2")).unwrap(),
+    );
+    let rt = std::sync::Arc::new(userscript_engine::UserscriptRuntime::new(
+        mgr.clone(),
+        storage,
+    ));
+    let state = web_api::state::build_state(
+        cfg.clone(),
+        ::common::config::ProxyConfig::default(),
+        engine,
+        svc,
+        client,
+        mgr,
+        rt,
+        ctx.temp_dir.path().join("proxy.toml"),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+    )
+    .await
+    .unwrap();
+    let server = axum_test::TestServer::new(web_api::create_router(state, &cfg)).unwrap();
+    for (tok, expect) in [(a, true), (k, true), (r, false)] {
+        let resp = server
+            .get("/api/v1/auth/me")
+            .add_cookie(Cookie::new("access_token", tok))
+            .await;
+        assert_eq!(resp.status_code() == StatusCode::OK, expect);
+    }
+}
+
+// ---------------------------------------------------------------- users
+
+#[tokio::test]
+async fn user_management_and_last_admin_protection() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let bob = ctx.user(&admin, "bob_user", "user").await;
+    let bob_id = bob.get("/api/v1/auth/me").await.json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let admin_id = admin.get("/api/v1/auth/me").await.json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let list: Value = admin.get("/api/v1/users").await.json();
+    assert_eq!(list["total"], 2);
+    bob.get("/api/v1/users").await.assert_status_forbidden();
+
+    // Duplicate usernames conflict.
+    let dup = admin
+        .post("/api/v1/users")
+        .json(&json!({"username": "bob_user", "password": PASSWORD, "role": "viewer"}))
+        .await;
+    assert_eq!(dup.status_code(), StatusCode::CONFLICT);
+
+    // The last admin can be neither demoted, disabled nor deleted.
+    for body in [json!({"role": "user"}), json!({"enabled": false})] {
+        let r = admin
+            .patch(&format!("/api/v1/users/{admin_id}"))
+            .json(&body)
+            .await;
+        assert_eq!(r.status_code(), StatusCode::CONFLICT);
+        assert_eq!(r.json::<Value>()["error"]["code"], "last_admin");
+    }
+    assert_eq!(
+        admin
+            .delete(&format!("/api/v1/users/{admin_id}"))
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+
+    // Promote Bob, and then the original admin may be demoted.
+    admin
+        .patch(&format!("/api/v1/users/{bob_id}"))
+        .json(&json!({"role": "admin"}))
+        .await
+        .assert_status_ok();
+    admin
+        .patch(&format!("/api/v1/users/{admin_id}"))
+        .json(&json!({"role": "viewer"}))
+        .await
+        .assert_status_ok();
+    // Role changes apply to existing sessions at once.
+    admin.get("/api/v1/users").await.assert_status_forbidden();
+
+    // Disabling a user kills their sessions; deleting removes the account.
+    bob.patch(&format!("/api/v1/users/{admin_id}"))
+        .json(&json!({"role": "admin"}))
+        .await
+        .assert_status_ok();
+    admin
+        .patch(&format!("/api/v1/users/{bob_id}"))
+        .json(&json!({"enabled": false}))
+        .await
+        .assert_status_ok();
+    bob.get("/api/v1/auth/me")
+        .await
+        .assert_status_unauthorized();
+    admin
+        .delete(&format!("/api/v1/users/{bob_id}"))
+        .await
+        .assert_status_ok();
+    admin
+        .get(&format!("/api/v1/users/{bob_id}"))
+        .await
+        .assert_status_not_found();
+}
+
+// ---------------------------------------------------------------- config
+
+#[tokio::test]
+async fn config_get_update_with_etag() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let got = admin.get("/api/v1/config").await;
+    got.assert_status_ok();
+    let etag = got.header("etag").to_str().unwrap().to_string();
+    assert!(got.json::<Value>()["port"].is_number());
+
+    // No If-Match -> 428; stale -> 412; correct -> 200 and a new ETag.
+    let body = json!({"port": 9090, "max_connections": 2000});
+    let r = admin.put("/api/v1/config").json(&body).await;
+    assert_eq!(r.status_code(), StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(r.json::<Value>()["error"]["code"], "precondition_required");
+    let r = admin
+        .put("/api/v1/config")
+        .add_header("if-match", "\"stale\"")
+        .json(&body)
+        .await;
+    assert_eq!(r.status_code(), StatusCode::PRECONDITION_FAILED);
+    let ok = admin
+        .put("/api/v1/config")
+        .add_header("if-match", etag.clone())
+        .json(&body)
+        .await;
+    ok.assert_status_ok();
+    assert_eq!(ok.json::<Value>()["port"], 9090);
+    assert_ne!(ok.header("etag").to_str().unwrap(), etag);
+    // The old ETag is now stale (lost-update protection).
+    let again = admin
+        .put("/api/v1/config")
+        .add_header("if-match", etag)
+        .json(&body)
+        .await;
+    assert_eq!(again.status_code(), StatusCode::PRECONDITION_FAILED);
+}
+
+async fn put_config(sess: &common::Sess, body: Value) -> axum_test::TestResponse {
+    let etag = sess
+        .get("/api/v1/config")
+        .await
+        .header("etag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    sess.put("/api/v1/config")
+        .add_header("if-match", etag)
+        .json(&body)
+        .await
+}
+
+#[tokio::test]
+async fn config_reports_restart_required_and_validates() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let r = put_config(
+        &admin,
+        json!({
+            "transparent_port": 3129,
+            "tls_passthrough_hosts": ["bank.example", "*.pinned.example"],
+            "block_private_destinations": true,
+            "allowed_destinations": ["10.0.0.0/8"],
+            "allowed_clients": ["192.168.0.0/16", "fd00::/8"]
+        }),
+    )
+    .await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(
+        body["restart_required"],
+        json!([
+            "transparent_port",
+            "tls_passthrough_hosts",
+            "block_private_destinations",
+            "allowed_destinations",
+            "allowed_clients"
+        ])
+    );
+    assert_eq!(body["applied"], json!([]));
+    let again = put_config(
+        &admin,
+        json!({"block_private_destinations": true, "transparent_port": 0}),
+    )
+    .await;
+    assert_eq!(
+        again.json::<Value>()["restart_required"],
+        json!(["transparent_port"])
+    );
+    assert_eq!(
+        put_config(&admin, json!({"allowed_clients": ["10.0.0.0/33"]}))
+            .await
+            .status_code(),
+        400
+    );
+    assert_eq!(
+        put_config(&admin, json!({"port": 0})).await.status_code(),
+        400
+    );
+}
+
+#[tokio::test]
+async fn config_applies_live_settings() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    assert!(ctx.state.shared_engine.is_enabled());
+    let r = put_config(
+        &admin,
+        json!({"enable_adblock": false, "request_timeout_secs": 7, "auto_update": false,
+               "update_interval_hours": 2, "port": 9191}),
+    )
+    .await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    let applied: Vec<&str> = body["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for f in [
+        "enable_adblock",
+        "request_timeout_secs",
+        "auto_update",
+        "update_interval_hours",
+    ] {
+        assert!(applied.contains(&f), "{f}: {applied:?}");
+    }
+    assert_eq!(body["restart_required"], json!(["port"]));
+    assert!(!ctx.state.shared_engine.is_enabled());
+    assert_eq!(
+        ctx.state
+            .proxy_state
+            .request_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        7000
+    );
+    assert_eq!(
+        ctx.state.list_service.schedule(),
+        (false, std::time::Duration::from_secs(2 * 3600))
+    );
+    admin.post("/api/v1/config/reload").await.assert_status_ok();
+}
+
+#[tokio::test]
+async fn schedule_get_and_set() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    admin
+        .put("/api/v1/lists/schedule")
+        .json(&json!({"auto_update": true, "interval_hours": 6}))
+        .await
+        .assert_status_ok();
+    let s: Value = admin.get("/api/v1/lists/schedule").await.json();
+    assert_eq!(s, json!({"auto_update": true, "interval_hours": 6}));
+    assert_eq!(
+        admin
+            .put("/api/v1/lists/schedule")
+            .json(&json!({"interval_hours": 0}))
+            .await
+            .status_code(),
+        400
+    );
+}
+
+#[tokio::test]
+async fn proxy_stats_and_filter_stats() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let p: Value = admin.get("/api/v1/stats/proxy").await.json();
+    assert!(p["connections"]["total"].is_number());
+    let f: Value = admin.get("/api/v1/stats/filter").await.json();
+    assert!(f["total_requests"].is_number() && f["top_blocked_domains"].is_array());
+    let recent: Value = admin.get("/api/v1/stats/blocked/recent").await.json();
+    assert_eq!(recent["available"], false);
+}
+
+// ---------------------------------------------------------------- lists
+
+#[tokio::test]
+async fn lists_ssrf_protection_and_crud() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    for url in [
+        "http://localhost/f.txt",
+        "https://192.168.1.1/f.txt",
+        "https://internal.corp.local/f.txt",
+    ] {
+        admin
+            .post("/api/v1/lists")
+            .json(&json!({"id": "t", "name": "T", "url": url}))
+            .await
+            .assert_status_bad_request();
+    }
+    let add = admin
+        .post("/api/v1/lists")
+        .json(&json!({"id": "my-list", "name": "Mine", "url": "https://example.com/x.txt", "enabled": false}))
+        .await;
+    assert_eq!(add.status_code(), StatusCode::CREATED);
+    let dup = admin
+        .post("/api/v1/lists")
+        .json(&json!({"id": "my-list", "name": "Dup", "url": "https://example.com/x.txt"}))
+        .await;
+    assert_eq!(dup.status_code(), StatusCode::CONFLICT);
+
+    let page: Value = admin.get("/api/v1/lists?limit=1").await.json();
+    assert_eq!(page["limit"], 1);
+    assert!(page["total"].as_u64().unwrap() >= 1);
+    assert!(page["items"].as_array().unwrap().len() <= 1);
+    let status: Value = admin.get("/api/v1/lists/my-list/status").await.json();
+    assert_eq!(status["id"], "my-list");
+
+    let upd: Value = admin
+        .put("/api/v1/lists/my-list")
+        .json(&json!({"name": "Renamed"}))
+        .await
+        .json();
+    assert_eq!(upd["name"], "Renamed");
+    admin
+        .post("/api/v1/lists/my-list/refresh")
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    admin
+        .post("/api/v1/lists/refresh")
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    admin
+        .post("/api/v1/lists/nope/refresh")
+        .await
+        .assert_status_not_found();
+    admin
+        .delete("/api/v1/lists/my-list")
+        .await
+        .assert_status_ok();
+    admin
+        .get("/api/v1/lists/my-list")
+        .await
+        .assert_status_not_found();
+}
+
+// ---------------------------------------------------------------- rules / engine
+
+#[tokio::test]
+async fn custom_rules_use_if_match() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let got = admin.get("/api/v1/rules/custom").await;
+    assert_eq!(got.json::<Value>()["rules"], "");
+    let etag = got.header("etag").to_str().unwrap().to_string();
+
+    let body = json!({"rules": "||my.ads^\n@@||good.example^"});
+    assert_eq!(
+        admin
+            .put("/api/v1/rules/custom")
+            .json(&body)
+            .await
+            .status_code(),
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    admin
+        .put("/api/v1/rules/custom")
+        .add_header("if-match", etag.clone())
+        .json(&body)
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        admin
+            .put("/api/v1/rules/custom")
+            .add_header("if-match", etag)
+            .json(&body)
+            .await
+            .status_code(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(
+        admin.get("/api/v1/rules/custom").await.json::<Value>()["rules"],
+        "||my.ads^\n@@||good.example^"
+    );
+}
+
+#[tokio::test]
+async fn rules_validate_and_url_test_do_not_install() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let v: Value = admin
+        .post("/api/v1/rules/validate")
+        .json(&json!({"rules": "! c\n||ads.example^\nexample.com##.banner\n"}))
+        .await
+        .json();
+    assert_eq!(v["rejected"], 0);
+    assert_eq!(v["accepted"], 2);
+    assert_eq!(v["lines"][0]["line"], 2);
+    // Nothing was stored.
+    assert_eq!(
+        admin.get("/api/v1/rules/custom").await.json::<Value>()["rules"],
+        ""
+    );
+
+    // Install a real engine and test a URL against it.
+    ctx.state
+        .shared_engine
+        .install(filter_engine::compile_engine(&[
+            "||ads.example.com^\n".to_string()
+        ]));
+    let t: Value = admin
+        .post("/api/v1/rules/test")
+        .json(&json!({"url": "https://ads.example.com/x.js", "source_url": "https://site.example/", "resource_type": "script"}))
+        .await
+        .json();
+    assert_eq!(t["blocked"], true);
+    assert_eq!(t["matched_rule"], "||ads.example.com^");
+    let ok: Value = admin
+        .post("/api/v1/rules/test")
+        .json(&json!({"url": "https://fine.example/x.js"}))
+        .await
+        .json();
+    assert_eq!(ok["blocked"], false);
+    // Stats are not touched by dry-run tests.
+    assert_eq!(ctx.state.filter_stats.snapshot().total_requests, 0);
+}
+
+#[tokio::test]
+async fn engine_status_and_reload() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let s: Value = admin.get("/api/v1/engine/status").await.json();
+    assert!(s["build_count"].is_number() && s["building"].is_boolean());
+    let r = admin.post("/api/v1/engine/reload").await;
+    r.assert_status(StatusCode::ACCEPTED);
+    assert_eq!(r.json::<Value>()["building"], true);
+}
+
+#[tokio::test]
+async fn reset_stats_requires_admin_scope() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let bob = ctx.user(&admin, "bob_user", "user").await;
+    bob.post("/api/v1/stats/filter/reset")
+        .await
+        .assert_status_forbidden();
+    admin
+        .post("/api/v1/stats/filter/reset")
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn viewer_can_read_but_not_write() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let v = ctx.user(&admin, "viewer_user", "viewer").await;
+    v.get("/api/v1/lists").await.assert_status_ok();
+    let w = v
+        .post("/api/v1/lists")
+        .json(&json!({"id": "x", "name": "X", "url": "https://example.com/x.txt"}))
+        .await;
+    w.assert_status_forbidden();
+    let b: Value = w.json();
+    assert_eq!(b["error"]["code"], "insufficient_scope");
+    assert!(b["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("lists:write"));
+    v.get("/api/v1/tokens").await.assert_status_forbidden();
+}
+
+// ---------------------------------------------------------------- userscripts
+
+#[tokio::test]
+async fn userscript_lifecycle() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let r = admin
+        .post("/api/v1/userscripts")
+        .json(&json!({"source": SCRIPT}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::CREATED);
+    let created: Value = r.json();
+    assert_eq!(created["name"], "Test Script");
+    let id = created["id"]
+        .as_str()
+        .unwrap()
+        .replace(' ', "%20")
+        .replace(':', "%3A");
+
+    assert_eq!(
+        admin.get("/api/v1/userscripts").await.json::<Value>()["total"],
+        1
+    );
+    assert!(admin
+        .get(&format!("/api/v1/userscripts/{id}/source"))
+        .await
+        .json::<Value>()["source"]
+        .as_str()
+        .unwrap()
+        .contains("Hello"));
+    let en: Value = admin
+        .put(&format!("/api/v1/userscripts/{id}/enabled"))
+        .json(&json!({"enabled": false}))
+        .await
+        .json();
+    assert_eq!(en["enabled"], false);
+    assert_eq!(
+        admin.get("/api/v1/userscripts/stats").await.json::<Value>()["total_scripts"],
+        1
+    );
+    admin
+        .delete(&format!("/api/v1/userscripts/{id}"))
+        .await
+        .assert_status_ok();
+    admin
+        .get(&format!("/api/v1/userscripts/{id}"))
+        .await
+        .assert_status_not_found();
+}
+
+#[tokio::test]
+async fn userscript_rejects_bad_sources() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    for src in ["console.log('no metadata');", ""] {
+        admin
+            .post("/api/v1/userscripts")
+            .json(&json!({"source": src}))
+            .await
+            .assert_status_bad_request();
+    }
+}
+
+// ---------------------------------------------------------------- CA
+
+#[tokio::test]
+async fn ca_info_and_downloads() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    // Generate a CA and point the config at it.
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Test CA");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let cert = params.self_signed(&key).unwrap();
+    let path = ctx.temp_dir.path().join("ca.crt");
+    std::fs::write(&path, cert.pem()).unwrap();
+    ctx.state.proxy_state.config.write().mitm.ca_cert_path = path;
+
+    let info: Value = admin.get("/api/v1/ca").await.json();
+    assert!(info["subject"].as_str().unwrap().contains("Test CA"));
+    assert_eq!(info["fingerprint_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(info["expired"], false);
+    let pem = ctx.server.get("/api/v1/ca.crt").await;
+    pem.assert_status_ok();
+    assert!(pem.text().contains("BEGIN CERTIFICATE"));
+    let der = ctx.server.get("/api/v1/ca.der").await;
+    der.assert_status_ok();
+    assert_eq!(der.as_bytes().as_ref(), cert.der().as_ref());
+}
+
+// ---------------------------------------------------------------- pagination / request id
+
+#[tokio::test]
+async fn pagination_is_uniform_and_request_id_is_echoed() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    for n in 0..3 {
+        ctx.user(&admin, &format!("user_{n}"), "viewer").await;
+    }
+    let p1: Value = admin.get("/api/v1/users?limit=2&page=1").await.json();
+    let p2: Value = admin.get("/api/v1/users?limit=2&page=2").await.json();
+    assert_eq!(
+        (
+            p1["total"].clone(),
+            p1["items"].as_array().unwrap().len(),
+            p1["has_more"].clone()
+        ),
+        (json!(4), 2, json!(true))
+    );
+    assert_eq!(
+        (
+            p2["items"].as_array().unwrap().len(),
+            p2["has_more"].clone()
+        ),
+        (2, json!(false))
+    );
+    admin
+        .get("/api/v1/users?limit=abc")
+        .await
+        .assert_status_bad_request();
+
+    let r = ctx
+        .server
+        .get("/api/v1/health")
+        .add_header("x-request-id", "req-123")
+        .await;
+    assert_eq!(r.header("x-request-id"), "req-123");
+    assert!(ctx
+        .server
+        .get("/api/v1/health")
+        .await
+        .headers()
+        .contains_key("x-request-id"));
+}
+
+// ---------------------------------------------------------------- audit
+
+#[tokio::test]
+async fn audit_records_changes_without_secrets() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    admin
+        .post("/api/v1/lists")
+        .json(&json!({"id": "aud", "name": "Aud", "url": "https://example.com/x.txt"}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let secret = ctx.token(&admin, &["lists:read"]).await;
+    ctx.bearer("POST", "/api/v1/lists/refresh", &secret)
+        .await
+        .assert_status_forbidden();
+
+    let log: Value = admin.get("/api/v1/audit?limit=100").await.json();
+    let items = log["items"].as_array().unwrap();
+    let find = |route: &str, status: u64| {
+        items
+            .iter()
+            .find(|e| e["route"] == route && e["status"] == status)
+            .unwrap_or_else(|| panic!("no audit entry for {route} {status}: {log}"))
+            .clone()
+    };
+    let add = find("/api/v1/lists", 201);
+    assert_eq!(add["actor_type"], "user");
+    assert_eq!(add["actor_name"], "admin_user");
+    assert_eq!(add["scope"], "lists:write");
+    assert_eq!(add["method"], "POST");
+    assert!(add["request_id"].is_string());
+    let denied = find("/api/v1/lists/refresh", 403);
+    assert_eq!(denied["actor_type"], "token");
+    assert_eq!(denied["outcome"], "denied");
+    // Login is audited with the named actor; secrets never appear.
+    assert!(items
+        .iter()
+        .any(|e| e["route"] == "/api/v1/auth/register" && e["actor_name"] == "admin_user"));
+    assert!(!log.to_string().contains(&secret) && !log.to_string().contains(PASSWORD));
+
+    // Filtering and the scope gate on the audit log itself.
+    let only: Value = admin.get("/api/v1/audit?outcome=denied").await.json();
+    assert!(only["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["outcome"] == "denied"));
+    let bob = ctx.user(&admin, "bob_user", "user").await;
+    bob.get("/api/v1/audit").await.assert_status_forbidden();
+}
+
+#[tokio::test]
+async fn audit_log_is_bounded() {
+    let ctx = TestContext::with_config(|c| c.audit.max_entries = 5)
+        .await
+        .unwrap();
+    let admin = ctx.admin().await;
+    for _ in 0..140 {
+        admin
+            .post("/api/v1/stats/filter/reset")
+            .await
+            .assert_status_ok();
+    }
+    ctx.state.audit.prune();
+    assert!(ctx.state.audit.len() <= 5);
 }

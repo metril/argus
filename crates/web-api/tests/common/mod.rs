@@ -1,10 +1,13 @@
-//! Test helpers and utilities
-//!
-//! Provides common setup and utilities for integration tests.
+//! Test helpers: an isolated app per test (own temp dir, in-process transport, no ports).
+
+#![allow(dead_code)]
 
 use axum::Router;
+use axum_test::{TestRequest, TestServer};
 use common::config::ProxyConfig;
+use cookie::Cookie;
 use filter_engine::SharedEngine;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tempfile::TempDir;
 use userscript_engine::{UserscriptManager, UserscriptRuntime, UserscriptStorage};
@@ -13,36 +16,38 @@ use web_api::state::build_state;
 use web_api::{create_router, ApiResult, AppState};
 use web_api::{ListService, ListServiceConfig, ListStore};
 
-/// Test context that manages temporary directories and state
+pub const PASSWORD: &str = "SecurePassword123!";
+
 pub struct TestContext {
     pub router: Router,
-    #[allow(dead_code)]
+    pub server: Arc<TestServer>,
     pub state: Arc<AppState>,
-    #[allow(dead_code)]
-    temp_dir: TempDir,
+    pub api_config: ApiConfig,
+    pub temp_dir: TempDir,
 }
 
 impl TestContext {
-    /// Create a new test context with fresh state
     pub async fn new() -> ApiResult<Self> {
+        Self::with_config(|_| {}).await
+    }
+
+    pub async fn with_config(tweak: impl FnOnce(&mut ApiConfig)) -> ApiResult<Self> {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let temp_path = temp_dir.path();
 
-        // Create API config with temp paths
         let mut api_config = ApiConfig::default();
         api_config.auth.jwt_secret_path = temp_path.join("jwt_secret");
         api_config.session.storage_path = temp_path.join("sessions");
+        tweak(&mut api_config);
 
-        // Create proxy config
         let proxy_config = ProxyConfig::default();
         let config_path = temp_path.join("proxy.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&proxy_config).expect("serialize proxy config"),
+        )
+        .expect("write proxy config");
 
-        // Write initial proxy config
-        let config_str =
-            toml::to_string_pretty(&proxy_config).expect("Failed to serialize proxy config");
-        std::fs::write(&config_path, config_str).expect("Failed to write proxy config");
-
-        // Create shared filter engine + persistent list store (empty for tests)
         let shared_engine = Arc::new(SharedEngine::new());
         let filter_store =
             ListStore::open(&temp_path.join("filters")).expect("Failed to open filter store");
@@ -54,7 +59,6 @@ impl TestContext {
             http_client.clone(),
         );
 
-        // Create userscript manager, storage and runtime
         let userscript_manager = Arc::new(
             UserscriptManager::new(temp_path.join("userscripts"))
                 .expect("Failed to create userscript manager"),
@@ -68,7 +72,6 @@ impl TestContext {
             userscript_storage,
         ));
 
-        // Build state
         let state = build_state(
             api_config.clone(),
             proxy_config,
@@ -82,49 +85,128 @@ impl TestContext {
         )
         .await?;
 
-        // Create router
         let router = create_router(state.clone(), &api_config);
-
+        let server =
+            Arc::new(TestServer::new(router.clone()).expect("Failed to create test server"));
         Ok(Self {
             router,
+            server,
             state,
+            api_config,
             temp_dir,
         })
     }
+
+    /// Register the first user (an administrator) and return its session.
+    pub async fn admin(&self) -> Sess {
+        let resp = self
+            .server
+            .post("/api/v1/auth/register")
+            .json(&json!({"username": "admin_user", "password": PASSWORD, "password_confirm": PASSWORD}))
+            .await;
+        resp.assert_status_ok();
+        Sess::from_response(self.server.clone(), &resp)
+    }
+
+    /// Create `name` with `role` through the admin API and log in as them.
+    pub async fn user(&self, admin: &Sess, name: &str, role: &str) -> Sess {
+        admin
+            .post("/api/v1/users")
+            .json(&json!({"username": name, "password": PASSWORD, "role": role}))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+        self.login(name).await
+    }
+
+    pub async fn login(&self, name: &str) -> Sess {
+        let resp = self
+            .server
+            .post("/api/v1/auth/login")
+            .json(&json!({"username": name, "password": PASSWORD}))
+            .await;
+        resp.assert_status_ok();
+        Sess::from_response(self.server.clone(), &resp)
+    }
+
+    /// Mint an API token with the given scopes for `sess`; returns the secret.
+    pub async fn token(&self, sess: &Sess, scopes: &[&str]) -> String {
+        let resp = sess
+            .post("/api/v1/tokens")
+            .json(&json!({"name": "test", "scopes": scopes}))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        resp.json::<Value>()["secret"].as_str().unwrap().to_string()
+    }
+
+    /// Request authenticated with a bearer token.
+    pub fn bearer(&self, method: &str, path: &str, secret: &str) -> TestRequest {
+        let r = match method {
+            "GET" => self.server.get(path),
+            "POST" => self.server.post(path),
+            "PUT" => self.server.put(path),
+            "PATCH" => self.server.patch(path),
+            "DELETE" => self.server.delete(path),
+            m => panic!("unsupported method {m}"),
+        };
+        r.authorization_bearer(secret)
+    }
 }
 
-/// Extract access token cookie from response headers
-pub fn extract_access_token(response: &axum_test::TestResponse) -> Option<String> {
-    for value in response.headers().get_all("set-cookie") {
-        if let Ok(s) = value.to_str() {
-            if s.starts_with("access_token=") {
-                let token = s
-                    .split(';')
-                    .next()
-                    .unwrap()
-                    .strip_prefix("access_token=")
-                    .unwrap();
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
+/// A cookie session; requests made through it carry the access cookie and CSRF header.
+pub struct Sess {
+    pub server: Arc<TestServer>,
+    pub access: String,
+    pub refresh: String,
+    pub csrf: String,
 }
 
-/// Extract refresh token cookie from response headers
-pub fn extract_refresh_token(response: &axum_test::TestResponse) -> Option<String> {
-    for value in response.headers().get_all("set-cookie") {
-        if let Ok(s) = value.to_str() {
-            if s.starts_with("refresh_token=") {
-                let token = s
-                    .split(';')
-                    .next()
-                    .unwrap()
-                    .strip_prefix("refresh_token=")
-                    .unwrap();
-                return Some(token.to_string());
-            }
+fn cookie_from(resp: &axum_test::TestResponse, name: &str) -> Option<String> {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|s| {
+            s.strip_prefix(&format!("{name}="))
+                .map(|r| r.split(';').next().unwrap_or("").to_string())
+        })
+}
+
+pub fn extract_access_token(resp: &axum_test::TestResponse) -> Option<String> {
+    cookie_from(resp, "access_token")
+}
+
+pub fn extract_refresh_token(resp: &axum_test::TestResponse) -> Option<String> {
+    cookie_from(resp, "refresh_token")
+}
+
+impl Sess {
+    pub fn from_response(server: Arc<TestServer>, resp: &axum_test::TestResponse) -> Self {
+        Self {
+            server,
+            access: cookie_from(resp, "access_token").expect("access cookie"),
+            refresh: cookie_from(resp, "refresh_token").expect("refresh cookie"),
+            csrf: cookie_from(resp, "csrf_token").expect("csrf cookie"),
         }
     }
-    None
+
+    fn with(&self, r: TestRequest) -> TestRequest {
+        r.add_cookie(Cookie::new("access_token", self.access.clone()))
+            .add_header("x-csrf-token", self.csrf.clone())
+    }
+
+    pub fn get(&self, p: &str) -> TestRequest {
+        self.with(self.server.get(p))
+    }
+    pub fn post(&self, p: &str) -> TestRequest {
+        self.with(self.server.post(p))
+    }
+    pub fn put(&self, p: &str) -> TestRequest {
+        self.with(self.server.put(p))
+    }
+    pub fn patch(&self, p: &str) -> TestRequest {
+        self.with(self.server.patch(p))
+    }
+    pub fn delete(&self, p: &str) -> TestRequest {
+        self.with(self.server.delete(p))
+    }
 }
