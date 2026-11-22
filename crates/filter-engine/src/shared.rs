@@ -38,6 +38,9 @@ pub struct Cosmetics {
     pub procedural_actions: Vec<String>,
     /// True if this page is excepted from generic (class/id) hiding.
     pub generichide: bool,
+    /// Selectors the page's `site#@#selector` rules except, so another engine's hides of the
+    /// same selector can be cancelled (see `merge_cosmetics` in proxy-core).
+    pub exceptions: Vec<String>,
 }
 
 /// IP-literal host matcher (CIDR lists cannot be hostname rules); `allow` wins over `block`.
@@ -489,6 +492,7 @@ impl SharedEngine {
                 injected_script: res.injected_script,
                 procedural_actions: res.procedural_actions.into_iter().collect(),
                 generichide: res.generichide,
+                exceptions: res.exceptions.into_iter().collect(),
             }
         })
     }

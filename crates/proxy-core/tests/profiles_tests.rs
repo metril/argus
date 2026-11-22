@@ -516,3 +516,43 @@ async fn gm_values_are_namespaced_per_profile() {
     );
     assert_eq!(st, 401);
 }
+
+#[tokio::test]
+async fn userscript_chunks_are_bound_to_the_profile_they_were_planned_for() {
+    use hyper::{HeaderMap, Method};
+    use proxy_core::gm::{Caller, GmHost};
+    use userscript_engine::install::{finish_install, plan_install, Approvals, Fetched};
+    use userscript_engine::UserscriptManager;
+
+    let dir = tempfile::tempdir().unwrap();
+    let m = Arc::new(UserscriptManager::new(dir.path().to_path_buf()).unwrap());
+    let src = "// ==UserScript==\n// @name n\n// @namespace t\n// @version 1.0\n// @match *://hit.test/*\n// ==/UserScript==\n1;\n";
+    let s = finish_install(
+        plan_install(src, None).unwrap(),
+        Fetched::default(),
+        Approvals::default(),
+    )
+    .unwrap();
+    m.install_script("p1", s).unwrap();
+    let host = GmHost::new();
+    let origin = "https://hit.test";
+    let plan = |profile: &str| {
+        host.plan_document(&m, profile, "hit.test", "https://hit.test/", origin, true)
+    };
+    assert!(plan("p2").is_none(), "p2 has no scripts");
+    let fetch = |planned: &proxy_core::gm::DocPlan, as_profile: &str| {
+        let c = Caller {
+            manager: &m,
+            host: "hit.test",
+            origin,
+            profile: as_profile,
+        };
+        let rest = planned.srcs[0].strip_prefix("/__adblock__/us/").unwrap();
+        host.serve_chunk(&m, &c, &Method::GET, &HeaderMap::new(), rest)
+            .status()
+    };
+    let planned = plan("p1").unwrap();
+    // A requester resolved to another profile cannot take it (and does not consume it).
+    assert_eq!(fetch(&planned, "p2"), 404);
+    assert_eq!(fetch(&planned, "p1"), 200);
+}

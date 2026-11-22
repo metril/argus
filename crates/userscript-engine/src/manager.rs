@@ -29,7 +29,7 @@ pub struct UserscriptManager {
     db: Arc<Db>,
     /// Live per-document index of the default profile, rebuilt (and swapped atomically) after
     /// every change; the proxy reads it lock-free.
-    live_index: ArcSwap<ScriptIndex>,
+    live_index: Arc<ArcSwap<ScriptIndex>>,
     /// Live indexes of the non-default profiles, by profile name.
     profile_indexes: RwLock<HashMap<String, Arc<ArcSwap<ScriptIndex>>>>,
     /// Served for a profile without an index (never mutated).
@@ -68,7 +68,7 @@ impl UserscriptManager {
         Ok(Self {
             scripts: Arc::new(RwLock::new(HashMap::new())),
             db,
-            live_index: ArcSwap::from_pointee(ScriptIndex::default()),
+            live_index: Arc::new(ArcSwap::from_pointee(ScriptIndex::default())),
             profile_indexes: RwLock::new(HashMap::new()),
             empty_index: ArcSwap::from_pointee(ScriptIndex::default()),
             gm: GmBackend::new(storage.clone(), Quotas::default()),
@@ -119,6 +119,24 @@ impl UserscriptManager {
             Some(slot) => slot.load(),
             None => self.empty_index.load(),
         }
+    }
+
+    /// The swappable handle of `profile`'s live index (created empty when missing). Keep it (a
+    /// compiled profile holds one) and `load()` it on the request path: no lock, no hashing.
+    /// [`Self::refresh_index_for`] swaps new indexes into the same handle; only
+    /// [`Self::drop_profile_index`] detaches it.
+    pub fn index_handle(&self, profile: &str) -> Arc<ArcSwap<ScriptIndex>> {
+        if profile == DEFAULT_PROFILE {
+            return self.live_index.clone();
+        }
+        if let Some(h) = self.profile_indexes.read().get(profile) {
+            return h.clone();
+        }
+        self.profile_indexes
+            .write()
+            .entry(profile.to_string())
+            .or_insert_with(|| Arc::new(ArcSwap::from_pointee(ScriptIndex::default())))
+            .clone()
     }
 
     /// Rebuild the default profile's live index from its scripts and swap it in. Called after
@@ -586,6 +604,21 @@ console.log('test');
         m.load_all().unwrap();
         assert!(m.get_all_in("a").is_empty());
         assert_eq!(m.get_all_in("b").len(), 1);
+    }
+
+    #[test]
+    fn index_handles_follow_every_refresh() {
+        let temp_dir = tempdir().unwrap();
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let (kids, def) = (m.index_handle("kids"), m.index_handle(DEFAULT_PROFILE));
+        assert!(kids.load().is_empty() && def.load().is_empty());
+        let id = m.install_in("kids", TEST_SCRIPT.to_string()).unwrap();
+        m.install(TEST_SCRIPT.to_string()).unwrap();
+        assert_eq!(kids.load().len(), 1, "same handle after refresh");
+        assert_eq!(def.load().len(), 1);
+        assert!(Arc::ptr_eq(&kids, &m.index_handle("kids")));
+        m.set_enabled_in("kids", &id, false).unwrap();
+        assert!(kids.load().is_empty());
     }
 
     #[test]

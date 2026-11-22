@@ -130,8 +130,19 @@ fn apply_overlay(
     base
 }
 
-/// Merge overlay cosmetic resources into the base's.
+/// Merge overlay cosmetic resources into the base's. The overlay wins: its `site#@#selector`
+/// exceptions cancel the base's hides of that selector, and its `$generichide` exception makes
+/// the page generic-hide free.
+///
+/// Limits of the engine API, deliberately documented in `docs/PROFILES.md`: only host-scoped
+/// overlay exceptions are visible here (a bare `#@#.x` is resolved inside the overlay engine
+/// alone), an overlay exception cannot cancel a base *procedural* filter, and `$generichide`
+/// cannot strip the non-class/id "misc" generic selectors already in the base's static list;
+/// `$elemhide` is not understood by the engine at all (base or overlay).
 fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosmetics) {
+    if !ov.exceptions.is_empty() {
+        base.hide_selectors.retain(|s| !ov.exceptions.contains(s));
+    }
     base.hide_selectors.extend(ov.hide_selectors);
     base.procedural_actions.extend(ov.procedural_actions);
     if !ov.injected_script.is_empty() {
@@ -141,6 +152,36 @@ fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosme
         base.injected_script.push_str(&ov.injected_script);
     }
     base.generichide |= ov.generichide;
+    base.exceptions.extend(ov.exceptions);
+}
+
+/// Generic hide selectors for the classes and ids a page reports, from both of the profile's
+/// engines: the base's minus the overlay's exceptions, plus the overlay's own; nothing when
+/// either engine excepts the page from generic hiding.
+pub(crate) fn dynamic_selectors(
+    profile: &Profile,
+    url: &str,
+    classes: &[String],
+    ids: &[String],
+) -> Vec<String> {
+    let mut out = profile.engine.dynamic_hide_selectors(url, classes, ids);
+    let Some(ov) = &profile.overlay else {
+        return out;
+    };
+    if !ov.is_enabled() {
+        return out;
+    }
+    let cos = ov.cosmetic_for(url);
+    if cos.generichide {
+        return Vec::new();
+    }
+    out.retain(|s| !cos.exceptions.contains(s));
+    for s in ov.dynamic_hide_selectors(url, classes, ids) {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
@@ -441,10 +482,10 @@ impl ProxyContext {
         // the page's bundles or GM traffic (see docs/USERSCRIPT-PROTOCOL.md section 6).
         if is_service_worker_fetch(req.headers()) {
             let prof = rctx.profile.load();
-            let refuse = prof.userscript_manager().is_some_and(|m| {
+            let refuse = prof.script_index.as_ref().is_some_and(|ix| {
                 self.internal
                     .gm
-                    .blocks_service_workers(m, &prof.name, &host)
+                    .blocks_service_workers_in(&ix.load(), &host)
             });
             if refuse {
                 debug!("Refused a service worker script fetch for {host}");
@@ -803,12 +844,13 @@ impl ProxyContext {
                     None
                 } else {
                     let prof = rctx.profile.load();
-                    prof.userscript_manager().and_then(|m| {
-                        if m.index_for(&prof.name).is_empty() {
+                    prof.script_index.as_ref().and_then(|ix| {
+                        let idx = ix.load();
+                        if idx.is_empty() {
                             return None; // zero cost: no allocation, no probe
                         }
-                        self.internal.gm.plan_document(
-                            m,
+                        self.internal.gm.plan_document_in(
+                            &idx,
                             &prof.name,
                             &host,
                             &url,
@@ -825,10 +867,10 @@ impl ProxyContext {
                 };
                 let unregister_sw = !blocks_scripts
                     && us.is_some()
-                    && rctx.profile.load().userscript_manager().is_some_and(|m| {
+                    && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
                         self.internal
                             .gm
-                            .blocks_service_workers(m, &rctx.profile.load().name, &host)
+                            .blocks_service_workers_in(&ix.load(), &host)
                     });
                 let head = if enabled {
                     build_head(&PageSpec {
@@ -1235,6 +1277,60 @@ mod url_tests {
                 "/x"
             ),
             "http://example.com:8080/x"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_merge_tests {
+    use super::merge_cosmetics;
+    use filter_engine::{compile_engine, overlay_from_rules, SharedEngine};
+
+    const URL: &str = "https://example.com/page";
+
+    fn engine(list: &str) -> SharedEngine {
+        let e = SharedEngine::new();
+        e.install(compile_engine(&[list.to_string()]));
+        e
+    }
+
+    #[test]
+    fn overlay_cosmetic_exception_cancels_a_base_hide() {
+        let base = engine("example.com##.x\nexample.com##.y\n");
+        let ov = overlay_from_rules("example.com#@#.x").unwrap().unwrap();
+        let mut c = base.cosmetic_for(URL);
+        assert!(c.hide_selectors.iter().any(|s| s == ".x"));
+        merge_cosmetics(&mut c, ov.cosmetic_for(URL));
+        assert!(!c.hide_selectors.iter().any(|s| s == ".x"), "{c:?}");
+        assert!(c.hide_selectors.iter().any(|s| s == ".y"), "{c:?}");
+        // Another site is unaffected.
+        let mut other = base.cosmetic_for("https://other.test/");
+        merge_cosmetics(&mut other, ov.cosmetic_for("https://other.test/"));
+        assert!(other.hide_selectors.is_empty());
+    }
+
+    #[test]
+    fn overlay_generichide_and_exceptions_apply_to_dynamic_selectors() {
+        use crate::request_ctx::Profile;
+        use std::sync::Arc;
+        let classes = ["gen".to_string()];
+        let profile = |rules: &str| {
+            let base = Arc::new(engine("##.gen\n"));
+            let p = Profile::new(1, 1, base);
+            p.with_overlay(overlay_from_rules(rules).unwrap())
+        };
+        let sel = |p: &Profile| super::dynamic_selectors(p, URL, &classes, &[]);
+        assert_eq!(sel(&profile("")), vec![".gen"]);
+        assert!(sel(&profile("example.com#@#.gen")).is_empty());
+        assert!(sel(&profile("@@||example.com^$generichide")).is_empty());
+        // An overlay's own generic rule is served too, and other sites keep the base's.
+        let p = profile("##.own");
+        let both = super::dynamic_selectors(&p, URL, &["gen".into(), "own".into()], &[]);
+        assert!(both.contains(&".gen".to_string()) && both.contains(&".own".to_string()));
+        let p = profile("example.com#@#.gen");
+        assert_eq!(
+            super::dynamic_selectors(&p, "https://other.test/", &classes, &[]),
+            vec![".gen"]
         );
     }
 }

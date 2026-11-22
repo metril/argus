@@ -84,6 +84,8 @@ struct Doc {
     /// Script ids in injection order (run-at group, then install order).
     ids: Vec<String>,
     fetched: Vec<bool>,
+    /// Storage namespace the document was planned for.
+    profile: String,
     host: String,
     origin: String,
     top: bool,
@@ -148,12 +150,17 @@ impl DocStore {
     }
 
     /// Take chunk `n` of document `id` for a request to `host`. Each chunk is served once; a
-    /// wrong host or an expired record yields `None` (a wrong host does not consume it).
-    fn take(&self, id: &str, n: usize, host: &str) -> Option<Chunk> {
+    /// wrong host or profile, or an expired record, yields `None` (which does not consume the chunk).
+    fn take(&self, id: &str, n: usize, host: &str, profile: &str) -> Option<Chunk> {
         let mut g = self.inner.lock();
         let (map, _) = &mut *g;
         let d = map.get_mut(id)?;
-        if d.created.elapsed() > self.ttl || d.host != host || n >= d.ids.len() || d.fetched[n] {
+        if d.created.elapsed() > self.ttl
+            || d.host != host
+            || d.profile != profile
+            || n >= d.ids.len()
+            || d.fetched[n]
+        {
             return None;
         }
         d.fetched[n] = true;
@@ -421,14 +428,17 @@ impl GmHost {
         profile: &str,
         host: &str,
     ) -> bool {
+        self.blocks_service_workers_in(&manager.index_for(profile), host)
+    }
+
+    /// [`Self::blocks_service_workers`] over an index the caller already holds (a profile keeps
+    /// its own handle, so the request path takes no lock).
+    pub fn blocks_service_workers_in(&self, index: &ScriptIndex, host: &str) -> bool {
         use common::config::ServiceWorkerPolicy::*;
         match self.sw_policy() {
             Allow => false,
-            Block => !manager.index_for(profile).is_empty(),
-            BlockWhenPrivileged => manager
-                .index_for(profile)
-                .for_host(host)
-                .any(|c| is_privileged(&c.script)),
+            Block => !index.is_empty(),
+            BlockWhenPrivileged => index.for_host(host).any(|c| is_privileged(&c.script)),
         }
     }
 
@@ -445,7 +455,29 @@ impl GmHost {
         origin: &str,
         is_top_frame: bool,
     ) -> Option<DocPlan> {
-        let guard = manager.index_for(profile);
+        self.plan_document_in(
+            &manager.index_for(profile),
+            profile,
+            host,
+            url,
+            origin,
+            is_top_frame,
+        )
+    }
+
+    /// [`Self::plan_document`] over the index of `profile` (the storage namespace) the caller
+    /// already holds. The registered document remembers the namespace: its chunks are served
+    /// only to requests of the same profile.
+    pub fn plan_document_in(
+        &self,
+        index: &Arc<ScriptIndex>,
+        profile: &str,
+        host: &str,
+        url: &str,
+        origin: &str,
+        is_top_frame: bool,
+    ) -> Option<DocPlan> {
+        let guard = index;
         if guard.is_empty() {
             return None;
         }
@@ -466,9 +498,10 @@ impl GmHost {
             })
             .collect();
         let doc = Doc {
-            index: Arc::clone(&guard),
+            index: Arc::clone(guard),
             fetched: vec![false; ids.len()],
             ids,
+            profile: profile.to_string(),
             host: host.to_string(),
             origin: origin.to_string(),
             top: is_top_frame,
@@ -516,7 +549,7 @@ impl GmHost {
         let Some((id, n)) = parsed else {
             return not_found();
         };
-        let Some(chunk) = self.docs.take(id, n, c.host) else {
+        let Some(chunk) = self.docs.take(id, n, c.host, c.profile) else {
             return not_found();
         };
         let Some(cs) = chunk.index.get(&chunk.script_id) else {
@@ -1335,6 +1368,7 @@ mod tests {
             index: Arc::new(ScriptIndex::default()),
             ids: (0..n).map(|i| format!("s{i}")).collect(),
             fetched: vec![false; n],
+            profile: "p".into(),
             host: host.into(),
             origin: format!("https://{host}"),
             top: true,
@@ -1346,11 +1380,12 @@ mod tests {
     fn chunks_are_single_use_and_bound_to_the_host() {
         let s = DocStore::new(8, Duration::from_secs(60));
         let id = s.insert(doc("a.test", 2));
-        assert!(s.take(&id, 0, "b.test").is_none(), "wrong host");
-        assert!(s.take(&id, 0, "a.test").is_some());
-        assert!(s.take(&id, 0, "a.test").is_none(), "replay");
-        assert!(s.take(&id, 5, "a.test").is_none());
-        assert!(s.take(&id, 1, "a.test").is_some());
+        assert!(s.take(&id, 0, "b.test", "p").is_none(), "wrong host");
+        assert!(s.take(&id, 0, "a.test", "q").is_none(), "wrong profile");
+        assert!(s.take(&id, 0, "a.test", "p").is_some());
+        assert!(s.take(&id, 0, "a.test", "p").is_none(), "replay");
+        assert!(s.take(&id, 5, "a.test", "p").is_none());
+        assert!(s.take(&id, 1, "a.test", "p").is_some());
         assert!(s.is_empty(), "fully fetched documents are dropped");
     }
 
@@ -1359,8 +1394,11 @@ mod tests {
         let s = DocStore::new(3, Duration::from_secs(60));
         let ids: Vec<String> = (0..10).map(|_| s.insert(doc("a.test", 1))).collect();
         assert!(s.len() <= 3);
-        assert!(s.take(&ids[0], 0, "a.test").is_none(), "oldest evicted");
-        assert!(s.take(&ids[9], 0, "a.test").is_some());
+        assert!(
+            s.take(&ids[0], 0, "a.test", "p").is_none(),
+            "oldest evicted"
+        );
+        assert!(s.take(&ids[9], 0, "a.test", "p").is_some());
     }
 
     #[test]
@@ -1368,7 +1406,7 @@ mod tests {
         let s = DocStore::new(8, Duration::from_millis(10));
         let id = s.insert(doc("a.test", 1));
         std::thread::sleep(Duration::from_millis(30));
-        assert!(s.take(&id, 0, "a.test").is_none());
+        assert!(s.take(&id, 0, "a.test", "p").is_none());
         s.insert(doc("a.test", 1));
         assert_eq!(s.len(), 1, "insert purges expired entries");
     }

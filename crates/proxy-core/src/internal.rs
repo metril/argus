@@ -416,7 +416,7 @@ impl Internal {
             return self.panel_state(req, host, rctx).await;
         }
         if rest == "cc" {
-            return self.cc(req, host, engine).await;
+            return self.cc(req, host, &profile).await;
         }
         if let Some(r) = rest.strip_prefix("us/") {
             return match profile.userscript_manager() {
@@ -561,7 +561,7 @@ impl Internal {
         &self,
         req: Request<Incoming>,
         host: &str,
-        engine: &SharedEngine,
+        profile: &crate::request_ctx::Profile,
     ) -> Response<ProxyBody> {
         let deny = |s| plain(s, "no-store", "same-origin");
         if req.method() != Method::POST {
@@ -644,7 +644,8 @@ impl Internal {
         for note in parsed.unsupported.iter().take(32) {
             self.note_unsupported(note);
         }
-        let selectors = engine.dynamic_hide_selectors(&parsed.url, &parsed.classes, &parsed.ids);
+        let selectors =
+            crate::filtering::dynamic_selectors(profile, &parsed.url, &parsed.classes, &parsed.ids);
         let json = serde_json::json!({ "selectors": selectors }).to_string();
         Response::builder()
             .status(StatusCode::OK)
