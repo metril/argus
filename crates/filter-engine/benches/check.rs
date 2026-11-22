@@ -200,5 +200,79 @@ fn bench_html_path(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_check, bench_real, bench_html_path);
+/// A profile with an overlay: what `apply_overlay` plus the document `site_off` probes cost when
+/// each layer builds its own adblock request (`separate`) versus sharing one (`shared`).
+fn bench_overlay_path(c: &mut Criterion) {
+    let base = SharedEngine::new();
+    base.install(compile_engine(&[loadgen_list(50_000)]));
+    let ov =
+        filter_engine::overlay_from_rules("||overlay-ads.test^\n@@||ads0.test^$domain=ok.test\n")
+            .unwrap()
+            .unwrap();
+    let source = "https://page.example.com/";
+    let cases = [
+        (
+            "allowed_script",
+            "https://cdn.thirdparty.test/app.js",
+            "script",
+        ),
+        ("base_blocked_image", "https://ads0.test/pixel.gif", "image"),
+        ("document", "https://www0.test/page.html", "document"),
+    ];
+    let mut g = c.benchmark_group("overlay_path");
+    for (name, url, ty) in cases {
+        let doc = ty == "document";
+        g.bench_function(format!("{name}/separate"), |b| {
+            b.iter(|| {
+                let url = black_box(url);
+                let b0 = base.check_deferred(url, source, ty);
+                let o = ov.check_deferred(url, source, ty);
+                let mut out = o.blocked || o.exception_rule.is_some();
+                if !out && b0.blocked {
+                    if let Ok(req) = adblock::request::Request::new(url, source, ty) {
+                        out = ov
+                            .engine()
+                            .check_network_request_subset(&req, false, true)
+                            .exception
+                            .is_some();
+                    }
+                }
+                let off = doc && (base.site_off(url) || ov.site_off(url));
+                black_box((b0.blocked, out, off))
+            })
+        });
+        g.bench_function(format!("{name}/shared"), |b| {
+            b.iter(|| {
+                let url = black_box(url);
+                let q = filter_engine::Query::new(url, source, ty);
+                let b0 = base.check_deferred_q(&q);
+                let o = ov.check_deferred_q(&q);
+                let mut out = o.blocked || o.exception_rule.is_some();
+                if !out && b0.blocked {
+                    if let Some(req) = q.request() {
+                        out = ov
+                            .engine()
+                            .check_network_request_subset(req, false, true)
+                            .exception
+                            .is_some();
+                    }
+                }
+                let off = doc && {
+                    let probe = SharedEngine::site_probe(url);
+                    base.site_off_with(&probe) || ov.site_off_with(&probe)
+                };
+                black_box((b0.blocked, out, off))
+            })
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_check,
+    bench_real,
+    bench_html_path,
+    bench_overlay_path
+);
 criterion_main!(benches);

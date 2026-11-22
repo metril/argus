@@ -100,9 +100,7 @@ fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
 fn apply_overlay(
     profile: &Profile,
     base: filter_engine::MatchResult,
-    url: &str,
-    source_url: &str,
-    resource_type: &str,
+    q: &filter_engine::Query<'_>,
 ) -> filter_engine::MatchResult {
     let Some(ov) = &profile.overlay else {
         return base;
@@ -111,15 +109,15 @@ fn apply_overlay(
         return base;
     }
     // Neither verdict is counted here: the caller records the final one once.
-    let o = ov.check_deferred(url, source_url, resource_type);
+    let o = ov.check_deferred_q(q);
     if o.blocked || o.exception_rule.is_some() {
         return o;
     }
     // An exception-only overlay rule is only reported by the engine next to a block it
     // overrides, so when the base blocked, ask the overlay for its exceptions explicitly.
     if base.blocked {
-        if let Ok(req) = adblock::request::Request::new(url, source_url, resource_type) {
-            let r = ov.engine().check_network_request_subset(&req, false, true);
+        if let Some(req) = q.request() {
+            let r = ov.engine().check_network_request_subset(req, false, true);
             if !r.matched {
                 if let Some(rule) = r.exception {
                     return filter_engine::MatchResult::allowed_by_exception(rule);
@@ -408,10 +406,10 @@ impl ProxyContext {
     ) -> bool {
         let profile = rctx.profile.load();
         profile.engine.is_enabled() && {
-            let base = profile
-                .engine
-                .check_deferred(url, source_url, resource_type);
-            let v = apply_overlay(&profile, base, url, source_url, resource_type);
+            // One adblock request serves the base engine and the overlay.
+            let q = filter_engine::Query::new(url, source_url, resource_type);
+            let base = profile.engine.check_deferred_q(&q);
+            let v = apply_overlay(&profile, base, &q);
             profile
                 .engine
                 .record_verdict(v, url, source_url, resource_type, &profile.label)
@@ -537,8 +535,9 @@ impl ProxyContext {
             let engine = &profile.engine;
             if engine.is_enabled() {
                 let source = source_url(&headers, &url, rtype);
-                let (verdict, gen_) = engine.check_gen_deferred(&url, source, rtype.as_str());
-                let verdict = apply_overlay(&profile, verdict, &url, source, rtype.as_str());
+                let q = filter_engine::Query::new(&url, source, rtype.as_str());
+                let (verdict, gen_) = engine.check_gen_deferred_q(&q);
+                let verdict = apply_overlay(&profile, verdict, &q);
                 let verdict =
                     engine.record_verdict(verdict, &url, source, rtype.as_str(), &profile.label);
                 generation = Some(gen_);
@@ -553,9 +552,15 @@ impl ProxyContext {
                     return Ok(block_response(rtype, &verdict, &url));
                 }
                 // A non-default profile keeps its per-site exceptions in its overlay rules.
-                page_off = rtype.is_frame()
-                    && (engine.site_off(&url)
-                        || profile.overlay.as_ref().is_some_and(|o| o.site_off(&url)));
+                page_off = rtype.is_frame() && {
+                    // Base and overlay judge the same probe request.
+                    let probe = SharedEngine::site_probe(&url);
+                    engine.site_off_with(&probe)
+                        || profile
+                            .overlay
+                            .as_ref()
+                            .is_some_and(|o| o.site_off_with(&probe))
+                };
                 if let Some(new_url) = verdict.rewritten_url {
                     let navigation =
                         rtype == RequestType::Document && (method == hyper::Method::GET || is_head);

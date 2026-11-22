@@ -45,6 +45,6 @@ pub use scriptlet_resources::{
 };
 pub use shared::{
     build_engine, compile_engine, overlay_from_rules, overlay_from_rules_shared, try_build_engine,
-    Cosmetics, Generation, IpFilter, ResourceReport, SharedEngine,
+    Cosmetics, Generation, IpFilter, Query, ResourceReport, SharedEngine,
 };
 pub use stats::{BlockingStats, FilterStats};

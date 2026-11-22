@@ -539,14 +539,19 @@ impl SharedEngine {
     /// as if the page requested it: an exception matching means the page is excepted. Records
     /// nothing. One engine lookup; call it for documents only.
     pub fn site_off(&self, page_url: &str) -> bool {
+        self.site_off_with(&Self::site_probe(page_url))
+    }
+
+    /// The probe [`Self::site_off_with`] takes; one probe serves several engines.
+    pub fn site_probe(page_url: &str) -> Query<'_> {
+        Query::new(SITE_OFF_PROBE, page_url, "other")
+    }
+
+    /// [`Self::site_off`] with a prebuilt probe from [`Self::site_probe`].
+    pub fn site_off_with(&self, probe: &Query<'_>) -> bool {
         self.enabled.load(Ordering::Relaxed)
             && self
-                .decide(
-                    &self.engine.load().engine,
-                    SITE_OFF_PROBE,
-                    page_url,
-                    "other",
-                )
+                .decide_q(&self.engine.load().engine, probe)
                 .exception_rule
                 .is_some()
     }
@@ -581,10 +586,15 @@ impl SharedEngine {
         source_url: &str,
         resource_type: &str,
     ) -> (MatchResult, Arc<Generation>) {
+        self.check_gen_deferred_q(&Query::new(url, source_url, resource_type))
+    }
+
+    /// [`Self::check_gen_deferred`] for a [`Query`] shared with other engines.
+    pub fn check_gen_deferred_q(&self, q: &Query<'_>) -> (MatchResult, Arc<Generation>) {
         loop {
             let guard = self.engine.load();
             let r = if self.enabled.load(Ordering::Relaxed) {
-                self.decide(&guard.engine, url, source_url, resource_type)
+                self.decide_q(&guard.engine, q)
             } else {
                 MatchResult::allowed()
             };
@@ -596,8 +606,14 @@ impl SharedEngine {
 
     /// [`Self::check`] without the bookkeeping (see [`Self::check_gen_deferred`]).
     pub fn check_deferred(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
+        self.check_deferred_q(&Query::new(url, source_url, resource_type))
+    }
+
+    /// [`Self::check_deferred`] for a [`Query`] shared with other engines. One engine load: the
+    /// whole decision uses that generation (the pre-check sets are separate swaps).
+    pub fn check_deferred_q(&self, q: &Query<'_>) -> MatchResult {
         if self.enabled.load(Ordering::Relaxed) {
-            self.decide(&self.engine.load().engine, url, source_url, resource_type)
+            self.decide_q(&self.engine.load().engine, q)
         } else {
             MatchResult::allowed()
         }
@@ -693,6 +709,13 @@ impl SharedEngine {
         source_url: &str,
         resource_type: &str,
     ) -> MatchResult {
+        self.decide_q(eng, &Query::new(url, source_url, resource_type))
+    }
+
+    /// [`Self::decide`] for a [`Query`], whose adblock request is built at most once however many
+    /// engines and layers look at it.
+    fn decide_q(&self, eng: &AdblockEngine, q: &Query<'_>) -> MatchResult {
+        let (url, resource_type) = (q.url, q.rtype);
         // Pre-check layer: IP literals, then the domain set.
         let ipf = self.ip_filter.load();
         let ds = self.domains.load();
@@ -726,7 +749,7 @@ impl SharedEngine {
                     None => precheck::applies(false, f.scheme, f.rt),
                 };
                 if ok {
-                    return self.domain_block(&ds, hit, f.host, url, source_url, resource_type);
+                    return self.domain_block(eng, &ds, hit, f.host, q);
                 }
             }
         }
@@ -736,12 +759,8 @@ impl SharedEngine {
             return MatchResult::allowed();
         }
 
-        let request = match crate::matcher::make_request(url, source_url, resource_type) {
-            Ok(r) => r,
-            Err(e) => {
-                debug!("Filter check error for {url}: {e}; allowing");
-                return MatchResult::allowed();
-            }
+        let Some(request) = q.request() else {
+            return MatchResult::allowed();
         };
         if fast.is_none()
             && !ds.is_empty()
@@ -769,11 +788,11 @@ impl SharedEngine {
                     && precheck::applies(false, scheme, precheck::idx(&request.request_type))
                 {
                     let host = name.to_string();
-                    return self.domain_block(&ds, hit, &host, url, source_url, resource_type);
+                    return self.domain_block(eng, &ds, hit, &host, q);
                 }
             }
         }
-        let result = eng.check_network_request(&request);
+        let result = eng.check_network_request(request);
         RequestMatcher::to_match_result(result)
     }
 
@@ -782,12 +801,11 @@ impl SharedEngine {
     /// those, as the full engine would after a normal block match).
     fn domain_block(
         &self,
+        eng: &AdblockEngine,
         ds: &DomainSet,
         hit: DomainHit,
         host: &str,
-        url: &str,
-        source_url: &str,
-        resource_type: &str,
+        q: &Query<'_>,
     ) -> MatchResult {
         let mut rule = String::with_capacity(host.len() + 12);
         match hit.exact {
@@ -815,16 +833,49 @@ impl SharedEngine {
         if !ds.engine_overrides() {
             return plain(rule, list);
         }
-        let Ok(request) = crate::matcher::make_request(url, source_url, resource_type) else {
+        let Some(request) = q.request() else {
             return plain(rule, list);
         };
-        let res = self.with_engine(|e| e.check_network_request_subset(&request, true, true));
+        // The caller's engine, not a fresh load: one check, one generation.
+        let res = eng.check_network_request_subset(request, true, true);
         let mut r = RequestMatcher::to_match_result(res);
         if r.blocked && !r.important {
             r.matched_rule = Some(rule);
             r.list_id = list;
         }
         r
+    }
+}
+
+/// One request to judge, with its adblock `Request` built lazily and at most once: the base
+/// engine, an overlay, the domain-set pre-check and exception lookups all share it.
+pub struct Query<'a> {
+    url: &'a str,
+    source: &'a str,
+    rtype: &'a str,
+    req: std::cell::OnceCell<Option<adblock::request::Request>>,
+}
+
+impl<'a> Query<'a> {
+    pub fn new(url: &'a str, source: &'a str, resource_type: &'a str) -> Self {
+        Self {
+            url,
+            source,
+            rtype: resource_type,
+            req: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The adblock request (`None`, logged, when the URL does not parse: such a request is
+    /// allowed).
+    pub fn request(&self) -> Option<&adblock::request::Request> {
+        self.req
+            .get_or_init(|| {
+                crate::matcher::make_request(self.url, self.source, self.rtype)
+                    .map_err(|e| debug!("Filter check error for {}: {e}; allowing", self.url))
+                    .ok()
+            })
+            .as_ref()
     }
 }
 
@@ -840,6 +891,43 @@ pub fn compile_engine(list_contents: &[String]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_domain_set_hit_consults_the_engine_the_check_started_with() {
+        let mut b = crate::DomainSetBuilder::new(vec!["l".into()]);
+        b.add_suffix("ads.example.com", 0);
+        let set = Arc::new(b.finish(true, false).set);
+        let old = build_engine(
+            &compile_engine(&["@@||ads.example.com^\n".to_string()]),
+            &[],
+        );
+        let shared = SharedEngine::new();
+        let new = build_engine(&compile_engine(&["||other.test^\n".to_string()]), &[]);
+        shared.install_set(
+            Arc::new(Vec::new()),
+            new,
+            Arc::default(),
+            Arc::default(),
+            set,
+        );
+        // A check that began on the old generation (which excepts the host) must stay on it even
+        // though a newer one is already live.
+        let r = shared.decide(
+            &old,
+            "https://ads.example.com/a.js",
+            "https://p.test/",
+            "script",
+        );
+        assert!(!r.blocked, "{r:?}");
+        // The live generation has no exception: it blocks.
+        let r = shared.decide(
+            &shared.engine.load().engine,
+            "https://ads.example.com/a.js",
+            "https://p.test/",
+            "script",
+        );
+        assert!(r.blocked);
+    }
 
     #[test]
     fn empty_engine_allows_everything() {
