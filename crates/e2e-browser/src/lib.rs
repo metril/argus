@@ -140,6 +140,9 @@ pub const HOSTS: &[&str] = &[
     "us2.test",
     "api.test",
     "deny.test",
+    "sp.test",
+    "cdn.test",
+    "adblock.invalid",
 ];
 
 fn leaf_spki(der: &[u8]) -> String {

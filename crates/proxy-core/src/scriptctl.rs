@@ -41,6 +41,22 @@ impl DocEntry {
     }
 }
 
+/// Rules carry no port, so a host source must match whatever port the host is served on (CSP
+/// otherwise matches only the scheme's default port). Keywords, schemes (`data:`), `'self'` and
+/// sources with a path (the proxy's own) are left alone.
+fn any_port(directives: &mut [sp::CspDirective]) {
+    for d in directives {
+        for tok in &mut d.sources {
+            let t = tok.as_str();
+            let authority = t.split_once("://").map_or(t, |(_, r)| r);
+            if t.starts_with('\'') || t.ends_with(':') || t == "*" || authority.contains(['/', ':']) {
+                continue;
+            }
+            tok.push_str(":*");
+        }
+    }
+}
+
 type DocKey = (u64, bool, u16, Box<str>);
 
 /// One profile's script control.
@@ -175,9 +191,14 @@ impl ScriptControl {
                 nonce: Some(NONCE_MARK),
                 path: Some(INTERNAL_PREFIX),
             };
-            let csp = page
-                .csp_header(Some(&inject))
-                .map(|c| format!("{c}; report-uri {INTERNAL_PREFIX}pv?d={DOC_MARK}"));
+            let mut directives = page.csp(Some(&inject));
+            any_port(&mut directives);
+            let csp = (!directives.is_empty()).then(|| {
+                format!(
+                    "{}; report-uri {INTERNAL_PREFIX}pv?d={DOC_MARK}",
+                    sp::render_header(&directives)
+                )
+            });
             let actions = page.html_actions();
             let html = (!actions.is_empty()).then(|| {
                 Arc::new(crate::rewrite::PolicyHtml {
