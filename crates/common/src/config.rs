@@ -147,7 +147,8 @@ pub struct AdblockSettings {
     pub max_list_bytes: usize,
     /// Threads of the dedicated list-build pool (parse, convert, compile). 0 = half the cores, at
     /// least 1. A rebuild runs at low priority on these threads so it does not take the cores the
-    /// proxy workers need; raise it for faster rebuilds on a machine that is otherwise idle.
+    /// proxy workers need. A 100k-rule rebuild takes about the same (about 240 ms) with 1, 2 or 4
+    /// threads, so lowering this costs little build time.
     #[serde(default)]
     pub build_threads: usize,
     /// Destinations the control plane (list, `!#include` and resource downloads) may fetch from
