@@ -95,8 +95,8 @@ dropped; in the other rounds the direct path itself showed 100-250 ms stalls, i.
 the proxy. Every request in every round succeeded (0 errors, 0 rejected); 3 steady and 4 reload
 rounds (all h1) dropped requests during such stalls and are flagged failed by loadgen.
 
-**The host was not quiet**: unrelated background workloads (about 1% CPU
-each, 8-12% nice, 23-28% system), load average 2.1-9.3 during the
+**The host was not quiet**: unrelated background workloads (8-12% nice,
+23-28% system), load average 2.1-9.3 during the
 runs; `uptime` and the top CPU consumers before and after every batch are in the JSON. Nothing
 was stopped or paused.
 
