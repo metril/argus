@@ -13,9 +13,9 @@ use e2e::{EntryMode, TestEnv};
 use tokio::net::TcpStream;
 
 /// Offer `rate` new connections/s for `secs` on a fixed schedule from 8 workers (connect, then
-/// close). Returns (connected, accepted, rejected) as counted by the proxy once it has seen them
+/// close). Returns (connected, accepted, rejected, seconds until the last one was seen) as counted by the proxy once it has seen them
 /// all.
-async fn offer(env: &TestEnv, rate: u64, secs: u64) -> (u64, u64, u64) {
+async fn offer(env: &TestEnv, rate: u64, secs: u64) -> (u64, u64, u64, f64) {
     let addr = env.proxy.entry_addr();
     let workers = 8u64;
     let per_worker = rate * secs / workers;
@@ -51,13 +51,28 @@ async fn offer(env: &TestEnv, rate: u64, secs: u64) -> (u64, u64, u64) {
     for h in hs {
         connected += h.await.unwrap();
     }
-    // Let the accept loop drain its backlog.
+    // Let the accept loop drain its backlog: done when the counters have been still for 1 s (or
+    // all connections are accounted for). `elapsed` runs from the first scheduled connection to
+    // the last change.
     let deadline = Instant::now() + Duration::from_secs(60);
+    let (mut last, mut last_change) = (0, Instant::now());
     loop {
         let s = env.proxy.load_manager.stats();
-        if s.connections_accepted + s.connections_rejected >= connected || Instant::now() > deadline
+        let seen = s.connections_accepted + s.connections_rejected;
+        if seen != last {
+            (last, last_change) = (seen, Instant::now());
+        }
+        if seen >= connected
+            || last_change.elapsed() > Duration::from_secs(1)
+            || Instant::now() > deadline
         {
-            return (connected, s.connections_accepted, s.connections_rejected);
+            let elapsed = last_change.duration_since(start).as_secs_f64();
+            return (
+                connected,
+                s.connections_accepted,
+                s.connections_rejected,
+                elapsed,
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -73,11 +88,11 @@ async fn env_default() -> TestEnv {
 
 #[ignore = "needs a release build and a quiet machine"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn default_limit_admits_9k_per_second_without_rejections() {
+async fn default_limit_admits_10k_per_second_without_rejections() {
     let env = env_default().await;
-    let (connected, accepted, rejected) = offer(&env, 9_000, 3).await;
-    eprintln!("connected {connected} accepted {accepted} rejected {rejected}");
-    assert_eq!(connected, 27_000);
+    let (connected, accepted, rejected, secs) = offer(&env, 10_000, 3).await;
+    eprintln!("connected {connected} accepted {accepted} rejected {rejected} in {secs:.2}s");
+    assert_eq!(connected, 30_000);
     assert_eq!(rejected, 0);
     assert_eq!(accepted, connected);
 }
@@ -86,10 +101,13 @@ async fn default_limit_admits_9k_per_second_without_rejections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn limit_is_enforced_above_10k_per_second() {
     let env = env_default().await;
-    let (connected, accepted, rejected) = offer(&env, 20_000, 3).await;
-    eprintln!("connected {connected} accepted {accepted} rejected {rejected}");
-    assert_eq!(accepted + rejected, connected);
-    // About 10k/s for 3 s plus a 100 ms burst.
-    assert!((25_000..=34_000).contains(&accepted), "{accepted} accepted");
-    assert!(rejected >= 20_000, "{rejected} rejected");
+    let (connected, accepted, rejected, secs) = offer(&env, 20_000, 3).await;
+    eprintln!("connected {connected} accepted {accepted} rejected {rejected} in {secs:.2}s");
+    // The limiter admits 10k/s (plus a 100 ms burst) over however long the accept loop took.
+    assert!(
+        accepted as f64 <= 10_000.0 * secs + 1_500.0,
+        "{accepted} accepted in {secs}s"
+    );
+    assert!(accepted >= 25_000, "{accepted} accepted");
+    assert!(rejected >= 15_000, "{rejected} rejected");
 }

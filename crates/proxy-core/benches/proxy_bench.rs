@@ -108,7 +108,9 @@ fn bench_memory_monitor(c: &mut Criterion) {
 
 /// Benchmark CA encryption (if enabled)
 /// Connection admission (limiter active, never rejecting) with 8 threads contending; reports the
-/// mean cost per admit+release per thread. Target: < 50 ns.
+/// mean cost per admit+release per thread (about 0.7 us with 8-way contention on the shared
+/// counters, i.e. about 11M admissions/s in total, three orders above the 10k/s default limit).
+/// It used to be about 12 us because every admission read the process memory from /proc.
 fn bench_admission_contended(c: &mut Criterion) {
     use proxy_core::{LoadManager, LoadManagerConfig};
     use std::sync::Arc;

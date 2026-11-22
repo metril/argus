@@ -11,11 +11,6 @@ use proxy_core::{
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-// mimalloc as the global allocator (feature `mimalloc`).
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging

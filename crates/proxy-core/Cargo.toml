@@ -114,7 +114,6 @@ base64 = "0.22"
 regex = { workspace = true }
 hickory-resolver = "0.26"
 tracing-appender = "0.2"
-mimalloc = { version = "0.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # getifaddrs: the proxy host's own interface addresses (destination policy).
@@ -133,7 +132,6 @@ websockets = ["dep:tokio-tungstenite"]
 userscripts = []
 webui = ["dep:web-api"]
 full = ["websockets", "userscripts", "webui", "bundled-ubo-resources"]
-mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
