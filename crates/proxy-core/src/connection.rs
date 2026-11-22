@@ -14,7 +14,7 @@ use crate::authority;
 use crate::filtering::ProxyContext;
 use crate::inject::{full_body, ProxyBody};
 use crate::mitm::MitmHandler;
-use crate::request_ctx::RequestCtx;
+use crate::request_ctx::ConnCtx;
 use crate::{tls, Error, Result};
 use bytes::Bytes;
 use hyper::body::Incoming;
@@ -114,16 +114,16 @@ pub struct ConnectionHandler {
     pub(crate) client_addr: SocketAddr,
     pub(crate) shared: Arc<ConnectionShared>,
     /// Built once per connection; every request on it (plain, MITM h1/h2, WebSocket) shares it.
-    rctx: Arc<RequestCtx>,
+    conn: Arc<ConnCtx>,
 }
 
 impl ConnectionHandler {
     pub fn new(client_addr: SocketAddr, shared: Arc<ConnectionShared>) -> Self {
-        let rctx = Arc::new(shared.ctx.request_ctx_for(client_addr, None));
+        let conn = Arc::new(ConnCtx::new(shared.ctx.profiles(), client_addr));
         Self {
             client_addr,
             shared,
-            rctx,
+            conn,
         }
     }
 
@@ -153,6 +153,8 @@ impl ConnectionHandler {
         }
 
         if !buf.starts_with(b"CONNECT ") {
+            // Plain proxy request: its first request may carry the device token.
+            self.conn.await_token();
             return Ok(Entry::PlainHttp(Prefixed::new(buf, stream)));
         }
 
@@ -169,6 +171,21 @@ impl ConnectionHandler {
                 return Err(e);
             }
         };
+        // Device token: only the CONNECT head decides; nothing inside the tunnel can.
+        let profiles = self.shared.ctx.profiles();
+        let digest =
+            proxy_auth_value(&buf[..head_len]).and_then(crate::profiles::digest_from_proxy_auth);
+        let known = digest.is_some_and(|d| ConnCtx::token_known(profiles, &d));
+        if let Some(d) = digest {
+            self.conn.set_token(profiles, d);
+        }
+        if self.shared.ctx.require_device_token() && !known {
+            let _ = stream.write_all(PROXY_AUTH_REQUIRED_RAW).await;
+            return Err(Error::Connection(format!(
+                "device token required from {}",
+                self.client_addr
+            )));
+        }
         let leftover = buf.split_off(head_len);
 
         debug!("CONNECT {}:{} from {}", host, port, self.client_addr);
@@ -262,12 +279,12 @@ impl ConnectionHandler {
 
         if use_http2 {
             let shared = self.shared.clone();
-            let rctx = self.rctx.clone();
+            let conn = self.conn.clone();
             let service = move |req| {
                 let shared = shared.clone();
-                let rctx = rctx.clone();
+                let conn = conn.clone();
                 let origin = origin.clone();
-                async move { handle_request(shared, rctx, req, origin).await }
+                async move { handle_request(shared, conn, req, origin).await }
             };
             crate::http2::serve_http2(tls_stream, service).await
         } else {
@@ -282,12 +299,12 @@ impl ConnectionHandler {
     {
         let shared = self.shared.clone();
         let client_addr = self.client_addr;
-        let rctx = self.rctx.clone();
+        let conn = self.conn.clone();
         let service = service_fn(move |req| {
             let shared = shared.clone();
-            let rctx = rctx.clone();
+            let conn = conn.clone();
             let origin = origin.clone();
-            async move { handle_request(shared, rctx, req, origin).await }
+            async move { handle_request(shared, conn, req, origin).await }
         });
 
         http1::Builder::new()
@@ -347,6 +364,28 @@ impl ConnectionHandler {
     }
 }
 
+const PROXY_AUTH_REQUIRED_RAW: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"adblocker\"\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+
+fn proxy_auth_required() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header("proxy-authenticate", "Basic realm=\"adblocker\"")
+        .header("connection", "close")
+        .body(full_body(Bytes::new()))
+        .expect("static response")
+}
+
+/// Value of the `Proxy-Authorization` header in a raw request head.
+fn proxy_auth_value(head: &[u8]) -> Option<&[u8]> {
+    head.split(|&b| b == b'\n').skip(1).find_map(|line| {
+        let line = line.trim_ascii_end();
+        let (name, value) = line.split_at(line.iter().position(|&b| b == b':')?);
+        name.trim_ascii()
+            .eq_ignore_ascii_case(b"proxy-authorization")
+            .then(|| value[1..].trim_ascii())
+    })
+}
+
 fn plain_origin() -> Origin {
     Origin {
         scheme: "http",
@@ -358,10 +397,33 @@ fn plain_origin() -> Origin {
 /// Handle a single HTTP request (plain proxying or decrypted MITM traffic).
 async fn handle_request(
     shared: Arc<ConnectionShared>,
-    rctx: Arc<RequestCtx>,
-    req: Request<Incoming>,
+    conn: Arc<ConnCtx>,
+    mut req: Request<Incoming>,
     origin: Origin,
 ) -> Result<Response<ProxyBody>> {
+    let profiles = shared.ctx.profiles();
+    let require = shared.ctx.require_device_token();
+    // Plain proxy connections: the first request's `Proxy-Authorization` picks the device. It is
+    // never read again, and never on a decrypted (tunnelled) connection.
+    if conn.take_awaiting() {
+        let digest = req
+            .headers()
+            .get(hyper::header::PROXY_AUTHORIZATION)
+            .and_then(|v| crate::profiles::digest_from_proxy_auth(v.as_bytes()));
+        if let Some(d) = digest {
+            conn.set_token(profiles, d);
+        }
+        if require && !digest.is_some_and(|d| ConnCtx::token_known(profiles, &d)) {
+            conn.await_token();
+            return Ok(proxy_auth_required());
+        }
+    }
+    // Never forwarded upstream.
+    req.headers_mut().remove(hyper::header::PROXY_AUTHORIZATION);
+    let rctx = conn.current(profiles, require);
+    if conn.is_revoked() {
+        return Ok(proxy_auth_required());
+    }
     trace!(
         "Request from {}: {} {} {:?}",
         rctx.client_addr,
@@ -819,8 +881,55 @@ mod tests {
         });
         let addr: SocketAddr = "203.0.113.7:4242".parse().unwrap();
         let h = ConnectionHandler::new(addr, shared);
-        assert_eq!(h.rctx.client_addr, addr);
-        assert!(h.rctx.auth_user.is_none());
-        assert!(Arc::ptr_eq(&h.rctx.profile, ctx.default_profile()));
+        let rctx = h.conn.current(ctx.profiles(), false);
+        assert_eq!(rctx.client_addr, addr);
+        assert!(rctx.auth_user.is_none());
+        assert!(Arc::ptr_eq(&rctx.profile, ctx.default_profile()));
+    }
+
+    /// A header inside a tunnelled / transparent connection can never switch the profile.
+    #[tokio::test]
+    async fn header_on_a_tunnelled_connection_cannot_switch_profile() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let engine = Arc::new(filter_engine::SharedEngine::new());
+        engine.install(filter_engine::compile_engine(&["/ads/\n".to_string()]));
+        let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+        // Token "tok" maps to a profile that blocks nothing; the default (by address) blocks /ads/.
+        let open = Arc::new(filter_engine::SharedEngine::new());
+        let slot = Arc::new(filter_engine::ArcSwap::from_pointee(crate::Profile::new(
+            1, 0, open,
+        )));
+        ctx.profiles().publish(
+            crate::ProfileTable::builder(ctx.default_profile().clone())
+                .profile(1, slot)
+                .token(crate::token_digest(b"tok"), 1)
+                .build(),
+        );
+        let shared = Arc::new(ConnectionShared {
+            mitm: None,
+            enable_http2: false,
+            enable_websockets: false,
+            ctx,
+            timeouts: Timeouts::from_config(&crate::config::ProxyConfig::default().performance),
+            passthrough: Default::default(),
+            #[cfg(feature = "websockets")]
+            ws: None,
+        });
+        let h = ConnectionHandler::new("203.0.113.7:4242".parse().unwrap(), shared);
+        let (mut client, server) = tokio::io::duplex(8192);
+        let origin = Origin::plain("127.0.0.1:9".parse().unwrap());
+        let serve = tokio::spawn(async move { h.serve_http(server, origin).await });
+        let auth = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "u:tok");
+        let req = format!(
+            "GET /ads/x HTTP/1.1\r\nHost: example.test\r\nProxy-Authorization: Basic {auth}\r\nConnection: close\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        let _ = serve.await;
+        let head = String::from_utf8_lossy(&out);
+        // Blocked by the default profile (no upstream dial): the token in the header was ignored.
+        assert!(head.starts_with("HTTP/1.1 "), "{head}");
+        assert!(!head.starts_with("HTTP/1.1 502"), "went upstream: {head}");
     }
 }

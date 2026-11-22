@@ -360,7 +360,7 @@ impl PanelHost {
         let userscripts: Vec<Value> = profile
             .userscript_manager()
             .map(|m| {
-                m.get_all_in(userscript_engine::DEFAULT_PROFILE)
+                m.get_all_in(&profile.name)
                     .iter()
                     .filter(|s| {
                         userscript_engine::matcher::Rules::compile(

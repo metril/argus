@@ -39,6 +39,7 @@ impl ProxyServer {
         // Reject invalid CIDR lists at startup instead of silently ignoring entries.
         DestPolicy::from_config(&config)?;
         let client_acl = Arc::new(ClientAcl::new(&config.proxy.allowed_clients)?);
+        ctx.set_require_device_token(config.proxy.require_device_token);
         ctx.set_request_timeout(std::time::Duration::from_secs(
             config.performance.request_timeout_secs,
         ));

@@ -70,9 +70,6 @@ const JSON_ROUTES: &[&str] = &[
     "cookie",
 ];
 
-/// Name of the one profile that has userscripts today.
-pub const PROFILE: &str = userscript_engine::DEFAULT_PROFILE;
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -210,6 +207,8 @@ pub struct Caller<'a> {
     pub host: &'a str,
     /// Origin of the connection's authority in `Origin`-header form.
     pub origin: &'a str,
+    /// The requesting profile's name: the namespace of tokens, GM values and cookies.
+    pub profile: &'a str,
 }
 
 #[derive(Default)]
@@ -280,6 +279,7 @@ impl Default for GmHost {
 }
 
 struct Authed {
+    profile: String,
     idx: Arc<ScriptIndex>,
     id: String,
     origin: String,
@@ -292,7 +292,7 @@ impl Authed {
     }
     fn ctx(&self) -> ScriptCtx<'_> {
         ScriptCtx {
-            profile: PROFILE,
+            profile: &self.profile,
             script: self.script(),
             page_host: &self.page_host,
         }
@@ -511,7 +511,7 @@ impl GmHost {
         };
         let mut values = HashMap::new();
         let ctx = ScriptCtx {
-            profile: PROFILE,
+            profile: c.profile,
             script: &cs.script,
             page_host: c.host,
         };
@@ -519,7 +519,7 @@ impl GmHost {
             values.insert(cs.script.id.clone(), v);
         }
         let mut opts = BundleOptions::new(
-            PROFILE,
+            c.profile,
             &chunk.origin,
             chunk.top,
             manager.token_key(),
@@ -556,7 +556,7 @@ impl GmHost {
             manager.token_key(),
             tok,
             now_secs(),
-            PROFILE,
+            c.profile,
             c.origin,
             |_| {
                 Some(ScriptRecord {
@@ -567,6 +567,7 @@ impl GmHost {
         )
         .map_err(|e| unauth(&format!("token rejected: {e:?}")))?;
         Ok(Authed {
+            profile: c.profile.to_string(),
             idx,
             id,
             origin: c.origin.to_string(),
@@ -674,7 +675,7 @@ impl GmHost {
                 let t = token::mint(
                     manager.token_key(),
                     &TokenClaims {
-                        profile: PROFILE,
+                        profile: &a.profile,
                         script_id: &s.id,
                         script_version: s.metadata.version.as_deref().unwrap_or(""),
                         origin: &a.origin,
@@ -1128,7 +1129,7 @@ async fn run_outbound(
         }
         let jar_cookie = cur
             .use_cookie_jar
-            .then(|| manager.cookies().header_for(PROFILE, &a.id, &cur.url))
+            .then(|| manager.cookies().header_for(&a.profile, &a.id, &cur.url))
             .flatten();
         let cookie = match (jar_cookie, explicit_cookie) {
             (Some(j), Some(e)) => Some(format!("{j}; {e}")),
@@ -1191,7 +1192,7 @@ async fn run_outbound(
             if !sc.is_empty() {
                 manager
                     .cookies()
-                    .store_response(PROFILE, &a.id, &cur.url, sc.into_iter());
+                    .store_response(&a.profile, &a.id, &cur.url, sc.into_iter());
             }
         }
         let status = resp.status().as_u16();

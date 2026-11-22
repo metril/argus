@@ -426,6 +426,7 @@ impl Internal {
                         manager: m,
                         host,
                         origin,
+                        profile: &profile.name,
                     },
                     &method,
                     req.headers(),
@@ -441,6 +442,7 @@ impl Internal {
                         manager: m,
                         host,
                         origin,
+                        profile: &profile.name,
                     };
                     self.gm.handle_gm(req, &caller, up, r).await
                 }
