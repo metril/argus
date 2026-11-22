@@ -19,6 +19,7 @@ pub mod csp;
 pub mod error;
 pub mod ext;
 pub mod filtering;
+pub mod gm;
 pub mod http2;
 pub mod inject;
 pub mod internal;

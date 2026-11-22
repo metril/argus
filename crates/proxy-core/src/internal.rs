@@ -8,6 +8,8 @@
 //! |------------------------------|-----------|-----------------------------------------------------|
 //! | `/__adblock__/boot.<hash>.js`| GET, HEAD | static script, immutable cache, hash in the URL     |
 //! | `/__adblock__/s/<hash>.js`   | GET, HEAD | scriptlet bundle generated for a page, by hash      |
+//! | `/__adblock__/us/<doc>.<n>.js`| GET      | per-document userscript bundle, single use, `no-store`, see [`crate::gm`] |
+//! | `/__adblock__/gm/v1/*`       | POST, GET | userscript backend (`resource` is GET); capability token + same-origin checks, see [`crate::gm`] |
 //! | `/__adblock__/cc`            | POST      | class/id selectors; JSON only (forces a CORS preflight for foreign pages), per-page HMAC token bound to the host, page URL must be on that host, same-origin fetch metadata, 64 KiB cap |
 //!
 //! Static responses use `Cross-Origin-Resource-Policy: cross-origin` so they load under
@@ -85,6 +87,8 @@ pub struct Internal {
     key: [u8; 32],
     scriptlets: moka::sync::Cache<String, Arc<str>>,
     unsupported: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
+    /// Userscript delivery and backend state.
+    pub gm: Arc<crate::gm::GmHost>,
 }
 
 impl Default for Internal {
@@ -104,6 +108,7 @@ impl Internal {
                 .time_to_idle(Duration::from_secs(3600))
                 .build(),
             unsupported: Default::default(),
+            gm: Arc::new(crate::gm::GmHost::new()),
         }
     }
 
@@ -172,13 +177,18 @@ impl Internal {
             .collect()
     }
 
-    /// Answer an internal request. `host` is the request's normalised host name (no port).
+    /// Answer an internal request. `host` is the request's normalised host name (no port);
+    /// `origin` is the connection authority in `Origin`-header form.
     pub async fn handle(
         &self,
         req: Request<Incoming>,
         host: &str,
-        engine: &SharedEngine,
+        origin: &str,
+        rctx: &crate::request_ctx::RequestCtx,
+        up: &crate::gm::Upstream<'_>,
     ) -> Response<ProxyBody> {
+        let profile = rctx.profile.load_full();
+        let engine: &SharedEngine = &profile.engine;
         // Refused outright while ad blocking is off for the profile.
         if !engine.is_enabled() {
             return plain(StatusCode::NOT_FOUND, "no-store", "same-origin");
@@ -191,6 +201,35 @@ impl Internal {
 
         if rest == "cc" {
             return self.cc(req, host, engine).await;
+        }
+        if let Some(r) = rest.strip_prefix("us/") {
+            return match profile.userscript_manager() {
+                Some(m) => self.gm.serve_chunk(
+                    m,
+                    &crate::gm::Caller {
+                        manager: m,
+                        host,
+                        origin,
+                    },
+                    &method,
+                    req.headers(),
+                    r,
+                ),
+                None => plain(StatusCode::NOT_FOUND, "no-store", "same-origin"),
+            };
+        }
+        if let Some(r) = rest.strip_prefix("gm/v1/") {
+            return match profile.userscript_manager() {
+                Some(m) => {
+                    let caller = crate::gm::Caller {
+                        manager: m,
+                        host,
+                        origin,
+                    };
+                    self.gm.handle_gm(req, &caller, up, r).await
+                }
+                None => plain(StatusCode::NOT_FOUND, "no-store", "same-origin"),
+            };
         }
         let asset: Option<(Bytes, &'static str)> = if path == boot_path() {
             Some((Bytes::from_static(BOOT_JS.as_bytes()), "immutable"))

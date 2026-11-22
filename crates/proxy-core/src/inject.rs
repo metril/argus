@@ -127,6 +127,9 @@ pub struct PageSpec<'a> {
     /// Scripts from trusted extended rules (`#%#`, scriptlets, snippets): one hash-addressed
     /// bundle loaded after the boot script, which provides their runtime hook.
     pub ext_script: &'a str,
+    /// Per-document userscript bundle URLs (see [`crate::gm`]), one classic synchronous
+    /// `<script src>` each, after the blocker's own scripts so the page sees them first.
+    pub userscripts: &'a [String],
 }
 
 /// The markup for one page, plus what it needs from the page's CSP.
@@ -225,6 +228,13 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                 );
             }
         }
+        for src in spec.userscripts {
+            let _ = write!(
+                head.html,
+                "<script src=\"{src}\" nonce=\"{nonce}\"></script>"
+            );
+            head.has_script = true;
+        }
     }
     head
 }
@@ -258,6 +268,7 @@ mod tests {
             script_ok: true,
             observer_ok: true,
             ext_script: "",
+            userscripts: &[],
         }
     }
 

@@ -63,6 +63,31 @@ async fn main() -> Result<()> {
     .map_err(|e| Error::Config(format!("Failed to open filter list service: {e}")))?;
     list_service.start();
 
+    // Userscripts: one manager (one database, one live index) shared by the proxy's injection
+    // and GM endpoints and by the management API. The proxy only uses it when enabled.
+    #[cfg(feature = "webui")]
+    let need_manager = config.userscripts.enabled || config.webui.enabled;
+    #[cfg(not(feature = "webui"))]
+    let need_manager = config.userscripts.enabled;
+    let userscript_manager = if need_manager {
+        let m = Arc::new(
+            userscript_engine::UserscriptManager::new(config.adblock.data_dir.clone()).map_err(
+                |e| Error::Config(format!("Failed to initialize userscript manager: {e}")),
+            )?,
+        );
+        if let Err(e) = m.load_all() {
+            tracing::warn!("Failed to load userscripts: {e}");
+        }
+        Some(m)
+    } else {
+        None
+    };
+    if config.userscripts.enabled {
+        ctx.set_userscripts(userscript_manager.clone());
+    } else {
+        info!("Userscripts disabled: scripts are managed but never injected");
+    }
+
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
     let webui_handle = if config.webui.enabled {
@@ -73,6 +98,9 @@ async fn main() -> Result<()> {
                 shared_engine.clone(),
                 list_service,
                 ctx.request_timeout_handle(),
+                userscript_manager
+                    .clone()
+                    .expect("manager exists when the web UI is enabled"),
             )
             .await?,
         )
@@ -112,9 +140,9 @@ async fn start_webui_server(
     shared_engine: Arc<SharedEngine>,
     list_service: Arc<ListService>,
     request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    userscript_manager: Arc<userscript_engine::UserscriptManager>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    use tracing::warn;
-    use userscript_engine::{UserscriptManager, UserscriptRuntime};
+    use userscript_engine::UserscriptRuntime;
     use web_api::{build_state, start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
@@ -122,27 +150,6 @@ async fn start_webui_server(
     // One database file per process: users, sessions, tokens, audit and userscripts share
     // `<adblock.data_dir>/adblocker.redb` with the filter lists.
     let data_dir = config.adblock.data_dir.clone();
-
-    // Initialize userscript manager
-    let userscript_manager = if config.userscripts.enabled {
-        info!(
-            "Initializing userscript manager with data dir: {:?}",
-            data_dir
-        );
-        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
-            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-        })?)
-    } else {
-        info!("Userscripts disabled, using empty userscript manager");
-        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
-            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-        })?)
-    };
-
-    // Load existing userscripts
-    if let Err(e) = userscript_manager.load_all() {
-        warn!("Failed to load userscripts: {}", e);
-    }
 
     // Create userscript runtime
     let storage = userscript_manager.storage_arc();

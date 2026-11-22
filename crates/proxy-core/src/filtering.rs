@@ -15,7 +15,7 @@ use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody
 use crate::internal::Internal;
 use crate::policy::{is_refusal, DestPolicy};
 use crate::redirect::{block_response, redirect_response, rewrite_redirect};
-use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
+use crate::request_ctx::{default_profile_slot, Profile, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url, RequestType};
 use crate::rewrite::codec::{choose_encoding, response_codings};
 use crate::rewrite::pipeline::{transform_html, transform_text, Outcome};
@@ -82,6 +82,17 @@ pub fn refused_response() -> Response<ProxyBody> {
         .expect("static response")
 }
 
+/// `Origin`-header form of an authority: scheme, host, and the port unless it is the default.
+fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
+    let scheme = if scheme == "http" { "http" } else { "https" };
+    let default = if scheme == "http" { 80 } else { 443 };
+    if port == default {
+        format!("{scheme}://{url_host}")
+    } else {
+        format!("{scheme}://{url_host}:{port}")
+    }
+}
+
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
 pub struct ProxyContext {
     engine: Arc<SharedEngine>,
@@ -126,6 +137,21 @@ impl ProxyContext {
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Attach (or detach) the userscripts of the default profile. Live: connections hold the
+    /// profile slot, so the next request sees them.
+    pub fn set_userscripts(&self, manager: Option<Arc<userscript_engine::UserscriptManager>>) {
+        let slot = &self.default_ctx.profile;
+        let cur = slot.load_full();
+        slot.store(Arc::new(
+            Profile::new(cur.id, cur.generation, cur.engine.clone()).with_userscripts(manager),
+        ));
+    }
+
+    /// Documents currently holding unfetched userscript bundle URLs (bounded; for tests/metrics).
+    pub fn userscript_docs(&self) -> usize {
+        self.internal.gm.docs.len()
     }
 
     /// Scriptlet names that pages reported as unsupported (no uBO equivalent), with report counts.
@@ -299,8 +325,14 @@ impl ProxyContext {
         // Internal endpoints are answered locally for every host: never filtered, never
         // forwarded.
         if uri.path().starts_with(csp::INTERNAL_PREFIX) {
-            let engine = rctx.profile.load().engine.clone();
-            return Ok(self.internal.handle(req, &host, &engine).await);
+            let origin = origin_of(scheme, &url_host, port);
+            let up = crate::gm::Upstream {
+                client: &self.client,
+                strict_client: &self.strict_client,
+                policy: &self.policy,
+                resolve_all_to: self.resolve_all_to,
+            };
+            return Ok(self.internal.handle(req, &host, &origin, rctx, &up).await);
         }
 
         // Take the request apart: the header map is moved, not copied, from here on.
@@ -591,7 +623,24 @@ impl ProxyContext {
                     );
                 }
                 let ext_script = transforms.scripts.join(";\n");
+                // Userscripts: matched against the profile's index (one atomic load and an
+                // emptiness check when there are none); nothing at all under `sandbox`.
+                let us = if blocks_scripts {
+                    None
+                } else {
+                    rctx.profile.load().userscript_manager().and_then(|m| {
+                        self.internal.gm.plan_document(
+                            m,
+                            &host,
+                            &url,
+                            &origin_of(scheme, &url_host, port),
+                            rtype != RequestType::Subdocument,
+                        )
+                    })
+                };
+                let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
                 let head = build_head(&PageSpec {
+                    userscripts: us_srcs,
                     ext_script: &ext_script,
                     cosmetics: &cos,
                     internal: &self.internal,
@@ -602,10 +651,10 @@ impl ProxyContext {
                 });
                 let needs = csp::Needs {
                     script: head.has_script,
-                    style: head.has_style,
-                    connect: head.observer,
+                    style: head.has_style || us.as_ref().is_some_and(|p| p.style),
+                    connect: head.observer || us.as_ref().is_some_and(|p| p.connect),
                 };
-                let meta_csp: Option<crate::rewrite::MetaCsp> = if head.observer {
+                let meta_csp: Option<crate::rewrite::MetaCsp> = if needs.connect {
                     let (origin, nonce) = (origin.clone(), nonce.clone());
                     Some(Arc::new(move |c: &str| {
                         let a = csp::adapt(
