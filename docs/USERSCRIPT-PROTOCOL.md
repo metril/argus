@@ -38,12 +38,12 @@ intercepts (the page's origin is the proxied host, so requests are same-origin).
    bundle's nonce to elements they create. Trusted Types: not handled by the runtime; if the
    page enforces it, the proxy must allow the policy it creates for `boot.js`, or skip userscripts.
 5. One syntax error in any script makes the whole bundle fail to parse. Call `generate` once
-   per script and inject several bundles if isolation matters more than size (the 40 KB runtime
-   is then repeated; keep the file cacheable per script).
+   per script and inject several bundles if isolation matters more than size (with
+   the shared runtime of 2.1 the 40 KB runtime is not repeated).
 6. The runtime removes its own `<script>` element from the DOM at startup and again removes
    any element it injected (`@unwrap`) after execution.
 
-Bundle layout: `(<gm.js>)({base, top, handler, handlerVersion}, [{d: descriptor, f: fn}, ...], window);`
+Bundle layout: the runtime (`<gm.js>`, installed once, see 2.1) is called as `run({base, top, handler, handlerVersion}, [{d: descriptor, f: fn}, ...], window, shared)`.
 Descriptor `d`: `id, name, runAt, grants (canonical, lowercase), params, token, meta, metaStr,
 unwrap, values?, resources?, code?`. `f` is `function(GM_info, GM, <granted GM_*>, unsafeWindow)`
 wrapping `@require`s + source in one scope (`this === window`; async function with
@@ -54,10 +54,19 @@ nonce'd inline `<script>`.
 ### 2.1 As implemented in `proxy-core` (`src/gm.rs`)
 
 * **One file per script**, as 2.5 suggests: `/__adblock__/us/<doc>.<n>.js`, `n` in injection order
-  (run-at group, then install order). The shared 40 KB runtime is repeated in each file (a syntax
-  error in one script must not break another; there is no safe way to share one runtime instance
-  between separate `<script>` files without a global). Consequence: with several scripts on one
-  page only the first runtime instance registers the menu-command registry.
+  (run-at group, then install order); a syntax error in one script cannot break another.
+* **The runtime is served once**, from a shared, content-hashed, immutable URL
+  (`/__adblock__/gm.<hash>.js`, `Cache-Control: immutable`, no secret in it): one nonce'd
+  `<script src>` placed before the first bundle. It installs the runtime function, the command
+  registry shared by every script of the document, and one non-writable, non-configurable entry
+  point under `Symbol.for("adblock.userscript.runtime")`. Each bundle is then only
+  `(function(r){if(r)r(cfg,[entries]);})(window[Symbol.for("adblock.userscript.runtime")]);`
+  (`BundleOptions::shared_runtime`; without it the bundle starts with the same installer, and a
+  later bundle reuses the first install). Secrecy is unchanged: capability tokens, stored values
+  and `@resource` bodies still arrive only in the per-document, single-use `no-store` bundle
+  responses. A hostile page that finds the entry point can call it, but with entries of its own
+  and no token it has no GM authority; it can at most add fake menu commands. Consequence:
+  `GM_registerMenuCommand` registers for every script on the page, not just the first.
 * The page's `<head>` carries only the `<script src>` tags: no token, no config. The bundle is
   generated when the URL is fetched (stored values read then), served once (`404` afterwards),
   bound to the document's host, and expires 60 s after the document was served. Per-document
@@ -229,4 +238,8 @@ Unsupported (reported at install): `@run-at context-menu`, `@webRequest`/`GM_web
 
 Menu commands are exposed to an in-page panel through `window[Symbol.for("adblock.userscript.menu")]`:
 a frozen, non-enumerable object `{commands(): [{script, scriptName, id, caption, accessKey}],
-invoke(scriptId, id): boolean, subscribe(callback)}`. The panel task consumes it.
+invoke(scriptId, id): boolean, subscribe(callback)}`. It is created once per document by the shared
+runtime script and holds the commands of every script; callbacks are never exposed, only invoked.
+The in-page panel (`docs/SCRIPT-POLICY.md`) lists and fires them. Like everything in the page's
+JavaScript world it is reachable by the page: a hostile page can list the commands (script names
+and captions) and invoke them, which runs code the script already chose to run on a user action.

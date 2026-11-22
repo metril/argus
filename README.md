@@ -898,6 +898,39 @@ auto_apply_updates = false     # apply only updates that do not widen grants/@ma
 Stored scripts from before the rewrite (`resources` map format) cannot be read; they are dropped
 with a log line when the database is loaded.
 
+## Script control
+
+NoScript-style control of what a page may run and load, per site, enforced by the proxy. It is
+**off until you switch it on** (`PUT /api/v1/policy/settings`, or the dashboard's "Script policy" page).
+Full model, tables and limits: [docs/SCRIPT-POLICY.md](docs/SCRIPT-POLICY.md).
+
+- **How it works.** A generated `Content-Security-Policy` is added to each HTML document as an extra
+  header (browsers intersect it with the site's own, so it can only restrict). The proxy also rewrites
+  the HTML where CSP cannot express the intent (`<noscript>` revealed, optional stripping of blocked
+  `<script>` elements, meta refresh, `ping`), and refuses denied third-party subresources early when
+  it knows which page asked. Our own injected resources keep working under any policy.
+- **Presets.** `default` (first party everything; third-party scripts, plugins, workers and pings
+  blocked), `trusted` (nothing added), `untrusted` (no scripts at all, `<noscript>` shown) and
+  `custom`. Per-site rules, a per-page source matrix ("allow `cdn.example.net` on `example.com`") and
+  temporary permissions (5 minutes, 1 hour, 1 day, until restart) are in the dashboard and API.
+- **Userscripts** run regardless of page restrictions (as in every userscript manager); what a script
+  creates (inline handlers, `eval`) still obeys the page policy.
+- **The panel.** `PUT /api/v1/policy/panel {"enabled": true, "pin": "..."}`, then press
+  **Alt+Shift+A** on any page (configurable). A read-only panel opens in a closed shadow root: preset,
+  blocked sources by domain with per-capability toggles, temporary allows, per-site ad blocking,
+  userscripts and their menu commands. It cannot change anything itself: **changes are confirmed on a
+  page only the proxy answers** (`https://adblock.invalid/`), with your PIN, because a hostile page
+  can do anything the panel can. Authentication is `pin` (default), `session` (use the dashboard) or
+  `none` (trusted LAN only). In transparent mode that name does not resolve unless your DNS points it
+  at the gateway; use the dashboard instead. Threat model and residual risks:
+  [docs/SCRIPT-POLICY.md](docs/SCRIPT-POLICY.md#the-in-page-panel).
+- **What CSP cannot do.** Deny carve-outs ("all third parties except `ads.net`") and per-URL allows
+  cannot be written in CSP; `sendBeacon` cannot be separated from `connect`; service-worker and cached
+  pages keep the policy they were stored with; only HTML documents get the header. See the list in
+  [docs/SCRIPT-POLICY.md](docs/SCRIPT-POLICY.md#what-csp-cannot-express).
+- **Config.** `[script_control]` in `config/default.toml`: `panel_enabled` (global switch),
+  `panel_host` (must end in `.invalid`), `dashboard_url`.
+
 ## Security and Sandboxing (Week 16)
 
 The userscript engine includes comprehensive security hardening to protect against malicious scripts and prevent security vulnerabilities.

@@ -163,3 +163,25 @@ Config (`[userscripts]`): `update_check_interval_hours` (0 = off, default) sched
 script with an update URL; `auto_apply_updates` (default false) applies found updates only when they
 do not widen `@match`/`@connect`/`@grant`. Installing from a `.user.js` URL is `POST /userscripts/plan`
 with `url`; there is no proxy interception.
+
+## Script policy and the in-page panel
+
+Routes under `/api/v1/policy` (scopes `policy:read` / `policy:write`); see `docs/SCRIPT-POLICY.md`
+for the model. All act on the default profile and writes are audited.
+
+| Method and path | Scope | Purpose |
+|---|---|---|
+| `GET`, `PUT /policy/settings` | read / write | Master switch (off by default), global preset, default profile, strip mode, network hints. |
+| `GET`, `POST /policy/site-rules`, `PUT`, `DELETE /policy/site-rules/{id}` | read / write | Per-site presets. |
+| `GET`, `POST /policy/source-rules`, `PUT`, `DELETE /policy/source-rules/{id}` | read / write | Per-page source allow/deny rules (the matrix). |
+| `GET`, `POST`, `DELETE /policy/temp`, `DELETE /policy/temp/{id}` | read / write | Temporary grants (TTL, until restart, optionally persisted). |
+| `GET /policy/explain?url=`, `POST /policy/preview` | read | The CSP, HTML actions and hints for a URL; before/after for a proposed change. |
+| `GET /policy/export`, `POST /policy/import` | read / write | JSON document; temporary grants are not exported. |
+| `GET /policy/reports?site=` | read | Blocked sources per page for one-click allow, fed by the proxy's blocks and the browsers' violation reports of the policy the proxy added. |
+| `GET`, `PUT /policy/panel` | read / write | In-page panel: `enabled` (per profile, off by default), `hotkey` (default `Alt+Shift+A`; modifiers plus one key, with Alt, Ctrl or Meta), `auth` (`pin` default, `session`, `none`), `pin` (4 to 64 characters; write-only, `pin_set` says whether one is set), `clear_pin`. Returns `reserved_host`. |
+| `GET /rules/site-exceptions` | `rules:read` | Sites with ad blocking switched off. |
+| `PUT`, `DELETE /rules/site-exceptions/{site}` | `rules:write` | Switch ad blocking off or on for a site (a host name, lowercase punycode). Stored as custom rules (`@@$domain=site` plus the sentinel `\|\|adblock.invalid^`), so they appear in `GET /rules/custom`. |
+
+Deployment settings are in `[script_control]` (`panel_enabled`, `panel_host`, `dashboard_url`). The
+panel's own endpoints (`/__adblock__/panel/state`, `/__adblock__/pv`, and the reserved host) are
+proxy-internal and are not part of this API.

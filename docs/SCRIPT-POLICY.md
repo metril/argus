@@ -183,8 +183,7 @@ It can also be wrong: requests made by a worker carry the worker script's URL as
 item is (capability, source host) with count, first/last seen, a sample URL without query, and a suggested one-click
 allow (a host-level source rule; none for inline/eval/data/blob). Report-only violations are ignored.
 Violations from the site's own policy cannot be told apart by the event alone: the wiring should forward only those
-whose `originalPolicy` equals the header the proxy added. `GET /policy/reports` reads it; it is empty until the
-proxy records into `PolicyStore::record_block` / `record_violation`.
+whose `originalPolicy` equals the header the proxy added (see below). `GET /policy/reports` reads it, per profile.
 
 ## Storage, API, import/export
 
@@ -203,13 +202,124 @@ Routes (all under `/api/v1/policy`): `settings` (GET/PUT), `site-rules` (GET/POS
 `temp/{id}` (DELETE), `explain` (GET `?url=`), `preview` (POST a proposed change, returns before/after CSP),
 `export` (GET), `import` (POST), `reports` (GET).
 
-## What the proxy wiring must provide
+## How the proxy wires it
 
-- A shared `Arc<PolicyStore>` (or its `snapshot("default")`), refreshed per document; call `decide` once per HTML
-  response and cache the rendered header and `HtmlActions` by `cache_key()`.
-- The proxy's nonce and resource path for `ProxyInject`, per document.
-- The final request URL (scheme, normalised host, port) of each HTML response.
-- Per subresource request: `Sec-Fetch-Dest`, `Sec-Fetch-Site`, `Referer`, `Origin`, `Ping-To`, and the request
-  target; on a block, record `PolicyStore::record_block` and return the typed block response.
-- Forwarding of `securitypolicyviolation` events from the in-page code to `record_violation`.
-- The lol_html stage applying `HtmlActions` (selectors are lol_html syntax; `i` flags need lol_html support).
+`crates/proxy-core/src/scriptctl.rs` owns it; the pure crate stays free of I/O.
+
+- **Snapshot.** Each `Profile` carries `Option<Arc<ScriptControl>>`: a lock-free current
+  `CompiledPolicy`, rebuilt on the writer's thread after every edit (the store's change hook) and by a
+  task that sleeps until `valid_until()` (temporary grants), never by polling. With the master switch
+  off every entry point is one relaxed atomic load and nothing else (asserted by tests: the `decide`
+  counter stays at zero).
+- **Documents.** One `decide` per HTML response, cached per `(generation, scheme, host, port)` in a
+  bounded cache. The CSP text is cached with markers for the per-document nonce and report token. It
+  is added as a **separate** `Content-Security-Policy` header, after the extended-rule header edits (a
+  `$removeheader` rule cannot strip it), never merged into the site's own. `Permissions-Policy` is
+  merged with the site's own header by the restrictive merge of the extended rules (never widening).
+  `no-transform` pages still get the headers (header-only work). The proxy's own resources stay
+  working under the generated policy by construction: its tags carry the per-document nonce, and
+  `ProxyInject` adds the nonce and the `/__adblock__/` path where `'self'` is not already allowed.
+- **Ports.** Rules carry no port, so the proxy widens every host source to any port
+  (`cdn.example.net:*`); CSP would otherwise match the default port only.
+- **HTML actions** run in the same streaming `lol_html` stage as the rest (bounded memory):
+  `<noscript>` unwrapping when scripts are blocked, optional strip mode (blocked `<script src>`,
+  `preload as=script` and `modulepreload` for blocked sources, executable inline blocks when inline is
+  denied), meta refresh and `ping` as in the table above. The proxy's own elements are inserted by
+  the stage itself and are never subject to these rules.
+- **Network hints** run on the request path after the ad-block verdict: `sec-fetch-dest` selects the
+  capability, `PageContext::from_headers` the page; unknown context means no decision. Denied
+  requests get the typed block response with `x-adblock: policy`, and are recorded with
+  `PolicyStore::record_block`. No allocation on the allow path.
+- **Reports** are per profile. Browser violations arrive through the CSP's own `report-uri
+  /__adblock__/pv?d=<token>` (no script in the page is involved, and it can only ever carry
+  violations of *our* header). `POST /__adblock__/pv` accepts a report only if the per-document token
+  is ours for that host, the report names that host, and its `original-policy` equals the header we
+  generated (nonce and token normalised). The site's own policy is acknowledged (204) and dropped.
+  Limits: 8 KiB, 64 reports per document, `application/csp-report`/`json`/`reports+json`, not
+  `cross-site`.
+- **Per-site ad blocking off** is stored as custom rules: `@@$domain=example.com` (requests) plus the
+  sentinel `||adblock.invalid^` that `SharedEngine::site_off` probes to leave cosmetics, scriptlets and
+  extended rules out of that site's documents. The API edits the same lines
+  (`/rules/site-exceptions`).
+
+### Userscripts and script policy
+
+Userscript managers run their scripts regardless of page restrictions (a NoScript-restricted page
+still runs Tampermonkey); this proxy does the same. Our bundles and the shared runtime are covered by
+the proxy nonce and path, so they run under `Untrusted`, and their GM requests are covered by the
+`/__adblock__/` connect allowance. What the policy still governs is whatever a script *creates*: an
+inline event handler, a `<script>` it injects without our nonce, `eval` or `new Function` it calls.
+Those are page-world operations and obey the page policy. `@unwrap` scripts (nonce'd inline code) run.
+
+## The in-page panel
+
+A proxy has no toolbar button, so the control surface is a hotkey, **Alt+Shift+A** by default (not a
+default shortcut of Chrome, Firefox or Edge on any platform; Alt alone or Ctrl+Shift+A would collide
+with menus, the add-ons manager or tab search). It is configurable (`PUT /policy/panel`), per profile,
+off by default, and `script_control.panel_enabled = false` removes it everywhere. Only `boot.js`
+carries a key listener (about 290 bytes); the panel script (`/__adblock__/panel.<hash>.js`,
+immutable) is fetched on the first keypress. Nothing is visible before that. Only trusted
+(`isTrusted`) key events open it.
+
+The panel renders in a closed Shadow DOM under `all: initial`, at the top z-index, with focus trap,
+`Esc`, ARIA roles, `prefers-color-scheme` colours and a phone-width layout, with no `innerHTML`, no
+inline handlers and no `eval` (so it works under strict CSP and Trusted Types). It shows the site's
+preset, the sources blocked on the page by registrable domain with a toggle per capability, a TTL
+choice for temporary allows, "allow all temporarily", "revoke temporary permissions", the count of
+blocked requests, per-site ad blocking, the userscripts matching the page (with their menu commands)
+and a "reload to apply" prompt when the settings change.
+
+### Authority: why the panel cannot change anything
+
+The panel runs in the page's JavaScript world. A hostile page can synthesise keys (untrusted events
+are ignored, but it can load the same script), find our element (a closed root has no
+`shadowRoot`, yet the page can hook `attachShadow` before us), and call any endpoint the panel calls.
+So **nothing the page's world can do authorises a change**:
+
+1. The panel is read-only. A change is a *proposal* encoded in a link to the reserved host
+   (`https://adblock.invalid/confirm?p=…`, `rel=noopener`).
+2. That host is answered by the proxy alone and is a top-level page the site cannot script: no
+   JavaScript at all, `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `Cross-Origin-Opener-Policy:
+   same-origin`, and a request with a `Sec-Fetch-Dest` other than `document` is refused (framing and
+   `fetch` get 403). The user reads the changes in plain words before anything happens.
+3. `POST /apply` needs a same-origin, user-activated form post (`Sec-Fetch-Site: same-origin`,
+   `Sec-Fetch-User: ?1`, `Origin` equal to the reserved origin), an HMAC nonce bound to this profile
+   and exactly this proposal (ten minutes), and, by default, the profile's PIN, with a lockout after 5
+   wrong tries (30 s doubling to 15 min). Every operation is validated again server-side.
+4. `panel.auth` is `pin` (default), `session` (the panel never writes, it links to the dashboard,
+   where the logged-in session decides) or `none` (a click on the confirmation page; trusted LAN
+   only). With `pin` and no PIN set, changes are refused until one is set in the dashboard.
+
+**Why not an in-page cross-origin iframe?** It would keep the interactive UI out of the page's reach,
+but the page controls the iframe's element and its ancestors (opacity, overlays, `pointer-events`), so
+a click could be tricked (clickjacking); the site's `frame-src` and our own policy would also have to
+allow it, and Intersection Observer v2 visibility checks exist in Chromium only. A top-level page
+cannot be overlaid by the site at all.
+
+**Reserved host.** `adblock.invalid` (`script_control.panel_host`; it must end in `.invalid`, which
+no real site can claim and which never resolves on the internet). *Explicit proxy:* the browser sends
+`CONNECT adblock.invalid:443` (or an absolute-form HTTP request) to the proxy, which intercepts it
+like any host: a certificate from the proxy CA, then answered locally. It is never forwarded
+upstream, never filtered or rewritten, in both modes (checked in tests). *Transparent mode:* the name
+resolves only if the client's DNS points it at the gateway, which is not the default; there, use the
+dashboard origin instead (`panel.auth = session`, or edit in the dashboard directly): the panel's
+"Open dashboard" link (`script_control.dashboard_url`, derived from `[webui]` when it is a specific
+address) is the alternative.
+
+**Residual risks, honestly.** (a) A hostile page can read everything the panel reads: the preset
+name, which sources were blocked (it can see its own failed loads anyway), blocked counts, the
+userscripts that match the page and their menu captions (these last three it could not otherwise
+learn), and it can invoke menu commands. (b) It can open the confirmation page with a proposal of its
+choosing (a popup or navigation); a user who then reads nothing and types the PIN applies it. The page
+shows the change in plain words and says to continue only when the user started it. (c) A page can
+spam proposals; they do nothing until confirmed. (d) With `auth = none`, a user clicking through a
+page-opened confirmation page applies it: do not use `none` outside a trusted network. (e) The PIN
+is hashed with a salted SHA-256 and protected by lockout, not by a slow KDF; a stolen database
+allows offline guessing of a short PIN. (f) Anyone using the proxy from the same profile can open
+the confirmation page: the profile is the trust boundary, and `session` mode removes writes from it.
+
+## More limits from the wiring
+
+A violation is reported only if the browser sends the `report-uri` request (a user agent may drop
+it); a page served from a service-worker or HTTP cache keeps the policy it was stored with; and the
+panel is not injected into a `sandbox`ed document without `allow-scripts`.

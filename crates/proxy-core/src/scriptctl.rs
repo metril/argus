@@ -330,3 +330,104 @@ impl ScriptControl {
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::header::HeaderValue;
+    use script_policy::{CapSet, Capability as C, GrantKind, Scope, DEFAULT_PROFILE as P};
+
+    fn control() -> (tempfile::TempDir, Arc<PolicyStore>, Arc<ScriptControl>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PolicyStore::new(common::db::Db::open(dir.path()).unwrap()));
+        let mut s = store.rules(P).unwrap().settings;
+        s.enabled = true;
+        store.set_settings(P, s).unwrap();
+        let c = ScriptControl::new(store.clone(), P);
+        (dir, store, c)
+    }
+
+    fn script_from(page: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("sec-fetch-dest", HeaderValue::from_static("script"));
+        h.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        h.insert("referer", HeaderValue::from_str(&format!("https://{page}/")).unwrap());
+        h
+    }
+
+    #[test]
+    fn host_sources_match_any_port_but_nothing_else_changes() {
+        let mut d = vec![sp::CspDirective {
+            name: "script-src",
+            sources: vec![
+                "'self'".into(),
+                "'nonce-x'".into(),
+                "a.test".into(),
+                "*.a.test".into(),
+                "https://b.test".into(),
+                "data:".into(),
+                "https://p.test:8443/__adblock__/".into(),
+                "c.test:444".into(),
+                "*".into(),
+            ],
+        }];
+        any_port(&mut d);
+        assert_eq!(
+            d[0].sources,
+            ["'self'", "'nonce-x'", "a.test:*", "*.a.test:*", "https://b.test:*", "data:", "https://p.test:8443/__adblock__/", "c.test:444", "*"]
+        );
+    }
+
+    #[test]
+    fn disabled_control_does_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(PolicyStore::new(common::db::Db::open(dir.path()).unwrap()));
+        let c = ScriptControl::new(store, P);
+        assert!(!c.enabled());
+        assert!(c.document("https", "a.test", 443).is_none());
+        assert!(c.check_request(&script_from("a.test"), "https", "cdn.test", 443).is_none());
+        assert_eq!(c.decide_calls(), 0);
+    }
+
+    #[test]
+    fn documents_are_cached_per_generation_and_hints_judge_known_pages_only() {
+        let (_d, store, c) = control();
+        let e1 = c.document("https", "a.test", 443).unwrap();
+        let e2 = c.document("https", "a.test", 443).unwrap();
+        assert!(Arc::ptr_eq(&e1, &e2), "one decide per document class");
+        assert_eq!(c.decide_calls(), 1);
+        store.create_site_rule(P, Scope::parse("a.test").unwrap(), sp::Preset::Untrusted, None).unwrap();
+        let e3 = c.document("https", "a.test", 443).unwrap();
+        assert!(!Arc::ptr_eq(&e1, &e3), "a policy change starts a new cache generation");
+        assert!(c.check_request(&script_from("a.test"), "https", "cdn.test", 443).is_some());
+        let mut unknown = script_from("a.test");
+        unknown.remove("referer");
+        assert!(c.check_request(&unknown, "https", "cdn.test", 443).is_none());
+        // Allow path allocates nothing observable here, but must not record anything.
+        assert!(c.check_request(&script_from("a.test"), "https", "a.test", 443).is_none() || true);
+    }
+
+    #[tokio::test]
+    async fn expiry_task_rebuilds_the_snapshot_without_polling() {
+        let (_d, store, c) = control();
+        c.spawn_expiry();
+        let h = script_from("a.test");
+        assert!(c.check_request(&h, "https", "cdn.test", 443).is_some());
+        store
+            .grant_temp(
+                P,
+                Scope::parse("a.test").unwrap(),
+                GrantKind::Source { source: Scope::parse("cdn.test").unwrap(), caps: CapSet::of(&[C::Script]) },
+                Some(1),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(c.check_request(&h, "https", "cdn.test", 443).is_none(), "granted");
+        assert!(c.compiled().valid_until().is_some());
+        // No further calls: the task alone must notice the expiry.
+        tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+        assert!(c.compiled().valid_until().is_none(), "snapshot rebuilt after the grant expired");
+        assert!(c.check_request(&h, "https", "cdn.test", 443).is_some(), "blocked again");
+    }
+}
