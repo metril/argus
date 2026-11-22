@@ -103,6 +103,22 @@ pub fn encrypt_ca_key_with_config(
     Ok(output)
 }
 
+/// Describe an age decryption error without using its `Display` impl, which loads
+/// localisation assets at runtime and can panic when they are unavailable.
+fn describe_decrypt_error(e: &age::DecryptError) -> &'static str {
+    use age::DecryptError as D;
+    match e {
+        D::DecryptionFailed | D::KeyDecryptionFailed | D::NoMatchingKeys | D::InvalidMac => {
+            "wrong passphrase or corrupted data"
+        }
+        D::ExcessiveWork { .. } => "passphrase work factor is too high",
+        D::InvalidHeader | D::UnknownFormat => "invalid or unsupported encrypted key format",
+        D::Io(_) => "I/O error while reading the encrypted key",
+        #[allow(unreachable_patterns)]
+        _ => "unsupported encrypted key",
+    }
+}
+
 /// Decrypt a CA private key with a passphrase
 ///
 /// # Arguments
@@ -135,13 +151,19 @@ pub fn decrypt_ca_key_with_config(
     let identity = age::scrypt::Identity::new(SecretString::from(passphrase.to_string()));
 
     // Decrypt
-    let decryptor = age::Decryptor::new(encrypted)
-        .map_err(|e| Error::Certificate(format!("Failed to create decryptor: {}", e)))?;
+    let decryptor = age::Decryptor::new(encrypted).map_err(|e| {
+        Error::Certificate(format!(
+            "Failed to create decryptor: {}",
+            describe_decrypt_error(&e)
+        ))
+    })?;
 
     let mut decrypted = Vec::new();
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
-        .map_err(|e| Error::Certificate(format!("Failed to decrypt: {}", e)))?;
+        .map_err(|e| {
+            Error::Certificate(format!("Failed to decrypt: {}", describe_decrypt_error(&e)))
+        })?;
 
     reader
         .read_to_end(&mut decrypted)
@@ -263,7 +285,8 @@ mod tests {
 
         let result = decrypt_ca_key(&encrypted, "WrongPassphrase!!");
 
-        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("wrong passphrase"), "{msg}");
     }
 
     #[test]

@@ -67,6 +67,10 @@ api-types = { workspace = true, features = ["server"] }
 # OpenAPI documentation
 utoipa = { version = "5.3", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+# rust-embed reads assets from disk in debug builds, at the path they had when compiled. That path
+# is gone when a prebuilt test archive runs elsewhere, so embed them instead (feature unification
+# applies this to every crate using rust-embed, e.g. age and utoipa-swagger-ui).
+rust-embed = { version = "8", features = ["debug-embed"] }
 utoipa-axum = "0.2"
 
 # Token digests, CSRF tags, ETags

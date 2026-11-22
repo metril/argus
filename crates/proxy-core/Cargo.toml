@@ -83,6 +83,10 @@ time = { workspace = true }
 age = { workspace = true }
 secrecy = { workspace = true }
 rand = "0.8"
+# rust-embed reads assets from disk in debug builds, at the path they had when compiled. That path
+# is gone when a prebuilt test archive runs elsewhere, so embed them instead (feature unification
+# applies this to every crate using rust-embed, e.g. age and utoipa-swagger-ui).
+rust-embed = { version = "8", features = ["debug-embed"] }
 
 # Common utilities
 common = { path = "../common" }
