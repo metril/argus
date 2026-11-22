@@ -57,6 +57,7 @@ fn test_custom_config() {
             enable_http2: false,
             enable_http3: true,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: false,

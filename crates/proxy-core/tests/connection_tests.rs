@@ -26,6 +26,7 @@ async fn test_server_with_mitm_enabled() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: true,
@@ -77,6 +78,7 @@ async fn test_server_with_mitm_disabled() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -120,6 +122,7 @@ async fn test_certificate_generation() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: true,
@@ -194,6 +197,7 @@ async fn test_load_manager_integration() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: false,

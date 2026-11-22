@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use filter_engine::SharedEngine;
 use proxy_core::{
-    config::ProxyConfig, filtering::ProxyContext, server::ProxyServer, Error, Result,
+    config::ProxyConfig,
+    filtering::ProxyContext,
+    server::ProxyServer,
+    upstream::{build_upstream_client, UpstreamOptions},
+    Result,
 };
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -34,12 +38,8 @@ async fn main() -> Result<()> {
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
 
-    // One pooled upstream client for forwarding proxied requests. Redirects are passed through to
-    // the client (the proxy must not follow them itself).
-    let proxy_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))?;
+    // One pooled upstream client for forwarding proxied requests (no redirect following).
+    let proxy_client = build_upstream_client(&UpstreamOptions::from_config(&config))?;
 
     let ctx = Arc::new(ProxyContext::new(
         shared_engine.clone(),
@@ -88,6 +88,7 @@ async fn start_webui_server(
     config_path: String,
     shared_engine: Arc<SharedEngine>,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    use proxy_core::Error;
     use tracing::warn;
     use userscript_engine::{UserscriptManager, UserscriptRuntime};
     use web_api::{

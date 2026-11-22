@@ -23,6 +23,10 @@ pub struct ProxySettings {
     pub enable_http2: bool,
     pub enable_http3: bool,
     pub enable_websockets: bool,
+    /// Extra PEM root CA files trusted when connecting to upstream servers (in addition to the
+    /// built-in web roots), e.g. a private/corporate CA.
+    #[serde(default)]
+    pub extra_upstream_ca_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +134,7 @@ impl Default for ProxyConfig {
                 enable_http2: true,
                 enable_http3: false,
                 enable_websockets: true,
+                extra_upstream_ca_paths: Vec::new(),
             },
             mitm: MitmSettings {
                 enabled: true,

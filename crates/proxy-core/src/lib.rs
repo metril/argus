@@ -23,6 +23,7 @@ pub mod memory_monitor;
 pub mod mitm;
 pub mod server;
 pub mod tls;
+pub mod upstream;
 #[cfg(feature = "websockets")]
 pub mod websocket;
 
