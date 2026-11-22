@@ -20,7 +20,7 @@ pub mod shared;
 pub mod stats;
 
 pub use arc_swap::{self, ArcSwap};
-pub use bundled::{BUNDLED_RESOURCES_COMMIT, BUNDLED_RESOURCES_JSON};
+pub use bundled::{BUNDLED_AVAILABLE, BUNDLED_RESOURCES_COMMIT, BUNDLED_RESOURCES_JSON};
 pub use compile::{compile_lists, Compiled, ListCompileStats};
 pub use error::{Error, Result};
 pub use formats::{

@@ -368,6 +368,7 @@ async fn include_directive_is_fetched_from_the_same_origin_only() {
     assert!(blocked(&engine2, "http://included.test/x"));
 }
 
+#[cfg(feature = "bundled-ubo-resources")]
 #[tokio::test]
 async fn bundled_scriptlets_work_with_no_network() {
     let f = Arc::new(Files::default());
@@ -409,7 +410,7 @@ async fn resources_fetch_a_fixed_file_list_and_replace_the_bundled_copy() {
         c.scriptlet_resources_url = format!("http://{addr}/res");
         c.scriptlet_retry_initial = Duration::from_millis(5);
     });
-    e.svc.reload_now().await; // bundled applied first: it has no `fixture-only`
+    e.svc.reload_now().await; // bundled (if compiled in) is applied first: no `fixture-only`
     assert!(e
         .engine
         .cosmetic_for("https://example.com/")
@@ -432,4 +433,24 @@ async fn resources_fetch_a_fixed_file_list_and_replace_the_bundled_copy() {
         .unwrap()
         .iter()
         .all(|p| p.starts_with("/res/") && p.ends_with(".js") || p == "/l"));
+}
+
+#[tokio::test]
+async fn cached_resources_work_offline_without_bundled_snapshot() {
+    let f = Arc::new(Files::default());
+    f.set("/l", "example.com##+js(noopjs)\n");
+    let addr = serve(f).await;
+    let e = env(one(addr, "/l"), |c| {
+        c.scriptlet_resources_url = "http://127.0.0.1:1/resources.json".into();
+    });
+    // The on-disk cache of a previous successful fetch.
+    let json = r#"[{"name":"noopjs.js","aliases":[],"kind":{"mime":"application/javascript"},"content":"KGZ1bmN0aW9uKCl7fSkoKTs="}]"#;
+    std::fs::write(e.dir.path().join("resources.json"), json).unwrap();
+    e.svc.ensure_scriptlet_resources().await; // cache hit, no network
+    e.svc.reload_now().await;
+    assert!(!e
+        .engine
+        .cosmetic_for("https://example.com/")
+        .injected_script
+        .is_empty());
 }

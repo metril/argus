@@ -22,6 +22,10 @@ rayon = { workspace = true }
 filter-engine = { path = "../filter-engine" }
 common = { path = "../common" }
 
+[features]
+# Propagates to filter-engine: embed the GPL-3.0 uBO scriptlet snapshot. Off by default.
+bundled-ubo-resources = ["filter-engine/bundled-ubo-resources"]
+
 [dev-dependencies]
 tempfile = { workspace = true }
 axum = { workspace = true }
