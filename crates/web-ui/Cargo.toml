@@ -47,6 +47,12 @@ web-sys = { version = "0.3", features = [
     "Location",
     "HtmlDocument",
     "console",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "HtmlAnchorElement",
+    "File",
+    "FileList",
 ] }
 js-sys = "0.3"
 
