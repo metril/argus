@@ -647,6 +647,20 @@ async fn proxy_stats_and_filter_stats() {
     let admin = ctx.admin().await;
     let p: Value = admin.get("/api/v1/stats/proxy").await.json();
     assert!(p["connections"]["total"].is_number());
+    // Upstream/DNS/policy failures are visible in the API, not only in debug logs.
+    ::common::faults::note(::common::faults::Fault::UpstreamTimeout, "slow.test");
+    ::common::faults::note(::common::faults::Fault::DnsFailure, "nx.test");
+    ::common::faults::note(::common::faults::Fault::PolicyRefusal, "lo.test");
+    ::common::faults::note(::common::faults::Fault::UpstreamError, "bad.test");
+    let p: Value = admin.get("/api/v1/stats/proxy").await.json();
+    for k in [
+        "upstream_timeouts",
+        "upstream_errors",
+        "dns_failures",
+        "destination_refusals",
+    ] {
+        assert!(p["faults"][k].as_u64().unwrap() >= 1, "{k}: {p}");
+    }
     let f: Value = admin.get("/api/v1/stats/filter").await.json();
     assert!(f["total_requests"].is_number() && f["top_blocked_domains"].is_array());
     let recent: Value = admin.get("/api/v1/stats/blocked/recent").await.json();

@@ -290,12 +290,26 @@ pub struct MitmStats {
     pub cached_certificates: usize,
 }
 
+/// Upstream and destination failures since start (individual events are only logged at debug
+/// level; the log carries one summary per interval).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FaultStats {
+    pub upstream_timeouts: u64,
+    pub upstream_errors: u64,
+    pub dns_failures: u64,
+    /// Connections refused by the destination policy.
+    pub destination_refusals: u64,
+}
+
 /// Proxy statistics response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ProxyStatsResponse {
     pub connections: ConnectionStats,
     pub requests: RequestStats,
+    #[serde(default)]
+    pub faults: FaultStats,
     pub mitm: Option<MitmStats>,
 }
 

@@ -3,6 +3,7 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod faults;
 pub mod net_policy;
 pub mod profile_store;
 pub mod types;

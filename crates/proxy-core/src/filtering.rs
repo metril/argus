@@ -40,11 +40,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
-/// Upstream timeouts since start (per-request events are debug only).
-pub static UPSTREAM_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Upstream errors since start.
-pub static UPSTREAM_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1), plus framing headers we
 /// reconstruct ourselves.
 const HOP_BY_HOP: &[&str] = &[
@@ -638,6 +633,7 @@ impl ProxyContext {
         // Destination policy. reqwest skips its resolver for IP-literal hosts, so literals are
         // judged here; names are judged on what they resolve to, inside the client's resolver.
         if let Err(r) = self.policy.check_literal(&host, port) {
+            common::faults::note(common::faults::Fault::PolicyRefusal, &host);
             debug!("Refused destination {host}:{port}: {r}");
             return Ok(refused_response());
         }
@@ -696,8 +692,7 @@ impl ProxyContext {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), rb.send()).await {
                 Ok(r) => r,
                 Err(_) => {
-                    UPSTREAM_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                    debug!("Upstream timeout for {url}");
+                    common::faults::note(common::faults::Fault::UpstreamTimeout, &host);
                     return Ok(status_response(
                         StatusCode::GATEWAY_TIMEOUT,
                         "Upstream timeout",
@@ -708,11 +703,12 @@ impl ProxyContext {
         let resp = match sent {
             Ok(r) => r,
             Err(e) if is_refusal(&e) => {
+                common::faults::note(common::faults::Fault::PolicyRefusal, &host);
                 debug!("Refused destination {host}:{port} (resolved): {e}");
                 return Ok(refused_response());
             }
             Err(e) => {
-                UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+                common::faults::note(common::faults::Fault::UpstreamError, &host);
                 debug!("Upstream error for {}: {}", url, e);
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
             }

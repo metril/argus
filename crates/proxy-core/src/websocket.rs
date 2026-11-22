@@ -270,6 +270,7 @@ pub async fn proxy_upgrade(
     let io = match ws.dial(&target.host, target.port, target.tls).await {
         Ok(io) => io,
         Err(Error::DestinationRefused(why)) => {
+            common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
             debug!("Refused WebSocket to {}: {}", check_url, why);
             return Ok(refused_response());
         }

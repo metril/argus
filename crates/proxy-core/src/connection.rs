@@ -208,6 +208,7 @@ impl ConnectionHandler {
             )
         };
         if refused {
+            common::faults::note(common::faults::Fault::PolicyRefusal, &host);
             debug!("Refused CONNECT to {host}:{port} from {}", self.client_addr);
             let _ = stream
                 .write_all(
@@ -338,6 +339,7 @@ impl ConnectionHandler {
         let mut server = match tokio::time::timeout(t.handshake, dial).await {
             Ok(Ok(s)) => s,
             Ok(Err(e @ Error::DestinationRefused(_))) => {
+                common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
                 debug!("Refused tunnel to {}:{}: {e}", target.host, target.port);
                 return Err(e);
             }

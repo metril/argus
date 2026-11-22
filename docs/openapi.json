@@ -1331,6 +1331,39 @@
         ],
         "type": "object"
       },
+      "FaultStats": {
+        "description": "Upstream and destination failures since start (individual events are only logged at debug\nlevel; the log carries one summary per interval).",
+        "properties": {
+          "destination_refusals": {
+            "description": "Connections refused by the destination policy.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dns_failures": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upstream_errors": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upstream_timeouts": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "upstream_timeouts",
+          "upstream_errors",
+          "dns_failures",
+          "destination_refusals"
+        ],
+        "type": "object"
+      },
       "FieldError": {
         "description": "One field-level validation problem.",
         "properties": {
@@ -3542,6 +3575,9 @@
         "properties": {
           "connections": {
             "$ref": "#/components/schemas/ConnectionStats"
+          },
+          "faults": {
+            "$ref": "#/components/schemas/FaultStats"
           },
           "mitm": {
             "oneOf": [
