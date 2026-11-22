@@ -5,6 +5,7 @@
 //! negotiated end to end therefore keep working, and the proxy never re-frames messages.
 
 use crate::filtering::ProxyContext;
+use crate::request_ctx::RequestCtx;
 use crate::inject::{full_body, ProxyBody};
 use crate::{Error, Result};
 use bytes::Bytes;
@@ -80,24 +81,7 @@ impl WsUpstream {
         resolve_all_to: Option<IpAddr>,
         dial_timeout: Duration,
     ) -> Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        for path in extra_ca_paths {
-            let pem = std::fs::read(path).map_err(|e| {
-                Error::Config(format!(
-                    "Failed to read upstream CA {}: {e}",
-                    path.display()
-                ))
-            })?;
-            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-                let cert = cert.map_err(|e| {
-                    Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-                })?;
-                roots.add(cert).map_err(|e| {
-                    Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-                })?;
-            }
-        }
+        let roots = crate::upstream::build_root_store(extra_ca_paths)?;
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -221,6 +205,7 @@ fn status_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody>
 pub async fn proxy_upgrade(
     ws: &WsUpstream,
     ctx: &ProxyContext,
+    rctx: &RequestCtx,
     mut req: Request<Incoming>,
     default_tls: bool,
     fallback: Option<(String, u16)>,
@@ -240,11 +225,12 @@ pub async fn proxy_upgrade(
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&check_url)
         .to_string();
-    if ctx.should_block(&check_url, &origin, "websocket") {
+    if ctx.should_block_with(rctx, &check_url, &origin, "websocket") {
         debug!("Blocked WebSocket to {}", check_url);
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header("x-adblock", "blocked")
+            .header("cache-control", "no-store")
             .body(full_body(Bytes::from_static(b"Blocked")))
             .expect("static response"));
     }

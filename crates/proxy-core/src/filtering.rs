@@ -12,6 +12,7 @@ use crate::inject::{build_payload, full_body, inject_body, passthrough_body, Pro
 use crate::redirect::{block_response, redirect_response, rewrite_redirect};
 use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url, RequestType};
+use crate::upstream::{build_upstream_client, UpstreamOptions};
 use crate::{Error, Result};
 use bytes::Bytes;
 use filter_engine::SharedEngine;
@@ -20,7 +21,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
 use hyper::header::{HeaderName, CONTENT_TYPE, HOST};
 use hyper::{Request, Response, StatusCode};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +56,10 @@ pub struct ProxyContext {
     /// Context used by [`Self::forward`] (default profile, unattributed client).
     default_ctx: RequestCtx,
     /// Upstream request timeout in milliseconds; 0 disables it.
-    request_timeout_ms: AtomicU64,
+    request_timeout_ms: Arc<AtomicU64>,
+    /// Code-only upstream dial override (tests/controlled setups); shared by the HTTP client and
+    /// the WebSocket dialer. Never read from config.
+    resolve_all_to: Option<IpAddr>,
 }
 
 impl ProxyContext {
@@ -70,8 +74,32 @@ impl ProxyContext {
             engine,
             client,
             default_ctx,
-            request_timeout_ms: AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS),
+            request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
+            resolve_all_to: None,
         }
+    }
+
+    /// Build the context and its pooled upstream client from `opts` in one step, so the HTTP
+    /// client and WebSocket dialer share the same resolve override.
+    pub fn with_upstream(
+        engine: Arc<SharedEngine>,
+        opts: &UpstreamOptions,
+        adblock_enabled: bool,
+    ) -> Result<Self> {
+        let client = build_upstream_client(opts)?;
+        let mut ctx = Self::new(engine, client, adblock_enabled);
+        ctx.resolve_all_to = opts.resolve_all_to;
+        Ok(ctx)
+    }
+
+    /// The upstream dial override, if any (code-only).
+    pub fn resolve_all_to(&self) -> Option<IpAddr> {
+        self.resolve_all_to
+    }
+
+    /// Shared handle to the request timeout in milliseconds (for live settings updates).
+    pub fn request_timeout_handle(&self) -> Arc<AtomicU64> {
+        self.request_timeout_ms.clone()
     }
 
     /// The shared engine handle (used by the WS/h3 paths too).
@@ -119,6 +147,22 @@ impl ProxyContext {
     /// Shared by the HTTP, WebSocket, and HTTP/3 paths.
     pub fn should_block(&self, url: &str, source_url: &str, resource_type: &str) -> bool {
         self.engine.is_enabled() && self.engine.check(url, source_url, resource_type).blocked
+    }
+
+    /// Like [`Self::should_block`] but with the profile in `rctx`.
+    pub fn should_block_with(
+        &self,
+        rctx: &RequestCtx,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+    ) -> bool {
+        let profile = rctx.profile.load();
+        profile.engine.is_enabled()
+            && profile
+                .engine
+                .check(url, source_url, resource_type)
+                .blocked
     }
 
     /// Forward a proxied request using the default request context.

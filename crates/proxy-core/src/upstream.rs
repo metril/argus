@@ -4,6 +4,7 @@ use crate::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Options for [`build_upstream_client`].
 #[derive(Debug, Clone, Default)]
@@ -12,7 +13,13 @@ pub struct UpstreamOptions {
     pub extra_ca_paths: Vec<PathBuf>,
     /// Resolve every upstream hostname to this IP (ports come from the URL). Meant for tests
     /// and controlled environments; leave `None` in normal operation.
+    ///
+    /// Code-only on purpose: never derived from config or serde.
     pub resolve_all_to: Option<IpAddr>,
+    /// TCP connect timeout for upstream connections.
+    pub connect_timeout: Option<Duration>,
+    /// Idle read timeout between upstream body chunks.
+    pub read_timeout: Option<Duration>,
 }
 
 impl UpstreamOptions {
@@ -21,8 +28,45 @@ impl UpstreamOptions {
         Self {
             extra_ca_paths: config.proxy.extra_upstream_ca_paths.clone(),
             resolve_all_to: None,
+            connect_timeout: Some(Duration::from_secs(
+                config.performance.connection_timeout_secs.max(1),
+            )),
+            read_timeout: Some(Duration::from_secs(
+                config.performance.request_timeout_secs.max(1),
+            )),
         }
     }
+}
+
+/// Root store used for every upstream TLS dial: built-in web roots plus `extra_ca_paths` (PEM
+/// files). Shared by the WebSocket path so HTTP and WebSocket trust the same CAs.
+pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for path in extra_ca_paths {
+        let pem = std::fs::read(path).map_err(|e| {
+            Error::Config(format!(
+                "Failed to read upstream CA {}: {e}",
+                path.display()
+            ))
+        })?;
+        let mut n = 0;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let cert = cert
+                .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
+            roots
+                .add(cert)
+                .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
+            n += 1;
+        }
+        if n == 0 {
+            return Err(Error::Config(format!(
+                "Upstream CA {} contains no PEM certificates",
+                path.display()
+            )));
+        }
+    }
+    Ok(roots)
 }
 
 struct FixedIpResolver(IpAddr);
@@ -57,6 +101,12 @@ pub fn build_upstream_client(opts: &UpstreamOptions) -> Result<reqwest::Client> 
             builder = builder.add_root_certificate(cert);
         }
     }
+    if let Some(t) = opts.connect_timeout {
+        builder = builder.connect_timeout(t);
+    }
+    if let Some(t) = opts.read_timeout {
+        builder = builder.read_timeout(t);
+    }
     if let Some(ip) = opts.resolve_all_to {
         builder = builder.dns_resolver(Arc::new(FixedIpResolver(ip)));
     }
@@ -72,7 +122,7 @@ mod tests {
     fn opts_with(path: PathBuf) -> UpstreamOptions {
         UpstreamOptions {
             extra_ca_paths: vec![path],
-            resolve_all_to: None,
+            ..Default::default()
         }
     }
 

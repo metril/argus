@@ -9,7 +9,6 @@ use crate::{
     mitm::MitmHandler,
     Error, Result,
 };
-use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
@@ -22,14 +21,15 @@ pub struct ProxyServer {
     load_manager: Arc<LoadManager>,
     /// Shared filtering + upstream-forwarding context handed to each connection.
     ctx: Arc<ProxyContext>,
-    /// Test/controlled-environment override: dial every WebSocket upstream at this IP (mirrors
-    /// `UpstreamOptions::resolve_all_to` for the HTTP client).
-    ws_resolve_all_to: Option<IpAddr>,
 }
 
 impl ProxyServer {
     /// Create a new proxy server with the given configuration and filtering context.
     pub fn new(config: ProxyConfig, ctx: Arc<ProxyContext>) -> Result<Self> {
+        ctx.set_request_timeout(std::time::Duration::from_secs(
+            config.performance.request_timeout_secs,
+        ));
+
         // Initialize MITM handler if enabled
         let mitm_handler = if config.mitm.enabled {
             info!("Initializing MITM support");
@@ -75,7 +75,6 @@ impl ProxyServer {
             mitm_handler,
             load_manager,
             ctx,
-            ws_resolve_all_to: None,
         })
     }
 
@@ -88,12 +87,6 @@ impl ProxyServer {
         let mut server = Self::new(config, ctx)?;
         server.load_manager = Arc::new(LoadManager::new(load_manager_config));
         Ok(server)
-    }
-
-    /// Dial WebSocket upstreams at `ip` regardless of hostname (tests / controlled setups).
-    pub fn with_ws_resolve_all_to(mut self, ip: IpAddr) -> Self {
-        self.ws_resolve_all_to = Some(ip);
-        self
     }
 
     /// Start the proxy server with graceful shutdown
@@ -161,7 +154,7 @@ impl ProxyServer {
             ws: if self.config.proxy.enable_websockets {
                 Some(Arc::new(crate::websocket::WsUpstream::new(
                     &self.config.proxy.extra_upstream_ca_paths,
-                    self.ws_resolve_all_to,
+                    self.ctx.resolve_all_to(),
                     timeouts.handshake,
                 )?))
             } else {

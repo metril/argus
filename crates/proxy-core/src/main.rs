@@ -8,7 +8,7 @@ use proxy_core::{
     config::ProxyConfig,
     filtering::ProxyContext,
     server::ProxyServer,
-    upstream::{build_upstream_client, UpstreamOptions},
+    upstream::UpstreamOptions,
     Error, Result,
 };
 use tracing::{error, info};
@@ -39,14 +39,12 @@ async fn main() -> Result<()> {
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
 
-    // One pooled upstream client for forwarding proxied requests (no redirect following).
-    let proxy_client = build_upstream_client(&UpstreamOptions::from_config(&config))?;
-
-    let ctx = Arc::new(ProxyContext::new(
+    // One pooled upstream client (connect/read timeouts from config, no redirect following).
+    let ctx = Arc::new(ProxyContext::with_upstream(
         shared_engine.clone(),
-        proxy_client,
+        &UpstreamOptions::from_config(&config),
         config.adblock.enabled,
-    ));
+    )?);
 
     // Create the proxy server
     let server = ProxyServer::new(config.clone(), ctx).map_err(|e| {

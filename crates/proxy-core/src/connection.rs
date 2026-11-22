@@ -12,6 +12,7 @@
 use crate::filtering::ProxyContext;
 use crate::inject::{full_body, ProxyBody};
 use crate::mitm::MitmHandler;
+use crate::request_ctx::RequestCtx;
 use crate::{tls, Error, Result};
 use bytes::Bytes;
 use hyper::body::Incoming;
@@ -94,13 +95,17 @@ pub enum Entry<IO> {
 pub struct ConnectionHandler {
     client_addr: SocketAddr,
     shared: Arc<ConnectionShared>,
+    /// Built once per connection; every request on it (plain, MITM h1/h2, WebSocket) shares it.
+    rctx: Arc<RequestCtx>,
 }
 
 impl ConnectionHandler {
     pub fn new(client_addr: SocketAddr, shared: Arc<ConnectionShared>) -> Self {
+        let rctx = Arc::new(shared.ctx.request_ctx_for(client_addr, None));
         Self {
             client_addr,
             shared,
+            rctx,
         }
     }
 
@@ -211,11 +216,12 @@ impl ConnectionHandler {
 
         if use_http2 {
             let shared = self.shared.clone();
-            let client_addr = self.client_addr;
+            let rctx = self.rctx.clone();
             let service = move |req| {
                 let shared = shared.clone();
+                let rctx = rctx.clone();
                 let origin = origin.clone();
-                async move { handle_request(shared, client_addr, req, origin).await }
+                async move { handle_request(shared, rctx, req, origin).await }
             };
             crate::http2::serve_http2(tls_stream, service).await
         } else {
@@ -230,10 +236,12 @@ impl ConnectionHandler {
     {
         let shared = self.shared.clone();
         let client_addr = self.client_addr;
+        let rctx = self.rctx.clone();
         let service = service_fn(move |req| {
             let shared = shared.clone();
+            let rctx = rctx.clone();
             let origin = origin.clone();
-            async move { handle_request(shared, client_addr, req, origin).await }
+            async move { handle_request(shared, rctx, req, origin).await }
         });
 
         http1::Builder::new()
@@ -290,13 +298,13 @@ fn plain_origin() -> Origin {
 /// Handle a single HTTP request (plain proxying or decrypted MITM traffic).
 async fn handle_request(
     shared: Arc<ConnectionShared>,
-    client_addr: SocketAddr,
+    rctx: Arc<RequestCtx>,
     req: Request<Incoming>,
     origin: Origin,
 ) -> Result<Response<ProxyBody>> {
     trace!(
         "Request from {}: {} {} {:?}",
-        client_addr,
+        rctx.client_addr,
         req.method(),
         req.uri(),
         req.version()
@@ -308,6 +316,7 @@ async fn handle_request(
             return crate::websocket::proxy_upgrade(
                 ws,
                 &shared.ctx,
+                &rctx,
                 req,
                 origin.scheme == "https",
                 origin.authority,
@@ -317,7 +326,7 @@ async fn handle_request(
     }
 
     if req.method() == Method::CONNECT {
-        warn!("CONNECT reached the HTTP handler from {}", client_addr);
+        warn!("CONNECT reached the HTTP handler from {}", rctx.client_addr);
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(full_body(Bytes::from_static(b"CONNECT not allowed here")))
@@ -326,7 +335,7 @@ async fn handle_request(
 
     shared
         .ctx
-        .forward(req, origin.scheme, origin.authority)
+        .forward_with(req, origin.scheme, origin.authority, &rctx)
         .await
 }
 
@@ -710,5 +719,25 @@ mod tests {
         let mut out = Vec::new();
         p.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"abcdef");
+    }
+
+    #[test]
+    fn connection_ctx_carries_real_client_addr_and_default_profile() {
+        let engine = Arc::new(filter_engine::SharedEngine::new());
+        let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+        let shared = Arc::new(ConnectionShared {
+            mitm: None,
+            enable_http2: false,
+            enable_websockets: false,
+            ctx: ctx.clone(),
+            timeouts: Timeouts::from_config(&crate::config::ProxyConfig::default().performance),
+            #[cfg(feature = "websockets")]
+            ws: None,
+        });
+        let addr: SocketAddr = "203.0.113.7:4242".parse().unwrap();
+        let h = ConnectionHandler::new(addr, shared);
+        assert_eq!(h.rctx.client_addr, addr);
+        assert!(h.rctx.auth_user.is_none());
+        assert!(Arc::ptr_eq(&h.rctx.profile, ctx.default_profile()));
     }
 }
