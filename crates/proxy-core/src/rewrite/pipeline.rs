@@ -450,8 +450,19 @@ mod tests {
 
     /// Re-encoding is CPU-bound (a brotli encoder's first write alone takes tens of
     /// milliseconds): it must not run on the async worker, where it would stall every other
-    /// connection scheduled there. A 1 ms heartbeat on the same single-threaded runtime shows how
-    /// long the worker was held up.
+    /// connection scheduled there. The CPU time the polling thread spends inside any single
+    /// poll of the stream is measured (thread CPU clock, so a loaded machine's scheduling
+    /// delays do not count): a poll that encodes inline costs tens of milliseconds of it.
+    fn thread_cpu_us() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid pointer to a timespec.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+    }
+
     #[tokio::test]
     async fn reencoding_does_not_stall_the_async_worker() {
         let mut x = 0x2545_f491_4f6c_dd1du64;
@@ -472,31 +483,24 @@ mod tests {
             })
             .collect();
         for coding in [Coding::Brotli, Coding::Zstd, Coding::Gzip] {
-            let worst_us = Arc::new(AtomicUsize::new(0));
-            let w = worst_us.clone();
-            let beat = tokio::spawn(async move {
-                let mut last = tokio::time::Instant::now();
-                loop {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    let now = tokio::time::Instant::now();
-                    w.fetch_max((now - last).as_micros() as usize, Ordering::Relaxed);
-                    last = now;
-                }
-            });
-            tokio::task::yield_now().await;
-            worst_us.store(0, Ordering::Relaxed);
             let input = stream::iter(chunks.clone().into_iter().map(Ok));
             let mut out = Box::pin(encode_stream(input, Some(coding)));
+            let mut worst = 0u64;
+            let mut timed = Box::pin(stream::poll_fn(|cx| {
+                let t0 = thread_cpu_us();
+                let r = out.as_mut().poll_next(cx);
+                worst = worst.max(thread_cpu_us() - t0);
+                r
+            }));
             let mut n = 0usize;
-            while let Some(c) = out.next().await {
+            while let Some(c) = timed.next().await {
                 n += c.unwrap().len();
             }
-            beat.abort();
+            drop(timed);
             assert!(n > 0);
-            let worst = worst_us.load(Ordering::Relaxed);
             assert!(
                 worst < 12_000,
-                "{coding:?}: the async worker was held for {worst} us by one poll"
+                "{coding:?}: one poll held the async worker for {worst} us of CPU"
             );
         }
     }
