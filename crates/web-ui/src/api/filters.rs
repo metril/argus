@@ -7,7 +7,9 @@ use super::client::{ApiClient, ApiError};
 // Aliases preserve the names the UI pages already use.
 pub use api_types::FilterListResponse as FilterList;
 pub use api_types::{
-    AddFilterListRequest, CustomRulesResponse, UpdateCustomRulesRequest, UpdateFilterListRequest,
+    AddFilterListRequest, BlockedEntry, BuildState, BuildSummary, CatalogueEntryResponse,
+    CustomRulesResponse, ListReport, RecentBlockedResponse, UpdateCustomRulesRequest,
+    UpdateFilterListRequest,
 };
 pub type FilterListsResponse = api_types::Page<FilterList>;
 
@@ -37,12 +39,16 @@ impl ApiClient {
         name: &str,
         url: &str,
         enabled: bool,
+        format: &str,
+        allowlist: bool,
     ) -> Result<FilterList, ApiError> {
         let req = AddFilterListRequest {
             id: id.to_string(),
             name: name.to_string(),
             url: url.to_string(),
             enabled: Some(enabled),
+            format: Some(format.to_string()),
+            allowlist: Some(allowlist),
         };
         self.post("/lists", &req).await
     }
@@ -88,5 +94,59 @@ impl ApiClient {
             rules: rules.to_string(),
         };
         self.put_if_match("/rules/custom", &req, etag).await
+    }
+
+    /// Toggle enabled / allowlist of a list (only the given fields change)
+    pub async fn set_list_flags(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+        allowlist: Option<bool>,
+    ) -> Result<FilterList, ApiError> {
+        let req = UpdateFilterListRequest {
+            name: None,
+            url: None,
+            enabled,
+            format: None,
+            allowlist,
+        };
+        self.update_filter_list(id, &req).await
+    }
+
+    /// What the last build made of a list
+    pub async fn get_list_report(&self, id: &str) -> Result<ListReport, ApiError> {
+        self.get(&format!("/lists/{}/report", id)).await
+    }
+
+    /// Build state and totals of the installed engine
+    pub async fn get_build_summary(&self) -> Result<BuildSummary, ApiError> {
+        self.get("/engine/build").await
+    }
+
+    /// The catalogue of well-known lists
+    pub async fn get_catalogue(&self) -> Result<Vec<CatalogueEntryResponse>, ApiError> {
+        self.get("/lists/catalogue").await
+    }
+
+    /// Add a catalogue entry as a list
+    pub async fn add_from_catalogue(&self, id: &str) -> Result<FilterList, ApiError> {
+        self.post(&format!("/lists/catalogue/{}", id), &()).await
+    }
+
+    /// Recently blocked requests, newest first, with optional filters
+    pub async fn get_recent_blocked(
+        &self,
+        limit: u32,
+        client: &str,
+        host: &str,
+        list_id: &str,
+    ) -> Result<RecentBlockedResponse, ApiError> {
+        let mut path = format!("/stats/blocked/recent?limit={limit}");
+        for (k, v) in [("client", client), ("host", host), ("list_id", list_id)] {
+            if !v.trim().is_empty() {
+                path.push_str(&format!("&{k}={}", js_sys::encode_uri_component(v.trim())));
+            }
+        }
+        self.get(&path).await
     }
 }

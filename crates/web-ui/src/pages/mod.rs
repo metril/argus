@@ -1,5 +1,6 @@
 //! Page components
 
+pub mod blocked;
 pub mod dashboard;
 pub mod filters;
 pub mod login;
@@ -9,6 +10,7 @@ pub mod settings;
 pub mod tokens;
 pub mod userscripts;
 
+pub use blocked::BlockedPage;
 pub use dashboard::DashboardPage;
 pub use filters::FiltersPage;
 pub use login::LoginPage;
