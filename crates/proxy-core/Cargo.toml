@@ -30,6 +30,7 @@ reqwest = { workspace = true, features = ["stream"] }
 futures-util = { workspace = true }
 async-stream = { workspace = true }
 async-compression = { workspace = true, features = ["zstd"] }
+brotli = "8"
 
 # TLS
 rustls = { workspace = true }
