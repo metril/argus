@@ -7,9 +7,10 @@ use rcgen::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Certificate Authority for generating and signing certificates
 pub struct CertificateAuthority {
@@ -166,12 +167,14 @@ impl CertificateAuthority {
         })
     }
 
-    /// Generate a certificate for the given domain
+    /// Generate a leaf certificate for a host (DNS name or IP literal).
+    ///
+    /// CPU-bound (key generation + signing); call from `spawn_blocking` on async paths.
     pub fn generate_cert(
         &self,
         domain: &str,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-        info!("Generating certificate for domain: {}", domain);
+        debug!("Generating certificate for host: {}", domain);
 
         // Create certificate parameters
         let mut params = CertificateParams::default();
@@ -181,19 +184,7 @@ impl CertificateAuthority {
         dn.push(DnType::CommonName, domain);
         params.distinguished_name = dn;
 
-        // Add subject alternative names
-        params.subject_alt_names =
-            vec![
-                SanType::DnsName(
-                    domain
-                        .try_into()
-                        .map_err(|e| Error::Certificate(format!("Invalid domain name: {:?}", e)))?,
-                ),
-                // Also add wildcard for subdomains
-                SanType::DnsName(format!("*.{}", domain).try_into().map_err(|e| {
-                    Error::Certificate(format!("Invalid wildcard domain: {:?}", e))
-                })?),
-            ];
+        params.subject_alt_names = subject_alt_names(domain)?;
 
         // Set validity period (30 days)
         params.not_before = OffsetDateTime::now_utc();
@@ -236,9 +227,34 @@ impl CertificateAuthority {
     }
 }
 
+/// Subject alternative names for a leaf certificate.
+///
+/// IP literals get an IP SAN only. DNS names get the name itself plus `*.name` when the name has
+/// at least two labels (a wildcard under a single-label host like `localhost` is meaningless).
+pub fn subject_alt_names(host: &str) -> Result<Vec<SanType>> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![SanType::IpAddress(ip)]);
+    }
+    let mut sans =
+        vec![SanType::DnsName(host.try_into().map_err(|e| {
+            Error::Certificate(format!("Invalid domain name: {:?}", e))
+        })?)];
+    if host.contains('.') && !host.starts_with("*.") {
+        sans.push(SanType::DnsName(format!("*.{host}").try_into().map_err(
+            |e| Error::Certificate(format!("Invalid wildcard domain: {:?}", e)),
+        )?));
+    }
+    Ok(sans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_ca_generation() {
@@ -288,5 +304,54 @@ mod tests {
         // Clean up
         let _ = fs::remove_file(&cert_path);
         let _ = fs::remove_file(&key_path);
+    }
+
+    fn dns(s: &str) -> SanType {
+        SanType::DnsName(s.try_into().unwrap())
+    }
+
+    #[test]
+    fn san_dns_has_wildcard() {
+        assert_eq!(
+            subject_alt_names("example.com").unwrap(),
+            vec![dns("example.com"), dns("*.example.com")]
+        );
+    }
+
+    #[test]
+    fn san_single_label_has_no_wildcard() {
+        assert_eq!(
+            subject_alt_names("localhost").unwrap(),
+            vec![dns("localhost")]
+        );
+    }
+
+    #[test]
+    fn san_ip_literals() {
+        assert_eq!(
+            subject_alt_names("127.0.0.1").unwrap(),
+            vec![SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        );
+        assert_eq!(
+            subject_alt_names("::1").unwrap(),
+            vec![SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST))]
+        );
+        assert_eq!(
+            subject_alt_names("[2001:db8::1]").unwrap(),
+            vec![SanType::IpAddress("2001:db8::1".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn ip_and_single_label_certs_generate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = CertificateAuthority::load_or_generate(
+            tmp.path().join("ca.crt"),
+            tmp.path().join("ca.key"),
+        )
+        .unwrap();
+        for host in ["10.1.2.3", "::1", "localhost", "a.example"] {
+            assert!(ca.generate_cert(host).is_ok(), "{host}");
+        }
     }
 }

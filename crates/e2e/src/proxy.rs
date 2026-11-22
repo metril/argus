@@ -20,6 +20,8 @@ pub struct TestProxy {
     /// PEM of the freshly generated proxy CA (what a client must trust).
     pub ca_pem: Vec<u8>,
     pub engine: Arc<SharedEngine>,
+    /// The proxy's MITM handler (cert cache / generation counter).
+    pub mitm: Option<Arc<proxy_core::mitm::MitmHandler>>,
     shutdown: broadcast::Sender<()>,
     _dir: tempfile::TempDir,
 }
@@ -87,7 +89,10 @@ impl TestProxy {
         })
         .map_err(|e| e.to_string())?;
         let ctx = Arc::new(ProxyContext::new(engine.clone(), client, true));
-        let server = ProxyServer::new(config, ctx).map_err(|e| e.to_string())?;
+        let server = ProxyServer::new(config, ctx)
+            .map_err(|e| e.to_string())?
+            .with_ws_resolve_all_to(origin.ip());
+        let mitm = server.mitm_handler().cloned();
         let ca_pem = std::fs::read(&ca_cert_path).map_err(|e| e.to_string())?;
 
         // Bind and keep the listener: connections queue in the backlog until `serve` accepts, so
@@ -107,6 +112,7 @@ impl TestProxy {
             addr,
             ca_pem,
             engine,
+            mitm,
             shutdown,
             _dir: dir,
         })

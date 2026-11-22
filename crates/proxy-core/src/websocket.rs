@@ -1,12 +1,28 @@
-//! WebSocket proxying implementation
+//! WebSocket proxying.
 //!
-//! This module provides WebSocket upgrade detection and bidirectional frame proxying.
+//! The client's upgrade request is forwarded upstream (over TLS for `wss`) and, when the origin
+//! answers `101`, both upgraded streams are spliced byte-for-byte. Extensions and subprotocols
+//! negotiated end to end therefore keep working, and the proxy never re-frames messages.
 
+use crate::filtering::ProxyContext;
+use crate::inject::{full_body, ProxyBody};
 use crate::{Error, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::Incoming;
+use hyper::header::{HeaderMap, HeaderName, HOST};
+use hyper::http::uri::Authority;
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::rt::TokioIo;
+use rustls::pki_types::ServerName;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{accept_async, client_async, WebSocketStream};
-use tracing::{debug, error, info, warn};
+use tokio_rustls::TlsConnector;
+use tracing::{debug, warn};
 
 /// Check if a request is a WebSocket upgrade request
 pub fn is_websocket_upgrade(headers: &hyper::HeaderMap) -> bool {
@@ -45,116 +61,289 @@ pub fn extract_ws_target(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> Result
     Ok(format!("{}://{}{}", scheme, host, path))
 }
 
-/// Proxy WebSocket connection between client and server
-pub async fn proxy_websocket<S>(client_stream: S, target_url: &str) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    info!("Establishing WebSocket proxy to {}", target_url);
+/// Object-safe duplex stream (plain TCP or TLS) used for upstream WebSocket connections.
+pub trait WsIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> WsIo for T {}
 
-    // Parse target URL to extract host and port
-    let url = target_url
-        .parse::<hyper::Uri>()
-        .map_err(|e| Error::Http(format!("Invalid WebSocket URL: {}", e)))?;
-
-    let host = url
-        .host()
-        .ok_or_else(|| Error::Http("Missing host in WebSocket URL".to_string()))?;
-
-    let port = url.port_u16().unwrap_or_else(|| {
-        if url.scheme_str() == Some("wss") {
-            443
-        } else {
-            80
-        }
-    });
-
-    // Connect to target server
-    let target_addr = format!("{}:{}", host, port);
-    let target_stream = TcpStream::connect(&target_addr).await.map_err(Error::Io)?;
-
-    debug!("Connected to target WebSocket server at {}", target_addr);
-
-    // Accept WebSocket connection from client
-    let client_ws = accept_async(client_stream)
-        .await
-        .map_err(|e| Error::Http(format!("Failed to accept WebSocket: {}", e)))?;
-
-    debug!("Client WebSocket handshake complete");
-
-    // Connect to target WebSocket server
-    let (server_ws, _) = client_async(target_url, target_stream)
-        .await
-        .map_err(|e| Error::Http(format!("Failed to connect to target WebSocket: {}", e)))?;
-
-    debug!("Server WebSocket connection established");
-
-    // Proxy messages bidirectionally
-    proxy_messages(client_ws, server_ws).await
+/// How WebSocket upgrades dial upstream: same trust roots as the HTTP client (built-in web roots
+/// plus the configured extra CAs) and an optional fixed-IP override matching
+/// `UpstreamOptions::resolve_all_to`.
+pub struct WsUpstream {
+    tls: TlsConnector,
+    resolve_all_to: Option<IpAddr>,
+    dial_timeout: Duration,
 }
 
-/// Bidirectionally proxy WebSocket messages
-async fn proxy_messages<S1, S2>(
-    client_ws: WebSocketStream<S1>,
-    server_ws: WebSocketStream<S2>,
-) -> Result<()>
-where
-    S1: AsyncRead + AsyncWrite + Unpin,
-    S2: AsyncRead + AsyncWrite + Unpin,
-{
-    use futures_util::{SinkExt, StreamExt};
-
-    let (mut client_sink, mut client_stream) = client_ws.split();
-    let (mut server_sink, mut server_stream) = server_ws.split();
-
-    let client_to_server = async {
-        while let Some(msg) = client_stream.next().await {
-            match msg {
-                Ok(msg) => {
-                    debug!("Client -> Server: {:?}", msg);
-                    if let Err(e) = server_sink.send(msg).await {
-                        error!("Error sending to server: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("Error receiving from client: {}", e);
-                    break;
-                }
+impl WsUpstream {
+    pub fn new(
+        extra_ca_paths: &[PathBuf],
+        resolve_all_to: Option<IpAddr>,
+        dial_timeout: Duration,
+    ) -> Result<Self> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for path in extra_ca_paths {
+            let pem = std::fs::read(path).map_err(|e| {
+                Error::Config(format!(
+                    "Failed to read upstream CA {}: {e}",
+                    path.display()
+                ))
+            })?;
+            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                let cert = cert.map_err(|e| {
+                    Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
+                })?;
+                roots.add(cert).map_err(|e| {
+                    Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
+                })?;
             }
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Tls(format!("Failed to select TLS versions: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Ok(Self {
+            tls: TlsConnector::from(Arc::new(config)),
+            resolve_all_to,
+            dial_timeout,
+        })
+    }
+
+    async fn dial(&self, host: &str, port: u16, tls: bool) -> Result<Box<dyn WsIo>> {
+        let connect = async {
+            let tcp = match self.resolve_all_to {
+                Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await,
+                None => TcpStream::connect((host, port)).await,
+            }
+            .map_err(Error::Io)?;
+            let _ = tcp.set_nodelay(true);
+            if !tls {
+                return Ok::<Box<dyn WsIo>, Error>(Box::new(tcp));
+            }
+            let name = ServerName::try_from(host.to_string())
+                .map_err(|e| Error::Tls(format!("Invalid server name {host}: {e}")))?;
+            let stream = self
+                .tls
+                .connect(name, tcp)
+                .await
+                .map_err(|e| Error::Tls(format!("Upstream TLS handshake failed: {e}")))?;
+            Ok(Box::new(stream))
+        };
+        tokio::time::timeout(self.dial_timeout, connect)
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+}
+
+/// Resolved upstream target of an upgrade request.
+#[derive(Debug, PartialEq, Eq)]
+struct Target {
+    host: String,
+    port: u16,
+    tls: bool,
+    path_and_query: String,
+}
+
+impl Target {
+    /// `http(s)://host[:port]/path` form used for filter matching (adblock matches http(s) URLs).
+    fn check_url(&self) -> String {
+        let scheme = if self.tls { "https" } else { "http" };
+        let default = if self.tls { 443 } else { 80 };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        if self.port == default {
+            format!("{scheme}://{host}{}", self.path_and_query)
+        } else {
+            format!("{scheme}://{host}:{}{}", self.port, self.path_and_query)
+        }
+    }
+}
+
+/// Work out where an upgrade request should go: absolute-form URI, else `Host` header, else the
+/// CONNECT target (`fallback`). `default_tls` applies when the URI carries no scheme.
+fn resolve_target(
+    uri: &Uri,
+    headers: &HeaderMap,
+    default_tls: bool,
+    fallback: Option<&(String, u16)>,
+) -> Option<Target> {
+    let tls = match uri.scheme_str() {
+        Some("https") | Some("wss") => true,
+        Some("http") | Some("ws") => false,
+        _ => default_tls,
+    };
+    let host_hdr: Option<Authority> = headers
+        .get(HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
+    let authority = uri.authority().cloned().or(host_hdr);
+    let (host, port) = match authority {
+        Some(a) => (a.host().to_string(), a.port_u16()),
+        None => {
+            let (h, p) = fallback?;
+            (h.clone(), Some(*p))
+        }
+    };
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host)
+        .to_string();
+    let port = port.unwrap_or(if tls { 443 } else { 80 });
+    let path_and_query = uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    Some(Target {
+        host,
+        port,
+        tls,
+        path_and_query,
+    })
+}
+
+fn status_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .body(full_body(Bytes::from_static(msg.as_bytes())))
+        .expect("static response")
+}
+
+/// Handle a WebSocket upgrade request: filter, dial upstream, forward the handshake, then splice.
+///
+/// `default_tls` is true for decrypted (MITM) traffic, whose origin-form URIs carry no scheme.
+pub async fn proxy_upgrade(
+    ws: &WsUpstream,
+    ctx: &ProxyContext,
+    mut req: Request<Incoming>,
+    default_tls: bool,
+    fallback: Option<(String, u16)>,
+) -> Result<Response<ProxyBody>> {
+    let Some(target) = resolve_target(req.uri(), req.headers(), default_tls, fallback.as_ref())
+    else {
+        return Ok(status_response(
+            StatusCode::BAD_REQUEST,
+            "Invalid WebSocket target",
+        ));
+    };
+
+    let check_url = target.check_url();
+    let origin = req
+        .headers()
+        .get(hyper::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&check_url)
+        .to_string();
+    if ctx.should_block(&check_url, &origin, "websocket") {
+        debug!("Blocked WebSocket to {}", check_url);
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("x-adblock", "blocked")
+            .body(full_body(Bytes::from_static(b"Blocked")))
+            .expect("static response"));
+    }
+
+    let io = match ws.dial(&target.host, target.port, target.tls).await {
+        Ok(io) => io,
+        Err(e) => {
+            warn!("WebSocket upstream dial to {} failed: {}", check_url, e);
+            return Ok(status_response(
+                StatusCode::BAD_GATEWAY,
+                "WebSocket upstream unavailable",
+            ));
         }
     };
 
-    let server_to_client = async {
-        while let Some(msg) = server_stream.next().await {
-            match msg {
-                Ok(msg) => {
-                    debug!("Server -> Client: {:?}", msg);
-                    if let Err(e) = client_sink.send(msg).await {
-                        error!("Error sending to client: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("Error receiving from server: {}", e);
-                    break;
-                }
-            }
-        }
-    };
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .map_err(|e| Error::Connection(format!("WebSocket upstream handshake: {e}")))?;
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
 
-    // Run both directions concurrently
-    tokio::select! {
-        _ = client_to_server => {
-            debug!("Client to server stream closed");
+    // Forward the client's handshake (Sec-WebSocket-* and the Upgrade pair included).
+    let mut up_req = Request::builder()
+        .method(Method::GET)
+        .uri(target.path_and_query.as_str())
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| Error::Http(format!("Bad upgrade request: {e}")))?;
+    {
+        let headers = up_req.headers_mut();
+        for (name, value) in req.headers() {
+            if name == HeaderName::from_static("proxy-authorization")
+                || name == HeaderName::from_static("proxy-connection")
+            {
+                continue;
+            }
+            headers.append(name.clone(), value.clone());
         }
-        _ = server_to_client => {
-            debug!("Server to client stream closed");
+        if !headers.contains_key(HOST) {
+            let default = if target.tls { 443 } else { 80 };
+            let host = if target.host.contains(':') {
+                format!("[{}]", target.host)
+            } else {
+                target.host.clone()
+            };
+            let value = if target.port == default {
+                host
+            } else {
+                format!("{host}:{}", target.port)
+            };
+            if let Ok(v) = value.parse() {
+                headers.insert(HOST, v);
+            }
         }
     }
 
-    info!("WebSocket proxy connection closed");
-    Ok(())
+    let mut resp = match tokio::time::timeout(ws.dial_timeout, sender.send_request(up_req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            warn!("WebSocket upstream request failed: {}", e);
+            return Ok(status_response(
+                StatusCode::BAD_GATEWAY,
+                "WebSocket upstream error",
+            ));
+        }
+        Err(_) => {
+            return Ok(status_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "WebSocket upstream timeout",
+            ))
+        }
+    };
+
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        // Origin refused the upgrade: hand its answer back unchanged.
+        return Ok(resp.map(|b| b.map_err(std::io::Error::other).boxed_unsync()));
+    }
+
+    let up_upgrade = hyper::upgrade::on(&mut resp);
+    let client_upgrade = hyper::upgrade::on(&mut req);
+    let desc = check_url.clone();
+    tokio::spawn(async move {
+        match tokio::try_join!(client_upgrade, up_upgrade) {
+            Ok((client, upstream)) => {
+                let mut client = TokioIo::new(client);
+                let mut upstream = TokioIo::new(upstream);
+                match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                    Ok((up, down)) => debug!("WebSocket {} closed (up {up}B, down {down}B)", desc),
+                    Err(e) => debug!("WebSocket {} ended: {}", desc, e),
+                }
+            }
+            Err(e) => warn!("WebSocket upgrade failed for {}: {}", desc, e),
+        }
+    });
+
+    let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    *out.headers_mut().expect("builder headers") = resp.headers().clone();
+    out.body(full_body(Bytes::new()))
+        .map_err(|e| Error::Http(format!("Bad upgrade response: {e}")))
 }
 
 #[cfg(test)]
@@ -195,5 +384,42 @@ mod tests {
 
         let target = extract_ws_target(&uri, &headers).unwrap();
         assert_eq!(target, "wss://example.com/ws");
+    }
+
+    #[test]
+    fn target_from_host_header_and_scheme_default() {
+        let uri: Uri = "/chat?x=1".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(HOST, "example.com:8080".parse().unwrap());
+        let t = resolve_target(&uri, &h, false, None).unwrap();
+        assert_eq!(
+            t,
+            Target {
+                host: "example.com".into(),
+                port: 8080,
+                tls: false,
+                path_and_query: "/chat?x=1".into()
+            }
+        );
+        assert_eq!(t.check_url(), "http://example.com:8080/chat?x=1");
+    }
+
+    #[test]
+    fn target_mitm_fallback_and_default_ports() {
+        let uri: Uri = "/ws".parse().unwrap();
+        let fb = ("example.com".to_string(), 443);
+        let t = resolve_target(&uri, &HeaderMap::new(), true, Some(&fb)).unwrap();
+        assert!(t.tls && t.port == 443);
+        assert_eq!(t.check_url(), "https://example.com/ws");
+        assert!(resolve_target(&uri, &HeaderMap::new(), true, None).is_none());
+    }
+
+    #[test]
+    fn target_absolute_ws_scheme_and_ipv6() {
+        let uri: Uri = "ws://[::1]:9000/s".parse().unwrap();
+        let t = resolve_target(&uri, &HeaderMap::new(), true, None).unwrap();
+        assert!(!t.tls);
+        assert_eq!(t.host, "::1");
+        assert_eq!(t.check_url(), "http://[::1]:9000/s");
     }
 }

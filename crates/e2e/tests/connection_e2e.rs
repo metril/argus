@@ -1,0 +1,67 @@
+//! Connection-level behaviour: WebSocket, IP-literal CONNECT, cold-host concurrency.
+
+use e2e::{connect_ws, connect_wss, e2e_test, HttpVersion, MockResponse};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+
+async fn echo(ws: &mut e2e::WsStream, text: &str) {
+    ws.send(Message::Text(text.into())).await.unwrap();
+    match ws.next().await.expect("frame").expect("ok frame") {
+        Message::Text(t) => assert_eq!(t.as_str(), text),
+        other => panic!("unexpected frame {other:?}"),
+    }
+}
+
+e2e_test!(ws_echo_plain, rules = [], |env| {
+    let mut ws = connect_ws(&env.proxy, "ws.test", env.origin.http_port(), "/ws").await;
+    echo(&mut ws, "hello").await;
+    echo(&mut ws, "again").await;
+    ws.close(None).await.unwrap();
+});
+
+e2e_test!(wss_echo_via_mitm, rules = [], |env| {
+    let mut ws = connect_wss(&env.proxy, "wss.test", env.origin.https_port(), "/ws").await;
+    echo(&mut ws, "secure hello").await;
+    echo(&mut ws, "secure again").await;
+    ws.close(None).await.unwrap();
+});
+
+e2e_test!(connect_to_ip_literal, rules = [], |env| {
+    env.origin.route("/ip", MockResponse::ok("ip-ok"));
+    let url = env.origin.https_url("127.0.0.1", "/ip");
+    let resp = env.client_with(HttpVersion::Http1).get(&url).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "ip-ok");
+});
+
+e2e_test!(concurrent_first_connections_one_cert, rules = [], |env| {
+    env.origin.route("/burst", MockResponse::ok("burst"));
+    let url = env.origin.https_url("cold-host.test", "/burst");
+    let tasks: Vec<_> = (0..24)
+        .map(|_| {
+            // One client per task so every request opens its own CONNECT.
+            let client = env.client_with(HttpVersion::Http1);
+            let url = url.clone();
+            tokio::spawn(async move { client.get(&url).await.status() })
+        })
+        .collect();
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), 200);
+    }
+    let mitm = env.proxy.mitm.as_ref().expect("mitm");
+    assert_eq!(mitm.generation_count(), 1);
+});
+
+e2e_test!(
+    ws_blocked_by_filter_never_reaches_origin,
+    rules = ["||blocked-ws.test^$websocket"],
+    |env| {
+        let tcp = tokio::net::TcpStream::connect(env.proxy.addr)
+            .await
+            .unwrap();
+        let url = format!("ws://blocked-ws.test:{}/ws", env.origin.http_port());
+        let err = tokio_tungstenite::client_async(url, tcp).await.unwrap_err();
+        assert!(matches!(err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403));
+        assert!(env.origin.requests_for("/ws").is_empty());
+    }
+);

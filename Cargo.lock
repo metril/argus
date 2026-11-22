@@ -3395,6 +3395,7 @@ dependencies = [
  "url",
  "userscript-engine",
  "web-api",
+ "webpki-roots",
 ]
 
 [[package]]
