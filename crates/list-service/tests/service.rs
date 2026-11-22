@@ -286,3 +286,26 @@ async fn scriptlet_resources_retry_until_available() {
     assert!(calls.load(Ordering::SeqCst) >= 2);
     assert!(dir.path().join("resources.json").exists());
 }
+
+#[tokio::test]
+async fn auto_update_schedule_can_be_enabled_live() {
+    let origin = Arc::new(Origin::default());
+    let addr = serve(origin.clone()).await;
+    let f = fixture(addr, |c| {
+        c.auto_update = false;
+        c.update_interval = Duration::from_secs(3600);
+    });
+    f.svc.start();
+    f.svc.wait_idle().await;
+    assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+
+    // Next fetch parks at the gate, proving the scheduler fired on the new short interval.
+    origin.gated.store(true, Ordering::SeqCst);
+    f.svc.set_schedule(true, Duration::from_millis(20));
+    assert_eq!(f.svc.schedule(), (true, Duration::from_millis(20)));
+    origin.arrived.notified().await;
+    origin.gated.store(false, Ordering::SeqCst);
+    origin.gate.notify_one();
+    f.svc.wait_idle().await;
+    assert!(origin.hits.load(Ordering::SeqCst) >= 2);
+}

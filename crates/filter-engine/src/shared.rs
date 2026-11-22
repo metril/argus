@@ -105,6 +105,11 @@ impl SharedEngine {
         Ok(n)
     }
 
+    /// The scriptlet/redirect resources currently loaded (pass to [`build_engine`] off-thread).
+    pub fn resources(&self) -> Arc<Vec<Resource>> {
+        self.resources.load_full()
+    }
+
     /// Install a freshly compiled, serialized engine (from [`compile_engine`]) and swap it in.
     ///
     /// Deserializes on the calling thread; from async code use `spawn_blocking`, or build with

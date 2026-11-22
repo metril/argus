@@ -28,10 +28,19 @@ impl ListService {
         }
     }
 
+    /// Parse + rebuild the engine on a blocking thread.
+    async fn set_resources(&self, json: String) -> Result<usize, String> {
+        let engine = self.engine.clone();
+        tokio::task::spawn_blocking(move || engine.set_resources_from_json(&json))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+    }
+
     async fn load_scriptlets_once(&self) -> Result<(), String> {
         let cache = self.cfg.data_dir.join("resources.json");
         if let Ok(json) = tokio::fs::read_to_string(&cache).await {
-            match self.engine.set_resources_from_json(&json) {
+            match self.set_resources(json).await {
                 Ok(n) => {
                     info!("Loaded {n} scriptlet resources from cache");
                     return Ok(());
@@ -43,8 +52,8 @@ impl ListService {
             .fetch_resources_json(&self.cfg.scriptlet_resources_url)
             .await?;
         let n = self
-            .engine
-            .set_resources_from_json(&json)
+            .set_resources(json.clone())
+            .await
             .map_err(|e| format!("resources invalid after conversion: {e}"))?;
         info!("Loaded {n} scriptlet resources");
         let _ = tokio::fs::create_dir_all(&self.cfg.data_dir).await;

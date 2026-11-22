@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use filter_engine::{compile_engine, FilterList, SharedEngine};
+use filter_engine::{build_engine, compile_engine, FilterList, SharedEngine};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
@@ -88,6 +88,8 @@ pub struct ListService {
     builds: AtomicU64,
     installed_once: AtomicBool,
     pub(crate) scriptlets_tx: watch::Sender<bool>,
+    /// Live auto-update schedule: `(auto_update, interval)`.
+    schedule: watch::Sender<(bool, Duration)>,
 }
 
 /// Read a response body, failing once it exceeds `cap` bytes.
@@ -125,7 +127,9 @@ impl ListService {
         engine: Arc<SharedEngine>,
         client: reqwest::Client,
     ) -> Arc<Self> {
+        let schedule = watch::channel((cfg.auto_update, cfg.update_interval)).0;
         Arc::new(Self {
+            schedule,
             cfg,
             store,
             engine,
@@ -174,18 +178,40 @@ impl ListService {
         self.trigger();
         let this = self.clone();
         tokio::spawn(async move { this.ensure_scriptlet_resources().await });
-        if self.cfg.auto_update {
-            let this = self.clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(this.cfg.update_interval);
-                ticker.tick().await; // initial load is separate
-                loop {
-                    ticker.tick().await;
-                    info!("Auto-update: refreshing filter lists");
-                    this.trigger();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut rx = this.schedule.subscribe();
+            loop {
+                let (auto, interval) = *rx.borrow_and_update();
+                if !auto {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
-            });
-        }
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        info!("Auto-update: refreshing filter lists");
+                        this.trigger();
+                    }
+                    r = rx.changed() => {
+                        if r.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Change the auto-update schedule while running; takes effect immediately.
+    pub fn set_schedule(&self, auto_update: bool, interval: Duration) {
+        self.schedule.send_replace((auto_update, interval));
+    }
+
+    /// The current `(auto_update, interval)` schedule.
+    pub fn schedule(&self) -> (bool, Duration) {
+        *self.schedule.borrow()
     }
 
     /// Request a rebuild without waiting. Overlapping triggers coalesce: at most one build runs,
@@ -231,10 +257,15 @@ impl ListService {
     }
 
     async fn compile_install(&self, contents: Vec<String>) -> Result<()> {
-        let bytes = tokio::task::spawn_blocking(move || compile_engine(&contents))
-            .await
-            .map_err(|e| Error::Other(format!("compile task failed: {e}")))?;
-        self.engine.install(bytes);
+        let resources = self.engine.resources();
+        let (blob, built) = tokio::task::spawn_blocking(move || {
+            let bytes = compile_engine(&contents);
+            let built = build_engine(&bytes, &resources);
+            (Arc::new(bytes), built)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("compile task failed: {e}")))?;
+        self.engine.install_built(blob, built);
         self.installed_once.store(true, Ordering::Release);
         Ok(())
     }
