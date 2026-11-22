@@ -1,8 +1,15 @@
 //! Caching DNS resolution for upstream connections.
 //!
-//! The cache stores only resolved addresses (clamped to the configured TTL bounds, failures
-//! cached briefly). It never decides policy: callers apply the destination policy to the
-//! addresses returned on every lookup, hit or miss, and connect to exactly those addresses.
+//! The cache stores only resolved addresses (clamped to the configured TTL bounds). Only
+//! definite negative answers (NXDOMAIN, or a name with no address records) are cached, briefly;
+//! transport failures (timeouts, SERVFAIL, I/O errors) never are, and a timed-out lookup is
+//! retried once. It never decides policy: callers apply the destination policy to the addresses
+//! returned on every lookup, hit or miss, and connect to exactly those addresses.
+//!
+//! Names hickory cannot resolve but the operating system can (mDNS `.local`, NSS sources) are
+//! looked up through the OS resolver whenever hickory answers "does not exist". This happens in
+//! the shared backend, so every path (MITM HTTP, CONNECT, WebSocket, transparent, control-plane
+//! fetches) behaves the same, and the policy still judges whatever either resolver returned.
 
 use common::config::DnsSettings;
 use moka::Expiry;
@@ -15,8 +22,34 @@ use std::time::{Duration, Instant};
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// A resolved name: addresses with their (unclamped) TTL, or an error message.
-pub type BackendResult = Result<(Vec<IpAddr>, Duration), String>;
+/// Why a lookup failed; decides whether the failure may be cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// The name does not exist or has no addresses: cacheable.
+    NotFound,
+    /// The query timed out: retried once, never cached.
+    Timeout,
+    /// SERVFAIL, I/O or other transport failure: never cached.
+    Transient,
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsFailure {
+    pub kind: FailKind,
+    pub message: String,
+}
+
+impl DnsFailure {
+    pub fn new(kind: FailKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+/// A resolved name: addresses with their (unclamped) TTL, or the failure.
+pub type BackendResult = Result<(Vec<IpAddr>, Duration), DnsFailure>;
 
 /// Source of truth behind the cache.
 pub trait DnsBackend: Send + Sync + 'static {
@@ -85,7 +118,10 @@ impl CachedResolver {
     /// Resolver for `settings`: hickory (system config or the configured servers) behind the cache.
     pub fn from_settings(settings: &DnsSettings) -> Self {
         Self::new(
-            Arc::new(HickoryBackend::new(settings)),
+            Arc::new(FallbackBackend {
+                primary: Arc::new(HickoryBackend::new(settings)),
+                secondary: Arc::new(OsBackend),
+            }),
             DnsCacheConfig::from(settings),
         )
     }
@@ -107,33 +143,110 @@ impl CachedResolver {
         let cfg = self.cfg.clone();
         let misses = &self.misses;
         let k2 = key.clone();
+        // `try_get_with` stores only `Ok`: transport failures are returned, not cached, and
+        // concurrent callers of one lookup share its outcome.
         let entry = self
             .cache
-            .get_with(key, async move {
+            .try_get_with(key, async move {
                 misses.fetch_add(1, Ordering::Relaxed);
-                match backend.lookup(&k2).await {
-                    Ok((addrs, ttl)) if !addrs.is_empty() => Entry {
+                let mut r = backend.lookup(&k2).await;
+                if matches!(&r, Err(f) if f.kind == FailKind::Timeout) {
+                    r = backend.lookup(&k2).await;
+                }
+                match r {
+                    Ok((addrs, ttl)) if !addrs.is_empty() => Ok(Entry {
                         result: Ok(addrs.into()),
                         ttl: ttl.clamp(cfg.min_ttl, cfg.max_ttl),
-                    },
-                    Ok(_) => Entry {
+                    }),
+                    Ok(_) => Ok(Entry {
                         result: Err("no addresses".into()),
                         ttl: cfg.negative_ttl,
-                    },
-                    Err(e) => Entry {
-                        result: Err(e.into()),
+                    }),
+                    Err(f) if f.kind == FailKind::NotFound => Ok(Entry {
+                        result: Err(f.message.into()),
                         ttl: cfg.negative_ttl,
-                    },
+                    }),
+                    Err(f) => Err(f),
                 }
             })
             .await;
-        entry.result.map_err(|e| e.to_string())
+        let out = match entry {
+            Ok(e) => e.result.map_err(|e| e.to_string()),
+            Err(f) => Err(f.message.clone()),
+        };
+        if out.is_err() {
+            common::faults::note(common::faults::Fault::DnsFailure, name);
+        }
+        out
     }
 }
 
 impl std::fmt::Debug for CachedResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedResolver").finish_non_exhaustive()
+    }
+}
+
+/// Operating-system resolver (`getaddrinfo`).
+pub struct OsBackend;
+
+impl DnsBackend for OsBackend {
+    fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
+        let name = name.to_string();
+        Box::pin(async move {
+            match tokio::net::lookup_host((name.as_str(), 0)).await {
+                Ok(addrs) => {
+                    let v: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+                    if v.is_empty() {
+                        Err(DnsFailure::new(FailKind::NotFound, "no addresses"))
+                    } else {
+                        Ok((v, Duration::from_secs(30)))
+                    }
+                }
+                Err(e) => Err(DnsFailure::new(classify_io(&e), e.to_string())),
+            }
+        })
+    }
+}
+
+/// `getaddrinfo` reports "not found" as a plain error; its text is the only portable signal.
+fn classify_io(e: &std::io::Error) -> FailKind {
+    let m = e.to_string().to_ascii_lowercase();
+    if m.contains("not known")
+        || m.contains("no such host")
+        || m.contains("no address associated")
+        || m.contains("name or service not found")
+        || m.contains("nodata")
+    {
+        FailKind::NotFound
+    } else {
+        FailKind::Transient
+    }
+}
+
+/// Asks `secondary` only when `primary` says the name does not exist.
+pub struct FallbackBackend {
+    pub primary: Arc<dyn DnsBackend>,
+    pub secondary: Arc<dyn DnsBackend>,
+}
+
+impl DnsBackend for FallbackBackend {
+    fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
+        let first = self.primary.lookup(name);
+        let secondary = self.secondary.clone();
+        let name = name.to_string();
+        Box::pin(async move {
+            match first.await {
+                Err(f) if f.kind == FailKind::NotFound => match secondary.lookup(&name).await {
+                    Ok(r) => Ok(r),
+                    // Both say the name does not exist; a transport failure of the second
+                    // resolver is not an answer, so it stays uncached.
+                    Err(g) if g.kind == FailKind::NotFound => Err(f),
+                    Err(g) => Err(g),
+                },
+                other => other,
+            }
+        })
     }
 }
 
@@ -199,6 +312,19 @@ impl HickoryBackend {
     }
 }
 
+/// Only an authoritative "no such name" / "no records" answer is a negative result; a timeout is
+/// retried, everything else (SERVFAIL, refused, I/O) is transient. Checked against hickory-net
+/// 0.26: `NetError::is_no_records_found` covers NXDOMAIN and NODATA (`DnsError::NoRecordsFound`).
+fn classify_hickory(e: &hickory_resolver::net::NetError) -> FailKind {
+    if e.is_no_records_found() {
+        FailKind::NotFound
+    } else if matches!(e, hickory_resolver::net::NetError::Timeout) {
+        FailKind::Timeout
+    } else {
+        FailKind::Transient
+    }
+}
+
 impl DnsBackend for HickoryBackend {
     fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
         let name = name.to_string();
@@ -209,16 +335,11 @@ impl DnsBackend for HickoryBackend {
                     let l = r
                         .lookup_ip(name.as_str())
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| DnsFailure::new(classify_hickory(&e), e.to_string()))?;
                     let ttl = l.valid_until().saturating_duration_since(Instant::now());
                     Ok((l.iter().collect(), ttl))
                 }
-                None => {
-                    let addrs = tokio::net::lookup_host((name.as_str(), 0))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    Ok((addrs.map(|a| a.ip()).collect(), Duration::from_secs(30)))
-                }
+                None => OsBackend.lookup(&name).await,
             }
         })
     }
@@ -232,18 +353,33 @@ mod tests {
     struct Fake {
         calls: AtomicU64,
         answer: Mutex<BackendResult>,
+        /// Answers handed out first, in order, before `answer`.
+        script: Mutex<Vec<BackendResult>>,
     }
     impl DnsBackend for Fake {
         fn lookup(&self, _name: &str) -> BoxFut<BackendResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let a = self.answer.lock().unwrap().clone();
+            let mut sc = self.script.lock().unwrap();
+            let a = if sc.is_empty() {
+                self.answer.lock().unwrap().clone()
+            } else {
+                sc.remove(0)
+            };
             Box::pin(async move { a })
         }
+    }
+    fn failing(kind: FailKind) -> Arc<Fake> {
+        Arc::new(Fake {
+            calls: AtomicU64::new(0),
+            answer: Mutex::new(Err(DnsFailure::new(kind, "boom"))),
+            script: Mutex::new(vec![]),
+        })
     }
     fn fake(ip: &str, ttl: Duration) -> Arc<Fake> {
         Arc::new(Fake {
             calls: AtomicU64::new(0),
             answer: Mutex::new(Ok((vec![ip.parse().unwrap()], ttl))),
+            script: Mutex::new(vec![]),
         })
     }
     fn cfg(min: u64, max: u64) -> DnsCacheConfig {
@@ -280,15 +416,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failures_are_cached_negatively() {
-        let f = Arc::new(Fake {
-            calls: AtomicU64::new(0),
-            answer: Mutex::new(Err("nxdomain".into())),
-        });
+    async fn nxdomain_is_cached_negatively() {
+        let f = failing(FailKind::NotFound);
         let r = CachedResolver::new(f.clone(), cfg(5_000, 60_000));
         assert!(r.resolve("nx.test").await.is_err());
         assert!(r.resolve("nx.test").await.is_err());
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transport_errors_are_never_cached() {
+        let f = failing(FailKind::Transient);
+        let r = CachedResolver::new(f.clone(), cfg(5_000, 60_000));
+        assert!(r.resolve("flaky.test").await.is_err());
+        assert!(r.resolve("flaky.test").await.is_err());
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            2,
+            "a lost answer must not stick"
+        );
+        // The next client gets a fresh attempt and succeeds.
+        *f.answer.lock().unwrap() = Ok((
+            vec!["203.0.113.9".parse().unwrap()],
+            Duration::from_secs(60),
+        ));
+        assert!(r.resolve("flaky.test").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_retried_once_and_not_cached() {
+        let f = failing(FailKind::Timeout);
+        let r = CachedResolver::new(f.clone(), cfg(5_000, 60_000));
+        assert!(r.resolve("slow.test").await.is_err());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2, "one retry, no more");
+        assert!(r.resolve("slow.test").await.is_err());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 4);
+        // First attempt times out, the retry answers.
+        let g = failing(FailKind::Timeout);
+        g.script
+            .lock()
+            .unwrap()
+            .push(Err(DnsFailure::new(FailKind::Timeout, "t")));
+        *g.answer.lock().unwrap() = Ok((
+            vec!["203.0.113.9".parse().unwrap()],
+            Duration::from_secs(60),
+        ));
+        let r = CachedResolver::new(g.clone(), cfg(5_000, 60_000));
+        assert!(r.resolve("slow2.test").await.is_ok());
+        assert_eq!(g.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn os_fallback_only_on_nonexistence() {
+        let ok = fake("203.0.113.7", Duration::from_secs(60));
+        let nx = failing(FailKind::NotFound);
+        let r = CachedResolver::new(
+            Arc::new(FallbackBackend {
+                primary: nx,
+                secondary: ok.clone(),
+            }),
+            cfg(5_000, 60_000),
+        );
+        assert_eq!(
+            r.resolve("printer.local").await.unwrap()[0],
+            "203.0.113.7".parse::<IpAddr>().unwrap()
+        );
+        let ok2 = fake("203.0.113.7", Duration::from_secs(60));
+        let r = CachedResolver::new(
+            Arc::new(FallbackBackend {
+                primary: failing(FailKind::Transient),
+                secondary: ok2.clone(),
+            }),
+            cfg(5_000, 60_000),
+        );
+        assert!(r.resolve("x.test").await.is_err());
+        assert_eq!(
+            ok2.calls.load(Ordering::SeqCst),
+            0,
+            "a transient failure is not 'does not exist'"
+        );
     }
 
     fn settings(servers: Vec<String>) -> DnsSettings {
@@ -321,8 +527,14 @@ mod tests {
                 let qtype = u16::from_be_bytes([q[qend - 4], q[qend - 3]]);
                 let mut r = Vec::new();
                 r.extend_from_slice(&q[..2]); // id
-                r.extend_from_slice(&[0x81, 0x80, 0, 1]); // response, RD+RA, qdcount
-                let an: u16 = if qtype == 1 { 1 } else { 0 };
+                                              // `nx.*` answers NXDOMAIN, `fail.*` SERVFAIL, anything else succeeds.
+                let rcode = match &q[13..15] {
+                    b"nx" => 3,
+                    b"fa" => 2,
+                    _ => 0,
+                };
+                r.extend_from_slice(&[0x81, 0x80 | rcode, 0, 1]); // response, RD+RA, qdcount
+                let an: u16 = if qtype == 1 && rcode == 0 { 1 } else { 0 };
                 r.extend_from_slice(&an.to_be_bytes());
                 r.extend_from_slice(&[0, 0, 0, 0]);
                 r.extend_from_slice(&q[12..qend]);
@@ -354,6 +566,31 @@ mod tests {
             queries.load(Ordering::SeqCst),
             before,
             "second lookup must hit the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn hickory_caches_nxdomain_but_not_servfail() {
+        let (addr, queries) = fake_dns_server();
+        let st = settings(vec![addr.to_string()]);
+        let r = CachedResolver::new(
+            Arc::new(HickoryBackend::new(&st)),
+            DnsCacheConfig {
+                negative_ttl: Duration::from_secs(30),
+                ..DnsCacheConfig::from(&st)
+            },
+        );
+        assert!(r.resolve("nx.example.test").await.is_err());
+        let n = queries.load(Ordering::SeqCst);
+        assert!(r.resolve("nx.example.test").await.is_err());
+        assert_eq!(queries.load(Ordering::SeqCst), n, "NXDOMAIN is cached");
+
+        assert!(r.resolve("fail.example.test").await.is_err());
+        let n = queries.load(Ordering::SeqCst);
+        assert!(r.resolve("fail.example.test").await.is_err());
+        assert!(
+            queries.load(Ordering::SeqCst) > n,
+            "SERVFAIL must be asked again"
         );
     }
 
