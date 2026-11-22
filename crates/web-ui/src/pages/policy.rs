@@ -5,7 +5,7 @@ use leptos::prelude::*;
 
 use crate::api::policy::*;
 use crate::api::ApiClient;
-use crate::components::{Card, Layout};
+use crate::components::{Card, Layout, ProfileSelector};
 use crate::state::{use_app_state, AppState};
 
 /// Capabilities that can be allowed or denied per third-party source.
@@ -61,6 +61,7 @@ pub fn PolicyPage() -> impl IntoView {
         <Layout>
             <div class="page-header">
                 <h1 class="page-title">"Script policy"</h1>
+                <ProfileSelector reload=reload />
             </div>
             <p class="modal-help">
                 "NoScript-style control, enforced with a Content-Security-Policy added to each page. \
@@ -68,7 +69,7 @@ pub fn PolicyPage() -> impl IntoView {
                  when it can tell which page made them."
             </p>
             <SettingsCard reload=reload />
-            <PanelCard />
+            <PanelCard reload=reload />
             <SitesCard reload=reload />
             <TempCard reload=reload />
             <ExplainCard />
@@ -767,7 +768,7 @@ fn ExplainCard() -> impl IntoView {
 
 /// The in-page panel (hotkey) and per-site "ad blocking off".
 #[component]
-fn PanelCard() -> impl IntoView {
+fn PanelCard(reload: RwSignal<u32>) -> impl IntoView {
     let app = use_app_state();
     let cur = RwSignal::new(Option::<PanelSettingsDto>::None);
     let pin = RwSignal::new(String::new());
@@ -777,6 +778,7 @@ fn PanelCard() -> impl IntoView {
     {
         let app = app.clone();
         Effect::new(move || {
+            reload.track();
             let app = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match ApiClient::new().get_panel_settings().await {

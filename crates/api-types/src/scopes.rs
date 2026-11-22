@@ -53,10 +53,10 @@ scopes! {
     ScriptsWrite => "scripts:write", "Install, update, enable, disable and remove userscripts; view and clear their stored values.";
     PolicyRead => "policy:read", "View script policy rules, explanations, temporary permissions and blocked-source reports.";
     PolicyWrite => "policy:write", "Change script policy settings, rules and temporary permissions; import policy.";
-    ProfilesRead => "profiles:read", "Read filtering profiles (reserved).";
-    ProfilesWrite => "profiles:write", "Change filtering profiles (reserved).";
-    DevicesRead => "devices:read", "Read devices (reserved).";
-    DevicesWrite => "devices:write", "Change devices (reserved).";
+    ProfilesRead => "profiles:read", "List and view filtering profiles (lists and overlay rules) the token may access.";
+    ProfilesWrite => "profiles:write", "Create, edit and delete filtering profiles.";
+    DevicesRead => "devices:read", "List and view devices (profile, addresses, token state; never the token).";
+    DevicesWrite => "devices:write", "Create, edit and delete devices; issue and revoke device tokens.";
     UsersRead => "users:read", "List and view user accounts.";
     UsersAdmin => "users:admin", "Create, update, disable and delete user accounts.";
     TokensSelf => "tokens:self", "Create, list and revoke your own API tokens.";

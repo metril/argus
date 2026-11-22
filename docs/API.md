@@ -27,7 +27,7 @@ curl -X POST http://host:3000/api/v1/tokens \
 The response contains `secret` exactly once; only a digest is stored. A token can never hold a
 scope its creator lacks, and its power shrinks if the creator is demoted or disabled. Revoking
 (`DELETE /tokens/{id}`) takes effect on the next request. Optional `profiles` restricts a token to
-the given profile ids (enforced once profile routes exist).
+the given profile ids (see "Profiles, devices and restricted tokens").
 
 ## Scopes
 
@@ -52,10 +52,10 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts; view and clear their stored values. |
 | `policy:read` | yes | yes | yes | View script policy rules, explanations, temporary permissions and blocked-source reports. |
 | `policy:write` | - | yes | yes | Change script policy settings, rules and temporary permissions; import policy. |
-| `profiles:read` | yes | yes | yes | Read filtering profiles (reserved). |
-| `profiles:write` | - | - | yes | Change filtering profiles (reserved). |
-| `devices:read` | yes | yes | yes | Read devices (reserved). |
-| `devices:write` | - | - | yes | Change devices (reserved). |
+| `profiles:read` | yes | yes | yes | List and view filtering profiles (lists and overlay rules) the token may access. |
+| `profiles:write` | - | - | yes | Create, edit and delete filtering profiles. |
+| `devices:read` | yes | yes | yes | List and view devices (profile, addresses, token state; never the token). |
+| `devices:write` | - | - | yes | Create, edit and delete devices; issue and revoke device tokens. |
 | `users:read` | - | - | yes | List and view user accounts. |
 | `users:admin` | - | - | yes | Create, update, disable and delete user accounts. |
 | `tokens:self` | - | yes | yes | Create, list and revoke your own API tokens. |
@@ -143,7 +143,7 @@ host, request type, matched rule, list id (for domain-set hits) and client label
 
 ## Userscripts
 
-All routes act on the default profile. Writes are audited.
+Routes take `?profile=<id>` (default `0`). Writes are audited.
 
 | Method and path | Scope | Purpose |
 |---|---|---|
@@ -167,7 +167,7 @@ with `url`; there is no proxy interception.
 ## Script policy and the in-page panel
 
 Routes under `/api/v1/policy` (scopes `policy:read` / `policy:write`); see `docs/SCRIPT-POLICY.md`
-for the model. All act on the default profile and writes are audited.
+for the model. Routes take `?profile=<id>` (default `0`) and writes are audited.
 
 | Method and path | Scope | Purpose |
 |---|---|---|
@@ -185,3 +185,40 @@ for the model. All act on the default profile and writes are audited.
 Deployment settings are in `[script_control]` (`panel_enabled`, `panel_host`, `dashboard_url`). The
 panel's own endpoints (`/__adblock__/panel/state`, `/__adblock__/pv`, and the reserved host) are
 proxy-internal and are not part of this API.
+
+## Profiles, devices and restricted tokens
+
+A profile is a named set of enabled filter lists plus overlay rules; profile `0` is the built-in
+`default` profile (the global lists and custom rules), which cannot be renamed or deleted. A
+device selects a profile by address or CIDR prefix, or by a device token. Ids are decimal strings.
+
+| Method and path | Scope | Purpose |
+|---|---|---|
+| `GET`, `POST /profiles` | `profiles:read` / `profiles:write` | List / create (`name`, `description`, `lists`, `rules`). |
+| `GET`, `PUT`, `DELETE /profiles/{profile_id}` | read / write | Get / update (omitted fields unchanged) / delete. Delete returns 409 while devices use the profile. |
+| `GET`, `POST /devices` | `devices:read` / `devices:write` | List / create (`name`, `profile_id`, `ips`). |
+| `GET`, `PUT`, `DELETE /devices/{device_id}` | read / write | Get / update name, profile or addresses / delete. |
+| `POST /devices/{device_id}/token` | `devices:write` | Issue a token (replaces the current one). The response, `201 {"token": ...}` with `Cache-Control: no-store`, is the only place it ever appears. Use it as `http://device:<token>@<proxy-host>:<port>`. |
+| `DELETE /devices/{device_id}/token` | `devices:write` | Revoke the token. |
+
+Errors: 400 (malformed id, invalid name, list, address or rules, or the default profile), 403
+(restricted token), 404, 409 (duplicate name or address, profile in use). Devices expose only
+`has_token` and `token_hint` (last 4 characters); no response, audit entry or log carries a token
+or its digest.
+
+**The `profile` parameter.** Script policy (`/policy/*`), userscripts (`/userscripts/*`, including
+storage) and `/rules/site-exceptions/*` operate on one profile, chosen with `?profile=<id>`
+(default `0`). Site exceptions of a non-default profile edit that profile's overlay rules. A
+malformed id is 400, an unknown one 404. A userscript plan can only be confirmed under the profile
+it was planned for.
+
+**Restricted tokens.** A token created with `profiles: [...]` can use only those profiles.
+Enforcement is one extractor (`ProfileParam`) on every profile-scoped route: another profile, or
+the default profile when `0` is not listed, is 403 `profile_forbidden`. Such a token lists only its
+profiles and the devices assigned to them, cannot create profiles, and cannot create a device in
+or move one to a profile it lacks. A token minted by a restricted token inherits its restriction
+when none is given and may only narrow it (wider is 403 `scope_escalation`). Global resources are
+not profile-scoped, so for restricted tokens: every write is 403 `profile_restricted` (lists,
+custom rules, config, engine, stats reset, users, CA, admin routes); reads of lists, config, stats,
+system status and CA info are allowed; `GET /rules/custom` needs access to profile `0`; users,
+audit and admin reads are refused. Managing the token's own tokens and sessions stays allowed.

@@ -2,9 +2,11 @@
 
 pub mod blocked;
 pub mod dashboard;
+pub mod devices;
 pub mod filters;
 pub mod login;
 pub mod policy;
+pub mod profiles;
 pub mod proxy;
 pub mod register;
 pub mod settings;
@@ -13,9 +15,11 @@ pub mod userscripts;
 
 pub use blocked::BlockedPage;
 pub use dashboard::DashboardPage;
+pub use devices::DevicesPage;
 pub use filters::FiltersPage;
 pub use login::LoginPage;
 pub use policy::PolicyPage;
+pub use profiles::ProfilesPage;
 pub use proxy::ProxyPage;
 pub use register::RegisterPage;
 pub use settings::SettingsPage;

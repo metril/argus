@@ -4,6 +4,7 @@ pub mod auth;
 pub mod client;
 pub mod filters;
 pub mod policy;
+pub mod profiles;
 pub mod proxy;
 pub mod tokens;
 pub mod userscripts;
