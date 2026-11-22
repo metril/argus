@@ -343,6 +343,10 @@ impl ProxyContext {
             if is_hop_by_hop(name) || name.as_str().eq_ignore_ascii_case("content-length") {
                 continue;
             }
+            // Never advertise HTTP/3 (QUIC bypasses the proxy): clients keep using TCP.
+            if name == hyper::header::ALT_SVC {
+                continue;
+            }
             if inject && name == hyper::header::CONTENT_ENCODING {
                 continue;
             }

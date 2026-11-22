@@ -2,8 +2,9 @@
 //!
 //! Two stages keep the entry mode separate from the interception logic:
 //!
-//! 1. **Entry** ([`ConnectionHandler::resolve_entry`]): works out what the client asked for
-//!    (CONNECT today; a transparent listener later) and produces a [`ConnectionTarget`] plus the
+//! 1. **Entry** ([`ConnectionHandler::resolve_entry`] for explicit-proxy mode,
+//!    [`crate::transparent::TransparentEntry`] for the transparent listener): works out what the
+//!    client asked for and produces a [`ConnectionTarget`] plus the
 //!    stream, with any bytes read past the request head replayed.
 //! 2. **Serve** ([`ConnectionHandler::intercept_and_serve`]): given a target and a stream, either
 //!    terminates TLS (MITM) and serves HTTP/1.1 or h2, or tunnels bytes. It does not care how the
@@ -63,6 +64,8 @@ pub struct ConnectionShared {
     /// Shared filtering + upstream-forwarding context (engine handle + pooled HTTP client).
     pub ctx: Arc<ProxyContext>,
     pub timeouts: Timeouts,
+    /// Hosts whose TLS is tunnelled instead of intercepted (both entry modes).
+    pub passthrough: crate::passthrough::PassthroughList,
     #[cfg(feature = "websockets")]
     pub ws: Option<Arc<crate::websocket::WsUpstream>>,
 }
@@ -79,22 +82,32 @@ pub struct ConnectionTarget {
 
 /// Where decrypted/plain HTTP requests are headed (origin-form URIs carry no host of their own).
 #[derive(Clone)]
-struct Origin {
+pub(crate) struct Origin {
     scheme: &'static str,
     authority: Option<(String, u16)>,
 }
 
-/// Result of the entry step.
+impl Origin {
+    /// Plain HTTP whose host comes from each request's `Host` header, falling back to `dst`.
+    pub(crate) fn plain(dst: SocketAddr) -> Self {
+        Self {
+            scheme: "http",
+            authority: Some((dst.ip().to_string(), dst.port())),
+        }
+    }
+}
+
+/// Result of the explicit-proxy entry step.
 pub enum Entry<IO> {
-    /// A CONNECT (or, later, transparent) target to intercept or tunnel.
+    /// A CONNECT target to intercept or tunnel.
     Target(ConnectionTarget, IO),
     /// Plain proxy-style HTTP; the stream replays the bytes already read.
     PlainHttp(IO),
 }
 
 pub struct ConnectionHandler {
-    client_addr: SocketAddr,
-    shared: Arc<ConnectionShared>,
+    pub(crate) client_addr: SocketAddr,
+    pub(crate) shared: Arc<ConnectionShared>,
     /// Built once per connection; every request on it (plain, MITM h1/h2, WebSocket) shares it.
     rctx: Arc<RequestCtx>,
 }
@@ -159,11 +172,12 @@ impl ConnectionHandler {
             .await
             .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
 
+        let intercept_tls = self.shared.mitm.is_some() && !self.shared.passthrough.matches(&host);
         let target = ConnectionTarget {
             host,
             port,
             client_addr: self.client_addr,
-            intercept_tls: self.shared.mitm.is_some(),
+            intercept_tls,
         };
         Ok(Entry::Target(target, Prefixed::new(leftover, stream)))
     }
@@ -230,7 +244,7 @@ impl ConnectionHandler {
     }
 
     /// Serve HTTP/1.1 (with upgrade support) over `io`.
-    async fn serve_http<IO>(&self, io: IO, origin: Origin) -> Result<()>
+    pub(crate) async fn serve_http<IO>(&self, io: IO, origin: Origin) -> Result<()>
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -262,8 +276,14 @@ impl ConnectionHandler {
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let t = &self.shared.timeouts;
-        let addr = (target.host.as_str(), target.port);
-        let mut server = match tokio::time::timeout(t.handshake, TcpStream::connect(addr)).await {
+        // Same resolution as the HTTP client: normal DNS unless a code-only override is set.
+        let dial = async {
+            match self.shared.ctx.resolve_all_to() {
+                Some(ip) => TcpStream::connect((ip, target.port)).await,
+                None => TcpStream::connect((target.host.as_str(), target.port)).await,
+            }
+        };
+        let mut server = match tokio::time::timeout(t.handshake, dial).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 return Err(Error::Connection(format!(
@@ -352,7 +372,7 @@ pub enum HeadError {
 }
 
 /// Read until `buf` holds at least `n` bytes (bounded by `timeout`).
-async fn read_at_least<R: AsyncRead + Unpin>(
+pub(crate) async fn read_at_least<R: AsyncRead + Unpin>(
     io: &mut R,
     buf: &mut Vec<u8>,
     n: usize,
@@ -731,6 +751,7 @@ mod tests {
             enable_websockets: false,
             ctx: ctx.clone(),
             timeouts: Timeouts::from_config(&crate::config::ProxyConfig::default().performance),
+            passthrough: Default::default(),
             #[cfg(feature = "websockets")]
             ws: None,
         });

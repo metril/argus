@@ -31,7 +31,6 @@ fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         port: config.proxy.port,
         max_connections: config.performance.max_connections as u32,
         enable_http2: config.proxy.enable_http2,
-        enable_http3: config.proxy.enable_http3,
         enable_websockets: config.proxy.enable_websockets,
         enable_mitm: config.mitm.enabled,
         connection_timeout_secs: config.performance.connection_timeout_secs,
@@ -116,7 +115,6 @@ pub async fn update_config(
             req.max_connections.map(|v| v as usize)
         );
         restart_field!("enable_http2", config.proxy.enable_http2, req.enable_http2);
-        restart_field!("enable_http3", config.proxy.enable_http3, req.enable_http3);
         restart_field!(
             "enable_websockets",
             config.proxy.enable_websockets,

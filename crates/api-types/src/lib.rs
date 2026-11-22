@@ -154,7 +154,6 @@ pub struct ProxyConfigResponse {
     pub port: u16,
     pub max_connections: u32,
     pub enable_http2: bool,
-    pub enable_http3: bool,
     pub enable_websockets: bool,
     pub enable_mitm: bool,
     pub connection_timeout_secs: u64,
@@ -196,7 +195,6 @@ pub struct UpdateProxyConfigRequest {
     pub max_connections: Option<u32>,
 
     pub enable_http2: Option<bool>,
-    pub enable_http3: Option<bool>,
     pub enable_websockets: Option<bool>,
     pub enable_mitm: Option<bool>,
 

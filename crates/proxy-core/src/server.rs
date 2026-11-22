@@ -7,6 +7,10 @@ use crate::{
     filtering::ProxyContext,
     load_manager::{AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig},
     mitm::MitmHandler,
+    passthrough::PassthroughList,
+    transparent::{
+        KernelOriginalDst, OriginalDst, TransparentEntry, KERNEL_ORIGINAL_DST_SUPPORTED,
+    },
     Error, Result,
 };
 use std::sync::Arc;
@@ -21,6 +25,9 @@ pub struct ProxyServer {
     load_manager: Arc<LoadManager>,
     /// Shared filtering + upstream-forwarding context handed to each connection.
     ctx: Arc<ProxyContext>,
+    /// Original-destination source for the transparent listener. Code-only (never from config);
+    /// `None` means the kernel's `SO_ORIGINAL_DST`.
+    original_dst: Option<Arc<dyn OriginalDst>>,
 }
 
 impl ProxyServer {
@@ -75,6 +82,7 @@ impl ProxyServer {
             mitm_handler,
             load_manager,
             ctx,
+            original_dst: None,
         })
     }
 
@@ -89,12 +97,29 @@ impl ProxyServer {
         Ok(server)
     }
 
+    /// Use `original_dst` instead of the kernel lookup for the transparent listener (tests and
+    /// controlled setups).
+    pub fn with_original_dst(mut self, original_dst: Arc<dyn OriginalDst>) -> Self {
+        self.original_dst = Some(original_dst);
+        self
+    }
+
     /// Start the proxy server with graceful shutdown
     pub async fn start(&self) -> Result<()> {
         let addr = format!("{}:{}", self.config.proxy.host, self.config.proxy.port);
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| Error::Connection(format!("Failed to bind to {}: {}", addr, e)))?;
+
+        let transparent = match self.config.proxy.transparent_port {
+            Some(port) => {
+                let taddr = format!("{}:{}", self.config.proxy.host, port);
+                Some(TcpListener::bind(&taddr).await.map_err(|e| {
+                    Error::Connection(format!("Failed to bind transparent listener {taddr}: {e}"))
+                })?)
+            }
+            None => None,
+        };
 
         // Create shutdown channel and spawn the signal handler.
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -105,7 +130,7 @@ impl ProxyServer {
             let _ = shutdown_signal.send(());
         });
 
-        self.serve(listener, shutdown_tx).await
+        self.serve_all(listener, transparent, shutdown_tx).await
     }
 
     /// Serve on an already-bound listener until `shutdown_tx` fires. Lets callers (and tests)
@@ -115,11 +140,23 @@ impl ProxyServer {
         listener: TcpListener,
         shutdown_tx: broadcast::Sender<()>,
     ) -> Result<()> {
-        let local_addr = listener.local_addr().ok();
-        let addr = local_addr.map(|a| a.to_string()).unwrap_or_default();
+        self.serve_all(listener, None, shutdown_tx).await
+    }
+
+    /// Like [`Self::serve`], plus an optional already-bound transparent-gateway listener served
+    /// with the same admission control, shared pipeline and shutdown signal.
+    pub async fn serve_all(
+        &self,
+        listener: TcpListener,
+        transparent: Option<TcpListener>,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> Result<()> {
+        let addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         info!("Proxy server listening on {}", addr);
         info!("HTTP/2: {}", self.config.proxy.enable_http2);
-        info!("HTTP/3: {}", self.config.proxy.enable_http3);
         info!("WebSockets: {}", self.config.proxy.enable_websockets);
         info!("MITM: {}", self.config.mitm.enabled);
 
@@ -135,14 +172,6 @@ impl ProxyServer {
         let _monitoring_handle = self.load_manager.start_monitoring();
         info!("Load manager monitoring started");
 
-        // Start HTTP/3 server if enabled
-        #[cfg(feature = "http3")]
-        if self.config.proxy.enable_http3 {
-            let port = local_addr.map_or(self.config.proxy.port, |a| a.port());
-            self.start_http3_server(shutdown_tx.subscribe(), port)
-                .await?;
-        }
-
         let timeouts = Timeouts::from_config(&self.config.performance);
         let shared = Arc::new(ConnectionShared {
             mitm: self.mitm_handler.clone(),
@@ -150,6 +179,7 @@ impl ProxyServer {
             enable_websockets: self.config.proxy.enable_websockets,
             ctx: self.ctx.clone(),
             timeouts,
+            passthrough: PassthroughList::new(&self.config.proxy.tls_passthrough_hosts),
             #[cfg(feature = "websockets")]
             ws: if self.config.proxy.enable_websockets {
                 Some(Arc::new(crate::websocket::WsUpstream::new(
@@ -162,7 +192,64 @@ impl ProxyServer {
             },
         });
 
-        // Subscribe to shutdown signal for the main loop
+        let entry = match &transparent {
+            Some(t) => {
+                let original_dst = match &self.original_dst {
+                    Some(d) => d.clone(),
+                    None if KERNEL_ORIGINAL_DST_SUPPORTED => Arc::new(KernelOriginalDst),
+                    None => {
+                        return Err(Error::Config(
+                            "transparent mode is only supported on Linux".into(),
+                        ))
+                    }
+                };
+                let mut own_ports: Vec<u16> = [listener.local_addr(), t.local_addr()]
+                    .into_iter()
+                    .flatten()
+                    .map(|a| a.port())
+                    .collect();
+                own_ports.dedup();
+                info!(
+                    "Transparent listener on {}",
+                    t.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                );
+                Some(Arc::new(TransparentEntry::new(original_dst, own_ports)))
+            }
+            None => None,
+        };
+
+        let explicit_loop = self.accept_loop(listener, shared.clone(), None, &shutdown_tx);
+        let transparent_loop = async {
+            if let Some(t) = transparent {
+                self.accept_loop(t, shared.clone(), entry, &shutdown_tx)
+                    .await;
+            }
+        };
+        tokio::join!(explicit_loop, transparent_loop);
+
+        // Log final statistics
+        let stats = self.load_manager.stats();
+        info!(
+            "Proxy server stopped. Final stats: accepted={}, rejected={} (memory={}, max={}, rate={})",
+            stats.connections_accepted,
+            stats.connections_rejected,
+            stats.connections_rejected_memory,
+            stats.connections_rejected_max,
+            stats.connections_rejected_rate
+        );
+
+        Ok(())
+    }
+
+    /// Accept connections on `listener` until shutdown; `entry` selects the transparent entry
+    /// layer (`None` = explicit proxy).
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        shared: Arc<ConnectionShared>,
+        entry: Option<Arc<TransparentEntry>>,
+        shutdown_tx: &broadcast::Sender<()>,
+    ) {
         let mut main_shutdown_rx = shutdown_tx.subscribe();
 
         loop {
@@ -193,6 +280,7 @@ impl ProxyServer {
                             trace!("Accepted connection from {}", client_addr);
 
                             let shared = shared.clone();
+                            let entry = entry.clone();
                             let mut shutdown_rx = shutdown_tx.subscribe();
                             let load_manager = self.load_manager.clone();
 
@@ -203,7 +291,12 @@ impl ProxyServer {
 
                                 let handler = ConnectionHandler::new(client_addr, shared);
                                 tokio::select! {
-                                    result = handler.handle(stream) => {
+                                    result = async {
+                                        match &entry {
+                                            Some(entry) => entry.handle(&handler, stream).await,
+                                            None => handler.handle(stream).await,
+                                        }
+                                    } => {
                                         if let Err(e) = result {
                                             debug!("Connection from {} ended with error: {}", client_addr, e);
                                         }
@@ -226,19 +319,6 @@ impl ProxyServer {
                 }
             }
         }
-
-        // Log final statistics
-        let stats = self.load_manager.stats();
-        info!(
-            "Proxy server stopped. Final stats: accepted={}, rejected={} (memory={}, max={}, rate={})",
-            stats.connections_accepted,
-            stats.connections_rejected,
-            stats.connections_rejected_memory,
-            stats.connections_rejected_max,
-            stats.connections_rejected_rate
-        );
-
-        Ok(())
     }
 
     /// Get MITM handler
@@ -254,74 +334,6 @@ impl ProxyServer {
     /// Get load manager statistics
     pub fn load_stats(&self) -> crate::load_manager::LoadManagerStatsSnapshot {
         self.load_manager.stats()
-    }
-
-    /// Start HTTP/3 server (optional feature)
-    #[cfg(feature = "http3")]
-    async fn start_http3_server(
-        &self,
-        shutdown_rx: broadcast::Receiver<()>,
-        local_port: u16,
-    ) -> Result<()> {
-        use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
-
-        // HTTP/3 requires MITM to be enabled for certificate generation
-        let mitm_handler = self
-            .mitm_handler
-            .as_ref()
-            .ok_or_else(|| Error::Config("HTTP/3 requires MITM to be enabled".to_string()))?;
-
-        // Get CA reference for QUIC/TLS
-        let _ca = mitm_handler.ca();
-        let ca_cert_pem = std::fs::read_to_string(&self.config.mitm.ca_cert_path)
-            .map_err(|e| Error::Tls(format!("Failed to read CA certificate: {}", e)))?;
-        let ca_key_pem = std::fs::read_to_string(&self.config.mitm.ca_key_path)
-            .map_err(|e| Error::Tls(format!("Failed to read CA key: {}", e)))?;
-
-        // Parse CA certificate and key
-        let ca_certs = rustls_pemfile::certs(&mut ca_cert_pem.as_bytes())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Tls(format!("Failed to parse CA certificate: {}", e)))?;
-
-        let ca_key = rustls_pemfile::private_key(&mut ca_key_pem.as_bytes())
-            .map_err(|e| Error::Tls(format!("Failed to parse CA key: {}", e)))?
-            .ok_or_else(|| Error::Tls("No private key found in CA key file".to_string()))?;
-
-        // Create TLS config with ALPN for HTTP/3
-        let mut tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(ca_certs, ca_key)
-            .map_err(|e| Error::Tls(format!("Failed to create TLS config: {}", e)))?;
-
-        // HTTP/3 requires "h3" ALPN protocol
-        tls_config.alpn_protocols = vec![b"h3".to_vec()];
-
-        // Create QUIC configuration
-        let udp_addr = format!("{}:{}", self.config.proxy.host, local_port)
-            .parse()
-            .map_err(|e| Error::Connection(format!("Invalid address: {}", e)))?;
-
-        let quic_config = QuicConfig::new(udp_addr, Arc::new(tls_config));
-        let endpoint = quic_config
-            .create_endpoint()
-            .map_err(|e| Error::Connection(format!("Failed to create QUIC endpoint: {}", e)))?;
-
-        info!("HTTP/3 server will start on UDP {}", udp_addr);
-
-        // Spawn HTTP/3 server in background, sharing the same filtering engine + upstream client.
-        let h3_filter = Arc::new(Http3Filter::new(
-            self.ctx.engine().clone(),
-            self.ctx.client(),
-            self.ctx.adblock_enabled(),
-        ));
-        let http3_server = Http3Server::new(endpoint, h3_filter);
-        tokio::spawn(async move {
-            if let Err(e) = http3_server.start(shutdown_rx).await {
-                warn!("HTTP/3 server error: {}", e);
-            }
-        });
-
-        Ok(())
     }
 }
 

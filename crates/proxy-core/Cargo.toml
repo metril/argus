@@ -81,9 +81,6 @@ common = { path = "../common" }
 tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = "1.0"
 
-# HTTP/3 support (optional)
-proxy-http3 = { path = "../proxy-http3", optional = true }
-
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine" }
 
@@ -96,14 +93,17 @@ web-api = { path = "../web-api", optional = true }
 # Filter-list service (always on — loads, compiles and refreshes the rules)
 list-service = { path = "../list-service" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# SO_ORIGINAL_DST / IP6T_SO_ORIGINAL_DST for transparent mode.
+socket2 = { version = "0.6", features = ["all"] }
+
 [features]
 # Request filtering is always compiled in; WebSocket proxying is on by default.
 default = ["websockets"]
-http3 = ["dep:proxy-http3"]
 websockets = ["dep:tokio-tungstenite"]
 userscripts = ["dep:userscript-engine"]
 webui = ["dep:web-api", "dep:userscript-engine"]
-full = ["http3", "websockets", "userscripts", "webui"]
+full = ["websockets", "userscripts", "webui"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

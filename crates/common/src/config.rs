@@ -21,7 +21,14 @@ pub struct ProxySettings {
     pub host: String,
     pub port: u16,
     pub enable_http2: bool,
-    pub enable_http3: bool,
+    /// Optional second listener for transparent-gateway mode (traffic redirected by the OS, no
+    /// proxy configuration on the client). Off when unset. Linux only.
+    #[serde(default)]
+    pub transparent_port: Option<u16>,
+    /// TLS hosts never intercepted (tunnelled opaquely) in both entry modes: exact names or
+    /// `*.suffix` entries (the latter match subdomains only, not the apex).
+    #[serde(default)]
+    pub tls_passthrough_hosts: Vec<String>,
     pub enable_websockets: bool,
     /// Extra PEM root CA files trusted when connecting to upstream servers (in addition to the
     /// built-in web roots), e.g. a private/corporate CA.
@@ -156,7 +163,8 @@ impl Default for ProxyConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 enable_http2: true,
-                enable_http3: false,
+                transparent_port: None,
+                tls_passthrough_hosts: Vec::new(),
                 enable_websockets: true,
                 extra_upstream_ca_paths: Vec::new(),
             },
