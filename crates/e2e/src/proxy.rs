@@ -286,6 +286,7 @@ impl TestProxy {
             userscripts: UserscriptSettings::default(),
             script_control: Default::default(),
             webui: WebUiSettings::default(),
+            dns: Default::default(),
         };
 
         tweak(&mut config);

@@ -53,6 +53,7 @@ async fn test_server_with_mitm_enabled() {
         userscripts: UserscriptSettings::default(),
         script_control: Default::default(),
         webui: WebUiSettings::default(),
+        dns: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -111,6 +112,7 @@ async fn test_server_with_mitm_disabled() {
         userscripts: UserscriptSettings::default(),
         script_control: Default::default(),
         webui: WebUiSettings::default(),
+        dns: Default::default(),
     };
 
     // Create server with MITM disabled
@@ -161,6 +163,7 @@ async fn test_certificate_generation() {
         userscripts: UserscriptSettings::default(),
         script_control: Default::default(),
         webui: WebUiSettings::default(),
+        dns: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -242,6 +245,7 @@ async fn test_load_manager_integration() {
         userscripts: UserscriptSettings::default(),
         script_control: Default::default(),
         webui: WebUiSettings::default(),
+        dns: Default::default(),
     };
 
     // Create server

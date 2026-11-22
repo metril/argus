@@ -65,6 +65,7 @@ fn config(port: u16, require_token: bool) -> ProxyConfig {
         userscripts: UserscriptSettings::default(),
         script_control: Default::default(),
         webui: WebUiSettings::default(),
+        dns: Default::default(),
     }
 }
 

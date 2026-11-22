@@ -107,6 +107,43 @@ fn bench_memory_monitor(c: &mut Criterion) {
 }
 
 /// Benchmark CA encryption (if enabled)
+/// Connection admission (limiter active, never rejecting) with 8 threads contending; reports the
+/// mean cost per admit+release per thread. Target: < 50 ns.
+fn bench_admission_contended(c: &mut Criterion) {
+    use proxy_core::{LoadManager, LoadManagerConfig};
+    use std::sync::Arc;
+    let lm = Arc::new(LoadManager::new(LoadManagerConfig {
+        max_connections: 1_000_000,
+        connection_rate_limit: 1_000_000_000,
+        adaptive_concurrency: false,
+        ..Default::default()
+    }));
+    let mut g = c.benchmark_group("admission");
+    g.bench_function("check_admission_8_threads", |b| {
+        b.iter_custom(|iters| {
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            let hs: Vec<_> = (0..8)
+                .map(|_| {
+                    let (lm, barrier) = (lm.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let t = std::time::Instant::now();
+                        for _ in 0..iters {
+                            black_box(lm.check_admission());
+                            lm.release_connection();
+                        }
+                        t.elapsed()
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let total: Duration = hs.into_iter().map(|h| h.join().unwrap()).sum();
+            total / 8
+        })
+    });
+    g.finish();
+}
+
 fn bench_ca_encryption(c: &mut Criterion) {
     use proxy_core::{decrypt_ca_key, encrypt_ca_key};
 
@@ -140,6 +177,7 @@ criterion_group!(
     bench_circuit_breaker_many_hosts,
     bench_circuit_breaker_record,
     bench_memory_monitor,
+    bench_admission_contended,
     bench_ca_encryption,
 );
 

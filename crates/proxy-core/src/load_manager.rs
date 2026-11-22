@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, warn};
 
 use crate::circuit_breaker::{
@@ -18,6 +18,9 @@ use crate::memory_monitor::{
     LoadSheddingAction, MemoryMonitor, MemoryMonitorConfig, MemoryMonitorStatsSnapshot,
     MemoryPressure,
 };
+
+/// Default connection admission rate (new connections per second).
+pub const DEFAULT_CONNECTION_RATE_LIMIT: u32 = 10_000;
 
 /// Unified load manager configuration
 #[derive(Debug, Clone)]
@@ -40,7 +43,7 @@ impl Default for LoadManagerConfig {
             circuit_breaker: CircuitBreakerConfig::default(),
             memory_monitor: MemoryMonitorConfig::default(),
             max_connections: 10000,
-            connection_rate_limit: 1000,
+            connection_rate_limit: DEFAULT_CONNECTION_RATE_LIMIT,
             adaptive_concurrency: true,
         }
     }
@@ -73,8 +76,8 @@ pub struct LoadManagerStats {
     pub connections_rejected_max: AtomicU64,
     /// Connections rejected due to rate limit
     pub connections_rejected_rate: AtomicU64,
-    /// Connection rate tracking
-    connection_timestamps: parking_lot::Mutex<Vec<Instant>>,
+    /// Rejections since the last summary warning (rate-limited logging).
+    rejected_since_log: AtomicU64,
 }
 
 impl Default for LoadManagerStats {
@@ -86,7 +89,7 @@ impl Default for LoadManagerStats {
             connections_rejected_memory: AtomicU64::new(0),
             connections_rejected_max: AtomicU64::new(0),
             connections_rejected_rate: AtomicU64::new(0),
-            connection_timestamps: parking_lot::Mutex::new(Vec::with_capacity(1000)),
+            rejected_since_log: AtomicU64::new(0),
         }
     }
 }
@@ -97,6 +100,76 @@ pub struct LoadManager {
     circuit_breaker: CircuitBreaker,
     memory_monitor: Arc<MemoryMonitor>,
     stats: LoadManagerStats,
+    limiter: RateLimiter,
+    epoch: Instant,
+    /// Millis since `epoch` of the last summary warning.
+    last_summary_ms: AtomicU64,
+}
+
+/// Lock-free token bucket (GCRA): one atomic holds the theoretical arrival time in nanoseconds.
+/// Each admission advances it by `1/rate`; a request is refused if that would put it more than
+/// the burst allowance (`burst/rate`, 100 ms worth) ahead of now. No locks, no allocation.
+pub struct RateLimiter {
+    /// Nanoseconds per admitted connection (0 = unlimited).
+    interval_ns: u64,
+    /// How far ahead of now the schedule may run.
+    burst_ns: u64,
+    tat: AtomicU64,
+    epoch: Instant,
+}
+
+impl RateLimiter {
+    /// `rate` connections per second; 0 = unlimited.
+    pub fn new(rate: u32) -> Self {
+        let interval_ns = if rate == 0 { 0 } else { 1_000_000_000 / rate as u64 };
+        // Burst: 100 ms of tokens, at least 1.
+        let burst_ns = (interval_ns * (rate as u64 / 10).max(1)).max(interval_ns);
+        Self { interval_ns, burst_ns, tat: AtomicU64::new(0), epoch: Instant::now() }
+    }
+
+    /// Take one token; false if the rate is exceeded.
+    #[inline]
+    pub fn try_acquire(&self) -> bool {
+        if self.interval_ns == 0 {
+            return true;
+        }
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        let mut cur = self.tat.load(Ordering::Relaxed);
+        loop {
+            let base = cur.max(now);
+            if base - now > self.burst_ns {
+                return false;
+            }
+            match self.tat.compare_exchange_weak(
+                cur,
+                base + self.interval_ns,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+/// Connection cap derived from the soft `RLIMIT_NOFILE`: two descriptors per proxied connection
+/// (client and upstream) after reserving headroom for listeners, pool, files and the API.
+pub fn derive_max_connections() -> usize {
+    const HEADROOM: u64 = 512;
+    const CAP: usize = 100_000;
+    const FLOOR: usize = 256;
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: getrlimit writes into the provided struct.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            let soft = lim.rlim_cur as u64;
+            let usable = soft.saturating_sub(HEADROOM) / 2;
+            return (usable as usize).clamp(FLOOR, CAP);
+        }
+    }
+    10_000
 }
 
 impl LoadManager {
@@ -104,12 +177,16 @@ impl LoadManager {
     pub fn new(config: LoadManagerConfig) -> Self {
         let circuit_breaker = CircuitBreaker::new(config.circuit_breaker.clone());
         let memory_monitor = Arc::new(MemoryMonitor::new(config.memory_monitor.clone()));
+        let config_rate = config.connection_rate_limit;
 
         Self {
             config,
             circuit_breaker,
             memory_monitor,
             stats: LoadManagerStats::default(),
+            limiter: RateLimiter::new(config_rate),
+            epoch: Instant::now(),
+            last_summary_ms: AtomicU64::new(0),
         }
     }
 
@@ -133,7 +210,7 @@ impl LoadManager {
             self.stats
                 .connections_rejected_memory
                 .fetch_add(1, Ordering::Relaxed);
-            warn!("Connection rejected: memory pressure critical");
+            self.note_rejection();
             return AdmissionResult::RejectedMemoryPressure;
         }
 
@@ -148,36 +225,21 @@ impl LoadManager {
                 self.stats
                     .connections_rejected_max
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "Connection rejected: max connections reached ({}/{})",
-                    active, effective_max
-                );
+                self.note_rejection();
                 return AdmissionResult::RejectedMaxConnections;
             }
         }
 
-        // 3. Check rate limit
-        if self.config.connection_rate_limit > 0 {
-            let now = Instant::now();
-            let one_second_ago = now - Duration::from_secs(1);
-
-            let mut timestamps = self.stats.connection_timestamps.lock();
-
-            // Remove old timestamps
-            timestamps.retain(|&t| t > one_second_ago);
-
-            if timestamps.len() >= self.config.connection_rate_limit as usize {
-                self.stats
-                    .connections_rejected
-                    .fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .connections_rejected_rate
-                    .fetch_add(1, Ordering::Relaxed);
-                debug!("Connection rejected: rate limit exceeded");
-                return AdmissionResult::RejectedRateLimit;
-            }
-
-            timestamps.push(now);
+        // 3. Check rate limit (lock-free)
+        if !self.limiter.try_acquire() {
+            self.stats
+                .connections_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .connections_rejected_rate
+                .fetch_add(1, Ordering::Relaxed);
+            self.note_rejection();
+            return AdmissionResult::RejectedRateLimit;
         }
 
         // Connection admitted
@@ -189,6 +251,33 @@ impl LoadManager {
             .fetch_add(1, Ordering::Relaxed);
 
         AdmissionResult::Admitted
+    }
+
+    /// Count a rejection and emit at most one summary warning per 10 s; per-event detail is
+    /// debug only.
+    fn note_rejection(&self) {
+        const INTERVAL_MS: u64 = 10_000;
+        debug!("Connection rejected");
+        self.stats.rejected_since_log.fetch_add(1, Ordering::Relaxed);
+        let now = self.epoch.elapsed().as_millis() as u64;
+        let last = self.last_summary_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= INTERVAL_MS
+            && self
+                .last_summary_ms
+                .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let n = self.stats.rejected_since_log.swap(0, Ordering::Relaxed);
+            let s = self.stats();
+            warn!(
+                "Rejected {} connections since the last report (memory={}, max={}, rate={} in total); active={}",
+                n,
+                s.connections_rejected_memory,
+                s.connections_rejected_max,
+                s.connections_rejected_rate,
+                s.active_connections
+            );
+        }
     }
 
     /// Release a connection (call when connection ends)
@@ -312,7 +401,7 @@ mod tests {
     fn test_default_config() {
         let config = LoadManagerConfig::default();
         assert_eq!(config.max_connections, 10000);
-        assert_eq!(config.connection_rate_limit, 1000);
+        assert_eq!(config.connection_rate_limit, 10_000);
         assert!(config.adaptive_concurrency);
     }
 
@@ -350,6 +439,38 @@ mod tests {
         // Release one and try again
         manager.release_connection();
         assert_eq!(manager.check_admission(), AdmissionResult::Admitted);
+    }
+
+    #[test]
+    fn rate_limiter_enforces_rate_and_small_burst() {
+        let l = RateLimiter::new(1000);
+        let ok = (0..1000).filter(|_| l.try_acquire()).count();
+        // Burst is 100 ms of tokens (100) plus whatever time elapsed during the loop.
+        assert!((100..=150).contains(&ok), "{ok}");
+        let off = RateLimiter::new(0);
+        assert!((0..100_000).all(|_| off.try_acquire()));
+    }
+
+    #[test]
+    fn rate_limiter_contended_total_is_bounded() {
+        let l = Arc::new(RateLimiter::new(2000));
+        let start = Instant::now();
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let l = l.clone();
+                std::thread::spawn(move || (0..20_000).filter(|_| l.try_acquire()).count())
+            })
+            .collect();
+        let total: usize = hs.into_iter().map(|h| h.join().unwrap()).sum();
+        let max = (2000.0 * start.elapsed().as_secs_f64()) as usize + 200 + 8;
+        assert!(total <= max, "{total} > {max}");
+        assert!(total >= 100);
+    }
+
+    #[test]
+    fn derived_max_connections_is_sane() {
+        let n = derive_max_connections();
+        assert!((256..=100_000).contains(&n));
     }
 
     #[test]
