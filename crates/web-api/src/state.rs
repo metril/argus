@@ -61,6 +61,10 @@ pub struct AppState {
     /// JWT configuration
     pub jwt_config: Arc<JwtConfig>,
 
+    /// bcrypt hash (at the configured cost) verified against when a login names no usable
+    /// account, so the response time does not reveal which usernames exist.
+    pub dummy_hash: String,
+
     /// Rate limiters
     pub rate_limiters: Arc<RateLimiters>,
 
@@ -486,6 +490,15 @@ pub async fn build_state(
         audience: api_config.auth.audience.clone(),
     });
 
+    let dummy_hash = {
+        let cost = api_config.auth.bcrypt_cost;
+        tokio::task::spawn_blocking(move || {
+            crate::auth::password::hash_password("dummy-password-never-matches", cost)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??
+    };
+
     // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
     let db = session_store.db();
@@ -532,6 +545,7 @@ pub async fn build_state(
         session_store,
         session_manager,
         jwt_config,
+        dummy_hash,
         rate_limiters,
         config_path: Arc::new(RwLock::new(config_path)),
         api_config,

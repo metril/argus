@@ -223,20 +223,20 @@ pub async fn login(
 ) -> ApiResult<Authed> {
     req.validate()?;
     let bad = || ApiError::AuthenticationFailed("Invalid username or password".into());
-    let user = state
-        .session_store
-        .get_user_by_username(&req.username)?
-        .ok_or_else(|| {
-            warn!("Login attempt for unknown user");
-            bad()
-        })?;
-    if !verify_blocking(req.password.clone(), user.password_hash.clone()).await? {
-        warn!("Failed login for user {}", user.username);
+    let (st, name) = (state.clone(), req.username.clone());
+    let found = blocking(move || Ok(st.session_store.get_user_by_username(&name)?)).await?;
+    // Always run one bcrypt verification (against a dummy hash when the account is missing or
+    // disabled) so response time does not reveal which usernames exist, and answer every
+    // failure identically.
+    let user = found.filter(|u| u.enabled);
+    let hash = user
+        .as_ref()
+        .map_or_else(|| state.dummy_hash.clone(), |u| u.password_hash.clone());
+    let ok = verify_blocking(req.password.clone(), hash).await?;
+    let Some(user) = user.filter(|_| ok) else {
+        warn!("Failed login attempt");
         return Err(bad());
-    }
-    if !user.enabled {
-        return Err(ApiError::AuthenticationFailed("Account is disabled".into()));
-    }
+    };
     let (headers, expires_in) = start_session_blocking(&state, user.clone(), client).await?;
     state.session_store.update_last_login(&user.id)?;
     info!("User logged in: {}", user.username);

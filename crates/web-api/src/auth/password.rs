@@ -38,6 +38,14 @@ pub fn hash_password(password: &str, cost: u32) -> ApiResult<String> {
     bcrypt::hash(password, cost).map_err(ApiError::from)
 }
 
+static VERIFY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of bcrypt verifications run so far in this process (lets tests assert that a login
+/// does the same work whether or not the account exists).
+pub fn verify_call_count() -> u64 {
+    VERIFY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Verify a password against a bcrypt hash
 ///
 /// # Arguments
@@ -51,6 +59,7 @@ pub fn hash_password(password: &str, cost: u32) -> ApiResult<String> {
 /// - Uses constant-time comparison to prevent timing attacks
 /// - Extracts cost and salt from the hash string automatically
 pub fn verify_password(password: &str, hash: &str) -> ApiResult<bool> {
+    VERIFY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     bcrypt::verify(password, hash).map_err(ApiError::from)
 }
 

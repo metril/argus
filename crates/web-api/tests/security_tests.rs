@@ -693,3 +693,46 @@ async fn per_token_rate_limit_applies() {
         .assert_status_ok();
     let _ = PASSWORD;
 }
+
+#[tokio::test]
+async fn login_does_the_same_bcrypt_work_and_answers_identically_for_every_failure() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    ctx.user(&admin, "alice", "viewer").await;
+    ctx.user(&admin, "dora", "viewer").await;
+    let mut dora = ctx
+        .state
+        .session_store
+        .get_user_by_username("dora")
+        .unwrap()
+        .unwrap();
+    dora.enabled = false;
+    ctx.state.session_store.store_user(&dora).unwrap();
+
+    let attempt = |name: &'static str, pw: &'static str| {
+        let ctx = &ctx;
+        async move {
+            let before = web_api::auth::password::verify_call_count();
+            let r = ctx
+                .server
+                .post("/api/v1/auth/login")
+                .json(&json!({"username": name, "password": pw}))
+                .await;
+            let ran = web_api::auth::password::verify_call_count() - before;
+            (r.status_code(), r.text(), ran)
+        }
+    };
+    let unknown = attempt("nobody", PASSWORD).await;
+    let wrong = attempt("alice", "Wrong-Password-1!").await;
+    let disabled = attempt("dora", PASSWORD).await;
+    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unknown.2, 1,
+        "an unknown user must still cost one bcrypt verify"
+    );
+    assert_eq!(wrong.2, 1);
+    assert_eq!(disabled.2, 1);
+    // Same status and identical body for every failure cause.
+    assert_eq!((wrong.0, &wrong.1), (unknown.0, &unknown.1));
+    assert_eq!((disabled.0, &disabled.1), (unknown.0, &unknown.1));
+}
