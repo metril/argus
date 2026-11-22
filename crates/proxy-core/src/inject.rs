@@ -228,6 +228,15 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                 );
             }
         }
+        if !spec.userscripts.is_empty() {
+            // The runtime once, before any bundle (bundles carry no runtime of their own).
+            let _ = write!(
+                head.html,
+                "<script src=\"{}\" nonce=\"{nonce}\"></script>",
+                crate::internal::gm_runtime_path()
+            );
+            head.has_script = true;
+        }
         for src in spec.userscripts {
             let _ = write!(
                 head.html,

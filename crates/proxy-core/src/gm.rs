@@ -428,7 +428,7 @@ impl GmHost {
         if let Ok(v) = manager.gm().values_get(&ctx, None) {
             values.insert(cs.script.id.clone(), v);
         }
-        let opts = BundleOptions::new(
+        let mut opts = BundleOptions::new(
             PROFILE,
             &chunk.origin,
             chunk.top,
@@ -436,6 +436,7 @@ impl GmHost {
             now_secs(),
             &values,
         );
+        opts.shared_runtime = true;
         let b = bundle::generate(&[cs], &opts);
         Response::builder()
             .status(StatusCode::OK)

@@ -50,6 +50,18 @@ pub fn boot_path() -> &'static str {
     &BOOT.1
 }
 
+static GM_RUNTIME: LazyLock<(String, String)> = LazyLock::new(|| {
+    let js = userscript_engine::bundle::runtime_script();
+    let path = format!("{}gm.{}.js", crate::csp::INTERNAL_PREFIX, short_hash(js.as_bytes()));
+    (js, path)
+});
+
+/// Path of the content-hashed shared GM runtime script (loaded once per document that has
+/// userscripts).
+pub fn gm_runtime_path() -> &'static str {
+    &GM_RUNTIME.1
+}
+
 fn short_hash(data: &[u8]) -> String {
     let d = Sha256::digest(data);
     d[..12].iter().map(|b| format!("{b:02x}")).collect()
@@ -412,6 +424,8 @@ impl Internal {
         }
         let asset: Option<(Bytes, &'static str)> = if path == boot_path() {
             Some((Bytes::from_static(BOOT_JS.as_bytes()), "immutable"))
+        } else if path == gm_runtime_path() {
+            Some((Bytes::from(GM_RUNTIME.0.clone()), "immutable"))
         } else if let Some(h) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".js")) {
             self.scriptlets
                 .get(h)

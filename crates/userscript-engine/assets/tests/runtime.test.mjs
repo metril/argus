@@ -327,3 +327,25 @@ test("capability tokens never appear on window, in the DOM or in URLs other than
   assert.ok(!JSON.stringify(Object.getOwnPropertySymbols(env.W)).includes("v1."));
   assert.ok(env.backend.calls.filter((c) => c.path !== "resource").every((c) => !c.url.includes("v1.")));
 });
+
+test("menu commands of every script on the page share one registry", async () => {
+  const env = makeEnv();
+  const grants = ["gm_registermenucommand", "gm_unregistermenucommand"];
+  const a = await run(env, { grants, id: "s1", name: "First" }, (api) => api);
+  const b = await run(env, { grants, id: "s2", name: "Second" }, (api) => api);
+  let hits = [];
+  a.GM_registerMenuCommand("A cmd", () => hits.push("a"));
+  const idB = b.GM_registerMenuCommand("B cmd", () => hits.push("b"));
+  const reg = env.W[env.W.Symbol.for("adblock.userscript.menu")];
+  let changes = 0;
+  reg.subscribe(() => changes++);
+  const cmds = reg.commands();
+  assert.deepEqual(cmds.map((c) => [c.scriptName, c.caption]), [["First", "A cmd"], ["Second", "B cmd"]]);
+  assert.ok(cmds.every((c) => c.run === undefined && c.fn === undefined), "callbacks are not exposed");
+  assert.equal(reg.invoke("s2", idB), true);
+  assert.equal(reg.invoke("s1", 999), false);
+  assert.deepEqual(hits, ["b"]);
+  b.GM_unregisterMenuCommand(idB);
+  assert.equal(changes, 1);
+  assert.equal(reg.commands().length, 1);
+});

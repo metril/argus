@@ -1,6 +1,6 @@
 /* Userscript runtime for the ad-blocking proxy: original code written from the public
  * GM_* / GM.* API documentation. This file is ONE function expression:
- *     (function (cfg, entries, W) { ... })
+ *     (function (cfg, entries, W, SH) { ... })
  * The generated bundle calls it with the config, the script entries and `window`.
  * It runs at document-start, before page scripts, and captures every built-in it needs
  * first; nothing below looks a built-in up on a global after that point.
@@ -150,32 +150,10 @@ function (cfg, entries, W) {
   }
 
   // ---- 3. per-script API ---------------------------------------------------------------------
-  var menu = []; // {script, scriptName, id, caption, accessKey, fn}
-  var menuSeq = 0, menuSubs = [];
-  function menuChanged() { for (var i = 0; i < menuSubs.length; i++) { safeCall("menu", menuSubs[i], null, []); } }
-  var MENU_SYM = W.Symbol && W.Symbol.for ? W.Symbol.for("adblock.userscript.menu") : "__adblock_userscript_menu__";
-  try {
-    ObjDefine(W, MENU_SYM, {
-      value: ObjFreeze({
-        commands: function () {
-          var out = [];
-          for (var i = 0; i < menu.length; i++) {
-            aPush(out, { script: menu[i].script, scriptName: menu[i].scriptName, id: menu[i].id,
-              caption: menu[i].caption, accessKey: menu[i].accessKey });
-          }
-          return out;
-        },
-        invoke: function (script, id) {
-          for (var i = 0; i < menu.length; i++) {
-            if (menu[i].script === script && menu[i].id === id) { safeCall(menu[i].scriptName, menu[i].fn, W, []); return true; }
-          }
-          return false;
-        },
-        subscribe: function (f) { if (isFn(f)) { aPush(menuSubs, f); } }
-      }),
-      enumerable: false, configurable: false, writable: false
-    });
-  } catch (e) { /* a hostile page may have claimed it; commands then just do not show */ }
+  // The command registry is shared by every script of the document (and by the in-page panel):
+  // it lives in SH, created once by the shared runtime script (see bundle::runtime_script).
+  var menu = SH.menu;
+  function menuChanged() { SH.changed(); }
 
   var urlListeners = null;
   function installUrlChange() {
@@ -761,9 +739,10 @@ function (cfg, entries, W) {
     }
     expose("gm_notification", "GM_notification", "notification", notification, function (a, b, c, d3) { return resolved(notification(a, b, c, d3)); });
     function registerMenu(caption, fn, opt) {
-      var id = ++menuSeq, key = typeof opt === "string" ? opt : (opt && opt.accessKey) || "";
+      var id = SH.next(), key = typeof opt === "string" ? opt : (opt && opt.accessKey) || "";
       if (opt && opt.id) { id = opt.id; for (var j = 0; j < menu.length; j++) { if (menu[j].script === d.id && menu[j].id === id) { aSplice(menu, j, 1); break; } } }
-      aPush(menu, { script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key, fn: fn });
+      aPush(menu, { script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key,
+        run: function () { safeCall(label, fn, W, []); } });
       menuChanged();
       return id;
     }

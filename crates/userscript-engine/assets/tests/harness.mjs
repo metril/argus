@@ -7,9 +7,16 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 export const runtimeSrc = readFileSync(join(here, "..", "gm.js"), "utf8");
 
+const sharedSrc = readFileSync(join(here, "..", "gm_shared.js"), "utf8").replace("/*RUNTIME*/null", runtimeSrc.trim());
+
+/** The runtime as a page uses it: the shared installer runs once per window, then each call goes
+ * through the hook it defines. Returns `(cfg, entries, W)`. */
 export function loadRuntime(ctx) {
-  if (ctx) return vm.runInContext("(" + runtimeSrc + ")", ctx);
-  return new Function("return (" + runtimeSrc + ")")();
+  const shared = ctx ? vm.runInContext("(" + sharedSrc + ")", ctx) : new Function("return (" + sharedSrc + ")")();
+  return (cfg, entries, W) => {
+    shared(W);
+    return W[W.Symbol.for("adblock.userscript.runtime")](cfg, entries);
+  };
 }
 
 class FakeNode extends EventTarget {

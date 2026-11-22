@@ -26,6 +26,25 @@ use std::collections::HashMap;
 /// The hand-written GM runtime (a single function expression).
 pub const RUNTIME_JS: &str = include_str!("../assets/gm.js");
 
+/// `Symbol.for` key under which the shared runtime script publishes its entry point.
+pub const RUNTIME_HOOK: &str = "adblock.userscript.runtime";
+/// `Symbol.for` key of the frozen command registry (`commands`, `invoke`, `subscribe`).
+pub const MENU_HOOK: &str = "adblock.userscript.menu";
+
+/// The script that installs the GM runtime once per document: the runtime function, the command
+/// registry every script of the page registers into (and the in-page panel reads), and one
+/// non-writable, non-configurable entry point the per-script bundles call. It holds no secret:
+/// tokens arrive only in the per-document bundles. Content-addressed and immutable, so it is
+/// served once from a hash URL and cached.
+pub fn runtime_script() -> String {
+    format!(
+        "({})(window);\n",
+        SHARED_JS.replace("/*RUNTIME*/null", RUNTIME_JS.trim()).trim()
+    )
+}
+
+const SHARED_JS: &str = include_str!("../assets/gm_shared.js");
+
 /// Canonical grant -> the `GM_*` name the script sees as a variable (and the runtime exposes).
 pub const API_TABLE: &[(&str, &str)] = &[
     ("gm_getvalue", "GM_getValue"),
@@ -76,6 +95,9 @@ pub struct BundleOptions<'a> {
     pub values: &'a HashMap<String, Map<String, Value>>,
     /// `@resource`s up to this size are embedded for synchronous `GM_getResourceText/URL`.
     pub inline_resource_limit: usize,
+    /// Call the runtime installed once by [`runtime_script`] instead of repeating it in the
+    /// bundle (the page must load that script first).
+    pub shared_runtime: bool,
 }
 
 impl<'a> BundleOptions<'a> {
@@ -97,6 +119,7 @@ impl<'a> BundleOptions<'a> {
             base_path: "/__adblock__/gm",
             values,
             inline_resource_limit: 256 * 1024,
+            shared_runtime: false,
         }
     }
 }
@@ -343,12 +366,18 @@ pub fn generate(scripts: &[&CompiledScript], opts: &BundleOptions<'_>) -> Bundle
     }
     let cfg = json!({"base": opts.base_path, "top": opts.is_top_frame, "handler": "AdBlocker Userscripts", "handlerVersion": env!("CARGO_PKG_VERSION")});
     let entries: Vec<&str> = chunks.iter().map(|c| c.js.as_str()).collect();
-    let js = format!(
-        "({})({},[{}],window);\n",
-        RUNTIME_JS.trim(),
+    let call = format!(
+        "(function(r){{if(r)r({},[{}]);}})(window[Symbol.for(\"{RUNTIME_HOOK}\")]);\n",
         js_json(&cfg),
         entries.join(",\n")
     );
+    // Self-contained (the runtime installs itself first; a later bundle reuses the earlier
+    // install) unless the page loads the shared runtime script.
+    let js = if opts.shared_runtime {
+        call
+    } else {
+        runtime_script() + &call
+    };
     Bundle { js, chunks, counts }
 }
 
@@ -466,9 +495,10 @@ mod tests {
         assert_eq!(order, ["start", "body", "end", "idle"]);
         assert_eq!(b.counts, [1, 1, 1, 1]);
         assert!(
-            b.js.starts_with("(/*")
-                && b.js.contains("})(")
-                && b.js.trim_end().ends_with(",window);")
+            b.js.starts_with("(function (W)") || b.js.starts_with("(/*")
+        );
+        assert!(
+            b.js.contains(RUNTIME_HOOK) && b.js.trim_end().ends_with("(window[Symbol.for(\"adblock.userscript.runtime\")]);")
         );
         assert!(generate(&[], &opts(&key, &vals)).js.is_empty());
     }
