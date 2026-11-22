@@ -513,12 +513,17 @@ pub struct ReloadEvent {
 /// The list rebuilt and swapped in every `interval` during the measurement.
 #[derive(Clone)]
 pub struct ReloadCfg {
-    pub engine: Arc<filter_engine::SharedEngine>,
-    /// Lists to alternate between (each reload compiles the next one from text).
+    /// The real list service over `engine`; each reload stores the next list as the custom
+    /// rules and runs `reload_now`, so parse, compile and install go through the service's build
+    /// pool exactly as a rebuild in the running process does.
+    pub service: Arc<list_service::ListService>,
+    /// Lists to alternate between.
     pub lists: Vec<Arc<String>>,
     pub interval: Duration,
-    /// Runtime whose blocking pool compiles the list (the proxy's, as in the real process).
+    /// Runtime the service runs on (the proxy's, as in the real process).
     pub builder: tokio::runtime::Handle,
+    /// Keeps the service's data directory alive for the run.
+    pub dir: Arc<tempfile::TempDir>,
 }
 
 async fn reload_loop(cfg: ReloadCfg, t0: Instant, duration: Duration) -> Vec<ReloadEvent> {
@@ -531,11 +536,17 @@ async fn reload_loop(cfg: ReloadCfg, t0: Instant, duration: Duration) -> Vec<Rel
         }
         tokio::time::sleep_until(at.into()).await;
         let text = cfg.lists[k % cfg.lists.len()].clone();
-        let engine = cfg.engine.clone();
+        let service = cfg.service.clone();
         let start = Instant::now();
         let _ = cfg
             .builder
-            .spawn_blocking(move || crate::install_rules_text(&engine, (*text).clone(), true))
+            .spawn(async move {
+                service
+                    .store()
+                    .set_custom_rules(&text)
+                    .expect("store custom rules");
+                service.reload_now().await;
+            })
             .await;
         events.push(ReloadEvent {
             start_s: start.saturating_duration_since(t0).as_secs_f64(),

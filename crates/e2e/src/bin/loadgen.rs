@@ -280,9 +280,24 @@ fn run(a: Args) -> i32 {
     };
     let ext_ca = a.ca.as_ref().map(|f| std::fs::read(f).expect("read --ca"));
 
+    let svc_dir = Arc::new(tempfile::tempdir().expect("service dir"));
     let reload = match (&inproc, a.reload) {
         (Some(p), true) => Some(ReloadCfg {
-            engine: p.engine.clone(),
+            dir: svc_dir.clone(),
+            service: {
+                let dir = svc_dir.path().to_path_buf();
+                let store = list_service::ListStore::new(&dir).expect("list store");
+                list_service::ListService::new(
+                    list_service::ListServiceConfig {
+                        data_dir: dir,
+                        auto_update: false,
+                        ..Default::default()
+                    },
+                    Arc::new(store),
+                    p.engine.clone(),
+                    reqwest::Client::new(),
+                )
+            },
             lists: [11u64, 12]
                 .iter()
                 .map(|s| Arc::new(generate_list(a.reload_rules, *s, &workload)))
