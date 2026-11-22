@@ -15,7 +15,7 @@ const MAX_INCLUDES: usize = 64;
 
 // ---- lexical helpers ---------------------------------------------------------------------------
 
-pub(crate) struct Cosmetic<'a> {
+pub struct Cosmetic<'a> {
     pub domains: &'a str,
     pub sep: &'a str,
     pub body: &'a str,
@@ -31,7 +31,7 @@ fn valid_domain_part(s: &str) -> bool {
 }
 
 /// Split a cosmetic / HTML-filter rule into `(domains, separator, body)`.
-pub(crate) fn split_cosmetic(line: &str) -> Option<Cosmetic<'_>> {
+pub fn split_cosmetic(line: &str) -> Option<Cosmetic<'_>> {
     if let Some(p) = line.find("$@$").or_else(|| line.find("$$")) {
         if valid_domain_part(&line[..p]) && !line.starts_with("||") && !line.starts_with("@@") {
             let sep_len = if line[p..].starts_with("$@$") { 3 } else { 2 };
@@ -63,7 +63,7 @@ pub(crate) fn split_cosmetic(line: &str) -> Option<Cosmetic<'_>> {
 }
 
 /// Split `pattern$options`. Regex rules (`/.../`) without options return no options.
-pub(crate) fn split_options(line: &str) -> (&str, Option<&str>) {
+pub fn split_options(line: &str) -> (&str, Option<&str>) {
     if line.len() > 1 && line.starts_with('/') && line.ends_with('/') {
         return (line, None);
     }
@@ -427,7 +427,6 @@ enum Rule {
     /// Rules to emit; `true` if rewritten from the input.
     Emit(Vec<String>, bool),
     Ext(ExtRule),
-    Skip(&'static str),
     Error(&'static str),
 }
 
@@ -458,7 +457,7 @@ fn network_rule(t: &str) -> Rule {
             "permissions" => ExtKind::Permissions,
             "urltransform" => ExtKind::UrlTransform,
             "method" => ExtKind::Method,
-            "header" => return Rule::Skip("header"),
+            "header" => ExtKind::Header,
             _ => continue,
         };
         return ext(kind);
@@ -654,7 +653,6 @@ pub(crate) fn convert_abp(content: &str, opts: &ConvertOptions) -> Converted {
                 }
                 out.ext.push(e);
             }
-            Rule::Skip(reason) => out.stats.skip(reason),
             Rule::Error(reason) => out.stats.error(line_no, reason),
         }
     }

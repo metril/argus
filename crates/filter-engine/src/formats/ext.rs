@@ -31,6 +31,8 @@ pub enum ExtKind {
     Method,
     /// `$popup` (needs window-opener context).
     Popup,
+    /// `$header=` response-header match.
+    Header,
     /// `$to=` with a non-trivial pattern.
     To,
     /// `$denyallow`: no exact native translation exists (an exception would also unblock the
@@ -64,6 +66,7 @@ impl ExtKind {
             Self::UrlTransform => "urltransform",
             Self::Method => "method",
             Self::Popup => "popup",
+            Self::Header => "header",
             Self::To => "to",
             Self::DenyAllow => "denyallow",
             Self::HtmlFilter => "html-filter",
@@ -86,6 +89,13 @@ pub struct ExtRule {
     /// Domains the rule is restricted to: cosmetic domain list, or `$domain=`/`$from=` values
     /// (a leading `~` marks a negated domain).
     pub domains: Vec<String>,
+    /// Id of the list the rule came from (set by the build pipeline; empty when unknown).
+    #[serde(default)]
+    pub list: String,
+    /// Whether the source list is trusted to run code in pages (`$replace`, `#%#`, ...). Set by
+    /// the consumer; the build pipeline leaves it `false`.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 impl ExtRule {
@@ -94,6 +104,8 @@ impl ExtRule {
             kind,
             raw: raw.to_string(),
             domains: abp::rule_domains(raw),
+            list: String::new(),
+            trusted: false,
         }
     }
 }

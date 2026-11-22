@@ -20,13 +20,13 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-pub use abp::{find_includes, preprocess_and_meta};
+pub use abp::{find_includes, preprocess_and_meta, split_cosmetic, split_options, Cosmetic};
 pub use ext::{classify_rejected, scriptlet_alias_table, ExtKind, ExtRule};
 pub use iplist::{IpRange, IpSet};
 
 /// Bumped whenever conversion output could change for the same input (part of the persisted
 /// engine's cache key).
-pub const CONVERTER_VERSION: u32 = 2;
+pub const CONVERTER_VERSION: u32 = 3;
 
 /// Max number of per-line errors kept in [`ConvertStats::errors`].
 pub const MAX_ERRORS: usize = 50;

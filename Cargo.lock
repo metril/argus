@@ -1435,6 +1435,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext-rules"
+version = "0.1.0"
+dependencies = [
+ "adblock",
+ "criterion",
+ "filter-engine",
+ "rand 0.8.6",
+ "regex",
+ "serde",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
