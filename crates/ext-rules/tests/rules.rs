@@ -562,8 +562,10 @@ fn stats_and_errors() {
     assert_eq!(s.per_kind["removeheader"].parse_errors, 1);
     assert_eq!(s.issues.len(), 4);
     assert!(s.issues[0].reason.contains("look-around"));
-    let mut o = BuildOptions::default();
-    o.max_issues = 1;
+    let o = BuildOptions {
+        max_issues: 1,
+        ..Default::default()
+    };
     let i = ExtIndex::build_with(&r2, &o);
     assert_eq!((i.stats().issues.len(), i.stats().issues_truncated), (1, 3));
 }

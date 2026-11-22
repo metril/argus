@@ -133,11 +133,10 @@ impl HeaderMatch {
     /// Does any response header satisfy the condition?
     pub fn matches(&self, headers: &[(&str, &str)]) -> bool {
         let mut any = false;
-        for (n, v) in headers
+        for (_, v) in headers
             .iter()
             .filter(|(n, _)| n.eq_ignore_ascii_case(&self.name))
         {
-            let _ = n;
             let m = match &self.cond {
                 HeaderCond::Present => true,
                 HeaderCond::Equals(e) => v.trim().eq_ignore_ascii_case(e),
@@ -287,8 +286,8 @@ pub enum Action {
     Header(HeaderMatch),
     HtmlRemove(HtmlRemoval),
     Inject(Injection),
-    /// An exception: disables rules whose [`target`] bit is in `mask` and whose value equals
-    /// `value` (empty `value` disables all of them).
+    /// An exception: disables rules whose [`target`] bit is in `mask` and whose
+    /// [`ParsedRule::value`] equals the exception's (an empty value disables all of them).
     Disable {
         mask: u32,
     },
@@ -364,7 +363,7 @@ pub struct ParsedRule {
     pub action: Action,
     /// Pairing key: an exception with a non-empty value disables the rule with the same value.
     pub value: String,
-    /// Exception value (when `action` is `Disable`).
+    /// Evaluation stage bits (request / response); 0 for page-scoped rules.
     pub(crate) stage: u8,
     /// Normalised text used to pair `$badfilter` rules with their target.
     pub(crate) key: String,
@@ -1152,7 +1151,6 @@ mod tests {
             Err(RuleError::Invalid(_))
         ));
         assert!(p("").is_err());
-        assert!(p("###").is_err() || p("###").is_ok());
     }
 
     #[test]

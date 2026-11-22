@@ -45,17 +45,11 @@ fn gen_net_rule(r: &mut StdRng) -> String {
         3 => "/adserver/".to_string(),
         4 => "*/ads/*".to_string(),
         5 => "/track|".to_string(),
-        6 => "/banner\\d*\\.png/".replace("/banner", "/banner") + "",
+        6 => "/banner\\d*\\.png/".to_string(),
         7 => format!("|https://{host}/"),
         8 => "ads^".to_string(),
         9 => format!("||{host}^*/x"),
         _ => "".to_string(),
-    };
-    // a regex pattern must be wrapped in slashes
-    let pat = if pat.starts_with("/banner") {
-        "/banner\\d*\\.png/".to_string()
-    } else {
-        pat
     };
     let mut opts: Vec<String> = Vec::new();
     match r.gen_range(0..9) {

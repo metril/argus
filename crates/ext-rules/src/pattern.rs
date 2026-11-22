@@ -165,18 +165,15 @@ impl Pattern {
                     while i < l.len() && l[i].is_ascii_alphanumeric() {
                         i += 1;
                     }
-                    let left = if s > 0 {
+                    // bounded on the left: inside the literal, after a separator token, or at an anchor
+                    let left = if s > 0 || ti > 0 {
                         true
-                    } else if ti > 0 {
-                        true // preceded by a separator token
                     } else if si == 0 {
                         g.anchor != Anchor::None && !g.lead_star
                     } else {
                         false
                     };
-                    let right = if i < l.len() {
-                        true
-                    } else if ti + 1 < seg.len() {
+                    let right = if i < l.len() || ti + 1 < seg.len() {
                         true
                     } else if si + 1 == nseg {
                         g.end && !g.trail_star

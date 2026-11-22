@@ -14,7 +14,7 @@
 
 use std::borrow::Cow;
 
-pub const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 128;
 
 // ---- JSON model --------------------------------------------------------------------------------

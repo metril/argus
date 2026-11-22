@@ -530,18 +530,20 @@ impl ExtIndex {
         let Some(ctx) = Ctx::new(req) else {
             return plan;
         };
-        let ct = resp.content_type().unwrap_or("");
-        let mime = ct
+        let mime_raw = resp
+            .content_type()
+            .unwrap_or("")
             .split(';')
             .next()
             .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+            .trim();
         let is_doc = matches!(
             req.resource_type,
             ResourceType::Document | ResourceType::Subdocument
         );
-        let is_html = is_doc && (mime == "text/html" || mime == "application/xhtml+xml");
+        let is_html = is_doc
+            && (mime_raw.eq_ignore_ascii_case("text/html")
+                || mime_raw.eq_ignore_ascii_case("application/xhtml+xml"));
         let mut ids = self.net_ids(&self.resp, &ctx);
         if is_html {
             ids.extend(self.dom_ids(&ctx.host));
@@ -549,6 +551,7 @@ impl ExtIndex {
         if ids.is_empty() {
             return plan;
         }
+        let mime = mime_raw.to_ascii_lowercase();
         let live = self.survivors(&ids, target::ALL);
         let clen = resp.content_length();
         let mut set_cookies: Vec<&CookieSpec> = Vec::new();
