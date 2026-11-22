@@ -304,6 +304,24 @@ async fn unknown_token_gets_407_when_required() {
     assert_eq!(read_reply(&mut s).await.status, 200);
 }
 
+/// Browsers send proxy credentials only after a 407 challenge: with the token required, the
+/// challenge-then-retry exchange (the proxy closes after the 407, so the retry arrives on a new
+/// connection) identifies the device.
+#[tokio::test]
+async fn credentials_sent_only_after_a_407_challenge_identify_the_device() {
+    let f = fixture(engine(&[]), true).await;
+    publish_ab(&f, &["/ads/"], &[], None);
+    for (token, reaches_origin) in [("tok-a", false), ("tok-b", true)] {
+        let mut s = connect(&f).await;
+        let first = request(&mut s, &f, "/ads/x", None).await;
+        assert_eq!(first.status, 407, "challenged first");
+        let mut s = connect(&f).await;
+        let retry = request(&mut s, &f, "/ads/x", Some(token)).await;
+        assert_ne!(retry.status, 407, "{}", retry.head);
+        assert_eq!(retry.reached_origin(), reaches_origin, "{token}");
+    }
+}
+
 #[tokio::test]
 async fn proxy_authorization_is_never_forwarded() {
     let f = fixture(engine(&[]), false).await;

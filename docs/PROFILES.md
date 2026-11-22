@@ -8,7 +8,14 @@ mapping uses the built-in `default` profile.
 - **Lists**: the filter lists enabled for it (any list in the catalogue, whether or not it is
   enabled globally). Profiles with the same set of lists share one compiled engine.
 - **Rules**: custom rules text, compiled as a small overlay checked after the lists. An overlay
-  exception beats a list block; an overlay block beats a list allow.
+  exception beats a list block; an overlay block beats a list allow. Cosmetics are merged from
+  both engines: an overlay `site#@#.selector` cancels the list's hide of that selector on that
+  site, and an overlay `@@||site^$generichide` stops class/id generic hiding there, including
+  the dynamic hiding the page asks for. Limits of the underlying engine: a bare (site-less)
+  `#@#.selector` in the overlay only affects the overlay's own rules; an overlay exception does
+  not cancel a list's procedural filter (`:has-text`, `:remove()`, ...); `$generichide` cannot
+  remove the non-class/id generic selectors already in the list's static stylesheet; and
+  `$elemhide` is not supported (in lists or overlay).
 - **Userscripts and script policy**: stored under the profile's storage namespace (installed
   scripts, GM values and cookies, site and source rules, temporary grants, panel settings and PIN).
   The namespace is `default` for the default profile and `p<id>` for every other profile. It is
@@ -47,6 +54,14 @@ another device's traffic. An identical address on two devices is refused.
 Source addresses on a LAN can be spoofed by another host; tokens are the stronger identity. Use
 tokens where it matters.
 
+**Browsers and tokens.** Browsers send proxy credentials only after the proxy answers `407`
+(Proxy-Authenticate) and, with the proxy closing after the `407`, retry on a new connection. A
+connection whose first request has no credentials is therefore resolved by address, or to
+`default`, and stays that way. To identify browsers by token reliably set
+`proxy.require_device_token = true`: the `407` challenge is what makes the browser send the token.
+Without it, clients that do not send credentials unprompted fall back to their address or the
+default profile.
+
 `proxy.require_device_token = true` makes explicit-proxy connections without a known token fail
 with `407`. It does not affect transparent mode. Revoking a token takes effect on open
 connections at their next request.
@@ -73,7 +88,9 @@ recorded in the build status.
 ## Deleting and renaming a profile
 
 A profile that devices still use cannot be deleted. Deleting one removes everything under its
-namespace: userscripts, GM values and cookies, script-policy rules, temporary grants, panel
+namespace (a sweep after every build pass and at startup also removes the namespaces of profiles
+that no longer exist, for example one created and deleted within a debounce window, or deleted
+while the proxy was down; failed removals are retried every 30 seconds): userscripts, GM values and cookies, script-policy rules, temporary grants, panel
 settings, PIN and lockout state, and its script control. Profile ids are never reused (the store
 keeps a high-water mark), so a profile created later, even with the same name, gets a new
 namespace and starts empty.
