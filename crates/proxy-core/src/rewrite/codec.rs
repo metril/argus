@@ -52,6 +52,7 @@ const LEVEL_GZIP: i32 = 4;
 
 /// The codings applied to a body, in the order they were applied (the `Content-Encoding` order).
 /// `Err(())` when any listed coding is one we cannot decode (the body must pass through).
+#[allow(clippy::result_unit_err)]
 pub fn response_codings(headers: &HeaderMap) -> Result<Vec<Coding>, ()> {
     let mut out = Vec::new();
     for v in headers.get_all(CONTENT_ENCODING) {
@@ -93,12 +94,7 @@ pub fn choose_encoding(request_headers: &HeaderMap) -> Option<Coding> {
             }
         }
     }
-    let order = [
-        Coding::Zstd,
-        Coding::Brotli,
-        Coding::Gzip,
-        Coding::Deflate,
-    ];
+    let order = [Coding::Zstd, Coding::Brotli, Coding::Gzip, Coding::Deflate];
     // An explicit `*` does not make us pick a coding the client never named.
     let _ = star;
     order
@@ -152,6 +148,7 @@ pub async fn decode_chain(mut input: DynBufRead, codings: &[Coding]) -> io::Resu
 }
 
 /// Incremental encoder into an in-memory buffer that the caller drains with [`Encoder::take`].
+#[allow(clippy::large_enum_variant)]
 pub enum Encoder {
     Identity(Vec<u8>),
     Gzip(enc::GzipEncoder<Vec<u8>>),
@@ -263,16 +260,15 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_every_coding() {
         let data = sample();
-        for c in [
-            Coding::Gzip,
-            Coding::Deflate,
-            Coding::Brotli,
-            Coding::Zstd,
-        ] {
+        for c in [Coding::Gzip, Coding::Deflate, Coding::Brotli, Coding::Zstd] {
             for chunk in [1000, 32 * 1024, data.len()] {
                 let enc = encode(Some(c), &data, chunk).await;
                 assert!(enc.len() < data.len() / 3, "{c:?} compressed");
-                assert_eq!(decode(enc, &[c]).await.unwrap(), data, "{c:?} chunk {chunk}");
+                assert_eq!(
+                    decode(enc, &[c]).await.unwrap(),
+                    data,
+                    "{c:?} chunk {chunk}"
+                );
             }
         }
         assert_eq!(
@@ -288,13 +284,17 @@ mod tests {
         let inner = encode(Some(Coding::Gzip), &data, 8192).await;
         let outer = encode(Some(Coding::Brotli), &inner, 8192).await;
         assert_eq!(
-            decode(outer, &[Coding::Gzip, Coding::Brotli]).await.unwrap(),
+            decode(outer, &[Coding::Gzip, Coding::Brotli])
+                .await
+                .unwrap(),
             data
         );
         let inner = encode(Some(Coding::Zstd), &data, 8192).await;
         let outer = encode(Some(Coding::Deflate), &inner, 8192).await;
         assert_eq!(
-            decode(outer, &[Coding::Zstd, Coding::Deflate]).await.unwrap(),
+            decode(outer, &[Coding::Zstd, Coding::Deflate])
+                .await
+                .unwrap(),
             data
         );
     }
@@ -362,7 +362,11 @@ mod tests {
             ("*", None),
         ];
         for (ae, want) in cases {
-            assert_eq!(choose_encoding(&hm(&[("accept-encoding", ae)])), *want, "{ae}");
+            assert_eq!(
+                choose_encoding(&hm(&[("accept-encoding", ae)])),
+                *want,
+                "{ae}"
+            );
         }
         assert_eq!(choose_encoding(&HeaderMap::new()), None);
     }

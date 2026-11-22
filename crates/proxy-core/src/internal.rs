@@ -62,7 +62,10 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
         ipad[i] ^= k[i];
         opad[i] ^= k[i];
     }
-    let inner = Sha256::new().chain_update(ipad).chain_update(msg).finalize();
+    let inner = Sha256::new()
+        .chain_update(ipad)
+        .chain_update(msg)
+        .finalize();
     Sha256::new()
         .chain_update(opad)
         .chain_update(inner)
@@ -176,8 +179,10 @@ impl Internal {
         };
         if method != Method::GET && method != Method::HEAD {
             let mut r = plain(StatusCode::METHOD_NOT_ALLOWED, "no-store", "same-origin");
-            r.headers_mut()
-                .insert("allow", hyper::header::HeaderValue::from_static("GET, HEAD"));
+            r.headers_mut().insert(
+                "allow",
+                hyper::header::HeaderValue::from_static("GET, HEAD"),
+            );
             return r;
         }
         Response::builder()

@@ -136,8 +136,10 @@ impl Policy {
 
     /// Whether `sandbox` is present and withholds `allow-same-origin` (opaque origin).
     pub fn sandbox_opaque_origin(&self) -> bool {
-        self.get("sandbox")
-            .is_some_and(|v| !v.iter().any(|t| t.eq_ignore_ascii_case("allow-same-origin")))
+        self.get("sandbox").is_some_and(|v| {
+            !v.iter()
+                .any(|t| t.eq_ignore_ascii_case("allow-same-origin"))
+        })
     }
 }
 
@@ -164,7 +166,7 @@ fn is_nonce_or_hash(tok: &str) -> bool {
 fn allows_inline(list: &[String], script: bool, nonce: Option<&str>) -> bool {
     if let Some(n) = nonce {
         let want = format!("'nonce-{n}'");
-        if list.iter().any(|t| *t == want) {
+        if list.contains(&want) {
             return true;
         }
     }
@@ -190,11 +192,15 @@ fn source_matches(tok: &str, origin: &PageOrigin, path: &str) -> bool {
     }
     // scheme-source: `https:`
     if let Some(s) = tok.strip_suffix(':') {
-        if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b)) && !s.is_empty() {
+        if s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+            && !s.is_empty()
+        {
             let s = s.to_ascii_lowercase();
             return s == origin.scheme
                 || (s == "http" && origin.scheme == "https")
-                || (s == "ws" && matches!(origin.scheme.as_str(), "ws" | "wss" | "http" | "https"))
+                || (s == "ws"
+                    && matches!(origin.scheme.as_str(), "ws" | "wss" | "http" | "https"))
                 || (s == "wss" && matches!(origin.scheme.as_str(), "wss" | "https"));
         }
     }
@@ -313,7 +319,9 @@ pub fn adapt(
         if tt_required {
             if let Some(v) = p.get_mut("trusted-types") {
                 let restricts = !v.is_empty()
-                    && !v.iter().any(|t| is_kw(t, "none") || t == "*" || t == TT_POLICY);
+                    && !v
+                        .iter()
+                        .any(|t| is_kw(t, "none") || t == "*" || t == TT_POLICY);
                 if restricts {
                     v.push(TT_POLICY.to_string());
                 }
@@ -442,7 +450,10 @@ mod tests {
                 "script-src 'nonce-abc' 'nonce-N0nce'",
             ),
             // default-src fallback is used for script, style and connect.
-            ("default-src 'none'", "default-src 'none' 'nonce-N0nce' https://example.test/__adblock__/"),
+            (
+                "default-src 'none'",
+                "default-src 'none' 'nonce-N0nce' https://example.test/__adblock__/",
+            ),
             // script-src-elem wins over script-src.
             (
                 "script-src 'self'; script-src-elem https://cdn.test",
@@ -454,7 +465,10 @@ mod tests {
                 "script-src https://cdn.test 'unsafe-inline' https://example.test/__adblock__/",
             ),
             // 'self' + unsafe-inline: nothing to add.
-            ("script-src 'self' 'unsafe-inline'", "script-src 'self' 'unsafe-inline'"),
+            (
+                "script-src 'self' 'unsafe-inline'",
+                "script-src 'self' 'unsafe-inline'",
+            ),
             // strict-dynamic ignores 'self': nonce required.
             (
                 "script-src 'self' 'strict-dynamic' 'nonce-abc'",
@@ -477,9 +491,15 @@ mod tests {
             ("script-src https:", "script-src https:"),
             ("script-src *.test", "script-src *.test"),
             ("script-src example.test", "script-src example.test"),
-            ("script-src example.test:8443", "script-src example.test:8443 'nonce-N0nce'"),
+            (
+                "script-src example.test:8443",
+                "script-src example.test:8443 'nonce-N0nce'",
+            ),
             // unrelated directives are untouched.
-            ("img-src 'none'; frame-ancestors 'self'", "img-src 'none'; frame-ancestors 'self'"),
+            (
+                "img-src 'none'; frame-ancestors 'self'",
+                "img-src 'none'; frame-ancestors 'self'",
+            ),
             // duplicate directives: first wins, later ones dropped.
             (
                 "script-src 'self'; script-src 'none'",
@@ -500,7 +520,13 @@ mod tests {
 
     #[test]
     fn style_nonce_added_without_unsafe_inline() {
-        let a = run("style-src 'self'", Needs { style: true, ..Needs::default() });
+        let a = run(
+            "style-src 'self'",
+            Needs {
+                style: true,
+                ..Needs::default()
+            },
+        );
         assert_eq!(a.text, "style-src 'self' 'nonce-N0nce'");
     }
 
@@ -521,7 +547,11 @@ mod tests {
         let a = run("sandbox allow-forms; script-src 'none'", ALL);
         assert!(a.blocks_scripts);
         assert!(a.opaque_origin);
-        assert!(!a.text.contains("nonce-N0nce 'nonce"), "no script nonce: {}", a.text);
+        assert!(
+            !a.text.contains("nonce-N0nce 'nonce"),
+            "no script nonce: {}",
+            a.text
+        );
         let a = run("sandbox allow-scripts allow-same-origin", ALL);
         assert!(!a.blocks_scripts && !a.opaque_origin);
     }
@@ -532,7 +562,11 @@ mod tests {
             "require-trusted-types-for 'script'; trusted-types foo bar; script-src 'self'",
             ALL,
         );
-        assert!(a.text.contains("trusted-types foo bar adblock-proxy"), "{}", a.text);
+        assert!(
+            a.text.contains("trusted-types foo bar adblock-proxy"),
+            "{}",
+            a.text
+        );
         for p in [
             "require-trusted-types-for 'script'; trusted-types *",
             "require-trusted-types-for 'script'; trusted-types 'none'",
@@ -547,10 +581,16 @@ mod tests {
     #[test]
     fn multiple_policies_each_adapted() {
         let (out, blocks, _) = adapt_headers(
-            &["script-src 'self'", "script-src 'nonce-abc', default-src 'self'"],
+            &[
+                "script-src 'self'",
+                "script-src 'nonce-abc', default-src 'self'",
+            ],
             &origin(),
             "N0nce",
-            Needs { script: true, ..Needs::default() },
+            Needs {
+                script: true,
+                ..Needs::default()
+            },
         );
         assert!(!blocks);
         assert_eq!(out[0], None, "first policy already allows us");
@@ -566,7 +606,10 @@ mod tests {
             &["script-src 'nonce-a'", "sandbox"],
             &origin(),
             "N0nce",
-            Needs { script: true, ..Needs::default() },
+            Needs {
+                script: true,
+                ..Needs::default()
+            },
         );
         assert!(blocks);
         assert_eq!(out, vec![None, None]);
@@ -601,15 +644,30 @@ mod tests {
         let a = adapt("script-src 'self'", PolicyKind::Header, &o, "N", ALL);
         assert!(!a.changed);
         let a = adapt("script-src example.test", PolicyKind::Header, &o, "N", ALL);
-        assert!(a.changed, "host-source without port means default port only");
+        assert!(
+            a.changed,
+            "host-source without port means default port only"
+        );
         assert_eq!(o.serialize(), "https://example.test:8443");
     }
 
     #[test]
     fn path_sources() {
         let o = origin();
-        assert!(source_matches("https://example.test/__adblock__/", &o, "/__adblock__/boot.js"));
-        assert!(!source_matches("https://example.test/js/", &o, "/__adblock__/boot.js"));
-        assert!(source_matches("example.test/__adblock__/boot.js", &o, "/__adblock__/boot.js"));
+        assert!(source_matches(
+            "https://example.test/__adblock__/",
+            &o,
+            "/__adblock__/boot.js"
+        ));
+        assert!(!source_matches(
+            "https://example.test/js/",
+            &o,
+            "/__adblock__/boot.js"
+        ));
+        assert!(source_matches(
+            "example.test/__adblock__/boot.js",
+            &o,
+            "/__adblock__/boot.js"
+        ));
     }
 }

@@ -109,7 +109,9 @@ async fn pipeline(encoded: Vec<u8>, coding: Option<Coding>, plan: &HtmlPlan) -> 
 }
 
 fn benches(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
     let internal = Internal::new();
     let html = page();
     let plan = plan(&internal);
@@ -216,7 +218,10 @@ fn benches(c: &mut Criterion) {
                 head_html: head.html,
                 ..Default::default()
             };
-            black_box((a, RewriteStage::new(&p, encoding_rs::UTF_8, false, 0).unwrap()))
+            black_box((
+                a,
+                RewriteStage::new(&p, encoding_rs::UTF_8, false, 0).unwrap(),
+            ))
         })
     });
     f.finish();

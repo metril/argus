@@ -139,7 +139,10 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
         .collect();
     if !plain.is_empty() {
         head.has_style = true;
-        let _ = write!(head.html, "<style id=\"__adblock_cosmetic\" nonce=\"{nonce}\">");
+        let _ = write!(
+            head.html,
+            "<style id=\"__adblock_cosmetic\" nonce=\"{nonce}\">"
+        );
         let mut css = String::new();
         css_ascii(&plain.join(","), &mut css);
         head.html.push_str(&css);
@@ -171,7 +174,10 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
 
         // Scriptlets first: they must run before any page script.
         if let Some(path) = &scriptlet {
-            let _ = write!(head.html, "<script src=\"{path}\" nonce=\"{nonce}\"></script>");
+            let _ = write!(
+                head.html,
+                "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
+            );
             head.has_script = true;
         }
         if observer || !proc_items.is_empty() {
@@ -218,9 +224,13 @@ mod tests {
         };
         let h = build_head(&spec(&cos, &i));
         assert!(h.html.contains(".ad,#banner{display:none!important}"));
-        assert!(h.html.contains("<style id=\"__adblock_cosmetic\" nonce=\"NONCE\">"));
+        assert!(h
+            .html
+            .contains("<style id=\"__adblock_cosmetic\" nonce=\"NONCE\">"));
         assert!(h.html.contains("id=\"__ab_cfg\""));
-        assert!(h.html.contains(&format!("src=\"{}\" nonce=\"NONCE\"", boot_path())));
+        assert!(h
+            .html
+            .contains(&format!("src=\"{}\" nonce=\"NONCE\"", boot_path())));
         assert!(h.has_style && h.has_script && h.observer);
         assert!(h.html.is_ascii());
     }
@@ -290,7 +300,10 @@ mod tests {
             ..Default::default()
         };
         let h = build_head(&spec(&cos, &i)).html;
-        assert!(!h.contains("window.x"), "scriptlet code must not be inlined");
+        assert!(
+            !h.contains("window.x"),
+            "scriptlet code must not be inlined"
+        );
         let s = h.find("/__adblock__/s/").expect("scriptlet tag");
         let b = h.find("/__adblock__/boot.").expect("boot tag");
         assert!(s < b);

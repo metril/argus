@@ -12,16 +12,16 @@ use crate::authority;
 use crate::csp;
 use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody};
 use crate::internal::Internal;
+use crate::policy::{is_refusal, DestPolicy};
+use crate::redirect::{block_response, redirect_response, rewrite_redirect};
+use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
+use crate::request_type::{classify, source_url, RequestType};
 use crate::rewrite::codec::{choose_encoding, response_codings};
 use crate::rewrite::pipeline::{transform_html, transform_text, Outcome};
 use crate::rewrite::{
     classify_body, media_type, BodyKind, HeaderEdit, HtmlPlan, ResponseInfo, ResponseTransforms,
     TransformSource,
 };
-use crate::policy::{is_refusal, DestPolicy};
-use crate::redirect::{block_response, redirect_response, rewrite_redirect};
-use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
-use crate::request_type::{classify, source_url, RequestType};
 use crate::upstream::{build_strict_upstream_client, build_upstream_client, UpstreamOptions};
 use crate::{Error, Result};
 use bytes::Bytes;
@@ -585,7 +585,10 @@ impl ProxyContext {
                 if name == hyper::header::CONTENT_LENGTH
                     || name == hyper::header::CONTENT_ENCODING
                     || name == hyper::header::ACCEPT_RANGES
-                    || matches!(n, "content-md5" | "digest" | "repr-digest" | "content-digest")
+                    || matches!(
+                        n,
+                        "content-md5" | "digest" | "repr-digest" | "content-digest"
+                    )
                 {
                     continue;
                 }
@@ -617,10 +620,9 @@ impl ProxyContext {
                     if let Ok(v) = value.to_str() {
                         if v.trim() == "*" {
                             builder = builder.header(name, value);
-                        } else if let Ok(hv) = HeaderValue::from_str(&format!(
-                            "{v}, {}",
-                            vary_additions(origin_coded)
-                        )) {
+                        } else if let Ok(hv) =
+                            HeaderValue::from_str(&format!("{v}, {}", vary_additions(origin_coded)))
+                        {
                             builder = builder.header(name, hv);
                         }
                         continue;

@@ -177,13 +177,17 @@ pub fn classify_body(
 ) -> BodyKind {
     let code = status.as_u16();
     // Never touch 1xx/204/205/206/304 or redirects; error pages (4xx/5xx) may be HTML documents.
-    if is_head || code < 200 || (300..400).contains(&code) || matches!(code, 204 | 205 | 206) {
+    if is_head || code < 200 || (300..400).contains(&code) || matches!(code, 204..=206) {
         return BodyKind::None;
     }
     if response_headers
         .get(hyper::header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("attachment"))
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("attachment")
+        })
     {
         return BodyKind::None;
     }
@@ -235,6 +239,7 @@ mod tests {
     fn classification_table() {
         use BodyKind::*;
         let html = [("content-type", "text/html; charset=utf-8")];
+        #[allow(clippy::type_complexity)]
         let cases: &[(bool, u16, RequestType, &[(&str, &str)], BodyKind)] = &[
             (false, 200, RequestType::Document, &html, Html),
             (false, 200, RequestType::Subdocument, &html, Html),
@@ -267,7 +272,12 @@ mod tests {
         ];
         for (head, status, ty, hdrs, want) in cases {
             assert_eq!(
-                classify_body(*head, StatusCode::from_u16(*status).unwrap(), *ty, &hm(hdrs)),
+                classify_body(
+                    *head,
+                    StatusCode::from_u16(*status).unwrap(),
+                    *ty,
+                    &hm(hdrs)
+                ),
                 *want,
                 "{head} {status} {ty:?} {hdrs:?}"
             );

@@ -50,7 +50,8 @@ pub fn sniff_html(b: &[u8]) -> bool {
             }
         }
         if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"!doctype") {
-            let after = String::from_utf8_lossy(&rest[8..rest.len().min(8 + 24)]).to_ascii_lowercase();
+            let after =
+                String::from_utf8_lossy(&rest[8..rest.len().min(8 + 24)]).to_ascii_lowercase();
             let after = after.trim_start();
             return after.starts_with("html")
                 && after[4..].starts_with(|c: char| c.is_ascii_whitespace() || c == '>')
@@ -64,7 +65,15 @@ pub fn sniff_html(b: &[u8]) -> bool {
             let name = String::from_utf8_lossy(&rest[..end]).to_ascii_lowercase();
             return !matches!(
                 name.as_str(),
-                "svg" | "rss" | "feed" | "xml" | "urlset" | "sitemapindex" | "opml" | "plist" | "math"
+                "svg"
+                    | "rss"
+                    | "feed"
+                    | "xml"
+                    | "urlset"
+                    | "sitemapindex"
+                    | "opml"
+                    | "plist"
+                    | "math"
             );
         }
         return false;
@@ -169,7 +178,14 @@ impl RewriteStage {
             let skip_code = rep.selector.is_none();
             let mut buf = String::new();
             handlers.push(text!(sel.as_str(), move |t| {
-                if skip_code && matches!(t.text_type(), lol_html::html_content::TextType::ScriptData | lol_html::html_content::TextType::RCData | lol_html::html_content::TextType::RawText) {
+                if skip_code
+                    && matches!(
+                        t.text_type(),
+                        lol_html::html_content::TextType::ScriptData
+                            | lol_html::html_content::TextType::RCData
+                            | lol_html::html_content::TextType::RawText
+                    )
+                {
                     return Ok(());
                 }
                 buf.push_str(t.as_str());
@@ -252,7 +268,10 @@ impl RewriteStage {
             return Bytes::new();
         }
         let cap = g.capacity().min(256 * 1024);
-        Bytes::from(std::mem::replace(&mut *g, Vec::with_capacity(cap.min(64 * 1024))))
+        Bytes::from(std::mem::replace(
+            &mut *g,
+            Vec::with_capacity(cap.min(64 * 1024)),
+        ))
     }
 
     /// Feed the next window of (decoded-from-transport) document bytes; returns rewritten bytes.

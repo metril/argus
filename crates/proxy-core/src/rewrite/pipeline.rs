@@ -123,7 +123,10 @@ pub enum Outcome {
 fn open(
     resp: reqwest::Response,
     codings: &[Coding],
-) -> (SharedRaw, impl std::future::Future<Output = io::Result<DynBufRead>> + '_) {
+) -> (
+    SharedRaw,
+    impl std::future::Future<Output = io::Result<DynBufRead>> + '_,
+) {
     let raw = SharedRaw::new(resp.bytes_stream().map_err(io::Error::other).boxed());
     let input: DynBufRead = Box::pin(StreamReader::new(raw.clone()));
     (raw, decode_chain(input, codings))
@@ -161,7 +164,11 @@ async fn fill_peek(reader: &mut DynBufRead, peek: &mut Vec<u8>) -> io::Result<bo
 fn utf8_prefix(det: &Detected, peek: &[u8]) -> Vec<u8> {
     let mut dec = det.encoding.new_decoder_without_bom_handling();
     let src = &peek[det.bom_len.min(peek.len())..];
-    let mut out = vec![0u8; dec.max_utf8_buffer_length(src.len()).unwrap_or(src.len() * 3 + 16)];
+    let mut out = vec![
+        0u8;
+        dec.max_utf8_buffer_length(src.len())
+            .unwrap_or(src.len() * 3 + 16)
+    ];
     let (_, _, written, _) = dec.decode_to_utf8(src, &mut out, false);
     out.truncate(written);
     out

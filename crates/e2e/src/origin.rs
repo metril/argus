@@ -442,14 +442,17 @@ async fn handle(
                     tokio::time::sleep(spec.pause).await;
                 }
                 let n = spec.chunk.len().min(spec.total - sent);
-                spec.sent
-                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                Some((Ok::<_, std::io::Error>(Frame::data(spec.chunk.slice(..n))), spec))
+                spec.sent.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                Some((
+                    Ok::<_, std::io::Error>(Frame::data(spec.chunk.slice(..n))),
+                    spec,
+                ))
             });
-            let s = futures_util::stream::once(async move {
-                Ok::<_, std::io::Error>(Frame::data(first))
-            })
-            .chain(rest);
+            let s =
+                futures_util::stream::once(
+                    async move { Ok::<_, std::io::Error>(Frame::data(first)) },
+                )
+                .chain(rest);
             http_body_util::StreamBody::new(s).boxed_unsync()
         }
     };

@@ -75,7 +75,10 @@ e2e_test!(
         );
         let resp = env
             .client()
-            .request(reqwest::Method::GET, &env.origin.https_url("example.test", "/page"))
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("example.test", "/page"),
+            )
             .header("sec-fetch-dest", "document")
             .send()
             .await

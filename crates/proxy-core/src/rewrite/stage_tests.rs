@@ -41,7 +41,15 @@ fn run_chunked(
 }
 
 fn run(input: &str) -> String {
-    String::from_utf8(run_chunked(&plan(), encoding_rs::UTF_8, false, 0, input.as_bytes(), &[usize::MAX])).unwrap()
+    String::from_utf8(run_chunked(
+        &plan(),
+        encoding_rs::UTF_8,
+        false,
+        0,
+        input.as_bytes(),
+        &[usize::MAX],
+    ))
+    .unwrap()
 }
 
 /// Adversarial documents: each must get exactly one injection, at the right place.
@@ -114,8 +122,22 @@ fn text_without_elements_gets_nothing() {
 #[test]
 fn one_byte_chunks_match_one_big_chunk() {
     for (input, _) in DOCS {
-        let big = run_chunked(&plan(), encoding_rs::UTF_8, false, 0, input.as_bytes(), &[usize::MAX]);
-        let tiny = run_chunked(&plan(), encoding_rs::UTF_8, false, 0, input.as_bytes(), &[1]);
+        let big = run_chunked(
+            &plan(),
+            encoding_rs::UTF_8,
+            false,
+            0,
+            input.as_bytes(),
+            &[usize::MAX],
+        );
+        let tiny = run_chunked(
+            &plan(),
+            encoding_rs::UTF_8,
+            false,
+            0,
+            input.as_bytes(),
+            &[1],
+        );
         assert_eq!(big, tiny, "input: {input}");
     }
 }
@@ -130,7 +152,7 @@ proptest! {
         sizes in proptest::collection::vec(1usize..40, 1..12),
         repeat in 1usize..30,
     ) {
-        let mut input = DOCS[doc].0.repeat(1).into_bytes();
+        let mut input = DOCS[doc].0.to_string().into_bytes();
         // Pad the body so boundaries land in many places.
         input.extend_from_slice("<p class=\"a\">filler & text</p>".repeat(repeat).as_bytes());
         let whole = run_chunked(&plan(), encoding_rs::UTF_8, false, 0, &input, &[usize::MAX]);
@@ -179,8 +201,15 @@ fn shift_jis_bytes_are_preserved_around_the_injection() {
 #[test]
 fn utf16_is_transcoded_and_meta_fixed() {
     let doc = "<html><head><meta charset=\"utf-16\"></head><body>\u{65e5}\u{672c}</body></html>";
-    for (enc, le) in [(encoding_rs::UTF_16LE, true), (encoding_rs::UTF_16BE, false)] {
-        let mut bytes = if le { vec![0xff, 0xfe] } else { vec![0xfe, 0xff] };
+    for (enc, le) in [
+        (encoding_rs::UTF_16LE, true),
+        (encoding_rs::UTF_16BE, false),
+    ] {
+        let mut bytes = if le {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
         for u in doc.encode_utf16() {
             bytes.extend_from_slice(&if le { u.to_le_bytes() } else { u.to_be_bytes() });
         }
@@ -198,7 +227,8 @@ fn utf16_is_transcoded_and_meta_fixed() {
 
 #[test]
 fn iso_2022_jp_is_transcoded() {
-    let (bytes, _, _) = encoding_rs::ISO_2022_JP.encode("<html><head></head><body>\u{65e5}\u{672c}</body></html>");
+    let (bytes, _, _) =
+        encoding_rs::ISO_2022_JP.encode("<html><head></head><body>\u{65e5}\u{672c}</body></html>");
     let out = run_chunked(&plan(), encoding_rs::ISO_2022_JP, true, 0, &bytes, &[2]);
     assert_eq!(
         String::from_utf8(out).unwrap(),
@@ -211,10 +241,22 @@ fn removal_replacement_and_extra_injections() {
     let p = HtmlPlan {
         head_html: MARK.into(),
         injections: vec![
-            Injection { pos: InjectPos::HeadStart, html: "<!--A-->".into() },
-            Injection { pos: InjectPos::BodyStart, html: "<!--B-->".into() },
-            Injection { pos: InjectPos::BodyEnd, html: "<!--C-->".into() },
-            Injection { pos: InjectPos::HeadEnd, html: "<!--D-->".into() },
+            Injection {
+                pos: InjectPos::HeadStart,
+                html: "<!--A-->".into(),
+            },
+            Injection {
+                pos: InjectPos::BodyStart,
+                html: "<!--B-->".into(),
+            },
+            Injection {
+                pos: InjectPos::BodyEnd,
+                html: "<!--C-->".into(),
+            },
+            Injection {
+                pos: InjectPos::HeadEnd,
+                html: "<!--D-->".into(),
+            },
         ],
         remove_selectors: vec!["div.ad".into(), "!!bad selector".into()],
         replacements: vec![TextReplacement {
@@ -226,7 +268,15 @@ fn removal_replacement_and_extra_injections() {
     };
     let input = "<html><head><meta http-equiv=\"Content-Security-Policy\" content=\"a\"></head><body><div class=\"ad\">no</div><p>a secret and another secret</p></body></html>";
     for sizes in [&[usize::MAX][..], &[1], &[7]] {
-        let out = String::from_utf8(run_chunked(&p, encoding_rs::UTF_8, false, 0, input.as_bytes(), sizes)).unwrap();
+        let out = String::from_utf8(run_chunked(
+            &p,
+            encoding_rs::UTF_8,
+            false,
+            0,
+            input.as_bytes(),
+            sizes,
+        ))
+        .unwrap();
         assert_eq!(
             out,
             "<html><head><!--A--><!--INJ--><meta http-equiv=\"Content-Security-Policy\" content=\"a added\"><!--D--></head><body><!--B--><p>a [x] and another [x]</p><!--C--></body></html>",
@@ -275,18 +325,21 @@ async fn encoder_flushes_when_upstream_goes_quiet() {
     use async_compression::tokio::bufread::ZstdDecoder;
     use tokio::io::AsyncReadExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
-    let input = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|v| (v, rx))
-    });
+    let input =
+        futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|v| (v, rx)) });
     let mut out = Box::pin(encode_stream(input, Some(super::codec::Coding::Zstd)));
-    tx.send(Ok(Bytes::from_static(b"<html><head>"))).await.unwrap();
+    tx.send(Ok(Bytes::from_static(b"<html><head>")))
+        .await
+        .unwrap();
     let first = tokio::time::timeout(std::time::Duration::from_secs(2), out.next())
         .await
         .expect("flushed without waiting for more input")
         .unwrap()
         .unwrap();
     // A decoder fed only this prefix already yields the text.
-    let mut dec = ZstdDecoder::new(tokio::io::BufReader::new(std::io::Cursor::new(first.to_vec())));
+    let mut dec = ZstdDecoder::new(tokio::io::BufReader::new(std::io::Cursor::new(
+        first.to_vec(),
+    )));
     let mut got = Vec::new();
     let mut buf = [0u8; 64];
     while let Ok(n) = dec.read(&mut buf).await {
@@ -305,9 +358,12 @@ async fn encoder_batches_when_input_is_ready() {
     let chunks: Vec<std::io::Result<Bytes>> = (0..200)
         .map(|_| Ok(Bytes::from_static(b"<p>some text that compresses well</p>")))
         .collect();
-    let outs: Vec<_> = encode_stream(futures_util::stream::iter(chunks), Some(super::codec::Coding::Gzip))
-        .collect()
-        .await;
+    let outs: Vec<_> = encode_stream(
+        futures_util::stream::iter(chunks),
+        Some(super::codec::Coding::Gzip),
+    )
+    .collect()
+    .await;
     // Ready input is not flushed per chunk.
     assert!(outs.len() < 10, "{} output chunks", outs.len());
 }
