@@ -724,3 +724,84 @@ fn unsafe_style_declarations_are_rejected_from_any_list() {
     ));
     assert!(ok.is_ok());
 }
+
+// ---- $cookie from untrusted lists may only remove or tighten ----------------------------------
+
+fn cookie_edit(trusted: bool, raw: &str, set_cookie: &str) -> Option<Vec<String>> {
+    let i = ExtIndex::build(&[rule(raw, trusted)]);
+    let p = plan(
+        &i,
+        &get("https://site.example/", ResourceType::Document),
+        "text/html",
+        &[("Set-Cookie", set_cookie)],
+    );
+    p.header_edits.iter().find_map(|e| match e {
+        HeaderEdit::SetAll(n, v) if n == "set-cookie" => Some(v.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn untrusted_cookie_rules_cannot_weaken_a_cookie() {
+    let weak = "c=1; Path=/; Secure; HttpOnly; Max-Age=60; SameSite=Strict";
+    // Loosening SameSite or extending the lifetime changes nothing.
+    assert_eq!(
+        cookie_edit(false, "||site.example^$cookie=c;sameSite=none", weak),
+        None
+    );
+    assert_eq!(
+        cookie_edit(false, "||site.example^$cookie=c;sameSite=lax", weak),
+        None
+    );
+    assert_eq!(
+        cookie_edit(false, "||site.example^$cookie=c;maxAge=999999", weak),
+        None
+    );
+    // A cookie without an explicit lifetime is not given one (it might outlive the session).
+    assert_eq!(
+        cookie_edit(
+            false,
+            "||site.example^$cookie=c;maxAge=999999",
+            "c=1; Secure"
+        ),
+        None
+    );
+    // Tightening applies and keeps Secure / HttpOnly.
+    let out = cookie_edit(
+        false,
+        "||site.example^$cookie=c;maxAge=30;sameSite=strict",
+        "c=1; Path=/; Secure; HttpOnly; Max-Age=60; SameSite=Lax",
+    )
+    .unwrap();
+    assert_eq!(out.len(), 1);
+    let line = &out[0];
+    for want in ["Secure", "HttpOnly", "Max-Age=30", "SameSite=Strict"] {
+        assert!(line.contains(want), "{line}");
+    }
+    // An unset SameSite is Lax by default: Strict is a tightening, None is not.
+    assert!(cookie_edit(
+        false,
+        "||site.example^$cookie=c;sameSite=strict",
+        "c=1; Secure"
+    )
+    .is_some());
+    assert_eq!(
+        cookie_edit(
+            false,
+            "||site.example^$cookie=c;sameSite=none",
+            "c=1; Secure"
+        ),
+        None
+    );
+    // Removal is always fine.
+    assert_eq!(
+        cookie_edit(false, "||site.example^$cookie=c", weak),
+        Some(vec![])
+    );
+    // Trusted lists keep the full behaviour.
+    let out = cookie_edit(true, "||site.example^$cookie=c;sameSite=none", weak).unwrap();
+    assert!(
+        out[0].contains("SameSite=None") && out[0].contains("Secure"),
+        "{out:?}"
+    );
+}

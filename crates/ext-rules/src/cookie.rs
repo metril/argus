@@ -6,7 +6,7 @@
 //!   `Cookie` header and from response `Set-Cookie` headers.
 //! * With `;maxAge=<seconds>` and/or `;sameSite=<none|lax|strict>` matched response cookies are
 //!   *modified* instead (`Max-Age` set and `Expires` dropped; `SameSite` replaced). Modifying
-//!   rules do not touch the request.
+//!   rules do not touch the request. From untrusted lists only tightening is applied.
 //! * `@@...$cookie[=value]` exceptions disable all cookie rules / the rule with the same value.
 
 use regex::{Regex, RegexBuilder};
@@ -26,6 +26,15 @@ pub enum SameSite {
 }
 
 impl SameSite {
+    /// Protection level: `None` < `Lax` < `Strict`.
+    fn rank(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Lax => 1,
+            Self::Strict => 2,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::None => "None",
@@ -42,6 +51,9 @@ pub struct CookieSpec {
     pub name: CookieName,
     pub max_age: Option<u64>,
     pub same_site: Option<SameSite>,
+    /// The rule comes from a trusted list (set when the index is built). Untrusted modifying
+    /// rules may only tighten a cookie, see [`apply_set_cookie`].
+    pub trusted: bool,
 }
 
 impl CookieSpec {
@@ -81,6 +93,7 @@ impl CookieSpec {
             name,
             max_age,
             same_site,
+            trusted: false,
         })
     }
 
@@ -123,22 +136,46 @@ pub enum SetCookie {
 }
 
 /// Apply specs to one `Set-Cookie` header value.
+///
+/// Removal is always honoured. Modifications from trusted lists are applied as written; from
+/// untrusted lists only when they tighten the cookie: a `Max-Age` shorter than the one the
+/// cookie already has (or 0), a `SameSite` stricter than the cookie's (an absent attribute counts
+/// as `Lax`, the browser default). `Secure` and `HttpOnly` are never touched.
 pub fn apply_set_cookie(line: &str, specs: &[&CookieSpec]) -> SetCookie {
     let mut parts = line.split(';');
     let first = parts.next().unwrap_or("");
     let name = first.split_once('=').map_or(first, |x| x.0).trim();
-    let mut max_age = None;
-    let mut same_site = None;
+    let attrs: Vec<&str> = parts.collect();
+    let attr = |k: &str| {
+        attrs.iter().find_map(|a| {
+            let (n, v) = a.split_once('=')?;
+            n.trim().eq_ignore_ascii_case(k).then(|| v.trim())
+        })
+    };
+    let cur_max_age = attr("max-age").and_then(|v| v.parse::<u64>().ok());
+    let cur_same_site = match attr("samesite").map(str::to_ascii_lowercase).as_deref() {
+        Some("none") => SameSite::None,
+        Some("strict") => SameSite::Strict,
+        _ => SameSite::Lax,
+    };
+    let (mut max_age, mut same_site) = (None, None);
     for s in specs.iter().filter(|s| s.matches_name(name)) {
         if !s.modifies() {
             return SetCookie::Remove;
         }
-        max_age = s.max_age.or(max_age);
-        same_site = s.same_site.or(same_site);
+        let m = s.max_age.filter(|&m| {
+            s.trusted || m == 0 || cur_max_age.is_some_and(|c| m < c.min(max_age.unwrap_or(c)))
+        });
+        let ss = s
+            .same_site
+            .filter(|&n| s.trusted || n.rank() > same_site.unwrap_or(cur_same_site).rank());
+        max_age = m.or(max_age);
+        same_site = ss.or(same_site);
     }
     if max_age.is_none() && same_site.is_none() {
         return SetCookie::Keep;
     }
+    let parts = attrs.into_iter();
     let mut out = String::from(first.trim_end());
     for attr in parts {
         let key = attr
@@ -186,7 +223,8 @@ mod tests {
         );
         assert_eq!(apply_set_cookie("b=2; Path=/", &[&b]), SetCookie::Remove);
         assert_eq!(apply_set_cookie("c=2; Path=/", &[&b]), SetCookie::Keep);
-        let m = CookieSpec::parse("c;maxAge=3600;sameSite=lax").unwrap();
+        let mut m = CookieSpec::parse("c;maxAge=3600;sameSite=lax").unwrap();
+        m.trusted = true;
         assert_eq!(
             apply_set_cookie(
                 "c=2; Path=/; Expires=Wed, 21 Oct 2099 07:28:00 GMT; SameSite=None; Secure",

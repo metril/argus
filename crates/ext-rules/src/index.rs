@@ -389,6 +389,10 @@ impl ExtIndex {
                 continue;
             }
             k.active += 1;
+            let mut p = p;
+            if let Action::Cookie(c) = &mut p.action {
+                c.trusted = p.trusted;
+            }
             idx.insert(p);
         }
         idx.stats = stats;
