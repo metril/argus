@@ -22,5 +22,7 @@ acceptance criteria could not be evaluated. Re-run on a quiet machine.
 
 Design changes: retired engines, aux data and swapped-out domain sets/IP filters are freed on
 a reaper thread (`filter_engine::reaper`); list builds run on a dedicated low-priority pool
-(`ListServiceConfig::build_threads`, 0 = cores/2). `loadgen` builds through
-`e2e::install_rules_text`, which does not use that pool.
+(`ListServiceConfig::build_threads`, config `adblock.build_threads`, 0 = cores/2). `loadgen`
+reloads through the list service (custom rules plus `reload_now`), so that pool is what it
+measures. Quiet-ish machine numbers and the per-stage engine check breakdown are in
+`README.md` (Results 2026-11-22).
