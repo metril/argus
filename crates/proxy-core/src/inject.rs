@@ -112,6 +112,9 @@ pub struct PageSpec<'a> {
     pub script_ok: bool,
     /// The class/id observer may call back (same-origin document, not generic-hide excepted).
     pub observer_ok: bool,
+    /// Scripts from trusted extended rules (`#%#`, scriptlets, snippets): one hash-addressed
+    /// bundle loaded after the boot script, which provides their runtime hook.
+    pub ext_script: &'a str,
 }
 
 /// The markup for one page, plus what it needs from the page's CSP.
@@ -180,7 +183,7 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
-        if observer || !proc_items.is_empty() {
+        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() {
             let cfg = serde_json::json!({
                 "p": proc_items,
                 "o": observer,
@@ -195,6 +198,13 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
             head.observer = observer;
+            if !spec.ext_script.is_empty() {
+                let path = spec.internal.put_scriptlet(spec.ext_script);
+                let _ = write!(
+                    head.html,
+                    "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
+                );
+            }
         }
     }
     head
@@ -212,6 +222,7 @@ mod tests {
             nonce: "NONCE",
             script_ok: true,
             observer_ok: true,
+            ext_script: "",
         }
     }
 

@@ -10,6 +10,7 @@
 
 use crate::authority;
 use crate::csp;
+use crate::ext;
 use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody};
 use crate::internal::Internal;
 use crate::policy::{is_refusal, DestPolicy};
@@ -99,6 +100,9 @@ pub struct ProxyContext {
     internal: Arc<Internal>,
     /// Optional per-response transforms (extended rules), see [`crate::rewrite`].
     transform_source: parking_lot::RwLock<Option<Arc<dyn TransformSource>>>,
+    /// Leave bodies alone when the origin says `Cache-Control: no-transform` (header-only edits
+    /// still apply). Many CDNs set it on everything, hence the switch.
+    respect_no_transform: std::sync::atomic::AtomicBool,
 }
 
 impl ProxyContext {
@@ -118,11 +122,18 @@ impl ProxyContext {
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
             resolve_all_to: None,
             internal: Arc::new(Internal::new()),
-            transform_source: parking_lot::RwLock::new(None),
+            transform_source: parking_lot::RwLock::new(Some(Arc::new(ext::ExtTransformSource))),
+            respect_no_transform: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
-    /// Install (or clear) the source of per-response transforms.
+    /// Honour `Cache-Control: no-transform` on responses (default on).
+    pub fn set_respect_no_transform(&self, respect: bool) {
+        self.respect_no_transform.store(respect, Ordering::Relaxed);
+    }
+
+    /// Install (or clear) the source of per-response transforms (the default is the extended
+    /// rule index, see [`crate::ext`]).
     pub fn set_transform_source(&self, source: Option<Arc<dyn TransformSource>>) {
         *self.transform_source.write() = source;
     }
@@ -257,7 +268,7 @@ impl ProxyContext {
         let method = req.method().clone();
         let is_head = method == hyper::Method::HEAD;
         let uri = req.uri().clone();
-        let headers = req.headers().clone();
+        let mut headers = req.headers().clone();
 
         // Target host/port: absolute-form URI / `:authority`, else the `Host` header, else the
         // MITM fallback. Authorities are parsed properly (bracketed IPv6, userinfo rejected).
@@ -307,12 +318,18 @@ impl ProxyContext {
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
         let mut csp: Option<String> = None;
+        // The engine generation this request is judged by (carries the ext-rule index); the
+        // response is judged by the same one.
+        let mut generation: Option<Arc<filter_engine::Generation>> = None;
+        let mut request_edits: Vec<ext_rules::HeaderEdit> = Vec::new();
         {
             let profile = rctx.profile.load();
             let engine = &profile.engine;
             if engine.is_enabled() {
                 let source = source_url(&headers, &url, rtype);
-                let verdict = engine.check_for(&url, source, rtype.as_str(), &profile.label);
+                let (verdict, gen_) =
+                    engine.check_gen(&url, source, rtype.as_str(), &profile.label);
+                generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
                     if let Some(res) = verdict.redirect_resource() {
@@ -329,11 +346,47 @@ impl ProxyContext {
                     // Subresource: fetch the cleaned URL transparently.
                     url = new_url;
                 }
+                // Extended rules run after the engine verdict (see `crate::ext` for precedence).
+                if let Some(idx) = generation
+                    .as_ref()
+                    .and_then(|g| g.aux::<ext_rules::ExtIndex>())
+                {
+                    let source = source_url(&headers, &url, rtype);
+                    if let Some(d) =
+                        ext::request_decision(idx, &url, method.as_str(), source, rtype, &headers)
+                    {
+                        if let Some(id) = d.block {
+                            let rule = idx.rule(id).map(|r| r.raw.clone()).unwrap_or_default();
+                            debug!("Blocked {} by extended rule {}", url, rule);
+                            let list = idx.rule(id).map(|r| r.list.clone());
+                            engine.stats_handle().record_blocked(rtype.as_str(), &host);
+                            engine.record_block(&filter_engine::BlockEvent {
+                                timestamp: chrono::Utc::now(),
+                                url: url.clone(),
+                                source_host: String::new(),
+                                request_type: rtype.as_str().to_string(),
+                                rule: rule.clone(),
+                                list_id: list,
+                                client: Some(profile.label.to_string()),
+                            });
+                            let v = filter_engine::MatchResult::blocked(rule);
+                            return Ok(block_response(rtype, &v, &url));
+                        }
+                        // Fetched transparently, never answered with a redirect: a URL
+                        // transform need not be idempotent, so a redirect could loop.
+                        if let Some((new_url, _)) = d.rewrite_url {
+                            url = new_url;
+                        }
+                        request_edits = d.header_edits;
+                    }
+                }
                 if rtype.is_frame() {
                     csp = engine.csp_for(&url, source_url(&headers, &url, rtype), rtype.as_str());
                 }
             }
         }
+
+        ext::apply_request_edits(&mut headers, &request_edits);
 
         // Stream the request body upstream; nothing is buffered.
         let has_body = !req.body().is_end_stream();
@@ -366,7 +419,7 @@ impl ProxyContext {
                 }
             }
         }
-        let mut rb = client.request(method, &dial_url);
+        let mut rb = client.request(method.clone(), &dial_url);
         if let Some(h) = host_override {
             rb = rb.header(HOST, h);
         }
@@ -422,7 +475,18 @@ impl ProxyContext {
 
         let status = resp.status();
         let resp_headers = resp.headers().clone();
-        let kind = classify_body(is_head, status, rtype, &resp_headers);
+        let mut kind = classify_body(is_head, status, rtype, &resp_headers);
+        // `Cache-Control: no-transform`: no body rewriting at all (header edits still apply).
+        if self.respect_no_transform.load(Ordering::Relaxed)
+            && resp_headers
+                .get_all(hyper::header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .any(|d| d.trim().eq_ignore_ascii_case("no-transform"))
+        {
+            kind = BodyKind::None;
+        }
         // HEAD / 1xx / 204 / 205 / 304 never carry a body, whatever the origin's length says.
         let body_allowed = !is_head
             && status.as_u16() >= 200
@@ -439,10 +503,13 @@ impl ProxyContext {
             (enabled, cos)
         };
         let source = self.transform_source.read().clone();
-        let transforms: ResponseTransforms = if enabled && kind != BodyKind::None {
+        let mut transforms: ResponseTransforms = if enabled {
             source
                 .and_then(|s| {
                     s.transforms_for(&ResponseInfo {
+                        generation: generation.as_ref(),
+                        method: method.as_str(),
+                        source_url: source_url(&headers, &url, rtype),
                         url: &url,
                         request_type: rtype,
                         status,
@@ -454,6 +521,19 @@ impl ProxyContext {
         } else {
             ResponseTransforms::default()
         };
+        if let Some(rule) = transforms.block.take() {
+            // A `$header` rule matched the response: answer with the block response instead.
+            debug!("Blocked {} by response rule {}", url, rule);
+            let v = filter_engine::MatchResult::blocked(rule);
+            return Ok(block_response(rtype, &v, &url));
+        }
+        if kind == BodyKind::None {
+            // Redirects, 204s, `no-transform`, downloads...: header edits only.
+            transforms = ResponseTransforms {
+                header_edits: std::mem::take(&mut transforms.header_edits),
+                ..Default::default()
+            };
+        }
 
         let codings = response_codings(&resp_headers);
         let out_coding = match &codings {
@@ -484,8 +564,21 @@ impl ProxyContext {
                     .filter_map(|v| v.to_str().ok())
                     .collect();
                 let (blocks_scripts, opaque) = csp::sandbox_facts(&csp_headers);
-                let cos = cosmetics.unwrap_or_default();
+                let mut cos = cosmetics.unwrap_or_default();
+                // Extended CSS the engine rejected goes to the in-page procedural evaluator.
+                for (selector, style) in &transforms.procedural {
+                    let action = match style {
+                        Some(s) => serde_json::json!({"type": "style", "arg": s}),
+                        None => serde_json::json!({"type": "hide"}),
+                    };
+                    cos.procedural_actions.push(
+                        serde_json::json!({"selector": [{"type": "css-selector", "arg": selector}], "action": action})
+                            .to_string(),
+                    );
+                }
+                let ext_script = transforms.scripts.join(";\n");
                 let head = build_head(&PageSpec {
+                    ext_script: &ext_script,
                     cosmetics: &cos,
                     internal: &self.internal,
                     host: &host,
@@ -521,18 +614,26 @@ impl ProxyContext {
                     injections: transforms.injections.clone(),
                     remove_selectors: transforms.remove_selectors.clone(),
                     replacements: transforms.text_replacements.clone(),
+                    element_filters: transforms.element_filters.clone(),
                     meta_csp,
                 };
-                if plan.is_empty() {
+                // `$replace` & co. on a document run on the decoded text first; the HTML stages
+                // (removals, injections, cosmetics) then see the result.
+                let pre = transforms
+                    .body
+                    .clone()
+                    .filter(|t| media_type(&resp_headers).is_some_and(|m| t.applies_to(&m)));
+                if plan.is_empty() && pre.is_none() {
                     passthrough_body(resp)
                 } else {
                     csp_values = csp::adapt_headers(&csp_headers, &origin, &nonce, needs).0;
-                    match transform_html(resp, codings, out_coding, content_type.clone(), plan)
+                    match transform_html(resp, codings, out_coding, content_type.clone(), plan, pre)
                         .await
                     {
                         Outcome::Html {
                             body,
                             utf8_charset: u,
+                            ..
                         } => {
                             rewritten = true;
                             utf8_charset = u;

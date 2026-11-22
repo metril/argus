@@ -21,6 +21,18 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// The engine generation (engine + extended-rule index) as one consistent snapshot.
+    pub fn generation(&self) -> Arc<filter_engine::Generation> {
+        self.engine.generation()
+    }
+
+    /// The extended-rule index of the live generation (shares the engine's atomic swap).
+    pub fn ext_index<'g>(
+        generation: &'g filter_engine::Generation,
+    ) -> Option<&'g ext_rules::ExtIndex> {
+        generation.aux::<ext_rules::ExtIndex>()
+    }
+
     pub fn new(id: u64, generation: u64, engine: Arc<SharedEngine>) -> Self {
         Self {
             id,

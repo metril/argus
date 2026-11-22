@@ -239,6 +239,7 @@ fn iso_2022_jp_is_transcoded() {
 #[test]
 fn removal_replacement_and_extra_injections() {
     let p = HtmlPlan {
+        element_filters: vec![],
         head_html: MARK.into(),
         injections: vec![
             Injection {
@@ -366,4 +367,92 @@ async fn encoder_batches_when_input_is_ready() {
     .await;
     // Ready input is not flushed per chunk.
     assert!(outs.len() < 10, "{} output chunks", outs.len());
+}
+
+#[test]
+fn end_injections_without_end_tags_land_at_end_of_stream_once() {
+    let p = HtmlPlan {
+        injections: vec![
+            Injection {
+                pos: InjectPos::HeadEnd,
+                html: "<!--D-->".into(),
+            },
+            Injection {
+                pos: InjectPos::BodyEnd,
+                html: "<!--C-->".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    let go = |input: &str, sizes: &[usize]| {
+        String::from_utf8(run_chunked(
+            &p,
+            encoding_rs::UTF_8,
+            false,
+            0,
+            input.as_bytes(),
+            sizes,
+        ))
+        .unwrap()
+    };
+    for sizes in [&[usize::MAX][..], &[1], &[5]] {
+        // Complete document: before the end tags.
+        assert_eq!(
+            go("<html><head></head><body>x</body></html>", sizes),
+            "<html><head><!--D--></head><body>x<!--C--></body></html>"
+        );
+        // Missing `</body></html>`: appended at the end, once.
+        assert_eq!(
+            go("<html><head></head><body>x", sizes),
+            "<html><head><!--D--></head><body>x<!--C-->"
+        );
+        // Missing head end tag and no body tag at all: both go to the end.
+        let out = go("<html><head><title>t</title><p>x", sizes);
+        assert_eq!(out.matches("<!--D-->").count(), 1, "{out}");
+        assert_eq!(out.matches("<!--C-->").count(), 1, "{out}");
+        assert!(
+            out.ends_with("<!--D--><!--C-->") || out.ends_with("<!--C--><!--D-->"),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn element_filters_remove_by_content_and_length() {
+    use super::html::apply_element_filters;
+    use super::ElementFilter;
+    let f = |sel: &str, needle: &'static str, min: usize, max: usize| ElementFilter {
+        selector: sel.into(),
+        accept: Arc::new(move |s: &str| s.contains(needle)),
+        min_len: min,
+        max_len: max,
+    };
+    let doc = b"<html><head><script>detect()</script><script>keep()</script><script>detect()//padding padding</script><style>detect</style></head><body><img src=x></body></html>";
+    let run = |fs: &[ElementFilter]| {
+        String::from_utf8(apply_element_filters(doc, encoding_rs::UTF_8, fs).unwrap()).unwrap()
+    };
+    let out = run(&[f("script", "detect", 0, 8192)]);
+    assert_eq!(out.matches("<script>").count(), 1, "{out}");
+    assert!(out.contains("keep()") && out.contains("<style>detect</style>"));
+    // max-length: the long one stays.
+    let out = run(&[f("script", "detect", 0, 10)]);
+    assert_eq!(out.matches("<script>").count(), 2, "{out}");
+    assert!(out.contains("padding"));
+    // min-length: only the long one goes.
+    let out = run(&[f("script", "detect", 11, 8192)]);
+    assert_eq!(out.matches("<script>").count(), 2, "{out}");
+    assert!(!out.contains("padding"));
+    // A selector lol_html cannot parse is skipped, the document is returned as it was.
+    assert_eq!(
+        run(&[f("div:has-text(x", "x", 0, 10)]),
+        String::from_utf8_lossy(doc)
+    );
+    // Void elements have no content: an empty-accepting filter removes them.
+    let out = run(&[ElementFilter {
+        selector: "img".into(),
+        accept: Arc::new(|s: &str| s.is_empty()),
+        min_len: 0,
+        max_len: 10,
+    }]);
+    assert!(!out.contains("<img"), "{out}");
 }

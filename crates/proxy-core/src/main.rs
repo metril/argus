@@ -44,6 +44,8 @@ async fn main() -> Result<()> {
         config.adblock.enabled,
     )?);
 
+    ctx.set_respect_no_transform(config.adblock.respect_no_transform);
+
     // Create the proxy server
     let server = ProxyServer::new(config.clone(), ctx.clone()).map_err(|e| {
         error!("Failed to initialize proxy server: {}", e);

@@ -94,7 +94,13 @@ pub fn classify(method: &Method, headers: &HeaderMap, path: &str) -> RequestType
     if is_ping_body {
         return RequestType::Ping;
     }
-    if hstr(headers, "sec-fetch-mode").is_some_and(|m| m == "navigate") {
+    // Clients without Fetch Metadata (older browsers, non-browser clients): navigations still
+    // announce themselves with `Upgrade-Insecure-Requests: 1` (sent by browsers for top-level and
+    // frame loads only) and an `Accept` that lists `text/html` (handled below).
+    if hstr(headers, "sec-fetch-mode").is_some_and(|m| m == "navigate")
+        || (*method == Method::GET
+            && hstr(headers, "upgrade-insecure-requests").is_some_and(|v| v.trim() == "1"))
+    {
         return RequestType::Document;
     }
     if hstr(headers, "x-requested-with").is_some_and(|v| v.eq_ignore_ascii_case("xmlhttprequest")) {
@@ -267,5 +273,20 @@ mod tests {
         let h = hm(&[("sec-fetch-site", "same-origin")]);
         assert_eq!(source_url(&h, url, RequestType::Image), url);
         assert_eq!(source_url(&HeaderMap::new(), url, RequestType::Image), url);
+    }
+
+    #[test]
+    fn navigations_without_fetch_metadata() {
+        let nav = hm(&[("upgrade-insecure-requests", "1"), ("accept", "*/*")]);
+        assert_eq!(classify(&Method::GET, &nav, "/x"), RequestType::Document);
+        assert_eq!(classify(&Method::POST, &nav, "/x"), RequestType::Other);
+        let html = hm(&[("accept", "text/html,application/xhtml+xml")]);
+        assert_eq!(classify(&Method::GET, &html, "/x"), RequestType::Document);
+        // Fetch Metadata wins over the heuristics.
+        let xhr = hm(&[
+            ("upgrade-insecure-requests", "1"),
+            ("sec-fetch-dest", "empty"),
+        ]);
+        assert_eq!(classify(&Method::GET, &xhr, "/x"), RequestType::Xhr);
     }
 }

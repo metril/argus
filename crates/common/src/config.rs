@@ -99,6 +99,15 @@ pub struct AdblockSettings {
     /// often carry tokens, so they are stripped before storing.
     #[serde(default)]
     pub recent_blocked_keep_query: bool,
+    /// Leave response bodies alone when the origin sends `Cache-Control: no-transform`
+    /// (header-only edits still apply). Many CDNs set it on everything; turn this off to rewrite
+    /// those pages anyway.
+    #[serde(default = "default_true")]
+    pub respect_no_transform: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Default client ACL: local and private networks only.
@@ -151,6 +160,7 @@ impl Default for AdblockSettings {
             max_list_bytes: default_max_list_bytes(),
             allowed_fetch_destinations: Vec::new(),
             recent_blocked_keep_query: false,
+            respect_no_transform: true,
         }
     }
 }

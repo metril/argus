@@ -17,6 +17,7 @@ pub mod config;
 pub mod connection;
 pub mod csp;
 pub mod error;
+pub mod ext;
 pub mod filtering;
 pub mod http2;
 pub mod inject;

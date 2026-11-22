@@ -87,6 +87,8 @@ webpki-roots = "1.0"
 
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine" }
+ext-rules = { path = "../ext-rules" }
+chrono = { workspace = true }
 
 # Userscript engine (optional)
 userscript-engine = { path = "../userscript-engine", optional = true }

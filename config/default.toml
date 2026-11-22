@@ -49,6 +49,9 @@ scriptlet_resources_url = "https://raw.githubusercontent.com/gorhill/uBlock/mast
 allowed_fetch_destinations = []
 # Keep query strings in the recent-blocked list (off: they are stripped because they can hold tokens).
 recent_blocked_keep_query = false
+# Leave response bodies alone when the origin sends `Cache-Control: no-transform` (header-only rule
+# edits still apply). Many CDNs send it on everything; set false to rewrite those pages anyway.
+respect_no_transform = true
 
 [webui]
 enabled = true

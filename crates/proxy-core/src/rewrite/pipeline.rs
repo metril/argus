@@ -27,7 +27,21 @@ const PEEK_WAIT: Duration = Duration::from_millis(250);
 /// Yield to the scheduler after this many bytes of CPU-bound work.
 const YIELD_EVERY: usize = 256 * 1024;
 
+/// Largest decoded document buffered for body transforms / content-dependent removals.
+const MAX_HTML_BUFFER: usize = 4 * 1024 * 1024;
+
 static PEAK_BUFFERED: AtomicUsize = AtomicUsize::new(0);
+static OVER_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many responses were left untouched (by a body transform or content-dependent removal)
+/// because their decoded body exceeded the size cap.
+pub fn over_cap_total() -> u64 {
+    OVER_CAP.load(Ordering::Relaxed)
+}
+
+fn note_over_cap() {
+    OVER_CAP.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Largest number of body bytes any rewrite stage held at once since the last
 /// [`reset_peak_buffered`] (input window + output window; fixed-size codec buffers excluded).
@@ -115,6 +129,8 @@ pub enum Outcome {
         body: ProxyBody,
         /// The document was transcoded to UTF-8: the `Content-Type` charset must say so.
         utf8_charset: bool,
+        /// A body transform or removal changed the document's own bytes (not just injections).
+        body_changed: bool,
     },
     /// A rewritten whole-body (JSON/text) response.
     Text { body: ProxyBody },
@@ -175,17 +191,76 @@ fn utf8_prefix(det: &Detected, peek: &[u8]) -> Vec<u8> {
 }
 
 /// Run an HTML document through decode → charset → `plan` → re-encode.
+///
+/// `pre` (a `$replace`-style body transform) runs on the whole decoded document first; then the
+/// HTML stages run on its result (content-dependent removals, injection, cosmetics). Both need
+/// the document buffered, up to [`MAX_HTML_BUFFER`] and the transform's own cap; a larger one is
+/// streamed through the HTML stages without them and counted ([`over_cap_total`]).
 pub async fn transform_html(
     resp: reqwest::Response,
     codings: Vec<Coding>,
     out_coding: Option<Coding>,
     content_type: Option<String>,
     plan: HtmlPlan,
+    pre: Option<Arc<dyn BodyTransform>>,
 ) -> Outcome {
     let (raw, opening) = open(resp, &codings);
     let Ok(mut reader) = opening.await else {
         return Outcome::Untouched(raw.replay());
     };
+    let mut changed_body = false;
+    if pre.is_some() || !plan.element_filters.is_empty() {
+        let cap = pre
+            .as_ref()
+            .map_or(MAX_HTML_BUFFER, |p| p.max_body_bytes().min(MAX_HTML_BUFFER));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut too_big = false;
+        loop {
+            let chunk = match reader.fill_buf().await {
+                Ok(b) => b,
+                Err(_) => return Outcome::Untouched(raw.replay()),
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let n = chunk.len();
+            buf.extend_from_slice(chunk);
+            reader.consume(n);
+            if buf.len() > cap {
+                too_big = true;
+                break;
+            }
+        }
+        if too_big {
+            note_over_cap();
+            reader = Box::pin(tokio::io::AsyncReadExt::chain(io::Cursor::new(buf), reader));
+        } else {
+            note_buffered(buf.len());
+            let det = charset::detect(content_type.as_deref(), &buf[..buf.len().min(PEEK_LEN)]);
+            let eligible = !charset::is_unusable(det.encoding)
+                && !charset::needs_transcode(det.encoding)
+                && sniff_html(&buf[..buf.len().min(PEEK_LEN)]);
+            if eligible {
+                if let Some(t) = &pre {
+                    if let Some(new) = t.apply(&buf) {
+                        buf = new;
+                        changed_body = true;
+                    }
+                }
+                if !plan.element_filters.is_empty() {
+                    if let Ok(new) = super::html::apply_element_filters(
+                        &buf,
+                        det.encoding,
+                        &plan.element_filters,
+                    ) {
+                        changed_body |= new != buf;
+                        buf = new;
+                    }
+                }
+            }
+            reader = Box::pin(io::Cursor::new(buf));
+        }
+    }
     let mut peek = Vec::with_capacity(PEEK_LEN + 512);
     match fill_peek(&mut reader, &mut peek).await {
         Ok(_) => {}
@@ -218,6 +293,7 @@ pub async fn transform_html(
     Outcome::Html {
         body,
         utf8_charset: transcode,
+        body_changed: changed_body,
     }
 }
 
@@ -335,6 +411,7 @@ pub async fn transform_text(
         reader.consume(n);
         if body.len() > cap || raw.recorded_len() > cap.saturating_mul(2) {
             // Too big: send what the origin sent, unmodified.
+            note_over_cap();
             return Outcome::Untouched(raw.replay());
         }
     }

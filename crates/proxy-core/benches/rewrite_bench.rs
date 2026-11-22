@@ -58,6 +58,7 @@ fn plan(internal: &Internal) -> HtmlPlan {
         nonce: &new_nonce(),
         script_ok: true,
         observer_ok: true,
+        ext_script: "",
     });
     HtmlPlan {
         head_html: head.html,
@@ -182,6 +183,7 @@ fn benches(c: &mut Criterion) {
                 nonce: "NONCE",
                 script_ok: true,
                 observer_ok: true,
+                ext_script: "",
             })
         })
     });
@@ -213,6 +215,7 @@ fn benches(c: &mut Criterion) {
                 nonce: &nonce,
                 script_ok: true,
                 observer_ok: true,
+                ext_script: "",
             });
             let p = HtmlPlan {
                 head_html: head.html,

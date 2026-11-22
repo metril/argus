@@ -88,9 +88,39 @@ pub trait BodyTransform: Send + Sync {
     fn apply(&self, body: &[u8]) -> Option<Vec<u8>>;
 }
 
+/// Removes elements whose content has to be looked at (`:has-text`, `tag-content`,
+/// `max-length`): the matching element is dropped when `accept` approves its content and its
+/// length is within bounds. Content is buffered per element, never more than `max_len` + 1
+/// bytes; the document itself is buffered (bounded) so the decision can precede the output.
+#[derive(Clone)]
+pub struct ElementFilter {
+    pub selector: String,
+    pub accept: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pub min_len: usize,
+    pub max_len: usize,
+}
+
+impl std::fmt::Debug for ElementFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElementFilter")
+            .field("selector", &self.selector)
+            .field("min_len", &self.min_len)
+            .field("max_len", &self.max_len)
+            .finish()
+    }
+}
+
 /// Everything to do to one response, computed once from the request URL, type and headers.
 #[derive(Default, Clone)]
 pub struct ResponseTransforms {
+    /// Replace the response with the block response (a `$header` rule matched).
+    pub block: Option<String>,
+    /// JavaScript from trusted rules (`#%#`, scriptlets, snippets), run before page scripts.
+    pub scripts: Vec<String>,
+    /// Procedural CSS for the in-page evaluator: selector and optional style declarations.
+    pub procedural: Vec<(String, Option<String>)>,
+    /// Content-dependent element removals.
+    pub element_filters: Vec<ElementFilter>,
     /// Elements to delete from HTML documents (HTML filters, `##^`).
     pub remove_selectors: Vec<String>,
     /// Text replacements in HTML text nodes.
@@ -105,7 +135,11 @@ pub struct ResponseTransforms {
 
 impl ResponseTransforms {
     pub fn is_empty(&self) -> bool {
-        self.remove_selectors.is_empty()
+        self.block.is_none()
+            && self.scripts.is_empty()
+            && self.procedural.is_empty()
+            && self.element_filters.is_empty()
+            && self.remove_selectors.is_empty()
             && self.text_replacements.is_empty()
             && self.header_edits.is_empty()
             && self.injections.is_empty()
@@ -114,7 +148,10 @@ impl ResponseTransforms {
 
     /// Whether any HTML-body work is requested.
     pub fn touches_html(&self) -> bool {
-        !self.remove_selectors.is_empty()
+        !self.scripts.is_empty()
+            || !self.procedural.is_empty()
+            || !self.element_filters.is_empty()
+            || !self.remove_selectors.is_empty()
             || !self.text_replacements.is_empty()
             || !self.injections.is_empty()
     }
@@ -122,6 +159,12 @@ impl ResponseTransforms {
 
 /// What a [`TransformSource`] sees of the exchange.
 pub struct ResponseInfo<'a> {
+    /// The engine generation the request was decided against (carries the ext-rule index), so
+    /// the response is judged by the same build as the request.
+    pub generation: Option<&'a Arc<filter_engine::Generation>>,
+    pub method: &'a str,
+    /// Page the request came from (`""` when unknown).
+    pub source_url: &'a str,
     pub url: &'a str,
     pub request_type: RequestType,
     pub status: StatusCode,
@@ -146,6 +189,8 @@ pub struct HtmlPlan {
     pub injections: Vec<Injection>,
     pub remove_selectors: Vec<String>,
     pub replacements: Vec<TextReplacement>,
+    /// Content-dependent removals (need the buffered document, see [`ElementFilter`]).
+    pub element_filters: Vec<ElementFilter>,
     /// Adapts `<meta http-equiv="content-security-policy">` content; `None` return = unchanged.
     pub meta_csp: Option<MetaCsp>,
 }
@@ -156,6 +201,7 @@ impl HtmlPlan {
             && self.injections.is_empty()
             && self.remove_selectors.is_empty()
             && self.replacements.is_empty()
+            && self.element_filters.is_empty()
     }
 }
 
