@@ -29,6 +29,19 @@ pub struct ProxySettings {
     /// `*.suffix` entries (the latter match subdomains only, not the apex).
     #[serde(default)]
     pub tls_passthrough_hosts: Vec<String>,
+    /// Also refuse upstream destinations in private ranges (RFC 1918, ULA `fc00::/7`, CGNAT
+    /// `100.64/10`). Loopback, link-local (cloud metadata), multicast and the proxy's own
+    /// listeners are always refused.
+    #[serde(default)]
+    pub block_private_destinations: bool,
+    /// CIDR exceptions that override the destination refusals (except loops onto the proxy's own
+    /// listeners).
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
+    /// CIDRs of clients allowed to use the proxy (both listeners); others are closed at accept.
+    /// Default: loopback, private, link-local, ULA and CGNAT sources. An empty list allows no one.
+    #[serde(default = "default_allowed_clients")]
+    pub allowed_clients: Vec<String>,
     pub enable_websockets: bool,
     /// Extra PEM root CA files trusted when connecting to upstream servers (in addition to the
     /// built-in web roots), e.g. a private/corporate CA.
@@ -76,6 +89,24 @@ pub struct AdblockSettings {
     /// Maximum accepted size of a downloaded list, in bytes.
     #[serde(default = "default_max_list_bytes")]
     pub max_list_bytes: usize,
+}
+
+/// Default client ACL: local and private networks only.
+pub fn default_allowed_clients() -> Vec<String> {
+    [
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 fn default_list_fetch_concurrency() -> usize {
@@ -165,6 +196,9 @@ impl Default for ProxyConfig {
                 enable_http2: true,
                 transparent_port: None,
                 tls_passthrough_hosts: Vec::new(),
+                block_private_destinations: false,
+                allowed_destinations: Vec::new(),
+                allowed_clients: default_allowed_clients(),
                 enable_websockets: true,
                 extra_upstream_ca_paths: Vec::new(),
             },

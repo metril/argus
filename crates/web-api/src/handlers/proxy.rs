@@ -38,7 +38,26 @@ fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         enable_adblock: config.adblock.enabled,
         auto_update: config.adblock.auto_update,
         update_interval_hours: config.adblock.update_interval_hours,
+        transparent_port: config.proxy.transparent_port,
+        tls_passthrough_hosts: config.proxy.tls_passthrough_hosts.clone(),
+        block_private_destinations: config.proxy.block_private_destinations,
+        allowed_destinations: config.proxy.allowed_destinations.clone(),
+        allowed_clients: config.proxy.allowed_clients.clone(),
     }
+}
+
+/// Whether `s` is an IP address or `addr/prefix` CIDR.
+fn valid_cidr(s: &str) -> bool {
+    let (addr, prefix) = match s.trim().split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s.trim(), None),
+    };
+    let max = match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => 32,
+        Ok(std::net::IpAddr::V6(_)) => 128,
+        Err(_) => return false,
+    };
+    prefix.is_none_or(|p| p.parse::<u8>().is_ok_and(|n| n <= max))
 }
 
 /// Push the settings that can change at runtime into the running proxy.
@@ -90,6 +109,17 @@ pub async fn update_config(
     req.validate()
         .map_err(|e| ApiError::ValidationError(e.to_string()))?;
 
+    for (name, list) in [
+        ("allowed_destinations", &req.allowed_destinations),
+        ("allowed_clients", &req.allowed_clients),
+    ] {
+        if let Some(bad) = list.iter().flatten().find(|c| !valid_cidr(c)) {
+            return Err(ApiError::ValidationError(format!(
+                "{name}: invalid CIDR {bad:?}"
+            )));
+        }
+    }
+
     // Update the in-memory config and note what changed (sync, lock released before any await).
     let mut applied: Vec<String> = Vec::new();
     let mut restart_required: Vec<String> = Vec::new();
@@ -121,6 +151,31 @@ pub async fn update_config(
             req.enable_websockets
         );
         restart_field!("enable_mitm", config.mitm.enabled, req.enable_mitm);
+        restart_field!(
+            "transparent_port",
+            config.proxy.transparent_port,
+            req.transparent_port.map(|p| (p != 0).then_some(p))
+        );
+        restart_field!(
+            "tls_passthrough_hosts",
+            config.proxy.tls_passthrough_hosts,
+            req.tls_passthrough_hosts
+        );
+        restart_field!(
+            "block_private_destinations",
+            config.proxy.block_private_destinations,
+            req.block_private_destinations
+        );
+        restart_field!(
+            "allowed_destinations",
+            config.proxy.allowed_destinations,
+            req.allowed_destinations
+        );
+        restart_field!(
+            "allowed_clients",
+            config.proxy.allowed_clients,
+            req.allowed_clients
+        );
         restart_field!(
             "connection_timeout_secs",
             config.performance.connection_timeout_secs,

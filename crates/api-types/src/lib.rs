@@ -165,6 +165,21 @@ pub struct ProxyConfigResponse {
     /// Hours between automatic list refreshes.
     #[serde(default)]
     pub update_interval_hours: u64,
+    /// Transparent-gateway listener port (`None` = off).
+    #[serde(default)]
+    pub transparent_port: Option<u16>,
+    /// TLS hosts never intercepted (exact or `*.suffix`).
+    #[serde(default)]
+    pub tls_passthrough_hosts: Vec<String>,
+    /// Also refuse private-range destinations.
+    #[serde(default)]
+    pub block_private_destinations: bool,
+    /// CIDR exceptions to the destination refusals.
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
+    /// CIDRs of clients allowed to use the proxy.
+    #[serde(default)]
+    pub allowed_clients: Vec<String>,
 }
 
 /// Result of a config update: the new config plus which changes are already live and which
@@ -210,6 +225,17 @@ pub struct UpdateProxyConfigRequest {
 
     #[cfg_attr(feature = "server", validate(range(min = 1, max = 8760)))]
     pub update_interval_hours: Option<u64>,
+
+    /// Transparent listener port; `0` turns it off. Needs a restart.
+    pub transparent_port: Option<u16>,
+    /// Replaces the TLS passthrough host list. Needs a restart.
+    pub tls_passthrough_hosts: Option<Vec<String>>,
+    /// Needs a restart.
+    pub block_private_destinations: Option<bool>,
+    /// CIDR list; replaces the current one. Needs a restart.
+    pub allowed_destinations: Option<Vec<String>>,
+    /// CIDR list; replaces the current one. Needs a restart.
+    pub allowed_clients: Option<Vec<String>>,
 }
 
 /// Connection statistics.

@@ -116,6 +116,16 @@ docker build -t adblocker .
 docker-compose up -d
 ```
 
+### Security defaults
+
+The proxy only serves private/local client addresses (`proxy.allowed_clients`) and never connects
+to loopback, link-local/metadata or its own listeners (`proxy.block_private_destinations`,
+`proxy.allowed_destinations`). The check runs on the resolved address that is actually dialled, so
+DNS rebinding cannot bypass it. Inside an intercepted TLS connection a request for another host is
+answered `421 Misdirected Request` unless the connection's certificate covers that name.
+Address-only caveat: names are checked when they resolve, so a name that resolves to one of the
+proxy host's own interface addresses is refused on the proxy's own ports only.
+
 ### Getting started (end-to-end)
 
 The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API), and optionally the transparent-mode port (`proxy.transparent_port`, off by default).
@@ -162,6 +172,16 @@ port = 8080
 max_connections = 10000
 enable_http2 = true
 enable_websockets = true  # Requires building with --features websockets
+# Who may use the proxy (CIDRs; others are closed at accept). Default: loopback, RFC 1918,
+# CGNAT, link-local and ULA sources. An empty list allows nobody; use ["0.0.0.0/0", "::/0"] to
+# open it to everyone (not recommended).
+allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"]
+# Destinations the proxy refuses to connect to (403, `x-adblock: destination-refused`): loopback,
+# link-local/cloud metadata, multicast and the proxy's own listeners, always. Private ranges
+# (RFC 1918, ULA, CGNAT) are allowed unless this is set:
+block_private_destinations = false
+# CIDR exceptions that win over the refusals above (never over the proxy's own listeners):
+allowed_destinations = []
 
 [mitm]
 enabled = true
