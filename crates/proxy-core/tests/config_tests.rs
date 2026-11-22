@@ -23,7 +23,8 @@ fn test_default_config() {
     assert_eq!(config.mitm.cert_idle_timeout_secs, 3600);
 
     // Test performance settings
-    assert_eq!(config.performance.max_connections, 10000);
+    assert_eq!(config.performance.max_connections, 0);
+    assert_eq!(config.performance.connection_rate_limit, Some(10_000));
     assert_eq!(config.performance.max_cert_generations, 10);
     assert_eq!(config.performance.max_html_buffers, 200);
     assert_eq!(config.performance.connection_timeout_secs, 30);
@@ -83,6 +84,7 @@ fn test_custom_config() {
         userscripts: UserscriptSettings::default(),
         script_control: Default::default(),
         webui: WebUiSettings::default(),
+        dns: Default::default(),
     };
 
     assert_eq!(config.proxy.host, "127.0.0.1");

@@ -14,7 +14,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    init_logging();
+    // Held to the end of `main` so buffered log lines are flushed on exit.
+    let _log_guard = init_logging();
 
     info!(
         "Starting adblocker proxy server v{}",
@@ -294,18 +295,24 @@ async fn start_webui_server(
     Ok(handle)
 }
 
-/// Initialize tracing subscriber for structured logging
-fn init_logging() {
+/// Initialize tracing: formatted events go through a non-blocking writer, so a slow or blocked
+/// stdout never stalls a request task (lines are dropped, not blocked on, if the buffer fills).
+/// File, line and thread ids are off by default; set `ADBLOCKER_LOG_VERBOSE=1` to add them.
+fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let verbose = std::env::var_os("ADBLOCKER_LOG_VERBOSE").is_some_and(|v| v != "0");
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
 
     tracing_subscriber::registry()
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
+                .with_writer(writer)
                 .with_target(true)
-                .with_thread_ids(true)
-                .with_line_number(true)
-                .with_file(true),
+                .with_thread_ids(verbose)
+                .with_line_number(verbose)
+                .with_file(verbose),
         )
         .init();
+    guard
 }

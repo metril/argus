@@ -38,7 +38,12 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::debug;
+
+/// Upstream timeouts since start (per-request events are debug only).
+pub static UPSTREAM_TIMEOUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Upstream errors since start.
+pub static UPSTREAM_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1), plus framing headers we
 /// reconstruct ourselves.
@@ -575,22 +580,24 @@ impl ProxyContext {
                         ext::request_decision(idx, &url, method.as_str(), source, rtype, &headers)
                     {
                         if let Some(id) = d.block {
-                            let rule = idx.rule(id).map(|r| r.raw.clone()).unwrap_or_default();
-                            debug!("Blocked {} by extended rule {}", url, rule);
-                            let list = idx.rule(id).map(|r| r.list.clone());
+                            let parsed = idx.rule(id);
+                            let rule = parsed.map(|r| r.raw.clone()).unwrap_or_default();
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!("Blocked {} by extended rule {}", url, rule);
+                            }
                             if let Some(sc) = &profile.script_control {
                                 count_page_block(sc, source_url(&headers, &url, rtype));
                             }
                             engine.stats_handle().record_blocked(rtype.as_str(), &host);
-                            engine.record_block(&filter_engine::BlockEvent {
-                                timestamp: chrono::Utc::now(),
-                                url: url.clone(),
-                                source_host: String::new(),
-                                request_type: rtype.as_str().to_string(),
-                                rule: rule.clone(),
-                                list_id: list,
-                                client: Some(profile.label.to_string()),
-                            });
+                            // Borrowed straight into the ring: no event struct, no clock read here.
+                            engine.block_log_handle().record(
+                                &url,
+                                "",
+                                rtype.as_str(),
+                                &rule,
+                                parsed.map(|r| r.list.as_str()),
+                                Some(profile.label.as_ref()),
+                            );
                             let v = filter_engine::MatchResult::blocked(rule);
                             return Ok(block_response(rtype, &v, &url));
                         }
@@ -689,7 +696,8 @@ impl ProxyContext {
             match tokio::time::timeout(Duration::from_millis(timeout_ms), rb.send()).await {
                 Ok(r) => r,
                 Err(_) => {
-                    warn!("Upstream timeout for {url}");
+                    UPSTREAM_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    debug!("Upstream timeout for {url}");
                     return Ok(status_response(
                         StatusCode::GATEWAY_TIMEOUT,
                         "Upstream timeout",
@@ -704,7 +712,8 @@ impl ProxyContext {
                 return Ok(refused_response());
             }
             Err(e) => {
-                warn!("Upstream error for {}: {}", url, e);
+                UPSTREAM_ERRORS.fetch_add(1, Ordering::Relaxed);
+                debug!("Upstream error for {}: {}", url, e);
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
             }
         };

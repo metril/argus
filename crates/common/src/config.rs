@@ -16,6 +16,54 @@ pub struct ProxyConfig {
     pub script_control: ScriptControlSettings,
     #[serde(default)]
     pub webui: WebUiSettings,
+    #[serde(default)]
+    pub dns: DnsSettings,
+}
+
+/// Upstream DNS resolution and caching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSettings {
+    /// Resolver addresses (`ip` or `ip:port`, UDP with TCP fallback). Empty uses the system
+    /// resolver configuration (`/etc/resolv.conf`).
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// Maximum cached names.
+    #[serde(default = "default_dns_cache_size")]
+    pub cache_size: u64,
+    /// Lower clamp on cached TTLs, seconds.
+    #[serde(default = "default_dns_min_ttl")]
+    pub min_ttl_secs: u64,
+    /// Upper clamp on cached TTLs, seconds.
+    #[serde(default = "default_dns_max_ttl")]
+    pub max_ttl_secs: u64,
+    /// How long failed lookups (NXDOMAIN, errors) are cached, seconds.
+    #[serde(default = "default_dns_negative_ttl")]
+    pub negative_ttl_secs: u64,
+}
+
+fn default_dns_cache_size() -> u64 {
+    4096
+}
+fn default_dns_min_ttl() -> u64 {
+    10
+}
+fn default_dns_max_ttl() -> u64 {
+    300
+}
+fn default_dns_negative_ttl() -> u64 {
+    10
+}
+
+impl Default for DnsSettings {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            cache_size: default_dns_cache_size(),
+            min_ttl_secs: default_dns_min_ttl(),
+            max_ttl_secs: default_dns_max_ttl(),
+            negative_ttl_secs: default_dns_negative_ttl(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,11 +115,13 @@ pub struct MitmSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceSettings {
+    /// Concurrent connection cap; 0 derives it from the soft file-descriptor limit.
     pub max_connections: usize,
     pub max_cert_generations: usize,
     pub max_html_buffers: usize,
     pub connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// New connections admitted per second; 0 or unset = unlimited (default 10000).
     #[serde(default)]
     pub connection_rate_limit: Option<u32>,
 }
@@ -341,17 +391,18 @@ impl Default for ProxyConfig {
                 cert_idle_timeout_secs: 3600,
             },
             performance: PerformanceSettings {
-                max_connections: 10000,
+                max_connections: 0,
                 max_cert_generations: 10,
                 max_html_buffers: 200,
                 connection_timeout_secs: 30,
                 request_timeout_secs: 60,
-                connection_rate_limit: Some(1000),
+                connection_rate_limit: Some(10_000),
             },
             adblock: AdblockSettings::default(),
             userscripts: UserscriptSettings::default(),
             script_control: ScriptControlSettings::default(),
             webui: WebUiSettings::default(),
+            dns: DnsSettings::default(),
         }
     }
 }
@@ -414,6 +465,29 @@ pub enum ConfigError {
     Parse(String),
     #[error("Serialize error: {0}")]
     Serialize(String),
+}
+
+/// Connection cap derived from the soft `RLIMIT_NOFILE`: two descriptors per proxied connection
+/// (client and upstream) after reserving headroom for listeners, pool, files and the API.
+pub fn derive_max_connections() -> usize {
+    const HEADROOM: u64 = 512;
+    const CAP: usize = 100_000;
+    const FLOOR: usize = 256;
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into the provided struct.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            #[allow(clippy::unnecessary_cast)] // rlim_t differs per platform
+            let soft = lim.rlim_cur as u64;
+            let usable = soft.saturating_sub(HEADROOM) / 2;
+            return (usable as usize).clamp(FLOOR, CAP);
+        }
+    }
+    10_000
 }
 
 #[cfg(test)]

@@ -78,6 +78,10 @@ pub struct MemoryMonitor {
     last_shed_time: parking_lot::Mutex<Option<Instant>>,
     /// Statistics
     stats: MemoryMonitorStats,
+    /// Reference point for `last_refresh_ms`.
+    epoch: Instant,
+    /// Millis since `epoch` of the last refresh made on the admission path (`u64::MAX`: never).
+    last_refresh_ms: AtomicU64,
 }
 
 /// Memory monitor statistics
@@ -112,6 +116,8 @@ impl MemoryMonitor {
             load_shedding_active: AtomicBool::new(false),
             last_shed_time: parking_lot::Mutex::new(None),
             stats: MemoryMonitorStats::default(),
+            epoch: Instant::now(),
+            last_refresh_ms: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -204,9 +210,29 @@ impl MemoryMonitor {
         }
     }
 
-    /// Check if a new connection should be accepted
+    /// Check if a new connection should be accepted.
+    ///
+    /// Reading the process memory is a syscall, so the admission path does it at most once per
+    /// `check_interval` (one caller wins the refresh) and otherwise uses the cached pressure level.
     pub fn should_accept_connection(&self) -> bool {
-        let action = self.should_shed_load();
+        let now = self.epoch.elapsed().as_millis() as u64;
+        let last = self.last_refresh_ms.load(Ordering::Relaxed);
+        let due = last == u64::MAX
+            || now.saturating_sub(last) >= self.config.check_interval.as_millis() as u64;
+        let action = if due
+            && self
+                .last_refresh_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.should_shed_load()
+        } else if MemoryPressure::from_u64(self.pressure.load(Ordering::Relaxed))
+            == MemoryPressure::Critical
+        {
+            LoadSheddingAction::RejectConnections
+        } else {
+            LoadSheddingAction::None
+        };
         if action == LoadSheddingAction::RejectConnections {
             self.stats
                 .connections_rejected
@@ -346,6 +372,30 @@ pub type SharedMemoryMonitor = Arc<MemoryMonitor>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_path_refreshes_at_most_once_per_interval() {
+        // Critical threshold of 1 byte: the first call measures and rejects, later calls within
+        // the interval reuse the cached level (still rejecting) without measuring again.
+        let m = MemoryMonitor::new(MemoryMonitorConfig {
+            warning_threshold: 1,
+            critical_threshold: 1,
+            check_interval: Duration::from_secs(3600),
+            ..Default::default()
+        });
+        assert!(!m.should_accept_connection());
+        let t = Instant::now();
+        for _ in 0..100_000 {
+            assert!(!m.should_accept_connection());
+        }
+        // 100k cached checks take far less than 100k /proc reads would (several hundred ms).
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(MemoryMonitor::with_defaults().should_accept_connection());
+    }
 
     #[test]
     fn test_pressure_levels() {

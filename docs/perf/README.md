@@ -37,3 +37,25 @@ The file holds `{"steady": <steady.json>, "reload": <reload.json>}`.
   The proxy must trust `dir/origin-ca.crt` (written on first run, reused later), allow loopback
   destinations and resolve `*.localhost`. Explicit mode only; no reload scenario.
 * Exit status is non-zero if any request failed, was rejected or dropped.
+
+## Connection admission
+
+New connections are admitted by a lock-free limiter (default 10,000/s, burst 100 ms of tokens;
+`performance.connection_rate_limit`, 0 = unlimited). `performance.max_connections = 0` derives the
+cap from the soft `RLIMIT_NOFILE`; the API and UI report the effective value. Admission no longer
+reads the process memory from `/proc` per connection (it refreshes at most once per check interval).
+
+* Unit: `load_manager::tests::default_limit_admits_10k_per_second_and_enforces_above`.
+* Real TCP (ignored by default; needs a release build and a quiet machine):
+  `cargo nextest run --release -p e2e --test admission_e2e --run-ignored all`. 10,000 new
+  connections/s for 3 s: 30000 accepted, 0 rejected. 20,000/s offered: about 30,400 accepted
+  (10k/s plus the burst) and the rest rejected.
+* Micro-benchmark: `cargo bench -p proxy-core --bench proxy_bench -- admission`: 12.5 us before
+  the `/proc` fix, 0.70 us after, per admit+release per thread with 8 threads contending.
+
+## A/B method used for changes
+
+`loadgen` binaries of the two commits, run interleaved (base, new, base, new, ...) at open loop
+3000 req/s, 10 s measured, 3 s warm-up; report medians with the min..max range. The h2 p99.9
+tail (about 10 ms vs about 1 ms direct) is present before and after and shows up whenever the mix
+contains the `html` class (rewritten pages), not for `small`, `medium` or `blocked` alone.

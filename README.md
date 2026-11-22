@@ -170,7 +170,6 @@ Edit `config/default.toml`:
 [proxy]
 host = "0.0.0.0"
 port = 8080
-max_connections = 10000
 enable_http2 = true
 enable_websockets = true  # Requires building with --features websockets
 # Who may use the proxy (CIDRs; others are closed at accept). Default: loopback, RFC 1918,
@@ -183,6 +182,10 @@ allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192
 block_private_destinations = false
 # CIDR exceptions that win over the refusals above (never over the proxy's own listeners):
 allowed_destinations = []
+
+[performance]
+max_connections = 0          # 0 = derive from the soft RLIMIT_NOFILE (2 fds per connection)
+connection_rate_limit = 10000  # new connections per second (0 = unlimited)
 
 [mitm]
 enabled = true

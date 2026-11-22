@@ -71,18 +71,19 @@ impl ProxyServer {
 
         // Initialize load manager with configuration from performance settings
         let load_manager_config = LoadManagerConfig {
-            max_connections: config.performance.max_connections,
-            connection_rate_limit: config.performance.connection_rate_limit.unwrap_or(1000),
+            max_connections: match config.performance.max_connections {
+                0 => crate::load_manager::derive_max_connections(),
+                n => n,
+            },
+            connection_rate_limit: config.performance.connection_rate_limit.unwrap_or(0),
             adaptive_concurrency: true,
             ..Default::default()
         };
-        let load_manager = Arc::new(LoadManager::new(load_manager_config));
-
         info!(
             "Load manager initialized: max_connections={}, rate_limit={}/s",
-            config.performance.max_connections,
-            config.performance.connection_rate_limit.unwrap_or(1000)
+            load_manager_config.max_connections, load_manager_config.connection_rate_limit
         );
+        let load_manager = Arc::new(LoadManager::new(load_manager_config));
 
         Ok(Self {
             config,
@@ -298,19 +299,10 @@ impl ProxyServer {
                                 AdmissionResult::Admitted => {
                                     debug!("Connection from {} admitted", client_addr);
                                 }
-                                AdmissionResult::RejectedMemoryPressure => {
-                                    warn!("Connection from {} rejected: memory pressure", client_addr);
-                                    // Connection is dropped automatically
-                                    continue;
-                                }
-                                AdmissionResult::RejectedMaxConnections => {
-                                    warn!("Connection from {} rejected: max connections reached", client_addr);
-                                    continue;
-                                }
-                                AdmissionResult::RejectedRateLimit => {
-                                    debug!("Connection from {} rejected: rate limit", client_addr);
-                                    continue;
-                                }
+                                // Rejections are counted and summarized by the load manager.
+                                AdmissionResult::RejectedMemoryPressure
+                                | AdmissionResult::RejectedMaxConnections
+                                | AdmissionResult::RejectedRateLimit => continue,
                             }
 
                             trace!("Accepted connection from {}", client_addr);

@@ -16,6 +16,7 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod connection;
 pub mod csp;
+pub mod dns;
 pub mod error;
 pub mod ext;
 pub mod filtering;

@@ -112,6 +112,8 @@ encoding_rs = "0.8"
 sha2 = { workspace = true }
 base64 = "0.22"
 regex = { workspace = true }
+hickory-resolver = "0.26"
+tracing-appender = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 # getifaddrs: the proxy host's own interface addresses (destination policy).
