@@ -318,6 +318,24 @@ is hashed with a salted SHA-256 and protected by lockout, not by a slow KDF; a s
 allows offline guessing of a short PIN. (f) Anyone using the proxy from the same profile can open
 the confirmation page: the profile is the trust boundary, and `session` mode removes writes from it.
 
+## Cost
+
+`cargo bench -p proxy-core --bench script_policy_bench`, 10,000 per-site rules, one core, debug-free
+release profile (criterion medians; your machine will differ):
+
+| Operation | Time |
+|---|---|
+| Master switch off, per HTML response or per request | about 4 ns (one atomic load) |
+| HTML response, cached header lookup | about 200 ns |
+| HTML response, first time for a host (decide and render the CSP) | about 6.7 µs |
+| Subresource check, allowed | about 0.6 to 0.8 µs |
+| Subresource check, denied (includes recording the report) | about 0.8 µs |
+| Subresource check, page unknown | about 0.17 µs |
+
+A profile whose every preset is `trusted` and that has no deny rule skips the request check entirely.
+`boot.js` grew from 7,792 to 8,084 bytes (+292) for the hotkey listener; the panel script (14.3 KB)
+is only fetched on the first keypress.
+
 ## More limits from the wiring
 
 A violation is reported only if the browser sends the `report-uri` request (a user agent may drop

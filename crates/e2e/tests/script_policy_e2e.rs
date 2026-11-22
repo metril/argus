@@ -586,3 +586,48 @@ e2e_test!(
         ));
     }
 );
+
+e2e_test!(
+    meta_refresh_is_removed_only_when_opted_in_and_scripts_are_blocked,
+    rules = [],
+    |env| {
+        let (store, _) = env.proxy.script_control();
+        store
+            .create_site_rule(
+                P,
+                Scope::parse("app.test").unwrap(),
+                Preset::Untrusted,
+                None,
+            )
+            .unwrap();
+        env.origin.route(
+        "/p",
+        MockResponse::html("<!doctype html><html><head><meta http-equiv=\"Refresh\" content=\"5;url=/next\"><meta charset=utf-8></head><body>x</body></html>"),
+    );
+        enable(&env, |_| {});
+        let body = page(&env, &env.client(), "app.test", "/p")
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.to_ascii_lowercase().contains("refresh"),
+            "off by default: {body}"
+        );
+        enable(&env, |s| s.strip_meta_refresh = true);
+        let body = page(&env, &env.client(), "app.test", "/p")
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(!body.to_ascii_lowercase().contains("refresh"), "{body}");
+        assert!(body.contains("charset"), "other metas stay");
+        // Scripts allowed on the page: the refresh stays.
+        let body = page(&env, &env.client(), "free.test", "/p")
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(body.to_ascii_lowercase().contains("refresh"), "{body}");
+    }
+);

@@ -36,7 +36,7 @@ macro_rules! panel_test {
     ($name:ident, $auth:expr, |$s:ident, $sites:ident| $body:block) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn $name() {
-            let Some($s) = Session::start(&["sp.test##.ad"]).await else {
+            let Some($s) = Session::start(&["sp.test##.ad", "/ad.png^$image,domain=sp.test"]).await else {
                 return;
             };
             let $sites = setup(&$s, $auth).await;
@@ -90,7 +90,7 @@ fn doc(extra_body: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=utf-8><title>t</title>\
          <script>window.__inline=1</script><script src=\"/own.js\"></script>\
-         <script src=\"CDN\"></script></head><body><input id=first><div class=ad>ad</div>{extra_body}</body></html>"
+         <script src=\"CDN\"></script></head><body><input id=first><div class=ad>ad</div><img src=\"/ad.png\">{extra_body}</body></html>"
     )
 }
 

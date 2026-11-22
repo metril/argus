@@ -60,12 +60,32 @@ fn any_port(directives: &mut [sp::CspDirective]) {
 
 type DocKey = (u64, bool, u16, Box<str>);
 
+/// Can any rule of the profile deny something? A profile whose every preset is `Trusted` and
+/// that has no deny rule needs no request-path checks at all.
+fn is_restrictive(store: &PolicyStore, profile: &str) -> bool {
+    let Ok(r) = store.rules(profile) else {
+        return true;
+    };
+    let s = &r.settings;
+    s.enabled
+        && (s.global.resolve(s) != sp::Profile::TRUSTED
+            || r.site_rules
+                .values()
+                .any(|x| x.preset.resolve(s) != sp::Profile::TRUSTED)
+            || r.source_rules
+                .values()
+                .any(|x| x.effect == sp::Effect::Deny))
+}
+
 /// One profile's script control.
 pub struct ScriptControl {
     store: Arc<PolicyStore>,
     profile: String,
     compiled: ArcSwap<sp::CompiledPolicy>,
     enabled: AtomicBool,
+    /// Some rule can deny something (checked off the request path); when none can, the request
+    /// check returns without a lookup.
+    restrictive: AtomicBool,
     panel: ArcSwap<PanelSettings>,
     docs: moka::sync::Cache<DocKey, Arc<DocEntry>>,
     wake: Arc<tokio::sync::Notify>,
@@ -83,6 +103,7 @@ impl ScriptControl {
         let panel = store.panel_settings(profile).unwrap_or_default();
         let this = Arc::new(ScriptControl {
             enabled: AtomicBool::new(compiled.is_enabled()),
+            restrictive: AtomicBool::new(is_restrictive(&store, profile)),
             compiled: ArcSwap::from(compiled),
             panel: ArcSwap::from_pointee(panel),
             store: store.clone(),
@@ -109,14 +130,23 @@ impl ScriptControl {
 
     /// Re-read the compiled policy and panel settings from the store, and wake the expiry task.
     pub fn refresh(&self) {
+        self.reload();
+        self.wake.notify_one();
+    }
+
+    /// [`Self::refresh`] without waking the expiry task (which calls it itself).
+    fn reload(&self) {
         if let Ok(c) = self.store.snapshot(&self.profile) {
             self.enabled.store(c.is_enabled(), Ordering::Release);
+            self.restrictive.store(
+                is_restrictive(&self.store, &self.profile),
+                Ordering::Release,
+            );
             self.compiled.store(c);
         }
         if let Ok(p) = self.store.panel_settings(&self.profile) {
             self.panel.store(Arc::new(p));
         }
-        self.wake.notify_one();
     }
 
     /// Spawn the task that rebuilds the snapshot when the next temporary grant expires. It
@@ -144,7 +174,7 @@ impl ScriptControl {
                     None => notified.await,
                 }
                 match weak.upgrade() {
-                    Some(this) => this.refresh(),
+                    Some(this) => this.reload(),
                     None => return,
                 }
             }
@@ -235,7 +265,7 @@ impl ScriptControl {
         host: &str,
         port: u16,
     ) -> Option<sp::Capability> {
-        if !self.enabled() {
+        if !self.enabled() || !self.restrictive.load(Ordering::Relaxed) {
             return None;
         }
         let target_scheme = sp::Scheme::parse(scheme)?;
@@ -432,6 +462,31 @@ mod tests {
         assert!(c
             .check_request(&unknown, "https", "cdn.test", 443)
             .is_none());
+    }
+
+    #[test]
+    fn all_trusted_profiles_skip_the_request_check_entirely() {
+        let (_d, store, c) = control();
+        let h = script_from("a.test");
+        assert!(c.check_request(&h, "https", "cdn.test", 443).is_some());
+        let mut s = store.rules(P).unwrap().settings;
+        s.global = sp::Preset::Trusted;
+        store.set_settings(P, s).unwrap();
+        let before = c.decide_calls();
+        assert!(c.check_request(&h, "https", "cdn.test", 443).is_none());
+        assert_eq!(c.decide_calls(), before, "no lookup at all");
+        store
+            .create_site_rule(
+                P,
+                Scope::parse("a.test").unwrap(),
+                sp::Preset::Untrusted,
+                None,
+            )
+            .unwrap();
+        assert!(
+            c.check_request(&h, "https", "cdn.test", 443).is_some(),
+            "one restrictive rule is enough"
+        );
     }
 
     #[tokio::test]
