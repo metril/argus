@@ -305,24 +305,103 @@ async fn start_webui_server(
     Ok(handle)
 }
 
-/// Initialize tracing: formatted events go through a non-blocking writer, so a slow or blocked
-/// stdout never stalls a request task (lines are dropped, not blocked on, if the buffer fills).
+/// Initialize tracing. Info, debug and trace lines go through a lossy non-blocking writer, so a
+/// slow or blocked stdout never stalls a request task (lines are dropped if the buffer fills).
+/// Warnings and errors use a separate non-lossy writer: they are rare (and rate-limited at
+/// their sources), and must not vanish under exactly the load that causes them.
 /// File, line and thread ids are off by default; set `ADBLOCKER_LOG_VERBOSE=1` to add them.
-fn init_logging() -> tracing_appender::non_blocking::WorkerGuard {
+fn init_logging() -> Vec<tracing_appender::non_blocking::WorkerGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let verbose = std::env::var_os("ADBLOCKER_LOG_VERBOSE").is_some_and(|v| v != "0");
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let (lossy, g1) = tracing_appender::non_blocking(std::io::stdout());
+    let (strict, g2) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(false)
+        .finish(std::io::stdout());
+    build_subscriber(env_filter, lossy, strict, verbose).init();
+    vec![g1, g2]
+}
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(
+/// Whether a level goes to the lossy writer (everything below WARN).
+fn is_lossy_level(level: &tracing::Level) -> bool {
+    *level > tracing::Level::WARN
+}
+
+fn build_subscriber<L, S>(
+    env_filter: EnvFilter,
+    lossy: L,
+    strict: S,
+    verbose: bool,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    L: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+    S: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::filter::filter_fn;
+    use tracing_subscriber::Layer;
+    macro_rules! fmt {
+        ($w:expr) => {
             tracing_subscriber::fmt::layer()
-                .with_writer(writer)
+                .with_writer($w)
                 .with_target(true)
                 .with_thread_ids(verbose)
                 .with_line_number(verbose)
-                .with_file(verbose),
-        )
-        .init();
-    guard
+                .with_file(verbose)
+        };
+    }
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt!(lossy).with_filter(filter_fn(|m| is_lossy_level(m.level()))))
+        .with(fmt!(strict).with_filter(filter_fn(|m| !is_lossy_level(m.level()))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    /// A writer that loses everything, like a full lossy channel.
+    #[derive(Clone)]
+    struct Drop_;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Drop_ {
+        type Writer = std::io::Sink;
+        fn make_writer(&'a self) -> std::io::Sink {
+            std::io::sink()
+        }
+    }
+
+    #[test]
+    fn warnings_and_errors_never_use_the_lossy_writer() {
+        let strict = Buf::default();
+        let sub = build_subscriber(EnvFilter::new("debug"), Drop_, strict.clone(), false);
+        tracing::subscriber::with_default(sub, || {
+            tracing::info!("chatter");
+            tracing::debug!("detail");
+            tracing::warn!("rejected 5 connections");
+            tracing::error!("boom");
+        });
+        let out = String::from_utf8(strict.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("rejected 5 connections") && out.contains("boom"),
+            "{out}"
+        );
+        assert!(!out.contains("chatter") && !out.contains("detail"), "{out}");
+    }
 }
