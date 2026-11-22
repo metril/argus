@@ -29,10 +29,20 @@ use tokio::sync::watch;
 pub const DEFAULT_PROFILE_ID: u64 = 0;
 /// Name of the built-in default profile.
 pub const DEFAULT_PROFILE_NAME: &str = "default";
+/// Storage namespace of a profile (userscripts, GM values, script policy): `default` for the
+/// built-in profile, else `p<id>`. Stable across renames; ids are never reused.
+pub fn namespace(id: u64) -> String {
+    if id == DEFAULT_PROFILE_ID {
+        DEFAULT_PROFILE_NAME.into()
+    } else {
+        format!("p{id}")
+    }
+}
 /// Largest accepted overlay rules text, in bytes.
 pub const MAX_RULES_BYTES: usize = 256 * 1024;
 /// Prefix of every device token.
 pub const TOKEN_PREFIX: &str = "abd_";
+const NEXT_PROFILE_ID_KEY: &str = "next_profile_id";
 const MAX_NAME_CHARS: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 500;
 const MAX_LISTS: usize = 1000;
@@ -120,7 +130,7 @@ fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '))
 }
 
-fn normalize_net(n: IpNet) -> Result<IpNet> {
+fn normalize_net(n: IpNet, allow_loopback: bool) -> Result<IpNet> {
     let n = n.trunc();
     let (min, family) = match n {
         IpNet::V4(_) => (8, "IPv4"),
@@ -132,7 +142,7 @@ fn normalize_net(n: IpNet) -> Result<IpNet> {
         ));
     }
     let a = n.network();
-    if a.is_loopback() || a.is_unspecified() || a.is_multicast() {
+    if (a.is_loopback() && !allow_loopback) || a.is_unspecified() || a.is_multicast() {
         return invalid(format!(
             "{n}: loopback, unspecified and multicast are refused"
         ));
@@ -140,7 +150,7 @@ fn normalize_net(n: IpNet) -> Result<IpNet> {
     // An IPv4-mapped IPv6 address names an IPv4 host; refuse the special ones the same way.
     if let IpAddr::V6(v6) = a {
         if let Some(v4) = v6.to_ipv4_mapped() {
-            if v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() {
+            if (v4.is_loopback() && !allow_loopback) || v4.is_unspecified() || v4.is_multicast() {
                 return invalid(format!(
                     "{n}: loopback, unspecified and multicast are refused"
                 ));
@@ -154,6 +164,8 @@ fn normalize_net(n: IpNet) -> Result<IpNet> {
 pub struct ProfileStore {
     db: Arc<Db>,
     tx: watch::Sender<u64>,
+    /// Accept loopback device addresses (tests only; off by default).
+    allow_loopback: bool,
 }
 
 impl ProfileStore {
@@ -162,6 +174,16 @@ impl ProfileStore {
         Ok(Self {
             db: db.clone(),
             tx: watch::channel(0).0,
+            allow_loopback: false,
+        })
+    }
+
+    /// Like [`Self::open`], but device addresses may be loopback. For tests that must resolve
+    /// devices by source address through a real socket; never wired to configuration.
+    pub fn open_allowing_loopback(db: &Arc<Db>) -> Result<Self> {
+        Ok(Self {
+            allow_loopback: true,
+            ..Self::open(db)?
         })
     }
 
@@ -250,7 +272,17 @@ impl ProfileStore {
                 ));
             }
             if p.id == DEFAULT_PROFILE_ID {
-                p.id = next;
+                // High-water mark: a deleted profile's id (and so its data namespace) is never
+                // handed out again.
+                let mut meta = txn.open_table(tables::META).map_err(db)?;
+                let mark = meta
+                    .get(NEXT_PROFILE_ID_KEY)
+                    .map_err(db)?
+                    .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                    .map_or(1, u64::from_be_bytes);
+                p.id = next.max(mark);
+                meta.insert(NEXT_PROFILE_ID_KEY, (p.id + 1).to_be_bytes().as_slice())
+                    .map_err(db)?;
                 p.created_at = now;
             } else {
                 p.created_at = existing
@@ -340,7 +372,7 @@ impl ProfileStore {
         }
         let mut nets = Vec::with_capacity(d.ips.len());
         for n in &d.ips {
-            let n = normalize_net(*n)?;
+            let n = normalize_net(*n, self.allow_loopback)?;
             if nets.contains(&n) {
                 return invalid(format!("{n} listed twice"));
             }
@@ -639,6 +671,33 @@ mod tests {
         // Putting "default" cannot rename or recreate it.
         assert!(s.put(d).is_err());
         assert_eq!(s.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleted_profile_ids_are_never_reused() {
+        let (_d, _db, s) = store();
+        let a = s.put(prof("a")).unwrap();
+        let b = s.put(prof("b")).unwrap();
+        assert!(s.delete(b.id).unwrap());
+        let c = s.put(prof("c")).unwrap();
+        assert!(c.id > b.id, "{} reused {}", c.id, b.id);
+        assert!(s.delete(c.id).unwrap() && s.delete(a.id).unwrap());
+        assert!(s.put(prof("d")).unwrap().id > c.id);
+    }
+
+    #[test]
+    fn namespace_is_stable_across_rename() {
+        assert_eq!(namespace(0), "default");
+        assert_eq!(namespace(7), "p7");
+    }
+
+    #[test]
+    fn loopback_devices_need_the_opt_in() {
+        let (_d, db, s) = store();
+        assert!(s.put_device(dev("x", 0, &["127.0.0.5"])).is_err());
+        let s2 = ProfileStore::open_allowing_loopback(&db).unwrap();
+        assert!(s2.put_device(dev("x", 0, &["127.0.0.5"])).is_ok());
+        assert!(s2.put_device(dev("y", 0, &["0.0.0.0"])).is_err());
     }
 
     #[test]
