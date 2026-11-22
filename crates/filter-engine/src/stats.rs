@@ -6,6 +6,34 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Resource types tallied in `blocked_by_type`; fixed so the hot path is an array index.
+const TYPES: [&str; 14] = [
+    "document",
+    "subdocument",
+    "sub_frame",
+    "script",
+    "stylesheet",
+    "image",
+    "font",
+    "media",
+    "xhr",
+    "fetch",
+    "websocket",
+    "ping",
+    "object",
+    "other",
+];
+
+/// Cap on distinct tracked domains, so hostile traffic cannot grow the map without bound.
+const MAX_DOMAINS: usize = 10_000;
+
+fn type_index(t: &str) -> usize {
+    TYPES
+        .iter()
+        .position(|x| *x == t)
+        .unwrap_or(TYPES.len() - 1)
+}
+
 /// Statistics for blocked and allowed requests
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlockingStats {
@@ -31,7 +59,7 @@ pub struct FilterStats {
     total_requests: Arc<AtomicU64>,
     blocked_requests: Arc<AtomicU64>,
     allowed_requests: Arc<AtomicU64>,
-    blocked_by_type: Arc<DashMap<String, u64>>,
+    blocked_by_type: Arc<[AtomicU64; TYPES.len()]>,
     blocked_domains: Arc<DashMap<String, u64>>,
 }
 
@@ -48,22 +76,23 @@ impl FilterStats {
             total_requests: Arc::new(AtomicU64::new(0)),
             blocked_requests: Arc::new(AtomicU64::new(0)),
             allowed_requests: Arc::new(AtomicU64::new(0)),
-            blocked_by_type: Arc::new(DashMap::new()),
+            blocked_by_type: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             blocked_domains: Arc::new(DashMap::new()),
         }
     }
 
-    /// Record a blocked request (lock-free).
+    /// Record a blocked request. Allocation-free except the first time a domain is seen.
     pub fn record_blocked(&self, resource_type: &str, domain: &str) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.blocked_requests.fetch_add(1, Ordering::Relaxed);
+        self.blocked_by_type[type_index(resource_type)].fetch_add(1, Ordering::Relaxed);
 
-        // Sharded concurrent maps: only the touched shard is locked, never a global lock.
-        *self
-            .blocked_by_type
-            .entry(resource_type.to_string())
-            .or_insert(0) += 1;
-        *self.blocked_domains.entry(domain.to_string()).or_insert(0) += 1;
+        // Sharded map: look up by &str first (no allocation); only a new domain allocates.
+        if let Some(mut v) = self.blocked_domains.get_mut(domain) {
+            *v += 1;
+        } else if self.blocked_domains.len() < MAX_DOMAINS {
+            *self.blocked_domains.entry(domain.to_string()).or_insert(0) += 1;
+        }
     }
 
     /// Record an allowed request
@@ -82,10 +111,13 @@ impl FilterStats {
         top_blocked.sort_by(|a, b| b.1.cmp(&a.1));
         top_blocked.truncate(10); // Top 10
 
-        let blocked_by_type: HashMap<String, u64> = self
-            .blocked_by_type
+        let blocked_by_type: HashMap<String, u64> = TYPES
             .iter()
-            .map(|e| (e.key().clone(), *e.value()))
+            .zip(self.blocked_by_type.iter())
+            .filter_map(|(t, c)| {
+                let n = c.load(Ordering::Relaxed);
+                (n > 0).then(|| (t.to_string(), n))
+            })
             .collect();
 
         BlockingStats {
@@ -102,7 +134,9 @@ impl FilterStats {
         self.total_requests.store(0, Ordering::Relaxed);
         self.blocked_requests.store(0, Ordering::Relaxed);
         self.allowed_requests.store(0, Ordering::Relaxed);
-        self.blocked_by_type.clear();
+        for c in self.blocked_by_type.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
         self.blocked_domains.clear();
     }
 }
