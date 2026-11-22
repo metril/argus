@@ -121,10 +121,19 @@ pub struct RateLimiter {
 impl RateLimiter {
     /// `rate` connections per second; 0 = unlimited.
     pub fn new(rate: u32) -> Self {
-        let interval_ns = if rate == 0 { 0 } else { 1_000_000_000 / rate as u64 };
+        let interval_ns = if rate == 0 {
+            0
+        } else {
+            1_000_000_000 / rate as u64
+        };
         // Burst: 100 ms of tokens, at least 1.
         let burst_ns = (interval_ns * (rate as u64 / 10).max(1)).max(interval_ns);
-        Self { interval_ns, burst_ns, tat: AtomicU64::new(0), epoch: Instant::now() }
+        Self {
+            interval_ns,
+            burst_ns,
+            tat: AtomicU64::new(0),
+            epoch: Instant::now(),
+        }
     }
 
     /// Take one token; false if the rate is exceeded.
@@ -153,24 +162,7 @@ impl RateLimiter {
     }
 }
 
-/// Connection cap derived from the soft `RLIMIT_NOFILE`: two descriptors per proxied connection
-/// (client and upstream) after reserving headroom for listeners, pool, files and the API.
-pub fn derive_max_connections() -> usize {
-    const HEADROOM: u64 = 512;
-    const CAP: usize = 100_000;
-    const FLOOR: usize = 256;
-    #[cfg(unix)]
-    {
-        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: getrlimit writes into the provided struct.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
-            let soft = lim.rlim_cur as u64;
-            let usable = soft.saturating_sub(HEADROOM) / 2;
-            return (usable as usize).clamp(FLOOR, CAP);
-        }
-    }
-    10_000
-}
+pub use common::config::derive_max_connections;
 
 impl LoadManager {
     /// Create a new load manager with the given configuration
@@ -258,7 +250,9 @@ impl LoadManager {
     fn note_rejection(&self) {
         const INTERVAL_MS: u64 = 10_000;
         debug!("Connection rejected");
-        self.stats.rejected_since_log.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .rejected_since_log
+            .fetch_add(1, Ordering::Relaxed);
         let now = self.epoch.elapsed().as_millis() as u64;
         let last = self.last_summary_ms.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= INTERVAL_MS
@@ -396,6 +390,7 @@ impl Drop for ConnectionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_default_config() {
@@ -465,6 +460,51 @@ mod tests {
         let max = (2000.0 * start.elapsed().as_secs_f64()) as usize + 200 + 8;
         assert!(total <= max, "{total} > {max}");
         assert!(total >= 100);
+    }
+
+    /// Offer `rate` admissions/s for `ms` from 4 threads on a fixed schedule; returns admitted.
+    fn offer_paced(m: &Arc<LoadManager>, rate: u64, ms: u64) -> u64 {
+        let threads = 4u64;
+        let per = rate * ms / 1000 / threads;
+        let gap = Duration::from_nanos(1_000_000_000 * threads / rate);
+        let start = Instant::now();
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let m = m.clone();
+                std::thread::spawn(move || {
+                    let mut ok = 0;
+                    for i in 0..per {
+                        let at = start + gap * i as u32 + gap * t as u32 / threads as u32;
+                        while Instant::now() < at {
+                            std::hint::spin_loop();
+                        }
+                        if m.check_admission() == AdmissionResult::Admitted {
+                            ok += 1;
+                            m.release_connection();
+                        }
+                    }
+                    ok
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).sum()
+    }
+
+    #[test]
+    fn default_limit_admits_10k_per_second_and_enforces_above() {
+        let m = Arc::new(LoadManager::with_defaults());
+        let offered = 10_000 * 1500 / 1000;
+        assert_eq!(
+            offer_paced(&m, 10_000, 1500),
+            offered,
+            "rejections at exactly 10k/s"
+        );
+        assert_eq!(m.stats().connections_rejected, 0);
+
+        let m = Arc::new(LoadManager::with_defaults());
+        let ok = offer_paced(&m, 20_000, 1500);
+        // 10k/s for 1.5 s plus the 100 ms burst (1000), with a little slack.
+        assert!((15_000..=16_500).contains(&ok), "{ok} of 30000 admitted");
     }
 
     #[test]

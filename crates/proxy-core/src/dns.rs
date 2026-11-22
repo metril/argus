@@ -144,6 +144,11 @@ pub struct HickoryBackend {
 }
 
 impl HickoryBackend {
+    /// False when setup failed and lookups use the OS resolver instead.
+    pub fn uses_hickory(&self) -> bool {
+        self.resolver.is_some()
+    }
+
     pub fn new(settings: &DnsSettings) -> Self {
         use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
         use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -201,7 +206,10 @@ impl DnsBackend for HickoryBackend {
         Box::pin(async move {
             match resolver {
                 Some(r) => {
-                    let l = r.lookup_ip(name.as_str()).await.map_err(|e| e.to_string())?;
+                    let l = r
+                        .lookup_ip(name.as_str())
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let ttl = l.valid_until().saturating_duration_since(Instant::now());
                     Ok((l.iter().collect(), ttl))
                 }
@@ -281,5 +289,83 @@ mod tests {
         assert!(r.resolve("nx.test").await.is_err());
         assert!(r.resolve("nx.test").await.is_err());
         assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn settings(servers: Vec<String>) -> DnsSettings {
+        DnsSettings {
+            servers,
+            cache_size: 100,
+            min_ttl_secs: 1,
+            max_ttl_secs: 60,
+            negative_ttl_secs: 1,
+        }
+    }
+
+    /// Minimal UDP DNS server: answers every A query with 192.0.2.77 (TTL 300). Counts queries.
+    fn fake_dns_server() -> (SocketAddr, Arc<AtomicU64>) {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let n = Arc::new(AtomicU64::new(0));
+        let n2 = n.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while let Ok((len, peer)) = sock.recv_from(&mut buf) {
+                n2.fetch_add(1, Ordering::SeqCst);
+                let q = &buf[..len];
+                // Question section ends after the name (labels, 0) plus type and class.
+                let mut i = 12;
+                while q[i] != 0 {
+                    i += q[i] as usize + 1;
+                }
+                let qend = i + 1 + 4;
+                let qtype = u16::from_be_bytes([q[qend - 4], q[qend - 3]]);
+                let mut r = Vec::new();
+                r.extend_from_slice(&q[..2]); // id
+                r.extend_from_slice(&[0x81, 0x80, 0, 1]); // response, RD+RA, qdcount
+                let an: u16 = if qtype == 1 { 1 } else { 0 };
+                r.extend_from_slice(&an.to_be_bytes());
+                r.extend_from_slice(&[0, 0, 0, 0]);
+                r.extend_from_slice(&q[12..qend]);
+                if an == 1 {
+                    r.extend_from_slice(&[
+                        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 192, 0, 2, 77,
+                    ]);
+                }
+                let _ = sock.send_to(&r, peer);
+            }
+        });
+        (addr, n)
+    }
+
+    #[tokio::test]
+    async fn explicit_server_with_port_override_resolves_and_caches() {
+        let (addr, queries) = fake_dns_server();
+        assert_ne!(addr.port(), 53);
+        let st = settings(vec![addr.to_string()]);
+        let b = HickoryBackend::new(&st);
+        assert!(b.uses_hickory());
+        let r = CachedResolver::new(Arc::new(b), DnsCacheConfig::from(&st));
+        let a = r.resolve("host.example.test").await.unwrap();
+        assert_eq!(a[0], "192.0.2.77".parse::<IpAddr>().unwrap());
+        let before = queries.load(Ordering::SeqCst);
+        assert!(before >= 1);
+        r.resolve("host.example.test").await.unwrap();
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            before,
+            "second lookup must hit the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_config_resolves_localhost() {
+        let b = HickoryBackend::new(&settings(vec![]));
+        assert!(
+            b.uses_hickory(),
+            "system resolver configuration was not usable"
+        );
+        let r = CachedResolver::new(Arc::new(b), DnsCacheConfig::from(&settings(vec![])));
+        let a = r.resolve("localhost").await.unwrap();
+        assert!(a.iter().any(|ip| ip.is_loopback()), "{a:?}");
     }
 }

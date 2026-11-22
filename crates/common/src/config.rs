@@ -467,6 +467,29 @@ pub enum ConfigError {
     Serialize(String),
 }
 
+/// Connection cap derived from the soft `RLIMIT_NOFILE`: two descriptors per proxied connection
+/// (client and upstream) after reserving headroom for listeners, pool, files and the API.
+pub fn derive_max_connections() -> usize {
+    const HEADROOM: u64 = 512;
+    const CAP: usize = 100_000;
+    const FLOOR: usize = 256;
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into the provided struct.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+            #[allow(clippy::unnecessary_cast)] // rlim_t differs per platform
+            let soft = lim.rlim_cur as u64;
+            let usable = soft.saturating_sub(HEADROOM) / 2;
+            return (usable as usize).clamp(FLOOR, CAP);
+        }
+    }
+    10_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

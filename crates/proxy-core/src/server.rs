@@ -81,8 +81,7 @@ impl ProxyServer {
         };
         info!(
             "Load manager initialized: max_connections={}, rate_limit={}/s",
-            load_manager_config.max_connections,
-            load_manager_config.connection_rate_limit
+            load_manager_config.max_connections, load_manager_config.connection_rate_limit
         );
         let load_manager = Arc::new(LoadManager::new(load_manager_config));
 
