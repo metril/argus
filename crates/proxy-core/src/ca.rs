@@ -14,10 +14,9 @@ use tracing::{debug, info};
 
 /// Certificate Authority for generating and signing certificates
 pub struct CertificateAuthority {
-    /// The CA key pair
-    ca_key_pair: KeyPair,
-    /// The CA certificate parameters (for issuer)
-    ca_params: CertificateParams,
+    /// Signing identity built from the stored CA certificate itself (subject DN, key id), so
+    /// leaves always chain to the exact certificate on disk.
+    issuer: Issuer<'static, KeyPair>,
     /// The CA certificate in DER format
     ca_cert_der: CertificateDer<'static>,
     /// The CA private key in DER format
@@ -60,10 +59,6 @@ impl CertificateAuthority {
         let ca_key_pair = KeyPair::from_pem(&key_pem)
             .map_err(|e| Error::Certificate(format!("Failed to parse CA private key: {}", e)))?;
 
-        // For loading existing CA, we create default params
-        // The actual certificate parameters will be extracted when creating an Issuer
-        let ca_params = CertificateParams::default();
-
         // Parse PEM to get DER formats
         let cert_der_bytes = pem::parse(&cert_pem)
             .map_err(|e| Error::Certificate(format!("Failed to parse CA certificate PEM: {}", e)))?
@@ -73,10 +68,12 @@ impl CertificateAuthority {
 
         let ca_key_der = PrivateKeyDer::try_from(ca_key_pair.serialize_der())
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
+        let issuer = Issuer::from_ca_cert_pem(&cert_pem, ca_key_pair).map_err(|e| {
+            Error::Certificate(format!("CA certificate does not match its key: {}", e))
+        })?;
 
         Ok(Self {
-            ca_key_pair,
-            ca_params,
+            issuer,
             ca_cert_der,
             ca_key_der,
         })
@@ -154,17 +151,8 @@ impl CertificateAuthority {
 
         info!("Generated new CA certificate");
 
-        // Get DER formats
-        let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
-        let ca_key_der = PrivateKeyDer::try_from(ca_key_pair.serialize_der())
-            .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
-
-        Ok(Self {
-            ca_key_pair,
-            ca_params: params,
-            ca_cert_der,
-            ca_key_der,
-        })
+        // Use the same path as a restart: the signing identity comes from the stored cert.
+        Self::load(cert_path, key_path)
     }
 
     /// Generate a leaf certificate for a host (DNS name or IP literal).
@@ -200,12 +188,8 @@ impl CertificateAuthority {
         let key_pair = KeyPair::generate()
             .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
 
-        // Create an Issuer from our CA
-        let issuer = Issuer::from_params(&self.ca_params, &self.ca_key_pair);
-
-        // Sign the certificate with our CA
         let cert = params
-            .signed_by(&key_pair, &issuer)
+            .signed_by(&key_pair, &self.issuer)
             .map_err(|e| Error::Certificate(format!("Failed to sign certificate: {}", e)))?;
 
         // Convert to DER format for rustls
@@ -255,6 +239,7 @@ pub fn subject_alt_names(host: &str) -> Result<Vec<SanType>> {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
 
     #[test]
     fn test_ca_generation() {
@@ -353,5 +338,51 @@ mod tests {
         for host in ["10.1.2.3", "::1", "localhost", "a.example"] {
             assert!(ca.generate_cert(host).is_ok(), "{host}");
         }
+    }
+
+    /// Verify `leaf` for `host` against only the on-disk CA certificate, with a real verifier.
+    fn verify_against_disk(cert_path: &Path, leaf: &CertificateDer<'static>, host: &str) {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::client::WebPkiServerVerifier;
+        let ca_pem = fs::read(cert_path).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+        verifier
+            .verify_server_cert(
+                leaf,
+                &[],
+                &name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .unwrap_or_else(|e| panic!("leaf for {host} does not chain to on-disk CA: {e}"));
+    }
+
+    #[test]
+    fn leaf_from_reloaded_ca_chains_to_on_disk_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cert, key) = (tmp.path().join("ca.crt"), tmp.path().join("ca.key"));
+        let first = CertificateAuthority::load_or_generate(&cert, &key).unwrap();
+        let (leaf, _) = first.generate_cert("example.com").unwrap();
+        verify_against_disk(&cert, &leaf, "example.com");
+        drop(first);
+
+        // "Restart": reload from disk and issue again.
+        let reloaded = CertificateAuthority::load_or_generate(&cert, &key).unwrap();
+        for host in ["example.com", "www.example.com", "127.0.0.1"] {
+            let (leaf, _) = reloaded.generate_cert(host).unwrap();
+            verify_against_disk(&cert, &leaf, host);
+        }
+        let on_disk = pem::parse(fs::read(&cert).unwrap()).unwrap();
+        assert_eq!(reloaded.ca_cert_der().as_ref(), on_disk.contents());
     }
 }
