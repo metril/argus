@@ -79,6 +79,7 @@ common = { path = "../common" }
 
 # WebSocket proxying (optional, feature `websockets`)
 tokio-tungstenite = { workspace = true, optional = true }
+webpki-roots = "1.0"
 
 # HTTP/3 support (optional)
 proxy-http3 = { path = "../proxy-http3", optional = true }

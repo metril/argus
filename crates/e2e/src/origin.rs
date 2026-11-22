@@ -111,7 +111,17 @@ impl SniResolver {
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, name);
         params.distinguished_name = dn;
-        params.subject_alt_names = vec![SanType::DnsName(name.try_into().expect("dns name"))];
+        params.subject_alt_names = if let Ok(ip) = name.parse::<IpAddr>() {
+            vec![SanType::IpAddress(ip)]
+        } else if name == "localhost" {
+            // Clients dialing an IP literal send no SNI; cover loopback too.
+            vec![
+                SanType::DnsName(name.try_into().expect("dns name")),
+                SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ]
+        } else {
+            vec![SanType::DnsName(name.try_into().expect("dns name"))]
+        };
         let key = KeyPair::generate().expect("leaf key");
         let issuer = Issuer::from_params(&self.ca_params, &self.ca_key);
         let cert = params.signed_by(&key, &issuer).expect("sign leaf");
@@ -207,6 +217,14 @@ impl TestOrigin {
             state,
             tasks,
         }
+    }
+
+    pub fn https_port(&self) -> u16 {
+        self.https_port
+    }
+
+    pub fn http_port(&self) -> u16 {
+        self.http_port
     }
 
     /// PEM of the origin CA (the proxy must trust it).

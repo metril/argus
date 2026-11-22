@@ -16,10 +16,12 @@
 mod client;
 mod origin;
 mod proxy;
+mod ws;
 
 pub use client::{HttpVersion, TestClient};
 pub use origin::{MockResponse, RecordedRequest, TestOrigin};
 pub use proxy::TestProxy;
+pub use ws::{connect_ws, connect_wss, WsStream};
 
 use std::sync::Once;
 

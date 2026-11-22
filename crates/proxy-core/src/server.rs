@@ -3,17 +3,18 @@
 use crate::{
     ca::CertificateAuthority,
     config::ProxyConfig,
-    connection::ConnectionHandler,
+    connection::{ConnectionHandler, ConnectionShared, Timeouts},
     filtering::ProxyContext,
     load_manager::{AdmissionResult, ConnectionGuard, LoadManager, LoadManagerConfig},
     mitm::MitmHandler,
     Error, Result,
 };
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 pub struct ProxyServer {
     config: ProxyConfig,
@@ -21,6 +22,9 @@ pub struct ProxyServer {
     load_manager: Arc<LoadManager>,
     /// Shared filtering + upstream-forwarding context handed to each connection.
     ctx: Arc<ProxyContext>,
+    /// Test/controlled-environment override: dial every WebSocket upstream at this IP (mirrors
+    /// `UpstreamOptions::resolve_all_to` for the HTTP client).
+    ws_resolve_all_to: Option<IpAddr>,
 }
 
 impl ProxyServer {
@@ -42,7 +46,8 @@ impl ProxyServer {
                 config.mitm.cert_cache_size,
                 config.mitm.cert_ttl_days * 24 * 3600, // Convert days to seconds
                 config.performance.max_cert_generations,
-            );
+            )
+            .with_http2(config.proxy.enable_http2);
 
             Some(Arc::new(handler))
         } else {
@@ -70,6 +75,7 @@ impl ProxyServer {
             mitm_handler,
             load_manager,
             ctx,
+            ws_resolve_all_to: None,
         })
     }
 
@@ -82,6 +88,12 @@ impl ProxyServer {
         let mut server = Self::new(config, ctx)?;
         server.load_manager = Arc::new(LoadManager::new(load_manager_config));
         Ok(server)
+    }
+
+    /// Dial WebSocket upstreams at `ip` regardless of hostname (tests / controlled setups).
+    pub fn with_ws_resolve_all_to(mut self, ip: IpAddr) -> Self {
+        self.ws_resolve_all_to = Some(ip);
+        self
     }
 
     /// Start the proxy server with graceful shutdown
@@ -110,10 +122,8 @@ impl ProxyServer {
         listener: TcpListener,
         shutdown_tx: broadcast::Sender<()>,
     ) -> Result<()> {
-        let addr = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
+        let local_addr = listener.local_addr().ok();
+        let addr = local_addr.map(|a| a.to_string()).unwrap_or_default();
         info!("Proxy server listening on {}", addr);
         info!("HTTP/2: {}", self.config.proxy.enable_http2);
         info!("HTTP/3: {}", self.config.proxy.enable_http3);
@@ -135,8 +145,29 @@ impl ProxyServer {
         // Start HTTP/3 server if enabled
         #[cfg(feature = "http3")]
         if self.config.proxy.enable_http3 {
-            self.start_http3_server(shutdown_tx.subscribe()).await?;
+            let port = local_addr.map_or(self.config.proxy.port, |a| a.port());
+            self.start_http3_server(shutdown_tx.subscribe(), port)
+                .await?;
         }
+
+        let timeouts = Timeouts::from_config(&self.config.performance);
+        let shared = Arc::new(ConnectionShared {
+            mitm: self.mitm_handler.clone(),
+            enable_http2: self.config.proxy.enable_http2,
+            enable_websockets: self.config.proxy.enable_websockets,
+            ctx: self.ctx.clone(),
+            timeouts,
+            #[cfg(feature = "websockets")]
+            ws: if self.config.proxy.enable_websockets {
+                Some(Arc::new(crate::websocket::WsUpstream::new(
+                    &self.config.proxy.extra_upstream_ca_paths,
+                    self.ws_resolve_all_to,
+                    timeouts.handshake,
+                )?))
+            } else {
+                None
+            },
+        });
 
         // Subscribe to shutdown signal for the main loop
         let mut main_shutdown_rx = shutdown_tx.subscribe();
@@ -166,30 +197,26 @@ impl ProxyServer {
                                 }
                             }
 
-                            info!("Accepted connection from {}", client_addr);
+                            trace!("Accepted connection from {}", client_addr);
 
-                            // Clone the MITM handler, config, and load manager for this connection
-                            let mitm_handler = self.mitm_handler.clone();
-                            let enable_http2 = self.config.proxy.enable_http2;
-                            let enable_websockets = self.config.proxy.enable_websockets;
+                            let shared = shared.clone();
                             let mut shutdown_rx = shutdown_tx.subscribe();
                             let load_manager = self.load_manager.clone();
-                            let ctx = self.ctx.clone();
 
                             // Spawn a new task to handle this connection
                             tokio::spawn(async move {
                                 // Create connection guard for automatic cleanup
                                 let _guard = ConnectionGuard::new(load_manager);
 
-                                let handler = ConnectionHandler::new(client_addr, mitm_handler, enable_http2, enable_websockets, ctx);
+                                let handler = ConnectionHandler::new(client_addr, shared);
                                 tokio::select! {
                                     result = handler.handle(stream) => {
                                         if let Err(e) = result {
-                                            warn!("Error handling connection from {}: {}", client_addr, e);
+                                            debug!("Connection from {} ended with error: {}", client_addr, e);
                                         }
                                     }
                                     _ = shutdown_rx.recv() => {
-                                        info!("Connection from {} terminated due to shutdown", client_addr);
+                                        debug!("Connection from {} terminated due to shutdown", client_addr);
                                     }
                                 }
                                 // _guard is dropped here, releasing the connection
@@ -238,7 +265,11 @@ impl ProxyServer {
 
     /// Start HTTP/3 server (optional feature)
     #[cfg(feature = "http3")]
-    async fn start_http3_server(&self, shutdown_rx: broadcast::Receiver<()>) -> Result<()> {
+    async fn start_http3_server(
+        &self,
+        shutdown_rx: broadcast::Receiver<()>,
+        local_port: u16,
+    ) -> Result<()> {
         use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
 
         // HTTP/3 requires MITM to be enabled for certificate generation
@@ -273,7 +304,7 @@ impl ProxyServer {
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
         // Create QUIC configuration
-        let udp_addr = format!("{}:{}", self.config.proxy.host, self.config.proxy.port)
+        let udp_addr = format!("{}:{}", self.config.proxy.host, local_port)
             .parse()
             .map_err(|e| Error::Connection(format!("Invalid address: {}", e)))?;
 
