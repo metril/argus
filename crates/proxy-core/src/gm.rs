@@ -214,7 +214,8 @@ pub struct Caller<'a> {
 #[derive(Default)]
 struct Counts {
     per_script: HashMap<String, usize>,
-    profile: usize,
+    /// In-flight requests per profile name, so one profile cannot use up everyone's slots.
+    per_profile: HashMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -232,6 +233,7 @@ enum Kind {
 /// Releases a request slot on drop.
 struct Permit {
     host: Arc<GmHost>,
+    profile: String,
     script: String,
     kind: Kind,
 }
@@ -243,7 +245,12 @@ impl Drop for Permit {
             Kind::Xhr => &mut l.xhr,
             Kind::Json => &mut l.json,
         };
-        c.profile = c.profile.saturating_sub(1);
+        if let Some(n) = c.per_profile.get_mut(&self.profile) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                c.per_profile.remove(&self.profile);
+            }
+        }
         if let Some(n) = c.per_script.get_mut(&self.script) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -763,7 +770,7 @@ impl GmHost {
         };
         if is_xhr {
             // The xhr slot is taken here and held until the response has been streamed.
-            let Some(permit) = self.permit(&a.id, Kind::Xhr) else {
+            let Some(permit) = self.permit(&a.profile, &a.id, Kind::Xhr) else {
                 return quota();
             };
             let Some(bytes) = self.reserve(XHR_RESERVE) else {
@@ -773,7 +780,7 @@ impl GmHost {
                 .xhr(manager, c, up, &h, a, req.into_body(), (permit, bytes))
                 .await;
         }
-        let Some(_permit) = self.permit(&a.id, Kind::Json) else {
+        let Some(_permit) = self.permit(&a.profile, &a.id, Kind::Json) else {
             return quota();
         };
         let Some(_bytes) = self.reserve(declared.unwrap_or(JSON_CAP).min(JSON_CAP)) else {
@@ -857,20 +864,22 @@ impl GmHost {
         }
     }
 
-    fn permit(self: &Arc<Self>, script: &str, kind: Kind) -> Option<Permit> {
+    fn permit(self: &Arc<Self>, profile: &str, script: &str, kind: Kind) -> Option<Permit> {
         let mut l = self.limits.lock();
         let (c, per, all) = match kind {
             Kind::Xhr => (&mut l.xhr, MAX_XHR_PER_SCRIPT, MAX_XHR_PER_PROFILE),
             Kind::Json => (&mut l.json, MAX_JSON_PER_SCRIPT, MAX_JSON_PER_PROFILE),
         };
         let n = c.per_script.get(script).copied().unwrap_or(0);
-        if n >= per || c.profile >= all {
+        let p = c.per_profile.get(profile).copied().unwrap_or(0);
+        if n >= per || p >= all {
             return None;
         }
-        c.profile += 1;
+        *c.per_profile.entry(profile.to_string()).or_insert(0) += 1;
         *c.per_script.entry(script.to_string()).or_insert(0) += 1;
         Some(Permit {
             host: Arc::clone(self),
+            profile: profile.to_string(),
             script: script.to_string(),
             kind,
         })
@@ -1292,6 +1301,28 @@ async fn run_outbound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_slots_are_capped_per_profile() {
+        let host = Arc::new(GmHost::new());
+        let mut held = Vec::new();
+        // Profile "a" fills its cap across several scripts.
+        for i in 0..MAX_XHR_PER_PROFILE {
+            let p = host.permit("a", &format!("a{}", i / MAX_XHR_PER_SCRIPT), Kind::Xhr);
+            held.push(p.expect("within the cap"));
+        }
+        assert!(
+            host.permit("a", "a-extra", Kind::Xhr).is_none(),
+            "a is full"
+        );
+        // Another profile is not starved by it.
+        assert!(host.permit("b", "b0", Kind::Xhr).is_some());
+        // Releasing a slot frees room for "a" again.
+        held.pop();
+        assert!(host.permit("a", "a-extra", Kind::Xhr).is_some());
+        // The JSON pool is separate.
+        assert!(host.permit("a", "a0", Kind::Json).is_some());
+    }
 
     fn doc(host: &str, n: usize) -> Doc {
         Doc {
