@@ -192,7 +192,6 @@ pub const KNOWN_GRANTS: &[&str] = &[
     "gm_gettabs",
     "gm_cookie",
     "gm_webrequest",
-    "gm_setvalue",
 ];
 
 /// Canonical (comparison) form of a grant: `GM.getValue` and `GM_getValue` both become

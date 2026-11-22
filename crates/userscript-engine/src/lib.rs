@@ -9,6 +9,7 @@
 //! The wire protocol is documented in `docs/USERSCRIPT-PROTOCOL.md`.
 
 pub mod backend;
+pub mod bundle;
 
 pub mod error;
 pub mod index;
