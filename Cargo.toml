@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/proxy-core",
     "crates/filter-engine",
+    "crates/ext-rules",
     "crates/list-service",
     "crates/userscript-engine",
     "crates/web-api",
