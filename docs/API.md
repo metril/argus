@@ -77,7 +77,9 @@ Every failure uses one envelope with a stable `code`:
 
 Codes: `unauthorized` (401), `forbidden`, `insufficient_scope`, `scope_escalation`, `csrf_failed`
 (403), `not_found` (404), `already_exists`, `last_admin`, `registration_closed` (409/403),
-`validation_failed`, `invalid_body`, `invalid_query`, `bad_request` (400),
+`validation_failed`, `invalid_body`, `invalid_query`, `bad_request`, `invalid_fetch_url`,
+`fetch_destination_not_allowed` (400; a list URL that is not http(s) or points at a private,
+loopback or link-local destination, see the README's fetch policy),
 `precondition_failed` (412), `precondition_required` (428), `rate_limited` (429),
 `internal_error` (500). Responses carry an `X-Request-Id` (a client-supplied one is echoed).
 
@@ -95,7 +97,11 @@ Every list endpoint takes `?page=1&limit=50` (limit 1..=200) and returns
 
 Limits are per client IP, per user session / API token, and stricter per IP for login, register
 and refresh. `X-Forwarded-For` is honored only from `trusted_proxies`. CORS is same-origin only
-unless `cors_origins` lists allowed origins.
+unless `cors_origins` lists allowed origins. Session cookies get `Secure` per `webui.cookie_secure`
+(`auto` by default: only when a trusted proxy reports `X-Forwarded-Proto: https`).
+
+Failed logins are indistinguishable (same status, body and bcrypt work) whether the user is unknown,
+disabled or the password is wrong.
 
 ## Lists, reports and the engine
 
@@ -117,4 +123,7 @@ unless `cors_origins` lists allowed origins.
 
 `GET /stats/blocked/recent` reads the engine's bounded ring (newest first, paginated) and filters by
 `client` (profile label), `host` (host or subdomains) and `list_id`. Entries carry the URL, source
-host, request type, matched rule, list id (for domain-set hits) and client label.
+host, request type, matched rule, list id (for domain-set hits) and client label. Requires
+`stats:read`. URLs are stored without their query string and fragment unless
+`adblock.recent_blocked_keep_query` is set. `GET /system/metrics` also reports `storage`
+(`deferred_dropped`, `deferred_failed`, `deferred_queued`) for the background database writer.

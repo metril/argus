@@ -43,6 +43,12 @@ update_interval_hours = 24
 # copy. May also point to a single uBO scriptlets.js (.js) or a pre-built adblock-rust resources
 # array (.json). Set to "" to disable scriptlet injection entirely.
 scriptlet_resources_url = "https://raw.githubusercontent.com/gorhill/uBlock/master/src/js/resources"
+# List, `!#include` and resource downloads refuse private (RFC 1918, ULA, CGNAT), loopback and
+# link-local destinations. List CIDRs, IPs or host names here to fetch from your LAN, e.g.
+# ["192.168.1.0/24", "nas.lan"]. Redirects are followed at most 3 hops and never from https to http.
+allowed_fetch_destinations = []
+# Keep query strings in the recent-blocked list (off: they are stripped because they can hold tokens).
+recent_blocked_keep_query = false
 
 [webui]
 enabled = true
@@ -53,3 +59,8 @@ cors_origins = ["http://localhost:3000"]
 rate_limit_global_rpm = 10000
 rate_limit_ip_rpm = 100
 rate_limit_user_rpm = 1000
+# Secure flag on session cookies: "auto" (set when the request arrived over HTTPS via a trusted
+# proxy; plain-HTTP access keeps working), "always" or "never".
+cookie_secure = "auto"
+# Reverse proxies whose X-Forwarded-For / X-Forwarded-Proto are trusted (IP addresses).
+trusted_proxies = []

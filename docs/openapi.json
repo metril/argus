@@ -1113,11 +1113,15 @@
           },
           "proxy": {
             "$ref": "#/components/schemas/ProxyStatsResponse"
+          },
+          "storage": {
+            "$ref": "#/components/schemas/StorageMetrics"
           }
         },
         "required": [
           "proxy",
-          "filter"
+          "filter",
+          "storage"
         ],
         "type": "object"
       },
@@ -2107,6 +2111,35 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "StorageMetrics": {
+        "description": "Health of the deferred (background) database writes.",
+        "properties": {
+          "deferred_dropped": {
+            "description": "Telemetry writes discarded because the write queue was full.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_failed": {
+            "description": "Deferred writes that failed or panicked.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deferred_queued": {
+            "description": "Deferred writes waiting to be committed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deferred_dropped",
+          "deferred_failed",
+          "deferred_queued"
         ],
         "type": "object"
       },

@@ -194,6 +194,10 @@ enabled = true            # Network/cosmetic blocking via the bundled filter eng
 data_dir = "data/filters" # Database, cached list files and the compiled engine live here (see Storage layout)
 auto_update = true
 update_interval_hours = 24
+# Control-plane downloads (lists, `!#include`, scriptlet resources) refuse private, loopback and
+# link-local destinations by default; allow LAN hosts here (CIDRs, IPs or host names).
+allowed_fetch_destinations = []   # e.g. ["192.168.1.0/24", "nas.lan"]
+recent_blocked_keep_query = false # strip query strings from the recent-blocked list (they can hold tokens)
 
 [userscripts]
 enabled = true
@@ -202,6 +206,10 @@ enabled = true
 enabled = true
 host = "0.0.0.0"
 port = 3000                # Web UI + API
+# Binding beyond loopback serves plain HTTP: put a TLS-terminating reverse proxy in front.
+cookie_secure = "auto"     # "auto" | "always" | "never": Secure flag on session cookies; auto = when
+                           # the request came over HTTPS through a proxy listed in trusted_proxies
+trusted_proxies = []       # proxy IPs whose X-Forwarded-For / X-Forwarded-Proto are believed
 # Accounts are created by registering in the Web UI; the first user becomes admin.
 ```
 
@@ -246,6 +254,20 @@ A catalogue of well-known hosts, domain and IP lists (StevenBlack, AdAway, HaGeZ
 Army, Spamhaus DROP, Feodo, ...) is built in but **disabled by default**; nothing is downloaded until
 you add one (Filters, then Catalogue, or `POST /api/v1/lists/catalogue/{id}`). Each entry shows its
 licence: check it before use.
+
+### Fetch policy
+
+Lists, `!#include` targets and the scriptlet resource URL are fetched by the control plane under a
+stricter destination policy than proxied traffic: only `http`/`https`, and loopback, link-local
+(cloud metadata), multicast, unspecified and private ranges (RFC 1918, ULA, CGNAT) are refused,
+judged on the address actually connected to (so a name resolving internally is refused, and IPv6
+literals and mapped forms are covered). Redirects are followed for at most 3 hops, never from
+`https` to `http`, every hop is vetted the same way, and includes must stay on the list's origin.
+URLs are checked when saved (`400`, code `fetch_destination_not_allowed` or `invalid_fetch_url`)
+and again on every fetch. Hosting lists on your LAN: add its CIDR, IP or host name to
+`adblock.allowed_fetch_destinations`. Responses are read uncompressed and capped at
+`max_list_bytes` (all includes of a list share that budget); lines echoed in build reports are
+cut to 80 characters.
 
 ### Build failures and limits
 
