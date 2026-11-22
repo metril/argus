@@ -35,7 +35,7 @@ pub const DEFAULT_HOTKEY: &str = "Alt+Shift+A";
 impl Default for PanelSettings {
     fn default() -> Self {
         PanelSettings {
-            enabled: true,
+            enabled: false,
             hotkey: DEFAULT_HOTKEY.into(),
             auth: PanelAuth::Pin,
             pin_hash: None,

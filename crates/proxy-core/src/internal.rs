@@ -50,9 +50,28 @@ pub fn boot_path() -> &'static str {
     &BOOT.1
 }
 
+const PANEL_JS: &str = include_str!("../assets/panel.js");
+
+static PANEL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}panel.{}.js",
+        crate::csp::INTERNAL_PREFIX,
+        short_hash(PANEL_JS.as_bytes())
+    )
+});
+
+/// Path of the content-hashed panel script (fetched only when the hotkey is first used).
+pub fn panel_path() -> &'static str {
+    &PANEL
+}
+
 static GM_RUNTIME: LazyLock<(String, String)> = LazyLock::new(|| {
     let js = userscript_engine::bundle::runtime_script();
-    let path = format!("{}gm.{}.js", crate::csp::INTERNAL_PREFIX, short_hash(js.as_bytes()));
+    let path = format!(
+        "{}gm.{}.js",
+        crate::csp::INTERNAL_PREFIX,
+        short_hash(js.as_bytes())
+    );
     (js, path)
 });
 
@@ -101,6 +120,8 @@ pub struct Internal {
     unsupported: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
     /// Userscript delivery and backend state.
     pub gm: Arc<crate::gm::GmHost>,
+    /// The in-page panel's state endpoint and the reserved confirmation host.
+    pub panel: Arc<crate::panel::PanelHost>,
     /// Policy-violation reports accepted so far per document (rate limit).
     pv_counts: moka::sync::Cache<String, Arc<std::sync::atomic::AtomicU32>>,
 }
@@ -128,6 +149,7 @@ impl Internal {
                 .build(),
             unsupported: Default::default(),
             gm: Arc::new(crate::gm::GmHost::new()),
+            panel: Arc::default(),
             pv_counts: moka::sync::Cache::builder()
                 .max_capacity(16_384)
                 .time_to_idle(Duration::from_secs(600))
@@ -390,6 +412,9 @@ impl Internal {
             .unwrap_or_default();
         let method = req.method().clone();
 
+        if rest == "panel/state" {
+            return self.panel_state(req, host, rctx).await;
+        }
         if rest == "cc" {
             return self.cc(req, host, engine).await;
         }
@@ -424,6 +449,8 @@ impl Internal {
         }
         let asset: Option<(Bytes, &'static str)> = if path == boot_path() {
             Some((Bytes::from_static(BOOT_JS.as_bytes()), "immutable"))
+        } else if path == panel_path() {
+            Some((Bytes::from_static(PANEL_JS.as_bytes()), "immutable"))
         } else if path == gm_runtime_path() {
             Some((Bytes::from(GM_RUNTIME.0.clone()), "immutable"))
         } else if let Some(h) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".js")) {
@@ -452,6 +479,80 @@ impl Internal {
             .header("cross-origin-resource-policy", "cross-origin")
             .body(full_body(body))
             .expect("static internal response")
+    }
+
+    /// `POST /__adblock__/panel/state`: the read-only data the in-page panel shows. Guarded like
+    /// `cc` (JSON, page token bound to the host, same-origin, size cap, page URL on that host).
+    async fn panel_state(
+        &self,
+        req: Request<Incoming>,
+        host: &str,
+        rctx: &crate::request_ctx::RequestCtx,
+    ) -> Response<ProxyBody> {
+        let deny = |s| plain(s, "no-store", "same-origin");
+        if req.method() != Method::POST {
+            return deny(StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let h: &HeaderMap = req.headers();
+        let is_json = h
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
+            });
+        if !is_json {
+            return deny(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+        if h.get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v != "same-origin")
+        {
+            return deny(StatusCode::FORBIDDEN);
+        }
+        if !h
+            .get("x-adblock-token")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|t| self.token_valid(t, host))
+        {
+            return deny(StatusCode::FORBIDDEN);
+        }
+        let bytes = match Limited::new(req.into_body(), 4096).collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => return deny(StatusCode::PAYLOAD_TOO_LARGE),
+        };
+        #[derive(serde::Deserialize)]
+        struct Req {
+            url: String,
+        }
+        let Ok(Req { url }) = serde_json::from_slice::<Req>(&bytes) else {
+            return deny(StatusCode::BAD_REQUEST);
+        };
+        let same_host = url::Url::parse(&url)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .and_then(|u| crate::authority::normalize_host(u.host_str()?))
+            .is_some_and(|h| h == host);
+        if !same_host {
+            return deny(StatusCode::FORBIDDEN);
+        }
+        let Some(state) = self.panel.state(rctx, &url) else {
+            return deny(StatusCode::NOT_FOUND);
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .header("cache-control", "no-store")
+            .header("x-content-type-options", "nosniff")
+            .header("cross-origin-resource-policy", "same-origin")
+            .body(full_body(Bytes::from(state.to_string())))
+            .expect("panel state response")
+    }
+
+    /// HMAC over `msg` with the process key (no case folding), URL-safe base64.
+    pub(crate) fn sign(&self, msg: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(&hmac_sha256(&self.key, msg)[..16])
     }
 
     async fn cc(

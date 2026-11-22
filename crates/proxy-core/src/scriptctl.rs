@@ -49,7 +49,8 @@ fn any_port(directives: &mut [sp::CspDirective]) {
         for tok in &mut d.sources {
             let t = tok.as_str();
             let authority = t.split_once("://").map_or(t, |(_, r)| r);
-            if t.starts_with('\'') || t.ends_with(':') || t == "*" || authority.contains(['/', ':']) {
+            if t.starts_with('\'') || t.ends_with(':') || t == "*" || authority.contains(['/', ':'])
+            {
                 continue;
             }
             tok.push_str(":*");

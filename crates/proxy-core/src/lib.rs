@@ -26,6 +26,7 @@ pub mod internal;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
+pub mod panel;
 pub mod passthrough;
 pub mod policy;
 pub mod redirect;

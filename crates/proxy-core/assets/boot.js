@@ -74,4 +74,5 @@ try{new MutationObserver(schedule).observe(document.documentElement,{childList:t
 if(cfg.o)observer();
 procedural(cfg.p);
 if(cfg.l){for(var i=0;i<cfg.l.length;i++)loadScript(cfg.l[i]);}
+if(cfg.k){var K=cfg.k,pl=0;addEventListener('keydown',function(e){if(e.isTrusted&&e.altKey==!!K[0]&&e.ctrlKey==!!K[1]&&e.shiftKey==!!K[2]&&e.metaKey==!!K[3]&&e.code===K[4]){e.preventDefault();var t=window[Symbol.for('adblock.panel')];if(t)t();else if(!pl){pl=1;loadScript(cfg.pn);}}},true);}
 })();

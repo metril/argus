@@ -9,6 +9,7 @@ mod persist;
 mod report;
 mod scriptlets;
 mod service;
+pub mod site_exceptions;
 mod store;
 
 pub use error::{Error, Result};

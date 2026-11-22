@@ -151,6 +151,17 @@ impl ProxyContext {
         ));
     }
 
+    /// Configure the in-page panel (reserved host, global switch, dashboard link) and the
+    /// per-site blocking backend.
+    pub fn configure_panel(
+        &self,
+        cfg: crate::panel::PanelConfig,
+        blocking: Option<Arc<dyn crate::panel::SiteBlocking>>,
+    ) {
+        self.internal.panel.configure(cfg);
+        self.internal.panel.set_site_blocking(blocking);
+    }
+
     /// Attach the script control of the default profile (see [`crate::scriptctl`]). Live, like
     /// [`Self::set_userscripts`].
     pub fn set_script_control(&self, control: Option<Arc<crate::scriptctl::ScriptControl>>) {
@@ -335,6 +346,17 @@ impl ProxyContext {
             .or(named.as_ref().and_then(|(_, p)| *p))
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
         let url_host = authority::url_host(&host);
+
+        // The reserved confirmation host is answered by the proxy alone: never filtered, never
+        // forwarded, whatever the entry mode.
+        if self.internal.panel.is_panel_host(&host) {
+            let origin = origin_of(scheme, &url_host, port);
+            return Ok(self
+                .internal
+                .panel
+                .handle(&self.internal, req, rctx, &origin)
+                .await);
+        }
 
         // Internal endpoints are answered locally for every host: never filtered, never
         // forwarded.
@@ -694,9 +716,15 @@ impl ProxyContext {
                     })
                 };
                 let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
+                let panel_key = if enabled && !blocks_scripts {
+                    self.internal.panel.hotkey(rctx)
+                } else {
+                    None
+                };
                 let head = if enabled {
                     build_head(&PageSpec {
                         userscripts: us_srcs,
+                        panel: panel_key.as_ref(),
                         ext_script: &ext_script,
                         cosmetics: &cos,
                         internal: &self.internal,
@@ -711,7 +739,9 @@ impl ProxyContext {
                 let needs = csp::Needs {
                     script: head.has_script,
                     style: head.has_style || us.as_ref().is_some_and(|p| p.style),
-                    connect: head.observer || us.as_ref().is_some_and(|p| p.connect),
+                    connect: head.observer
+                        || panel_key.is_some()
+                        || us.as_ref().is_some_and(|p| p.connect),
                 };
                 let meta_csp: Option<crate::rewrite::MetaCsp> = if needs.connect {
                     let (origin, nonce) = (origin.clone(), nonce.clone());

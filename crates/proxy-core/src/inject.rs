@@ -130,6 +130,9 @@ pub struct PageSpec<'a> {
     /// Per-document userscript bundle URLs (see [`crate::gm`]), one classic synchronous
     /// `<script src>` each, after the blocker's own scripts so the page sees them first.
     pub userscripts: &'a [String],
+    /// The in-page panel's hotkey (`[alt, ctrl, shift, meta, code]`), when the panel is on: the
+    /// boot script then registers a key listener that loads the panel on first use.
+    pub panel: Option<&'a serde_json::Value>,
 }
 
 /// The markup for one page, plus what it needs from the page's CSP.
@@ -205,12 +208,17 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
-        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() {
-            let cfg = serde_json::json!({
+        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() || spec.panel.is_some()
+        {
+            let mut cfg = serde_json::json!({
                 "p": proc_items,
                 "o": observer,
                 "t": spec.internal.token_for(spec.host),
             });
+            if let Some(k) = spec.panel {
+                cfg["k"] = k.clone();
+                cfg["pn"] = serde_json::Value::String(crate::internal::panel_path().to_string());
+            }
             let json = json_ascii(&cfg.to_string());
             let _ = write!(
                 head.html,
@@ -278,6 +286,7 @@ mod tests {
             observer_ok: true,
             ext_script: "",
             userscripts: &[],
+            panel: None,
         }
     }
 
