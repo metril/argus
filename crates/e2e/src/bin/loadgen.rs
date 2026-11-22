@@ -36,6 +36,9 @@ const HELP: &str = "loadgen: proxy latency load generator
                            trust it across runs
   --host-suffix S          hostname suffix (default test; use localhost for an external proxy
                            that resolves names itself)
+  --print-list             print the filter list the workload needs (required rules plus the
+                           generated or --lists content) and exit; load it into an external
+                           proxy as custom rules (use the same --host-suffix, --hosts, --mix)
   --no-pin                 do not pin runtimes to CPUs
   --json                   one JSON object on stdout instead of a table";
 
@@ -61,6 +64,7 @@ struct Args {
     suffix: Option<String>,
     pin: bool,
     json: bool,
+    print_list: bool,
 }
 
 fn parse() -> Result<Args, String> {
@@ -86,6 +90,7 @@ fn parse() -> Result<Args, String> {
         suffix: None,
         pin: true,
         json: false,
+        print_list: false,
     };
     let (mut open, mut conns, mut rate, mut inflight) = (false, 16usize, 2000u32, 512usize);
     let mut it = std::env::args().skip(1);
@@ -95,6 +100,7 @@ fn parse() -> Result<Args, String> {
         match k.as_str() {
             "--help" | "-h" => return Err(HELP.into()),
             "--json" => a.json = true,
+            "--print-list" => a.print_list = true,
             "--no-pin" => a.pin = false,
             "--proto" => {
                 a.protos = val()?
@@ -223,6 +229,11 @@ fn run(a: Args) -> i32 {
         suffix,
     };
 
+    if a.print_list {
+        print!("{}", list_text_of(&a, &workload));
+        return 0;
+    }
+
     // Origin (own runtime).
     let ca_files = a.origin_ca_dir.as_ref().map(|d| {
         (
@@ -247,16 +258,7 @@ fn run(a: Args) -> i32 {
     setup_origin(&origin);
 
     // Filter list.
-    let list_text = if a.lists.is_empty() {
-        generate_list(a.rules, 1, &workload)
-    } else {
-        let mut t = workload.required_rules();
-        for f in &a.lists {
-            t += &std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{f}: {e}"));
-            t.push('\n');
-        }
-        t
-    };
+    let list_text = list_text_of(&a, &workload);
 
     // Proxy (own runtime), or an external one.
     let want_proxy = a.paths.contains(&"proxy");
@@ -530,5 +532,19 @@ fn print_table(o: &Value) {
         for (k, v) in m {
             println!("p99 spread {k}: {}% {}", v["spread_pct"], v["p99_ms"]);
         }
+    }
+}
+
+/// The filter list for the run: generated, or the workload's required rules plus `--lists`.
+fn list_text_of(a: &Args, workload: &Workload) -> String {
+    if a.lists.is_empty() {
+        generate_list(a.rules, 1, workload)
+    } else {
+        let mut t = workload.required_rules();
+        for f in &a.lists {
+            t += &std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+            t.push('\n');
+        }
+        t
     }
 }
