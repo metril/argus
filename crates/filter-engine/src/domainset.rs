@@ -197,7 +197,8 @@ impl DomainSet {
     fn probe(&self, k: u64) -> Option<u16> {
         let cap = self.keys.len();
         let mut i = ((k as u128 * cap as u128) >> 64) as usize;
-        loop {
+        // Bounded by the capacity even if the table has no empty slot (corrupt input).
+        for _ in 0..cap {
             let s = self.keys[i];
             if s == k {
                 return Some(self.meta[i]);
@@ -210,6 +211,7 @@ impl DomainSet {
                 i = 0;
             }
         }
+        None
     }
 
     /// Look `host` up: its label suffixes from the shortest (two labels) to the whole host, then
@@ -319,18 +321,26 @@ impl DomainSet {
         if b.len() != end || entries > cap || (cap == 0) != (entries == 0) {
             return Err("domain set size mismatch".into());
         }
+        // The builder keeps the load at or below 0.6; anything denser (a table with no empty
+        // slot makes a miss probe the whole table) is corrupt.
+        if entries.checked_mul(4).is_none_or(|e| e > cap * 3) {
+            return Err("domain set load factor too high".into());
+        }
         let lists: Vec<String> = serde_json::from_slice(&b[40..keys_at])
             .map_err(|e| format!("domain set lists: {e}"))?;
-        let keys = b[keys_at..meta_at]
+        let keys: Vec<u64> = b[keys_at..meta_at]
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
             .collect();
+        if keys.iter().filter(|k| **k != 0).count() != entries {
+            return Err("domain set entry count mismatch".into());
+        }
         let meta = b[meta_at..end]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
             .collect();
         Ok(Self {
-            keys,
+            keys: keys.into(),
             meta,
             lists,
             entries,
@@ -496,6 +506,52 @@ pub fn is_set_host(h: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hand-made table: `keys` (0 = empty slot) with `entries` claimed.
+    fn raw_table(entries: u64, keys: &[u64]) -> Vec<u8> {
+        let lists = b"[\"a\"]";
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(0);
+        out.extend_from_slice(&[0; 7]);
+        out.extend_from_slice(&entries.to_le_bytes());
+        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(lists.len() as u64).to_le_bytes());
+        out.extend_from_slice(lists);
+        for k in keys {
+            out.extend_from_slice(&k.to_le_bytes());
+        }
+        out.extend(std::iter::repeat(0u8).take(keys.len() * 2));
+        out
+    }
+
+    #[test]
+    fn full_or_overloaded_tables_are_rejected_and_probe_terminates() {
+        // entries == cap: no empty slot, a miss would probe forever.
+        let full = raw_table(4, &[11, 22, 33, 44]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = DomainSet::from_bytes(&full);
+            // If a full table were accepted, a miss must still terminate.
+            if let Ok(s) = r {
+                let _ = s.lookup("miss.example.com", Scheme::Https);
+                tx.send(true).ok();
+            } else {
+                tx.send(false).ok();
+            }
+        });
+        let accepted = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("lookup on a full table must terminate");
+        assert!(!accepted, "a table with no empty slot must be rejected");
+        // Too dense (above the builder's load factor) is rejected too.
+        assert!(DomainSet::from_bytes(&raw_table(7, &[1, 2, 3, 4, 5, 6, 7, 0])).is_err());
+        // Claimed entry count must match the occupied slots.
+        assert!(DomainSet::from_bytes(&raw_table(1, &[0, 0, 0, 0, 0, 0, 0, 0])).is_err());
+        // A real table round-trips.
+        let s = build(&[("ads.example.com", 0)], &[]);
+        assert!(DomainSet::from_bytes(&s.to_bytes()).is_ok());
+    }
 
     fn build(rules: &[(&str, u16)], exact: &[(&str, Scheme)]) -> DomainSet {
         let mut b = DomainSetBuilder::new(vec!["a".into(), "b".into()]);

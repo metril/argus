@@ -134,6 +134,18 @@ pub(crate) fn save(
     Ok(())
 }
 
+fn read_len(b: &[u8]) -> Result<usize, String> {
+    let n = u64::from_le_bytes(b.try_into().map_err(|_| "short length")?);
+    usize::try_from(n).map_err(|_| "length out of range".to_string())
+}
+
+/// Split a `u64` length-prefixed chunk off the front of `b`: `(chunk, rest)`.
+fn split_chunk(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len = read_len(b.get(..8)?).ok()?;
+    let end = 8usize.checked_add(len)?;
+    Some((b.get(8..end)?, b.get(end..)?))
+}
+
 /// Load and verify the persisted engine. `Err` says why it was rejected (missing, wrong key,
 /// truncated, corrupt).
 pub(crate) fn load(path: &Path, key: &Key) -> Result<Persisted, String> {
@@ -145,34 +157,26 @@ pub(crate) fn load(path: &Path, key: &Key) -> Result<Persisted, String> {
     if &bytes[MAGIC.len()..MAGIC.len() + 32] != key {
         return Err("cache key mismatch".into());
     }
-    let len = u64::from_le_bytes(bytes[head - 8..head].try_into().unwrap()) as usize;
-    if bytes.len() != head + len + 32 {
+    let len = read_len(&bytes[head - 8..head])?;
+    // Every length read from the file is checked against what is actually there before slicing.
+    let total = head
+        .checked_add(len)
+        .and_then(|n| n.checked_add(32))
+        .ok_or("bad body length")?;
+    if bytes.len() != total {
         return Err("truncated or oversized".into());
     }
     let body = &bytes[head..head + len];
     if Sha256::digest(body).as_slice() != &bytes[head + len..] {
         return Err("checksum mismatch".into());
     }
-    if body.len() < 8 {
-        return Err("short body".into());
-    }
-    let blob_len = u64::from_le_bytes(body[..8].try_into().unwrap()) as usize;
-    if body.len() < 8 + blob_len {
-        return Err("short engine blob".into());
-    }
-    let rest = &body[8 + blob_len..];
-    if rest.len() < 8 {
-        return Err("short domain set".into());
-    }
-    let dom_len = u64::from_le_bytes(rest[..8].try_into().unwrap()) as usize;
-    if rest.len() < 8 + dom_len {
-        return Err("short domain set".into());
-    }
-    let domains = DomainSet::from_bytes(&rest[8..8 + dom_len])?;
+    let (blob, rest) = split_chunk(body).ok_or("short engine blob")?;
+    let (dom, side_bytes) = split_chunk(rest).ok_or("short domain set")?;
+    let domains = DomainSet::from_bytes(dom)?;
     let side: Sidecar =
-        serde_json::from_slice(&rest[8 + dom_len..]).map_err(|e| format!("sidecar: {e}"))?;
+        serde_json::from_slice(side_bytes).map_err(|e| format!("sidecar: {e}"))?;
     Ok(Persisted {
-        blob: body[8..8 + blob_len].to_vec(),
+        blob: blob.to_vec(),
         domains,
         ext: side.ext,
         ip: IpFilter::from_ranges(&side.ip_block, &side.ip_allow),
@@ -233,6 +237,103 @@ mod tests {
         assert!(load(&path, &key(1)).is_err());
         assert!(load(&dir.path().join("missing"), &key(1)).is_err());
         assert!(!dir.path().join("engine.bin.tmp").exists());
+    }
+
+    /// Re-seal `body` into a file image with a valid header and checksum.
+    fn seal(key: &Key, body: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(MAGIC);
+        f.extend_from_slice(key);
+        f.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        f.extend_from_slice(body);
+        f.extend_from_slice(&Sha256::digest(body));
+        f
+    }
+
+    /// Load `image` the way the service does, on a thread with a deadline.
+    fn load_with_deadline(path: std::path::PathBuf, image: Vec<u8>, key: Key) {
+        std::fs::write(&path, image).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(|| {
+                if let Ok(p) = load(&path, &key) {
+                    let _ = filter_engine::try_build_engine(&p.blob, &[]);
+                    let _ = p.domains.lookup("a.blocked.test", filter_engine::Scheme::Https);
+                }
+            });
+            let _ = tx.send(r.is_ok());
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("loading a corrupt engine file hung");
+        assert!(ok, "loading a corrupt engine file panicked");
+    }
+
+    #[test]
+    fn corrupt_engine_files_never_panic_or_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let list = filter_engine::ListInput {
+            id: "l".into(),
+            content: "||ads.example.com^\n||blocked.test^\n##.banner\n".into(),
+            format: ListFormat::Auto,
+            allowlist: false,
+            includes: Default::default(),
+        };
+        let built = filter_engine::build_set(&[list]);
+        let k = key(3);
+        save(
+            &path,
+            &k,
+            &built.blob,
+            &built.domains,
+            &[],
+            &IpFilter::default(),
+            &BuildSummary::default(),
+        )
+        .unwrap();
+        let good = std::fs::read(&path).unwrap();
+        let head = MAGIC.len() + 32 + 8;
+        let body = good[head..good.len() - 32].to_vec();
+        assert!(load(&path, &k).is_ok());
+
+        // Oversized length fields (`8 + len` would overflow).
+        let blob_len = u64::from_le_bytes(body[..8].try_into().unwrap()) as usize;
+        for huge in [u64::MAX, u64::MAX - 7, u64::MAX - 8, 1 << 63] {
+            let mut b = body.clone();
+            b[..8].copy_from_slice(&huge.to_le_bytes());
+            load_with_deadline(path.clone(), seal(&k, &b), k);
+            let mut b = body.clone();
+            let at = 8 + blob_len;
+            b[at..at + 8].copy_from_slice(&huge.to_le_bytes());
+            load_with_deadline(path.clone(), seal(&k, &b), k);
+        }
+        // Random mutations and truncations, checksum recomputed so the parser really runs.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..300 {
+            let mut b = body.clone();
+            match next() % 3 {
+                0 => {
+                    for _ in 0..1 + next() % 4 {
+                        let i = (next() as usize) % b.len();
+                        b[i] ^= 1 << (next() % 8);
+                    }
+                }
+                1 => b.truncate((next() as usize) % b.len()),
+                _ => {
+                    // Corrupt the length prefixes and the domain-set header area in particular.
+                    let i = (next() as usize) % 64.min(b.len());
+                    b[i] = next() as u8;
+                }
+            }
+            load_with_deadline(path.clone(), seal(&k, &b), k);
+        }
     }
 
     #[test]
