@@ -103,7 +103,8 @@ pub struct PolicyStore {
     /// Blocked-source reports, one aggregator per profile.
     reports: Mutex<HashMap<String, ReportAggregator>>,
     /// Called with the profile name after every committed change (rules, panel settings).
-    listeners: RwLock<Vec<Listener>>,
+    listeners: RwLock<Vec<(u64, Listener)>>,
+    next_listener: std::sync::atomic::AtomicU64,
 }
 
 impl PolicyStore {
@@ -119,6 +120,7 @@ impl PolicyStore {
             published: RwLock::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
             listeners: RwLock::new(Vec::new()),
+            next_listener: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -304,12 +306,32 @@ impl PolicyStore {
     }
 
     /// Register a callback run (on the writer's thread) after every committed change.
-    pub fn on_change(&self, f: impl Fn(&str) + Send + Sync + 'static) {
-        self.listeners.write().push(Arc::new(f));
+    /// Returns an id for [`Self::remove_listener`].
+    pub fn on_change(&self, f: impl Fn(&str) + Send + Sync + 'static) -> u64 {
+        let id = self
+            .next_listener
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.listeners.write().push((id, Arc::new(f)));
+        id
+    }
+
+    /// Unregister a callback (a deleted profile's control). Unknown ids are ignored.
+    pub fn remove_listener(&self, id: u64) {
+        self.listeners.write().retain(|(i, _)| *i != id);
+    }
+
+    /// Number of registered callbacks (tests).
+    pub fn listener_count(&self) -> usize {
+        self.listeners.read().len()
     }
 
     fn notify(&self, profile: &str) {
-        let ls: Vec<_> = self.listeners.read().clone();
+        let ls: Vec<_> = self
+            .listeners
+            .read()
+            .iter()
+            .map(|(_, l)| l.clone())
+            .collect();
         for l in ls {
             l(profile);
         }

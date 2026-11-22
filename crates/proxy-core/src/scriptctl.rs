@@ -95,6 +95,8 @@ pub struct ScriptControl {
     panel: ArcSwap<PanelSettings>,
     docs: moka::sync::Cache<DocKey, Arc<DocEntry>>,
     wake: Arc<tokio::sync::Notify>,
+    /// The store listener, removed by [`Self::stop`] and on drop.
+    listener: std::sync::atomic::AtomicU64,
     /// The expiry task, aborted by [`Self::stop`] and on drop.
     expiry: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
     /// Number of `decide` calls made (tests and benches assert the disabled path makes none).
@@ -119,6 +121,7 @@ impl ScriptControl {
             docs: moka::sync::Cache::builder().max_capacity(4096).build(),
             wake: Arc::new(tokio::sync::Notify::new()),
             expiry: parking_lot::Mutex::new(None),
+            listener: AtomicU64::new(0),
             decides: AtomicU64::new(0),
             blocked: moka::sync::Cache::builder()
                 .max_capacity(2048)
@@ -127,13 +130,14 @@ impl ScriptControl {
         });
         let weak: Weak<ScriptControl> = Arc::downgrade(&this);
         let name = profile.to_string();
-        store.on_change(move |p| {
+        let lid = store.on_change(move |p| {
             if p == name {
                 if let Some(s) = weak.upgrade() {
                     s.refresh();
                 }
             }
         });
+        this.listener.store(lid, Ordering::Release);
         this
     }
 
@@ -193,8 +197,12 @@ impl ScriptControl {
         }
     }
 
-    /// End the expiry task (the profile is gone). Safe to call more than once.
+    /// End the expiry task and unregister the store listener (the profile is gone). Safe to call more than once.
     pub fn stop(&self) {
+        let lid = self.listener.swap(0, Ordering::AcqRel);
+        if lid != 0 {
+            self.store.remove_listener(lid);
+        }
         if let Some(h) = self.expiry.lock().as_ref() {
             h.abort();
         }
