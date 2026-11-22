@@ -16,6 +16,7 @@ use validator::Validate;
 
 use super::{check_if_match, etag_of};
 use crate::auth::authz::Principal;
+use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::state::{blocking, AppState};
 
@@ -266,49 +267,84 @@ fn site_exception_error(site: &str) -> ApiError {
 #[utoipa::path(
     get, path = "/rules/site-exceptions", tag = "rules",
     security(("bearer_auth" = ["rules:read"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse))
 )]
 pub async fn list_site_exceptions(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
 ) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
-    let rules = state.filter_store.get_custom_rules()?;
+    let st = state.clone();
+    let rules = blocking(move || profile_rules(&st, profile.id)).await?;
     Ok(Json(api_types::SiteExceptionsResponse {
         sites: list_service::site_exceptions::list(&rules),
     }))
 }
 
+/// The rules text exceptions live in: the global custom rules for the default profile, the
+/// profile's overlay rules otherwise.
+fn profile_rules(st: &AppState, id: u64) -> ApiResult<String> {
+    if id == 0 {
+        return Ok(st.filter_store.get_custom_rules()?);
+    }
+    let rec = st
+        .profiles
+        .get(id)?
+        .ok_or_else(|| ApiError::NotFound("Profile not found".into()))?;
+    Ok(rec.rules)
+}
+
 async fn set_site_exception(
     state: Arc<AppState>,
     p: Principal,
+    profile: ProfileParam,
     site: String,
     disabled: bool,
 ) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
     let st = state.clone();
     let s = site.clone();
+    let id = profile.id;
     blocking(move || {
-        let rules = st.filter_store.get_custom_rules()?;
-        let new = list_service::site_exceptions::set(&rules, &s, disabled)
+        if id == 0 {
+            let rules = st.filter_store.get_custom_rules()?;
+            let new = list_service::site_exceptions::set(&rules, &s, disabled)
+                .ok_or_else(|| site_exception_error(&s))?;
+            if new != rules {
+                st.filter_store.set_custom_rules(&new)?;
+            }
+            return Ok(());
+        }
+        let mut rec = st
+            .profiles
+            .get(id)?
+            .ok_or_else(|| ApiError::NotFound("Profile not found".into()))?;
+        let new = list_service::site_exceptions::set(&rec.rules, &s, disabled)
             .ok_or_else(|| site_exception_error(&s))?;
-        if new != rules {
-            st.filter_store.set_custom_rules(&new)?;
+        if new != rec.rules {
+            rec.rules = new;
+            rec.updated_at = chrono::Utc::now();
+            st.profiles.put(rec)?;
         }
         Ok(())
     })
     .await?;
     info!(
-        "Ad blocking {} for {site} by {}",
+        "Ad blocking {} for {site} in profile {} by {}",
         if disabled { "disabled" } else { "enabled" },
+        profile.id,
         p.username
     );
-    state.list_service.trigger();
-    list_site_exceptions(State(state)).await
+    if id == 0 {
+        state.list_service.trigger();
+    }
+    list_site_exceptions(State(state), profile).await
 }
 
 /// Switch ad blocking off for a site (document exception in the custom rules).
 #[utoipa::path(
     put, path = "/rules/site-exceptions/{site}", tag = "rules",
     security(("bearer_auth" = ["rules:write"])),
-    params(("site" = String, Path, description = "Host name, lowercase punycode")),
+    params(ProfileQuery, ("site" = String, Path, description = "Host name, lowercase punycode")),
     responses(
         (status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse),
         (status = 400, description = "Not a plain host name"),
@@ -317,16 +353,17 @@ async fn set_site_exception(
 pub async fn put_site_exception(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
+    profile: ProfileParam,
     crate::error::ApiPath(site): crate::error::ApiPath<String>,
 ) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
-    set_site_exception(state, p, site, true).await
+    set_site_exception(state, p, profile, site, true).await
 }
 
 /// Switch ad blocking back on for a site.
 #[utoipa::path(
     delete, path = "/rules/site-exceptions/{site}", tag = "rules",
     security(("bearer_auth" = ["rules:write"])),
-    params(("site" = String, Path, description = "Host name, lowercase punycode")),
+    params(ProfileQuery, ("site" = String, Path, description = "Host name, lowercase punycode")),
     responses(
         (status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse),
         (status = 400, description = "Not a plain host name"),
@@ -335,7 +372,8 @@ pub async fn put_site_exception(
 pub async fn delete_site_exception(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
+    profile: ProfileParam,
     crate::error::ApiPath(site): crate::error::ApiPath<String>,
 ) -> ApiResult<Json<api_types::SiteExceptionsResponse>> {
-    set_site_exception(state, p, site, false).await
+    set_site_exception(state, p, profile, site, false).await
 }

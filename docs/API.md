@@ -52,10 +52,10 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts; view and clear their stored values. |
 | `policy:read` | yes | yes | yes | View script policy rules, explanations, temporary permissions and blocked-source reports. |
 | `policy:write` | - | yes | yes | Change script policy settings, rules and temporary permissions; import policy. |
-| `profiles:read` | yes | yes | yes | Read filtering profiles (reserved). |
-| `profiles:write` | - | - | yes | Change filtering profiles (reserved). |
-| `devices:read` | yes | yes | yes | Read devices (reserved). |
-| `devices:write` | - | - | yes | Change devices (reserved). |
+| `profiles:read` | yes | yes | yes | List and view filtering profiles (lists and overlay rules) the token may access. |
+| `profiles:write` | - | - | yes | Create, edit and delete filtering profiles. |
+| `devices:read` | yes | yes | yes | List and view devices (profile, addresses, token state; never the token). |
+| `devices:write` | - | - | yes | Create, edit and delete devices; issue and revoke device tokens. |
 | `users:read` | - | - | yes | List and view user accounts. |
 | `users:admin` | - | - | yes | Create, update, disable and delete user accounts. |
 | `tokens:self` | - | yes | yes | Create, list and revoke your own API tokens. |

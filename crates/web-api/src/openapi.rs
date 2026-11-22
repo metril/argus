@@ -34,6 +34,8 @@ use crate::auth::authz::RouteTable;
         (name = "ca", description = "CA certificate"),
         (name = "userscripts", description = "Userscripts"),
         (name = "policy", description = "Script policy (NoScript-style per-site capabilities)"),
+        (name = "profiles", description = "Per-device filtering profiles"),
+        (name = "devices", description = "Devices and their tokens"),
         (name = "audit", description = "Audit log"),
         (name = "system", description = "Health, status, metrics, this document"),
     )

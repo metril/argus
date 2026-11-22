@@ -55,6 +55,7 @@ cookie = { version = "0.18", features = ["percent-encode"] }
 parking_lot = { workspace = true }
 base64 = "0.22"
 url = "2.5"
+ipnet = "2.9"
 
 # Common utilities
 common = { path = "../common" }

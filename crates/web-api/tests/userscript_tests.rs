@@ -208,6 +208,7 @@ async fn widening_update_stays_pending_until_approved() {
     // Even with apply=true a widening update is parked.
     let out = web_api::userscript_ops::stage_update(
         &ctx.state.userscript_manager,
+        userscript_engine::DEFAULT_PROFILE,
         &script,
         up,
         install::Fetched::default(),
@@ -264,6 +265,7 @@ async fn non_widening_update_applies_and_pending_can_be_discarded() {
     assert!(!up.diff.needs_reapproval());
     let out = web_api::userscript_ops::stage_update(
         mgr,
+        userscript_engine::DEFAULT_PROFILE,
         &script,
         up,
         install::Fetched::default(),
@@ -284,6 +286,7 @@ async fn non_widening_update_applies_and_pending_can_be_discarded() {
     let up = install::plan_update(&s, &src("1.2", ""), None).unwrap();
     web_api::userscript_ops::stage_update(
         mgr,
+        userscript_engine::DEFAULT_PROFILE,
         &s,
         up,
         install::Fetched::default(),

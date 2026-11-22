@@ -1,7 +1,6 @@
 //! Control-plane userscript logic shared by the handlers and the scheduled update check:
 //! guarded fetching, the pending-plan store and the update flow.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +12,7 @@ use userscript_engine::install::{
     self, Approvals, Fetched, InstallPlan, MAX_ASSET_BYTES, MAX_REQUIRES, MAX_RESOURCES,
 };
 use userscript_engine::script::ScriptAssets;
-use userscript_engine::{PendingUpdate, Userscript, DEFAULT_PROFILE};
+use userscript_engine::{PendingUpdate, Userscript};
 
 use crate::error::{ApiError, ApiResult};
 use crate::handlers::lists::FETCH_DESTINATION_CODE;
@@ -33,6 +32,8 @@ pub struct StoredPlan {
     pub fetched: Fetched,
     /// Fingerprint of the installed script this plan updates (None for a new install).
     pub base: Option<String>,
+    /// Profile the plan was made for; confirming under another profile is refused.
+    pub profile: String,
 }
 
 /// Identifies the installed script's source and assets, so a stale plan is refused.
@@ -268,6 +269,7 @@ pub async fn build_plan(
         plan,
         fetched,
         base: None,
+        profile: String::new(),
     })
 }
 
@@ -307,10 +309,15 @@ pub enum CheckOutcome {
 
 /// Check one script for an update and apply it (only when `apply` and it does not widen
 /// `@match`/`@connect`/`@grant`) or park it as the script's pending update.
-pub async fn check_update(state: &AppState, id: &str, apply: bool) -> ApiResult<CheckOutcome> {
+pub async fn check_update(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+    apply: bool,
+) -> ApiResult<CheckOutcome> {
     let mgr = &state.userscript_manager;
     let script = mgr
-        .get(id)
+        .get_in(profile, id)
         .ok_or_else(|| ApiError::NotFound(format!("Userscript '{id}' not found")))?;
     let check_url = install::update_check_url(&script.metadata).ok_or_else(|| {
         ApiError::bad_request("Script has no @version with an @updateURL/@downloadURL")
@@ -320,7 +327,7 @@ pub async fn check_update(state: &AppState, id: &str, apply: bool) -> ApiResult<
     let mut origin = check_url.clone();
     let mut up = install::plan_update(&script, &text, Some(&check_url)).map_err(invalid)?;
     if !up.is_newer {
-        let _ = mgr.modify_script(DEFAULT_PROFILE, id, |s| s.last_update_check = Some(now));
+        let _ = mgr.modify_script(profile, id, |s| s.last_update_check = Some(now));
         return Ok(CheckOutcome::UpToDate);
     }
     // The check URL may serve metadata only: download the full script from its own URL.
@@ -334,6 +341,7 @@ pub async fn check_update(state: &AppState, id: &str, apply: bool) -> ApiResult<
     let fetched = fetch_assets(state, &up.plan).await?;
     stage_update(
         &state.userscript_manager,
+        profile,
         &script,
         up,
         fetched,
@@ -347,6 +355,7 @@ pub async fn check_update(state: &AppState, id: &str, apply: bool) -> ApiResult<
 /// `@grant`) or park it as the script's pending update.
 pub fn stage_update(
     mgr: &userscript_engine::UserscriptManager,
+    profile: &str,
     script: &Userscript,
     up: install::UpdatePlan,
     fetched: Fetched,
@@ -365,7 +374,7 @@ pub fn stage_update(
     let mut cand = install::finish_update(script, up, fetched, true, false).map_err(invalid)?;
     cand.last_update_check = Some(now);
     if apply && !needs {
-        mgr.replace_script(DEFAULT_PROFILE, cand)?;
+        mgr.replace_script(profile, cand)?;
         return Ok(CheckOutcome::Updated);
     }
     let pending = PendingUpdate {
@@ -377,7 +386,7 @@ pub fn stage_update(
         origin_url: Some(origin.to_string()),
     };
     let p2 = pending.clone();
-    mgr.modify_script(DEFAULT_PROFILE, id, |s| {
+    mgr.modify_script(profile, id, |s| {
         s.pending_update = Some(p2);
         s.last_update_check = Some(now);
     })?;
@@ -385,10 +394,15 @@ pub fn stage_update(
 }
 
 /// Apply a script's pending update.
-pub fn approve_pending(state: &AppState, id: &str, allow_connect_all: bool) -> ApiResult<()> {
+pub fn approve_pending(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+    allow_connect_all: bool,
+) -> ApiResult<()> {
     let mgr = &state.userscript_manager;
     let script = mgr
-        .get(id)
+        .get_in(profile, id)
         .ok_or_else(|| ApiError::NotFound(format!("Userscript '{id}' not found")))?;
     let pending = script
         .pending_update
@@ -413,7 +427,7 @@ pub fn approve_pending(state: &AppState, id: &str, allow_connect_all: bool) -> A
     )
     .map_err(invalid)?;
     new.last_update_check = script.last_update_check;
-    mgr.replace_script(DEFAULT_PROFILE, new)?;
+    mgr.replace_script(profile, new)?;
     Ok(())
 }
 
@@ -454,36 +468,40 @@ pub fn build_from_bundle(
     .map_err(invalid)
 }
 
-/// Check every script that has an update URL (scheduled run). Failures are logged.
+/// Check every script of every profile that has an update URL (scheduled run). Failures are
+/// logged.
 pub async fn check_all(state: &AppState, auto_apply: bool) {
-    let ids: Vec<String> = state
-        .userscript_manager
-        .get_all_in(DEFAULT_PROFILE)
-        .into_iter()
-        .filter(|s| install::update_check_url(&s.metadata).is_some())
-        .map(|s| s.id)
-        .collect();
-    let mut by_id: HashMap<String, &'static str> = HashMap::new();
-    for id in ids {
-        let r = match check_update(state, &id, auto_apply).await {
-            Ok(CheckOutcome::UpToDate) => "up_to_date",
-            Ok(CheckOutcome::Updated) => {
-                tracing::info!("Userscript {id} updated automatically");
-                "updated"
+    let profiles: Vec<String> = match state.profiles.list() {
+        Ok(v) => v.into_iter().map(|p| p.name).collect(),
+        Err(e) => {
+            tracing::warn!("Scheduled userscript update check: cannot list profiles: {e}");
+            return;
+        }
+    };
+    let mut total = 0usize;
+    for profile in profiles {
+        let ids: Vec<String> = state
+            .userscript_manager
+            .get_all_in(&profile)
+            .into_iter()
+            .filter(|s| install::update_check_url(&s.metadata).is_some())
+            .map(|s| s.id)
+            .collect();
+        for id in ids {
+            total += 1;
+            match check_update(state, &profile, &id, auto_apply).await {
+                Ok(CheckOutcome::UpToDate) => {}
+                Ok(CheckOutcome::Updated) => {
+                    tracing::info!("Userscript {id} ({profile}) updated automatically");
+                }
+                Ok(CheckOutcome::Pending(_)) => {
+                    tracing::info!("Userscript {id} ({profile}) has an update awaiting approval");
+                }
+                Err(e) => {
+                    tracing::warn!("Update check for userscript {id} ({profile}) failed: {e}");
+                }
             }
-            Ok(CheckOutcome::Pending(_)) => {
-                tracing::info!("Userscript {id} has an update awaiting approval");
-                "pending"
-            }
-            Err(e) => {
-                tracing::warn!("Update check for userscript {id} failed: {e}");
-                "failed"
-            }
-        };
-        by_id.insert(id, r);
+        }
     }
-    tracing::debug!(
-        "Scheduled userscript update check done: {} scripts",
-        by_id.len()
-    );
+    tracing::debug!("Scheduled userscript update check done: {total} scripts");
 }

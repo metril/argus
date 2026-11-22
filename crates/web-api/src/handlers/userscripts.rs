@@ -19,10 +19,10 @@ use tracing::info;
 use url::Url;
 use userscript_engine::install::{self, Approvals};
 use userscript_engine::storage::ns;
-use userscript_engine::DEFAULT_PROFILE;
 use utoipa::IntoParams;
 
 use crate::auth::authz::Principal;
+use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::AppState;
 use crate::userscript_ops::{self as ops, CheckOutcome, StoredPlan};
@@ -43,11 +43,11 @@ fn diff_dto(d: &install::UpdateDiff) -> UpdateDiffDto {
     }
 }
 
-fn storage_bytes_of(state: &AppState, id: &str) -> u64 {
+fn storage_bytes_of(state: &AppState, profile: &str, id: &str) -> u64 {
     state
         .userscript_manager
         .storage()
-        .list_sizes(&ns(DEFAULT_PROFILE, id))
+        .list_sizes(&ns(profile, id))
         .map(|v| v.iter().map(|(_, n)| *n as u64).sum())
         .unwrap_or(0)
 }
@@ -93,17 +93,21 @@ fn userscript_response(
 }
 
 fn respond(state: &AppState, script: &userscript_engine::Userscript) -> UserscriptResponse {
-    userscript_response(script, storage_bytes_of(state, &script.id))
+    userscript_response(script, storage_bytes_of(state, &script.profile, &script.id))
 }
 
 fn not_found(id: &str) -> ApiError {
     ApiError::NotFound(format!("Userscript '{id}' not found"))
 }
 
-fn get_script(state: &AppState, id: &str) -> ApiResult<userscript_engine::Userscript> {
+fn get_script(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+) -> ApiResult<userscript_engine::Userscript> {
     state
         .userscript_manager
-        .get(id)
+        .get_in(profile, id)
         .ok_or_else(|| not_found(id))
 }
 
@@ -129,21 +133,22 @@ pub struct ListUserscriptsQuery {
 #[utoipa::path(
     get, path = "/userscripts", tag = "userscripts",
     security(("bearer_auth" = ["scripts:read"])),
-    params(ListUserscriptsQuery),
+    params(ProfileQuery, ListUserscriptsQuery),
     responses((status = 200, description = "Userscripts", body = Page<UserscriptResponse>))
 )]
 pub async fn list_userscripts(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiQuery(q): ApiQuery<ListUserscriptsQuery>,
 ) -> ApiResult<Json<Page<UserscriptResponse>>> {
     let usage = state
         .userscript_manager
         .storage()
-        .profile_usage(DEFAULT_PROFILE)
+        .profile_usage(&profile.name)
         .unwrap_or_default();
     let all = state
         .userscript_manager
-        .get_all()
+        .get_all_in(&profile.name)
         .iter()
         .map(|s| {
             let used = usage.get(&ns(&s.profile, &s.id)).copied().unwrap_or(0);
@@ -158,11 +163,13 @@ pub async fn list_userscripts(
 #[utoipa::path(
     post, path = "/userscripts", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
+    params(ProfileQuery),
     request_body = InstallUserscriptRequest,
     responses((status = 201, description = "Installed", body = UserscriptResponse))
 )]
 pub async fn install_userscript(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiJson(req): ApiJson<InstallUserscriptRequest>,
 ) -> ApiResult<(StatusCode, Json<UserscriptResponse>)> {
@@ -173,9 +180,9 @@ pub async fn install_userscript(
         .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
     let id = state
         .userscript_manager
-        .install_script(DEFAULT_PROFILE, script)
+        .install_script(&profile.name, script)
         .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
-    let script = get_script(&state, &id)?;
+    let script = get_script(&state, &profile.name, &id)?;
     info!("Userscript {} installed by {}", id, p.username);
     Ok((StatusCode::CREATED, Json(respond(&state, &script))))
 }
@@ -184,15 +191,20 @@ pub async fn install_userscript(
 #[utoipa::path(
     get, path = "/userscripts/stats", tag = "userscripts",
     security(("bearer_auth" = ["scripts:read"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Statistics", body = UserscriptStatsResponse))
 )]
-pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<UserscriptStatsResponse> {
-    let s = state.userscript_manager.stats();
+pub async fn get_stats(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+) -> Json<UserscriptStatsResponse> {
+    let all = state.userscript_manager.get_all_in(&profile.name);
+    let enabled = all.iter().filter(|s| s.enabled).count();
     Json(UserscriptStatsResponse {
-        total_scripts: s.total_scripts,
-        enabled_scripts: s.enabled_scripts,
-        disabled_scripts: s.disabled_scripts,
-        total_executions: s.total_executions,
+        total_scripts: all.len(),
+        enabled_scripts: enabled,
+        disabled_scripts: all.len() - enabled,
+        total_executions: all.iter().map(|s| s.execution_count).sum(),
     })
 }
 
@@ -200,28 +212,30 @@ pub async fn get_stats(State(state): State<Arc<AppState>>) -> Json<UserscriptSta
 #[utoipa::path(
     get, path = "/userscripts/{id}", tag = "userscripts",
     security(("bearer_auth" = ["scripts:read"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Userscript", body = UserscriptResponse))
 )]
 pub async fn get_userscript(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    Ok(Json(respond(&state, &get_script(&state, &id)?)))
+    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
 }
 
 /// Get a userscript's source.
 #[utoipa::path(
     get, path = "/userscripts/{id}/source", tag = "userscripts",
     security(("bearer_auth" = ["scripts:read"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Source", body = UserscriptSourceResponse))
 )]
 pub async fn get_userscript_source(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<UserscriptSourceResponse>> {
-    let s = get_script(&state, &id)?;
+    let s = get_script(&state, &profile.name, &id)?;
     Ok(Json(UserscriptSourceResponse {
         id: s.id,
         source: s.source,
@@ -232,17 +246,18 @@ pub async fn get_userscript_source(
 #[utoipa::path(
     delete, path = "/userscripts/{id}", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Uninstalled", body = MessageResponse))
 )]
 pub async fn uninstall_userscript(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
     state
         .userscript_manager
-        .uninstall(&id)
+        .uninstall_in(&profile.name, &id)
         .map_err(|e| match e {
             userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
             _ => ApiError::Internal(format!("Failed to uninstall: {e}")),
@@ -257,25 +272,26 @@ pub async fn uninstall_userscript(
 #[utoipa::path(
     put, path = "/userscripts/{id}/enabled", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     request_body = SetEnabledRequest,
     responses((status = 200, description = "Updated", body = UserscriptResponse))
 )]
 pub async fn set_enabled(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<SetEnabledRequest>,
 ) -> ApiResult<Json<UserscriptResponse>> {
     state
         .userscript_manager
-        .set_enabled(&id, req.enabled)
+        .set_enabled_in(&profile.name, &id, req.enabled)
         .map_err(|e| match e {
             userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
             _ => ApiError::Internal(format!("Failed to update: {e}")),
         })?;
     info!("Userscript {id} enabled={} by {}", req.enabled, p.username);
-    Ok(Json(respond(&state, &get_script(&state, &id)?)))
+    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
 }
 
 // ------------------------------------------------------------------ two-step install
@@ -349,11 +365,13 @@ fn plan_response(state: &AppState, plan_id: String, sp: &StoredPlan) -> Userscri
 #[utoipa::path(
     post, path = "/userscripts/plan", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
+    params(ProfileQuery),
     request_body = PlanUserscriptRequest,
     responses((status = 200, description = "Plan", body = UserscriptPlanResponse))
 )]
 pub async fn plan_userscript(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiJson(req): ApiJson<PlanUserscriptRequest>,
 ) -> ApiResult<Json<UserscriptPlanResponse>> {
@@ -375,9 +393,10 @@ pub async fn plan_userscript(
         }
     };
     let mut sp = ops::build_plan(&state, source, origin.as_ref()).await?;
+    sp.profile = profile.name.clone();
     sp.base = state
         .userscript_manager
-        .get(&sp.plan.metadata.unique_id())
+        .get_in(&profile.name, &sp.plan.metadata.unique_id())
         .map(|e| ops::source_fingerprint(&e));
     let name = sp.plan.metadata.name.clone();
     let resp_plan = plan_response(&state, String::new(), &sp);
@@ -393,7 +412,7 @@ pub async fn plan_userscript(
 #[utoipa::path(
     post, path = "/userscripts/plan/{plan_id}/confirm", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("plan_id" = String, Path, description = "Plan id")),
+    params(ProfileQuery, ("plan_id" = String, Path, description = "Plan id")),
     request_body = ConfirmPlanRequest,
     responses(
         (status = 201, description = "Installed", body = UserscriptResponse),
@@ -404,11 +423,16 @@ pub async fn plan_userscript(
 )]
 pub async fn confirm_plan(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(plan_id): ApiPath<String>,
     ApiJson(req): ApiJson<ConfirmPlanRequest>,
 ) -> ApiResult<(StatusCode, Json<UserscriptResponse>)> {
-    let sp = state.userscript_plans.get(&plan_id).ok_or_else(|| {
+    let sp = state
+        .userscript_plans
+        .get(&plan_id)
+        .filter(|sp| sp.profile == profile.name)
+        .ok_or_else(|| {
         ApiError::coded(
             StatusCode::NOT_FOUND,
             "plan_not_found",
@@ -421,7 +445,7 @@ pub async fn confirm_plan(
         ));
     }
     let id = sp.plan.metadata.unique_id();
-    if let Some(existing) = state.userscript_manager.get(&id) {
+    if let Some(existing) = state.userscript_manager.get_in(&profile.name, &id) {
         // Updating: confirming is the approval of the diff the plan showed, provided the
         // installed script is still the one that diff was computed against.
         if sp.base.as_deref() != Some(ops::source_fingerprint(&existing).as_str()) {
@@ -445,14 +469,14 @@ pub async fn confirm_plan(
         new.pending_update = None;
         state
             .userscript_manager
-            .replace_script(DEFAULT_PROFILE, new)
+            .replace_script(&profile.name, new)
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         state.userscript_plans.remove(&plan_id);
         info!(
             "Userscript {id} updated from plan by {} (connect_all={})",
             p.username, req.allow_connect_all
         );
-        let script = get_script(&state, &id)?;
+        let script = get_script(&state, &profile.name, &id)?;
         return Ok((StatusCode::OK, Json(respond(&state, &script))));
     }
     let mut script = install::finish_install(
@@ -466,14 +490,14 @@ pub async fn confirm_plan(
     script.enabled = req.enable;
     state
         .userscript_manager
-        .install_script(DEFAULT_PROFILE, script)
+        .install_script(&profile.name, script)
         .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
     state.userscript_plans.remove(&plan_id);
     info!(
         "Userscript {id} installed from plan by {} (connect_all={})",
         p.username, req.allow_connect_all
     );
-    let script = get_script(&state, &id)?;
+    let script = get_script(&state, &profile.name, &id)?;
     Ok((StatusCode::CREATED, Json(respond(&state, &script))))
 }
 
@@ -486,19 +510,20 @@ pub async fn confirm_plan(
 #[utoipa::path(
     post, path = "/userscripts/{id}/check-update", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     request_body = CheckUpdateRequest,
     responses((status = 200, description = "Result", body = CheckUpdateResponse))
 )]
 pub async fn check_update(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<CheckUpdateRequest>,
 ) -> ApiResult<Json<CheckUpdateResponse>> {
-    let before = get_script(&state, &id)?;
-    let outcome = ops::check_update(&state, &id, req.apply).await?;
-    let script = get_script(&state, &id)?;
+    let before = get_script(&state, &profile.name, &id)?;
+    let outcome = ops::check_update(&state, &profile.name, &id, req.apply).await?;
+    let script = get_script(&state, &profile.name, &id)?;
     let (status, new_version, diff) = match &outcome {
         CheckOutcome::UpToDate => ("up_to_date", None, None),
         CheckOutcome::Updated => ("updated", script.metadata.version.clone(), None),
@@ -522,40 +547,42 @@ pub async fn check_update(
 #[utoipa::path(
     post, path = "/userscripts/{id}/update/approve", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     request_body = ApproveUpdateRequest,
     responses((status = 200, description = "Updated", body = UserscriptResponse))
 )]
 pub async fn approve_update(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<ApproveUpdateRequest>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    ops::approve_pending(&state, &id, req.allow_connect_all)?;
+    ops::approve_pending(&state, &profile.name, &id, req.allow_connect_all)?;
     info!("Userscript {id} update approved by {}", p.username);
-    Ok(Json(respond(&state, &get_script(&state, &id)?)))
+    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
 }
 
 /// Discard a script's pending update.
 #[utoipa::path(
     delete, path = "/userscripts/{id}/update", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Discarded", body = UserscriptResponse))
 )]
 pub async fn discard_update(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    get_script(&state, &id)?;
+    get_script(&state, &profile.name, &id)?;
     state
         .userscript_manager
-        .modify_script(DEFAULT_PROFILE, &id, |s| s.pending_update = None)
+        .modify_script(&profile.name, &id, |s| s.pending_update = None)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     info!("Userscript {id} pending update discarded by {}", p.username);
-    Ok(Json(respond(&state, &get_script(&state, &id)?)))
+    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
 }
 
 // ------------------------------------------------------------------ storage
@@ -564,15 +591,16 @@ pub async fn discard_update(
 #[utoipa::path(
     get, path = "/userscripts/{id}/storage", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Values", body = UserscriptStorageResponse))
 )]
 pub async fn get_storage(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<UserscriptStorageResponse>> {
-    get_script(&state, &id)?;
-    let space = ns(DEFAULT_PROFILE, &id);
+    get_script(&state, &profile.name, &id)?;
+    let space = ns(&profile.name, &id);
     let storage = state.userscript_manager.storage();
     let mut sizes = storage
         .list_sizes(&space)
@@ -607,18 +635,19 @@ pub async fn get_storage(
 #[utoipa::path(
     delete, path = "/userscripts/{id}/storage", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Cleared", body = MessageResponse))
 )]
 pub async fn clear_storage(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
-    get_script(&state, &id)?;
+    get_script(&state, &profile.name, &id)?;
     state
         .userscript_manager
-        .clear_values(DEFAULT_PROFILE, &id)
+        .clear_values(&profile.name, &id)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     info!("Userscript {id} storage cleared by {}", p.username);
     Ok(Json(MessageResponse {
@@ -630,7 +659,7 @@ pub async fn clear_storage(
 #[utoipa::path(
     delete, path = "/userscripts/{id}/storage/{name}", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(
+    params(ProfileQuery, 
         ("id" = String, Path, description = "Userscript id"),
         ("name" = String, Path, description = "Value name")
     ),
@@ -638,11 +667,12 @@ pub async fn clear_storage(
 )]
 pub async fn delete_storage_value(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiPath((id, name)): ApiPath<(String, String)>,
 ) -> ApiResult<Json<MessageResponse>> {
-    get_script(&state, &id)?;
-    let space = ns(DEFAULT_PROFILE, &id);
+    get_script(&state, &profile.name, &id)?;
+    let space = ns(&profile.name, &id);
     let storage = state.userscript_manager.storage();
     let exists = storage
         .get_raw(&space, &name)
@@ -658,7 +688,7 @@ pub async fn delete_storage_value(
     state
         .userscript_manager
         .gm()
-        .forget_script(DEFAULT_PROFILE, &id);
+        .forget_script(&profile.name, &id);
     info!("Userscript {id} value '{name}' deleted by {}", p.username);
     Ok(Json(MessageResponse {
         message: format!("Value '{name}' deleted"),
@@ -681,11 +711,12 @@ pub struct ExportQuery {
 #[utoipa::path(
     get, path = "/userscripts/export", tag = "userscripts",
     security(("bearer_auth" = ["scripts:read"])),
-    params(ExportQuery),
+    params(ProfileQuery, ExportQuery),
     responses((status = 200, description = "Bundle", body = UserscriptBundle))
 )]
 pub async fn export_userscripts(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiQuery(q): ApiQuery<ExportQuery>,
 ) -> ApiResult<Json<UserscriptBundle>> {
@@ -697,9 +728,9 @@ pub async fn export_userscripts(
     }
     let storage = state.userscript_manager.storage();
     let mut scripts = Vec::new();
-    for s in state.userscript_manager.get_all_in(DEFAULT_PROFILE) {
+    for s in state.userscript_manager.get_all_in(&profile.name) {
         let values = if with_values {
-            let space = ns(DEFAULT_PROFILE, &s.id);
+            let space = ns(&profile.name, &s.id);
             let mut m = BTreeMap::new();
             for (name, _) in storage
                 .list_sizes(&space)
@@ -762,11 +793,13 @@ pub async fn export_userscripts(
 #[utoipa::path(
     post, path = "/userscripts/import", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
+    params(ProfileQuery),
     request_body = UserscriptBundle,
     responses((status = 200, description = "Per-script results", body = ImportUserscriptsResponse))
 )]
 pub async fn import_userscripts(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     Extension(p): Extension<Principal>,
     ApiJson(bundle): ApiJson<UserscriptBundle>,
 ) -> ApiResult<Json<ImportUserscriptsResponse>> {
@@ -846,23 +879,23 @@ pub async fn import_userscripts(
             script.installed_at = old.installed_at;
             script.execution_count = old.execution_count;
             script.last_executed = old.last_executed;
-            mgr.replace_script(DEFAULT_PROFILE, script)
+            mgr.replace_script(&profile.name, script)
                 .map(|_| "replaced")
         } else {
-            mgr.install_script(DEFAULT_PROFILE, script)
+            mgr.install_script(&profile.name, script)
                 .map(|_| "installed")
         };
         match status {
             Ok(st) => {
                 if let Some(values) = entry.values {
-                    let _ = mgr.clear_values(DEFAULT_PROFILE, &id);
-                    let space = ns(DEFAULT_PROFILE, &id);
+                    let _ = mgr.clear_values(&profile.name, &id);
+                    let space = ns(&profile.name, &id);
                     for (n, v) in values {
                         if let Err(e) = mgr.storage().set_raw(&space, &n, v) {
                             tracing::warn!("import value {id}/{n}: {e}");
                         }
                     }
-                    mgr.gm().forget_script(DEFAULT_PROFILE, &id);
+                    mgr.gm().forget_script(&profile.name, &id);
                 }
                 results.push(result(st, None));
             }

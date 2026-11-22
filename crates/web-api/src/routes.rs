@@ -10,8 +10,8 @@ use utoipa_axum::{
 };
 
 use crate::handlers::{
-    audit, auth, certificate, health, lists, policy, proxy, rules, stats, tokens, users,
-    userscripts,
+    audit, auth, certificate, devices, health, lists, policy, profiles, proxy, rules, stats,
+    tokens, users, userscripts,
 };
 use crate::state::AppState;
 
@@ -142,6 +142,20 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(policy::import))
         .routes(routes!(policy::reports))
         .routes(routes!(policy::get_panel, policy::put_panel))
+        // profiles and devices
+        .routes(routes!(profiles::list_profiles, profiles::create_profile))
+        .routes(routes!(
+            profiles::get_profile,
+            profiles::update_profile,
+            profiles::delete_profile
+        ))
+        .routes(routes!(devices::list_devices, devices::create_device))
+        .routes(routes!(
+            devices::get_device,
+            devices::update_device,
+            devices::delete_device
+        ))
+        .routes(routes!(devices::issue_device_token, devices::revoke_device_token))
         // audit
         .routes(routes!(audit::list_audit))
 }
