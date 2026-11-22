@@ -465,7 +465,7 @@ impl RateLimiters {
     }
 }
 
-/// Build the application state from components
+/// Build the application state from components, with a script policy store of its own.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_state(
     api_config: ApiConfig,
@@ -477,6 +477,36 @@ pub async fn build_state(
     userscript_runtime: Arc<UserscriptRuntime>,
     config_path: PathBuf,
     request_timeout_ms: Arc<AtomicU64>,
+) -> ApiResult<Arc<AppState>> {
+    build_state_with_policy(
+        api_config,
+        proxy_config,
+        shared_engine,
+        list_service,
+        http_client,
+        userscript_manager,
+        userscript_runtime,
+        config_path,
+        request_timeout_ms,
+        None,
+    )
+    .await
+}
+
+/// Build the application state, sharing `policy` (the proxy path reads the same store) when
+/// given.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_state_with_policy(
+    api_config: ApiConfig,
+    proxy_config: ProxyConfig,
+    shared_engine: Arc<SharedEngine>,
+    list_service: Arc<ListService>,
+    http_client: reqwest::Client,
+    userscript_manager: Arc<UserscriptManager>,
+    userscript_runtime: Arc<UserscriptRuntime>,
+    config_path: PathBuf,
+    request_timeout_ms: Arc<AtomicU64>,
+    policy: Option<Arc<script_policy::store::PolicyStore>>,
 ) -> ApiResult<Arc<AppState>> {
     crate::auth::password::validate_bcrypt_cost(api_config.auth.bcrypt_cost)?;
     if api_config.auth.bcrypt_cost < crate::auth::password::RECOMMENDED_MIN_BCRYPT_COST {
@@ -508,7 +538,8 @@ pub async fn build_state(
     // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
     let db = session_store.db();
-    let policy = Arc::new(script_policy::store::PolicyStore::new(db.clone()));
+    let policy =
+        policy.unwrap_or_else(|| Arc::new(script_policy::store::PolicyStore::new(db.clone())));
 
     // Sessions (committed before revocation takes effect), tokens and audit share the db.
     let session_manager = Arc::new(SessionManager::new(db.clone())?);

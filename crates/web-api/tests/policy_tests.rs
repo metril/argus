@@ -449,6 +449,7 @@ async fn reports_list_blocked_sources_with_suggestions() {
     let empty: Value = admin.get(&format!("{B}/reports")).await.json();
     assert_eq!(empty["total"], 0);
     ctx.state.policy.record_block(
+        script_policy::DEFAULT_PROFILE,
         "www.example.com",
         script_policy::BlockEvent {
             cap: script_policy::Capability::Script,
@@ -458,6 +459,7 @@ async fn reports_list_blocked_sources_with_suggestions() {
         },
     );
     ctx.state.policy.record_block(
+        script_policy::DEFAULT_PROFILE,
         "other.org",
         script_policy::BlockEvent {
             cap: script_policy::Capability::Font,

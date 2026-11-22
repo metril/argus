@@ -196,6 +196,7 @@ fn import_export_through_the_store_and_reports() {
     assert_eq!(s.rules(DEFAULT_PROFILE).unwrap().export(), doc);
     // Reports.
     s.record_block(
+        DEFAULT_PROFILE,
         "a.com",
         BlockEvent {
             cap: C::Script,
@@ -204,6 +205,9 @@ fn import_export_through_the_store_and_reports() {
             via: Via::Network,
         },
     );
-    assert_eq!(s.report_for("a.com").unwrap().items.len(), 1);
-    assert_eq!(s.report_pages().len(), 1);
+    assert_eq!(
+        s.report_for(DEFAULT_PROFILE, "a.com").unwrap().items.len(),
+        1
+    );
+    assert_eq!(s.report_pages(DEFAULT_PROFILE).len(), 1);
 }

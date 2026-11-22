@@ -10,7 +10,8 @@ use crate::model::{
     Effect, GrantKind, PolicyExport, Preset, RuleError, RuleSet, Settings, SiteRule, SourceRule,
     TempGrant,
 };
-use crate::report::{BlockEvent, CspViolation, PageReport, ReportAggregator, ReportLimits};
+use crate::panel::PanelSettings;
+use crate::report::{BlockEvent, CspViolation, PageReport, ReportAggregator};
 use crate::scope::Scope;
 use common::db::redb::Durability;
 use common::db::{tables, Db, DbError};
@@ -83,7 +84,10 @@ pub struct PolicyStore {
     /// Serialises writers and slow-path rebuilds; never held by `snapshot`'s fast path.
     state: Mutex<HashMap<String, ProfileState>>,
     published: RwLock<HashMap<String, Arc<CompiledPolicy>>>,
-    reports: Mutex<ReportAggregator>,
+    /// Blocked-source reports, one aggregator per profile.
+    reports: Mutex<HashMap<String, ReportAggregator>>,
+    /// Called with the profile name after every committed change (rules, panel settings).
+    listeners: RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl PolicyStore {
@@ -97,7 +101,8 @@ impl PolicyStore {
             clock,
             state: Mutex::new(HashMap::new()),
             published: RwLock::new(HashMap::new()),
-            reports: Mutex::new(ReportAggregator::new(ReportLimits::default())),
+            reports: Mutex::new(HashMap::new()),
+            listeners: RwLock::new(Vec::new()),
         }
     }
 
@@ -227,7 +232,44 @@ impl PolicyStore {
         ps.generation = generation;
         let compiled = Arc::new(CompiledPolicy::compile(&ps.rules, generation, now));
         self.published.write().insert(profile.into(), compiled);
+        drop(st);
+        self.notify(profile);
         Ok(out)
+    }
+
+    /// Register a callback run (on the writer's thread) after every committed change.
+    pub fn on_change(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        self.listeners.write().push(Arc::new(f));
+    }
+
+    fn notify(&self, profile: &str) {
+        let ls: Vec<_> = self.listeners.read().clone();
+        for l in ls {
+            l(profile);
+        }
+    }
+
+    /// Panel settings of `profile` (defaults when never set).
+    pub fn panel_settings(&self, profile: &str) -> Result<PanelSettings, StoreError> {
+        self.db.read(|txn| {
+            let meta = txn.open_table(tables::POLICY_META)?;
+            Ok(match meta.get(key(profile, "panel").as_str())? {
+                Some(v) => serde_json::from_slice(v.value())
+                    .map_err(|e| StoreError::Corrupt(format!("panel settings: {e}")))?,
+                None => PanelSettings::default(),
+            })
+        })
+    }
+
+    pub fn set_panel_settings(&self, profile: &str, p: &PanelSettings) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(p).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        self.db.write(Durability::Immediate, |txn| {
+            let mut meta = txn.open_table(tables::POLICY_META)?;
+            meta.insert(key(profile, "panel").as_str(), bytes.as_slice())?;
+            Ok::<_, StoreError>(())
+        })?;
+        self.notify(profile);
+        Ok(())
     }
 
     // ---- convenience edits (each is one `mutate`) ----
@@ -411,21 +453,35 @@ impl PolicyStore {
 
     // ---- reports ----
 
-    pub fn record_block(&self, page_host: &str, ev: BlockEvent) {
-        self.reports.lock().record(page_host, ev, self.now());
+    pub fn record_block(&self, profile: &str, page_host: &str, ev: BlockEvent) {
+        let now = self.now();
+        self.reports
+            .lock()
+            .entry(profile.to_string())
+            .or_default()
+            .record(page_host, ev, now);
     }
 
     /// Returns false when the violation was ignored.
-    pub fn record_violation(&self, v: &CspViolation) -> bool {
-        self.reports.lock().record_violation(v, self.now())
+    pub fn record_violation(&self, profile: &str, v: &CspViolation) -> bool {
+        let now = self.now();
+        self.reports
+            .lock()
+            .entry(profile.to_string())
+            .or_default()
+            .record_violation(v, now)
     }
 
-    pub fn report_for(&self, page_host: &str) -> Option<PageReport> {
-        self.reports.lock().page(page_host)
+    pub fn report_for(&self, profile: &str, page_host: &str) -> Option<PageReport> {
+        self.reports.lock().get(profile)?.page(page_host)
     }
 
-    pub fn report_pages(&self) -> Vec<PageReport> {
-        self.reports.lock().pages()
+    pub fn report_pages(&self, profile: &str) -> Vec<PageReport> {
+        self.reports
+            .lock()
+            .get(profile)
+            .map(|a| a.pages())
+            .unwrap_or_default()
     }
 }
 

@@ -16,6 +16,8 @@ pub mod csp;
 pub mod hints;
 pub mod html;
 pub mod model;
+#[cfg(feature = "store")]
+pub mod panel;
 pub mod report;
 pub mod scope;
 #[cfg(feature = "store")]

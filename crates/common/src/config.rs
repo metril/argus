@@ -13,6 +13,8 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub userscripts: UserscriptSettings,
     #[serde(default)]
+    pub script_control: ScriptControlSettings,
+    #[serde(default)]
     pub webui: WebUiSettings,
 }
 
@@ -176,6 +178,30 @@ pub struct UserscriptSettings {
     pub auto_apply_updates: bool,
 }
 
+/// Script control (NoScript-style policy) and its in-page panel. The rules and the master switch
+/// live in the database and the management API; these are deployment settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScriptControlSettings {
+    /// Offer the in-page panel at all (each profile can also turn it off).
+    pub panel_enabled: bool,
+    /// Reserved host name the proxy answers itself for panel confirmations. It must never
+    /// resolve on the real internet: keep a `.invalid` name.
+    pub panel_host: String,
+    /// Dashboard base URL the panel links to (empty: derived from the `webui` settings).
+    pub dashboard_url: String,
+}
+
+impl Default for ScriptControlSettings {
+    fn default() -> Self {
+        Self {
+            panel_enabled: true,
+            panel_host: "adblock.invalid".into(),
+            dashboard_url: String::new(),
+        }
+    }
+}
+
 /// When session cookies carry the `Secure` attribute.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CookieSecure {
@@ -300,6 +326,7 @@ impl Default for ProxyConfig {
             },
             adblock: AdblockSettings::default(),
             userscripts: UserscriptSettings::default(),
+            script_control: ScriptControlSettings::default(),
             webui: WebUiSettings::default(),
         }
     }

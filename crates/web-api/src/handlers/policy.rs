@@ -906,7 +906,7 @@ pub async fn reports(
         .filter(|s| !s.is_empty());
     let all: Vec<PolicyReportDto> = state
         .policy
-        .report_pages()
+        .report_pages(PROFILE)
         .iter()
         .filter(|r| {
             want.as_ref()
