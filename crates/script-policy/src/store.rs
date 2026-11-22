@@ -22,6 +22,9 @@ use std::sync::Arc;
 /// Seconds since the unix epoch; injectable for tests.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
+/// Callback run after a committed change, with the profile name.
+type Listener = Arc<dyn Fn(&str) + Send + Sync>;
+
 pub fn system_clock() -> Clock {
     Arc::new(|| {
         std::time::SystemTime::now()
@@ -87,7 +90,7 @@ pub struct PolicyStore {
     /// Blocked-source reports, one aggregator per profile.
     reports: Mutex<HashMap<String, ReportAggregator>>,
     /// Called with the profile name after every committed change (rules, panel settings).
-    listeners: RwLock<Vec<Arc<dyn Fn(&str) + Send + Sync>>>,
+    listeners: RwLock<Vec<Listener>>,
 }
 
 impl PolicyStore {

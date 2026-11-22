@@ -143,3 +143,7 @@ harness = false
 [[bench]]
 name = "userscripts_bench"
 harness = false
+
+[[bench]]
+name = "script_policy_bench"
+harness = false

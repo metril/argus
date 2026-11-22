@@ -128,7 +128,7 @@ impl ScriptControl {
                 let Some(this) = weak.upgrade() else { return };
                 let until = this.compiled.load().valid_until();
                 let now = this.store.now();
-                let wait = until.map(|u| u.saturating_sub(now).max(0) + 1);
+                let wait = until.map(|u| u.saturating_sub(now) + 1);
                 let wake = this.wake.clone();
                 drop(this);
                 let notified = wake.notified();
@@ -351,7 +351,10 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("sec-fetch-dest", HeaderValue::from_static("script"));
         h.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
-        h.insert("referer", HeaderValue::from_str(&format!("https://{page}/")).unwrap());
+        h.insert(
+            "referer",
+            HeaderValue::from_str(&format!("https://{page}/")).unwrap(),
+        );
         h
     }
 
@@ -374,7 +377,17 @@ mod tests {
         any_port(&mut d);
         assert_eq!(
             d[0].sources,
-            ["'self'", "'nonce-x'", "a.test:*", "*.a.test:*", "https://b.test:*", "data:", "https://p.test:8443/__adblock__/", "c.test:444", "*"]
+            [
+                "'self'",
+                "'nonce-x'",
+                "a.test:*",
+                "*.a.test:*",
+                "https://b.test:*",
+                "data:",
+                "https://p.test:8443/__adblock__/",
+                "c.test:444",
+                "*"
+            ]
         );
     }
 
@@ -385,7 +398,9 @@ mod tests {
         let c = ScriptControl::new(store, P);
         assert!(!c.enabled());
         assert!(c.document("https", "a.test", 443).is_none());
-        assert!(c.check_request(&script_from("a.test"), "https", "cdn.test", 443).is_none());
+        assert!(c
+            .check_request(&script_from("a.test"), "https", "cdn.test", 443)
+            .is_none());
         assert_eq!(c.decide_calls(), 0);
     }
 
@@ -396,15 +411,27 @@ mod tests {
         let e2 = c.document("https", "a.test", 443).unwrap();
         assert!(Arc::ptr_eq(&e1, &e2), "one decide per document class");
         assert_eq!(c.decide_calls(), 1);
-        store.create_site_rule(P, Scope::parse("a.test").unwrap(), sp::Preset::Untrusted, None).unwrap();
+        store
+            .create_site_rule(
+                P,
+                Scope::parse("a.test").unwrap(),
+                sp::Preset::Untrusted,
+                None,
+            )
+            .unwrap();
         let e3 = c.document("https", "a.test", 443).unwrap();
-        assert!(!Arc::ptr_eq(&e1, &e3), "a policy change starts a new cache generation");
-        assert!(c.check_request(&script_from("a.test"), "https", "cdn.test", 443).is_some());
+        assert!(
+            !Arc::ptr_eq(&e1, &e3),
+            "a policy change starts a new cache generation"
+        );
+        assert!(c
+            .check_request(&script_from("a.test"), "https", "cdn.test", 443)
+            .is_some());
         let mut unknown = script_from("a.test");
         unknown.remove("referer");
-        assert!(c.check_request(&unknown, "https", "cdn.test", 443).is_none());
-        // Allow path allocates nothing observable here, but must not record anything.
-        assert!(c.check_request(&script_from("a.test"), "https", "a.test", 443).is_none() || true);
+        assert!(c
+            .check_request(&unknown, "https", "cdn.test", 443)
+            .is_none());
     }
 
     #[tokio::test]
@@ -417,17 +444,29 @@ mod tests {
             .grant_temp(
                 P,
                 Scope::parse("a.test").unwrap(),
-                GrantKind::Source { source: Scope::parse("cdn.test").unwrap(), caps: CapSet::of(&[C::Script]) },
+                GrantKind::Source {
+                    source: Scope::parse("cdn.test").unwrap(),
+                    caps: CapSet::of(&[C::Script]),
+                },
                 Some(1),
                 false,
                 false,
             )
             .unwrap();
-        assert!(c.check_request(&h, "https", "cdn.test", 443).is_none(), "granted");
+        assert!(
+            c.check_request(&h, "https", "cdn.test", 443).is_none(),
+            "granted"
+        );
         assert!(c.compiled().valid_until().is_some());
         // No further calls: the task alone must notice the expiry.
         tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
-        assert!(c.compiled().valid_until().is_none(), "snapshot rebuilt after the grant expired");
-        assert!(c.check_request(&h, "https", "cdn.test", 443).is_some(), "blocked again");
+        assert!(
+            c.compiled().valid_until().is_none(),
+            "snapshot rebuilt after the grant expired"
+        );
+        assert!(
+            c.check_request(&h, "https", "cdn.test", 443).is_some(),
+            "blocked again"
+        );
     }
 }
