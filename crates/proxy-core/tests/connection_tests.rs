@@ -179,7 +179,7 @@ async fn test_certificate_generation() {
     );
 
     // Force cache maintenance to update stats
-    mitm.run_pending_tasks();
+    mitm.run_pending_tasks().await;
 
     // Check cache stats
     let stats = mitm.cache_stats();

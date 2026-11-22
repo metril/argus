@@ -1,28 +1,40 @@
 //! MITM logic and certificate caching
 
-use crate::{ca::CertificateAuthority, Error, Result};
-use moka::sync::Cache;
+use crate::{ca::CertificateAuthority, tls, Error, Result};
+use moka::future::Cache;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::ProducesTickets;
+use rustls::ServerConfig;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tracing::{debug, info};
+use tracing::{debug, info, trace, warn};
 
-/// Cached certificate data
+/// Cached certificate data, including the ready-to-use TLS server config so a warm connection
+/// does no certificate or config construction.
 #[derive(Clone)]
 pub struct CertificateData {
     pub cert: CertificateDer<'static>,
     pub key: Arc<PrivateKeyDer<'static>>,
+    pub server_config: Arc<ServerConfig>,
 }
 
 /// MITM handler with certificate caching
 pub struct MitmHandler {
     /// Certificate Authority
     ca: Arc<CertificateAuthority>,
-    /// Certificate cache (domain -> certificate data)
+    /// Certificate cache (host -> certificate data). `try_get_with` coalesces concurrent misses
+    /// for one host into a single generation.
     cert_cache: Cache<String, Arc<CertificateData>>,
-    /// Semaphore to limit concurrent certificate generations
+    /// Limits concurrent certificate generations across distinct hosts
     cert_gen_semaphore: Arc<Semaphore>,
+    /// Offer h2 via ALPN on client connections
+    enable_http2: bool,
+    /// Shared session-ticket key rotator for TLS resumption across all hosts
+    ticketer: Option<Arc<dyn ProducesTickets>>,
+    /// Number of leaf certificates actually generated (observability / tests)
+    generations: Arc<AtomicU64>,
 }
 
 impl MitmHandler {
@@ -38,78 +50,104 @@ impl MitmHandler {
             cache_size, cache_ttl_secs
         );
 
-        // Create cache with TTL and size limits
         let cert_cache = Cache::builder()
             .max_capacity(cache_size as u64)
             .time_to_live(Duration::from_secs(cache_ttl_secs))
             .time_to_idle(Duration::from_secs(cache_ttl_secs / 2))
             .build();
 
+        let ticketer = match tls::new_ticketer() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                warn!("TLS session tickets disabled: {}", e);
+                None
+            }
+        };
+
         Self {
             ca,
             cert_cache,
-            cert_gen_semaphore: Arc::new(Semaphore::new(max_concurrent_generations)),
+            cert_gen_semaphore: Arc::new(Semaphore::new(max_concurrent_generations.max(1))),
+            enable_http2: true,
+            ticketer,
+            generations: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Get or generate a certificate for the given domain
+    /// Whether client-facing TLS configs offer h2 (set before first use; default true).
+    pub fn with_http2(mut self, enable_http2: bool) -> Self {
+        self.enable_http2 = enable_http2;
+        self
+    }
+
+    /// Number of certificates generated so far.
+    pub fn generation_count(&self) -> u64 {
+        self.generations.load(Ordering::Relaxed)
+    }
+
+    /// Get or generate a certificate (and ready TLS config) for the given host.
+    ///
+    /// Generation runs on the blocking pool; concurrent first requests for one host share one run.
     pub async fn get_certificate(&self, domain: &str) -> Result<Arc<CertificateData>> {
-        // Normalize domain (remove port if present)
-        let domain = Self::normalize_domain(domain);
+        let host = Self::normalize_domain(domain);
 
-        // Check cache first
-        if let Some(cert_data) = self.cert_cache.get(&domain) {
-            debug!("Cache hit for domain: {}", domain);
+        if let Some(cert_data) = self.cert_cache.get(&host).await {
+            trace!("Cache hit for host: {}", host);
             return Ok(cert_data);
         }
 
-        debug!("Cache miss for domain: {}", domain);
+        let ca = self.ca.clone();
+        let sem = self.cert_gen_semaphore.clone();
+        let ticketer = self.ticketer.clone();
+        let enable_http2 = self.enable_http2;
+        let generations = self.generations.clone();
+        let key = host.clone();
 
-        // Acquire semaphore permit to limit concurrent generations
-        let _permit = self
-            .cert_gen_semaphore
-            .acquire()
+        self.cert_cache
+            .try_get_with(key, async move {
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|e| Error::Internal(format!("Failed to acquire semaphore: {}", e)))?;
+                generations.fetch_add(1, Ordering::Relaxed);
+                debug!("Generating certificate for host: {}", host);
+                tokio::task::spawn_blocking(move || {
+                    let (cert, key) = ca.generate_cert(&host)?;
+                    let server_config = tls::build_server_config(
+                        cert.clone(),
+                        key.clone_key(),
+                        enable_http2,
+                        ticketer,
+                    )?;
+                    Ok::<_, Error>(Arc::new(CertificateData {
+                        cert,
+                        key: Arc::new(key),
+                        server_config,
+                    }))
+                })
+                .await
+                .map_err(|e| Error::Internal(format!("Certificate task failed: {}", e)))?
+            })
             .await
-            .map_err(|e| Error::Internal(format!("Failed to acquire semaphore: {}", e)))?;
-
-        // Double-check cache after acquiring permit (another task might have generated it)
-        if let Some(cert_data) = self.cert_cache.get(&domain) {
-            debug!(
-                "Cache hit after semaphore acquisition for domain: {}",
-                domain
-            );
-            return Ok(cert_data);
-        }
-
-        // Generate new certificate
-        info!("Generating certificate for domain: {}", domain);
-        let (cert, key) = self.ca.generate_cert(&domain)?;
-
-        let cert_data = Arc::new(CertificateData {
-            cert,
-            key: Arc::new(key),
-        });
-
-        // Cache the certificate
-        self.cert_cache.insert(domain.clone(), cert_data.clone());
-
-        Ok(cert_data)
+            .map_err(|e: Arc<Error>| Error::Certificate(e.to_string()))
     }
 
     /// Handle a CONNECT request
     pub async fn handle_connect(&self, domain: &str, port: u16) -> Result<Arc<CertificateData>> {
-        debug!("Handling CONNECT for {}:{}", domain, port);
-
-        // Get or generate certificate for the domain
+        trace!("Handling CONNECT for {}:{}", domain, port);
         self.get_certificate(domain).await
     }
 
-    /// Normalize domain name (remove port and convert to lowercase)
-    fn normalize_domain(domain: &str) -> String {
-        // Remove port if present
-        let domain = domain.split(':').next().unwrap_or(domain);
-        // Convert to lowercase
-        domain.to_lowercase()
+    /// Normalize a host (strip port and IPv6 brackets, lowercase).
+    fn normalize_domain(host: &str) -> String {
+        let h = if let Some(rest) = host.strip_prefix('[') {
+            rest.split(']').next().unwrap_or(rest)
+        } else if host.matches(':').count() > 1 {
+            host // bare IPv6 literal
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
+        h.to_lowercase()
     }
 
     /// Get a reference to the Certificate Authority
@@ -126,8 +164,8 @@ impl MitmHandler {
     }
 
     /// Run pending cache maintenance tasks (useful for testing to ensure stats are updated)
-    pub fn run_pending_tasks(&self) {
-        self.cert_cache.run_pending_tasks();
+    pub async fn run_pending_tasks(&self) {
+        self.cert_cache.run_pending_tasks().await;
     }
 
     /// Clear the certificate cache
@@ -149,51 +187,29 @@ mod tests {
     use super::*;
     use crate::ca::CertificateAuthority;
 
+    fn test_ca() -> (tempfile::TempDir, Arc<CertificateAuthority>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = Arc::new(
+            CertificateAuthority::load_or_generate(
+                tmp.path().join("ca.crt"),
+                tmp.path().join("ca.key"),
+            )
+            .expect("Failed to create CA"),
+        );
+        (tmp, ca)
+    }
+
     #[tokio::test]
     async fn test_cert_caching() {
-        let tmp = tempfile::tempdir().unwrap();
-        let temp_dir = tmp.path().to_path_buf();
-        let cert_path = temp_dir.join("test-mitm-ca.crt");
-        let key_path = temp_dir.join("test-mitm-ca.key");
-
-        // Clean up any existing files
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-
-        // Create CA
-        let ca = Arc::new(
-            CertificateAuthority::load_or_generate(&cert_path, &key_path)
-                .expect("Failed to create CA"),
-        );
-
-        // Create MITM handler
+        let (_tmp, ca) = test_ca();
         let handler = MitmHandler::new(ca, 10, 3600, 5);
 
-        // Get certificate for a domain
-        let cert1 = handler
-            .get_certificate("example.com")
-            .await
-            .expect("Failed to get certificate");
-
-        // Get certificate for the same domain again (should be cached)
-        let cert2 = handler
-            .get_certificate("example.com")
-            .await
-            .expect("Failed to get certificate");
-
-        // Both should be the same (Arc pointing to same data)
+        let cert1 = handler.get_certificate("example.com").await.unwrap();
+        let cert2 = handler.get_certificate("example.com").await.unwrap();
         assert!(Arc::ptr_eq(&cert1, &cert2));
 
-        // Force cache maintenance to update stats
-        handler.run_pending_tasks();
-
-        // Check cache stats
-        let stats = handler.cache_stats();
-        assert_eq!(stats.entry_count, 1);
-
-        // Clean up
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
+        handler.run_pending_tasks().await;
+        assert_eq!(handler.cache_stats().entry_count, 1);
     }
 
     #[tokio::test]
@@ -207,51 +223,39 @@ mod tests {
             MitmHandler::normalize_domain("sub.example.com:8443"),
             "sub.example.com"
         );
+        assert_eq!(MitmHandler::normalize_domain("[::1]:443"), "::1");
+        assert_eq!(MitmHandler::normalize_domain("2001:DB8::1"), "2001:db8::1");
     }
 
     #[tokio::test]
     async fn test_multiple_domains() {
-        let tmp = tempfile::tempdir().unwrap();
-        let temp_dir = tmp.path().to_path_buf();
-        let cert_path = temp_dir.join("test-mitm-multi-ca.crt");
-        let key_path = temp_dir.join("test-mitm-multi-ca.key");
-
-        // Clean up any existing files
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-
-        // Create CA
-        let ca = Arc::new(
-            CertificateAuthority::load_or_generate(&cert_path, &key_path)
-                .expect("Failed to create CA"),
-        );
-
-        // Create MITM handler
+        let (_tmp, ca) = test_ca();
         let handler = MitmHandler::new(ca, 10, 3600, 5);
+        for d in ["example.com", "test.com", "another.com"] {
+            handler.get_certificate(d).await.unwrap();
+        }
+        handler.run_pending_tasks().await;
+        assert_eq!(handler.cache_stats().entry_count, 3);
+        assert_eq!(handler.generation_count(), 3);
+    }
 
-        // Get certificates for multiple domains
-        let _cert1 = handler
-            .get_certificate("example.com")
-            .await
-            .expect("Failed to get certificate");
-        let _cert2 = handler
-            .get_certificate("test.com")
-            .await
-            .expect("Failed to get certificate");
-        let _cert3 = handler
-            .get_certificate("another.com")
-            .await
-            .expect("Failed to get certificate");
-
-        // Force cache maintenance to update stats
-        handler.run_pending_tasks();
-
-        // Check cache stats
-        let stats = handler.cache_stats();
-        assert_eq!(stats.entry_count, 3);
-
-        // Clean up
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_requests_generate_once() {
+        let (_tmp, ca) = test_ca();
+        let handler = Arc::new(MitmHandler::new(ca, 10, 3600, 8));
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let h = handler.clone();
+                tokio::spawn(
+                    async move { h.get_certificate("Burst.Example.com:443").await.unwrap() },
+                )
+            })
+            .collect();
+        let mut certs = Vec::new();
+        for t in tasks {
+            certs.push(t.await.unwrap());
+        }
+        assert_eq!(handler.generation_count(), 1);
+        assert!(certs.iter().all(|c| Arc::ptr_eq(c, &certs[0])));
     }
 }
