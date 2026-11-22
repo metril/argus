@@ -239,11 +239,11 @@ impl CertificateAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_ca_generation() {
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-ca.crt");
         let key_path = temp_dir.join("test-ca.key");
 
@@ -266,7 +266,8 @@ mod tests {
 
     #[test]
     fn test_cert_generation() {
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-ca2.crt");
         let key_path = temp_dir.join("test-ca2.key");
 

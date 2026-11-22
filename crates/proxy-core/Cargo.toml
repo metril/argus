@@ -102,6 +102,7 @@ webui = ["dep:web-api", "dep:userscript-engine"]
 full = ["http3", "websockets", "userscripts", "webui"]
 
 [dev-dependencies]
+tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 

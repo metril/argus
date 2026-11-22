@@ -56,14 +56,14 @@ where
 mod tests {
     use super::*;
     use crate::ca::CertificateAuthority;
-    use std::env;
 
     #[test]
     fn test_server_config_creation() {
         // Install ring crypto provider for tests
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-tls-ca.crt");
         let key_path = temp_dir.join("test-tls-ca.key");
 

@@ -148,11 +148,11 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::ca::CertificateAuthority;
-    use std::env;
 
     #[tokio::test]
     async fn test_cert_caching() {
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-mitm-ca.crt");
         let key_path = temp_dir.join("test-mitm-ca.key");
 
@@ -211,7 +211,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_domains() {
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-mitm-multi-ca.crt");
         let key_path = temp_dir.join("test-mitm-multi-ca.key");
 
