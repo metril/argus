@@ -1325,7 +1325,7 @@ Contributions are welcome! Please:
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+Proprietary. All rights reserved. Not licensed for redistribution.
 
 ## Security
 
