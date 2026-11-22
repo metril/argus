@@ -9,6 +9,7 @@ pub mod auth;
 pub mod certificate;
 pub mod health;
 pub mod lists;
+pub mod policy;
 pub mod proxy;
 pub mod rules;
 pub mod stats;

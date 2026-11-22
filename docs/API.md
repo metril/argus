@@ -50,8 +50,8 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `ca:admin` | - | - | yes | Manage the CA certificate (reserved). |
 | `scripts:read` | yes | yes | yes | View userscripts and their source. |
 | `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts. |
-| `policy:read` | yes | yes | yes | Read the script policy (reserved). |
-| `policy:write` | - | yes | yes | Change the script policy (reserved). |
+| `policy:read` | yes | yes | yes | View script policy rules, explanations, temporary permissions and blocked-source reports. |
+| `policy:write` | - | yes | yes | Change script policy settings, rules and temporary permissions; import policy. |
 | `profiles:read` | yes | yes | yes | Read filtering profiles (reserved). |
 | `profiles:write` | - | - | yes | Change filtering profiles (reserved). |
 | `devices:read` | yes | yes | yes | Read devices (reserved). |

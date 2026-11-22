@@ -80,6 +80,9 @@ pub struct AppState {
     /// Persisted audit log.
     pub audit: Arc<AuditStore>,
 
+    /// Script policy rules (per profile), compiled snapshots and blocked-source reports.
+    pub policy: Arc<script_policy::store::PolicyStore>,
+
     /// Process start, for uptime.
     pub started_at: Instant,
 
@@ -502,6 +505,7 @@ pub async fn build_state(
     // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
     let db = session_store.db();
+    let policy = Arc::new(script_policy::store::PolicyStore::new(db.clone()));
 
     // Sessions (committed before revocation takes effect), tokens and audit share the db.
     let session_manager = Arc::new(SessionManager::new(db.clone())?);
@@ -551,6 +555,7 @@ pub async fn build_state(
         api_config,
         tokens,
         audit,
+        policy,
         started_at: Instant::now(),
         spec_json: OnceLock::new(),
         route_auth: OnceLock::new(),

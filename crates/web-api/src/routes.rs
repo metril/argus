@@ -6,7 +6,8 @@ use std::sync::Arc;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::handlers::{
-    audit, auth, certificate, health, lists, proxy, rules, stats, tokens, users, userscripts,
+    audit, auth, certificate, health, lists, policy, proxy, rules, stats, tokens, users,
+    userscripts,
 };
 use crate::state::AppState;
 
@@ -94,6 +95,29 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(userscripts::get_userscript_source))
         .routes(routes!(userscripts::set_enabled))
+        // script policy
+        .routes(routes!(policy::get_settings, policy::put_settings))
+        .routes(routes!(policy::list_site_rules, policy::create_site_rule))
+        .routes(routes!(policy::update_site_rule, policy::delete_site_rule))
+        .routes(routes!(
+            policy::list_source_rules,
+            policy::create_source_rule
+        ))
+        .routes(routes!(
+            policy::update_source_rule,
+            policy::delete_source_rule
+        ))
+        .routes(routes!(
+            policy::list_temp,
+            policy::grant_temp,
+            policy::revoke_all_temp
+        ))
+        .routes(routes!(policy::revoke_temp))
+        .routes(routes!(policy::explain))
+        .routes(routes!(policy::preview))
+        .routes(routes!(policy::export))
+        .routes(routes!(policy::import))
+        .routes(routes!(policy::reports))
         // audit
         .routes(routes!(audit::list_audit))
 }
