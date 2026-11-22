@@ -1,0 +1,13 @@
+||plus.example.com^
+||dot.example.com^
+||star.example.com^
+|http://exact.example.com^
+|https://exact.example.com^
+|ws://exact.example.com^
+|wss://exact.example.com^
+||suffix.example.net^
+|http://dom.example.net^
+|https://dom.example.net^
+|ws://dom.example.net^
+|wss://dom.example.net^
+/^[a-z][a-z0-9+.-]*:\/\/[^\/?#]*kw/

@@ -22,3 +22,17 @@ bytes = { workspace = true }
 
 # Time
 chrono = { workspace = true }
+
+# Embedded database
+redb = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+# Destination policy: CIDRs, interface addresses, guarded DNS resolver for reqwest
+ipnet = "2.9"
+libc = "0.2"
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

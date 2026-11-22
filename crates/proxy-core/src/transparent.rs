@@ -209,6 +209,7 @@ impl TransparentEntry {
             let io = Prefixed::new(buf, stream);
             return match hello {
                 Hello::Sni(host) => {
+                    let host = crate::authority::normalize_host(&host).unwrap_or(host);
                     let passthrough = h.shared.passthrough.matches(&host);
                     debug!(
                         "transparent TLS {host}:{} from {} ({})",

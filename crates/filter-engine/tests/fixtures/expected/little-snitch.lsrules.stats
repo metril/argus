@@ -1,0 +1,12 @@
+format=little-snitch
+total_lines=12
+converted=12
+skipped=3
+error_count=0
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={"disabled": 1, "localhost": 1, "no-domain-target": 1}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }

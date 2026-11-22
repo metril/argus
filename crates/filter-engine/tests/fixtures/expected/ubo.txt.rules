@@ -1,0 +1,4 @@
+||not-chromium.example^
+||ublock.example^
+||included.example^
+example.com##+js(abort-on-property-read, foo)

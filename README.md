@@ -34,8 +34,10 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - Domain-specific and exception rules
   - Injected into HTML responses via the MITM proxy (streaming, gzip/br aware), with a
     dynamic class/id helper and a procedural-filter evaluator (`:has-text`, `:matches-css`, …)
-- ✅ Scriptlet injection (`##+js(...)`): uBlock Origin's scriptlets are fetched at runtime
-  (GPLv3, not vendored), converted to adblock-rust resources, and cached under `data/filters`.
+- ✅ Scriptlet injection (`##+js(...)`): uBlock Origin's scriptlets are fetched at runtime,
+  converted to adblock-rust resources (parsed with a real JavaScript parser and validated; a
+  resource that fails is dropped and listed in `GET /engine/status`), and cached under
+  `data/filters`; the default build also embeds a copy (see below).
   Configurable (or disabled with `""`) via `[adblock] scriptlet_resources_url`.
 - ✅ Custom user rules: block/allow (`@@`)/cosmetic rules editable in the Web UI, compiled into
   the engine alongside subscribed lists
@@ -134,7 +136,7 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
 2. **Create your account** — open `http://localhost:3000` and register. The **first** user
    registered automatically becomes the admin.
 3. **Install the root CA** — in the Web UI go to **Settings → CA Certificate → Download CA
-   Certificate**, or fetch it directly from any device at `http://<server>:3000/api/ca.crt` (this
+   Certificate**, or fetch it directly from any device at `http://<server>:3000/api/v1/ca.crt` (this
    endpoint is public so phones and other machines can grab it by URL). Then trust it so MITM'd
    HTTPS pages validate:
    - **macOS**: open the downloaded file → add to the **System** keychain in Keychain Access →
@@ -151,9 +153,9 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
      Proxy (HTTP)** and **Secure Web Proxy (HTTPS)**, both `Server: <server-ip>`, `Port: 8080`.
 5. **Manage blocklists** — the default lists (EasyList, EasyPrivacy, AdGuard Base/Tracking) are
    seeded and downloaded automatically; add your own under **Filters**. Lists are **persisted**
-   (Sled) and survive restarts, and the engine recompiles automatically when you change them.
+   in the local database and survive restarts, and the engine recompiles automatically when you change them.
 6. **Verify it's working**:
-   - `curl http://<server>:3000/api/health` returns `{"status":"healthy",...}`.
+   - `curl http://<server>:3000/api/v1/health` returns `{"status":"healthy",...}`.
    - With your device browsing through the proxy, the **Requests Checked / Blocked** counters on
      the **Filters** page climb, and the proxy logs show per-connection lines.
    - **#1 gotcha:** if HTTPS pages error with a certificate warning, the CA from step 3 isn't
@@ -191,20 +193,160 @@ cert_cache_size = 1000
 
 [adblock]
 enabled = true            # Network/cosmetic blocking via the bundled filter engine
-data_dir = "data/filters" # Filter lists + cached content are persisted here (Sled)
+data_dir = "data/filters" # Database, cached list files and the compiled engine live here (see Storage layout)
 auto_update = true
 update_interval_hours = 24
+# Control-plane downloads (lists, `!#include`, scriptlet resources) refuse private, loopback and
+# link-local destinations by default; allow LAN hosts here (CIDRs, IPs or host names).
+allowed_fetch_destinations = []   # e.g. ["192.168.1.0/24", "nas.lan"]
+recent_blocked_keep_query = false # strip query strings from the recent-blocked list (they can hold tokens)
+respect_no_transform = true # skip body rewriting when the origin sends Cache-Control: no-transform
 
 [userscripts]
 enabled = true
-data_dir = "data/userscripts"
 
 [webui]
 enabled = true
 host = "0.0.0.0"
 port = 3000                # Web UI + API
+# Binding beyond loopback serves plain HTTP: put a TLS-terminating reverse proxy in front.
+cookie_secure = "auto"     # "auto" | "always" | "never": Secure flag on session cookies; auto = when
+                           # the request came over HTTPS through a proxy listed in trusted_proxies
+trusted_proxies = []       # proxy IPs whose X-Forwarded-For / X-Forwarded-Proto are believed
 # Accounts are created by registering in the Web UI; the first user becomes admin.
 ```
+
+## Blocklist formats and lists
+
+Each list has a **format** (`auto` by default: detected from the content) and an optional
+**allowlist** flag (every rule of the list becomes an exception). The list's build report
+(`GET /api/v1/lists/{id}/report`, shown on the **Filters** page) says which format was detected and
+how many rules were network / cosmetic / handed off / skipped / deduplicated, with the first parse
+issues. Pure domain rules (`||host^`, hosts and domain entries) are held in a compact domain set
+instead of the engine.
+
+### Supported blocklist formats
+
+| Format | Example line | Maps to | Skipped or handed off |
+|---|---|---|---|
+| `abp` (Adblock Plus / EasyList) | `\|\|ads.example^$third-party` | engine network and cosmetic rules | options adblock-rust lacks are handed off (see below) |
+| `ubo` (uBlock Origin) | `example.com##+js(aeld, click)` | as `abp`, plus scriptlets, `!#include`, `!#if` | as `abp` |
+| `adguard` | `\|\|ads.example^$removeparam=id` | as `abp`; AdGuard-only syntax translated where possible | `#%#` JS, `$$` HTML filters, `$denyallow`, `$replace`, ... are handed off |
+| `hosts` | `0.0.0.0 ads.example` | blocks the host and its subdomains | `localhost` and local names skipped |
+| `domains` | `ads.example` (`*.d`, `.d` also accepted) | blocks the domain and subdomains | local names skipped |
+| `dnsmasq` | `address=/ads.example/0.0.0.0` | blocks the domain | other directives skipped |
+| `unbound` | `local-zone: "ads.example." always_nxdomain` | blocks the domain | non-blocking zone types skipped |
+| `rpz` | `ads.example CNAME .` | blocks the domain; `rpz-passthru` becomes an exception | non-reject policies and custom answers skipped |
+| `pihole` | `^ads[0-9]+\.example$` (regex) or `ads.example` | domains and host regex rules | unsupported regex anchors are errors |
+| `adguard-home` | `\|\|ads.example^$important` | DNS-style `\|\|host^` rules and exceptions | unsupported modifiers skipped |
+| `little-snitch` | `.lsrules` JSON | deny rules for hosts and domains | allow rules, non-host targets skipped |
+| `surge` | `DOMAIN-SUFFIX,ads.example,REJECT` | domain, keyword, regex and CIDR rules | non-reject policies skipped |
+| `clash` | `payload:` YAML with `+.ads.example` | domain, keyword, regex and CIDR rules | unsupported rule types skipped |
+| `ip-list` | `192.0.2.0/24` | IP/CIDR/range block list checked for IP-literal hosts | none |
+
+**Handed off** rules (`$replace`, `$jsonprune`, `$cookie`, `$removeheader`, HTML filters, `#%#`
+JavaScript, ...) are parsed and kept, but not enforced yet. `GET /api/v1/rules/ext` lists them (kind,
+raw rule, domains) and `GET /api/v1/engine/build` counts them per kind. A rule the engine cannot
+parse is *rejected* and appears in the list's issues. `POST /api/v1/rules/validate` runs the same
+conversion for a given format and reports each line as translated, accepted, handed off, skipped or
+rejected without storing anything.
+
+### List catalogue
+
+A catalogue of well-known hosts, domain and IP lists (StevenBlack, AdAway, HaGeZi, OISD, Phishing
+Army, Spamhaus DROP, Feodo, ...) is built in but **disabled by default**; nothing is downloaded until
+you add one (Filters, then Catalogue, or `POST /api/v1/lists/catalogue/{id}`). Each entry shows its
+licence: check it before use.
+
+### Fetch policy
+
+Lists, `!#include` targets and the scriptlet resource URL are fetched by the control plane under a
+stricter destination policy than proxied traffic: only `http`/`https`, and loopback, link-local
+(cloud metadata), multicast, unspecified and private ranges (RFC 1918, ULA, CGNAT) are refused,
+judged on the address actually connected to (so a name resolving internally is refused, and IPv6
+literals and mapped forms are covered). Redirects are followed for at most 3 hops, never from
+`https` to `http`, every hop is vetted the same way, and includes must stay on the list's origin.
+URLs are checked when saved (`400`, code `fetch_destination_not_allowed` or `invalid_fetch_url`)
+and again on every fetch. Hosting lists on your LAN: add its CIDR, IP or host name to
+`adblock.allowed_fetch_destinations`. gzip, deflate, br and zstd replies are accepted and decoded as
+a stream: `max_list_bytes` is enforced on the *decoded* bytes (all includes of a list share that
+budget) and a compression-ratio cap (100:1 beyond the first MiB) stops decompression bombs; other
+codings are refused. Lines echoed in build reports are cut to 80 characters.
+
+### Build failures and limits
+
+A failed build (for example a list set that exceeds adblock-rust's flatbuffer limits, roughly a
+million non-domain rules; pure domain rules are not counted because they bypass the engine) leaves
+the previous engine serving. The failure is logged, shown as `Failed` in the build state
+(`GET /api/v1/engine/build`, Filters page) and the next successful build clears it. The limit is
+not worked around by sharding: reduce the number of path-style rules, or prefer domain-format lists.
+
+### Storage layout
+
+Everything lives under `adblock.data_dir` (default `data/filters`):
+
+- `adblocker.redb`: one database for list metadata, build reports, users, sessions, tokens, audit
+  log and userscripts.
+- `lists/`: raw list contents as content-addressed files (`lists/<sha256>`), garbage-collected when
+  unreferenced.
+- `engine.bin`: the compiled engine, domain set and handed-off rules, so a restart serves the last
+  build before touching the network (invalidated when lists or the converter change).
+
+Old sled directories are ignored (and can be deleted). `userscripts.data_dir` and
+`webui.session_storage_path` no longer exist; the proxy refuses to start if they are still set.
+
+### `bundled-ubo-resources` feature
+
+Scriptlet rules (`##+js(...)`) need the uBlock Origin resource library. The default build embeds a
+pinned copy of it (GPL-3.0; see `docs/LICENSING.md`). At runtime the freshest fetched copy wins,
+then the on-disk cache `<data_dir>/resources.json`, then the embedded copy. To build without it:
+`cargo build --release --no-default-features --features websockets` (the `full` feature includes it).
+
+## Rule support
+
+Rules the network engine cannot express are handed to the extended-rule index (`crates/ext-rules`),
+built in the same off-thread compile step as the engine, persisted with it (same cache key) and
+swapped in together with it, so a request never pairs one build's engine with another build's
+extended rules. *Enforced* means it changes traffic on the HTTP/1.1 and HTTP/2 forward path
+(plain and MITM); WebSocket and HTTP/3 requests see only the network engine.
+
+| Modifier / syntax | Status | Needs a trusted list |
+| --- | --- | --- |
+| Network rules, `@@`, `$important`, `$badfilter`, `$redirect`, `$csp`, `$removeparam`, `$generichide`, cosmetic `##` | enforced (engine) | no |
+| `$replace` (text bodies up to 3 MiB; on HTML it runs first, see below) | enforced | yes |
+| `$jsonprune` (up to 4 MiB), `$xmlprune` (up to 4 MiB), `$hls` (up to 2 MiB) | enforced | no |
+| `$removeheader` (response and `request:`; forbidden list refused) | enforced | no |
+| `$cookie` (removal on requests; removal and attribute edits on `Set-Cookie`) | enforced | no |
+| `$permissions` (documents) | enforced | no |
+| `$urltransform` (same origin, path and query only, fetched transparently) | enforced | yes |
+| `$method`, `$to`, `$denyallow` | enforced | no |
+| `$header` (blocks a response whose header matches) | enforced | no |
+| HTML filters `##^`, `$$` (`:has-text`, `tag-content`, `min/max-length`) | enforced (`parent-elements` ignored: partial) | no |
+| `#%#` JavaScript | enforced (runs before page scripts, after the boot runtime) | yes |
+| AdGuard scriptlets without a uBO equivalent, ABP snippets (`#$#`) | partial: `log` and `log-addEventListener` run; every other name is reported once per page as `unsupported scriptlet <name>` | yes |
+| Extended CSS the engine rejected (`#?#`, `#$?#`) | partial: in-page evaluator (`:has-text`, `:matches-css*`, `:matches-attr`, `:matches-path`, `:min-text-length`, `:upward`, `:xpath`) | no |
+| `$popup` | parsed only (no opener information in request headers) | n/a |
+| `$stealth`, `$network`, `$referrerpolicy`, other unknown options | parsed only, listed as `unsupported` in `GET /rules/ext` | n/a |
+
+**Trust.** `$replace`, `$urltransform`, `#%#`, snippets and unknown scriptlets let a list author
+rewrite content or run code in every page, so they are dropped (and counted per list in
+`GET /api/v1/engine/build`, `ext_stats`) unless the list is *trusted*. Custom rules are always
+trusted; downloaded lists are not until you turn on `trusted` (Filters page, or
+`PUT /api/v1/lists/{id}` with `lists:write`; the change is audited). Exceptions never need trust.
+
+**Precedence.** An engine block is final. An engine exception (`@@||host^`) does *not* switch off
+extended rules: as in uBlock Origin and AdGuard, each modifier is disabled only by an exception
+naming it (`@@||host^$replace`), with `$important` beating a plain exception; `$removeparam`
+runs before `$urltransform`.
+
+**Apply order for responses.** Header edits and `$header` blocking happen first; then, for a
+document, `$replace` runs on the decoded text, and the HTML stages (content-dependent removals,
+`##^`, cosmetic and script injection) see its result; non-HTML bodies go decode, transform
+(`$replace`, `$jsonprune`, `$xmlprune`, `$hls`, in list order), re-encode. Bodies over a
+transform's cap (or documents over 4 MiB when buffering is needed) pass through untouched and are
+counted. `Cache-Control: no-transform` skips all body work (header edits still apply) unless
+`adblock.respect_no_transform = false`. Documents are recognised from `Sec-Fetch-Dest`, else from
+`Sec-Fetch-Mode: navigate`, `Upgrade-Insecure-Requests: 1` or an `Accept` listing `text/html`.
 
 ## AdGuard Filter Syntax
 
@@ -239,14 +381,14 @@ Remove unwanted HTTP headers:
 # Remove request header
 ||example.com^$removeheader=request:user-agent
 
-# Security headers cannot be removed (Content-Length, Set-Cookie, etc.)
+# Security and framing headers cannot be removed
 ```
 
-**Restricted headers** (cannot be removed for security):
-- Content-Length, Content-Encoding, Transfer-Encoding
-- Cookie, Set-Cookie, Authorization
-- Access-Control-*, Origin, Content-Security-Policy
-- And 20+ others (see source code for full list)
+**Forbidden headers** follow AdGuard's published list (the CORS family `Access-Control-*`,
+`Cross-Origin-*`, `Origin`, `Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
+`Sec-Fetch-*`, ...) plus the headers that frame the message (`Content-Length`, `Content-Type`,
+`Content-Encoding`, `Transfer-Encoding`, `Connection`, `Host`, `Proxy-*`, ...); such a rule is
+parsed but never applied. The full list is in `crates/ext-rules/src/headers.rs`.
 
 ### $replace - Content Replacement
 
@@ -265,8 +407,8 @@ Replace content in responses using regex:
 
 **Limitations**:
 - Only applies to text content types (HTML, JS, CSS, JSON)
-- Maximum response size: 10 MB
-- Rules from trusted filters only
+- Maximum decoded response size: 3 MiB (larger bodies pass through untouched)
+- Rules from trusted lists only (see below)
 
 ### Exception Rules
 
@@ -858,7 +1000,7 @@ Scripts use glob-style patterns for matching:
 Each userscript has isolated storage:
 - Values are namespaced by script ID
 - Scripts cannot access other scripts' data
-- Persistent storage using sled database
+- Persistent storage in the shared redb database (`adblocker.redb`)
 - In-memory caching for performance
 
 ### Security Considerations
@@ -1153,7 +1295,7 @@ The userscript engine consists of:
 
 1. **Metadata Parser** (`metadata.rs`) - Parses `// ==UserScript==` blocks
 2. **Script Manager** (`manager.rs`) - Lifecycle management (install/update/uninstall)
-3. **Storage** (`storage.rs`) - Persistent key-value storage with sled database
+3. **Storage** (`storage.rs`) - Persistent key-value storage in the shared redb database
 4. **GM API** (`gm_api.rs`) - Implementation of all GM_* functions
 5. **Executor** (`executor.rs`) - Boa engine integration and JavaScript execution
 

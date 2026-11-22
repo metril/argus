@@ -1,146 +1,108 @@
-//! Axum web server setup and routing
+//! Axum web server setup: the versioned API, docs UI, static web UI and global middleware.
 
-use axum::http::{header, HeaderValue, Method};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::{
-    middleware,
-    routing::{delete, get, post, put},
-    Router,
+    extract::Request, middleware, middleware::Next, response::Response, routing::any, Router,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
-use crate::auth::middleware::auth_middleware;
+use crate::auth::authz::authorize;
 use crate::config::ApiConfig;
-use crate::handlers;
-use crate::middleware::{rate_limit_middleware, request_id_middleware};
+use crate::error::{envelope, ApiError};
+use crate::middleware::{audit_middleware, rate_limit_middleware, request_id_middleware};
+use crate::openapi::{finalize, ApiDoc};
+use crate::routes::{api_router, API_PREFIX};
 use crate::state::AppState;
+
+/// Build the OpenAPI document and route table for an assembled router. Exposed so tests can
+/// exercise registration of arbitrary routers.
+pub fn build_api(
+    router: OpenApiRouter<Arc<AppState>>,
+) -> (
+    Router<Arc<AppState>>,
+    serde_json::Value,
+    crate::auth::authz::RouteTable,
+) {
+    let (router, spec) = OpenApiRouter::with_openapi(<ApiDoc as utoipa::OpenApi>::openapi())
+        .nest(API_PREFIX, router)
+        .split_for_parts();
+    let (doc, table) = finalize(spec);
+    (router, doc, table)
+}
+
+async fn api_not_found() -> ApiError {
+    ApiError::NotFound("No such API route".into())
+}
+
+/// Give bodiless 405s the standard error envelope.
+async fn normalize_errors(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    if resp.status() == StatusCode::METHOD_NOT_ALLOWED
+        && !resp.headers().contains_key(header::CONTENT_TYPE)
+    {
+        let allow = resp.headers().get(header::ALLOW).cloned();
+        let mut r = envelope(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "Method not allowed",
+        );
+        if let Some(a) = allow {
+            r.headers_mut().insert(header::ALLOW, a);
+        }
+        return r;
+    }
+    resp
+}
 
 /// Create the Axum router with all routes and middleware
 pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
-    // Build CORS layer from configuration
-    // Note: Cannot use `Any` with `allow_credentials(true)`, so we specify allowed values
-    let cors = build_cors_layer(&config.security.cors_origins);
+    create_router_with(state, config, api_router())
+}
 
-    // Public auth routes (no authentication required)
-    let public_auth_routes = Router::new()
-        .route("/register", post(handlers::auth::register))
-        .route("/login", post(handlers::auth::login))
-        .route("/refresh", post(handlers::auth::refresh));
+/// [`create_router`] over an explicit route set (tests add routes to prove deny-by-default).
+pub fn create_router_with(
+    state: Arc<AppState>,
+    config: &ApiConfig,
+    api: OpenApiRouter<Arc<AppState>>,
+) -> Router {
+    let (routes, doc, table) = build_api(api);
+    if !table.undeclared.is_empty() || !table.invalid.is_empty() {
+        tracing::error!(
+            "Routes without a valid authorization declaration (denied by default): {:?} {:?}",
+            table.undeclared,
+            table.invalid
+        );
+    }
+    let _ = state.spec_json.set(doc.to_string());
+    let _ = state.route_auth.set(table);
 
-    // Protected auth routes (authentication required)
-    let protected_auth_routes = Router::new()
-        .route("/logout", post(handlers::auth::logout))
-        .route("/me", get(handlers::auth::me))
-        .route("/sessions", get(handlers::auth::list_sessions))
-        .route(
-            "/sessions/{session_id}",
-            delete(handlers::auth::revoke_session),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
-
-    // Combine auth routes
-    let auth_router = Router::new()
-        .merge(public_auth_routes)
-        .merge(protected_auth_routes)
+    // Authorization is a `route_layer`: it only runs for matched routes and sees `MatchedPath`.
+    let api = routes
+        .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state.clone());
 
-    // Health + public download routes (no authentication required)
-    let health_router = Router::new()
-        .route("/health", get(handlers::health::health_check))
-        .route("/metrics", get(handlers::health::metrics))
-        // CA certificate is public so any device can fetch and trust it by URL.
-        .route("/ca.crt", get(handlers::certificate::download_ca))
-        .with_state(state.clone());
+    let docs: Router = SwaggerUi::new(format!("{API_PREFIX}/docs"))
+        .config(Config::from(format!("{API_PREFIX}/openapi.json")))
+        .into();
 
-    // Proxy management routes (protected)
-    let proxy_router = Router::new()
-        .route(
-            "/config",
-            get(handlers::proxy::get_config).put(handlers::proxy::update_config),
-        )
-        .route("/stats", get(handlers::proxy::get_stats))
-        .route("/reload-config", post(handlers::proxy::reload_config))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state.clone());
-
-    // Filter management routes (protected)
-    let filters_router = Router::new()
-        .route(
-            "/lists",
-            get(handlers::filters::list_filter_lists).post(handlers::filters::add_filter_list),
-        )
-        .route(
-            "/lists/{id}",
-            get(handlers::filters::get_filter_list)
-                .put(handlers::filters::update_filter_list)
-                .delete(handlers::filters::delete_filter_list),
-        )
-        .route(
-            "/custom-rules",
-            get(handlers::filters::get_custom_rules).put(handlers::filters::update_custom_rules),
-        )
-        .route("/stats", get(handlers::filters::get_stats))
-        .route("/stats/reset", post(handlers::filters::reset_stats))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state.clone());
-
-    // Userscript management routes (protected)
-    let userscripts_router = Router::new()
-        .route(
-            "/",
-            get(handlers::userscripts::list_userscripts)
-                .post(handlers::userscripts::install_userscript),
-        )
-        .route("/stats", get(handlers::userscripts::get_stats))
-        .route(
-            "/{id}",
-            get(handlers::userscripts::get_userscript)
-                .put(handlers::userscripts::update_userscript)
-                .delete(handlers::userscripts::uninstall_userscript),
-        )
-        .route(
-            "/{id}/source",
-            get(handlers::userscripts::get_userscript_source),
-        )
-        .route("/{id}/enabled", put(handlers::userscripts::set_enabled))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ))
-        .with_state(state.clone());
-
-    // Build the main router with global middleware
-    // Layers are applied bottom-to-top (last added = outermost)
     let mut router = Router::new()
-        .nest("/api/auth", auth_router)
-        .nest("/api/proxy", proxy_router)
-        .nest("/api/filters", filters_router)
-        .nest("/api/userscripts", userscripts_router)
-        .nest("/api", health_router);
+        .merge(api)
+        .merge(docs)
+        .route("/api/{*rest}", any(api_not_found));
 
-    // Add static file serving for WebUI if enabled
     if config.webui.enabled {
         let dist_path = &config.webui.dist_path;
         if dist_path.exists() {
             let index_file = dist_path.join("index.html");
-
-            // Serve static files from dist directory
-            // fallback_service routes all non-API requests to index.html for SPA routing
             let serve_dir = ServeDir::new(dist_path).not_found_service(ServeFile::new(&index_file));
-
             router = router.fallback_service(serve_dir);
             tracing::info!("WebUI static files enabled from {:?}", dist_path);
         } else {
@@ -151,72 +113,108 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
         }
     }
 
+    // Layers: last added = outermost.
+    if let Some(cors) = build_cors_layer(&config.security.cors_origins) {
+        router = router.layer(cors);
+    }
     router
-        // Innermost: CORS (handles preflight)
-        .layer(cors)
-        // TraceLayer for request/response logging
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
-        // Rate limiting
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit_middleware,
         ))
-        // Outermost: Request ID (ensures all logs have request ID)
-        .layer(middleware::from_fn(request_id_middleware))
+        .layer(middleware::from_fn(normalize_errors))
+        .layer(middleware::from_fn_with_state(state, request_id_middleware))
 }
 
 /// Start the web server
 pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::error::ApiResult<()> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-
     tracing::info!("Web API server listening on {}", addr);
+    warn_if_exposed_without_tls(&config);
+
+    let sessions = state.session_manager.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            let s = sessions.clone();
+            match tokio::task::spawn_blocking(move || s.purge_expired()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("session purge failed: {e}"),
+                Err(e) => tracing::warn!("session purge task failed: {e}"),
+            }
+        }
+    });
 
     let router = create_router(state, &config);
-
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| crate::error::ApiError::Internal(e.to_string()))?;
-
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(())
 }
 
-/// Build CORS layer from configuration
-///
-/// SECURITY: Uses explicit origin allowlist instead of wildcard.
-/// Cannot use `Any` with `allow_credentials(true)`.
-fn build_cors_layer(origins: &[String]) -> CorsLayer {
+/// The server speaks plain HTTP. Bound beyond loopback, logins and session cookies cross the
+/// network in clear unless a TLS-terminating reverse proxy sits in front. Logged once at startup.
+fn warn_if_exposed_without_tls(config: &ApiConfig) {
+    let host = config.server.host.trim_matches(['[', ']']);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        tracing::warn!(
+            "Web UI is bound to {host} without TLS: passwords and session cookies are sent in \
+             clear text. Put a TLS-terminating reverse proxy in front (and list it under \
+             network.trusted_proxies so cookies get the Secure flag) or bind to 127.0.0.1."
+        );
+    }
+}
+
+/// CORS: same-origin only unless origins are allowlisted (then credentials are allowed for
+/// exactly those origins).
+fn build_cors_layer(origins: &[String]) -> Option<CorsLayer> {
     use tower_http::cors::AllowOrigin;
 
-    // Build list of allowed origins
-    let allowed_origins: Vec<HeaderValue> = origins
+    let allowed: Vec<HeaderValue> = origins
         .iter()
-        .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+        .filter_map(|o| o.parse::<HeaderValue>().ok())
         .collect();
-
-    // Fallback to development origin if none configured
-    let origins = if allowed_origins.is_empty() {
-        tracing::warn!("No CORS origins configured, using localhost:5173 default");
-        vec!["http://localhost:5173".parse::<HeaderValue>().unwrap()]
-    } else {
-        allowed_origins
-    };
-
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([
-            header::ACCEPT,
-            header::AUTHORIZATION,
-            header::CONTENT_TYPE,
-            header::COOKIE,
-        ])
-        .allow_credentials(true)
-        .max_age(std::time::Duration::from_secs(3600)) // Cache preflight for 1 hour
+    if allowed.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed))
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::ACCEPT,
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::IF_MATCH,
+                header::HeaderName::from_static("x-csrf-token"),
+                header::HeaderName::from_static("x-request-id"),
+            ])
+            .expose_headers([
+                header::ETAG,
+                header::HeaderName::from_static("x-request-id"),
+            ])
+            .allow_credentials(true)
+            .max_age(std::time::Duration::from_secs(3600)),
+    )
 }

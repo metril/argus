@@ -1,0 +1,11 @@
+! AdGuard Home
+||ads.example.com^
+@@||ok.example.com^
+||imp.example.com^$important
+||aaaa.example.com^$dnstype=AAAA
+||dev.example.com^$client=192.168.0.1
+||rewrite.example.com^$dnsrewrite=1.2.3.4
+/^ads[0-9]+\.example\.com$/
+||wild*.example.com^
+plain.example.org
+0.0.0.0 hostsline.example.org

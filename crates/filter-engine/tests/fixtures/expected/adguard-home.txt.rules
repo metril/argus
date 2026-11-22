@@ -1,0 +1,7 @@
+||ads.example.com^
+@@||ok.example.com^
+||imp.example.com^$important
+/^[a-z][a-z0-9+.-]*:\/\/(?:[^\/?#@]*@)?(?:ads[0-9]+\.example\.com)(?::\d+)?(?:[\/?#]|\z)/
+||wild*.example.com^
+||plain.example.org^
+||hostsline.example.org^

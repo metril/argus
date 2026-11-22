@@ -25,6 +25,49 @@ pub struct ApiConfig {
 
     /// WebUI settings
     pub webui: WebUiConfig,
+
+    /// Audit log retention.
+    #[serde(default)]
+    pub audit: AuditConfig,
+
+    /// Client-address handling and auth-endpoint limits.
+    #[serde(default)]
+    pub network: NetworkConfig,
+}
+
+/// Audit log bounds: whichever limit is hit first prunes the oldest entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    pub max_entries: usize,
+    pub retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            retention_days: 90,
+        }
+    }
+}
+
+/// Network-facing settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    /// Reverse proxies whose `X-Forwarded-For` / `X-Real-IP` headers are trusted. Empty means
+    /// the socket peer address is always used.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// Per-IP limit for login/register/refresh.
+    pub auth_requests_per_minute: u32,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            auth_requests_per_minute: 10,
+        }
+    }
 }
 
 /// Server configuration
@@ -120,17 +163,21 @@ pub struct SecurityConfig {
     /// Allowed CORS origins
     pub cors_origins: Vec<String>,
 
-    /// Cookie secure flag
-    pub cookie_secure: bool,
+    /// `Secure` flag on session cookies: `auto` (default) sets it when the request arrived over
+    /// HTTPS (`X-Forwarded-Proto: https` from a trusted proxy), `always` or `never`. A boolean
+    /// is still accepted (`true` = `always`, `false` = `never`).
+    pub cookie_secure: CookieSecure,
 }
+
+pub use common::config::CookieSecure;
 
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             enable_csrf: true,
-            require_https: false, // Development default
-            cors_origins: vec!["http://localhost:5173".to_string()],
-            cookie_secure: false, // Development default
+            require_https: false,     // Development default
+            cors_origins: Vec::new(), // same-origin only unless allowlisted
+            cookie_secure: CookieSecure::Auto,
         }
     }
 }
@@ -138,7 +185,8 @@ impl Default for SecurityConfig {
 /// Session storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Path to session storage directory
+    /// Directory holding `adblocker.redb` (the one database file shared by users, sessions,
+    /// tokens, audit and userscripts)
     pub storage_path: PathBuf,
 
     /// Cleanup interval in seconds

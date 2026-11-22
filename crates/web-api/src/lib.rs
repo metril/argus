@@ -1,54 +1,18 @@
-//! Web API - RESTful API backend for the adblocker proxy
+//! Web API - versioned REST control plane for the adblocker proxy.
 //!
-//! Provides a secure, production-ready API for managing proxy configuration,
-//! filter lists, userscripts, and monitoring.
-//!
-//! ## API Endpoints
-//!
-//! ### Health
-//! - `GET /api/health` - Health check
-//! - `GET /api/metrics` - System metrics
-//!
-//! ### Authentication
-//! - `POST /api/auth/register` - Register new user
-//! - `POST /api/auth/login` - Login
-//! - `POST /api/auth/logout` - Logout (requires auth)
-//! - `POST /api/auth/refresh` - Refresh access token
-//! - `GET /api/auth/me` - Get current user (requires auth)
-//! - `GET /api/auth/sessions` - List sessions (requires auth)
-//! - `DELETE /api/auth/sessions/{id}` - Revoke session (requires auth)
-//!
-//! ### Proxy Management
-//! - `GET /api/proxy/config` - Get configuration (requires auth)
-//! - `PUT /api/proxy/config` - Update configuration (requires auth)
-//! - `GET /api/proxy/stats` - Get statistics (requires auth)
-//! - `POST /api/proxy/reload-config` - Reload from file (requires admin)
-//!
-//! ### Filter Lists
-//! - `GET /api/filters/lists` - List filter lists (requires auth)
-//! - `POST /api/filters/lists` - Add filter list (requires auth)
-//! - `GET /api/filters/lists/{id}` - Get filter list (requires auth)
-//! - `PUT /api/filters/lists/{id}` - Update filter list (requires auth)
-//! - `DELETE /api/filters/lists/{id}` - Delete filter list (requires auth)
-//! - `GET /api/filters/stats` - Get blocking stats (requires auth)
-//! - `POST /api/filters/stats/reset` - Reset stats (requires admin)
-//!
-//! ### Userscripts
-//! - `GET /api/userscripts` - List userscripts (requires auth)
-//! - `POST /api/userscripts` - Install userscript (requires auth)
-//! - `GET /api/userscripts/{id}` - Get userscript (requires auth)
-//! - `GET /api/userscripts/{id}/source` - Get source code (requires auth)
-//! - `PUT /api/userscripts/{id}` - Update userscript (requires auth)
-//! - `DELETE /api/userscripts/{id}` - Uninstall userscript (requires auth)
-//! - `PUT /api/userscripts/{id}/enabled` - Enable/disable (requires auth)
-//! - `GET /api/userscripts/stats` - Get statistics (requires auth)
+//! Everything lives under `/api/v1`; the OpenAPI document is served at
+//! `/api/v1/openapi.json` and a docs UI at `/api/v1/docs`. Routes are registered through their
+//! `#[utoipa::path]` declarations (see [`routes`]) and authorization is deny-by-default with
+//! one scope declaration per route (see [`auth::authz`]). See `docs/API.md`.
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod middleware;
 pub mod openapi;
+pub mod routes;
 pub mod server;
 pub mod state;
 
@@ -57,5 +21,5 @@ pub use config::ApiConfig;
 pub use error::{ApiError, ApiResult};
 pub use list_service::{ListService, ListServiceConfig, ListStatus, ListStore};
 pub use openapi::ApiDoc;
-pub use server::{create_router, start_server};
+pub use server::{build_api, create_router, create_router_with, start_server};
 pub use state::{build_state, AppState, ProxyState, ProxyStats};

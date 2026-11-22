@@ -1,0 +1,5 @@
+||ads.example.com^
+@@||ok.example.com^$document
+example.com##.banner
+example.com#@#.keep
+||cdn.example.com^$script,third-party

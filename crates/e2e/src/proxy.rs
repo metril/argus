@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use filter_engine::{compile_engine, SharedEngine};
+use filter_engine::SharedEngine;
 use proxy_core::config::{
     AdblockSettings, MitmSettings, PerformanceSettings, ProxyConfig, ProxySettings,
     UserscriptSettings, WebUiSettings,
@@ -47,6 +47,36 @@ impl OriginalDst for TestDst {
     }
 }
 
+/// Compile `rules` as one filter list and install engine and extended-rule index together, the
+/// way the list service does. The list is trusted (extended rules that run code are active)
+/// unless `rules` contains the comment line `!untrusted`.
+pub fn install_rules(engine: &SharedEngine, rules: &[&str]) {
+    let trusted = !rules.contains(&"!untrusted");
+    let text: String = rules.iter().map(|r| format!("{r}\n")).collect();
+    let built = filter_engine::build_set(&[filter_engine::ListInput {
+        id: "test".into(),
+        content: text,
+        format: filter_engine::ListFormat::Abp,
+        allowlist: false,
+        trusted,
+        includes: Default::default(),
+    }]);
+    let mut ext = built.ext;
+    for e in &mut ext {
+        e.trusted = trusted;
+    }
+    let index = Arc::new(ext_rules::ExtIndex::build(&ext));
+    let live = filter_engine::build_engine(&built.blob, &engine.resources());
+    engine.install_set_with(
+        Arc::new(built.blob),
+        live,
+        Some(index),
+        Arc::new(ext),
+        Arc::new(built.ip),
+        Arc::new(built.domains),
+    );
+}
+
 /// The real proxy running in-process on an ephemeral port.
 pub struct TestProxy {
     pub mode: EntryMode,
@@ -68,6 +98,11 @@ pub struct TestProxy {
 }
 
 impl TestProxy {
+    /// Replace the installed rules (engine and extended-rule index swap as one generation).
+    pub fn install_rules(&self, rules: &[&str]) {
+        install_rules(&self.engine, rules);
+    }
+
     /// Start a proxy that trusts `origin`'s CA, resolves every hostname to the origin, and
     /// filters with `rules` (filter-list text lines, compiled directly, no downloads).
     pub async fn start(
@@ -167,8 +202,7 @@ impl TestProxy {
 
         let engine = Arc::new(SharedEngine::new());
         engine.set_enabled(true);
-        let lines: Vec<String> = rules.iter().map(|r| format!("{r}\n")).collect();
-        engine.install(compile_engine(&lines));
+        install_rules(&engine, rules);
 
         let ctx = Arc::new(
             ProxyContext::with_upstream(
@@ -181,6 +215,7 @@ impl TestProxy {
             )
             .map_err(|e| e.to_string())?,
         );
+        ctx.set_respect_no_transform(config.adblock.respect_no_transform);
         // A public-looking address (TEST-NET-3): the destination policy refuses loopback, and the
         // dial is redirected to the origin by the resolve override anyway.
         let fake = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));

@@ -1,0 +1,15 @@
+format=domains
+total_lines=9
+converted=5
+skipped=0
+error_count=3
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }
+error line 6: label starts or ends with `-`: `-bad-.example.com`
+error line 7: unrecognised line
+error line 8: looks like an IP address: `192.0.2.1`

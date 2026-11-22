@@ -2,15 +2,19 @@
 //!
 //! Defines the shared state that is passed to all handlers via Arc<AppState>.
 
+use crate::audit::AuditStore;
+use crate::auth::authz::RouteTable;
 use crate::auth::models::User;
 use crate::auth::session::SessionManager;
+use crate::auth::tokens::TokenStore;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
 use chrono::Utc;
 use common::config::ProxyConfig;
-use dashmap::DashMap;
+use common::db::redb::{Durability, ReadableTable};
+use common::db::{tables, Db, DbError};
 use filter_engine::{FilterStats, SharedEngine};
-use governor::{Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
 use list_service::{ListService, ListStore};
 use parking_lot::RwLock;
 use std::net::IpAddr;
@@ -18,6 +22,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 use userscript_engine::{UserscriptManager, UserscriptRuntime};
 use uuid::Uuid;
 
@@ -55,11 +61,33 @@ pub struct AppState {
     /// JWT configuration
     pub jwt_config: Arc<JwtConfig>,
 
+    /// bcrypt hash (at the configured cost) verified against when a login names no usable
+    /// account, so the response time does not reveal which usernames exist.
+    pub dummy_hash: String,
+
     /// Rate limiters
     pub rate_limiters: Arc<RateLimiters>,
 
     /// Path to proxy configuration file for reloading
     pub config_path: Arc<RwLock<PathBuf>>,
+
+    /// API server settings (CSRF, cookies, trusted proxies, ...).
+    pub api_config: ApiConfig,
+
+    /// Personal access tokens.
+    pub tokens: Arc<TokenStore>,
+
+    /// Persisted audit log.
+    pub audit: Arc<AuditStore>,
+
+    /// Process start, for uptime.
+    pub started_at: Instant,
+
+    /// Serialised OpenAPI document; set once by `create_router`.
+    pub spec_json: OnceLock<String>,
+
+    /// Route -> required scopes, derived from the OpenAPI spec by `create_router`.
+    pub route_auth: OnceLock<RouteTable>,
 }
 
 /// Proxy state wrapper
@@ -188,168 +216,246 @@ pub struct JwtConfig {
     pub audience: String,
 }
 
-/// Session store for user authentication and session management
+/// User accounts (persistent), on the shared database.
+///
+/// Durability: user changes are `Immediate` and must be made from a blocking context (see
+/// [`blocking`]); `last_login` is written lazily through the coalescing writer.
 pub struct SessionStore {
-    /// Sled database for persistent storage
-    db: sled::Db,
+    db: Arc<Db>,
+    /// Serialises changes that must preserve the "at least one enabled admin" invariant.
+    pub admin_lock: parking_lot::Mutex<()>,
+}
+
+fn user_json(user: &User) -> ApiResult<Vec<u8>> {
+    serde_json::to_vec(user).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 impl SessionStore {
+    /// Open the shared database in the directory `path`.
     pub fn new(path: PathBuf) -> ApiResult<Self> {
-        let db = sled::open(path)?;
-        Ok(Self { db })
+        Ok(Self::with_db(Db::open(&path)?))
     }
 
-    /// Get the users tree
-    fn users_tree(&self) -> ApiResult<sled::Tree> {
-        Ok(self.db.open_tree("users")?)
+    pub fn with_db(db: Arc<Db>) -> Self {
+        Self {
+            db,
+            admin_lock: parking_lot::Mutex::new(()),
+        }
     }
 
-    /// Get the username index tree
-    fn username_index(&self) -> ApiResult<sled::Tree> {
-        Ok(self.db.open_tree("username_index")?)
+    /// The shared database handle (other stores keep their tables in it).
+    pub fn db(&self) -> Arc<Db> {
+        self.db.clone()
     }
 
-    /// Store a user in the database
+    /// Number of enabled administrators.
+    pub fn enabled_admin_count(&self) -> ApiResult<usize> {
+        Ok(self
+            .get_all_users()?
+            .iter()
+            .filter(|u| u.enabled && u.role.is_admin())
+            .count())
+    }
+
+    /// Store a user and its username index entry in one transaction. A username already taken
+    /// by another user fails with `AlreadyExists` and nothing is written; renaming a user moves
+    /// the index entry atomically.
     pub fn store_user(&self, user: &User) -> ApiResult<()> {
-        let users = self.users_tree()?;
-        let index = self.username_index()?;
+        let bytes = user_json(user)?;
+        let id = user.id.to_string();
+        self.db.write::<_, ApiError>(Durability::Immediate, |t| {
+            let mut users = t.open_table(tables::USERS).map_err(DbError::from)?;
+            let mut names = t.open_table(tables::USERNAMES).map_err(DbError::from)?;
+            let owner = names
+                .get(user.username.as_str())
+                .map_err(DbError::from)?
+                .map(|g| g.value().to_string());
+            if owner.is_some_and(|o| o != id) {
+                return Err(ApiError::AlreadyExists(format!("User '{}'", user.username)));
+            }
+            let previous = users
+                .get(id.as_str())
+                .map_err(DbError::from)?
+                .and_then(|g| serde_json::from_slice::<User>(g.value()).ok());
+            if let Some(prev) = previous.filter(|p| p.username != user.username) {
+                names
+                    .remove(prev.username.as_str())
+                    .map_err(DbError::from)?;
+            }
+            users
+                .insert(id.as_str(), bytes.as_slice())
+                .map_err(DbError::from)?;
+            names
+                .insert(user.username.as_str(), id.as_str())
+                .map_err(DbError::from)?;
+            Ok(())
+        })
+    }
 
-        let user_bytes = serde_json::to_vec(user).map_err(|e| ApiError::Internal(e.to_string()))?;
-
-        // Store user by ID
-        users.insert(user.id.as_bytes(), user_bytes)?;
-
-        // Store username -> ID index
-        index.insert(user.username.as_bytes(), user.id.as_bytes())?;
-
-        Ok(())
+    fn load(&self, id: &str) -> ApiResult<Option<User>> {
+        self.db.read::<_, ApiError>(|r| {
+            let users = r.open_table(tables::USERS).map_err(DbError::from)?;
+            let found = users.get(id).map_err(DbError::from)?;
+            found
+                .map(|g| {
+                    serde_json::from_slice(g.value()).map_err(|e| ApiError::Internal(e.to_string()))
+                })
+                .transpose()
+        })
     }
 
     /// Get a user by ID
     pub fn get_user(&self, id: &Uuid) -> ApiResult<Option<User>> {
-        let users = self.users_tree()?;
-
-        match users.get(id.as_bytes())? {
-            Some(bytes) => {
-                let user: User = serde_json::from_slice(&bytes)
-                    .map_err(|e| ApiError::Internal(e.to_string()))?;
-                Ok(Some(user))
-            }
-            None => Ok(None),
-        }
+        self.load(&id.to_string())
     }
 
-    /// Get a user by username
+    /// Get a user by username (index and user are read from one snapshot).
     pub fn get_user_by_username(&self, username: &str) -> ApiResult<Option<User>> {
-        let index = self.username_index()?;
-
-        match index.get(username.as_bytes())? {
-            Some(id_bytes) => {
-                let id =
-                    Uuid::from_slice(&id_bytes).map_err(|e| ApiError::Internal(e.to_string()))?;
-                self.get_user(&id)
-            }
-            None => Ok(None),
-        }
+        self.db.read::<_, ApiError>(|r| {
+            let names = r.open_table(tables::USERNAMES).map_err(DbError::from)?;
+            let users = r.open_table(tables::USERS).map_err(DbError::from)?;
+            let Some(id) = names
+                .get(username)
+                .map_err(DbError::from)?
+                .map(|g| g.value().to_string())
+            else {
+                return Ok(None);
+            };
+            let found = users.get(id.as_str()).map_err(DbError::from)?;
+            found
+                .map(|g| {
+                    serde_json::from_slice(g.value()).map_err(|e| ApiError::Internal(e.to_string()))
+                })
+                .transpose()
+        })
     }
 
-    /// Update user's last login timestamp
+    /// Update the user's last login timestamp (queued; coalesced, no fsync).
     pub fn update_last_login(&self, id: &Uuid) -> ApiResult<()> {
-        if let Some(mut user) = self.get_user(id)? {
-            user.last_login = Some(Utc::now());
-            self.store_user(&user)?;
-        }
+        let id = id.to_string();
+        let now = Utc::now();
+        self.db.defer(move |t| {
+            let mut users = t.open_table(tables::USERS)?;
+            let cur = users.get(id.as_str())?.map(|g| g.value().to_vec());
+            if let Some(mut u) = cur.and_then(|b| serde_json::from_slice::<User>(&b).ok()) {
+                u.last_login = Some(now);
+                if let Ok(b) = serde_json::to_vec(&u) {
+                    users.insert(id.as_str(), b.as_slice())?;
+                }
+            }
+            Ok(())
+        });
         Ok(())
     }
 
     /// Check if a username exists
     pub fn username_exists(&self, username: &str) -> ApiResult<bool> {
-        let index = self.username_index()?;
-        Ok(index.contains_key(username.as_bytes())?)
+        self.db.read::<_, ApiError>(|r| {
+            let names = r.open_table(tables::USERNAMES).map_err(DbError::from)?;
+            let found = names.get(username).map_err(DbError::from)?.is_some();
+            Ok(found)
+        })
     }
 
-    /// Delete a user
+    /// Delete a user and its username index entry in one transaction.
     pub fn delete_user(&self, id: &Uuid) -> ApiResult<bool> {
-        let users = self.users_tree()?;
-        let index = self.username_index()?;
-
-        if let Some(user) = self.get_user(id)? {
-            users.remove(id.as_bytes())?;
-            index.remove(user.username.as_bytes())?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let id = id.to_string();
+        self.db.write::<_, ApiError>(Durability::Immediate, |t| {
+            let mut users = t.open_table(tables::USERS).map_err(DbError::from)?;
+            let mut names = t.open_table(tables::USERNAMES).map_err(DbError::from)?;
+            let old = users
+                .remove(id.as_str())
+                .map_err(DbError::from)?
+                .and_then(|g| serde_json::from_slice::<User>(g.value()).ok());
+            match old {
+                Some(u) => {
+                    names.remove(u.username.as_str()).map_err(DbError::from)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        })
     }
 
     /// Get all users
     pub fn get_all_users(&self) -> ApiResult<Vec<User>> {
-        let users = self.users_tree()?;
-        let mut result = Vec::new();
-
-        for item in users.iter() {
-            let (_, value) = item.map_err(|e| ApiError::Internal(e.to_string()))?;
-            let user: User =
-                serde_json::from_slice(&value).map_err(|e| ApiError::Internal(e.to_string()))?;
-            result.push(user);
-        }
-
-        Ok(result)
+        self.db.read::<_, ApiError>(|r| {
+            let users = r.open_table(tables::USERS).map_err(DbError::from)?;
+            let mut result = Vec::new();
+            for item in users.iter().map_err(DbError::from)? {
+                let (_, v) = item.map_err(DbError::from)?;
+                result.push(
+                    serde_json::from_slice::<User>(v.value())
+                        .map_err(|e| ApiError::Internal(e.to_string()))?,
+                );
+            }
+            Ok(result)
+        })
     }
 }
 
-/// Multi-tier rate limiters
+/// Run a storage operation on the blocking pool: redb write transactions fsync, so they must
+/// never run on an async worker thread.
+pub async fn blocking<T, F>(f: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::Internal(format!("storage task failed: {e}")))?
+}
+
+/// Rate limiters: global, per client IP, stricter per-IP for auth endpoints, and per principal
+/// (user session or API token).
 pub struct RateLimiters {
-    /// Global rate limiter (all requests)
-    pub global: Arc<
-        RwLock<
-            RateLimiter<
-                governor::state::direct::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
+    global: DefaultDirectRateLimiter,
+    ip: DefaultKeyedRateLimiter<IpAddr>,
+    auth: DefaultKeyedRateLimiter<IpAddr>,
+    principal: DefaultKeyedRateLimiter<String>,
+    checks: std::sync::atomic::AtomicU64,
+}
 
-    /// Per-IP rate limiters
-    pub per_ip: Arc<
-        DashMap<
-            IpAddr,
-            RateLimiter<
-                governor::state::direct::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
-
-    /// Per-user rate limiters
-    pub per_user: Arc<
-        DashMap<
-            String,
-            RateLimiter<
-                governor::state::direct::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
+fn per_minute(n: u64) -> Quota {
+    Quota::per_minute(
+        NonZeroU32::new(n.clamp(1, u32::MAX as u64) as u32).unwrap_or(NonZeroU32::MIN),
+    )
 }
 
 impl RateLimiters {
-    pub fn new(global_rpm: u64, _ip_rpm: u64, _user_rpm: u64) -> Self {
-        // Convert to NonZeroU32, defaulting to 1 if 0 or too large
-        let global_rpm_u32 = NonZeroU32::new(global_rpm.min(u32::MAX as u64) as u32)
-            .unwrap_or(NonZeroU32::new(1).unwrap());
-        let global_quota = Quota::per_minute(global_rpm_u32);
-        let global_limiter = RateLimiter::direct(global_quota);
-
+    pub fn new(global_rpm: u64, ip_rpm: u64, principal_rpm: u64, auth_rpm: u64) -> Self {
         Self {
-            global: Arc::new(RwLock::new(global_limiter)),
-            per_ip: Arc::new(DashMap::new()),
-            per_user: Arc::new(DashMap::new()),
+            global: governor::RateLimiter::direct(per_minute(global_rpm)),
+            ip: governor::RateLimiter::keyed(per_minute(ip_rpm)),
+            auth: governor::RateLimiter::keyed(per_minute(auth_rpm)),
+            principal: governor::RateLimiter::keyed(per_minute(principal_rpm)),
+            checks: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn housekeeping(&self) {
+        if self.checks.fetch_add(1, Ordering::Relaxed) % 4096 == 4095 {
+            self.ip.retain_recent();
+            self.auth.retain_recent();
+            self.principal.retain_recent();
+        }
+    }
+
+    pub fn check_global(&self) -> bool {
+        self.global.check().is_ok()
+    }
+
+    pub fn check_ip(&self, ip: IpAddr) -> bool {
+        self.housekeeping();
+        self.ip.check_key(&ip).is_ok()
+    }
+
+    pub fn check_auth(&self, ip: IpAddr) -> bool {
+        self.auth.check_key(&ip).is_ok()
+    }
+
+    pub fn check_principal(&self, key: &str) -> bool {
+        self.principal.check_key(&key.to_string()).is_ok()
     }
 }
 
@@ -366,6 +472,15 @@ pub async fn build_state(
     config_path: PathBuf,
     request_timeout_ms: Arc<AtomicU64>,
 ) -> ApiResult<Arc<AppState>> {
+    crate::auth::password::validate_bcrypt_cost(api_config.auth.bcrypt_cost)?;
+    if api_config.auth.bcrypt_cost < crate::auth::password::RECOMMENDED_MIN_BCRYPT_COST {
+        tracing::warn!(
+            "auth.bcrypt_cost = {} is weak; use {} or more outside of tests",
+            api_config.auth.bcrypt_cost,
+            crate::auth::password::RECOMMENDED_MIN_BCRYPT_COST
+        );
+    }
+
     // Initialize JWT config
     let jwt_config = Arc::new(JwtConfig {
         secret: load_or_generate_jwt_secret(&api_config.auth.jwt_secret_path).await?,
@@ -375,17 +490,34 @@ pub async fn build_state(
         audience: api_config.auth.audience.clone(),
     });
 
+    let dummy_hash = {
+        let cost = api_config.auth.bcrypt_cost;
+        tokio::task::spawn_blocking(move || {
+            crate::auth::password::hash_password("dummy-password-never-matches", cost)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??
+    };
+
     // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
+    let db = session_store.db();
 
-    // Initialize session manager (in-memory active sessions)
-    let session_manager = Arc::new(SessionManager::default());
+    // Sessions (committed before revocation takes effect), tokens and audit share the db.
+    let session_manager = Arc::new(SessionManager::new(db.clone())?);
+    let tokens = Arc::new(TokenStore::new(db.clone())?);
+    let audit = Arc::new(AuditStore::new(
+        db,
+        api_config.audit.max_entries,
+        api_config.audit.retention_days,
+    )?);
 
     // Initialize rate limiters
     let rate_limiters = Arc::new(RateLimiters::new(
         api_config.rate_limit.global_requests_per_minute,
         api_config.rate_limit.ip_requests_per_minute,
         api_config.rate_limit.user_requests_per_minute,
+        api_config.network.auth_requests_per_minute as u64,
     ));
 
     // Create proxy state
@@ -413,8 +545,15 @@ pub async fn build_state(
         session_store,
         session_manager,
         jwt_config,
+        dummy_hash,
         rate_limiters,
         config_path: Arc::new(RwLock::new(config_path)),
+        api_config,
+        tokens,
+        audit,
+        started_at: Instant::now(),
+        spec_json: OnceLock::new(),
+        route_auth: OnceLock::new(),
     }))
 }
 
@@ -451,4 +590,121 @@ async fn load_or_generate_jwt_secret(path: &PathBuf) -> ApiResult<String> {
     tracing::info!("Generated new JWT secret at {:?}", path);
 
     Ok(secret_base64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_types::UserRole;
+
+    fn store() -> (SessionStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (SessionStore::new(dir.path().to_path_buf()).unwrap(), dir)
+    }
+
+    fn user(name: &str) -> User {
+        User::new(name.into(), "hash".into(), UserRole::Viewer)
+    }
+
+    #[test]
+    fn roundtrip_and_index() {
+        let (s, _d) = store();
+        let u = user("alice");
+        s.store_user(&u).unwrap();
+        assert_eq!(s.get_user(&u.id).unwrap().unwrap().username, "alice");
+        assert_eq!(s.get_user_by_username("alice").unwrap().unwrap().id, u.id);
+        assert!(s.username_exists("alice").unwrap());
+        assert!(s.delete_user(&u.id).unwrap());
+        assert!(!s.username_exists("alice").unwrap());
+        assert!(s.get_user(&u.id).unwrap().is_none());
+        assert!(!s.delete_user(&u.id).unwrap());
+    }
+
+    #[test]
+    fn duplicate_username_writes_nothing() {
+        let (s, _d) = store();
+        let first = user("bob");
+        s.store_user(&first).unwrap();
+        let dup = user("bob");
+        assert!(matches!(
+            s.store_user(&dup),
+            Err(ApiError::AlreadyExists(_))
+        ));
+        // Neither the user row nor the index moved.
+        assert!(s.get_user(&dup.id).unwrap().is_none());
+        assert_eq!(s.get_user_by_username("bob").unwrap().unwrap().id, first.id);
+        assert_eq!(s.get_all_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_creation_of_one_username_has_one_winner() {
+        let (s, _d) = store();
+        let s = Arc::new(s);
+        let wins: usize = (0..8)
+            .map(|_| {
+                let s = s.clone();
+                std::thread::spawn(move || s.store_user(&user("carol")).is_ok())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum();
+        assert_eq!(wins, 1);
+        assert_eq!(s.get_all_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rename_moves_the_index_atomically() {
+        let (s, _d) = store();
+        let mut u = user("old");
+        s.store_user(&u).unwrap();
+        u.username = "new".into();
+        s.store_user(&u).unwrap();
+        assert!(!s.username_exists("old").unwrap());
+        assert_eq!(s.get_user_by_username("new").unwrap().unwrap().id, u.id);
+    }
+
+    #[test]
+    fn users_survive_restart_and_last_login_is_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let s = SessionStore::new(dir.path().to_path_buf()).unwrap();
+            let u = user("dave");
+            s.store_user(&u).unwrap();
+            s.update_last_login(&u.id).unwrap();
+            u.id
+        };
+        let s = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let u = s.get_user_by_username("dave").unwrap().unwrap();
+        assert_eq!(u.id, id);
+        assert!(u.last_login.is_some());
+    }
+
+    #[test]
+    fn legacy_sled_directory_does_not_break_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("sessions");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("conf"), b"x").unwrap();
+        std::fs::write(old.join("db"), b"x").unwrap();
+        let s = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        s.store_user(&user("erin")).unwrap();
+        assert_eq!(s.get_all_users().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            db.write::<_, DbError>(Durability::Immediate, |t| {
+                t.open_table(tables::META)?
+                    .insert("schema_version", 999u32.to_be_bytes().as_slice())?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let err = SessionStore::new(dir.path().to_path_buf()).err().unwrap();
+        assert!(err.to_string().contains("newer"), "{err}");
+    }
 }

@@ -1,0 +1,12 @@
+||ads.example.com^
+||wild.example.org^
+|http://exact.example.net^
+|https://exact.example.net^
+|ws://exact.example.net^
+|wss://exact.example.net^
+||r1.example.com^
+||r2.example.com^
+@@|http://ok.example.com^
+@@|https://ok.example.com^
+@@|ws://ok.example.com^
+@@|wss://ok.example.com^

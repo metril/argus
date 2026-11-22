@@ -89,6 +89,25 @@ pub struct AdblockSettings {
     /// Maximum accepted size of a downloaded list, in bytes.
     #[serde(default = "default_max_list_bytes")]
     pub max_list_bytes: usize,
+    /// Destinations the control plane (list, `!#include` and resource downloads) may fetch from
+    /// although they are private: CIDRs / IPs, or host names (a listed name may resolve to
+    /// private addresses). Private ranges are refused by default and loopback, link-local and
+    /// other reserved addresses always (unless given as a CIDR/IP here).
+    #[serde(default)]
+    pub allowed_fetch_destinations: Vec<String>,
+    /// Keep the query string of URLs in the recent-blocked list. Off by default: query strings
+    /// often carry tokens, so they are stripped before storing.
+    #[serde(default)]
+    pub recent_blocked_keep_query: bool,
+    /// Leave response bodies alone when the origin sends `Cache-Control: no-transform`
+    /// (header-only edits still apply). Many CDNs set it on everything; turn this off to rewrite
+    /// those pages anyway.
+    #[serde(default = "default_true")]
+    pub respect_no_transform: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Default client ACL: local and private networks only.
@@ -122,10 +141,10 @@ fn default_max_list_bytes() -> usize {
 }
 
 fn default_scriptlet_resources_url() -> String {
-    // uBlock Origin's scriptlet source directory (GitHub contents API). Every `.js` file is
-    // downloaded, concatenated, and converted to adblock-rust resources at runtime. Fetched on the
-    // user's machine (not vendored) since uBO's scriptlets are GPLv3.
-    "https://api.github.com/repos/gorhill/uBlock/contents/src/js/resources".to_string()
+    // Raw-file base URL of uBlock Origin's scriptlet directory. A fixed list of files is fetched
+    // from it, concatenated and converted to adblock-rust resources; a pinned snapshot is bundled
+    // in the binary as the offline fallback and this copy replaces it when available.
+    "https://raw.githubusercontent.com/gorhill/uBlock/master/src/js/resources".to_string()
 }
 
 impl Default for AdblockSettings {
@@ -139,21 +158,68 @@ impl Default for AdblockSettings {
             list_fetch_concurrency: default_list_fetch_concurrency(),
             list_fetch_timeout_secs: default_list_fetch_timeout_secs(),
             max_list_bytes: default_max_list_bytes(),
+            allowed_fetch_destinations: Vec::new(),
+            recent_blocked_keep_query: false,
+            respect_no_transform: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
-    pub data_dir: PathBuf,
 }
 
-impl Default for UserscriptSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            data_dir: PathBuf::from("data/userscripts"),
+/// When session cookies carry the `Secure` attribute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CookieSecure {
+    /// Only for requests that arrived over HTTPS, so plain-HTTP LAN access keeps working.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl Serialize for CookieSecure {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            CookieSecure::Auto => "auto",
+            CookieSecure::Always => "always",
+            CookieSecure::Never => "never",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CookieSecure {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Str(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Bool(true) => Ok(CookieSecure::Always),
+            Raw::Bool(false) => Ok(CookieSecure::Never),
+            Raw::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "auto" => Ok(CookieSecure::Auto),
+                "always" => Ok(CookieSecure::Always),
+                "never" => Ok(CookieSecure::Never),
+                other => Err(serde::de::Error::custom(format!(
+                    "cookie_secure must be auto, always or never, not {other:?}"
+                ))),
+            },
+        }
+    }
+}
+
+impl CookieSecure {
+    /// Whether to set `Secure` for a request that did (`https`) or did not arrive over HTTPS.
+    pub fn applies(self, https: bool) -> bool {
+        match self {
+            CookieSecure::Auto => https,
+            CookieSecure::Always => true,
+            CookieSecure::Never => false,
         }
     }
 }
@@ -164,11 +230,18 @@ pub struct WebUiSettings {
     pub host: String,
     pub port: u16,
     pub jwt_secret_path: PathBuf,
-    pub session_storage_path: PathBuf,
     pub cors_origins: Vec<String>,
     pub rate_limit_global_rpm: u64,
     pub rate_limit_ip_rpm: u64,
     pub rate_limit_user_rpm: u64,
+    /// `Secure` flag on session cookies: `auto` (default; set when the request arrived over
+    /// HTTPS through a trusted proxy), `always` or `never`.
+    #[serde(default)]
+    pub cookie_secure: CookieSecure,
+    /// Reverse proxies (IP addresses) whose `X-Forwarded-For` / `X-Forwarded-Proto` headers are
+    /// trusted. Empty: the socket peer is always used and requests count as plain HTTP.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for WebUiSettings {
@@ -178,11 +251,12 @@ impl Default for WebUiSettings {
             host: "127.0.0.1".to_string(),
             port: 3000,
             jwt_secret_path: PathBuf::from("data/jwt_secret"),
-            session_storage_path: PathBuf::from("data/sessions"),
             cors_origins: vec!["http://localhost:5173".to_string()],
             rate_limit_global_rpm: 10000,
             rate_limit_ip_rpm: 100,
             rate_limit_user_rpm: 1000,
+            cookie_secure: CookieSecure::Auto,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -231,8 +305,22 @@ impl ProxyConfig {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("Failed to read config file: {}", e)))?;
 
-        toml::from_str(&content)
-            .map_err(|e| ConfigError::Parse(format!("Failed to parse config: {}", e)))
+        Self::from_toml(&content)
+    }
+
+    /// Parse configuration from TOML text. Settings that no longer exist are an error, not
+    /// silently ignored.
+    pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
+        let parse = |e: toml::de::Error| ConfigError::Parse(format!("Failed to parse config: {e}"));
+        let doc: toml::Table = content.parse().map_err(parse)?;
+        for (section, key, hint) in REMOVED_SETTINGS {
+            if doc.get(*section).and_then(|s| s.get(*key)).is_some() {
+                return Err(ConfigError::Parse(format!(
+                    "`[{section}] {key}` was removed: {hint}. Delete it from the config file."
+                )));
+            }
+        }
+        toml::from_str(content).map_err(parse)
     }
 
     /// Save configuration to a TOML file
@@ -247,6 +335,20 @@ impl ProxyConfig {
     }
 }
 
+/// Settings that used to exist: `(section, key, what replaced them)`.
+const REMOVED_SETTINGS: &[(&str, &str, &str)] = &[
+    (
+        "userscripts",
+        "data_dir",
+        "userscripts are stored in `<adblock.data_dir>/adblocker.redb`",
+    ),
+    (
+        "webui",
+        "session_storage_path",
+        "sessions are stored in `<adblock.data_dir>/adblocker.redb`",
+    ),
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("I/O error: {0}")]
@@ -255,4 +357,26 @@ pub enum ConfigError {
     Parse(String),
     #[error("Serialize error: {0}")]
     Serialize(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_settings_are_rejected_with_a_clear_message() {
+        let base = toml::to_string(&ProxyConfig::default()).unwrap();
+        assert!(ProxyConfig::from_toml(&base).is_ok());
+        let bad = base.replace("[webui]", "[webui]\nsession_storage_path = \"x\"");
+        let e = ProxyConfig::from_toml(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("session_storage_path") && e.contains("removed"),
+            "{e}"
+        );
+        let bad = base.replace("[userscripts]", "[userscripts]\ndata_dir = \"x\"");
+        assert!(ProxyConfig::from_toml(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("data_dir"));
+    }
 }

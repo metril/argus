@@ -1,0 +1,15 @@
+format=clash
+total_lines=15
+converted=16
+skipped=1
+error_count=0
+translated=0
+ext=0
+ip_block=3
+ip_allow=0
+ext_counts={}
+skipped_reasons={"type-process-name": 1}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }
+ip 198.51.100.0-198.51.100.255
+ip 203.0.113.0-203.0.113.255
+ip 2001:db8:1::-2001:db8:1:ffff:ffff:ffff:ffff:ffff

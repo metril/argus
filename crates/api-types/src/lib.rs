@@ -11,6 +11,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod scopes;
+pub use scopes::{scope_table_markdown, Scope};
+
+mod more;
+pub use more::*;
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -105,6 +111,15 @@ pub struct UserInfo {
     pub role: UserRole,
     pub created_at: String,
     pub last_login: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Effective scopes granted by the role.
+    #[serde(default)]
+    pub scopes: Vec<Scope>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Login/register response.
@@ -121,12 +136,14 @@ pub type RegisterResponse = LoginResponse;
 
 /// Generic `{ "message": ... }` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct MessageResponse {
     pub message: String,
 }
 
 /// Active session description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SessionInfo {
     pub id: String,
     pub created_at: String,
@@ -134,12 +151,13 @@ pub struct SessionInfo {
     #[serde(default)]
     pub user_agent: Option<String>,
     pub ip_address: Option<String>,
-}
-
-/// Sessions list response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionsResponse {
-    pub sessions: Vec<SessionInfo>,
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub username: String,
+    /// True for the session making this request.
+    #[serde(default)]
+    pub current: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +216,7 @@ pub struct UpdateProxyConfigResponse {
 /// Partial proxy configuration update. Every field is optional; omitted fields
 /// are left unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(validator::Validate))]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
 pub struct UpdateProxyConfigRequest {
     #[cfg_attr(feature = "server", validate(length(min = 1, max = 255)))]
     pub host: Option<String>,
@@ -240,6 +258,7 @@ pub struct UpdateProxyConfigRequest {
 
 /// Connection statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ConnectionStats {
     pub total: u64,
     pub active: u64,
@@ -247,6 +266,7 @@ pub struct ConnectionStats {
 
 /// Request statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct RequestStats {
     pub total: u64,
     pub bytes_received: u64,
@@ -256,12 +276,14 @@ pub struct RequestStats {
 
 /// MITM statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct MitmStats {
     pub cached_certificates: usize,
 }
 
 /// Proxy statistics response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ProxyStatsResponse {
     pub connections: ConnectionStats,
     pub requests: RequestStats,
@@ -273,16 +295,39 @@ pub struct ProxyStatsResponse {
 // ---------------------------------------------------------------------------
 
 /// Generic paginated list response.
+/// Uniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaginatedResponse<T> {
-    pub data: Vec<T>,
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// Total matching items across all pages.
     pub total: usize,
     pub page: u32,
     pub limit: u32,
+    pub has_more: bool,
+}
+
+impl<T> Page<T> {
+    /// Slice `all` into the requested page (`page` is 1-based; `limit` clamped to 1..=200).
+    pub fn from_vec(all: Vec<T>, page: Option<u32>, limit: Option<u32>) -> Self {
+        let page = page.unwrap_or(1).max(1);
+        let limit = limit.unwrap_or(50).clamp(1, 200);
+        let total = all.len();
+        let start = ((page - 1) as usize).saturating_mul(limit as usize);
+        let items: Vec<T> = all.into_iter().skip(start).take(limit as usize).collect();
+        Self {
+            has_more: start + items.len() < total,
+            items,
+            total,
+            page,
+            limit,
+        }
+    }
 }
 
 /// Filter list description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct FilterListResponse {
     pub id: String,
     pub name: String,
@@ -296,11 +341,21 @@ pub struct FilterListResponse {
     /// When the list was last fetched or revalidated (RFC 3339).
     #[serde(default)]
     pub last_checked: Option<String>,
+    /// Format override (`auto` detects from the content; see the supported-formats table).
+    #[serde(default)]
+    pub format: String,
+    /// Every rule of the list is treated as an exception.
+    #[serde(default)]
+    pub allowlist: bool,
+    /// Trusted lists may use the code-running extended rules (`$replace`, `$urltransform`,
+    /// `#%#` scripts, snippets, unknown scriptlets); untrusted lists have those dropped.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// Add a filter list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(validator::Validate))]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
 pub struct AddFilterListRequest {
     #[cfg_attr(feature = "server", validate(length(min = 1, max = 100)))]
     pub id: String,
@@ -315,11 +370,20 @@ pub struct AddFilterListRequest {
     pub url: String,
 
     pub enabled: Option<bool>,
+    /// Format override; default `auto`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Treat every rule as an exception (default false).
+    #[serde(default)]
+    pub allowlist: Option<bool>,
+    /// Trust the list's code-running extended rules (default false). Audited.
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 /// Update a filter list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(validator::Validate))]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
 pub struct UpdateFilterListRequest {
     #[cfg_attr(feature = "server", validate(length(min = 1, max = 200)))]
     pub name: Option<String>,
@@ -331,17 +395,25 @@ pub struct UpdateFilterListRequest {
     pub url: Option<String>,
 
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub allowlist: Option<bool>,
+    /// Change the list's trust; recorded in the audit log.
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 /// The user's custom filter rules (raw adblock syntax).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CustomRulesResponse {
     pub rules: String,
 }
 
 /// Replace the user's custom filter rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(validator::Validate))]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
 pub struct UpdateCustomRulesRequest {
     #[cfg_attr(feature = "server", validate(length(max = 1_000_000)))]
     pub rules: String,
@@ -353,6 +425,7 @@ pub struct UpdateCustomRulesRequest {
 
 /// Userscript description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct UserscriptResponse {
     pub id: String,
     pub name: String,
@@ -368,24 +441,28 @@ pub struct UserscriptResponse {
 
 /// Install a userscript from source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct InstallUserscriptRequest {
     pub source: String,
 }
 
 /// Update a userscript's source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct UpdateUserscriptRequest {
     pub source: String,
 }
 
 /// Toggle a userscript's enabled state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SetEnabledRequest {
     pub enabled: bool,
 }
 
 /// Userscript engine statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct UserscriptStatsResponse {
     pub total_scripts: usize,
     pub enabled_scripts: usize,

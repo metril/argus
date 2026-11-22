@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,9 +16,18 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-sled = { workspace = true }
-filter-engine = { path = "../filter-engine" }
+sha2 = { workspace = true }
+rayon = { workspace = true }
+filter-engine = { path = "../filter-engine", default-features = false }
+ext-rules = { path = "../ext-rules" }
 common = { path = "../common" }
+async-compression = { workspace = true, features = ["zstd"] }
+tokio-util = { workspace = true }
+
+[features]
+default = ["bundled-ubo-resources"]
+# Propagates to filter-engine: embed the GPL-3.0 uBO scriptlet snapshot.
+bundled-ubo-resources = ["filter-engine/bundled-ubo-resources"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,26 +1,49 @@
 //! Password hashing utilities
 //!
-//! Uses bcrypt with cost factor 12 for secure password hashing.
+//! bcrypt password hashing; the cost factor comes only from configuration.
 
 use crate::error::{ApiError, ApiResult};
 
-/// bcrypt cost factor (12 is recommended for production)
-const BCRYPT_COST: u32 = 12;
+/// Lowest cost bcrypt itself accepts; anything below is rejected.
+pub const MIN_BCRYPT_COST: u32 = 4;
+/// Highest cost bcrypt accepts.
+pub const MAX_BCRYPT_COST: u32 = 31;
+/// Default cost (config default).
+pub const DEFAULT_BCRYPT_COST: u32 = 12;
+/// Costs below this are accepted (tests) but logged as weak at startup.
+pub const RECOMMENDED_MIN_BCRYPT_COST: u32 = 10;
+
+/// Check a configured bcrypt cost. The cost always comes from config (never from the build
+/// profile); values below [`RECOMMENDED_MIN_BCRYPT_COST`] are valid but only meant for tests.
+pub fn validate_bcrypt_cost(cost: u32) -> ApiResult<()> {
+    if !(MIN_BCRYPT_COST..=MAX_BCRYPT_COST).contains(&cost) {
+        return Err(ApiError::ValidationError(format!(
+            "auth.bcrypt_cost must be between {MIN_BCRYPT_COST} and {MAX_BCRYPT_COST}, got {cost}"
+        )));
+    }
+    Ok(())
+}
 
 /// Hash a password using bcrypt
 ///
 /// # Arguments
 /// * `password` - Plain text password to hash
-///
-/// # Returns
-/// * `ApiResult<String>` - bcrypt hash string
+/// * `cost` - bcrypt cost factor from `auth.bcrypt_cost` (12 is the default, ~250ms)
 ///
 /// # Security
-/// - Uses cost factor 12 (approximately 250ms on modern hardware)
 /// - Automatically generates a random salt
 /// - Output is a 60-character string containing algorithm, cost, salt, and hash
-pub fn hash_password(password: &str) -> ApiResult<String> {
-    bcrypt::hash(password, BCRYPT_COST).map_err(ApiError::from)
+pub fn hash_password(password: &str, cost: u32) -> ApiResult<String> {
+    validate_bcrypt_cost(cost)?;
+    bcrypt::hash(password, cost).map_err(ApiError::from)
+}
+
+static VERIFY_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Number of bcrypt verifications run so far in this process (lets tests assert that a login
+/// does the same work whether or not the account exists).
+pub fn verify_call_count() -> u64 {
+    VERIFY_CALLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Verify a password against a bcrypt hash
@@ -36,6 +59,7 @@ pub fn hash_password(password: &str) -> ApiResult<String> {
 /// - Uses constant-time comparison to prevent timing attacks
 /// - Extracts cost and salt from the hash string automatically
 pub fn verify_password(password: &str, hash: &str) -> ApiResult<bool> {
+    VERIFY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     bcrypt::verify(password, hash).map_err(ApiError::from)
 }
 
@@ -102,10 +126,11 @@ mod tests {
     #[test]
     fn test_hash_and_verify() {
         let password = "SecureP@ssw0rd!";
-        let hash = hash_password(password).unwrap();
+        let hash = hash_password(password, 4).unwrap();
 
-        // Hash should be 60 characters (bcrypt format)
+        // Hash should be 60 characters (bcrypt format), carrying the requested cost
         assert_eq!(hash.len(), 60);
+        assert!(hash.starts_with("$2b$04$"));
 
         // Verify correct password
         assert!(verify_password(password, &hash).unwrap());
@@ -133,5 +158,13 @@ mod tests {
 
         // Missing special character
         assert!(validate_password_strength("NoSpecial1A").is_err());
+    }
+
+    #[test]
+    fn cost_is_validated_not_defaulted_by_build_profile() {
+        assert!(hash_password("x", 3).is_err());
+        assert!(hash_password("x", 32).is_err());
+        assert!(validate_bcrypt_cost(DEFAULT_BCRYPT_COST).is_ok());
+        assert!(validate_bcrypt_cost(MIN_BCRYPT_COST).is_ok());
     }
 }

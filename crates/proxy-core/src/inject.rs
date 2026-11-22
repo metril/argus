@@ -1,48 +1,54 @@
-//! Streaming HTML cosmetic injection.
+//! What we put into a page, and the shared body types.
 //!
-//! For `text/html` responses we insert an element-hiding `<style>`, any scriptlet `<script>`, and a
-//! small dynamic-hiding helper near `</head>`. The body is processed as a stream: we buffer only up
-//! to the injection point (bounded), inject once, then pass the remainder through unbuffered — so
-//! memory stays flat regardless of page size. Compressed HTML is decoded on the fly and re-emitted
-//! as identity.
+//! The per-page delta is small: an inline `<style>` (so hiding applies before first paint), a
+//! non-executing JSON config block, and one or two same-origin external scripts under
+//! `/__adblock__/`: the content-hashed, immutable `boot.js` and (only when the page has
+//! scriptlets) a hash-addressed scriptlet bundle. The config is inline JSON because a
+//! `<script type="application/json">` is not governed by `script-src`, and it saves a round
+//! trip; scriptlets are code, so they must be an external script (or an inline script that a
+//! strict CSP would block, or `eval`, which CSP forbids), and being hash-addressed they are
+//! cached across pages that share them. Everything emitted here is pure ASCII so it is valid in
+//! any ASCII-compatible document encoding.
 
-use std::io;
-use std::pin::Pin;
-
+use crate::internal::{boot_path, Internal};
 use bytes::Bytes;
 use filter_engine::Cosmetics;
 use futures_util::StreamExt;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio_util::io::StreamReader;
+use std::fmt::Write as _;
+use std::io;
 
 /// Unified streaming response body used throughout the proxy.
 ///
-/// `Unsync` because the HTML-injection path holds a `dyn AsyncRead + Send` decoder (Send but not
-/// Sync); hyper only requires the body to be `Send`.
+/// `Unsync` because stream stages hold `Send`-only state; hyper only requires `Send`.
 pub type ProxyBody = UnsyncBoxBody<Bytes, io::Error>;
 
-/// Max bytes to buffer while searching for the injection anchor before giving up and prepending.
-const MAX_SEARCH: usize = 256 * 1024;
+/// A fresh 128-bit nonce from the OS CSPRNG, base64-encoded.
+pub fn new_nonce() -> String {
+    use base64::Engine as _;
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
 
-/// The dynamic class/id hiding helper injected into pages (see `/__adblock__/cc`).
-const HELPER_JS: &str = r#"(function(){if(window.__abH)return;window.__abH=1;
-var seen=new Set(),applied=new Set(),style=null,timer=null,pending=false;
-function ensureStyle(){if(!style){style=document.createElement('style');style.id='__adblock_dynamic';(document.head||document.documentElement).appendChild(style);}return style;}
-function collect(){var cls=new Set(),ids=new Set(),all=document.getElementsByTagName('*');
-for(var i=0;i<all.length;i++){var e=all[i];if(e.classList){for(var j=0;j<e.classList.length;j++)cls.add(e.classList[j]);}if(e.id)ids.add(e.id);}
-var nc=[],ni=[];cls.forEach(function(c){if(!seen.has('c:'+c)){seen.add('c:'+c);nc.push(c);}});ids.forEach(function(d){if(!seen.has('i:'+d)){seen.add('i:'+d);ni.push(d);}});return{classes:nc,ids:ni};}
-function request(){pending=false;var t=collect();if(!t.classes.length&&!t.ids.length)return;
-fetch('/__adblock__/cc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:location.href,classes:t.classes,ids:t.ids}),credentials:'omit'})
-.then(function(r){return r.ok?r.json():null;}).then(function(d){if(!d||!d.selectors)return;var add='';d.selectors.forEach(function(s){if(!applied.has(s)){applied.add(s);add+=s+',';}});if(add){ensureStyle().appendChild(document.createTextNode(add.slice(0,-1)+'{display:none!important}'));}}).catch(function(){});}
-function schedule(){if(pending)return;pending=true;if(timer)clearTimeout(timer);timer=setTimeout(request,200);}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',request);else request();
-try{new MutationObserver(schedule).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class','id']});}catch(e){}})();"#;
+/// Wrap a `Full` of bytes as a [`ProxyBody`].
+pub fn full_body(bytes: Bytes) -> ProxyBody {
+    Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
+}
+
+/// Stream a reqwest response body straight through (no buffering, original encoding preserved).
+pub fn passthrough_body(resp: reqwest::Response) -> ProxyBody {
+    let stream = resp
+        .bytes_stream()
+        .map(|res| res.map(Frame::data).map_err(io::Error::other));
+    BodyExt::boxed_unsync(StreamBody::new(stream))
+}
 
 /// Procedural pseudo-classes that aren't valid CSS and must be evaluated in JS. Note `:has()` is
-/// deliberately excluded — modern browsers support it natively, so it stays in the stylesheet.
+/// deliberately excluded: modern browsers support it natively, so it stays in the stylesheet.
 const PROC_MARKERS: &[&str] = &[
     ":has-text(",
     ":matches-css(",
@@ -62,216 +68,173 @@ fn is_procedural(sel: &str) -> bool {
     PROC_MARKERS.iter().any(|m| sel.contains(m))
 }
 
-/// Client-side evaluator for procedural cosmetic filters. It parses a raw procedural selector
-/// (e.g. `.box:has-text(Ad):upward(2)`) into a CSS anchor plus operators, evaluates them against
-/// the DOM, and applies the filter's action. The work-list is spliced in at `__AB_PROC__`; each
-/// item is `{s: "<raw selector>", a: "<action>", g: "<action arg>"}`.
-const PROCEDURAL_JS: &str = r#"(function(){if(window.__abPr)return;var items=__AB_PROC__;if(!items||!items.length)return;window.__abPr=1;
-var NAMES=['has-text','matches-css-before','matches-css-after','matches-css','matches-attr','matches-path','min-text-length','upward','xpath','-abp-contains','contains'];
-function parseSel(sel){var ops=[],out='',n=sel.length,i=0;
-while(i<n){if(sel[i]===':'){var matched=null;for(var k=0;k<NAMES.length;k++){var nm=NAMES[k];if(sel.substr(i+1,nm.length)===nm&&sel.charAt(i+1+nm.length)==='('){matched=nm;break;}}
-if(matched){var start=i+1+matched.length+1,depth=1,j=start;while(j<n){var c=sel[j];if(c==='(')depth++;else if(c===')'){depth--;if(depth===0)break;}j++;}
-ops.push({n:(matched==='-abp-contains'||matched==='contains')?'has-text':matched,a:sel.slice(start,j)});i=j+1;continue;}}
-out+=sel[i];i++;}
-return{css:out.trim(),ops:ops};}
-function rx(s){if(s&&s.length>1&&s[0]==='/'){var i=s.lastIndexOf('/');if(i>0){try{return new RegExp(s.slice(1,i),s.slice(i+1));}catch(e){}}}return null;}
-function applyOp(nodes,op){var nm=op.n,a=op.a,out=[];
-for(var i=0;i<nodes.length;i++){var el=nodes[i];
-if(nm==='has-text'){var re=rx(a),t=el.textContent||'';if(re?re.test(t):t.indexOf(a)!==-1)out.push(el);}
-else if(nm==='min-text-length'){if((el.textContent||'').length>=parseInt(a,10))out.push(el);}
-else if(nm==='matches-path'){var re=rx(a);if(re?re.test(location.pathname):location.pathname.indexOf(a)!==-1)out.push(el);}
-else if(nm==='matches-css'||nm==='matches-css-before'||nm==='matches-css-after'){var p=nm==='matches-css'?null:(nm==='matches-css-before'?'::before':'::after');var ix=a.indexOf(':');if(ix>=0){var pr=a.slice(0,ix).trim(),v=a.slice(ix+1).trim();var cs=getComputedStyle(el,p);var ac=cs.getPropertyValue(pr)||'';var re=rx(v);if(re?re.test(ac):ac.trim()===v)out.push(el);}}
-else if(nm==='matches-attr'){var m=a.match(/^([^=]+)(?:=([\s\S]*))?$/);if(m){var name=m[1].trim();if(el.hasAttribute(name)){if(m[2]===undefined)out.push(el);else{var v=el.getAttribute(name)||'';var re=rx(m[2]);if(re?re.test(v):v===m[2].replace(/^"|"$/g,''))out.push(el);}}}}
-else if(nm==='upward'){var num=parseInt(a,10);if(!isNaN(num)&&String(num)===a.trim()){var e=el;while(num-->0&&e)e=e.parentElement;if(e)out.push(e);}else{try{var c=el.closest(a);if(c)out.push(c);}catch(e){}}}
-else if(nm==='xpath'){try{var r=document.evaluate(a,el,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);for(var q=0;q<r.snapshotLength;q++){var nd=r.snapshotItem(q);if(nd.nodeType===1)out.push(nd);}}catch(e){}}
-else out.push(el);}
-return out.filter(function(v,ix){return out.indexOf(v)===ix;});}
-function evalItem(it){var ps=parseSel(it.s),nodes;
-try{nodes=ps.css?[].slice.call(document.querySelectorAll(ps.css)):[].slice.call(document.querySelectorAll('*'));}catch(e){return[];}
-for(var i=0;i<ps.ops.length;i++){nodes=applyOp(nodes,ps.ops[i]);if(!nodes.length)break;}return nodes;}
-function run(){for(var f=0;f<items.length;f++){var it=items[f],nodes;try{nodes=evalItem(it);}catch(e){continue;}
-for(var i=0;i<nodes.length;i++){var el=nodes[i];try{
-if(it.a==='remove')el.remove();
-else if(it.a==='style')el.style.cssText+=';'+(it.g||'');
-else if(it.a==='remove-attr')el.removeAttribute(it.g||'');
-else if(it.a==='remove-class')el.classList.remove(it.g||'');
-else el.style.setProperty('display','none','important');}catch(e){}}}}
-var t=null;function sch(){if(t)clearTimeout(t);t=setTimeout(run,200);}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',run);else run();
-try{new MutationObserver(sch).observe(document.documentElement,{childList:true,subtree:true,attributes:true});}catch(e){}})();"#;
+/// CSS text restricted to ASCII: anything else becomes a CSS escape (`\XX `), `<` included so the
+/// text can never close the `<style>` element.
+fn css_ascii(s: &str, out: &mut String) {
+    for c in s.chars() {
+        if c.is_ascii() && c != '<' && !c.is_ascii_control() {
+            out.push(c);
+        } else {
+            let _ = write!(out, "\\{:x} ", c as u32);
+        }
+    }
+}
 
-/// Build the HTML snippet to inject for a page, or `None` if there's nothing to do.
-///
-/// `include_helper` adds the dynamic class/id hiding helper (skipped when the page is generic-hide
-/// excepted).
-pub fn build_payload(cos: &Cosmetics, include_helper: bool) -> Option<Bytes> {
-    let mut out = String::new();
+/// JSON text restricted to ASCII with `<`, `>` and `&` escaped (safe inside `<script>`).
+fn json_ascii(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' | '>' | '&' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c if c.is_ascii() => out.push(c),
+            c => {
+                let mut buf = [0u16; 2];
+                for u in c.encode_utf16(&mut buf) {
+                    let _ = write!(out, "\\u{u:04x}");
+                }
+            }
+        }
+    }
+    out
+}
 
-    // Partition element-hiding selectors: plain CSS goes in a stylesheet; procedural selectors are
-    // evaluated in JS (mixing them into CSS would invalidate the whole rule).
+static UNSAFE_STYLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_unsafe_style() {
+    UNSAFE_STYLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Style declarations dropped at delivery because they could load resources (engine
+/// `:style()` results; ext-rule rejects are counted in the ext stats at build time).
+pub fn unsafe_styles_dropped() -> u64 {
+    UNSAFE_STYLES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Inputs for [`build_head`].
+pub struct PageSpec<'a> {
+    pub cosmetics: &'a Cosmetics,
+    pub internal: &'a Internal,
+    /// Host name the beacon token is bound to.
+    pub host: &'a str,
+    /// Per-response nonce put on our tags.
+    pub nonce: &'a str,
+    /// Scripts may be injected (no `sandbox` without `allow-scripts`).
+    pub script_ok: bool,
+    /// The class/id observer may call back (same-origin document, not generic-hide excepted).
+    pub observer_ok: bool,
+    /// Scripts from trusted extended rules (`#%#`, scriptlets, snippets): one hash-addressed
+    /// bundle loaded after the boot script, which provides their runtime hook.
+    pub ext_script: &'a str,
+}
+
+/// The markup for one page, plus what it needs from the page's CSP.
+#[derive(Debug, Clone, Default)]
+pub struct PageHead {
+    pub html: String,
+    pub has_style: bool,
+    pub has_script: bool,
+    pub observer: bool,
+}
+
+/// Build the head injection for a page; empty (`html == ""`) when there is nothing to do.
+pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
+    let cos = spec.cosmetics;
+    let mut head = PageHead::default();
+    let nonce = spec.nonce;
+
+    // Plain CSS hides; procedural selectors need JS (mixed into CSS they would invalidate the
+    // whole rule).
     let plain: Vec<&str> = cos
         .hide_selectors
         .iter()
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .filter(|s| !is_procedural(s))
         .collect();
     if !plain.is_empty() {
-        let css = plain.join(",");
-        if !css.contains("</style") {
-            out.push_str("<style id=\"__adblock_cosmetic\">");
-            out.push_str(&css);
-            out.push_str("{display:none!important}</style>");
+        head.has_style = true;
+        let _ = write!(
+            head.html,
+            "<style id=\"__adblock_cosmetic\" nonce=\"{nonce}\">"
+        );
+        let mut css = String::new();
+        css_ascii(&plain.join(","), &mut css);
+        head.html.push_str(&css);
+        head.html.push_str("{display:none!important}</style>");
+    }
+
+    if spec.script_ok {
+        let mut proc_items: Vec<serde_json::Value> = Vec::new();
+        for sel in cos.hide_selectors.iter().filter(|s| is_procedural(s)) {
+            proc_items.push(serde_json::json!({ "s": sel, "a": "hide" }));
         }
-    }
-
-    if !cos.injected_script.is_empty() && !cos.injected_script.contains("</script") {
-        out.push_str("<script>");
-        out.push_str(&cos.injected_script);
-        out.push_str("</script>");
-    }
-
-    // Build the procedural work-list: procedural hide selectors + parsed action filters.
-    let mut proc_items: Vec<serde_json::Value> = Vec::new();
-    for sel in cos.hide_selectors.iter().filter(|s| is_procedural(s)) {
-        proc_items.push(serde_json::json!({ "s": sel, "a": "hide" }));
-    }
-    for raw in &cos.procedural_actions {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-            let sel = v["selector"]
-                .get(0)
-                .and_then(|s| s["arg"].as_str())
-                .unwrap_or("");
-            if sel.is_empty() {
-                continue;
+        for raw in &cos.procedural_actions {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                let sel = v["selector"]
+                    .get(0)
+                    .and_then(|s| s["arg"].as_str())
+                    .unwrap_or("");
+                if sel.is_empty() {
+                    continue;
+                }
+                let act = v["action"]["type"].as_str().unwrap_or("hide");
+                let arg = v["action"]["arg"].as_str().unwrap_or("");
+                // Whatever list or engine produced it, a style block is judged here, last.
+                if act == "style" && !ext_rules::is_safe_style(arg) {
+                    note_unsafe_style();
+                    continue;
+                }
+                proc_items.push(serde_json::json!({ "s": sel, "a": act, "g": arg }));
             }
-            let act = v["action"]["type"].as_str().unwrap_or("hide");
-            let arg = v["action"]["arg"].as_str().unwrap_or("");
-            proc_items.push(serde_json::json!({ "s": sel, "a": act, "g": arg }));
         }
-    }
-    if !proc_items.is_empty() {
-        let array = serde_json::to_string(&proc_items).unwrap_or_else(|_| "[]".to_string());
-        if !array.contains("</script") {
-            out.push_str("<script id=\"__adblock_procedural\">");
-            out.push_str(&PROCEDURAL_JS.replace("__AB_PROC__", &array));
-            out.push_str("</script>");
+        let observer = spec.observer_ok && !cos.generichide;
+        let scriptlet = (!cos.injected_script.is_empty()).then(|| {
+            spec.internal
+                .put_scriptlet(&wrap_scriptlets(&cos.injected_script))
+        });
+
+        // Scriptlets first: they must run before any page script.
+        if let Some(path) = &scriptlet {
+            let _ = write!(
+                head.html,
+                "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
+            );
+            head.has_script = true;
         }
-    }
-
-    if include_helper {
-        out.push_str("<script id=\"__adblock_helper\">");
-        out.push_str(HELPER_JS);
-        out.push_str("</script>");
-    }
-
-    if out.is_empty() {
-        None
-    } else {
-        Some(Bytes::from(out))
-    }
-}
-
-/// Wrap a `Full` of bytes as a [`ProxyBody`].
-pub fn full_body(bytes: Bytes) -> ProxyBody {
-    Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
-}
-
-/// Stream a reqwest response body straight through (no buffering, original encoding preserved).
-pub fn passthrough_body(resp: reqwest::Response) -> ProxyBody {
-    let stream = resp
-        .bytes_stream()
-        .map(|res| res.map(Frame::data).map_err(io::Error::other));
-    BodyExt::boxed_unsync(StreamBody::new(stream))
-}
-
-/// Decode (per `content_encoding`) and inject `payload` into a streaming HTML body.
-pub fn inject_body(
-    resp: reqwest::Response,
-    payload: Bytes,
-    content_encoding: Option<&str>,
-) -> ProxyBody {
-    let io_stream = resp.bytes_stream().map(|res| res.map_err(io::Error::other));
-    let reader = StreamReader::new(io_stream);
-
-    let decoded: Pin<Box<dyn AsyncRead + Send>> = match content_encoding {
-        Some(e) if e.eq_ignore_ascii_case("gzip") || e.eq_ignore_ascii_case("x-gzip") => {
-            Box::pin(async_compression::tokio::bufread::GzipDecoder::new(reader))
-        }
-        Some(e) if e.eq_ignore_ascii_case("br") => Box::pin(
-            async_compression::tokio::bufread::BrotliDecoder::new(reader),
-        ),
-        Some(e) if e.eq_ignore_ascii_case("deflate") => {
-            Box::pin(async_compression::tokio::bufread::ZlibDecoder::new(reader))
-        }
-        _ => Box::pin(reader),
-    };
-
-    let stream = inject_stream(decoded, payload).map(|res| res.map(Frame::data));
-    BodyExt::boxed_unsync(StreamBody::new(stream))
-}
-
-/// Stream decompressed HTML, injecting `payload` once near the `</head>` anchor.
-fn inject_stream(
-    mut reader: Pin<Box<dyn AsyncRead + Send>>,
-    payload: Bytes,
-) -> impl futures_util::Stream<Item = io::Result<Bytes>> + Send {
-    async_stream::try_stream! {
-        let mut search: Vec<u8> = Vec::new();
-        let mut injected = false;
-        let mut buf = vec![0u8; 16 * 1024];
-
-        loop {
-            let n = reader.read(&mut buf).await?;
-            if n == 0 {
-                break;
+        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() {
+            let cfg = serde_json::json!({
+                "p": proc_items,
+                "o": observer,
+                "t": spec.internal.token_for(spec.host),
+            });
+            let json = json_ascii(&cfg.to_string());
+            let _ = write!(
+                head.html,
+                "<script type=\"application/json\" id=\"__ab_cfg\">{json}</script>\
+                 <script src=\"{}\" nonce=\"{nonce}\"></script>",
+                boot_path()
+            );
+            head.has_script = true;
+            head.observer = observer;
+            if !spec.ext_script.is_empty() {
+                let path = spec.internal.put_scriptlet(spec.ext_script);
+                let _ = write!(
+                    head.html,
+                    "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
+                );
             }
-            if injected {
-                yield Bytes::copy_from_slice(&buf[..n]);
-                continue;
-            }
-
-            search.extend_from_slice(&buf[..n]);
-            if let Some(pos) = find_injection_point(&search) {
-                let mut out = Vec::with_capacity(search.len() + payload.len());
-                out.extend_from_slice(&search[..pos]);
-                out.extend_from_slice(&payload);
-                out.extend_from_slice(&search[pos..]);
-                injected = true;
-                search = Vec::new();
-                yield Bytes::from(out);
-            } else if search.len() > MAX_SEARCH {
-                // No anchor found in a reasonable window: prepend and flush.
-                let mut out = Vec::with_capacity(search.len() + payload.len());
-                out.extend_from_slice(&payload);
-                out.append(&mut search);
-                injected = true;
-                yield Bytes::from(out);
-            }
-            // otherwise keep buffering until the anchor arrives (bounded by MAX_SEARCH)
-        }
-
-        if !injected {
-            let pos = find_injection_point(&search).unwrap_or(0);
-            let mut out = Vec::with_capacity(search.len() + payload.len());
-            out.extend_from_slice(&search[..pos]);
-            out.extend_from_slice(&payload);
-            out.extend_from_slice(&search[pos..]);
-            yield Bytes::from(out);
         }
     }
+    head
 }
 
-/// Find the byte offset to insert the payload at: just before `</head>`, else before `<body`.
-fn find_injection_point(buf: &[u8]) -> Option<usize> {
-    let lower = buf.to_ascii_lowercase();
-    find_sub(&lower, b"</head>").or_else(|| find_sub(&lower, b"<body"))
-}
-
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// Run the engine's scriptlet bundle in a private function scope that provides uBO's
+/// `scriptletGlobals` (state shared by the page's scriptlets; `safeSelf` and others read it and
+/// throw without it). The scope also keeps the helper functions (`safeSelf`, `setConstant`, ...)
+/// off the page's global object.
+fn wrap_scriptlets(js: &str) -> String {
+    format!("(function(){{\nconst scriptletGlobals = {{}};\n{js}\n}})();")
 }
 
 #[cfg(test)]
@@ -279,46 +242,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn payload_builds_style_and_helper() {
+    fn scriptlets_get_a_private_scope_with_scriptlet_globals() {
+        let w = wrap_scriptlets("a();");
+        assert!(w.starts_with("(function(){"));
+        assert!(w.contains("const scriptletGlobals = {};"));
+        assert!(w.trim_end().ends_with("})();"));
+    }
+
+    fn spec<'a>(cos: &'a Cosmetics, internal: &'a Internal) -> PageSpec<'a> {
+        PageSpec {
+            cosmetics: cos,
+            internal,
+            host: "example.test",
+            nonce: "NONCE",
+            script_ok: true,
+            observer_ok: true,
+            ext_script: "",
+        }
+    }
+
+    #[test]
+    fn head_has_style_config_and_boot() {
+        let i = Internal::new();
         let cos = Cosmetics {
             hide_selectors: vec![".ad".into(), "#banner".into()],
-            generichide: false,
             ..Default::default()
         };
-        let p = build_payload(&cos, true).expect("payload");
-        let s = String::from_utf8(p.to_vec()).unwrap();
-        assert!(s.contains(".ad,#banner{display:none!important}"));
-        assert!(s.contains("__adblock_helper"));
+        let h = build_head(&spec(&cos, &i));
+        assert!(h.html.contains(".ad,#banner{display:none!important}"));
+        assert!(h
+            .html
+            .contains("<style id=\"__adblock_cosmetic\" nonce=\"NONCE\">"));
+        assert!(h.html.contains("id=\"__ab_cfg\""));
+        assert!(h
+            .html
+            .contains(&format!("src=\"{}\" nonce=\"NONCE\"", boot_path())));
+        assert!(h.has_style && h.has_script && h.observer);
+        assert!(h.html.is_ascii());
     }
 
     #[test]
-    fn payload_empty_when_nothing_to_do() {
-        let cos = Cosmetics::default();
-        assert!(build_payload(&cos, false).is_none());
+    fn head_empty_when_nothing_to_do() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            generichide: true,
+            ..Default::default()
+        };
+        assert!(build_head(&spec(&cos, &i)).html.is_empty());
     }
 
     #[test]
-    fn procedural_hide_selector_kept_out_of_stylesheet() {
-        // A procedural selector must NOT leak into the <style> (it would be invalid CSS and break
-        // the whole rule); it goes to the procedural evaluator instead.
+    fn script_not_emitted_when_not_allowed() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: vec![".ad".into(), ".b:has-text(x)".into()],
+            injected_script: "alert(1)".into(),
+            ..Default::default()
+        };
+        let mut s = spec(&cos, &i);
+        s.script_ok = false;
+        let h = build_head(&s);
+        assert!(h.html.contains("<style"));
+        assert!(!h.html.contains("<script"));
+        assert!(!h.has_script);
+    }
+
+    #[test]
+    fn procedural_selector_kept_out_of_stylesheet() {
+        let i = Internal::new();
         let cos = Cosmetics {
             hide_selectors: vec![".real-ad".into(), ".box:has-text(Sponsored)".into()],
-            generichide: true, // skip the helper to isolate this
+            generichide: true,
             ..Default::default()
         };
-        let s = String::from_utf8(build_payload(&cos, false).unwrap().to_vec()).unwrap();
-        // Plain selector is in the stylesheet; procedural one is not.
-        assert!(s.contains(".real-ad{display:none!important}"));
-        assert!(!s.contains("<style id=\"__adblock_cosmetic\">.box:has-text"));
-        // The procedural selector is handed to the evaluator (JSON key order is not significant).
-        assert!(s.contains("__adblock_procedural"));
-        assert!(s.contains(r#""s":".box:has-text(Sponsored)""#));
-        assert!(s.contains(r#""a":"hide""#));
-        assert!(!s.contains("__AB_PROC__"), "placeholder must be replaced");
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(h.contains(".real-ad{display:none!important}"));
+        assert!(!h.contains("<style id=\"__adblock_cosmetic\" nonce=\"NONCE\">.box:has-text"));
+        assert!(h.contains(r#""s":".box:has-text(Sponsored)""#));
+        assert!(h.contains(r#""a":"hide""#));
     }
 
     #[test]
-    fn payload_parses_action_filter() {
+    fn action_filters_parsed() {
+        let i = Internal::new();
         let cos = Cosmetics {
             procedural_actions: vec![
                 r#"{"selector":[{"type":"css-selector","arg":".ad:has-text(Ad)"}],"action":{"type":"remove"}}"#.to_string(),
@@ -326,36 +332,66 @@ mod tests {
             generichide: true,
             ..Default::default()
         };
-        let s = String::from_utf8(build_payload(&cos, false).unwrap().to_vec()).unwrap();
-        assert!(s.contains(r#""s":".ad:has-text(Ad)""#));
-        assert!(s.contains(r#""a":"remove""#));
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(h.contains(r#""s":".ad:has-text(Ad)""#));
+        assert!(h.contains(r#""a":"remove""#));
     }
 
     #[test]
-    fn finds_head_anchor() {
-        let html = b"<html><head><title>x</title></head><body>hi</body></html>";
-        let pos = find_injection_point(html).unwrap();
-        assert_eq!(&html[pos..pos + 7], b"</head>");
+    fn scriptlet_is_external_and_first() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: vec![".ad".into()],
+            injected_script: "window.x=1;</script><b>".into(),
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(
+            !h.contains("window.x"),
+            "scriptlet code must not be inlined"
+        );
+        let s = h.find("/__adblock__/s/").expect("scriptlet tag");
+        let b = h.find("/__adblock__/boot.").expect("boot tag");
+        assert!(s < b);
     }
 
     #[test]
-    fn falls_back_to_body_anchor() {
-        let html = b"<html><body>no head here</body></html>";
-        let pos = find_injection_point(html).unwrap();
-        assert_eq!(&html[pos..pos + 5], b"<body");
+    fn hostile_selectors_cannot_break_out() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: vec!["a</style><script>x()</script>".into(), "[title=\"\u{5e7f}\"]".into()],
+            procedural_actions: vec![
+                r#"{"selector":[{"type":"css-selector","arg":"</script><b>:has-text(é)"}],"action":{"type":"hide"}}"#.to_string(),
+            ],
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(h.is_ascii(), "{h}");
+        assert_eq!(h.matches("</style>").count(), 1);
+        assert_eq!(h.matches("</script>").count(), 2, "only our own tags: {h}");
+        assert!(!h.contains("x()</script>"));
     }
 
-    #[tokio::test]
-    async fn injects_once_before_head() {
-        use http_body_util::BodyExt;
-        let html = b"<html><head><title>t</title></head><body><p>hello</p></body></html>".to_vec();
-        let reader: Pin<Box<dyn AsyncRead + Send>> = Box::pin(std::io::Cursor::new(html));
-        let payload = Bytes::from_static(b"<style>INJECTED</style>");
-        let stream = inject_stream(reader, payload);
-        let body = StreamBody::new(stream.map(|r| r.map(Frame::data))).boxed_unsync();
-        let collected = body.collect().await.unwrap().to_bytes();
-        let out = String::from_utf8(collected.to_vec()).unwrap();
-        assert!(out.contains("<style>INJECTED</style></head>"), "got: {out}");
-        assert_eq!(out.matches("INJECTED").count(), 1);
+    #[test]
+    fn unsafe_style_actions_never_reach_the_page() {
+        let i = Internal::new();
+        let act = |css: &str| {
+            serde_json::json!({"selector":[{"type":"css-selector","arg":"body"}],
+                "action":{"type":"style","arg":css}})
+            .to_string()
+        };
+        let cos = Cosmetics {
+            procedural_actions: vec![
+                act("background: url(http://evil.test/x)"),
+                act("background:image-set('http://evil.test/y' 1x)"),
+                act("color: red; @import 'z'"),
+                act("display: none !important"),
+            ],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(!h.contains("evil.test") && !h.contains("@import"), "{h}");
+        assert!(h.contains("display: none !important"), "{h}");
     }
 }

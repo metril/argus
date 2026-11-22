@@ -77,11 +77,7 @@ async fn profile_swap_applies(mode: EntryMode) {
     engine.install(compile_engine(&["||swap.test^\n".to_string()]));
     let slot = proxy.ctx.default_profile();
     let generation = slot.load().generation + 1;
-    slot.store(Arc::new(Profile {
-        id: slot.load().id,
-        generation,
-        engine,
-    }));
+    slot.store(Arc::new(Profile::new(slot.load().id, generation, engine)));
     // Same pooled client => same connection, same RequestCtx.
     let resp = c.get(&url).await;
     assert_eq!(resp.headers()["x-adblock"], "blocked");

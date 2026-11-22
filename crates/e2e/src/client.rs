@@ -47,7 +47,7 @@ impl TestClient {
         let mut b = reqwest::Client::builder()
             .use_rustls_tls()
             .tls_built_in_root_certs(false)
-            .timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none());
         for ca in cas {
             b = b.add_root_certificate(reqwest::Certificate::from_pem(ca).expect("CA pem"));

@@ -1,0 +1,22 @@
+[package]
+name = "ext-rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Pure parser, index and evaluator for extended (uBO/AdGuard) filter rules the network engine cannot run"
+
+[dependencies]
+filter-engine = { path = "../filter-engine", default-features = false }
+adblock = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "ext"
+harness = false

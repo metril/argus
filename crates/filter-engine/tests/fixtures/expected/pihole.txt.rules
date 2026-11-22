@@ -1,0 +1,6 @@
+||ads.example.com^
+/^[a-z][a-z0-9+.-]*:\/\/(?:[^\/?#@]*@)?(?:ads[0-9]+\.example\.com)(?::\d+)?(?:[\/?#]|\z)/
+/^[a-z][a-z0-9+.-]*:\/\/(?:[^\/?#@]*\.)?(?:tracker\.example\.net)(?::\d+)?(?:[\/?#]|\z)/
+/^[a-z][a-z0-9+.-]*:\/\/[^\/?#]*(?:banner.*\.example\.org)/
+||abp.example.com^
+@@||allowed.example.com^

@@ -29,9 +29,19 @@ const NAV_ITEMS: &[NavItem] = &[
         icon: "F",
     },
     NavItem {
+        path: "/blocked",
+        label: "Blocked",
+        icon: "B",
+    },
+    NavItem {
         path: "/userscripts",
         label: "Userscripts",
         icon: "U",
+    },
+    NavItem {
+        path: "/tokens",
+        label: "API Tokens",
+        icon: "T",
     },
     NavItem {
         path: "/settings",

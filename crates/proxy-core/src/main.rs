@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     // per worker; this handle shares the compiled rules as bytes between the proxy and the web API.
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
+    shared_engine.set_recent_keep_query(config.adblock.recent_blocked_keep_query);
 
     // One pooled upstream client (connect/read timeouts from config, no redirect following).
     let ctx = Arc::new(ProxyContext::with_upstream(
@@ -42,6 +43,8 @@ async fn main() -> Result<()> {
         &UpstreamOptions::from_config(&config),
         config.adblock.enabled,
     )?);
+
+    ctx.set_respect_no_transform(config.adblock.respect_no_transform);
 
     // Create the proxy server
     let server = ProxyServer::new(config.clone(), ctx.clone()).map_err(|e| {
@@ -85,7 +88,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "webui")]
     if let Some(handle) = webui_handle {
         handle.abort();
+        // Wait for the task to wind down so it no longer holds the database.
+        let _ = handle.await;
     }
+
+    // Commit queued background writes and fsync before exiting; do not rely on the drop order
+    // of `Arc`s held by aborted tasks.
+    common::db::Db::sync_all();
 
     proxy_result.map_err(|e| {
         error!("Proxy server error: {}", e);
@@ -110,24 +119,24 @@ async fn start_webui_server(
 
     info!("Initializing Web UI server...");
 
+    // One database file per process: users, sessions, tokens, audit and userscripts share
+    // `<adblock.data_dir>/adblocker.redb` with the filter lists.
+    let data_dir = config.adblock.data_dir.clone();
+
     // Initialize userscript manager
     let userscript_manager = if config.userscripts.enabled {
         info!(
             "Initializing userscript manager with data dir: {:?}",
-            config.userscripts.data_dir
+            data_dir
         );
-        Arc::new(
-            UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
-                proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-            })?,
-        )
+        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
+            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
+        })?)
     } else {
         info!("Userscripts disabled, using empty userscript manager");
-        Arc::new(
-            UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
-                proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-            })?,
-        )
+        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
+            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
+        })?)
     };
 
     // Load existing userscripts
@@ -166,10 +175,14 @@ async fn start_webui_server(
             enable_csrf: true,
             require_https: false,
             cors_origins: config.webui.cors_origins.clone(),
-            cookie_secure: false,
+            cookie_secure: config.webui.cookie_secure,
+        },
+        network: web_api::config::NetworkConfig {
+            trusted_proxies: config.webui.trusted_proxies.clone(),
+            ..Default::default()
         },
         session: web_api::config::SessionConfig {
-            storage_path: config.webui.session_storage_path.clone(),
+            storage_path: data_dir.clone(),
             cleanup_interval_seconds: 3600,
         },
         webui: web_api::config::WebUiConfig {
@@ -178,6 +191,7 @@ async fn start_webui_server(
                 .unwrap_or_else(|_| "webui".to_string())
                 .into(),
         },
+        ..Default::default()
     };
 
     // Build the application state

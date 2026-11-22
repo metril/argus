@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/proxy-core",
     "crates/filter-engine",
+    "crates/ext-rules",
     "crates/list-service",
     "crates/userscript-engine",
     "crates/web-api",
@@ -10,14 +11,15 @@ members = [
     "crates/common",
     "crates/api-types",
     "crates/e2e",
+    "crates/e2e-browser",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Real floor: tag_ptr 0.1.0 (transitive) requires Rust 1.88+. Toolchain is pinned to
+# Real floor: oxc_parser 0.126 (filter-engine) requires Rust 1.92. Toolchain is pinned to
 # stable in rust-toolchain.toml; no nightly features are used.
-rust-version = "1.88"
+rust-version = "1.92"
 authors = ["Adblocker Contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yourusername/adblocker"
@@ -88,7 +90,7 @@ moka = { version = "0.12", features = ["sync", "future"] }
 arc-swap = "1.7"
 
 # Database
-sled = "0.34"
+redb = "2.6"
 
 # Adblocking
 # No `single-thread`: makes `adblock::Engine` Send + Sync so one Arc<Engine> is shared by all workers.
@@ -134,6 +136,8 @@ mockall = "0.13"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.15"
 rand = "0.8"
+rayon = "1.10"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3
@@ -145,4 +149,18 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Hot byte-crunching dependencies stay optimised in dev/test builds so streaming tests are fast.
+[profile.dev.package.lol_html]
+opt-level = 3
+[profile.dev.package.encoding_rs]
+opt-level = 3
+[profile.dev.package.brotli]
+opt-level = 3
+[profile.dev.package.brotli-decompressor]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
 

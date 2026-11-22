@@ -1,0 +1,28 @@
+format=adguard
+total_lines=30
+converted=13
+skipped=0
+error_count=0
+translated=9
+ext=16
+ip_block=0
+ip_allow=0
+ext_counts={"cookie": 1, "denyallow": 1, "header": 1, "hls": 1, "html-filter": 2, "js-inject": 1, "jsonprune": 1, "method": 1, "permissions": 1, "popup": 1, "removeheader": 1, "replace": 1, "scriptlet": 1, "snippet": 1, "urltransform": 1}
+skipped_reasons={}
+meta=ListMeta { title: Some("AdGuard test"), homepage: None, version: None, expires_secs: None, redirect: None }
+ext Replace ||a.example^$replace=/foo/bar/ []
+ext JsonPrune ||b.example^$jsonprune=\$..ads []
+ext Cookie ||c.example^$cookie=sid []
+ext RemoveHeader ||d.example^$removeheader=refresh []
+ext Hls ||e.example^$hls=ad []
+ext Permissions ||f.example^$permissions=geolocation=() []
+ext Popup ||g.example^$popup []
+ext DenyAllow ||i.example^$denyallow=x.example|y.example,script,domain=z.example ["z.example"]
+ext Method ||m.example^$method=post []
+ext Header ||hh.example^$header=x-ad []
+ext UrlTransform ||u.example^$urltransform=/a/b/ []
+ext HtmlFilter example.com##^script:has-text(ad) ["example.com"]
+ext HtmlFilter example.com$$script[tag-content="ad"] ["example.com"]
+ext Scriptlet example.com#%#//scriptlet('some-unknown-scriptlet') ["example.com"]
+ext JsInject example.com#%#window.alert = function() {}; ["example.com"]
+ext Snippet example.com#$#hide-if-contains 'x' ["example.com"]

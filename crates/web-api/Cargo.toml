@@ -41,8 +41,8 @@ validator = { workspace = true }
 chrono = { workspace = true }
 
 # Database
-sled = { workspace = true }
-list-service = { path = "../list-service" }
+list-service = { path = "../list-service", default-features = false }
+ext-rules = { path = "../ext-rules" }
 
 # HTTP client (shared, for downloading filter lists)
 reqwest = { workspace = true }
@@ -58,15 +58,24 @@ url = "2.5"
 
 # Common utilities
 common = { path = "../common" }
-filter-engine = { path = "../filter-engine" }
+filter-engine = { path = "../filter-engine", default-features = false }
 userscript-engine = { path = "../userscript-engine" }
 api-types = { workspace = true, features = ["server"] }
 
 # OpenAPI documentation
 utoipa = { version = "5.3", features = ["axum_extras", "uuid"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
+utoipa-axum = "0.2"
+
+# Token digests, CSRF tags, ETags
+blake3 = "1.5"
+# CA certificate details
+x509-parser = "0.18"
+sha2 = "0.10"
 
 [dev-dependencies]
 axum-test = "18"
 tempfile = "3.10"
+rcgen = { workspace = true }
+regex = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

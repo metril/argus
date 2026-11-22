@@ -33,6 +33,7 @@ url = { workspace = true }
 
 # Caching
 arc-swap = { workspace = true }
+crossbeam = { workspace = true }
 
 # Concurrency
 dashmap = { workspace = true }
@@ -42,13 +43,33 @@ chrono = { workspace = true }
 
 # Cryptography (for checksums)
 base64 = "0.22"
+rayon = { workspace = true }
+regex = { workspace = true }
+
+# JavaScript parser (MIT): validates and extracts scriptlet sources. 0.126 is the newest line
+# that builds on the pinned 1.92 toolchain.
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_parser = "0.126"
+oxc_span = "0.126"
 
 # Common utilities
 common = { path = "../common" }
+
+[features]
+default = ["bundled-ubo-resources"]
+# Embed the uBlock Origin scriptlet snapshot (GPL-3.0) as the offline fallback. On by default;
+# build with `--no-default-features` to leave it out (see docs/LICENSING.md). Dependents declare
+# `default-features = false` and forward this feature, so it can be turned off from the top.
+bundled-ubo-resources = []
 
 [dev-dependencies]
 criterion = { workspace = true }
 
 [[bench]]
 name = "check"
+harness = false
+
+[[bench]]
+name = "formats"
 harness = false

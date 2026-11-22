@@ -12,7 +12,7 @@ pub use api_types::{
 impl ApiClient {
     /// Get proxy configuration
     pub async fn get_proxy_config(&self) -> Result<ProxyConfigResponse, ApiError> {
-        self.get("/api/proxy/config").await
+        self.get("/config").await
     }
 
     /// Update proxy configuration (partial; omitted fields are left unchanged)
@@ -20,16 +20,22 @@ impl ApiClient {
         &self,
         config: &UpdateProxyConfigRequest,
     ) -> Result<ProxyConfigResponse, ApiError> {
-        self.put("/api/proxy/config", config).await
+        // The update is partial and guarded by `If-Match`; read the current version first.
+        let (_, etag): (ProxyConfigResponse, _) = self.get_etag("/config").await?;
+        let etag = etag.ok_or_else(|| ApiError::Parse("missing ETag".into()))?;
+        let (updated, _) = self
+            .put_if_match::<api_types::UpdateProxyConfigResponse, _>("/config", config, &etag)
+            .await?;
+        Ok(updated.config)
     }
 
     /// Get proxy statistics
     pub async fn get_proxy_stats(&self) -> Result<ProxyStatsResponse, ApiError> {
-        self.get("/api/proxy/stats").await
+        self.get("/stats/proxy").await
     }
 
     /// Reload proxy configuration from file
     pub async fn reload_proxy_config(&self) -> Result<MessageResponse, ApiError> {
-        self.post("/api/proxy/reload-config", &()).await
+        self.post("/config/reload", &()).await
     }
 }

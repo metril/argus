@@ -1,0 +1,12 @@
+format=dnsmasq
+total_lines=11
+converted=7
+skipped=4
+error_count=0
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={"custom-answer": 2, "directive": 2}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }

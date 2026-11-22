@@ -303,7 +303,7 @@ mod tests {
     fn create_test_runtime() -> (UserscriptRuntime, TempDir) {
         let temp_dir = tempdir().unwrap();
         let manager = Arc::new(UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap());
-        // Use the manager's internal storage to avoid sled lock conflicts
+        // Use the manager's internal storage (shares its database handle)
         let storage = manager.storage_arc();
 
         (UserscriptRuntime::new(manager, storage), temp_dir)

@@ -8,8 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-proxy-core = { path = "../proxy-core", features = ["websockets"] }
-filter-engine = { path = "../filter-engine" }
+proxy-core = { path = "../proxy-core", default-features = false, features = ["websockets"] }
+filter-engine = { path = "../filter-engine", default-features = false }
+ext-rules = { path = "../ext-rules" }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -24,3 +25,6 @@ futures-util = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 async-trait = { workspace = true }
+async-compression = { workspace = true, features = ["zstd"] }
+encoding_rs = "0.8"
+serde_json = { workspace = true }

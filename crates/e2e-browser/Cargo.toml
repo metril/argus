@@ -1,0 +1,25 @@
+[package]
+name = "e2e-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+# Real-browser (headless Chromium over CDP) tests for the proxy. Skipped when no browser is found
+# unless ADBLOCKER_REQUIRE_BROWSER=1. See docs/TESTING.md.
+[dependencies]
+e2e = { path = "../e2e" }
+proxy-core = { path = "../proxy-core", default-features = false, features = ["websockets"] }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+chromiumoxide = { version = "0.9", default-features = false }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+x509-parser = "0.18"
+sha2 = { workspace = true }
+base64 = "0.22"
+rustls-pemfile = { workspace = true }
+async-compression = { workspace = true, features = ["zstd", "brotli"] }
+encoding_rs = "0.8"
