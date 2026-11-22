@@ -95,6 +95,7 @@ pub struct TestProxy {
     pub ctx: Arc<ProxyContext>,
     shutdown: broadcast::Sender<()>,
     dir: Option<tempfile::TempDir>,
+    userscripts: Mutex<Option<Arc<userscript_engine::UserscriptManager>>>,
 }
 
 impl TestProxy {
@@ -263,6 +264,7 @@ impl TestProxy {
             ctx,
             shutdown,
             dir: Some(dir),
+            userscripts: Mutex::new(None),
         })
     }
 
@@ -270,6 +272,45 @@ impl TestProxy {
     /// transparent port).
     pub fn entry_addr(&self) -> SocketAddr {
         self.transparent_addr.unwrap_or(self.addr)
+    }
+
+    /// The proxy's userscript manager (created and attached on first use, backed by a database
+    /// inside the proxy's data dir).
+    pub fn userscripts(&self) -> Arc<userscript_engine::UserscriptManager> {
+        let mut g = self.userscripts.lock();
+        if let Some(m) = g.as_ref() {
+            return m.clone();
+        }
+        let dir = self.dir.as_ref().expect("data dir").path().join("us");
+        let m = Arc::new(userscript_engine::UserscriptManager::new(dir).expect("manager"));
+        self.ctx.set_userscripts(Some(m.clone()));
+        *g = Some(m.clone());
+        m
+    }
+
+    /// Install `source` for the default profile (no dependencies; `@connect *` not approved).
+    pub fn install_userscript(&self, source: &str) -> String {
+        self.install_userscript_with(
+            source,
+            userscript_engine::install::Fetched::default(),
+            false,
+        )
+    }
+
+    /// Install with fetched `@require`/`@resource` bodies and an explicit `@connect *` approval.
+    pub fn install_userscript_with(
+        &self,
+        source: &str,
+        fetched: userscript_engine::install::Fetched,
+        allow_connect_all: bool,
+    ) -> String {
+        use userscript_engine::install::{finish_install, plan_install, Approvals};
+        let plan = plan_install(source, None).expect("plan");
+        let script =
+            finish_install(plan, fetched, Approvals { allow_connect_all }).expect("finish");
+        self.userscripts()
+            .install_script(userscript_engine::DEFAULT_PROFILE, script)
+            .expect("install")
     }
 
     /// `http://127.0.0.1:<port>` of the proxy.
