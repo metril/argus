@@ -21,6 +21,9 @@ pub mod inject;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
+pub mod redirect;
+pub mod request_ctx;
+pub mod request_type;
 pub mod server;
 pub mod tls;
 pub mod upstream;
@@ -40,4 +43,6 @@ pub use load_manager::{
     SharedLoadManager,
 };
 pub use memory_monitor::{LoadSheddingAction, MemoryMonitor, MemoryMonitorConfig, MemoryPressure};
+pub use request_ctx::{Profile, ProfileSlot, RequestCtx};
+pub use request_type::RequestType;
 pub use server::ProxyServer;
