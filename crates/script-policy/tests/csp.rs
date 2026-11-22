@@ -337,3 +337,157 @@ fn deny_over_covering_allow_drops_the_source() {
     );
     assert!(!p.allows_host(C::Script, "example.com"));
 }
+
+// ---- rendered headers are always well-formed -------------------------------------------------
+
+const KNOWN: &[&str] = &[
+    "script-src",
+    "script-src-attr",
+    "worker-src",
+    "object-src",
+    "frame-src",
+    "connect-src",
+    "style-src",
+    "img-src",
+    "font-src",
+    "media-src",
+    "default-src",
+    "base-uri",
+    "form-action",
+    "prefetch-src",
+    "manifest-src",
+];
+
+fn source_ok(s: &str) -> bool {
+    if matches!(
+        s,
+        "'none'"
+            | "'self'"
+            | "'unsafe-inline'"
+            | "'unsafe-eval'"
+            | "'strict-dynamic'"
+            | "*"
+            | "blob:"
+            | "data:"
+            | "https:"
+            | "http:"
+    ) {
+        return true;
+    }
+    if let Some(n) = s.strip_prefix("'nonce-").and_then(|x| x.strip_suffix('\'')) {
+        return !n.is_empty()
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b));
+    }
+    let rest = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let (hostport, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let (host, port) = if let Some(i) = hostport.find("]:") {
+        (&hostport[..=i], Some(&hostport[i + 2..]))
+    } else if hostport.starts_with('[') {
+        (hostport, None)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    let host = host.strip_prefix("*.").unwrap_or(host);
+    let host_ok = !host.is_empty()
+        && (host.starts_with('[')
+            && host.ends_with(']')
+            && host[1..host.len() - 1]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+            || host
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+                && !host.starts_with('.'));
+    let port_ok =
+        port.is_none_or(|p| p == "*" || (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())));
+    let path_ok = path
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/-._~%!$&()*+=:@".contains(&b));
+    host_ok && port_ok && path_ok
+}
+
+/// Parse a header the way a CSP parser does and check every directive and source expression.
+fn assert_well_formed(h: &str) {
+    for d in h.split(';') {
+        let d = d.trim();
+        assert!(!d.is_empty(), "empty directive in {h:?}");
+        let mut it = d.split(' ');
+        let name = it.next().unwrap();
+        assert!(
+            KNOWN.contains(&name),
+            "unexpected directive {name:?} in {h:?}"
+        );
+        let srcs: Vec<&str> = it.collect();
+        assert!(!srcs.is_empty(), "directive without sources in {h:?}");
+        for s in &srcs {
+            assert!(source_ok(s), "malformed source {s:?} in {h:?}");
+        }
+        if srcs.contains(&"'none'") {
+            assert_eq!(srcs.len(), 1, "'none' must stand alone in {h:?}");
+        }
+    }
+}
+
+use proptest::prelude::*;
+
+fn hostile() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[a-z0-9.-]{1,12}",
+        "[a-z0-9.;,'\"*: /\\\\%-]{1,16}",
+        "(xn--)?[a-z0-9\u{e4}\u{4e2d}\u{1f600}.-]{1,10}",
+        Just("a;script-src *".to_string()),
+        Just("evil.com;sandbox".to_string()),
+        Just("a,b.com".to_string()),
+        Just("münchen.example".to_string()),
+        Just("[::1]".to_string()),
+        Just("exa mple.com".to_string()),
+        Just("a'b.com".to_string()),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(600))]
+    #[test]
+    fn rendered_csp_is_always_well_formed(
+        page in hostile(),
+        src in hostile(),
+        port in proptest::option::of(any::<u16>()),
+        preset in 0u8..3,
+        allow in any::<bool>(),
+        px in any::<bool>(),
+    ) {
+        let mut r = rs();
+        let preset = match preset { 0 => Preset::Default, 1 => Preset::Untrusted, _ => Preset::Trusted };
+        // Rules are built from user-typed scopes: whatever parses must render safely.
+        if let Ok(p) = Scope::parse(&page) {
+            r.site_rules.insert("s".into(), SiteRule { id: "s".into(), scope: p, preset: preset.clone(), note: None });
+            if let Ok(sc) = Scope::parse(&src) {
+                r.source_rules.insert("r".into(), SourceRule {
+                    id: "r".into(), page: Scope::parse(&page).unwrap(), source: sc,
+                    caps: CapSet::of(&[C::Script, C::Connect, C::Frame]),
+                    effect: if allow { Effect::Allow } else { Effect::Deny }, note: None });
+            }
+        }
+        r.site_rules.insert("g".into(), SiteRule { id: "g".into(), scope: Scope::Global, preset, note: None });
+        let c = compile(&r);
+        for scheme in ["https", "http"] {
+            // The page host reaches us from the proxy; it is normalised first (IDN to punycode).
+            let host = match script_policy::normalize_host(&page) { Ok(h) => h, Err(_) => continue };
+            let p = c.decide(scheme, &host, port);
+            let inject = ProxyInject { nonce: Some("N0nce"), path: Some("/__adblock__/") };
+            if let Some(h) = p.csp_header(if px { Some(&inject) } else { None }) {
+                assert_well_formed(&h);
+            }
+        }
+    }
+}

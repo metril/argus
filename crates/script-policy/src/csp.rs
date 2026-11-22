@@ -62,6 +62,26 @@ enum SrcList {
 
 const SELF: &str = "'self'";
 
+/// Can `h` be written into a CSP source expression as is? Lowercase letters, digits, `-` and `_`
+/// in non-empty labels of at most 63 bytes (punycode for IDNs), or a bracketed IPv6 literal.
+/// Anything else (spaces, `;`, `,`, quotes, empty labels, non-ASCII) would corrupt the header, so
+/// it is dropped from the policy instead of rendered.
+fn host_ok(h: &str) -> bool {
+    if let Some(v6) = h.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        return !v6.is_empty()
+            && v6
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.');
+    }
+    h.len() <= 253
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        })
+}
+
 impl<'a> PagePolicy<'a> {
     /// Directives to add as an extra `Content-Security-Policy` header. Empty when the page is
     /// unrestricted or the master switch is off.
@@ -82,7 +102,7 @@ impl<'a> PagePolicy<'a> {
             return out;
         }
         let px = proxy.copied().unwrap_or_default();
-        let path_tok = px.path.map(|p| self.path_source(p));
+        let path_tok = px.path.and_then(|p| self.path_source(p));
         let nonce_tok = px.nonce.map(|n| format!("'nonce-{n}'"));
         let notes = &mut out.notes;
 
@@ -218,7 +238,14 @@ impl<'a> PagePolicy<'a> {
     }
 
     /// `scheme://host[:port]/path/` of a proxy resource prefix on this page's origin.
-    fn path_source(&self, path: &str) -> String {
+    fn path_source(&self, path: &str) -> Option<String> {
+        if !host_ok(self.host)
+            || path
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b";,'\"".contains(&b))
+        {
+            return None;
+        }
         let scheme = self.scheme.unwrap_or(Scheme::Https);
         let port = match self.port {
             Some(p) if p != scheme.default_port() => format!(":{p}"),
@@ -229,7 +256,13 @@ impl<'a> PagePolicy<'a> {
         } else {
             format!("/{path}")
         };
-        format!("{}://{}{}{}", scheme.as_str(), self.host, port, path)
+        Some(format!(
+            "{}://{}{}{}",
+            scheme.as_str(),
+            self.host,
+            port,
+            path
+        ))
     }
 
     /// Resolve the sources allowed for a source-keyed capability.
@@ -295,6 +328,15 @@ impl<'a> PagePolicy<'a> {
         }
         let mut toks: Vec<String> = Vec::new();
         for c in &survivors {
+            let usable = match &c.scope {
+                Scope::Global => true,
+                Scope::Site(h) | Scope::Host(h) | Scope::HostScheme(_, h) => host_ok(h),
+            };
+            if !usable {
+                notes
+                    .push("a source with a host that cannot be written in CSP was left out".into());
+                continue;
+            }
             match &c.scope {
                 Scope::Global => {}
                 Scope::Site(s) => {

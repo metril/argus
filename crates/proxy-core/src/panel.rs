@@ -205,6 +205,24 @@ impl Default for PanelHost {
     }
 }
 
+/// A web URL safe to show to a page: http(s) only, and never with credentials, a query or a
+/// fragment (those could carry a token or password).
+fn public_url(s: &str) -> String {
+    match url::Url::parse(s) {
+        Ok(u)
+            if matches!(u.scheme(), "http" | "https")
+                && u.username().is_empty()
+                && u.password().is_none() =>
+        {
+            let mut u = u;
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        }
+        _ => String::new(),
+    }
+}
+
 fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
@@ -361,7 +379,7 @@ impl PanelHost {
             .unwrap_or_default();
         let ps = sc.panel();
         let cfg = self.cfg.read().clone();
-        let panel_origin = format!("{}://{}", scheme.as_str(), cfg.host);
+        let panel_origin = format!("https://{}", cfg.host);
         Some(json!({
             "gen": format!("{}.{}.{}", compiled.generation(), u8::from(adblock_off), us_gen),
             "enabled": compiled.is_enabled(),
@@ -376,7 +394,7 @@ impl PanelHost {
             "auth": ps.auth,
             "pin_set": ps.pin_hash.as_deref().is_some_and(script_policy::panel::is_current_hash),
             "panel_origin": panel_origin,
-            "dashboard": cfg.dashboard_url,
+            "dashboard": public_url(&cfg.dashboard_url),
         }))
     }
 
@@ -401,6 +419,15 @@ impl PanelHost {
                 StatusCode::FORBIDDEN,
                 "Not available here",
                 "<p>This page can only be opened as a top-level page.</p>",
+            );
+        }
+        // The confirmation form carries a PIN: only over TLS, so it cannot be read or replayed on
+        // the LAN. The landing page says nothing sensitive and may stay on plain HTTP.
+        if !origin.starts_with("https://") && matches!(path.as_str(), "/confirm" | "/apply") {
+            return page_response(
+                StatusCode::FORBIDDEN,
+                "Use https",
+                "<p>Changes are confirmed over https only. Open this page as <b>https://</b> (the proxy's CA must be trusted by the browser).</p>",
             );
         }
         match (method, path.as_str()) {
@@ -466,6 +493,12 @@ impl PanelHost {
         let exp = now() + NONCE_TTL;
         let nonce = format!("{exp:x}.{}", internal.sign(&nonce_msg(rctx, p, exp)));
         let dash = self.cfg.read().dashboard_url.clone();
+        // Only a web URL becomes a link (never `javascript:` or `data:`).
+        let dash = if dash.starts_with("http://") || dash.starts_with("https://") {
+            dash
+        } else {
+            String::new()
+        };
         let (form, note) = match ps.auth {
             PanelAuth::Session => (
                 String::new(),
@@ -881,6 +914,23 @@ mod tests {
             enabled: false,
         });
         assert_eq!(esc(&d), "Ad blocking off for &lt;b&gt;");
+    }
+
+    #[test]
+    fn the_dashboard_url_shown_to_pages_carries_no_credentials() {
+        assert_eq!(public_url("http://10.0.0.2:8080/"), "http://10.0.0.2:8080/");
+        for bad in [
+            "http://admin:secret@10.0.0.2/",
+            "javascript:alert(1)",
+            "http://h/?token=abc",
+            "",
+        ] {
+            let out = public_url(bad);
+            assert!(
+                !out.contains("secret") && !out.contains("javascript") && !out.contains("token"),
+                "{bad} -> {out}"
+            );
+        }
     }
 
     #[test]

@@ -794,6 +794,9 @@ pub async fn export(State(state): State<Arc<AppState>>) -> ApiResult<Json<Policy
     }))
 }
 
+/// Most site rules, and most source rules, one import may carry (the request body is capped too).
+const MAX_IMPORT_RULES: usize = 5000;
+
 /// Import a policy document, replacing or merging into the current rules.
 #[utoipa::path(
     post, path = "/policy/import", tag = "policy",
@@ -815,6 +818,11 @@ pub async fn import(
         }
     };
     let d = req.document;
+    if d.site_rules.len() > MAX_IMPORT_RULES || d.source_rules.len() > MAX_IMPORT_RULES {
+        return Err(ApiError::ValidationError(format!(
+            "A policy import holds at most {MAX_IMPORT_RULES} site rules and {MAX_IMPORT_RULES} source rules"
+        )));
+    }
     let mut site_rules = Vec::new();
     for r in &d.site_rules {
         check_note(&r.note)?;

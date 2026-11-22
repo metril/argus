@@ -562,6 +562,28 @@ async fn panel_settings_validate_and_never_return_the_pin() {
         (Some(true), Some(true))
     );
     assert!(!r.to_string().contains("123456") && !r.to_string().contains("pin_hash"));
+    // Stored as Argon2id, a 5-character PIN is refused, and the change is audited without the PIN.
+    let p = ctx
+        .state
+        .policy
+        .panel_settings(script_policy::DEFAULT_PROFILE)
+        .unwrap();
+    assert!(p.pin_hash.as_deref().unwrap().starts_with("$argon2id$"));
+    admin
+        .put(&format!("{B}/panel"))
+        .json(&json!({"pin": "12345"}))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    let log: Value = admin.get("/api/v1/audit?limit=100").await.json();
+    let text = log.to_string();
+    assert!(
+        text.contains("/policy/panel"),
+        "PIN change is audited: {text}"
+    );
+    assert!(
+        !text.contains("123456") && !text.contains("argon2"),
+        "the audit log never holds the PIN or its hash"
+    );
     for bad in [
         json!({"hotkey": "Shift+A"}),
         json!({"hotkey": "Alt+Alt+A"}),
@@ -619,4 +641,27 @@ async fn site_exceptions_edit_the_custom_rules() {
     assert_eq!(r["sites"], json!([]));
     let rules: Value = admin.get("/api/v1/rules/custom").await.json();
     assert!(!rules["rules"].as_str().unwrap().contains("shop.test"));
+}
+
+#[tokio::test]
+async fn policy_import_is_bounded_in_rule_count() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    enable(&admin).await;
+    let mut doc: Value = admin.get(&format!("{B}/export")).await.json();
+    let rules: Vec<Value> = (0..5001)
+        .map(|i| json!({"scope": format!("host:h{i}.example.com"), "preset": preset("trusted")}))
+        .collect();
+    doc["site_rules"] = json!(rules);
+    admin
+        .post(&format!("{B}/import"))
+        .json(&json!({"mode": "merge", "document": doc}))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    doc["site_rules"] = json!(&rules[..50]);
+    admin
+        .post(&format!("{B}/import"))
+        .json(&json!({"mode": "merge", "document": doc}))
+        .await
+        .assert_status_ok();
 }

@@ -144,6 +144,33 @@ e2e_test!(
             .unwrap();
         assert_eq!(r.status(), 200);
         assert!(env.origin.requests().is_empty());
+        // ... but never the confirmation form or /apply: a PIN must not cross the LAN in clear.
+        let q = proposal();
+        let r = c
+            .request(
+                reqwest::Method::GET,
+                &env.origin.http_url(PANEL_HOST, &format!("/confirm?p={q}")),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        let body = r.text().await.unwrap();
+        assert!(
+            !body.contains("<form") && !body.contains("name=\"pin\""),
+            "{body}"
+        );
+        let r = c
+            .request(
+                reqwest::Method::POST,
+                &env.origin.http_url(PANEL_HOST, "/apply"),
+            )
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body("p=x&n=y&pin=z")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
     }
 );
 

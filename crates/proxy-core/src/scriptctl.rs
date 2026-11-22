@@ -195,6 +195,18 @@ impl ScriptControl {
     pub fn compiled(&self) -> Arc<sp::CompiledPolicy> {
         self.compiled.load_full()
     }
+
+    /// The snapshot to decide with: if a temporary grant in it has expired, rebuild it now rather
+    /// than waiting for the expiry task's timer, so an expiry takes effect on the very next
+    /// request. One atomic load and a clock read otherwise.
+    fn fresh(&self) -> Arc<sp::CompiledPolicy> {
+        let c = self.compiled.load_full();
+        if c.valid_until().is_some_and(|v| self.store.now() >= v) {
+            self.reload();
+            return self.compiled.load_full();
+        }
+        c
+    }
     pub fn panel(&self) -> Arc<PanelSettings> {
         self.panel.load_full()
     }
@@ -207,7 +219,7 @@ impl ScriptControl {
         if !self.enabled() {
             return None;
         }
-        let compiled = self.compiled.load_full();
+        let compiled = self.fresh();
         let https = scheme == "https";
         let key: DocKey = (compiled.generation(), https, port, host.into());
         if let Some(e) = self.docs.get(&key) {
@@ -294,7 +306,7 @@ impl ScriptControl {
         else {
             return None;
         };
-        let compiled = self.compiled.load();
+        let compiled = self.fresh();
         self.decides.fetch_add(1, Ordering::Relaxed);
         let page = compiled.decide(ps.as_str(), ph, pp);
         let hints = page.network_hints();
@@ -523,5 +535,36 @@ mod tests {
             c.check_request(&h, "https", "cdn.test", 443).is_some(),
             "blocked again"
         );
+    }
+
+    #[test]
+    fn an_expired_temporary_grant_is_gone_on_the_very_next_request() {
+        // No expiry task here: the request path itself must notice the expiry.
+        let (_d, store, c) = control();
+        let h = script_from("a.test");
+        store
+            .grant_temp(
+                P,
+                Scope::parse("a.test").unwrap(),
+                GrantKind::Source {
+                    source: Scope::parse("cdn.test").unwrap(),
+                    caps: CapSet::of(&[C::Script]),
+                },
+                Some(1),
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(
+            c.check_request(&h, "https", "cdn.test", 443).is_none(),
+            "granted"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(
+            c.check_request(&h, "https", "cdn.test", 443).is_some(),
+            "blocked again without waiting for a timer"
+        );
+        let e = c.document("https", "a.test", 443).unwrap();
+        assert!(c.compiled().valid_until().is_none(), "{:?}", e.csp);
     }
 }
