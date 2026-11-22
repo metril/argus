@@ -111,8 +111,7 @@ async fn start_webui_server(
     info!("Initializing Web UI server...");
 
     // One database file per process: users, sessions, tokens, audit and userscripts share
-    // `<adblock.data_dir>/adblocker.redb` with the filter lists. (`userscripts.data_dir` and
-    // `webui.session_storage_path` are no longer used for storage.)
+    // `<adblock.data_dir>/adblocker.redb` with the filter lists.
     let data_dir = config.adblock.data_dir.clone();
 
     // Initialize userscript manager

@@ -146,15 +146,11 @@ impl Default for AdblockSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
-    pub data_dir: PathBuf,
 }
 
 impl Default for UserscriptSettings {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            data_dir: PathBuf::from("data/userscripts"),
-        }
+        Self { enabled: false }
     }
 }
 
@@ -164,7 +160,6 @@ pub struct WebUiSettings {
     pub host: String,
     pub port: u16,
     pub jwt_secret_path: PathBuf,
-    pub session_storage_path: PathBuf,
     pub cors_origins: Vec<String>,
     pub rate_limit_global_rpm: u64,
     pub rate_limit_ip_rpm: u64,
@@ -178,7 +173,6 @@ impl Default for WebUiSettings {
             host: "127.0.0.1".to_string(),
             port: 3000,
             jwt_secret_path: PathBuf::from("data/jwt_secret"),
-            session_storage_path: PathBuf::from("data/sessions"),
             cors_origins: vec!["http://localhost:5173".to_string()],
             rate_limit_global_rpm: 10000,
             rate_limit_ip_rpm: 100,
@@ -231,8 +225,22 @@ impl ProxyConfig {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("Failed to read config file: {}", e)))?;
 
-        toml::from_str(&content)
-            .map_err(|e| ConfigError::Parse(format!("Failed to parse config: {}", e)))
+        Self::from_toml(&content)
+    }
+
+    /// Parse configuration from TOML text. Settings that no longer exist are an error, not
+    /// silently ignored.
+    pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
+        let parse = |e: toml::de::Error| ConfigError::Parse(format!("Failed to parse config: {e}"));
+        let doc: toml::Table = content.parse().map_err(parse)?;
+        for (section, key, hint) in REMOVED_SETTINGS {
+            if doc.get(*section).and_then(|s| s.get(*key)).is_some() {
+                return Err(ConfigError::Parse(format!(
+                    "`[{section}] {key}` was removed: {hint}. Delete it from the config file."
+                )));
+            }
+        }
+        toml::from_str(content).map_err(parse)
     }
 
     /// Save configuration to a TOML file
@@ -247,6 +255,20 @@ impl ProxyConfig {
     }
 }
 
+/// Settings that used to exist: `(section, key, what replaced them)`.
+const REMOVED_SETTINGS: &[(&str, &str, &str)] = &[
+    (
+        "userscripts",
+        "data_dir",
+        "userscripts are stored in `<adblock.data_dir>/adblocker.redb`",
+    ),
+    (
+        "webui",
+        "session_storage_path",
+        "sessions are stored in `<adblock.data_dir>/adblocker.redb`",
+    ),
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("I/O error: {0}")]
@@ -255,4 +277,26 @@ pub enum ConfigError {
     Parse(String),
     #[error("Serialize error: {0}")]
     Serialize(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removed_settings_are_rejected_with_a_clear_message() {
+        let base = toml::to_string(&ProxyConfig::default()).unwrap();
+        assert!(ProxyConfig::from_toml(&base).is_ok());
+        let bad = base.replace("[webui]", "[webui]\nsession_storage_path = \"x\"");
+        let e = ProxyConfig::from_toml(&bad).unwrap_err().to_string();
+        assert!(
+            e.contains("session_storage_path") && e.contains("removed"),
+            "{e}"
+        );
+        let bad = base.replace("[userscripts]", "[userscripts]\ndata_dir = \"x\"");
+        assert!(ProxyConfig::from_toml(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("data_dir"));
+    }
 }

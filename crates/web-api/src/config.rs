@@ -181,7 +181,8 @@ impl Default for SecurityConfig {
 /// Session storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Path to session storage directory
+    /// Directory holding `adblocker.redb` (the one database file shared by users, sessions,
+    /// tokens, audit and userscripts)
     pub storage_path: PathBuf,
 
     /// Cleanup interval in seconds
