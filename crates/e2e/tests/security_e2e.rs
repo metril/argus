@@ -365,7 +365,8 @@ e2e_test!(oversized_cc_body_gets_413, rules = [], |env| {
         .send()
         .await
         .unwrap();
-    assert_eq!(small.status(), 200);
+    // Well-formed but without a page token: refused (the full flow is in rewrite_e2e).
+    assert_eq!(small.status(), 415);
     assert!(env.origin.requests().is_empty());
 });
 
@@ -403,7 +404,7 @@ e2e_test!(
 );
 
 e2e_test!(
-    document_requests_only_accept_decodable_encodings,
+    document_requests_keep_the_clients_accept_encoding,
     rules = AD_RULES,
     |env| {
         env.origin
@@ -443,7 +444,8 @@ e2e_test!(
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(enc("/d"), vec!["gzip, br", "identity"]);
+        // Accept-Encoding is forwarded as the client sent it (zstd is decodable now).
+        assert_eq!(enc("/d"), vec!["gzip, zstd;q=0.9, br", "zstd"]);
         assert_eq!(enc("/asset"), vec!["zstd"]);
     }
 );

@@ -138,15 +138,17 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
     // HTML response gets the dynamic-hiding helper injected, original content preserved.
     let page = client
         .get(format!("http://127.0.0.1:{origin_port}/"))
+        .header("sec-fetch-dest", "document")
         .send()
         .await
         .expect("html request");
     assert_eq!(page.status(), 200);
     let html = page.text().await.unwrap();
-    assert!(
-        html.contains("__adblock_helper"),
-        "helper not injected: {html}"
-    );
+    assert!(html.contains("__ab_cfg"), "boot not injected: {html}");
+    let i = html.find("id=\"__ab_cfg\">").unwrap() + "id=\"__ab_cfg\">".len();
+    let cfg: serde_json::Value =
+        serde_json::from_str(&html[i..i + html[i..].find("</script>").unwrap()]).unwrap();
+    let token = cfg["t"].as_str().unwrap().to_string();
     assert!(
         html.contains("class=\"sponsored\""),
         "original content lost"
@@ -154,7 +156,8 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
 
     // The dynamic endpoint resolves generic selectors for reported class tokens, served locally.
     let cc = client
-        .post("http://anything.test/__adblock__/cc")
+        .post(format!("http://127.0.0.1:{origin_port}/__adblock__/cc"))
+        .header("x-adblock-token", token)
         .json(&serde_json::json!({
             "url": format!("http://127.0.0.1:{origin_port}/"),
             "classes": ["sponsored"],

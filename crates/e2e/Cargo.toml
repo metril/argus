@@ -24,3 +24,6 @@ futures-util = { workspace = true }
 parking_lot = { workspace = true }
 tempfile = { workspace = true }
 async-trait = { workspace = true }
+async-compression = { workspace = true, features = ["zstd"] }
+encoding_rs = "0.8"
+serde_json = { workspace = true }

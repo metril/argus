@@ -75,8 +75,11 @@ e2e_test!(
         );
         let resp = env
             .client()
-            .get(&env.origin.https_url("example.test", "/page"))
-            .await;
+            .request(reqwest::Method::GET, &env.origin.https_url("example.test", "/page"))
+            .header("sec-fetch-dest", "document")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let html = resp.text().await.unwrap();
         assert!(
