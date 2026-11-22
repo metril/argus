@@ -1,6 +1,12 @@
 //! Userscript manager for handling multiple scripts
 
-use crate::{script::Userscript, storage::UserscriptStorage, Error, Result};
+use crate::{
+    index::{BuildReport, ScriptIndex},
+    matcher::Options,
+    script::{Userscript, DEFAULT_PROFILE},
+    storage::{ns, UserscriptStorage},
+    Error, Result,
+};
 use common::db::redb::{Durability, ReadableTable};
 use common::db::{tables, Db, DbError};
 use parking_lot::RwLock;
@@ -9,14 +15,29 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Manages a collection of userscripts
+/// Manages a collection of userscripts. Every operation exists in a profile-aware `*_in` form;
+/// the plain methods address [`DEFAULT_PROFILE`].
 pub struct UserscriptManager {
-    /// All installed userscripts indexed by ID
-    scripts: Arc<RwLock<HashMap<String, Userscript>>>,
+    /// All installed userscripts indexed by (profile, id)
+    scripts: Arc<RwLock<HashMap<(String, String), Userscript>>>,
     /// Storage for script data
     storage: Arc<UserscriptStorage>,
     /// Shared database (userscripts and GM values)
     db: Arc<Db>,
+}
+
+fn key(profile: &str, id: &str) -> (String, String) {
+    (profile.to_string(), id.to_string())
+}
+
+fn check_ids(profile: &str, id: &str) -> Result<()> {
+    let bad = |s: &str| s.is_empty() || s.chars().any(|c| c.is_control());
+    if bad(profile) || bad(id) {
+        return Err(Error::InvalidScript(
+            "profile/script id must be non-empty without control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl UserscriptManager {
@@ -26,13 +47,9 @@ impl UserscriptManager {
             "Initializing userscript manager with data dir: {:?}",
             data_dir
         );
-
-        // Create data directory if it doesn't exist
         std::fs::create_dir_all(&data_dir)?;
-
         let db = Db::open(&data_dir)?;
         let storage = Arc::new(UserscriptStorage::with_db(db.clone()));
-
         Ok(Self {
             scripts: Arc::new(RwLock::new(HashMap::new())),
             storage,
@@ -40,140 +57,177 @@ impl UserscriptManager {
         })
     }
 
-    /// Install a new userscript from source code
+    /// Install a new userscript from source code (default profile; no dependencies fetched).
     pub fn install(&self, source: String) -> Result<String> {
-        let script = Userscript::new(source)?;
+        self.install_in(DEFAULT_PROFILE, source)
+    }
+
+    pub fn install_in(&self, profile: &str, source: String) -> Result<String> {
+        self.install_script(profile, Userscript::new(source)?)
+    }
+
+    /// Install a prepared script (e.g. from `install::finish_install`) into `profile`.
+    pub fn install_script(&self, profile: &str, mut script: Userscript) -> Result<String> {
+        check_ids(profile, &script.id)?;
+        script.profile = profile.to_string();
         let script_id = script.id.clone();
-
         info!("Installing userscript: {} ({})", script.name(), script_id);
-
-        // Check if already installed
-        {
-            let scripts = self.scripts.read();
-            if scripts.contains_key(&script_id) {
-                return Err(Error::InvalidScript(format!(
-                    "Script {} is already installed",
-                    script_id
-                )));
-            }
+        if self.scripts.read().contains_key(&key(profile, &script_id)) {
+            return Err(Error::InvalidScript(format!(
+                "Script {} is already installed",
+                script_id
+            )));
         }
-
-        // Persist
         self.save_script(&script, Durability::Immediate)?;
-
-        // Add to in-memory collection
-        self.scripts.write().insert(script_id.clone(), script);
-
+        self.scripts
+            .write()
+            .insert(key(profile, &script_id), script);
         Ok(script_id)
     }
 
-    /// Update an existing userscript
+    /// Update an existing userscript (default profile)
     pub fn update(&self, script_id: &str, new_source: String) -> Result<()> {
+        self.update_in(DEFAULT_PROFILE, script_id, new_source)
+    }
+
+    pub fn update_in(&self, profile: &str, script_id: &str, new_source: String) -> Result<()> {
         let mut scripts = self.scripts.write();
-
         let script = scripts
-            .get_mut(script_id)
+            .get_mut(&key(profile, script_id))
             .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
-
         info!("Updating userscript: {} ({})", script.name(), script_id);
-
         script.update(new_source)?;
-
         self.save_script(script, Durability::Immediate)?;
-
         Ok(())
     }
 
-    /// Uninstall a userscript
-    pub fn uninstall(&self, script_id: &str) -> Result<()> {
-        info!("Uninstalling userscript: {}", script_id);
+    /// Replace an installed script with an already verified update (see
+    /// `install::finish_update`, which enforces re-approval for widening updates).
+    pub fn replace_script(&self, profile: &str, mut script: Userscript) -> Result<()> {
+        let mut scripts = self.scripts.write();
+        if !scripts.contains_key(&key(profile, &script.id)) {
+            return Err(Error::ScriptNotFound(script.id));
+        }
+        script.profile = profile.to_string();
+        self.save_script(&script, Durability::Immediate)?;
+        scripts.insert(key(profile, &script.id), script);
+        Ok(())
+    }
 
-        // Remove from in-memory collection
+    /// Uninstall a userscript (default profile)
+    pub fn uninstall(&self, script_id: &str) -> Result<()> {
+        self.uninstall_in(DEFAULT_PROFILE, script_id)
+    }
+
+    pub fn uninstall_in(&self, profile: &str, script_id: &str) -> Result<()> {
+        info!("Uninstalling userscript: {}", script_id);
         let script = self
             .scripts
             .write()
-            .remove(script_id)
+            .remove(&key(profile, script_id))
             .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
 
         // Remove the script and its stored values in one transaction.
+        let namespace = ns(profile, script_id);
         self.storage.flush()?;
         self.db.write::<_, Error>(Durability::Immediate, |t| {
             t.open_table(tables::USERSCRIPTS)
                 .map_err(DbError::from)?
-                .remove(script_id)
+                .remove(namespace.as_str())
                 .map_err(DbError::from)?;
-            UserscriptStorage::clear_in_txn(t, script_id)
+            UserscriptStorage::clear_in_txn(t, &namespace)
         })?;
-        self.storage.drop_cache(script_id);
-
+        self.storage.drop_cache(&namespace);
         info!("Uninstalled userscript: {}", script.name());
-
         Ok(())
     }
 
-    /// Get a userscript by ID
+    /// Get a userscript by ID (default profile)
     pub fn get(&self, script_id: &str) -> Option<Userscript> {
-        self.scripts.read().get(script_id).cloned()
+        self.get_in(DEFAULT_PROFILE, script_id)
     }
 
-    /// Get all userscripts
+    pub fn get_in(&self, profile: &str, script_id: &str) -> Option<Userscript> {
+        self.scripts.read().get(&key(profile, script_id)).cloned()
+    }
+
+    /// Get all userscripts (all profiles)
     pub fn get_all(&self) -> Vec<Userscript> {
         self.scripts.read().values().cloned().collect()
     }
 
-    /// Get userscripts that should run on a given URL
-    pub fn get_scripts_for_url(&self, url: &str) -> Vec<Userscript> {
-        let scripts = self.scripts.read();
-        scripts
+    /// Scripts of one profile, in install order.
+    pub fn get_all_in(&self, profile: &str) -> Vec<Userscript> {
+        let mut v: Vec<Userscript> = self
+            .scripts
+            .read()
             .values()
-            .filter(|script| script.should_run_on(url))
+            .filter(|s| s.profile == profile)
             .cloned()
+            .collect();
+        v.sort_by(|a, b| {
+            a.installed_at
+                .cmp(&b.installed_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        v
+    }
+
+    /// Build the immutable per-document index of a profile's enabled scripts. Rebuild and swap
+    /// it (e.g. into an `ArcSwap`) after any change.
+    pub fn build_index(&self, profile: &str, opts: Options) -> BuildReport {
+        ScriptIndex::build(profile, &self.get_all_in(profile), opts)
+    }
+
+    /// Userscripts of the default profile that should run on a given URL
+    pub fn get_scripts_for_url(&self, url: &str) -> Vec<Userscript> {
+        self.get_all_in(DEFAULT_PROFILE)
+            .into_iter()
+            .filter(|script| script.should_run_on(url))
             .collect()
     }
 
-    /// Enable or disable a userscript
+    /// Enable or disable a userscript (default profile)
     pub fn set_enabled(&self, script_id: &str, enabled: bool) -> Result<()> {
+        self.set_enabled_in(DEFAULT_PROFILE, script_id, enabled)
+    }
+
+    pub fn set_enabled_in(&self, profile: &str, script_id: &str, enabled: bool) -> Result<()> {
         let mut scripts = self.scripts.write();
-
         let script = scripts
-            .get_mut(script_id)
+            .get_mut(&key(profile, script_id))
             .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
-
         info!(
             "{} userscript: {}",
             if enabled { "Enabling" } else { "Disabling" },
             script.name()
         );
-
         script.enabled = enabled;
-
         self.save_script(script, Durability::Immediate)?;
-
         Ok(())
     }
 
-    /// Record script execution
+    /// Record script execution (default profile)
     pub fn record_execution(&self, script_id: &str) -> Result<()> {
+        self.record_execution_in(DEFAULT_PROFILE, script_id)
+    }
+
+    pub fn record_execution_in(&self, profile: &str, script_id: &str) -> Result<()> {
         let mut scripts = self.scripts.write();
-
         let script = scripts
-            .get_mut(script_id)
+            .get_mut(&key(profile, script_id))
             .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
-
         script.record_execution();
-
         // Periodically persist (every 10 executions; no fsync, counters are best-effort)
         if script.execution_count % 10 == 0 {
             self.save_script(script, Durability::Eventual)?;
         }
-
         Ok(())
     }
 
     /// Load all userscripts from the database
     pub fn load_all(&self) -> Result<usize> {
         info!("Loading userscripts");
-
         let loaded: Vec<Userscript> = self.db.read(|r| {
             let t = r.open_table(tables::USERSCRIPTS).map_err(DbError::from)?;
             let mut out = Vec::new();
@@ -186,14 +240,12 @@ impl UserscriptManager {
             }
             Ok::<_, Error>(out)
         })?;
-
         let count = loaded.len();
         let mut scripts = self.scripts.write();
         for script in loaded {
             debug!("Loaded userscript: {}", script.name());
-            scripts.insert(script.id.clone(), script);
+            scripts.insert(key(&script.profile, &script.id), script);
         }
-
         info!("Loaded {} userscripts", count);
         Ok(count)
     }
@@ -211,10 +263,11 @@ impl UserscriptManager {
     /// Persist a script
     fn save_script(&self, script: &Userscript, durability: Durability) -> Result<()> {
         let json = serde_json::to_vec(script)?;
+        let k = ns(&script.profile, &script.id);
         self.db.write::<_, Error>(durability, |t| {
             t.open_table(tables::USERSCRIPTS)
                 .map_err(DbError::from)?
-                .insert(script.id.as_str(), json.as_slice())
+                .insert(k.as_str(), json.as_slice())
                 .map_err(DbError::from)?;
             Ok(())
         })
@@ -227,7 +280,6 @@ impl UserscriptManager {
         let enabled = scripts.values().filter(|s| s.enabled).count();
         let disabled = total - enabled;
         let total_executions: u64 = scripts.values().map(|s| s.execution_count).sum();
-
         UserscriptStats {
             total_scripts: total,
             enabled_scripts: enabled,
@@ -302,6 +354,30 @@ console.log('test');
         // Disabled script should not run
         let scripts = manager.get_scripts_for_url("https://example.com/page");
         assert_eq!(scripts.len(), 0);
+    }
+
+    #[test]
+    fn profiles_are_isolated() {
+        let temp_dir = tempdir().unwrap();
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let id = m.install_in("a", TEST_SCRIPT.to_string()).unwrap();
+        m.install_in("b", TEST_SCRIPT.to_string()).unwrap();
+        assert!(m.get(&id).is_none());
+        m.storage()
+            .set_raw(&ns("a", &id), "k", serde_json::json!(1))
+            .unwrap();
+        assert!(m.storage().get_raw(&ns("b", &id), "k").unwrap().is_none());
+        m.set_enabled_in("a", &id, false).unwrap();
+        assert!(m.build_index("a", Options::default()).index.is_empty());
+        assert_eq!(m.build_index("b", Options::default()).index.len(), 1);
+        m.uninstall_in("a", &id).unwrap();
+        assert!(m.storage().get_raw(&ns("a", &id), "k").unwrap().is_none());
+        assert_eq!(m.get_all_in("b").len(), 1);
+        drop(m);
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        m.load_all().unwrap();
+        assert!(m.get_all_in("a").is_empty());
+        assert_eq!(m.get_all_in("b").len(), 1);
     }
 
     #[test]

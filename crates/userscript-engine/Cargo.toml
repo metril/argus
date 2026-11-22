@@ -43,7 +43,18 @@ validator = { workspace = true }
 # Encoding
 base64 = "0.22"
 
-# Common utilities
+smallvec = "1.13"
+hmac = "0.12"
+sha2 = { workspace = true }
+md-5 = "0.10"
+subtle = "2.6"
+psl = "2"
 
 [dev-dependencies]
 tempfile = "3.15"
+criterion = { workspace = true }
+rand = { workspace = true }
+
+[[bench]]
+name = "index"
+harness = false
