@@ -25,12 +25,13 @@ use std::io;
 /// `Unsync` because stream stages hold `Send`-only state; hyper only requires `Send`.
 pub type ProxyBody = UnsyncBoxBody<Bytes, io::Error>;
 
-/// A fresh 128-bit nonce from the OS CSPRNG, base64-encoded.
+/// A fresh 128-bit nonce, base64-encoded. Drawn from the thread-local CSPRNG (ChaCha12, seeded
+/// from the OS and reseeded periodically), so no syscall per nonce.
 pub fn new_nonce() -> String {
     use base64::Engine as _;
     use rand::RngCore;
     let mut b = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    rand::thread_rng().fill_bytes(&mut b);
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 

@@ -23,6 +23,7 @@ pub mod gm;
 pub mod http2;
 pub mod inject;
 pub mod internal;
+pub mod dns;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;

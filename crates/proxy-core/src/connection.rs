@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 /// Maximum size of a CONNECT request head.
 pub const MAX_HEAD_BYTES: usize = 16 * 1024;
@@ -469,7 +469,7 @@ async fn handle_request(
     }
 
     if req.method() == Method::CONNECT {
-        warn!("CONNECT reached the HTTP handler from {}", rctx.client_addr);
+        debug!("CONNECT reached the HTTP handler from {}", rctx.client_addr);
         return Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(full_body(Bytes::from_static(b"CONNECT not allowed here")))

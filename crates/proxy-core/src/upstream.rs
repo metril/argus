@@ -1,5 +1,6 @@
 //! Construction of the pooled upstream HTTP client.
 
+use crate::dns::CachedResolver;
 use crate::policy::{DestPolicy, PolicyRefused};
 use crate::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -23,6 +24,8 @@ pub struct UpstreamOptions {
     pub read_timeout: Option<Duration>,
     /// Destination policy applied to every address the client resolves.
     pub policy: Arc<DestPolicy>,
+    /// Shared caching resolver; a default one is created per client when `None`.
+    pub dns: Option<Arc<CachedResolver>>,
 }
 
 impl UpstreamOptions {
@@ -37,6 +40,7 @@ impl UpstreamOptions {
             read_timeout: Some(Duration::from_secs(
                 config.performance.request_timeout_secs.max(1),
             )),
+            dns: Some(Arc::new(CachedResolver::from_settings(&config.dns))),
             policy: Arc::new(DestPolicy::from_config(config).unwrap_or_else(|e| {
                 // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
                 tracing::warn!("destination policy config invalid: {e}");
@@ -86,39 +90,58 @@ struct PolicyResolver {
     override_ip: Option<IpAddr>,
     /// Also refuse every address of this host (client used for the proxy's own ports).
     strict: bool,
+    dns: Arc<CachedResolver>,
+}
+
+impl PolicyResolver {
+    /// Resolve (cached) and apply the destination policy to every address, on every call. The
+    /// returned addresses are exactly what the connector dials; nothing is resolved again.
+    async fn resolve_checked(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ip) = self.override_ip {
+            return Ok(vec![SocketAddr::new(ip, 0)]);
+        }
+        let addrs = self.dns.resolve(name).await.map_err(|e| {
+            Box::new(std::io::Error::other(format!("dns lookup failed: {e}")))
+                as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        let mut allowed = Vec::with_capacity(addrs.len());
+        let mut denied = None;
+        for ip in addrs.iter() {
+            let verdict = if self.strict {
+                self.policy.check_ip_strict(*ip)
+            } else {
+                self.policy.check_ip(*ip)
+            };
+            match verdict {
+                Ok(()) => allowed.push(SocketAddr::new(*ip, 0)),
+                Err(r) => {
+                    denied.get_or_insert(r);
+                }
+            }
+        }
+        if allowed.is_empty() {
+            if let Some(r) = denied {
+                return Err(Box::new(PolicyRefused(r)));
+            }
+        }
+        Ok(allowed)
+    }
 }
 
 impl reqwest::dns::Resolve for PolicyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let policy = self.policy.clone();
-        let (override_ip, strict) = (self.override_ip, self.strict);
+        let this = PolicyResolver {
+            policy: self.policy.clone(),
+            override_ip: self.override_ip,
+            strict: self.strict,
+            dns: self.dns.clone(),
+        };
         Box::pin(async move {
-            if let Some(ip) = override_ip {
-                return Ok(Box::new(std::iter::once(SocketAddr::new(ip, 0))) as reqwest::dns::Addrs);
-            }
-            let mut allowed = Vec::new();
-            let mut denied = None;
-            for addr in tokio::net::lookup_host((name.as_str(), 0)).await? {
-                let verdict = if strict {
-                    policy.check_ip_strict(addr.ip())
-                } else {
-                    policy.check_ip(addr.ip())
-                };
-                match verdict {
-                    Ok(()) => allowed.push(addr),
-                    Err(r) => {
-                        denied.get_or_insert(r);
-                    }
-                }
-            }
-            if allowed.is_empty() {
-                if let Some(r) = denied {
-                    return Err(
-                        Box::new(PolicyRefused(r)) as Box<dyn std::error::Error + Send + Sync>
-                    );
-                }
-            }
-            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+            let v = this.resolve_checked(name.as_str()).await?;
+            Ok(Box::new(v.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
@@ -140,7 +163,19 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
     // destination policy.
     let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        // Latency over batching: the proxy relays whole messages, never small interactive writes
+        // it could usefully coalesce (also reqwest's default; stated so it cannot regress).
+        .tcp_nodelay(true)
+        // Detect dead pooled connections (NAT timeouts, vanished peers) before a request is
+        // sent down one.
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        // Bound idle descriptors per origin; connections beyond this are closed when idle.
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(Duration::from_secs(60))
+        // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
+        // the 64 KiB default, which throttles large downloads from distant origins.
+        .http2_adaptive_window(true);
     for path in &opts.extra_ca_paths {
         let pem = std::fs::read(path).map_err(|e| {
             Error::Config(format!(
@@ -170,6 +205,10 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         policy: opts.policy.clone(),
         override_ip: opts.resolve_all_to,
         strict,
+        dns: opts
+            .dns
+            .clone()
+            .unwrap_or_else(|| Arc::new(CachedResolver::from_settings(&Default::default()))),
     }));
     builder
         .build()
@@ -199,6 +238,45 @@ mod tests {
         // A config file cannot carry the override: unknown keys are not part of the schema.
         let toml = toml::to_string(&cfg).unwrap();
         assert!(!toml.contains("resolve_all_to"));
+    }
+
+    struct Fixed(std::sync::atomic::AtomicU64, IpAddr);
+    impl crate::dns::DnsBackend for Fixed {
+        fn lookup(
+            &self,
+            _n: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::dns::BackendResult> + Send>>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ip = self.1;
+            Box::pin(async move { Ok((vec![ip], Duration::from_secs(60))) })
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_is_applied_to_cache_hits() {
+        let backend = Arc::new(Fixed(Default::default(), "127.0.0.1".parse().unwrap()));
+        let dns = Arc::new(CachedResolver::new(
+            backend.clone(),
+            crate::dns::DnsCacheConfig {
+                capacity: 10,
+                min_ttl: Duration::from_secs(60),
+                max_ttl: Duration::from_secs(60),
+                negative_ttl: Duration::from_secs(60),
+            },
+        ));
+        let r = PolicyResolver {
+            policy: Arc::new(DestPolicy::default()),
+            override_ip: None,
+            strict: false,
+            dns: dns.clone(),
+        };
+        for _ in 0..3 {
+            assert!(r.resolve_checked("rebind.test").await.is_err());
+        }
+        // One backend lookup, two cache hits, refused every time.
+        assert_eq!(backend.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(dns.stats(), (2, 1));
     }
 
     #[test]
