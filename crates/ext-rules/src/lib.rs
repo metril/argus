@@ -35,7 +35,7 @@ pub use cookie::{
 pub use filter_engine::formats::{ExtKind, ExtRule};
 pub use headers::{is_removable_header, HeaderEdit};
 pub use hls::{apply_hls, HlsPrune, MAX_HLS_BYTES};
-pub use index::{BuildOptions, ExtIndex, ExtStats, KindStats, RuleIssue};
+pub use index::{BuildOptions, ExtIndex, ExtStats, KindStats, RuleIssue, RuleState};
 pub use jsonprune::{apply_jsonprune, JsonPrune, MAX_JSON_BYTES};
 pub use parse::{
     parse_rule, target, Action, HeaderMatch, HtmlRemoval, Injection, ParsedRule, RuleError,

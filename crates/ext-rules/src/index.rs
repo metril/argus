@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
 use filter_engine::formats::ExtRule;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cookie::{apply_set_cookie, filter_request_cookie, CookieSpec, SetCookie};
 use crate::headers::HeaderEdit;
@@ -23,7 +23,7 @@ use crate::types::{
 use crate::util::{host_range, lower, suffixes, FxMap};
 
 /// Per-kind build statistics (kinds are [`filter_engine::formats::ExtKind::as_str`] names).
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KindStats {
     /// Parsed successfully.
     pub parsed: usize,
@@ -40,7 +40,7 @@ pub struct KindStats {
 }
 
 /// One rule that could not be used.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleIssue {
     pub kind: String,
     pub list: String,
@@ -50,7 +50,7 @@ pub struct RuleIssue {
 }
 
 /// What the build did with the handed-off rules.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtStats {
     pub total: usize,
     pub per_kind: BTreeMap<String, KindStats>,
@@ -60,6 +60,43 @@ pub struct ExtStats {
     pub issues: Vec<RuleIssue>,
     /// Failures beyond the kept ones.
     pub issues_truncated: usize,
+}
+
+/// What the build did with one handed-off rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuleState {
+    /// In the index (enforced; exceptions disable matching rules at request time).
+    Active,
+    /// Needs a trusted list and the list is not trusted.
+    DroppedUntrusted,
+    /// Well-formed but not implemented.
+    Unsupported(String),
+    /// Malformed.
+    Invalid(String),
+    /// Switched off by a `$badfilter` rule.
+    Badfiltered,
+    /// A `$badfilter` rule itself (no effect of its own).
+    Badfilter,
+}
+
+impl RuleState {
+    /// Stable machine name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::DroppedUntrusted => "dropped_untrusted",
+            Self::Unsupported(_) => "unsupported",
+            Self::Invalid(_) => "invalid",
+            Self::Badfiltered => "badfiltered",
+            Self::Badfilter => "badfilter",
+        }
+    }
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Unsupported(r) | Self::Invalid(r) => Some(r),
+            _ => None,
+        }
+    }
 }
 
 /// Index build options.
@@ -239,6 +276,8 @@ pub struct ExtIndex {
     present: u32,
     needs_req_headers: bool,
     stats: ExtStats,
+    /// Fate of every input rule, in input order.
+    states: Vec<RuleState>,
 }
 
 impl std::fmt::Debug for ExtIndex {
@@ -260,8 +299,9 @@ impl ExtIndex {
             total: rules.len(),
             ..Default::default()
         };
-        let mut parsed: Vec<ParsedRule> = Vec::with_capacity(rules.len());
-        for r in rules {
+        let mut parsed: Vec<(usize, ParsedRule)> = Vec::with_capacity(rules.len());
+        let mut states: Vec<RuleState> = vec![RuleState::Active; rules.len()];
+        for (ri, r) in rules.iter().enumerate() {
             let k = stats
                 .per_kind
                 .entry(r.kind.as_str().to_string())
@@ -272,10 +312,15 @@ impl ExtIndex {
                     if opts.trusted_lists.contains(&p.list) {
                         p.trusted = true;
                     }
-                    parsed.push(p);
+                    parsed.push((ri, p));
                 }
                 Err(e) => {
                     let unsupported = matches!(e, RuleError::Unsupported(_));
+                    states[ri] = if unsupported {
+                        RuleState::Unsupported(e.reason().to_string())
+                    } else {
+                        RuleState::Invalid(e.reason().to_string())
+                    };
                     if unsupported {
                         k.unsupported += 1
                     } else {
@@ -297,8 +342,8 @@ impl ExtIndex {
         }
         let bad: HashSet<String> = parsed
             .iter()
-            .filter(|p| p.badfilter)
-            .map(|p| p.key.clone())
+            .filter(|(_, p)| p.badfilter)
+            .map(|(_, p)| p.key.clone())
             .collect();
         let mut idx = ExtIndex {
             rules: Vec::new(),
@@ -308,16 +353,19 @@ impl ExtIndex {
             present: 0,
             needs_req_headers: false,
             stats: ExtStats::default(),
+            states: Vec::new(),
         };
-        for p in parsed {
+        for (ri, p) in parsed {
             let k = stats
                 .per_kind
                 .get_mut(p.src_kind.as_str())
                 .expect("counted above");
             if p.badfilter {
+                states[ri] = RuleState::Badfilter;
                 continue;
             }
             if bad.contains(&p.key) {
+                states[ri] = RuleState::Badfiltered;
                 k.badfiltered += 1;
                 continue;
             }
@@ -327,12 +375,14 @@ impl ExtIndex {
                     .dropped_untrusted_by_list
                     .entry(p.list.clone())
                     .or_default() += 1;
+                states[ri] = RuleState::DroppedUntrusted;
                 continue;
             }
             k.active += 1;
             idx.insert(p);
         }
         idx.stats = stats;
+        idx.states = states;
         idx
     }
 
@@ -389,6 +439,10 @@ impl ExtIndex {
     }
     pub fn len(&self) -> usize {
         self.rules.len()
+    }
+    /// Fate of the `i`-th rule handed to [`Self::build_with`].
+    pub fn state_of(&self, i: usize) -> Option<&RuleState> {
+        self.states.get(i)
     }
     pub fn stats(&self) -> &ExtStats {
         &self.stats
@@ -515,6 +569,53 @@ impl ExtIndex {
             }
         }
         d
+    }
+
+    /// The body transforms among `ids` (rule ids from [`ResponsePlan::matched`]), grouped like
+    /// [`Self::response_plan`] groups them, so a caller can keep owned ids instead of borrows.
+    pub fn body_transforms_for(&self, ids: &[RuleId]) -> Vec<BodyTransform<'_>> {
+        let mut out: Vec<BodyTransform<'_>> = Vec::new();
+        for &id in ids {
+            let Some(r) = self.rules.get(id as usize) else {
+                continue;
+            };
+            match &r.action {
+                Action::Replace(s) => out.push(BodyTransform::Replace(s)),
+                Action::JsonPrune(s) => match out.iter_mut().find_map(|t| match t {
+                    BodyTransform::JsonPrune(v) => Some(v),
+                    _ => None,
+                }) {
+                    Some(v) => v.push(s),
+                    None => out.push(BodyTransform::JsonPrune(vec![s])),
+                },
+                Action::XmlPrune(s) => match out.iter_mut().find_map(|t| match t {
+                    BodyTransform::XmlPrune(v) => Some(v),
+                    _ => None,
+                }) {
+                    Some(v) => v.push(s),
+                    None => out.push(BodyTransform::XmlPrune(vec![s])),
+                },
+                Action::Hls(s) => match out.iter_mut().find_map(|t| match t {
+                    BodyTransform::Hls(v) => Some(v),
+                    _ => None,
+                }) {
+                    Some(v) => v.push(s),
+                    None => out.push(BodyTransform::Hls(vec![s])),
+                },
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Is `id` a body-rewriting rule (`$replace`, `$jsonprune`, `$xmlprune`, `$hls`)?
+    pub fn is_body_rule(&self, id: RuleId) -> bool {
+        self.rules.get(id as usize).is_some_and(|r| {
+            matches!(
+                r.action,
+                Action::Replace(_) | Action::JsonPrune(_) | Action::XmlPrune(_) | Action::Hls(_)
+            )
+        })
     }
 
     /// Everything to do to a response. Compute once per response.
