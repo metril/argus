@@ -712,10 +712,8 @@ const UNSAFE_STYLES: &[&str] = &[
 fn unsafe_style_declarations_are_rejected_from_any_list() {
     for st in UNSAFE_STYLES {
         for trusted in [false, true] {
-            for sep in ["#$?#"] {
-                let raw = format!("a.example{sep}body {{ {st} }}");
-                assert!(parse_rule(&rule(&raw, trusted)).is_err(), "{raw}");
-            }
+            let raw = format!("a.example#$?#body {{ {st} }}");
+            assert!(parse_rule(&rule(&raw, trusted)).is_err(), "{raw}");
         }
     }
     let ok = parse_rule(&rule(
