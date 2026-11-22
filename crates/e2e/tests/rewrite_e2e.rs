@@ -879,6 +879,54 @@ e2e_test!(
     }
 );
 
+// A page's token only buys lookups for its own host: asking about another site's cosmetic rules
+// (which would reveal the user's lists) is refused.
+e2e_test!(
+    beacon_refuses_urls_of_other_hosts,
+    rules = ["rw.test##.ad", "##.banner", "victim.test##.secret-rule"],
+    |env| {
+        env.origin.route("/p", MockResponse::html(PAGE));
+        let html = body_text(get_doc(&env, HttpVersion::Auto, "/p", &[]).await).await;
+        let i = html.find("id=\"__ab_cfg\">").expect("cfg") + "id=\"__ab_cfg\">".len();
+        let j = html[i..].find("</script>").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&html[i..i + j]).unwrap();
+        let token = cfg["t"].as_str().unwrap().to_string();
+        let client = env.client();
+        let url = env.origin.https_url("rw.test", "/__adblock__/cc");
+        let ask = |page_url: &str, class: &str| {
+            let body = serde_json::json!({"url": page_url, "classes": [class], "ids": []});
+            client
+                .request(reqwest::Method::POST, &url)
+                .header("content-type", "application/json")
+                .header("x-adblock-token", &token)
+                .body(body.to_string())
+                .send()
+        };
+        for foreign in [
+            "https://victim.test/",
+            "https://victim.test:8443/x",
+            "https://rw.test.evil.test/",
+            "https://evil.test/?https://rw.test/",
+            "https://rw.test@victim.test/",
+            "not a url",
+            "",
+        ] {
+            let r = ask(foreign, "secret-rule").await.unwrap();
+            assert_eq!(r.status(), 403, "{foreign}");
+            assert!(body_text(r).await.is_empty(), "{foreign}");
+        }
+        // Its own host, spelled differently, still works.
+        for own in [
+            "https://rw.test/",
+            "https://RW.test./a?b=1",
+            "http://rw.test:8080/",
+        ] {
+            let r = ask(own, "banner").await.unwrap();
+            assert_eq!(r.status(), 200, "{own}");
+        }
+    }
+);
+
 e2e_test!(
     internal_endpoints_refused_when_blocking_is_off,
     rules = AD,

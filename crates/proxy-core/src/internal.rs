@@ -8,7 +8,7 @@
 //! |------------------------------|-----------|-----------------------------------------------------|
 //! | `/__adblock__/boot.<hash>.js`| GET, HEAD | static script, immutable cache, hash in the URL     |
 //! | `/__adblock__/s/<hash>.js`   | GET, HEAD | scriptlet bundle generated for a page, by hash      |
-//! | `/__adblock__/cc`            | POST      | class/id selectors; JSON only (forces a CORS preflight for foreign pages), per-page HMAC token bound to the host, same-origin fetch metadata, 64 KiB cap |
+//! | `/__adblock__/cc`            | POST      | class/id selectors; JSON only (forces a CORS preflight for foreign pages), per-page HMAC token bound to the host, page URL must be on that host, same-origin fetch metadata, 64 KiB cap |
 //!
 //! Static responses use `Cross-Origin-Resource-Policy: cross-origin` so they load under
 //! `Cross-Origin-Embedder-Policy: require-corp` (also from sandboxed, opaque-origin frames); the
@@ -140,7 +140,10 @@ impl Internal {
 
     /// Store a scriptlet bundle and return its URL path (`/__adblock__/s/<hash>.js`).
     pub fn put_scriptlet(&self, code: &str) -> String {
-        let hash = short_hash(code.as_bytes());
+        let hash: String = hmac_sha256(&self.key, code.as_bytes())[..12]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         if !self.scriptlets.contains_key(&hash) {
             self.scriptlets.insert(hash.clone(), Arc::from(code));
         }
@@ -293,6 +296,16 @@ impl Internal {
         let Ok(parsed) = serde_json::from_slice::<CcReq>(&bytes) else {
             return deny(StatusCode::BAD_REQUEST);
         };
+        // The token is bound to the page's host: the URL a page asks about must be that host too,
+        // or any page could probe which cosmetic rules the user has for other sites.
+        let same_host = url::Url::parse(&parsed.url)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .and_then(|u| crate::authority::normalize_host(u.host_str()?))
+            .is_some_and(|h| h == host);
+        if !same_host {
+            return deny(StatusCode::FORBIDDEN);
+        }
         for note in parsed.unsupported.iter().take(32) {
             self.note_unsupported(note);
         }
@@ -369,6 +382,16 @@ mod tests {
     fn boot_path_is_content_hashed() {
         assert!(boot_path().starts_with("/__adblock__/boot."));
         assert!(boot_path().ends_with(".js"));
+    }
+
+    #[test]
+    fn scriptlet_urls_cannot_be_guessed_from_their_content() {
+        // A keyed hash: a page cannot compute another site's bundle URL from a known rule set
+        // and probe whether the user visited that site.
+        let (a, b) = (Internal::new(), Internal::new());
+        assert_ne!(a.put_scriptlet("a()"), b.put_scriptlet("a()"));
+        let unkeyed = format!("{}s/{}.js", crate::csp::INTERNAL_PREFIX, short_hash(b"a()"));
+        assert_ne!(a.put_scriptlet("a()"), unkeyed);
     }
 
     #[test]
