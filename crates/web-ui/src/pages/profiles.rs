@@ -191,7 +191,12 @@ pub fn ProfilesPage() -> impl IntoView {
                                                 <span class="us-badge">"built-in"</span>
                                             })}
                                         </td>
-                                        <td>{p.description.clone()}</td>
+                                        <td>
+                                            {p.description.clone()}
+                                            {p.last_error.clone().map(|e| view! {
+                                                <p class="form-error">"Last build failed: "{e}</p>
+                                            })}
+                                        </td>
                                         <td>{if builtin {
                                             "global lists".to_string()
                                         } else {

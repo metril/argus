@@ -13,6 +13,7 @@ use rustc_hash::FxHashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// BLAKE3 digest of a device token (the table key; raw tokens are never stored or compared).
 pub fn token_digest(raw: &[u8]) -> [u8; 32] {
@@ -31,14 +32,37 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// A table entry: the profile slot and, for a stored device, its last-seen cell (unix seconds,
+/// 0 = never). Resolving stores the current second into it: one relaxed load, and one store
+/// only when the second changed.
+#[derive(Clone)]
+pub struct Entry {
+    slot: ProfileSlot,
+    seen: Option<Arc<AtomicU64>>,
+}
+
+impl Entry {
+    #[inline]
+    fn touch(&self) {
+        if let Some(s) = &self.seen {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if s.load(Ordering::Relaxed) != now {
+                s.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Immutable lookup snapshot.
 pub struct ProfileTable {
-    ips: FxHashMap<IpAddr, ProfileSlot>,
+    ips: FxHashMap<IpAddr, Entry>,
     /// Subnets, one hash map per distinct prefix length, longest length first: the first length
     /// that has the masked address wins. Cost is one probe per distinct length in use.
     v4: Vec<PrefixLevel<u32>>,
     v6: Vec<PrefixLevel<u128>>,
-    tokens: FxHashMap<[u8; 32], ProfileSlot>,
+    tokens: FxHashMap<[u8; 32], Entry>,
     by_id: FxHashMap<u64, ProfileSlot>,
     default: ProfileSlot,
 }
@@ -59,34 +83,30 @@ impl ProfileTable {
     /// Exact device address, then the longest matching prefix, then the default profile.
     #[inline]
     pub fn resolve_ip(&self, ip: IpAddr) -> &ProfileSlot {
+        self.find_ip(ip).map_or(&self.default, |e| &e.slot)
+    }
+
+    #[inline]
+    fn find_ip(&self, ip: IpAddr) -> Option<&Entry> {
         let ip = normalize_ip(ip);
         if let Some(s) = self.ips.get(&ip) {
-            return s;
+            return Some(s);
         }
         match ip {
             IpAddr::V4(a) => {
                 let a = u32::from(a);
-                for l in &self.v4 {
-                    if let Some(s) = l.map.get(&(a & l.mask)) {
-                        return s;
-                    }
-                }
+                self.v4.iter().find_map(|l| l.map.get(&(a & l.mask)))
             }
             IpAddr::V6(a) => {
                 let a = u128::from(a);
-                for l in &self.v6 {
-                    if let Some(s) = l.map.get(&(a & l.mask)) {
-                        return s;
-                    }
-                }
+                self.v6.iter().find_map(|l| l.map.get(&(a & l.mask)))
             }
         }
-        &self.default
     }
 
     #[inline]
     pub fn resolve_digest(&self, d: &[u8; 32]) -> Option<&ProfileSlot> {
-        self.tokens.get(d)
+        self.tokens.get(d).map(|e| &e.slot)
     }
 
     pub fn slot(&self, id: u64) -> Option<&ProfileSlot> {
@@ -100,13 +120,13 @@ impl ProfileTable {
 
 struct PrefixLevel<K> {
     mask: K,
-    map: FxHashMap<K, ProfileSlot>,
+    map: FxHashMap<K, Entry>,
 }
 
 pub struct TableBuilder {
-    ips: FxHashMap<IpAddr, ProfileSlot>,
-    prefixes: Vec<(IpNet, ProfileSlot)>,
-    tokens: FxHashMap<[u8; 32], ProfileSlot>,
+    ips: FxHashMap<IpAddr, Entry>,
+    prefixes: Vec<(IpNet, Entry)>,
+    tokens: FxHashMap<[u8; 32], Entry>,
     by_id: FxHashMap<u64, ProfileSlot>,
     default: ProfileSlot,
 }
@@ -120,28 +140,39 @@ impl TableBuilder {
         self.by_id.get(&id).cloned()
     }
     /// Entries naming a profile id that was not registered are ignored.
-    pub fn ip(mut self, addr: IpAddr, id: u64) -> Self {
-        if let Some(s) = self.get(id) {
-            self.ips.insert(normalize_ip(addr), s);
+    pub fn ip(self, addr: IpAddr, id: u64) -> Self {
+        self.ip_for(addr, id, None)
+    }
+    pub fn prefix(self, net: IpNet, id: u64) -> Self {
+        self.prefix_for(net, id, None)
+    }
+    pub fn token(self, digest: [u8; 32], id: u64) -> Self {
+        self.token_for(digest, id, None)
+    }
+    /// Like [`Self::ip`], recording resolutions in `seen` (a device's last-seen cell, see
+    /// [`Profiles::seen_cell`]).
+    pub fn ip_for(mut self, addr: IpAddr, id: u64, seen: Option<Arc<AtomicU64>>) -> Self {
+        if let Some(slot) = self.get(id) {
+            self.ips.insert(normalize_ip(addr), Entry { slot, seen });
         }
         self
     }
-    pub fn prefix(mut self, net: IpNet, id: u64) -> Self {
-        if let Some(s) = self.get(id) {
-            self.prefixes.push((net.trunc(), s));
+    pub fn prefix_for(mut self, net: IpNet, id: u64, seen: Option<Arc<AtomicU64>>) -> Self {
+        if let Some(slot) = self.get(id) {
+            self.prefixes.push((net.trunc(), Entry { slot, seen }));
         }
         self
     }
-    pub fn token(mut self, digest: [u8; 32], id: u64) -> Self {
-        if let Some(s) = self.get(id) {
-            self.tokens.insert(digest, s);
+    pub fn token_for(mut self, digest: [u8; 32], id: u64, seen: Option<Arc<AtomicU64>>) -> Self {
+        if let Some(slot) = self.get(id) {
+            self.tokens.insert(digest, Entry { slot, seen });
         }
         self
     }
     pub fn build(self) -> ProfileTable {
         let (mut v4, mut v6) = (
-            Vec::<(u8, u32, ProfileSlot)>::new(),
-            Vec::<(u8, u128, ProfileSlot)>::new(),
+            Vec::<(u8, u32, Entry)>::new(),
+            Vec::<(u8, u128, Entry)>::new(),
         );
         for (net, slot) in self.prefixes {
             match net {
@@ -163,7 +194,7 @@ impl TableBuilder {
 }
 
 fn levels<K: Copy + Eq + std::hash::Hash>(
-    mut entries: Vec<(u8, K, ProfileSlot)>,
+    mut entries: Vec<(u8, K, Entry)>,
     mask_of: impl Fn(u8) -> K,
 ) -> Vec<PrefixLevel<K>> {
     entries.sort_by_key(|e| std::cmp::Reverse(e.0));
@@ -187,6 +218,9 @@ fn levels<K: Copy + Eq + std::hash::Hash>(
 pub struct Profiles {
     table: ArcSwap<ProfileTable>,
     epoch: AtomicU64,
+    /// Device id to last-seen cell. Locked only by the table builder and the API read path,
+    /// never on resolve (the table entries hold the cells).
+    seen: parking_lot::Mutex<FxHashMap<u64, Arc<AtomicU64>>>,
 }
 
 impl Profiles {
@@ -195,7 +229,27 @@ impl Profiles {
         Self {
             table: ArcSwap::from_pointee(ProfileTable::builder(default).build()),
             epoch: AtomicU64::new(0),
+            seen: Default::default(),
         }
+    }
+
+    /// The last-seen cell of device `id` (created on first use; survives table publishes).
+    pub fn seen_cell(&self, id: u64) -> Arc<AtomicU64> {
+        self.seen.lock().entry(id).or_default().clone()
+    }
+
+    /// Forget devices not in `keep`.
+    pub fn retain_seen(&self, keep: &std::collections::HashSet<u64>) {
+        self.seen.lock().retain(|id, _| keep.contains(id));
+    }
+
+    /// When a connection last resolved to device `id` (unix seconds; `None`: not since start).
+    pub fn last_seen(&self, id: u64) -> Option<u64> {
+        self.seen
+            .lock()
+            .get(&id)
+            .map(|c| c.load(Ordering::Relaxed))
+            .filter(|&t| t != 0)
     }
 
     /// Resolve a device: a known token wins over the address. Returns the slot and the epoch it
@@ -212,10 +266,17 @@ impl Profiles {
         // re-resolves on its next request.
         let epoch = self.epoch.load(Ordering::Acquire);
         let t = self.table.load();
-        if let Some(s) = digest.and_then(|d| t.resolve_digest(d)) {
-            return (s.clone(), epoch);
+        if let Some(e) = digest.and_then(|d| t.tokens.get(d)) {
+            e.touch();
+            return (e.slot.clone(), epoch);
         }
-        (t.resolve_ip(ip).clone(), epoch)
+        match t.find_ip(ip) {
+            Some(e) => {
+                e.touch();
+                (e.slot.clone(), epoch)
+            }
+            None => (t.default.clone(), epoch),
+        }
     }
 
     #[inline]
@@ -335,6 +396,28 @@ mod tests {
         assert!(!p.edit(77, cur));
         assert_eq!(p.epoch(), e0 + 1);
         assert_eq!(p.table().slot(1).unwrap().load().generation, 9);
+    }
+
+    #[test]
+    fn resolving_a_device_records_when_it_was_seen() {
+        let p = Profiles::new(default_profile_slot(Arc::new(SharedEngine::new())));
+        let cell = p.seen_cell(7);
+        let t = ProfileTable::builder(p.table().default_slot().clone())
+            .profile(1, slot(1))
+            .ip_for("10.0.0.5".parse().unwrap(), 1, Some(cell))
+            .token_for(token_digest(b"tok"), 1, Some(p.seen_cell(8)))
+            .build();
+        p.publish(t);
+        assert_eq!(p.last_seen(7), None);
+        p.resolve("10.0.0.6".parse().unwrap(), None);
+        assert_eq!(p.last_seen(7), None, "other addresses do not count");
+        p.resolve("10.0.0.5".parse().unwrap(), None);
+        assert!(p.last_seen(7).is_some_and(|t| t > 1_600_000_000));
+        assert_eq!(p.last_seen(8), None);
+        p.resolve("10.0.0.6".parse().unwrap(), Some(b"tok"));
+        assert!(p.last_seen(8).is_some());
+        p.retain_seen(&[8].into_iter().collect());
+        assert_eq!(p.last_seen(7), None, "forgotten devices are dropped");
     }
 
     #[test]

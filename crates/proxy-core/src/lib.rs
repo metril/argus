@@ -42,6 +42,8 @@ pub mod transparent;
 pub mod upstream;
 #[cfg(feature = "websockets")]
 pub mod websocket;
+#[cfg(feature = "webui")]
+pub mod webui;
 
 pub use ca_encryption::{
     decrypt_ca_key, encrypt_ca_key, is_encrypted_key, read_encrypted_key, validate_passphrase,

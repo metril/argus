@@ -27,7 +27,7 @@ use crate::auth::profile::{forbidden_profile, parse_profile_id};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
 
-pub fn device_dto(d: &DeviceRecord) -> DeviceDto {
+pub fn device_dto(state: &AppState, d: &DeviceRecord) -> DeviceDto {
     DeviceDto {
         id: d.id.to_string(),
         name: d.name.clone(),
@@ -35,8 +35,11 @@ pub fn device_dto(d: &DeviceRecord) -> DeviceDto {
         ips: d.ips.iter().map(|n| n.to_string()).collect(),
         has_token: d.token_digest.is_some(),
         token_hint: d.token_hint.clone(),
-        // The proxy does not record when a device was last seen; nothing is invented here.
-        last_seen: None,
+        last_seen: state
+            .profile_runtime
+            .as_ref()
+            .and_then(|r| r.device_last_seen(d.id))
+            .map(|t| t.to_rfc3339()),
         created_at: d.created_at.to_rfc3339(),
     }
 }
@@ -108,7 +111,7 @@ pub async fn list_devices(
     let items = all
         .iter()
         .filter(|d| p.may_access_profile(&d.profile_id.to_string()))
-        .map(device_dto)
+        .map(|d| device_dto(&state, d))
         .collect();
     Ok(Json(Page::from_vec(items, q.page, q.limit)))
 }
@@ -147,7 +150,7 @@ pub async fn create_device(
     })
     .await?;
     info!("Device {} created by {}", rec.id, p.username);
-    Ok((StatusCode::CREATED, Json(device_dto(&rec))))
+    Ok((StatusCode::CREATED, Json(device_dto(&state, &rec))))
 }
 
 /// Get one device.
@@ -166,7 +169,7 @@ pub async fn get_device(
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<DeviceDto>> {
-    Ok(Json(device_dto(&load(&state, &p, &id).await?)))
+    Ok(Json(device_dto(&state, &load(&state, &p, &id).await?)))
 }
 
 /// Update a device's name, profile or addresses; omitted fields are unchanged.
@@ -203,7 +206,7 @@ pub async fn update_device(
     let st = state.clone();
     let rec = blocking(move || Ok(st.profiles.put_device(rec)?)).await?;
     info!("Device {} updated by {}", rec.id, p.username);
-    Ok(Json(device_dto(&rec)))
+    Ok(Json(device_dto(&state, &rec)))
 }
 
 /// Delete a device (its token stops working).

@@ -18,7 +18,12 @@ use crate::auth::profile::ProfileParam;
 use crate::error::{ApiError, ApiJson, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
 
-pub fn profile_dto(p: &ProfileRecord) -> ProfileDto {
+pub fn profile_dto(state: &AppState, p: &ProfileRecord) -> ProfileDto {
+    let build = state
+        .profile_runtime
+        .as_ref()
+        .and_then(|r| r.build_info(p.id))
+        .unwrap_or_default();
     ProfileDto {
         id: p.id.to_string(),
         name: p.name.clone(),
@@ -27,6 +32,8 @@ pub fn profile_dto(p: &ProfileRecord) -> ProfileDto {
         rules: p.rules.clone(),
         created_at: p.created_at.to_rfc3339(),
         updated_at: p.updated_at.to_rfc3339(),
+        last_error: build.last_error,
+        last_built: build.last_built.map(|t| t.to_rfc3339()),
     }
 }
 
@@ -67,7 +74,7 @@ pub async fn list_profiles(
     let items = all
         .iter()
         .filter(|r| p.may_access_profile(&r.id.to_string()))
-        .map(profile_dto)
+        .map(|r| profile_dto(&state, r))
         .collect();
     Ok(Json(Page::from_vec(items, q.page, q.limit)))
 }
@@ -113,7 +120,7 @@ pub async fn create_profile(
     })
     .await?;
     info!("Profile {} created by {}", rec.id, p.username);
-    Ok((StatusCode::CREATED, Json(profile_dto(&rec))))
+    Ok((StatusCode::CREATED, Json(profile_dto(&state, &rec))))
 }
 
 /// Get one profile.
@@ -134,7 +141,7 @@ pub async fn get_profile(
     let st = state.clone();
     let rec = blocking(move || Ok(st.profiles.get(profile.id)?)).await?;
     let rec = rec.ok_or_else(|| ApiError::NotFound("Profile not found".into()))?;
-    Ok(Json(profile_dto(&rec)))
+    Ok(Json(profile_dto(&state, &rec)))
 }
 
 /// Update a profile; omitted fields are unchanged. The default profile cannot be changed here
@@ -189,7 +196,7 @@ pub async fn update_profile(
     })
     .await?;
     info!("Profile {id} updated by {}", p.username);
-    Ok(Json(profile_dto(&rec)))
+    Ok(Json(profile_dto(&state, &rec)))
 }
 
 /// Delete a profile. Refused (409) while devices are assigned to it.

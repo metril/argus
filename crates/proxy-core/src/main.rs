@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
                 config_path.clone(),
                 shared_engine.clone(),
                 list_service,
-                ctx.request_timeout_handle(),
+                &ctx,
                 userscript_manager
                     .clone()
                     .expect("manager exists when the web UI is enabled"),
@@ -208,25 +208,17 @@ async fn start_webui_server(
     config_path: String,
     shared_engine: Arc<SharedEngine>,
     list_service: Arc<ListService>,
-    request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    ctx: &Arc<ProxyContext>,
     userscript_manager: Arc<userscript_engine::UserscriptManager>,
     policy_store: Arc<script_policy::store::PolicyStore>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    use userscript_engine::UserscriptRuntime;
-    use web_api::{build_state_with_policy, start_server, ApiConfig};
+    use web_api::{start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
 
     // One database file per process: users, sessions, tokens, audit and userscripts share
     // `<adblock.data_dir>/adblocker.redb` with the filter lists.
     let data_dir = config.adblock.data_dir.clone();
-
-    // Create userscript runtime
-    let storage = userscript_manager.storage_arc();
-    let userscript_runtime = Arc::new(UserscriptRuntime::new(
-        Arc::clone(&userscript_manager),
-        storage,
-    ));
 
     // Build API configuration from proxy config
     let api_config = ApiConfig {
@@ -271,18 +263,18 @@ async fn start_webui_server(
         ..Default::default()
     };
 
-    // Build the application state
-    let state = build_state_with_policy(
-        api_config.clone(),
-        config.clone(),
-        shared_engine,
-        list_service,
-        reqwest::Client::new(),
-        userscript_manager,
-        userscript_runtime,
-        config_path.into(),
-        request_timeout_ms,
-        Some(policy_store),
+    // Build the application state over the proxy's own stores (profiles, policy, userscripts).
+    let state = proxy_core::webui::build_api_state(
+        ctx,
+        proxy_core::webui::ApiInputs {
+            api_config: api_config.clone(),
+            proxy_config: config.clone(),
+            shared_engine,
+            list_service,
+            manager: userscript_manager,
+            policy: policy_store,
+            config_path: config_path.into(),
+        },
     )
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;

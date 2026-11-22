@@ -473,7 +473,10 @@ pub fn build_from_bundle(
 /// logged.
 pub async fn check_all(state: &AppState, auto_apply: bool) {
     let profiles: Vec<String> = match state.profiles.list() {
-        Ok(v) => v.into_iter().map(|p| p.name).collect(),
+        Ok(v) => v
+            .into_iter()
+            .map(|p| common::profile_store::namespace(p.id))
+            .collect(),
         Err(e) => {
             tracing::warn!("Scheduled userscript update check: cannot list profiles: {e}");
             return;

@@ -226,6 +226,7 @@ pub fn DevicesPage() -> impl IntoView {
                                 <th>"Profile"</th>
                                 <th>"Addresses"</th>
                                 <th>"Token"</th>
+                                <th>"Last seen"</th>
                                 <th></th>
                             </tr>
                         </thead>
@@ -243,6 +244,7 @@ pub fn DevicesPage() -> impl IntoView {
                                             <td>{move || profile_name(&pid)}</td>
                                             <td>{if d.ips.is_empty() { "-".to_string() } else { d.ips.join(", ") }}</td>
                                             <td>{token_state(&d)}</td>
+                                            <td>{d.last_seen.clone().unwrap_or_else(|| "never".to_string())}</td>
                                             <td>
                                                 <button class="btn btn-secondary"
                                                     on:click=move |_| open_edit(de.clone())>"Edit"</button>

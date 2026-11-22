@@ -9,8 +9,10 @@ mapping uses the built-in `default` profile.
   enabled globally). Profiles with the same set of lists share one compiled engine.
 - **Rules**: custom rules text, compiled as a small overlay checked after the lists. An overlay
   exception beats a list block; an overlay block beats a list allow.
-- **Userscripts and script policy**: stored per profile name (installed scripts, GM values and
-  cookies, site and source rules, temporary grants, panel settings and PIN).
+- **Userscripts and script policy**: stored under the profile's storage namespace (installed
+  scripts, GM values and cookies, site and source rules, temporary grants, panel settings and PIN).
+  The namespace is `default` for the default profile and `p<id>` for every other profile. It is
+  derived from the profile id, never from its name, so renaming a profile only changes its label.
 
 The `default` profile (id 0) is built in and cannot be edited, renamed or deleted. Its lists and
 rules are the global list enablement and global custom rules.
@@ -61,10 +63,21 @@ request too. If a rebuild fails (invalid rules, missing list), the profile keeps
 compiled state, or uses the default profile's engine if it was never built, and the error is
 recorded in the build status.
 
-## Deleting a profile
+## Deleting and renaming a profile
 
-A profile that devices still use cannot be deleted. Deleting one removes its userscripts, GM
-values and cookies, its script-policy rules, temporary grants, panel settings, PIN and lockout
-state, and its script control. A profile created later with the same name starts empty. Renaming
-a profile changes its namespace: the old name's data is removed and the renamed profile starts
-empty.
+A profile that devices still use cannot be deleted. Deleting one removes everything under its
+namespace: userscripts, GM values and cookies, script-policy rules, temporary grants, panel
+settings, PIN and lockout state, and its script control. Profile ids are never reused (the store
+keeps a high-water mark), so a profile created later, even with the same name, gets a new
+namespace and starts empty.
+
+Renaming a profile changes its label only. Its userscripts, GM values, policy and PIN state stay
+where they are.
+
+## Build status and device activity
+
+The profile API reports the proxy's last build of each profile (`last_built`, and `last_error`
+when the last attempt failed and the previous state is still serving). A device's `last_seen` is
+the last time a connection resolved to it (second resolution). It is recorded in proxy memory at
+connection resolve time, not per request, and is empty until the device connects after a proxy
+start.

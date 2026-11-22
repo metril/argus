@@ -840,6 +840,7 @@
             "type": "array"
           },
           "last_seen": {
+            "description": "When a connection last resolved to this device (RFC 3339, second resolution). Kept in\nproxy memory: absent until the device connects after a proxy start.",
             "type": [
               "string",
               "null"
@@ -2094,6 +2095,7 @@
                   "type": "array"
                 },
                 "last_seen": {
+                  "description": "When a connection last resolved to this device (RFC 3339, second resolution). Kept in\nproxy memory: absent until the device connects after a proxy start.",
                   "type": [
                     "string",
                     "null"
@@ -2405,6 +2407,20 @@
                 },
                 "id": {
                   "type": "string"
+                },
+                "last_built": {
+                  "description": "When the proxy last built this profile successfully (RFC 3339).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_error": {
+                  "description": "Why the proxy's last build of this profile failed (it keeps serving the previous state);\nabsent when the last build succeeded or the proxy reports no build status.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "lists": {
                   "description": "Enabled filter list ids.",
@@ -3384,6 +3400,20 @@
           },
           "id": {
             "type": "string"
+          },
+          "last_built": {
+            "description": "When the proxy last built this profile successfully (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the proxy's last build of this profile failed (it keeps serving the previous state);\nabsent when the last build succeeded or the proxy reports no build status.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "lists": {
             "description": "Enabled filter list ids.",

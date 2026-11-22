@@ -56,6 +56,13 @@ pub struct ProfileDto {
     pub rules: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Why the proxy's last build of this profile failed (it keeps serving the previous state);
+    /// absent when the last build succeeded or the proxy reports no build status.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// When the proxy last built this profile successfully (RFC 3339).
+    #[serde(default)]
+    pub last_built: Option<String>,
 }
 
 /// Create a profile.
@@ -101,6 +108,8 @@ pub struct DeviceDto {
     /// Last 4 characters of the current token, to tell tokens apart.
     #[serde(default)]
     pub token_hint: Option<String>,
+    /// When a connection last resolved to this device (RFC 3339, second resolution). Kept in
+    /// proxy memory: absent until the device connects after a proxy start.
     #[serde(default)]
     pub last_seen: Option<String>,
     pub created_at: String,

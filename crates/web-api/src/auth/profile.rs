@@ -73,7 +73,7 @@ pub async fn resolve(
     let rec = rec.ok_or_else(|| ApiError::NotFound(format!("Profile {id} not found")))?;
     Ok(ProfileParam {
         id: rec.id,
-        name: rec.name,
+        name: common::profile_store::namespace(rec.id),
     })
 }
 
