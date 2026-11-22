@@ -471,6 +471,47 @@ pub struct BuildSummary {
     pub from_persisted: bool,
     /// Handed-off rules by kind.
     pub ext_counts: std::collections::BTreeMap<String, usize>,
+    /// What the extended-rule index did with them (absent before the first build).
+    #[serde(default)]
+    pub ext_stats: Option<ExtStatsDto>,
+}
+
+/// Per-kind outcome of building the extended-rule index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtKindStatsDto {
+    pub parsed: usize,
+    /// Enforced.
+    pub active: usize,
+    /// Dropped because the source list is not trusted.
+    pub dropped_untrusted: usize,
+    /// Well-formed but not implemented.
+    pub unsupported: usize,
+    pub parse_errors: usize,
+    pub badfiltered: usize,
+}
+
+/// A handed-off rule that could not be used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtIssueDto {
+    pub kind: String,
+    pub list: String,
+    pub raw: String,
+    pub reason: String,
+    pub unsupported: bool,
+}
+
+/// Outcome of building the extended-rule index.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtStatsDto {
+    pub total: usize,
+    pub per_kind: std::collections::BTreeMap<String, ExtKindStatsDto>,
+    /// Rules dropped for lack of trust, per list id.
+    pub dropped_untrusted_by_list: std::collections::BTreeMap<String, usize>,
+    pub issues: Vec<ExtIssueDto>,
+    pub issues_truncated: usize,
 }
 
 /// A well-known list that can be added with `POST /lists/catalogue/{id}`.
@@ -487,11 +528,21 @@ pub struct CatalogueEntryResponse {
     pub added: bool,
 }
 
-/// A rule that parsed but is not enforced yet.
+/// A handed-off rule and what the extended-rule index did with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ExtRuleResponse {
     pub kind: String,
     pub raw: String,
     pub domains: Vec<String>,
+    /// Source list id.
+    #[serde(default)]
+    pub list: String,
+    /// `active`, `dropped_untrusted`, `unsupported`, `invalid`, `badfiltered`, `badfilter`, or
+    /// `unknown` (the index was rebuilt while the page was read).
+    #[serde(default)]
+    pub state: String,
+    /// Why the rule is unsupported / invalid.
+    #[serde(default)]
+    pub reason: Option<String>,
 }

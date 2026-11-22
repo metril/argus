@@ -33,6 +33,7 @@ fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> F
         last_checked: status.last_checked.map(|dt| dt.to_rfc3339()),
         format: list.format.as_str().to_string(),
         allowlist: list.allowlist,
+        trusted: list.trusted,
     }
 }
 
@@ -105,6 +106,7 @@ pub async fn add_filter_list(
         list.format = parse_format(f)?;
     }
     list.allowlist = req.allowlist.unwrap_or(false);
+    list.trusted = req.trusted.unwrap_or(false);
     let (st, l) = (state.clone(), list.clone());
     blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
     info!("Filter list '{}' added by {}", req.id, p.username);
@@ -129,6 +131,35 @@ pub async fn get_filter_list(
     match state.filter_store.get(&id)? {
         Some(list) => Ok(Json(filter_list_response(&state, &list))),
         None => Err(ApiError::NotFound(format!("Filter list '{id}' not found"))),
+    }
+}
+
+/// Record a trust change as its own audit entry (the generic entry for the route does not say
+/// what was changed). Needs `lists:write`, like the route itself.
+fn audit_trust_change(state: &AppState, p: &Principal, list_id: &str, trusted: bool) {
+    use crate::auth::authz::Actor;
+    let (actor_type, actor_id) = match &p.actor {
+        Actor::Token { token_id } => ("token", token_id.clone()),
+        Actor::Session { .. } => ("user", p.user_id.to_string()),
+    };
+    let entry = api_types::AuditEntry {
+        id: String::new(),
+        at: chrono::Utc::now().to_rfc3339(),
+        actor_type: actor_type.into(),
+        actor_id: Some(actor_id),
+        actor_name: Some(p.username.clone()),
+        method: "PUT".into(),
+        route: format!("/api/v1/lists/{{id}}#trusted={trusted}"),
+        scope: "lists:write".into(),
+        target: Some(list_id.to_string()),
+        status: 200,
+        outcome: "success".into(),
+        ip: None,
+        user_agent: None,
+        request_id: None,
+    };
+    if let Err(e) = state.audit.append(entry) {
+        tracing::error!("Failed to write audit entry: {e}");
     }
 }
 
@@ -177,6 +208,10 @@ pub async fn update_filter_list(
     if let Some(a) = req.allowlist {
         list.allowlist = a;
     }
+    let trust_change = req.trusted.filter(|t| *t != list.trusted);
+    if let Some(t) = req.trusted {
+        list.trusted = t;
+    }
     let (st, l, rid) = (state.clone(), list.clone(), id.clone());
     blocking(move || {
         st.filter_store.upsert_durable(&l)?;
@@ -187,6 +222,9 @@ pub async fn update_filter_list(
     })
     .await?;
     info!("Filter list '{id}' updated by {}", p.username);
+    if let Some(t) = trust_change {
+        audit_trust_change(&state, &p, &id, t);
+    }
     state.list_service.trigger();
     Ok(Json(filter_list_response(&state, &list)))
 }
@@ -460,7 +498,44 @@ pub async fn get_build_summary(State(state): State<Arc<AppState>>) -> Json<Build
         duplicates: s.duplicates,
         from_persisted: s.from_persisted,
         ext_counts,
+        ext_stats: s.ext_stats.as_ref().map(ext_stats_dto),
     })
+}
+
+fn ext_stats_dto(s: &ext_rules::ExtStats) -> api_types::ExtStatsDto {
+    api_types::ExtStatsDto {
+        total: s.total,
+        per_kind: s
+            .per_kind
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    api_types::ExtKindStatsDto {
+                        parsed: v.parsed,
+                        active: v.active,
+                        dropped_untrusted: v.dropped_untrusted,
+                        unsupported: v.unsupported,
+                        parse_errors: v.parse_errors,
+                        badfiltered: v.badfiltered,
+                    },
+                )
+            })
+            .collect(),
+        dropped_untrusted_by_list: s.dropped_untrusted_by_list.clone(),
+        issues: s
+            .issues
+            .iter()
+            .map(|i| api_types::ExtIssueDto {
+                kind: i.kind.clone(),
+                list: i.list.clone(),
+                raw: i.raw.clone(),
+                reason: i.reason.clone(),
+                unsupported: i.unsupported,
+            })
+            .collect(),
+        issues_truncated: s.issues_truncated,
+    }
 }
 
 /// The default-disabled catalogue of well-known lists (hosts, domain and IP lists).
@@ -538,7 +613,8 @@ pub struct ExtRulesQuery {
     pub limit: Option<u32>,
 }
 
-/// Rules that parsed but are not enforced yet (handed off), read-only.
+/// Rules the network engine cannot run (handed off) and what the extended-rule index did with
+/// each, read-only.
 #[utoipa::path(
     get, path = "/rules/ext", tag = "rules",
     security(("bearer_auth" = ["rules:read"])),
@@ -549,7 +625,12 @@ pub async fn list_ext_rules(
     State(state): State<Arc<AppState>>,
     ApiQuery(q): ApiQuery<ExtRulesQuery>,
 ) -> Json<Page<ExtRuleResponse>> {
+    let generation = state.shared_engine.generation();
+    let index = generation.aux::<ext_rules::ExtIndex>();
     let rules = state.shared_engine.ext_rules();
+    // The rule list and the index are installed together; if a rebuild slipped in between the
+    // two reads, say `unknown` instead of mislabelling.
+    let index = index.filter(|i| i.stats().total == rules.len());
     let total_matching = rules
         .iter()
         .filter(|r| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
@@ -558,13 +639,20 @@ pub async fn list_ext_rules(
     let page = q.page.unwrap_or(1).max(1);
     let items: Vec<ExtRuleResponse> = rules
         .iter()
-        .filter(|r| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
+        .enumerate()
+        .filter(|(_, r)| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
         .skip((page as usize - 1).saturating_mul(limit as usize))
         .take(limit as usize)
-        .map(|r| ExtRuleResponse {
-            kind: r.kind.as_str().into(),
-            raw: r.raw.clone(),
-            domains: r.domains.clone(),
+        .map(|(i, r)| {
+            let st = index.and_then(|x| x.state_of(i));
+            ExtRuleResponse {
+                kind: r.kind.as_str().into(),
+                raw: r.raw.clone(),
+                domains: r.domains.clone(),
+                list: r.list.clone(),
+                state: st.map_or("unknown", |s| s.as_str()).into(),
+                reason: st.and_then(|s| s.reason()).map(str::to_string),
+            }
         })
         .collect();
     Json(Page {

@@ -42,6 +42,7 @@ chrono = { workspace = true }
 
 # Database
 list-service = { path = "../list-service" }
+ext-rules = { path = "../ext-rules" }
 
 # HTTP client (shared, for downloading filter lists)
 reqwest = { workspace = true }

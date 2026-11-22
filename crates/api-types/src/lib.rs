@@ -347,6 +347,10 @@ pub struct FilterListResponse {
     /// Every rule of the list is treated as an exception.
     #[serde(default)]
     pub allowlist: bool,
+    /// Trusted lists may use the code-running extended rules (`$replace`, `$urltransform`,
+    /// `#%#` scripts, snippets, unknown scriptlets); untrusted lists have those dropped.
+    #[serde(default)]
+    pub trusted: bool,
 }
 
 /// Add a filter list.
@@ -372,6 +376,9 @@ pub struct AddFilterListRequest {
     /// Treat every rule as an exception (default false).
     #[serde(default)]
     pub allowlist: Option<bool>,
+    /// Trust the list's code-running extended rules (default false). Audited.
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 /// Update a filter list.
@@ -392,6 +399,9 @@ pub struct UpdateFilterListRequest {
     pub format: Option<String>,
     #[serde(default)]
     pub allowlist: Option<bool>,
+    /// Change the list's trust; recorded in the audit log.
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 /// The user's custom filter rules (raw adblock syntax).
