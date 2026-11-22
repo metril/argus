@@ -1539,6 +1539,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "list-service",
  "parking_lot",
  "proxy-core",
  "rcgen",
