@@ -39,7 +39,8 @@ pub async fn list_users(
     State(state): State<Arc<AppState>>,
     ApiQuery(q): ApiQuery<PageQuery>,
 ) -> ApiResult<Json<Page<UserInfo>>> {
-    let mut users = state.session_store.get_all_users()?;
+    let st = state.clone();
+    let mut users = blocking(move || Ok(st.session_store.get_all_users()?)).await?;
     users.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     let all = users.iter().map(UserInfo::from).collect();
     Ok(Json(Page::from_vec(all, q.page, q.limit)))

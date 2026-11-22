@@ -10,7 +10,7 @@ use utoipa::IntoParams;
 
 use crate::audit::AuditFilter;
 use crate::error::{ApiQuery, ApiResult};
-use crate::state::AppState;
+use crate::state::{blocking, AppState};
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -58,7 +58,10 @@ pub async fn list_audit(
         until: q.until,
     };
     let offset = (page as usize - 1) * limit as usize;
-    let (items, total) = state.audit.query(&filter, offset, limit as usize);
+    // The query waits for the deferred-write flush and reads the table: never on an async worker.
+    let st = state.clone();
+    let (items, total) =
+        blocking(move || Ok(st.audit.query(&filter, offset, limit as usize))).await?;
     Ok(Json(Page {
         has_more: offset + items.len() < total,
         items,

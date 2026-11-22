@@ -28,6 +28,16 @@ pub struct AuditFilter {
 }
 
 impl AuditFilter {
+    fn is_empty(&self) -> bool {
+        self.actor.is_none()
+            && self.method.is_none()
+            && self.outcome.is_none()
+            && self.route.is_none()
+            && self.target.is_none()
+            && self.since.is_none()
+            && self.until.is_none()
+    }
+
     fn matches(&self, e: &AuditEntry) -> bool {
         let at = DateTime::parse_from_rfc3339(&e.at).map(|t| t.with_timezone(&Utc));
         self.actor
@@ -116,7 +126,7 @@ impl AuditStore {
         entry.id = format!("{id:016x}");
         let bytes = serde_json::to_vec(&entry)?;
         let (max, cutoff) = (self.max_entries, Utc::now() - self.retention);
-        self.db.defer(move |t| {
+        self.db.defer_keep(move |t| {
             let mut tb = t.open_table(tables::AUDIT)?;
             tb.insert(id, bytes.as_slice())?;
             prune_table(&mut tb, max, cutoff)
@@ -136,32 +146,65 @@ impl AuditStore {
         }
     }
 
-    /// Newest-first matching entries; returns `(page items, total matches)`.
+    /// Newest-first matching entries; returns `(page items, total)`. The scan stops as soon as
+    /// the page (plus one entry, to tell whether more follow) is filled or the entries are older
+    /// than `since`, so it never reads the whole table. `total` is exact for an unfiltered
+    /// query and otherwise the number of matches seen up to the stopping point (a lower bound
+    /// that exceeds `offset + items.len()` exactly when more entries follow).
     pub fn query(&self, f: &AuditFilter, offset: usize, limit: usize) -> (Vec<AuditEntry>, usize) {
+        let (items, total, _) = self.query_scanned(f, offset, limit);
+        (items, total)
+    }
+
+    /// [`Self::query`] that also reports how many stored entries were examined.
+    pub fn query_scanned(
+        &self,
+        f: &AuditFilter,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<AuditEntry>, usize, usize) {
+        /// Upper bound on entries examined by one query.
+        const MAX_SCAN: usize = 100_000;
         self.db.flush_deferred();
-        let mut total = 0usize;
+        let unfiltered = f.is_empty();
+        let mut seen = 0usize;
+        let mut scanned = 0usize;
         let mut items = Vec::new();
         let res = self.db.read::<_, DbError>(|r| {
             let t = r.open_table(tables::AUDIT)?;
             for item in t.iter()?.rev() {
                 let (_, v) = item?;
+                scanned += 1;
+                if scanned > MAX_SCAN {
+                    break;
+                }
                 let Ok(e) = serde_json::from_slice::<AuditEntry>(v.value()) else {
                     continue;
                 };
+                // Ids grow with time: once entries are older than `since`, nothing newer follows.
+                if let (Some(since), Ok(at)) = (f.since, DateTime::parse_from_rfc3339(&e.at)) {
+                    if at.with_timezone(&Utc) < since {
+                        break;
+                    }
+                }
                 if !f.matches(&e) {
                     continue;
                 }
-                if total >= offset && items.len() < limit {
+                if seen >= offset && items.len() < limit {
                     items.push(e);
                 }
-                total += 1;
+                seen += 1;
+                if seen > offset + limit {
+                    break;
+                }
             }
             Ok(())
         });
         if let Err(e) = res {
             tracing::error!("audit query failed: {e}");
         }
-        (items, total)
+        let total = if unfiltered { self.len() } else { seen };
+        (items, total, scanned)
     }
 
     pub fn len(&self) -> usize {
@@ -284,5 +327,36 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(store.len(), 100);
+    }
+
+    #[test]
+    fn query_reads_only_what_the_page_needs() {
+        let d = tempfile::tempdir().unwrap();
+        let store = AuditStore::new(Db::open(d.path()).unwrap(), 10_000, 30).unwrap();
+        for i in 0..2000 {
+            let mut e = entry(if i % 2 == 0 { "even" } else { "odd" });
+            e.at = (Utc::now() - Duration::minutes(2000 - i)).to_rfc3339();
+            store.append(e).unwrap();
+        }
+        let (items, total, scanned) = store.query_scanned(&AuditFilter::default(), 0, 10);
+        assert_eq!(items.len(), 10);
+        assert_eq!(total, 2000);
+        assert!(scanned <= 11, "scanned {scanned}");
+        // A time bound stops the scan at the boundary instead of reading the older history.
+        let f = AuditFilter {
+            since: Some(Utc::now() - Duration::seconds(6030)),
+            ..Default::default()
+        };
+        let (items, _, scanned) = store.query_scanned(&f, 0, 200);
+        assert_eq!(items.len(), 100);
+        assert!(scanned <= 102, "scanned {scanned}");
+        // Filtered paging reports more-to-come through `total`.
+        let f = AuditFilter {
+            actor: Some("even".into()),
+            ..Default::default()
+        };
+        let (items, total, _) = store.query_scanned(&f, 0, 5);
+        assert_eq!(items.len(), 5);
+        assert!(total > items.len());
     }
 }

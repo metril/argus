@@ -158,13 +158,14 @@ pub async fn update_filter_list(
     if let Some(name) = req.name {
         list.name = name;
     }
+    let mut reset_status = false;
     if let Some(url) = req.url {
         if url != list.url {
             list.url = url;
             list.etag = None;
             list.last_updated = None;
             list.rule_count = 0;
-            let _ = state.filter_store.set_status(&id, &Default::default());
+            reset_status = true;
         }
     }
     if let Some(enabled) = req.enabled {
@@ -176,8 +177,15 @@ pub async fn update_filter_list(
     if let Some(a) = req.allowlist {
         list.allowlist = a;
     }
-    let (st, l) = (state.clone(), list.clone());
-    blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
+    let (st, l, rid) = (state.clone(), list.clone(), id.clone());
+    blocking(move || {
+        st.filter_store.upsert_durable(&l)?;
+        if reset_status {
+            let _ = st.filter_store.set_status(&rid, &Default::default());
+        }
+        Ok(())
+    })
+    .await?;
     info!("Filter list '{id}' updated by {}", p.username);
     state.list_service.trigger();
     Ok(Json(filter_list_response(&state, &list)))
@@ -244,15 +252,21 @@ pub async fn refresh_list(
     State(state): State<Arc<AppState>>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<(StatusCode, Json<EngineStatusResponse>)> {
-    let mut list = state
-        .filter_store
-        .get(&id)?
-        .ok_or_else(|| ApiError::NotFound(format!("Filter list '{id}' not found")))?;
-    list.etag = None;
-    state.filter_store.upsert(&list)?;
-    let mut status = state.filter_store.get_status(&id).unwrap_or_default();
-    status.last_modified = None;
-    let _ = state.filter_store.set_status(&id, &status);
+    let st = state.clone();
+    let rid = id.clone();
+    blocking(move || {
+        let mut list = st
+            .filter_store
+            .get(&rid)?
+            .ok_or_else(|| ApiError::NotFound(format!("Filter list '{rid}' not found")))?;
+        list.etag = None;
+        st.filter_store.upsert(&list)?;
+        let mut status = st.filter_store.get_status(&rid).unwrap_or_default();
+        status.last_modified = None;
+        let _ = st.filter_store.set_status(&rid, &status);
+        Ok(())
+    })
+    .await?;
     state.list_service.trigger();
     let mut st = engine_status(&state).await;
     st.building = true;

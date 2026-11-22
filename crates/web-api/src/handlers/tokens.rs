@@ -82,11 +82,9 @@ pub async fn list_tokens(
     Extension(p): Extension<Principal>,
     ApiQuery(q): ApiQuery<PageQuery>,
 ) -> ApiResult<Json<Page<ApiTokenInfo>>> {
-    Ok(Json(Page::from_vec(
-        state.tokens.list(Some(&p.user_id)),
-        q.page,
-        q.limit,
-    )))
+    let (st, uid) = (state.clone(), p.user_id);
+    let tokens = blocking(move || Ok(st.tokens.list(Some(&uid)))).await?;
+    Ok(Json(Page::from_vec(tokens, q.page, q.limit)))
 }
 
 /// Revoke one of your own tokens; it stops working immediately.
@@ -124,11 +122,9 @@ pub async fn admin_list_tokens(
     State(state): State<Arc<AppState>>,
     ApiQuery(q): ApiQuery<PageQuery>,
 ) -> ApiResult<Json<Page<ApiTokenInfo>>> {
-    Ok(Json(Page::from_vec(
-        state.tokens.list(None),
-        q.page,
-        q.limit,
-    )))
+    let st = state.clone();
+    let tokens = blocking(move || Ok(st.tokens.list(None))).await?;
+    Ok(Json(Page::from_vec(tokens, q.page, q.limit)))
 }
 
 /// Revoke any user's token.
