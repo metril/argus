@@ -9,7 +9,6 @@
 //! The compiled blob is kept next to the live engine so it can be persisted
 //! ([`SharedEngine::serialized`]) and so the resource library can be re-applied.
 
-use adblock::lists::{FilterSet, ParseOptions};
 use adblock::resources::Resource;
 use adblock::Engine as AdblockEngine;
 use arc_swap::ArcSwap;
@@ -17,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
+use crate::compile::compile_lists;
+use crate::formats::{ExtRule, IpRange, IpSet};
 use crate::matcher::{MatchResult, RequestMatcher};
 use crate::redirect_resources::builtin_redirect_resources;
 use crate::stats::FilterStats;
@@ -35,12 +36,36 @@ pub struct Cosmetics {
     pub generichide: bool,
 }
 
+/// IP-literal host matcher (CIDR lists cannot be hostname rules); `allow` wins over `block`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpFilter {
+    pub block: IpSet,
+    pub allow: IpSet,
+}
+
+impl IpFilter {
+    pub fn from_ranges(block: &[IpRange], allow: &[IpRange]) -> Self {
+        Self {
+            block: IpSet::from_ranges(block),
+            allow: IpSet::from_ranges(allow),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.block.is_empty()
+    }
+}
+
 /// Handle to the live compiled engine, shared by all workers via `Arc<SharedEngine>`.
 pub struct SharedEngine {
     /// The live engine. Readers do one `load()`; writers swap in a fully built engine.
     engine: ArcSwap<AdblockEngine>,
     /// Serialized form of the installed rules (empty = empty engine).
     blob: ArcSwap<Vec<u8>>,
+    /// Extended rules the engine cannot express (hand-off for later phases).
+    ext_rules: ArcSwap<Vec<ExtRule>>,
+    /// Blocked / allowed IP ranges, checked for requests to IP-literal hosts.
+    ip_filter: ArcSwap<IpFilter>,
     /// Master on/off switch, shared (see [`Self::enabled_flag`]) so the web UI toggle is live.
     enabled: Arc<AtomicBool>,
     /// User-loaded scriptlet/redirect resource library (overrides built-ins by name).
@@ -85,6 +110,8 @@ impl SharedEngine {
         Self {
             engine: ArcSwap::new(build_engine(&[], &[])),
             blob: ArcSwap::new(Arc::new(Vec::new())),
+            ext_rules: ArcSwap::new(Arc::new(Vec::new())),
+            ip_filter: ArcSwap::new(Arc::new(IpFilter::default())),
             enabled: Arc::new(AtomicBool::new(true)),
             resources: ArcSwap::new(Arc::new(Vec::new())),
             write_lock: Mutex::new(()),
@@ -121,11 +148,34 @@ impl SharedEngine {
 
     /// Swap in an engine already built from `blob` by [`build_engine`] (no work on this thread).
     pub fn install_built(&self, blob: Arc<Vec<u8>>, engine: Arc<AdblockEngine>) {
+        self.install_full(blob, engine, Arc::default(), Arc::default());
+    }
+
+    /// Like [`Self::install_built`], also replacing the extended-rule list and IP filter.
+    pub fn install_full(
+        &self,
+        blob: Arc<Vec<u8>>,
+        engine: Arc<AdblockEngine>,
+        ext: Arc<Vec<ExtRule>>,
+        ip: Arc<IpFilter>,
+    ) {
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = blob.len();
         self.blob.store(blob);
         self.engine.store(engine);
+        self.ext_rules.store(ext);
+        self.ip_filter.store(ip);
         info!("Installed compiled filter engine ({bytes} bytes)");
+    }
+
+    /// Extended rules (`$replace`, HTML filters, ...) found in the installed lists.
+    pub fn ext_rules(&self) -> Arc<Vec<ExtRule>> {
+        self.ext_rules.load_full()
+    }
+
+    /// The installed IP block / allow ranges.
+    pub fn ip_filter(&self) -> Arc<IpFilter> {
+        self.ip_filter.load_full()
     }
 
     /// The serialized rules currently installed (for persisting to disk).
@@ -225,6 +275,17 @@ impl SharedEngine {
             return MatchResult::allowed();
         }
 
+        let ipf = self.ip_filter.load();
+        if !ipf.is_empty() {
+            let host = RequestMatcher::host_of(url);
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if !ipf.allow.contains(ip) && ipf.block.contains(ip) {
+                    self.stats.record_blocked(resource_type, host);
+                    return MatchResult::blocked(format!("ip-list:{ip}"));
+                }
+            }
+        }
+
         let result = self.with_engine(|engine| {
             RequestMatcher::check_request(engine, url, source_url, resource_type)
         });
@@ -248,21 +309,13 @@ impl SharedEngine {
     }
 }
 
-/// Compile a set of raw filter-list contents into a serialized adblock engine.
+/// Compile ABP/uBO rule text (one string per list) into a serialized adblock engine.
 ///
-/// Every list's full text is handed to `FilterSet::add_filter_list`, which parses comments,
-/// metadata, network rules and cosmetic rules natively. The resulting engine is optimized and
-/// returned as serialized bytes suitable for [`SharedEngine::install`]. Pure-CPU and `Send`-safe —
-/// call it from `spawn_blocking`.
+/// Thin wrapper over [`compile_lists`] that discards the per-list accounting. Pure-CPU and
+/// `Send`-safe: call it from `spawn_blocking`.
 pub fn compile_engine(list_contents: &[String]) -> Vec<u8> {
-    // debug=true keeps rule text so block pages / logs can show the matched rule.
-    let mut filter_set = FilterSet::new(true);
-    for content in list_contents {
-        // `add_filter_list` handles comment/metadata stripping and rule classification itself.
-        let _ = filter_set.add_filter_list(content, ParseOptions::default());
-    }
-    let engine = AdblockEngine::from_filter_set(filter_set, true);
-    engine.serialize()
+    let refs: Vec<&str> = list_contents.iter().map(String::as_str).collect();
+    compile_lists(&refs).blob
 }
 
 #[cfg(test)]

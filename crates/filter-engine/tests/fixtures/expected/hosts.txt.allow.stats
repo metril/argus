@@ -1,0 +1,15 @@
+format=hosts
+total_lines=18
+converted=10
+skipped=7
+error_count=3
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={"localhost": 5, "non-sinkhole-ip": 2}
+meta=ListMeta { title: Some("Test hosts"), homepage: None, version: None, expires_secs: Some(172800), redirect: None }
+error line 13: invalid character in hostname: `bad_host!.com`
+error line 14: single-label hostname: `singlelabel`
+error line 17: address without hostname

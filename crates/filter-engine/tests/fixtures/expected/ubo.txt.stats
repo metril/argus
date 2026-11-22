@@ -1,0 +1,12 @@
+format=ubo
+total_lines=15
+converted=4
+skipped=0
+error_count=0
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={}
+meta=ListMeta { title: Some("uBO list"), homepage: None, version: None, expires_secs: None, redirect: None }

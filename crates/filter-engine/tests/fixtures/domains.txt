@@ -1,0 +1,9 @@
+# plain domain list
+ads.example.com
+*.wild.example.org
+.dot.example.net
+Mixed.Case.Example.COM   # trailing comment
+-bad-.example.com
+not a domain line
+192.0.2.1
+xn--bcher-kva.example

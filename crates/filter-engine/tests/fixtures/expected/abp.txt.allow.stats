@@ -1,0 +1,12 @@
+format=abp
+total_lines=11
+converted=5
+skipped=0
+error_count=0
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={}
+meta=ListMeta { title: Some("Test ABP"), homepage: Some("https://example.org"), version: Some("202401010000"), expires_secs: Some(345600), redirect: Some("https://example.org/new.txt") }

@@ -1,0 +1,16 @@
+# Surge rule list
+DOMAIN,exact.example.com,REJECT
+DOMAIN-SUFFIX,suffix.example.com,REJECT
+DOMAIN-SUFFIX,proxied.example.com,PROXY
+DOMAIN-SUFFIX,nopolicy.example.com
+DOMAIN-KEYWORD,adtrack,REJECT-TINYGIF
+URL-REGEX,^https?://x\.example\.com/ads/,REJECT
+IP-CIDR,192.0.2.0/24,REJECT,no-resolve
+IP-CIDR6,2001:db8::/32,REJECT
+GEOIP,CN,DIRECT
+FINAL,DIRECT
+host, qx.example.com, reject
+host-suffix, qxs.example.com, reject
+host-keyword, qxk, reject
+[URL Rewrite]
+^https://x.example.com - reject

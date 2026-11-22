@@ -1,0 +1,20 @@
+$TTL 300
+$ORIGIN rpz.example.
+@ IN SOA localhost. root.localhost. (
+    1 ; serial
+    3h ; refresh
+    1h ; retry
+    1w ; expire
+    1h ) ; minimum
+  IN NS localhost.
+ads.example.com CNAME .
+*.ads.example.com CNAME .
+nodata.example.com 60 IN CNAME *.
+safe.example.com CNAME rpz-passthru.
+*.safe.example.com CNAME rpz-passthru.
+drop.example.com.rpz.example. CNAME rpz-drop.
+ns.evil.example.com.rpz-nsdname CNAME .
+24.0.2.0.192.rpz-ip CNAME .
+walled.example.com CNAME garden.example.net.
+a.example.com A 0.0.0.0
+b.example.com A 192.0.2.50

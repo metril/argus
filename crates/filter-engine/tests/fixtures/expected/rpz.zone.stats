@@ -1,0 +1,12 @@
+format=rpz
+total_lines=20
+converted=8
+skipped=4
+error_count=0
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={"custom-answer": 1, "no-owner": 1, "rpz-ip": 1, "rpz-nsdname": 1}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }

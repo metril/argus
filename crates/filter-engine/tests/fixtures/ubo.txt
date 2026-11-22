@@ -1,0 +1,15 @@
+! Title: uBO list
+!#if env_chromium
+||chromium-only.example^
+!#else
+||not-chromium.example^
+!#endif
+!#if ext_ublock && !adguard
+||ublock.example^
+!#endif
+!#if (adguard || env_mobile)
+||adguard-or-mobile.example^
+!#endif
+!#include extra.txt
+example.com##+js(abort-on-property-read, foo)
+# hash comment

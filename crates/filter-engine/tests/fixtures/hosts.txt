@@ -1,0 +1,18 @@
+﻿# Title: Test hosts
+# Expires: 2 days
+127.0.0.1 localhost
+127.0.0.1	localhost.localdomain local
+::1 ip6-localhost ip6-loopback
+255.255.255.255 broadcasthost
+0.0.0.0 ads.example.com
+0.0.0.0 Tracker.Example.NET # inline comment
+127.0.0.1 a.example.org b.example.org c.example.org
+:: v6.example.com
+::1 v6b.example.com
+0.0.0.0 bücher.example
+0.0.0.0 bad_host!.com
+0.0.0.0 singlelabel
+192.168.1.5 nas.example.lan
+0.0.0.0 ads.example.com
+0.0.0.0
+bare.example.com

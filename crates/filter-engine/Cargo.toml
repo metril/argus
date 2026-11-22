@@ -42,6 +42,8 @@ chrono = { workspace = true }
 
 # Cryptography (for checksums)
 base64 = "0.22"
+rayon = { workspace = true }
+regex = { workspace = true }
 
 # Common utilities
 common = { path = "../common" }

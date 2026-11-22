@@ -1,0 +1,12 @@
+{
+  "name": "Test Rules",
+  "description": "x",
+  "denied-remote-domains": ["ads.example.com", "*.wild.example.org", "localhost"],
+  "denied-remote-hosts": ["exact.example.net"],
+  "rules": [
+    {"action": "deny", "process": "any", "remote-domains": "r1.example.com, r2.example.com"},
+    {"action": "allow", "process": "any", "remote-hosts": ["ok.example.com"]},
+    {"action": "deny", "process": "any", "remote-hosts": "off.example.com", "disabled": true},
+    {"action": "deny", "process": "any", "remote-addresses": "1.2.3.4"}
+  ]
+}
