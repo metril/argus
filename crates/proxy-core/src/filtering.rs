@@ -246,7 +246,10 @@ impl ProxyContext {
     /// profile slot, so the next request sees them.
     pub fn set_userscripts(&self, manager: Option<Arc<userscript_engine::UserscriptManager>>) {
         let slot = &self.default_slot;
-        slot.store(Arc::new(slot.load().with(|p| p.userscripts = manager)));
+        slot.store(Arc::new(
+            slot.load()
+                .with(|p| *p = p.clone().with_userscripts(manager)),
+        ));
     }
 
     /// What to do about service workers on sites that get userscripts.
