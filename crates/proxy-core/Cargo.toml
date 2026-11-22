@@ -138,3 +138,7 @@ harness = false
 [[bench]]
 name = "rewrite_bench"
 harness = false
+
+[[bench]]
+name = "userscripts_bench"
+harness = false

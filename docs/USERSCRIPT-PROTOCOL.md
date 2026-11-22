@@ -51,6 +51,32 @@ wrapping `@require`s + source in one scope (`this === window`; async function wi
 exist whenever any real grant is present. `@unwrap` scripts get no GM API and are injected as a
 nonce'd inline `<script>`.
 
+### 2.1 As implemented in `proxy-core` (`src/gm.rs`)
+
+* **One file per script**, as 2.5 suggests: `/__adblock__/us/<doc>.<n>.js`, `n` in injection order
+  (run-at group, then install order). The shared 40 KB runtime is repeated in each file (a syntax
+  error in one script must not break another; there is no safe way to share one runtime instance
+  between separate `<script>` files without a global). Consequence: with several scripts on one
+  page only the first runtime instance registers the menu-command registry.
+* The page's `<head>` carries only the `<script src>` tags: no token, no config. The bundle is
+  generated when the URL is fetched (stored values read then), served once (`404` afterwards),
+  bound to the document's host, and expires 60 s after the document was served. Per-document
+  records live in a bounded map (4096, oldest evicted first).
+* The scripts' `<script>` tags come after the blocker's own tags, still before any page script.
+  The policy gets `script` (nonce), `connect` (when any script has a grant), and `style` (when a
+  script uses `GM_addStyle`/`@unwrap`). A response whose CSP is `sandbox` without `allow-scripts`
+  gets nothing.
+* `origin` for token binding is derived from the connection (scheme, host, port), not from a
+  header; the `Origin` header must equal it. `resource` GETs have no `Origin`, so they need
+  `Sec-Fetch-Site: same-origin`. POSTs need `Origin` and `Content-Type`; a cross-site request,
+  `null` origin or a missing header is `403` with an empty body, and `OPTIONS` is never answered.
+* `values/get` also works for scripts that only `@grant GM_addValueChangeListener`.
+* Outbound concurrency: 8 per script, 32 per profile (`429` + `quota_exceeded`). The request body is
+  buffered up to `Quotas::max_request_body` (64 MiB); the response is streamed with a 256 MiB cap
+  and one overall deadline (`timeout`). `Accept-Encoding: identity` is sent unless the script set one.
+* Not implemented: attaching the browser's own cookies for `anonymous: false` (the proxy cannot
+  see them; only the GM jar is used), and a shared, cacheable runtime URL.
+
 ## 3. Capability token
 
 `v1.<b64url(script_id)>.<exp_unix_secs>.<b64url(HMAC-SHA256(key, msg))>`,

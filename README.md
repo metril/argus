@@ -49,11 +49,10 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
   - Exception rules for disabling scriptlets
 
 ### Userscript Engine (Phase 4 - v0.4.0)
-- Greasemonkey-compatible userscript execution
-- Boa JavaScript engine with V8-level sandboxing
-- GM_* API support (storage, XHR, DOM manipulation)
-- Process-level isolation with bubblewrap + seccomp-bpf
-- 30-second timeout enforcement
+- Userscripts injected per document (see [Userscripts](#userscripts)), run in the page
+- GM_* / GM.* API: values, XHR (under the destination policy and `@connect`), styles, resources
+- Capability tokens, same-origin checks and server-side grants (no isolated world: see the hostile-page notes)
+- Two-step install with approval, update checks with re-approval, storage view, export/import
 
 ### Web Management UI (Phase 5 - v1.0.0)
 - Leptos-based WebUI on port 3000
@@ -815,704 +814,89 @@ match engine.trigger_update().await {
 - Base64 encoding for checksum representation
 - Supports ETag-based conditional requests
 
-## Userscript Engine
+## Userscripts
 
-The userscript engine provides Greasemonkey/Tampermonkey compatibility for running custom JavaScript on web pages.
+Tampermonkey/Violentmonkey-style userscripts run in the page, injected by the proxy. There is no
+browser extension: the proxy rewrites HTML responses and answers a small backend itself.
 
-### Installing Userscripts
+### How it works
 
-```rust
-use userscript_engine::UserscriptManager;
+1. A script is installed through the Web UI or the API in two steps (`plan`, then `confirm`). The
+   plan lists the grants, `@connect` hosts, match scope (broad scopes such as `<all_urls>` and
+   `@connect *` are flagged) and anything unsupported; nothing runs until you approve it.
+2. For each HTML document the proxy asks the profile's script index which scripts match
+   (`@match`/`@include`/`@exclude`/`@noframes`; top frame vs. iframe comes from `Sec-Fetch-Dest`).
+   With no installed scripts, or no match, nothing is added to the page and no extra request is made.
+3. Each matching script becomes one classic `<script src="/__adblock__/us/<doc>.<n>.js">` at the top
+   of `<head>` (so `@run-at document-start` runs before page scripts; the runtime stages
+   `document-body`/`-end`/`-idle`). A script with a syntax error cannot break another script.
+   The bundle URL is per document, unguessable, single use and `no-store`; the page's CSP is
+   adapted the same way as for the blocker's own scripts (nonce, `connect-src`, Trusted Types name).
+4. The runtime talks to `/__adblock__/gm/v1/*` on the page's own origin. Every call needs a
+   capability token (HMAC over profile, script, version, origin, grants and expiry), the matching
+   `Origin`, same-origin fetch metadata and a custom header. Authority comes from the stored script:
+   `@grant`, `@connect`, quotas and the destination policy are enforced server-side. Protocol:
+   `docs/USERSCRIPT-PROTOCOL.md`.
 
-// Create manager
-let manager = UserscriptManager::new("./data/userscripts".into())?;
+Outbound `GM_xmlhttpRequest`/`GM_download` traffic goes through the proxy's own upstream client under
+the same destination policy as proxied traffic (loopback, link-local, the proxy's own listeners and,
+if configured, private ranges are refused even for `@connect *`), re-checks `@connect` on every
+redirect, and streams both ways in bounded memory. It is not run through the filter engine (script
+managers do not filter either). Cookies: the proxy cannot see the browser's cookie store, so
+`GM_cookie` and non-anonymous requests use a per-profile jar inside the proxy (in memory, lost on
+restart); the browser's own cookies are never attached to a script's request.
 
-// Install a userscript
-let script_source = r#"
-// ==UserScript==
-// @name         Example Script
-// @namespace    http://example.com
-// @version      1.0.0
-// @description  Demonstrates userscript features
-// @match        *://example.com/*
-// @grant        GM_setValue
-// @grant        GM_getValue
-// ==/UserScript==
+### What works
 
-// Your script code here
-GM_setValue('visits', (GM_getValue('visits', 0) + 1));
-console.log('Visit count:', GM_getValue('visits'));
-"#;
+`GM_getValue/setValue/deleteValue/listValues` (+ `GM.*` promise forms, `GM_getValues`...),
+`GM_addValueChangeListener` (also across tabs), `GM_addStyle`, `GM_addElement`,
+`GM_getResourceText/URL`, `@require`, `GM_xmlhttpRequest` (GET/POST/headers, progress, abort,
+timeout, redirects), `GM_download`, `GM_cookie`, `GM_info`, `unsafeWindow`, `GM_openInTab`,
+`GM_setClipboard`, `GM_notification`, `GM_registerMenuCommand` (registry only), `@grant none`.
+Install, update checks (manual or scheduled; an update that widens `@match`/`@grant`/`@connect`
+stays pending until approved), per-script enable/disable, storage view/clear and JSON
+export/import are in the Web UI and the API (`docs/API.md`).
 
-let script_id = manager.install(script_source.to_string())?;
+### What cannot work through a proxy
+
+- **No isolated world.** Scripts run in the page's JavaScript world. `@sandbox`, `@inject-into
+  content` and `@run-in` cannot be honoured (reported at install). `@grant none` scripts and
+  `unsafeWindow` are the page's `window`.
+- No `@webRequest`/`GM_webRequest`, no `@run-at context-menu`, no toolbar/context-menu UI, no other
+  extension-only APIs. Menu commands are collected but there is no panel yet, and with several
+  scripts on one page only the first script's commands are registered.
+- The proxy cannot write files (`GM_download` saves through the browser) or read the browser's cookies.
+- `@unwrap` scripts need an inline script, so they do not run under CSPs or Trusted Types that
+  forbid it. Pages sent with CSP `sandbox` (no `allow-scripts`) get no scripts at all.
+- The browser must trust the proxy CA and reach the page through the proxy; HTTP/3 is not supported.
+
+### Hostile pages (read this)
+
+A userscript shares its world with the page, so a page is not fully contained. What the design
+does: the runtime captures `fetch`, `JSON`, `Promise`, `Function.prototype.call/apply/bind`, DOM
+prototypes and stream readers before any page code runs, keeps tokens only in closures (never in
+the DOM, an attribute or a URL), serves each bundle once, and deletes its own `<script>` element. A
+page that overrides `fetch`, `JSON.parse` or `Function.prototype.call` after load cannot read a
+token or hijack a script's calls, and its own calls to the endpoints are refused (browser tests
+assert this). What it can still do: poison built-ins before they are captured if it runs before
+the proxy's script (not possible for an inline script in the document, but for a service worker, an
+extension or an earlier same-origin frame); tamper with objects it receives later, for example
+observe the values a script reads through `Promise.prototype.then` or anything a script writes to
+the DOM or exposes on `window`; and, with a token it somehow stole, act as that one script on that
+one origin until the token expires (one hour), within that script's approved grants and `@connect`.
+Only install scripts you trust with the data of the sites they run on.
+
+### Configuration
+
+```toml
+[userscripts]
+enabled = true                 # inject scripts and serve the GM backend
+update_check_interval_hours = 0  # scheduled update checks (0 = off)
+auto_apply_updates = false     # apply only updates that do not widen grants/@match/@connect
 ```
 
-### Metadata Block
-
-Userscripts must include a metadata block with directives:
-
-**Required**:
-- `@name` - Script name (used as unique identifier with namespace)
-
-**Common**:
-- `@namespace` - Unique namespace (combined with name for ID)
-- `@version` - Version string for update checks
-- `@description` - Human-readable description
-- `@author` - Script author
-
-**Execution Control**:
-- `@match` - URL patterns where script runs (recommended)
-- `@include` - URL patterns to include (legacy)
-- `@exclude` - URL patterns to exclude
-- `@run-at` - When to inject: `document-start`, `document-end` (default), `document-idle`
-- `@noframes` - Don't run in iframes
-
-**Permissions**:
-- `@grant` - Required GM_* API functions (e.g., `@grant GM_setValue`)
-- `@connect` - Domains allowed for GM_xmlhttpRequest
-
-**Resources**:
-- `@require` - External scripts to load before execution
-- `@resource` - Named resources accessible via GM_getResourceURL
-
-**Updates**:
-- `@updateURL` - URL to check for updates
-- `@downloadURL` - URL to download updates
-
-### Example Metadata Block
-
-```javascript
-// ==UserScript==
-// @name         Advanced Example
-// @namespace    http://mysite.com/userscripts
-// @version      2.1.0
-// @description  Comprehensive userscript example
-// @author       Your Name
-// @match        *://example.com/*
-// @match        *://test.example.com/*
-// @exclude      *://example.com/admin*
-// @run-at       document-end
-// @grant        GM_setValue
-// @grant        GM_getValue
-// @grant        GM_deleteValue
-// @grant        GM_listValues
-// @grant        GM_info
-// @require      https://code.jquery.com/jquery-3.6.0.min.js
-// @resource     icon https://example.com/icon.png
-// @updateURL    https://example.com/script.meta.js
-// @downloadURL  https://example.com/script.user.js
-// ==/UserScript==
-```
-
-### GM_* API (Week 13 Foundation)
-
-**Storage Functions** (Implemented):
-
-```javascript
-// Store values (supports string, number, boolean, arrays, objects)
-GM_setValue('username', 'john');
-GM_setValue('count', 42);
-GM_setValue('config', {theme: 'dark', lang: 'en'});
-
-// Retrieve values with optional default
-let name = GM_getValue('username', 'guest');
-let count = GM_getValue('count', 0);
-
-// Delete values
-GM_deleteValue('old_key');
-
-// List all stored keys
-let keys = GM_listValues(); // Returns ['username', 'count', 'config']
-
-// Get script info
-let info = GM_info();
-console.log(info.script.id);      // Script unique ID
-console.log(info.scriptHandler);   // "AdBlocker Userscript Engine"
-console.log(info.version);         // Engine version
-```
-
-**Coming in Week 14**:
-- `GM_xmlhttpRequest` - Cross-domain HTTP requests
-- `GM_notification` - Desktop notifications
-- `GM_openInTab` - Open URLs in new tabs
-- `GM_addStyle` - Inject CSS
-- `GM_getResourceURL` - Access @resource files
-- `GM_setClipboard` - Clipboard access
-
-### Managing Userscripts
-
-```rust
-// Load all scripts from disk
-manager.load_all()?;
-
-// Get script by ID
-if let Some(script) = manager.get("example.com:Example Script") {
-    println!("Name: {}", script.name());
-    println!("Version: {:?}", script.version());
-    println!("Enabled: {}", script.enabled);
-}
-
-// Get scripts for a URL
-let scripts = manager.get_scripts_for_url("https://example.com/page");
-for script in scripts {
-    println!("Will run: {}", script.name());
-}
-
-// Enable/disable scripts
-manager.set_enabled("script-id", false)?;
-
-// Update a script
-manager.update("script-id", new_source)?;
-
-// Uninstall a script
-manager.uninstall("script-id")?;
-
-// Get statistics
-let stats = manager.stats();
-println!("Total: {}, Enabled: {}, Disabled: {}",
-    stats.total_scripts, stats.enabled_scripts, stats.disabled_scripts);
-```
-
-### URL Matching
-
-Scripts use glob-style patterns for matching:
-
-```javascript
-// Exact domain
-// @match https://example.com/*
-
-// Any subdomain
-// @match *://*.example.com/*
-
-// Any protocol
-// @match *://example.com/*
-
-// All URLs
-// @match *://*/*
-// @match <all_urls>
-
-// Exclusions
-// @exclude *://example.com/admin*
-```
-
-### Storage Isolation
-
-Each userscript has isolated storage:
-- Values are namespaced by script ID
-- Scripts cannot access other scripts' data
-- Persistent storage in the shared redb database (`adblocker.redb`)
-- In-memory caching for performance
-
-### Security Considerations
-
-1. **@grant declarations required** - Scripts must declare which GM_* APIs they need
-2. **Permission checks enforced** - Calling undeclared APIs throws PermissionDenied error
-3. **Storage isolation** - Scripts cannot access each other's data
-4. **URL pattern validation** - Only runs on matched URLs
-5. **Metadata validation** - Scripts require valid metadata block
-
-### Best Practices
-
-1. **Always use @match over @include** - More precise, better performance
-2. **Declare minimal @grant permissions** - Request only needed APIs
-3. **Use @exclude for sensitive pages** - Don't run on admin/login pages
-4. **Version your scripts** - Enables proper update detection
-5. **Test before deploying** - Verify script works on target sites
-6. **Namespace your scripts** - Prevents ID conflicts with other authors
-
-### JavaScript Execution (Week 14)
-
-Execute userscripts with the Boa JavaScript engine:
-
-```rust
-use userscript_engine::{ScriptExecutor, GmApi, UserscriptStorage};
-use std::sync::Arc;
-
-// Create storage and API
-let storage = Arc::new(UserscriptStorage::new("./data/userscripts".into())?);
-let grants = vec!["GM_setValue".to_string(), "GM_getValue".to_string()];
-let gm_api = Arc::new(GmApi::new("my-script".to_string(), storage, grants));
-
-// Create executor with GM API injected
-let mut executor = ScriptExecutor::new(gm_api)?;
-
-// Execute userscript
-executor.execute(&script.source, &script.name())?;
-```
-
-### Advanced GM_* APIs
-
-#### GM_addStyle - CSS Injection
-
-Inject custom CSS into the page:
-
-```javascript
-// ==UserScript==
-// @name         Style Injector
-// @grant        GM_addStyle
-// ==/UserScript==
-
-// Hide ads
-GM.addStyle(`
-    .advertisement,
-    .sponsored-content {
-        display: none !important;
-    }
-`);
-
-// Custom theme
-GM.addStyle(`
-    body {
-        background-color: #1e1e1e;
-        color: #d4d4d4;
-    }
-`);
-```
-
-#### GM_xmlhttpRequest - Cross-Domain Requests
-
-Make HTTP requests that bypass CORS:
-
-```javascript
-// ==UserScript==
-// @name         API Client
-// @grant        GM_xmlhttpRequest
-// @connect      api.example.com
-// ==/UserScript==
-
-GM.xmlhttpRequest({
-    method: "GET",
-    url: "https://api.example.com/data",
-    headers: {
-        "User-Agent": "MyScript/1.0"
-    },
-    onload: function(response) {
-        console.log("Status:", response.status);
-        console.log("Data:", response.responseText);
-    },
-    onerror: function(error) {
-        console.error("Request failed:", error);
-    }
-});
-```
-
-#### GM_notification - Desktop Notifications
-
-Show desktop notifications:
-
-```javascript
-// ==UserScript==
-// @name         Notifier
-// @grant        GM_notification
-// ==/UserScript==
-
-GM.notification({
-    title: "Script Loaded",
-    text: "Your userscript is running!",
-    timeout: 5000
-});
-
-// Notification with callback
-GM.notification({
-    title: "New Message",
-    text: "You have a new message",
-    onclick: function() {
-        window.location.href = "/messages";
-    }
-});
-```
-
-#### GM_openInTab - Open URLs
-
-Open URLs in new tabs:
-
-```javascript
-// ==UserScript==
-// @name         Link Opener
-// @grant        GM_openInTab
-// ==/UserScript==
-
-document.querySelectorAll('a.external').forEach(link => {
-    link.addEventListener('click', (e) => {
-        e.preventDefault();
-
-        // Open in background tab
-        GM.openInTab(link.href, {
-            active: false,
-            insert: true,
-            setParent: true
-        });
-    });
-});
-```
-
-#### GM_getResourceURL - Resource Access
-
-Access @resource files:
-
-```javascript
-// ==UserScript==
-// @name         Resource User
-// @grant        GM_getResourceURL
-// @resource     icon https://example.com/icon.png
-// @resource     config https://example.com/config.json
-// ==/UserScript==
-
-// Get icon URL
-const iconUrl = GM.getResourceURL('icon');
-document.querySelector('#logo').src = iconUrl;
-
-// Fetch config
-const configUrl = GM.getResourceURL('config');
-fetch(configUrl)
-    .then(r => r.json())
-    .then(config => console.log('Config:', config));
-```
-
-#### GM_setClipboard - Clipboard Access
-
-Copy text to clipboard:
-
-```javascript
-// ==UserScript==
-// @name         Clipboard Helper
-// @grant        GM_setClipboard
-// ==/UserScript==
-
-document.querySelectorAll('.copy-button').forEach(button => {
-    button.addEventListener('click', () => {
-        const text = button.dataset.text;
-        GM.setClipboard(text);
-
-        button.textContent = 'Copied!';
-        setTimeout(() => {
-            button.textContent = 'Copy';
-        }, 2000);
-    });
-});
-```
-
-### Complete Example Userscript
-
-```javascript
-// ==UserScript==
-// @name         Complete Example
-// @namespace    http://example.com
-// @version      1.0.0
-// @description  Demonstrates all GM_* APIs
-// @match        *://example.com/*
-// @grant        GM_setValue
-// @grant        GM_getValue
-// @grant        GM_addStyle
-// @grant        GM_xmlhttpRequest
-// @grant        GM_notification
-// @grant        GM_openInTab
-// @grant        GM_setClipboard
-// @grant        GM_getResourceURL
-// @connect      api.example.com
-// @resource     logo https://example.com/logo.png
-// ==/UserScript==
-
-(function() {
-    'use strict';
-
-    // Get script info
-    const info = GM.info();
-    console.log('Script:', info.script.id);
-
-    // Track visits
-    const visits = GM.getValue('visits', 0) + 1;
-    GM.setValue('visits', visits);
-
-    // Show notification on first visit
-    if (visits === 1) {
-        GM.notification({
-            title: 'Welcome!',
-            text: 'This is your first visit'
-        });
-    }
-
-    // Inject custom styles
-    GM.addStyle(`
-        .custom-banner {
-            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 20px;
-            text-align: center;
-        }
-    `);
-
-    // Add banner
-    const banner = document.createElement('div');
-    banner.className = 'custom-banner';
-    banner.textContent = `Visit count: ${visits}`;
-    document.body.insertBefore(banner, document.body.firstChild);
-
-    // Add copy button
-    const copyBtn = document.createElement('button');
-    copyBtn.textContent = 'Copy Visit Count';
-    copyBtn.onclick = () => {
-        GM.setClipboard(`You've visited ${visits} times`);
-    };
-    banner.appendChild(copyBtn);
-
-    // Fetch remote data
-    GM.xmlhttpRequest({
-        method: 'GET',
-        url: 'https://api.example.com/status',
-        onload: (response) => {
-            console.log('API Status:', response.responseText);
-        }
-    });
-
-    // Open link in tab on button click
-    const linkBtn = document.createElement('button');
-    linkBtn.textContent = 'Open Related Page';
-    linkBtn.onclick = () => {
-        GM.openInTab('https://example.com/related', {
-            active: false
-        });
-    };
-    banner.appendChild(linkBtn);
-
-})();
-```
-
-### Implementation Notes (Week 14)
-
-- **Week 13**: Metadata parser, storage system, basic GM_* APIs (setValue, getValue, deleteValue, listValues)
-- **Week 14**: Boa JavaScript engine integration, advanced GM_* APIs (xmlhttpRequest, notification, addStyle, etc.)
-- Full Greasemonkey/Tampermonkey compatibility
-- Permission system enforces @grant declarations
-- JavaScript execution with proper value conversion between Rust and JS
-- GM object injected into global scope
-- All GM_* functions return promises or values as per spec
-- Error handling with detailed error messages
-
-### Architecture
-
-The userscript engine consists of:
-
-1. **Metadata Parser** (`metadata.rs`) - Parses `// ==UserScript==` blocks
-2. **Script Manager** (`manager.rs`) - Lifecycle management (install/update/uninstall)
-3. **Storage** (`storage.rs`) - Persistent key-value storage in the shared redb database
-4. **GM API** (`gm_api.rs`) - Implementation of all GM_* functions
-5. **Executor** (`executor.rs`) - Boa engine integration and JavaScript execution
-
-### Execution Runtime (Week 15)
-
-Execute userscripts with proper timing and resource management:
-
-```rust
-use userscript_engine::{UserscriptManager, UserscriptRuntime, UserscriptStorage, RunAt};
-use std::sync::Arc;
-
-// Create manager and storage
-let manager = Arc::new(UserscriptManager::new("./data/userscripts".into())?);
-let storage = Arc::new(UserscriptStorage::new("./data/userscripts".into())?);
-
-// Create runtime
-let runtime = UserscriptRuntime::new(manager.clone(), storage);
-
-// Load userscripts from disk
-manager.load_all()?;
-
-// Execute scripts at document-start
-let results = runtime.execute_for_url(
-    "https://example.com/page",
-    RunAt::DocumentStart
-).await?;
-
-println!("Executed: {}", results.executed.len());
-println!("Failed: {}", results.failed.len());
-
-// Execute scripts at document-end
-let results = runtime.execute_for_url(
-    "https://example.com/page",
-    RunAt::DocumentEnd
-).await?;
-
-// Execute scripts at document-idle
-let results = runtime.execute_for_url(
-    "https://example.com/page",
-    RunAt::DocumentIdle
-).await?;
-```
-
-### @run-at Timing
-
-Control when scripts execute:
-
-```javascript
-// ==UserScript==
-// @name         Early Script
-// @run-at       document-start
-// ==/UserScript==
-
-// Runs before page scripts execute
-// Can intercept page behavior
-
-// ==UserScript==
-// @name         DOM Ready Script
-// @run-at       document-end
-// ==/UserScript==
-
-// Runs when DOM is ready
-// Most common for DOM manipulation
-
-// ==UserScript==
-// @name         Full Load Script
-// @run-at       document-idle
-// ==/UserScript==
-
-// Runs after everything is loaded
-// Use for non-critical functionality
-```
-
-### @require Dependencies
-
-Load external libraries:
-
-```javascript
-// ==UserScript==
-// @name         jQuery Script
-// @require      https://code.jquery.com/jquery-3.6.0.min.js
-// @require      https://cdn.example.com/library.js
-// @grant        GM_setValue
-// ==/UserScript==
-
-// jQuery is now available
-$('button').click(() => {
-    GM.setValue('clicked', true);
-});
-```
-
-The runtime automatically:
-- Fetches @require URLs
-- Caches dependencies for performance
-- Executes them before your script
-- Handles fetch errors gracefully
-
-### @resource Files
-
-Access external resources:
-
-```javascript
-// ==UserScript==
-// @name         Resource Example
-// @resource     icon https://example.com/icon.png
-// @resource     template https://example.com/template.html
-// @grant        GM_getResourceURL
-// ==/UserScript==
-
-// Get resource as data URL
-const iconUrl = GM.getResourceURL('icon');
-document.querySelector('#logo').src = iconUrl;
-
-// Resources are:
-// - Fetched and cached automatically
-// - Converted to base64 data URLs
-// - MIME type detected from extension
-```
-
-### Page Context
-
-Track page state and inject CSS:
-
-```rust
-use userscript_engine::{PageContext, DocumentReadyState};
-
-let mut ctx = PageContext::new("https://example.com".to_string());
-
-// Update ready state as page loads
-ctx.ready_state = DocumentReadyState::Interactive;
-
-// Collect injected CSS from GM_addStyle
-ctx.injected_css.push("body { background: #000; }".to_string());
-
-// Get all CSS to inject
-let css = ctx.get_css();
-```
-
-### Cache Management
-
-Monitor and control caches:
-
-```rust
-// Get cache statistics
-let stats = runtime.cache_stats();
-println!("@require cached: {}", stats.require_cached);
-println!("@resource cached: {}", stats.resource_cached);
-
-// Clear caches
-runtime.clear_caches();
-```
-
-### Complete Integration Example
-
-```rust
-use userscript_engine::{
-    UserscriptManager, UserscriptRuntime, UserscriptStorage,
-    RunAt, DocumentReadyState, PageContext
-};
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup
-    let manager = Arc::new(UserscriptManager::new("./data/userscripts".into())?);
-    let storage = Arc::new(UserscriptStorage::new("./data/userscripts".into())?);
-    let runtime = UserscriptRuntime::new(manager.clone(), storage);
-
-    // Load installed scripts
-    manager.load_all()?;
-
-    // Install a new script
-    let script = r#"
-// ==UserScript==
-// @name         Page Enhancer
-// @match        *://example.com/*
-// @run-at       document-end
-// @require      https://code.jquery.com/jquery-3.6.0.min.js
-// @grant        GM_setValue
-// @grant        GM_getValue
-// @grant        GM_addStyle
-// ==/UserScript==
-
-GM.addStyle('body { font-family: Arial; }');
-
-const visits = GM.getValue('visits', 0) + 1;
-GM.setValue('visits', visits);
-
-$('body').prepend(`<div>Visit #${visits}</div>`);
-"#;
-
-    manager.install(script.to_string())?;
-
-    // Execute for a page request
-    let url = "https://example.com/page";
-    let mut page_ctx = PageContext::new(url.to_string());
-
-    // Execute at document-start
-    runtime.execute_for_url(url, RunAt::DocumentStart).await?;
-
-    // Simulate DOM ready
-    page_ctx.ready_state = DocumentReadyState::Interactive;
-    let results = runtime.execute_for_url(url, RunAt::DocumentEnd).await?;
-
-    println!("Executed {} scripts", results.executed.len());
-
-    // Get injected CSS
-    let css = page_ctx.get_css();
-    println!("Injected CSS: {}", css);
-
-    // Simulate complete load
-    page_ctx.ready_state = DocumentReadyState::Complete;
-    runtime.execute_for_url(url, RunAt::DocumentIdle).await?;
-
-    Ok(())
-}
-```
+Stored scripts from before the rewrite (`resources` map format) cannot be read; they are dropped
+with a log line when the database is loaded.
 
 ## Security and Sandboxing (Week 16)
 

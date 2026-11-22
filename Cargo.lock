@@ -1556,17 +1556,25 @@ name = "e2e-browser"
 version = "0.1.0"
 dependencies = [
  "async-compression",
+ "axum-test",
  "base64 0.22.1",
  "chromiumoxide",
+ "common",
+ "cookie",
  "e2e",
  "encoding_rs",
+ "filter-engine",
  "futures-util",
  "proxy-core",
+ "reqwest 0.12.28",
  "rustls-pemfile",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
+ "userscript-engine",
+ "web-api",
  "x509-parser",
 ]
 

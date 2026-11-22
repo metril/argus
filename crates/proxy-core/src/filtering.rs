@@ -629,6 +629,9 @@ impl ProxyContext {
                     None
                 } else {
                     rctx.profile.load().userscript_manager().and_then(|m| {
+                        if m.live_index().is_empty() {
+                            return None; // zero cost: no allocation, no probe
+                        }
                         self.internal.gm.plan_document(
                             m,
                             &host,

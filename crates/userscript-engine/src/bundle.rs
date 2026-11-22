@@ -269,12 +269,17 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
     if uses("gm_getvalue")
         || uses("gm_getvalues")
         || uses("gm_listvalues")
+        || uses("gm_addvaluechangelistener")
         || uses("gm_setvalue")
         || uses("gm_setvalues")
     {
         if let Some(v) = opts.values.get(&s.id) {
             d.insert("values".into(), Value::Object(v.clone()));
         }
+    } else {
+        // Nothing to read: an empty snapshot, so the runtime does not try to load values (a
+        // lazy load would be refused for lack of a read grant, and the script would never run).
+        d.insert("values".into(), Value::Object(Map::new()));
     }
     if uses("gm_getresourcetext") || uses("gm_getresourceurl") {
         let mut res = Map::new();

@@ -209,7 +209,13 @@ impl GmBackend {
         ctx: &ScriptCtx<'_>,
         names: Option<&[String]>,
     ) -> GmResult<Map<String, Value>> {
-        ctx.require(&["GM_getValue", "GM_getValues", "GM_listValues"])?;
+        ctx.require(&[
+            "GM_getValue",
+            "GM_getValues",
+            "GM_listValues",
+            // A change listener is handed old and new values, so it may read them.
+            "GM_addValueChangeListener",
+        ])?;
         let space = ns(ctx.profile, &ctx.script.id);
         let all;
         let names: &[String] = match names {
