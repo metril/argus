@@ -1080,7 +1080,7 @@ async fn run_outbound(
         }
         let jar_cookie = cur
             .use_cookie_jar
-            .then(|| manager.cookies().header_for(PROFILE, &cur.url))
+            .then(|| manager.cookies().header_for(PROFILE, &a.id, &cur.url))
             .flatten();
         let cookie = match (jar_cookie, explicit_cookie) {
             (Some(j), Some(e)) => Some(format!("{j}; {e}")),
@@ -1143,7 +1143,7 @@ async fn run_outbound(
             if !sc.is_empty() {
                 manager
                     .cookies()
-                    .store_response(PROFILE, &cur.url, sc.into_iter());
+                    .store_response(PROFILE, &a.id, &cur.url, sc.into_iter());
             }
         }
         let status = resp.status().as_u16();

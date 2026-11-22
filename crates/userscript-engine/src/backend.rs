@@ -733,11 +733,11 @@ pub struct Cookie {
     pub expiration_date: Option<i64>,
 }
 
-/// Cookie storage the proxy provides (per profile; the GM jar that `xhr` uses too).
+/// Cookie storage the proxy provides (per profile and script; the GM jar that `xhr` uses too).
 pub trait CookieJar {
-    fn list(&self, profile: &str, url: &Url, name: Option<&str>) -> Vec<Cookie>;
-    fn set(&self, profile: &str, url: &Url, cookie: Cookie) -> Result<(), String>;
-    fn delete(&self, profile: &str, url: &Url, name: &str) -> Result<(), String>;
+    fn list(&self, profile: &str, script: &str, url: &Url, name: Option<&str>) -> Vec<Cookie>;
+    fn set(&self, profile: &str, script: &str, url: &Url, cookie: Cookie) -> Result<(), String>;
+    fn delete(&self, profile: &str, script: &str, url: &Url, name: &str) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -767,19 +767,24 @@ impl GmBackend {
         match op {
             CookieOp::List { url, name } => {
                 let url = parse(&url)?;
-                Ok(
-                    serde_json::to_value(jar.list(ctx.profile, &url, name.as_deref()))
-                        .unwrap_or(Value::Null),
-                )
+                Ok(serde_json::to_value(jar.list(
+                    ctx.profile,
+                    &ctx.script.id,
+                    &url,
+                    name.as_deref(),
+                ))
+                .unwrap_or(Value::Null))
             }
             CookieOp::Set { url, cookie } => {
                 let url = parse(&url)?;
-                jar.set(ctx.profile, &url, cookie).map_err(internal)?;
+                jar.set(ctx.profile, &ctx.script.id, &url, cookie)
+                    .map_err(internal)?;
                 Ok(Value::Null)
             }
             CookieOp::Delete { url, name } => {
                 let url = parse(&url)?;
-                jar.delete(ctx.profile, &url, &name).map_err(internal)?;
+                jar.delete(ctx.profile, &ctx.script.id, &url, &name)
+                    .map_err(internal)?;
                 Ok(Value::Null)
             }
         }
@@ -1208,17 +1213,17 @@ mod tests {
 
         struct Jar;
         impl CookieJar for Jar {
-            fn list(&self, _: &str, _: &Url, _: Option<&str>) -> Vec<Cookie> {
+            fn list(&self, _: &str, _: &str, _: &Url, _: Option<&str>) -> Vec<Cookie> {
                 vec![Cookie {
                     name: "a".into(),
                     value: "1".into(),
                     ..Default::default()
                 }]
             }
-            fn set(&self, _: &str, _: &Url, _: Cookie) -> Result<(), String> {
+            fn set(&self, _: &str, _: &str, _: &Url, _: Cookie) -> Result<(), String> {
                 Ok(())
             }
-            fn delete(&self, _: &str, _: &Url, _: &str) -> Result<(), String> {
+            fn delete(&self, _: &str, _: &str, _: &Url, _: &str) -> Result<(), String> {
                 Ok(())
             }
         }
@@ -1263,6 +1268,65 @@ mod tests {
         assert_eq!(
             b.resource(&ctx(&nog, "p"), "r").unwrap_err().code,
             ErrorCode::NotGranted
+        );
+    }
+
+    #[test]
+    fn cookie_jars_are_isolated_per_script() {
+        let (b, _d) = backend();
+        let mk = |name: &str| {
+            let src = format!(
+                "// ==UserScript==\n// @name {name}\n// @namespace n\n// @grant GM_cookie\n// @connect a.test\n// ==/UserScript==\n"
+            );
+            finish_install(
+                plan_install(&src, None).unwrap(),
+                Fetched::default(),
+                Approvals::default(),
+            )
+            .unwrap()
+        };
+        let (a, c) = (mk("alpha"), mk("beta"));
+        assert_ne!(a.id, c.id);
+        let jar = crate::cookies::GmCookieJar::new();
+        let u = "https://a.test/".to_string();
+        b.cookie_op(
+            &ctx(&a, "p"),
+            CookieOp::Set {
+                url: u.clone(),
+                cookie: Cookie {
+                    name: "sid".into(),
+                    value: "secret".into(),
+                    http_only: true,
+                    ..Default::default()
+                },
+            },
+            &jar,
+        )
+        .unwrap();
+        let list = |s: &Userscript| {
+            b.cookie_op(
+                &ctx(s, "p"),
+                CookieOp::List {
+                    url: u.clone(),
+                    name: None,
+                },
+                &jar,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            list(&a).as_array().unwrap().len(),
+            1,
+            "owner sees its cookie"
+        );
+        assert!(
+            list(&c).as_array().unwrap().is_empty(),
+            "another script must not"
+        );
+        let url = Url::parse(&u).unwrap();
+        assert!(
+            jar.header_for("p", &c.id, &url).is_none(),
+            "nor replay it on its own requests"
         );
     }
 }
