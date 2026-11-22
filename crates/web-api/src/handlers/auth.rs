@@ -82,7 +82,7 @@ fn start_session(
         tokens.refresh_expires_in,
     )?;
     Ok((
-        session_cookies(state, &tokens, &sid),
+        session_cookies(state, client, &tokens, &sid),
         tokens.access_expires_in,
     ))
 }
@@ -97,8 +97,19 @@ async fn start_session_blocking(
     blocking(move || start_session(&st, &user, &client)).await
 }
 
-fn session_cookies(state: &AppState, t: &crate::auth::TokenPair, sid: &Uuid) -> HeaderMap {
-    let secure = state.api_config.security.cookie_secure;
+/// Cookie names keep their plain spelling: the `__Host-` prefix needs `Secure`, which is off for
+/// plain-HTTP access, and the SPA reads `csrf_token` by name, so the names stay as they are.
+fn session_cookies(
+    state: &AppState,
+    client: &ClientInfo,
+    t: &crate::auth::TokenPair,
+    sid: &Uuid,
+) -> HeaderMap {
+    let secure = state
+        .api_config
+        .security
+        .cookie_secure
+        .applies(client.https);
     let mut h = HeaderMap::new();
     set_cookie(
         &mut h,
@@ -134,14 +145,14 @@ fn session_cookies(state: &AppState, t: &crate::auth::TokenPair, sid: &Uuid) -> 
     h
 }
 
-fn expired_cookies() -> HeaderMap {
+fn expired_cookies(secure: bool) -> HeaderMap {
     let mut h = HeaderMap::new();
     for (name, http_only) in [
         (ACCESS_TOKEN_COOKIE, true),
         (REFRESH_TOKEN_COOKIE, true),
         (CSRF_COOKIE, false),
     ] {
-        set_cookie(&mut h, cookie_string(name, "", 0, false, http_only));
+        set_cookie(&mut h, cookie_string(name, "", 0, secure, http_only));
     }
     h
 }
@@ -262,6 +273,7 @@ pub async fn login(
 )]
 pub async fn refresh(
     State(state): State<Arc<AppState>>,
+    Extension(client): Extension<ClientInfo>,
     headers: HeaderMap,
 ) -> ApiResult<(HeaderMap, axum::Json<MessageResponse>)> {
     let token = refresh_cookie(&headers)
@@ -299,7 +311,7 @@ pub async fn refresh(
         }
     }
     Ok((
-        session_cookies(&state, &tokens, &sid),
+        session_cookies(&state, &client, &tokens, &sid),
         msg("Token refreshed"),
     ))
 }
@@ -312,6 +324,7 @@ pub async fn refresh(
 )]
 pub async fn logout(
     State(state): State<Arc<AppState>>,
+    Extension(client): Extension<ClientInfo>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<(HeaderMap, axum::Json<MessageResponse>)> {
     let sid = p.session_id().ok_or_else(|| {
@@ -321,7 +334,12 @@ pub async fn logout(
     })?;
     let st = state.clone();
     blocking(move || st.session_manager.revoke_session(&sid)).await?;
-    Ok((expired_cookies(), msg("Logged out successfully")))
+    let secure = state
+        .api_config
+        .security
+        .cookie_secure
+        .applies(client.https);
+    Ok((expired_cookies(secure), msg("Logged out successfully")))
 }
 
 /// The authenticated caller, with its effective scopes.

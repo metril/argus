@@ -736,3 +736,65 @@ async fn login_does_the_same_bcrypt_work_and_answers_identically_for_every_failu
     assert_eq!((wrong.0, &wrong.1), (unknown.0, &unknown.1));
     assert_eq!((disabled.0, &disabled.1), (unknown.0, &unknown.1));
 }
+
+async fn login_set_cookies(
+    mode: web_api::config::CookieSecure,
+    forwarded_https: bool,
+) -> Vec<String> {
+    let ctx = TestContext::with_config(|c| c.security.cookie_secure = mode)
+        .await
+        .unwrap();
+    let mut req = ctx.server.post("/api/v1/auth/register");
+    if forwarded_https {
+        // No trusted proxy is configured, so this header must be ignored.
+        req = req.add_header("x-forwarded-proto", "https");
+    }
+    let resp = req
+        .json(
+            &json!({"username": "admin_user", "password": PASSWORD, "password_confirm": PASSWORD}),
+        )
+        .await;
+    resp.assert_status_ok();
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn cookie_secure_is_auto_always_or_never() {
+    use web_api::config::CookieSecure::*;
+    assert_eq!(
+        web_api::config::SecurityConfig::default().cookie_secure,
+        Auto
+    );
+    for (mode, want) in [(Auto, false), (Never, false), (Always, true)] {
+        let cookies = login_set_cookies(mode, false).await;
+        assert_eq!(cookies.len(), 3);
+        for c in &cookies {
+            assert_eq!(c.contains("Secure"), want, "{mode:?}: {c}");
+        }
+    }
+    // An unproxied `X-Forwarded-Proto: https` is spoofable and must not turn Secure on.
+    for c in login_set_cookies(Auto, true).await {
+        assert!(!c.contains("Secure"), "{c}");
+    }
+}
+
+#[test]
+fn cookie_secure_config_accepts_words_and_legacy_booleans() {
+    use web_api::config::{CookieSecure, SecurityConfig};
+    let parse = |v: &str| -> Result<SecurityConfig, _> {
+        toml::from_str(&format!(
+            "enable_csrf = true\nrequire_https = false\ncors_origins = []\ncookie_secure = {v}"
+        ))
+    };
+    assert_eq!(
+        parse("\"always\"").unwrap().cookie_secure,
+        CookieSecure::Always
+    );
+    assert_eq!(parse("true").unwrap().cookie_secure, CookieSecure::Always);
+    assert_eq!(parse("false").unwrap().cookie_secure, CookieSecure::Never);
+    assert!(parse("\"sometimes\"").is_err());
+}

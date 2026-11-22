@@ -22,6 +22,8 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
     pub ip: Option<IpAddr>,
+    /// The request reached us over HTTPS (see [`request_is_https`]).
+    pub https: bool,
     pub user_agent: Option<String>,
     pub request_id: String,
 }
@@ -51,6 +53,18 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: &[IpAddr]) 
     Some(forwarded.or_else(real).unwrap_or(peer))
 }
 
+/// Whether the request arrived over HTTPS: only a trusted proxy's `X-Forwarded-Proto: https` is
+/// believed (the server itself speaks plain HTTP).
+pub fn request_is_https(headers: &HeaderMap, peer: Option<IpAddr>, trusted: &[IpAddr]) -> bool {
+    let Some(peer) = peer else { return false };
+    trusted.contains(&peer)
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("https"))
+}
+
 fn sanitize_id(raw: &str) -> Option<String> {
     (!raw.is_empty() && raw.len() <= 64 && raw.bytes().all(|b| b.is_ascii_graphic()))
         .then(|| raw.to_string())
@@ -74,6 +88,11 @@ pub async fn request_id_middleware(
         .map(|c| c.0.ip());
     let info = ClientInfo {
         ip: client_ip(
+            req.headers(),
+            peer,
+            &state.api_config.network.trusted_proxies,
+        ),
+        https: request_is_https(
             req.headers(),
             peer,
             &state.api_config.network.trusted_proxies,
@@ -104,6 +123,25 @@ pub async fn request_id_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn https_is_only_believed_from_trusted_proxies() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        let proxy: IpAddr = "10.0.0.2".parse().unwrap();
+        let other: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(request_is_https(&h, Some(proxy), &[proxy]));
+        assert!(
+            !request_is_https(&h, Some(other), &[proxy]),
+            "spoofed header"
+        );
+        assert!(!request_is_https(&h, None, &[proxy]));
+        assert!(!request_is_https(&HeaderMap::new(), Some(proxy), &[proxy]));
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert!(!request_is_https(&h, Some(proxy), &[proxy]));
+        h.insert("x-forwarded-proto", "http, https".parse().unwrap());
+        assert!(request_is_https(&h, Some(proxy), &[proxy]));
+    }
 
     #[test]
     fn forwarded_header_only_trusted_from_trusted_peers() {

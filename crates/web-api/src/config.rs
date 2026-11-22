@@ -163,9 +163,13 @@ pub struct SecurityConfig {
     /// Allowed CORS origins
     pub cors_origins: Vec<String>,
 
-    /// Cookie secure flag
-    pub cookie_secure: bool,
+    /// `Secure` flag on session cookies: `auto` (default) sets it when the request arrived over
+    /// HTTPS (`X-Forwarded-Proto: https` from a trusted proxy), `always` or `never`. A boolean
+    /// is still accepted (`true` = `always`, `false` = `never`).
+    pub cookie_secure: CookieSecure,
 }
+
+pub use common::config::CookieSecure;
 
 impl Default for SecurityConfig {
     fn default() -> Self {
@@ -173,7 +177,7 @@ impl Default for SecurityConfig {
             enable_csrf: true,
             require_https: false,     // Development default
             cors_origins: Vec::new(), // same-origin only unless allowlisted
-            cookie_secure: false,     // Development default
+            cookie_secure: CookieSecure::Auto,
         }
     }
 }

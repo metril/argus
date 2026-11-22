@@ -172,7 +172,11 @@ async fn start_webui_server(
             enable_csrf: true,
             require_https: false,
             cors_origins: config.webui.cors_origins.clone(),
-            cookie_secure: false,
+            cookie_secure: config.webui.cookie_secure,
+        },
+        network: web_api::config::NetworkConfig {
+            trusted_proxies: config.webui.trusted_proxies.clone(),
+            ..Default::default()
         },
         session: web_api::config::SessionConfig {
             storage_path: data_dir.clone(),

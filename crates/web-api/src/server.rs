@@ -136,6 +136,7 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("Web API server listening on {}", addr);
+    warn_if_exposed_without_tls(&config);
 
     let sessions = state.session_manager.clone();
     tokio::spawn(async move {
@@ -159,6 +160,23 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(())
+}
+
+/// The server speaks plain HTTP. Bound beyond loopback, logins and session cookies cross the
+/// network in clear unless a TLS-terminating reverse proxy sits in front. Logged once at startup.
+fn warn_if_exposed_without_tls(config: &ApiConfig) {
+    let host = config.server.host.trim_matches(['[', ']']);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        tracing::warn!(
+            "Web UI is bound to {host} without TLS: passwords and session cookies are sent in \
+             clear text. Put a TLS-terminating reverse proxy in front (and list it under \
+             network.trusted_proxies so cookies get the Secure flag) or bind to 127.0.0.1."
+        );
+    }
 }
 
 /// CORS: same-origin only unless origins are allowlisted (then credentials are allowed for
