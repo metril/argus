@@ -2,7 +2,7 @@
 //!
 //! Spins up a real origin server + the real `ProxyServer` with an engine compiled from a single
 //! block rule, then drives traffic through the proxy: an allowed request is forwarded to the
-//! origin; a blocked host returns `204` without ever contacting an origin.
+//! origin; a blocked host gets a synthetic response without ever contacting an origin.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,7 +197,7 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     assert_eq!(allowed.status(), 200);
     assert_eq!(allowed.text().await.unwrap(), "origin-hello");
 
-    // Blocked host → 204, and it never reaches any origin (the host doesn't even resolve).
+    // Blocked host → synthetic response, and it never reaches any origin (the host doesn't even resolve).
     let blocked = client
         .get("http://blocked.test/ads.js")
         .send()
@@ -205,8 +205,8 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
         .expect("blocked request should still get a synthetic response");
     assert_eq!(
         blocked.status(),
-        204,
-        "blocked host must return 204 No Content"
+        200,
+        "blocked script gets an empty 200 JS body"
     );
     assert_eq!(blocked.headers().get("x-adblock").unwrap(), "blocked");
 }

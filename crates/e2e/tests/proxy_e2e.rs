@@ -35,7 +35,11 @@ e2e_test!(blocked_never_reaches_origin, rules = BLOCKED_RULES, |env| {
     let resp = client
         .get(&env.origin.https_url("blocked.test", "/ad.js"))
         .await;
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200); // script block: empty JS body
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/javascript"
+    );
     assert_eq!(resp.headers().get("x-adblock").unwrap(), "blocked");
     // Sanity: an allowed request on the same origin does arrive, so "no request" is meaningful.
     env.origin.route("/ok", MockResponse::ok("ok"));

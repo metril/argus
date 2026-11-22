@@ -1,32 +1,25 @@
-//! Thread-local, lock-free shared adblock engine.
+//! Shared adblock engine: one `Arc<Engine>` behind an `ArcSwap`.
 //!
-//! `adblock::Engine` is `!Send`/`!Sync` (it holds an `Rc` + `RefCell`), so it cannot be stored in
-//! shared state or called across the proxy's worker threads directly. Instead we share the
-//! *compiled engine as serialized bytes* (`Send + Sync`) plus a generation counter, and let each
-//! worker thread lazily deserialize its **own** `Engine` into a `thread_local!`.
+//! `adblock::Engine` is `Send + Sync` (the workspace builds it without the `single-thread`
+//! feature), and every query method takes `&self`. The request path therefore does one atomic
+//! load and calls the engine directly; there is no per-thread copy and no deserialization after a
+//! reload. Reloads build the new engine off the request path and swap the pointer; in-flight
+//! requests keep the old engine alive until they finish.
 //!
-//! The hot path (`check`, `cosmetic_for`, ...) is lock-free: it loads the generation with a single
-//! relaxed/acquire atomic and compares it to the thread-local cached generation. On a match (the
-//! common case) it uses the cached engine directly — no `ArcSwap` load, no `Arc` clone, no mutex.
-//! Only when the generation changed (once per worker per reload) does it `load_full()` the blob and
-//! deserialize. This scales linearly across worker threads to hundreds of concurrent clients.
+//! The compiled blob is kept next to the live engine so it can be persisted
+//! ([`SharedEngine::serialized`]) and so the resource library can be re-applied.
 
 use adblock::lists::{FilterSet, ParseOptions};
 use adblock::resources::Resource;
 use adblock::Engine as AdblockEngine;
 use arc_swap::ArcSwap;
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::matcher::{MatchResult, RequestMatcher};
+use crate::redirect_resources::builtin_redirect_resources;
 use crate::stats::FilterStats;
-
-thread_local! {
-    /// Per-worker-thread engine, tagged with the generation it was built from.
-    static LOCAL_ENGINE: RefCell<Option<(u64, AdblockEngine)>> = const { RefCell::new(None) };
-}
 
 /// Cosmetic resources for a page: element-hiding selectors + scriptlet JS to inject.
 #[derive(Debug, Clone, Default)]
@@ -42,20 +35,18 @@ pub struct Cosmetics {
     pub generichide: bool,
 }
 
-/// A `Send + Sync` handle to a compiled adblock engine, shared as serialized bytes.
-///
-/// Clone-free sharing is done via `Arc<SharedEngine>`; the type itself is intentionally not
-/// `Clone` (it owns the atomics/blob).
+/// Handle to the live compiled engine, shared by all workers via `Arc<SharedEngine>`.
 pub struct SharedEngine {
-    /// Serialized engine bytes produced by [`compile_engine`]. Empty means "empty engine".
+    /// The live engine. Readers do one `load()`; writers swap in a fully built engine.
+    engine: ArcSwap<AdblockEngine>,
+    /// Serialized form of the installed rules (empty = empty engine).
     blob: ArcSwap<Vec<u8>>,
-    /// Bumped on every [`SharedEngine::install`]; worker threads rebuild when it changes.
-    generation: AtomicU64,
-    /// Master on/off switch (independent of the compiled ruleset).
-    enabled: AtomicBool,
-    /// Scriptlet/redirect resource library (uBO-compatible). Empty until loaded; applied to each
-    /// worker's engine after deserialize so `##+js(...)` scriptlets resolve.
+    /// Master on/off switch, shared (see [`Self::enabled_flag`]) so the web UI toggle is live.
+    enabled: Arc<AtomicBool>,
+    /// User-loaded scriptlet/redirect resource library (overrides built-ins by name).
     resources: ArcSwap<Vec<Resource>>,
+    /// Serializes writers (install / resource load); never taken on the request path.
+    write_lock: Mutex<()>,
     /// Shared, thread-safe blocking statistics.
     stats: FilterStats,
 }
@@ -66,36 +57,80 @@ impl Default for SharedEngine {
     }
 }
 
+/// Deserialize `blob` (if non-empty) and apply built-in plus user resources. CPU-bound: call it
+/// from `spawn_blocking` for large lists.
+pub fn build_engine(blob: &[u8], user_resources: &[Resource]) -> Arc<AdblockEngine> {
+    let mut engine = AdblockEngine::default();
+    if !blob.is_empty() {
+        if let Err(e) = engine.deserialize(blob) {
+            warn!("Failed to deserialize filter engine: {e:?}; using empty engine");
+        }
+    }
+    let mut all: Vec<Resource> = user_resources.to_vec();
+    for b in builtin_redirect_resources() {
+        let taken = all
+            .iter()
+            .any(|r| r.name == b.name || r.aliases.contains(&b.name));
+        if !taken {
+            all.push(b);
+        }
+    }
+    engine.use_resources(all);
+    Arc::new(engine)
+}
+
 impl SharedEngine {
     /// Create an empty shared engine (allows everything until rules are installed).
     pub fn new() -> Self {
         Self {
+            engine: ArcSwap::new(build_engine(&[], &[])),
             blob: ArcSwap::new(Arc::new(Vec::new())),
-            generation: AtomicU64::new(0),
-            enabled: AtomicBool::new(true),
+            enabled: Arc::new(AtomicBool::new(true)),
             resources: ArcSwap::new(Arc::new(Vec::new())),
+            write_lock: Mutex::new(()),
             stats: FilterStats::new(),
         }
     }
 
     /// Load the scriptlet/redirect resource library from a JSON array of uBO-compatible resources
-    /// (e.g. Brave's `resources.json`). Bumps the generation so every worker re-applies them.
-    /// Returns the number of resources loaded.
+    /// (e.g. Brave's `resources.json`) and rebuild the engine. Returns the number loaded.
     pub fn set_resources_from_json(&self, json: &str) -> Result<usize, serde_json::Error> {
         let resources: Vec<Resource> = serde_json::from_str(json)?;
         let n = resources.len();
+        let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.resources.store(Arc::new(resources));
-        self.generation.fetch_add(1, Ordering::Release);
+        self.engine
+            .store(build_engine(&self.blob.load(), &self.resources.load()));
         info!("Loaded {n} scriptlet/redirect resources");
         Ok(n)
     }
 
-    /// Install a freshly compiled, serialized engine and make every worker rebuild on next use.
+    /// Install a freshly compiled, serialized engine (from [`compile_engine`]) and swap it in.
+    ///
+    /// Deserializes on the calling thread; from async code use `spawn_blocking`, or build with
+    /// [`build_engine`] there and call [`Self::install_built`].
     pub fn install(&self, serialized: Vec<u8>) {
-        let bytes = serialized.len();
-        self.blob.store(Arc::new(serialized));
-        let gen = self.generation.fetch_add(1, Ordering::Release) + 1;
-        info!("Installed compiled filter engine (generation {gen}, {bytes} bytes)");
+        let engine = build_engine(&serialized, &self.resources.load());
+        self.install_built(Arc::new(serialized), engine);
+    }
+
+    /// Swap in an engine already built from `blob` by [`build_engine`] (no work on this thread).
+    pub fn install_built(&self, blob: Arc<Vec<u8>>, engine: Arc<AdblockEngine>) {
+        let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = blob.len();
+        self.blob.store(blob);
+        self.engine.store(engine);
+        info!("Installed compiled filter engine ({bytes} bytes)");
+    }
+
+    /// The serialized rules currently installed (for persisting to disk).
+    pub fn serialized(&self) -> Arc<Vec<u8>> {
+        self.blob.load_full()
+    }
+
+    /// The live engine (one atomic load + refcount bump).
+    pub fn engine(&self) -> Arc<AdblockEngine> {
+        self.engine.load_full()
     }
 
     /// Enable or disable blocking globally.
@@ -108,48 +143,34 @@ impl SharedEngine {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    /// The shared on/off flag, for components that want to flip or read it directly.
+    pub fn enabled_flag(&self) -> Arc<AtomicBool> {
+        self.enabled.clone()
+    }
+
     /// Get a cloneable handle to the shared statistics tracker.
     pub fn stats_handle(&self) -> FilterStats {
         self.stats.clone()
     }
 
-    /// Run `f` with this thread's engine, rebuilding it first if the shared generation changed.
-    ///
-    /// Lock-free fast path: a single atomic load + thread-local borrow when up to date.
+    /// Run `f` with the live engine: a single atomic load, no clone, no lock.
+    #[inline]
     fn with_engine<R>(&self, f: impl FnOnce(&AdblockEngine) -> R) -> R {
-        let current_gen = self.generation.load(Ordering::Acquire);
-        LOCAL_ENGINE.with(|cell| {
-            {
-                let stale = match &*cell.borrow() {
-                    Some((gen, _)) => *gen != current_gen,
-                    None => true,
-                };
-                if stale {
-                    let blob = self.blob.load_full();
-                    let mut engine = AdblockEngine::default();
-                    if !blob.is_empty() {
-                        if let Err(e) = engine.deserialize(&blob) {
-                            warn!("Failed to deserialize filter engine (generation {current_gen}): {e:?}; using empty engine");
-                        }
-                    }
-                    // Re-apply the scriptlet resource library so `##+js(...)` rules resolve. Not
-                    // part of the serialized blob, so it must be set on each worker's engine.
-                    let resources = self.resources.load();
-                    if !resources.is_empty() {
-                        engine.use_resources(resources.iter().cloned());
-                    }
-                    *cell.borrow_mut() = Some((current_gen, engine));
-                }
-            }
-            let guard = cell.borrow();
-            let (_, engine) = guard.as_ref().expect("engine just ensured present");
-            f(engine)
-        })
+        let guard = self.engine.load();
+        f(&guard)
+    }
+
+    /// Extra `Content-Security-Policy` directives (`$csp`) for a document/subdocument response.
+    pub fn csp_for(&self, url: &str, source_url: &str, resource_type: &str) -> Option<String> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.with_engine(|e| RequestMatcher::csp_directives(e, url, source_url, resource_type))
     }
 
     /// Cosmetic resources (element-hiding CSS + scriptlet JS) for a page URL.
     ///
-    /// Lock-free thread-local, same engine as [`Self::check`]. `generichide` is true when the page
+    /// Same engine as [`Self::check`]. `generichide` is true when the page
     /// is excepted from generic (class/id) hiding — callers can use it to skip the dynamic helper.
     pub fn cosmetic_for(&self, url: &str) -> Cosmetics {
         if !self.enabled.load(Ordering::Relaxed) {
@@ -192,7 +213,7 @@ impl SharedEngine {
     /// Check whether a network request should be blocked, recording statistics.
     ///
     /// `resource_type` is the adblock resource type (e.g. `script`, `image`, `document`,
-    /// `websocket`, `other`). Sync and lock-free; never held across an `.await`.
+    /// `websocket`, `other`). One atomic load; no lock.
     pub fn check(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
         if !self.enabled.load(Ordering::Relaxed) {
             self.stats.record_allowed();
@@ -206,9 +227,8 @@ impl SharedEngine {
         match result {
             Ok(r) => {
                 if r.blocked {
-                    let domain = RequestMatcher::extract_domain(url)
-                        .unwrap_or_else(|_| "unknown".to_string());
-                    self.stats.record_blocked(resource_type, &domain);
+                    self.stats
+                        .record_blocked(resource_type, RequestMatcher::host_of(url));
                 } else {
                     self.stats.record_allowed();
                 }
@@ -230,7 +250,8 @@ impl SharedEngine {
 /// returned as serialized bytes suitable for [`SharedEngine::install`]. Pure-CPU and `Send`-safe —
 /// call it from `spawn_blocking`.
 pub fn compile_engine(list_contents: &[String]) -> Vec<u8> {
-    let mut filter_set = FilterSet::new(false);
+    // debug=true keeps rule text so block pages / logs can show the matched rule.
+    let mut filter_set = FilterSet::new(true);
     for content in list_contents {
         // `add_filter_list` handles comment/metadata stripping and rule classification itself.
         let _ = filter_set.add_filter_list(content, ParseOptions::default());
@@ -378,6 +399,123 @@ mod tests {
                 .check("https://ads.example/ok", "https://site/", "image")
                 .blocked,
             "@@ exception should allow this URL"
+        );
+    }
+
+    fn engine_with(rules: &[&str]) -> SharedEngine {
+        let shared = SharedEngine::new();
+        let lines: Vec<String> = rules.iter().map(|r| format!("{r}\n")).collect();
+        shared.install(compile_engine(&lines));
+        shared
+    }
+
+    #[test]
+    fn engine_is_send_sync() {
+        fn assert_ss<T: Send + Sync>() {}
+        assert_ss::<AdblockEngine>();
+        assert_ss::<SharedEngine>();
+    }
+
+    #[test]
+    fn blocked_result_carries_rule_text() {
+        let s = engine_with(&["||ads.test^"]);
+        let r = s.check("https://ads.test/x.js", "https://site.test/", "script");
+        assert!(r.blocked && !r.important);
+        assert_eq!(r.matched_rule.as_deref(), Some("||ads.test^"));
+    }
+
+    #[test]
+    fn exception_beats_block() {
+        let s = engine_with(&["||ads.test^", "@@||ads.test/ok^"]);
+        let r = s.check("https://ads.test/ok", "https://site.test/", "image");
+        assert!(!r.blocked);
+        assert_eq!(r.exception_rule.as_deref(), Some("@@||ads.test/ok^"));
+    }
+
+    #[test]
+    fn important_beats_exception() {
+        let s = engine_with(&["||ads.test^$important", "@@||ads.test^"]);
+        let r = s.check("https://ads.test/x", "https://site.test/", "image");
+        assert!(r.blocked && r.important, "{r:?}");
+        // Without $important the exception wins.
+        let s = engine_with(&["||ads.test^", "@@||ads.test^"]);
+        assert!(
+            !s.check("https://ads.test/x", "https://site.test/", "image")
+                .blocked
+        );
+    }
+
+    #[test]
+    fn redirect_result_is_served_from_builtin_resource() {
+        let s = engine_with(&["||ads.test/p.gif$redirect=1x1.gif"]);
+        let r = s.check("https://ads.test/p.gif", "https://site.test/", "image");
+        assert!(r.blocked);
+        let res = r.redirect_resource().expect("redirect resource");
+        assert_eq!(res.mime, "image/gif");
+        assert!(res.body.starts_with(b"GIF8"));
+    }
+
+    #[test]
+    fn redirect_rule_applies_only_with_a_block() {
+        let s = engine_with(&["||ads.test^$script", "||ads.test^$redirect-rule=noop.js"]);
+        let r = s.check("https://ads.test/a.js", "https://site.test/", "script");
+        assert_eq!(
+            r.redirect_resource().unwrap().mime,
+            "application/javascript"
+        );
+        let r = s.check("https://ads.test/a.png", "https://site.test/", "image");
+        assert!(!r.blocked && r.redirect.is_none());
+    }
+
+    #[test]
+    fn removeparam_rewrites_url() {
+        let s = engine_with(&["||site.test^$removeparam=utm_source"]);
+        let r = s.check(
+            "https://site.test/p?a=1&utm_source=x",
+            "https://site.test/",
+            "document",
+        );
+        assert!(!r.blocked);
+        assert_eq!(r.rewritten_url.as_deref(), Some("https://site.test/p?a=1"));
+    }
+
+    #[test]
+    fn csp_directives_returned_for_documents() {
+        let s = engine_with(&["||site.test^$csp=script-src 'none'"]);
+        let csp = s.csp_for("https://site.test/", "https://site.test/", "document");
+        assert_eq!(csp.as_deref(), Some("script-src 'none'"));
+        assert!(s
+            .csp_for("https://other.test/", "https://other.test/", "document")
+            .is_none());
+    }
+
+    #[test]
+    fn reload_swaps_engine_without_stale_readers() {
+        let s = engine_with(&["||a.test^"]);
+        assert!(
+            s.check("https://a.test/", "https://x.test/", "image")
+                .blocked
+        );
+        s.install(compile_engine(&["||b.test^\n".to_string()]));
+        assert!(
+            !s.check("https://a.test/", "https://x.test/", "image")
+                .blocked
+        );
+        assert!(
+            s.check("https://b.test/", "https://x.test/", "image")
+                .blocked
+        );
+        assert!(!s.serialized().is_empty());
+    }
+
+    #[test]
+    fn enabled_flag_is_shared() {
+        let s = engine_with(&["||a.test^"]);
+        s.enabled_flag().store(false, Ordering::Relaxed);
+        assert!(!s.is_enabled());
+        assert!(
+            !s.check("https://a.test/", "https://x.test/", "image")
+                .blocked
         );
     }
 
