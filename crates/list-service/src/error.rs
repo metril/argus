@@ -9,8 +9,8 @@ pub enum Error {
     Other(String),
 }
 
-impl From<sled::Error> for Error {
-    fn from(e: sled::Error) -> Self {
+impl From<common::db::DbError> for Error {
+    fn from(e: common::db::DbError) -> Self {
         Error::Storage(e.to_string())
     }
 }
