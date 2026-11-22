@@ -151,7 +151,7 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
      Proxy (HTTP)** and **Secure Web Proxy (HTTPS)**, both `Server: <server-ip>`, `Port: 8080`.
 5. **Manage blocklists** — the default lists (EasyList, EasyPrivacy, AdGuard Base/Tracking) are
    seeded and downloaded automatically; add your own under **Filters**. Lists are **persisted**
-   (Sled) and survive restarts, and the engine recompiles automatically when you change them.
+   in the local database and survive restarts, and the engine recompiles automatically when you change them.
 6. **Verify it's working**:
    - `curl http://<server>:3000/api/v1/health` returns `{"status":"healthy",...}`.
    - With your device browsing through the proxy, the **Requests Checked / Blocked** counters on
@@ -191,13 +191,12 @@ cert_cache_size = 1000
 
 [adblock]
 enabled = true            # Network/cosmetic blocking via the bundled filter engine
-data_dir = "data/filters" # Filter lists + cached content are persisted here (Sled)
+data_dir = "data/filters" # Database, cached list files and the compiled engine live here (see Storage layout)
 auto_update = true
 update_interval_hours = 24
 
 [userscripts]
 enabled = true
-data_dir = "data/userscripts"
 
 [webui]
 enabled = true
@@ -205,6 +204,77 @@ host = "0.0.0.0"
 port = 3000                # Web UI + API
 # Accounts are created by registering in the Web UI; the first user becomes admin.
 ```
+
+## Blocklist formats and lists
+
+Each list has a **format** (`auto` by default: detected from the content) and an optional
+**allowlist** flag (every rule of the list becomes an exception). The list's build report
+(`GET /api/v1/lists/{id}/report`, shown on the **Filters** page) says which format was detected and
+how many rules were network / cosmetic / handed off / skipped / deduplicated, with the first parse
+issues. Pure domain rules (`||host^`, hosts and domain entries) are held in a compact domain set
+instead of the engine.
+
+### Supported blocklist formats
+
+| Format | Example line | Maps to | Skipped or handed off |
+|---|---|---|---|
+| `abp` (Adblock Plus / EasyList) | `\|\|ads.example^$third-party` | engine network and cosmetic rules | options adblock-rust lacks are handed off (see below) |
+| `ubo` (uBlock Origin) | `example.com##+js(aeld, click)` | as `abp`, plus scriptlets, `!#include`, `!#if` | as `abp` |
+| `adguard` | `\|\|ads.example^$removeparam=id` | as `abp`; AdGuard-only syntax translated where possible | `#%#` JS, `$$` HTML filters, `$denyallow`, `$replace`, ... are handed off |
+| `hosts` | `0.0.0.0 ads.example` | blocks the host and its subdomains | `localhost` and local names skipped |
+| `domains` | `ads.example` (`*.d`, `.d` also accepted) | blocks the domain and subdomains | local names skipped |
+| `dnsmasq` | `address=/ads.example/0.0.0.0` | blocks the domain | other directives skipped |
+| `unbound` | `local-zone: "ads.example." always_nxdomain` | blocks the domain | non-blocking zone types skipped |
+| `rpz` | `ads.example CNAME .` | blocks the domain; `rpz-passthru` becomes an exception | non-reject policies and custom answers skipped |
+| `pihole` | `^ads[0-9]+\.example$` (regex) or `ads.example` | domains and host regex rules | unsupported regex anchors are errors |
+| `adguard-home` | `\|\|ads.example^$important` | DNS-style `\|\|host^` rules and exceptions | unsupported modifiers skipped |
+| `little-snitch` | `.lsrules` JSON | deny rules for hosts and domains | allow rules, non-host targets skipped |
+| `surge` | `DOMAIN-SUFFIX,ads.example,REJECT` | domain, keyword, regex and CIDR rules | non-reject policies skipped |
+| `clash` | `payload:` YAML with `+.ads.example` | domain, keyword, regex and CIDR rules | unsupported rule types skipped |
+| `ip-list` | `192.0.2.0/24` | IP/CIDR/range block list checked for IP-literal hosts | none |
+
+**Handed off** rules (`$replace`, `$jsonprune`, `$cookie`, `$removeheader`, HTML filters, `#%#`
+JavaScript, ...) are parsed and kept, but not enforced yet. `GET /api/v1/rules/ext` lists them (kind,
+raw rule, domains) and `GET /api/v1/engine/build` counts them per kind. A rule the engine cannot
+parse is *rejected* and appears in the list's issues. `POST /api/v1/rules/validate` runs the same
+conversion for a given format and reports each line as translated, accepted, handed off, skipped or
+rejected without storing anything.
+
+### List catalogue
+
+A catalogue of well-known hosts, domain and IP lists (StevenBlack, AdAway, HaGeZi, OISD, Phishing
+Army, Spamhaus DROP, Feodo, ...) is built in but **disabled by default**; nothing is downloaded until
+you add one (Filters, then Catalogue, or `POST /api/v1/lists/catalogue/{id}`). Each entry shows its
+licence: check it before use.
+
+### Build failures and limits
+
+A failed build (for example a list set that exceeds adblock-rust's flatbuffer limits, roughly a
+million non-domain rules; pure domain rules are not counted because they bypass the engine) leaves
+the previous engine serving. The failure is logged, shown as `Failed` in the build state
+(`GET /api/v1/engine/build`, Filters page) and the next successful build clears it. The limit is
+not worked around by sharding: reduce the number of path-style rules, or prefer domain-format lists.
+
+### Storage layout
+
+Everything lives under `adblock.data_dir` (default `data/filters`):
+
+- `adblocker.redb`: one database for list metadata, build reports, users, sessions, tokens, audit
+  log and userscripts.
+- `lists/`: raw list contents as content-addressed files (`lists/<sha256>`), garbage-collected when
+  unreferenced.
+- `engine.bin`: the compiled engine, domain set and handed-off rules, so a restart serves the last
+  build before touching the network (invalidated when lists or the converter change).
+
+Old sled directories are ignored (and can be deleted). `userscripts.data_dir` and
+`webui.session_storage_path` no longer exist; the proxy refuses to start if they are still set.
+
+### `bundled-ubo-resources` feature
+
+Scriptlet rules (`##+js(...)`) need the uBlock Origin resource library. It is fetched at runtime and
+cached as `<data_dir>/resources.json`. Building with `--features bundled-ubo-resources` (on
+`filter-engine` or `list-service`) also embeds a pinned snapshot as an offline fallback. It is **off
+by default** because the snapshot is GPL-3.0; see `docs/LICENSING.md`.
 
 ## AdGuard Filter Syntax
 
@@ -858,7 +928,7 @@ Scripts use glob-style patterns for matching:
 Each userscript has isolated storage:
 - Values are namespaced by script ID
 - Scripts cannot access other scripts' data
-- Persistent storage using sled database
+- Persistent storage in the shared redb database (`adblocker.redb`)
 - In-memory caching for performance
 
 ### Security Considerations
@@ -1153,7 +1223,7 @@ The userscript engine consists of:
 
 1. **Metadata Parser** (`metadata.rs`) - Parses `// ==UserScript==` blocks
 2. **Script Manager** (`manager.rs`) - Lifecycle management (install/update/uninstall)
-3. **Storage** (`storage.rs`) - Persistent key-value storage with sled database
+3. **Storage** (`storage.rs`) - Persistent key-value storage in the shared redb database
 4. **GM API** (`gm_api.rs`) - Implementation of all GM_* functions
 5. **Executor** (`executor.rs`) - Boa engine integration and JavaScript execution
 

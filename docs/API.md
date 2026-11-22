@@ -97,8 +97,24 @@ Limits are per client IP, per user session / API token, and stricter per IP for 
 and refresh. `X-Forwarded-For` is honored only from `trusted_proxies`. CORS is same-origin only
 unless `cors_origins` lists allowed origins.
 
+## Lists, reports and the engine
+
+- `POST /lists`, `PUT /lists/{id}`: besides `name`, `url`, `enabled`, accept `format` (`auto` by
+  default; see the README's format table) and `allowlist`.
+- `GET /lists/{id}/report`, `GET /rules/custom/report`: `ListReport` of the last build (detected
+  format, network/cosmetic/ext/skipped/deduped/rejected counts, first parse issues, header metadata,
+  content SHA).
+- `GET /engine/build`: `BuildSummary` with the build state (`idle`, `fetching`, `compiling`,
+  `failed` with the error; a failed build leaves the previous engine serving), last build duration
+  and time, domain-set size and handed-off rule counts per kind.
+- `GET /lists/catalogue`, `POST /lists/catalogue/{id}`: browse the default-disabled catalogue and
+  add an entry as a list.
+- `GET /rules/ext?kind=`: paginated read-only listing of rules that parsed but are not enforced yet.
+- `POST /rules/validate`: `{rules, format?, allowlist?}` runs the real conversion pipeline and
+  reports each line as `translated`, `accepted`, `handed_off`, `skipped` or `rejected`.
+
 ## Recently blocked requests
 
-`GET /stats/blocked/recent` exposes a bounded ring buffer, but the filter engine has no observer
-hook yet, so `available` is `false` until `FilterStats`/`SharedEngine::check` can feed
-`AppState::recent_blocked` (see `RecentBlocked::push`).
+`GET /stats/blocked/recent` reads the engine's bounded ring (newest first, paginated) and filters by
+`client` (profile label), `host` (host or subdomains) and `list_id`. Entries carry the URL, source
+host, request type, matched rule, list id (for domain-set hits) and client label.
