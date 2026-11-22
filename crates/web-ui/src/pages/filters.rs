@@ -29,6 +29,7 @@ pub fn FiltersPage() -> impl IntoView {
     let add_url = RwSignal::new(String::new());
     let add_format = RwSignal::new("auto".to_string());
     let add_allowlist = RwSignal::new(false);
+    let trust_change: RwSignal<Option<(String, bool)>> = RwSignal::new(None);
 
     // Build state (polled), per-list reports, catalogue
     let build = RwSignal::new(Option::<BuildSummary>::None);
@@ -134,6 +135,27 @@ pub fn FiltersPage() -> impl IntoView {
                         Err(e) => app_state.error(format!("Failed to update list: {}", e)),
                     }
                     flag_change.set(None);
+                });
+            }
+        });
+    }
+
+    // Trust / distrust a list
+    {
+        let app_state = app_state.clone();
+        Effect::new(move || {
+            if let Some((id, trusted)) = trust_change.get() {
+                let app_state = app_state.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match ApiClient::new().set_list_trusted(&id, trusted).await {
+                        Ok(updated) => filters.update(|f| {
+                            if let Some(x) = f.iter_mut().find(|x| x.id == id) {
+                                *x = updated;
+                            }
+                        }),
+                        Err(e) => app_state.error(format!("Failed to change trust: {}", e)),
+                    }
+                    trust_change.set(None);
                 });
             }
         });
@@ -294,12 +316,14 @@ pub fn FiltersPage() -> impl IntoView {
                 }>
                     <For
                         each=move || filters.get()
-                        key=|f| (f.id.clone(), f.enabled, f.allowlist, f.format.clone(), f.rule_count, f.last_error.clone())
+                        key=|f| (f.id.clone(), f.enabled, f.allowlist, f.trusted, f.format.clone(), f.rule_count, f.last_error.clone())
                         children=move |filter| {
                             let id_for_delete = filter.id.clone();
                             let id_report = filter.id.clone();
                             let id_allow = filter.id.clone();
                             let id_enable = filter.id.clone();
+                            let id_trust = filter.id.clone();
+                            let trusted = filter.trusted;
                             let (allowlist, enabled) = (filter.allowlist, filter.enabled);
                             let format = filter.format.clone();
                             let last_error = filter.last_error.clone();
@@ -353,6 +377,23 @@ pub fn FiltersPage() -> impl IntoView {
                                             />
                                             " Allowlist"
                                         </label>
+                                        <label
+                                            class="form-label"
+                                            title="Trusting a list lets its rules run JavaScript in the pages you visit (#%# scripts, scriptlets, snippets) and rewrite responses and URLs ($replace, $urltransform). Only trust lists you would let run code in every page."
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=trusted
+                                                on:change=move |ev| {
+                                                    let on = event_target::<HtmlInputElement>(&ev).checked();
+                                                    trust_change.set(Some((id_trust.clone(), on)));
+                                                }
+                                            />
+                                            " Trusted"
+                                        </label>
+                                        <p class="form-help">
+                                            "Trusted lists may run scripts in pages and rewrite responses and URLs; untrusted lists' such rules are dropped."
+                                        </p>
                                         <button
                                             class="btn btn-danger"
                                             on:click=move |_| delete_id.set(Some(id_for_delete.clone()))

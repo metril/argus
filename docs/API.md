@@ -106,16 +106,25 @@ disabled or the password is wrong.
 ## Lists, reports and the engine
 
 - `POST /lists`, `PUT /lists/{id}`: besides `name`, `url`, `enabled`, accept `format` (`auto` by
-  default; see the README's format table) and `allowlist`.
+  default; see the README's format table), `allowlist` and `trusted` (default false). A trusted
+  list's `$replace`, `$urltransform`, `#%#`, snippet and unknown-scriptlet rules are active; for
+  other lists they are dropped at build time. Changing `trusted` needs `lists:write` like every
+  list edit and is recorded as its own audit entry (route `/api/v1/lists/{id}#trusted=<bool>`);
+  it triggers a rebuild (trust is part of the engine cache key). Every list DTO carries `trusted`.
 - `GET /lists/{id}/report`, `GET /rules/custom/report`: `ListReport` of the last build (detected
   format, network/cosmetic/ext/skipped/deduped/rejected counts, first parse issues, header metadata,
   content SHA).
 - `GET /engine/build`: `BuildSummary` with the build state (`idle`, `fetching`, `compiling`,
   `failed` with the error; a failed build leaves the previous engine serving), last build duration
-  and time, domain-set size and handed-off rule counts per kind.
+  and time, domain-set size and handed-off rule counts per kind. `ext_stats` reports what the
+  extended-rule index did with them: per kind `parsed`, `active`, `dropped_untrusted`,
+  `unsupported`, `parse_errors`, `badfiltered`; `dropped_untrusted_by_list`; the first parse
+  `issues` and how many more were `issues_truncated`.
 - `GET /lists/catalogue`, `POST /lists/catalogue/{id}`: browse the default-disabled catalogue and
   add an entry as a list.
-- `GET /rules/ext?kind=`: paginated read-only listing of rules that parsed but are not enforced yet.
+- `GET /rules/ext?kind=`: paginated read-only listing of handed-off rules, each with its source
+  `list` and `state`: `active`, `dropped_untrusted`, `unsupported` (with `reason`), `invalid`,
+  `badfiltered`, `badfilter`, or `unknown` while a rebuild is being installed.
 - `POST /rules/validate`: `{rules, format?, allowlist?}` runs the real conversion pipeline and
   reports each line as `translated`, `accepted`, `handed_off`, `skipped` or `rejected`.
 

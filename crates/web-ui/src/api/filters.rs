@@ -49,6 +49,7 @@ impl ApiClient {
             enabled: Some(enabled),
             format: Some(format.to_string()),
             allowlist: Some(allowlist),
+            trusted: None,
         };
         self.post("/lists", &req).await
     }
@@ -109,6 +110,20 @@ impl ApiClient {
             enabled,
             format: None,
             allowlist,
+            trusted: None,
+        };
+        self.update_filter_list(id, &req).await
+    }
+
+    /// Trust or distrust a list's code-running extended rules (needs `lists:write`; audited)
+    pub async fn set_list_trusted(&self, id: &str, trusted: bool) -> Result<FilterList, ApiError> {
+        let req = UpdateFilterListRequest {
+            name: None,
+            url: None,
+            enabled: None,
+            format: None,
+            allowlist: None,
+            trusted: Some(trusted),
         };
         self.update_filter_list(id, &req).await
     }

@@ -30,6 +30,13 @@
           "name": {
             "type": "string"
           },
+          "trusted": {
+            "description": "Trust the list's code-running extended rules (default false). Audited.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "url": {
             "type": "string"
           }
@@ -351,6 +358,17 @@
               "type": "string"
             },
             "type": "object"
+          },
+          "ext_stats": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExtStatsDto",
+                "description": "What the extended-rule index did with them (absent before the first build)."
+              }
+            ]
           },
           "from_persisted": {
             "type": "boolean"
@@ -684,8 +702,77 @@
         ],
         "type": "object"
       },
+      "ExtIssueDto": {
+        "description": "A handed-off rule that could not be used.",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "list": {
+            "type": "string"
+          },
+          "raw": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "unsupported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "list",
+          "raw",
+          "reason",
+          "unsupported"
+        ],
+        "type": "object"
+      },
+      "ExtKindStatsDto": {
+        "description": "Per-kind outcome of building the extended-rule index.",
+        "properties": {
+          "active": {
+            "description": "Enforced.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "badfiltered": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dropped_untrusted": {
+            "description": "Dropped because the source list is not trusted.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parse_errors": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parsed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unsupported": {
+            "description": "Well-formed but not implemented.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "parsed",
+          "active",
+          "dropped_untrusted",
+          "unsupported",
+          "parse_errors",
+          "badfiltered"
+        ],
+        "type": "object"
+      },
       "ExtRuleResponse": {
-        "description": "A rule that parsed but is not enforced yet.",
+        "description": "A handed-off rule and what the extended-rule index did with it.",
         "properties": {
           "domains": {
             "items": {
@@ -696,7 +783,22 @@
           "kind": {
             "type": "string"
           },
+          "list": {
+            "description": "Source list id.",
+            "type": "string"
+          },
           "raw": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why the rule is unsupported / invalid.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`active`, `dropped_untrusted`, `unsupported`, `invalid`, `badfiltered`, `badfilter`, or\n`unknown` (the index was rebuilt while the page was read).",
             "type": "string"
           }
         },
@@ -704,6 +806,53 @@
           "kind",
           "raw",
           "domains"
+        ],
+        "type": "object"
+      },
+      "ExtStatsDto": {
+        "description": "Outcome of building the extended-rule index.",
+        "properties": {
+          "dropped_untrusted_by_list": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Rules dropped for lack of trust, per list id.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "issues": {
+            "items": {
+              "$ref": "#/components/schemas/ExtIssueDto"
+            },
+            "type": "array"
+          },
+          "issues_truncated": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_kind": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ExtKindStatsDto"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "per_kind",
+          "dropped_untrusted_by_list",
+          "issues",
+          "issues_truncated"
         ],
         "type": "object"
       },
@@ -770,6 +919,10 @@
           "rule_count": {
             "minimum": 0,
             "type": "integer"
+          },
+          "trusted": {
+            "description": "Trusted lists may use the code-running extended rules (`$replace`, `$urltransform`,\n`#%#` scripts, snippets, unknown scriptlets); untrusted lists have those dropped.",
+            "type": "boolean"
           },
           "url": {
             "type": "string"
@@ -1355,7 +1508,7 @@
           },
           "items": {
             "items": {
-              "description": "A rule that parsed but is not enforced yet.",
+              "description": "A handed-off rule and what the extended-rule index did with it.",
               "properties": {
                 "domains": {
                   "items": {
@@ -1366,7 +1519,22 @@
                 "kind": {
                   "type": "string"
                 },
+                "list": {
+                  "description": "Source list id.",
+                  "type": "string"
+                },
                 "raw": {
+                  "type": "string"
+                },
+                "reason": {
+                  "description": "Why the rule is unsupported / invalid.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "description": "`active`, `dropped_untrusted`, `unsupported`, `invalid`, `badfiltered`, `badfilter`, or\n`unknown` (the index was rebuilt while the page was read).",
                   "type": "string"
                 }
               },
@@ -1454,6 +1622,10 @@
                 "rule_count": {
                   "minimum": 0,
                   "type": "integer"
+                },
+                "trusted": {
+                  "description": "Trusted lists may use the code-running extended rules (`$replace`, `$urltransform`,\n`#%#` scripts, snippets, unknown scriptlets); untrusted lists have those dropped.",
+                  "type": "boolean"
                 },
                 "url": {
                   "type": "string"
@@ -2271,6 +2443,13 @@
           "name": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "trusted": {
+            "description": "Change the list's trust; recorded in the audit log.",
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -6001,7 +6180,7 @@
             ]
           }
         ],
-        "summary": "Rules that parsed but are not enforced yet (handed off), read-only.",
+        "summary": "Rules the network engine cannot run (handed off) and what the extended-rule index did with\neach, read-only.",
         "tags": [
           "rules"
         ]

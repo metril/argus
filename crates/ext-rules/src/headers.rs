@@ -93,13 +93,7 @@ mod tests {
 
     #[test]
     fn policy() {
-        for ok in [
-            "refresh",
-            "location",
-            "set-cookie",
-            "x-cache",
-            "report-to",
-        ] {
+        for ok in ["refresh", "location", "set-cookie", "x-cache", "report-to"] {
             assert!(is_removable_header(ok), "{ok}");
         }
         for bad in [

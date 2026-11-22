@@ -198,6 +198,7 @@ update_interval_hours = 24
 # link-local destinations by default; allow LAN hosts here (CIDRs, IPs or host names).
 allowed_fetch_destinations = []   # e.g. ["192.168.1.0/24", "nas.lan"]
 recent_blocked_keep_query = false # strip query strings from the recent-blocked list (they can hold tokens)
+respect_no_transform = true # skip body rewriting when the origin sends Cache-Control: no-transform
 
 [userscripts]
 enabled = true
@@ -265,9 +266,10 @@ literals and mapped forms are covered). Redirects are followed for at most 3 hop
 `https` to `http`, every hop is vetted the same way, and includes must stay on the list's origin.
 URLs are checked when saved (`400`, code `fetch_destination_not_allowed` or `invalid_fetch_url`)
 and again on every fetch. Hosting lists on your LAN: add its CIDR, IP or host name to
-`adblock.allowed_fetch_destinations`. Responses are read uncompressed and capped at
-`max_list_bytes` (all includes of a list share that budget); lines echoed in build reports are
-cut to 80 characters.
+`adblock.allowed_fetch_destinations`. gzip, deflate, br and zstd replies are accepted and decoded as
+a stream: `max_list_bytes` is enforced on the *decoded* bytes (all includes of a list share that
+budget) and a compression-ratio cap (100:1 beyond the first MiB) stops decompression bombs; other
+codings are refused. Lines echoed in build reports are cut to 80 characters.
 
 ### Build failures and limits
 
@@ -297,6 +299,52 @@ Scriptlet rules (`##+js(...)`) need the uBlock Origin resource library. It is fe
 cached as `<data_dir>/resources.json`. Building with `--features bundled-ubo-resources` (on
 `filter-engine` or `list-service`) also embeds a pinned snapshot as an offline fallback. It is **off
 by default** because the snapshot is GPL-3.0; see `docs/LICENSING.md`.
+
+## Rule support
+
+Rules the network engine cannot express are handed to the extended-rule index (`crates/ext-rules`),
+built in the same off-thread compile step as the engine, persisted with it (same cache key) and
+swapped in together with it, so a request never pairs one build's engine with another build's
+extended rules. *Enforced* means it changes traffic on the HTTP/1.1 and HTTP/2 forward path
+(plain and MITM); WebSocket and HTTP/3 requests see only the network engine.
+
+| Modifier / syntax | Status | Needs a trusted list |
+| --- | --- | --- |
+| Network rules, `@@`, `$important`, `$badfilter`, `$redirect`, `$csp`, `$removeparam`, `$generichide`, cosmetic `##` | enforced (engine) | no |
+| `$replace` (text bodies up to 3 MiB; on HTML it runs first, see below) | enforced | yes |
+| `$jsonprune` (up to 4 MiB), `$xmlprune` (up to 4 MiB), `$hls` (up to 2 MiB) | enforced | no |
+| `$removeheader` (response and `request:`; forbidden list refused) | enforced | no |
+| `$cookie` (removal on requests; removal and attribute edits on `Set-Cookie`) | enforced | no |
+| `$permissions` (documents) | enforced | no |
+| `$urltransform` (same origin, path and query only, fetched transparently) | enforced | yes |
+| `$method`, `$to`, `$denyallow` | enforced | no |
+| `$header` (blocks a response whose header matches) | enforced | no |
+| HTML filters `##^`, `$$` (`:has-text`, `tag-content`, `min/max-length`) | enforced (`parent-elements` ignored: partial) | no |
+| `#%#` JavaScript | enforced (runs before page scripts, after the boot runtime) | yes |
+| AdGuard scriptlets without a uBO equivalent, ABP snippets (`#$#`) | partial: `log` and `log-addEventListener` run; every other name is reported once per page as `unsupported scriptlet <name>` | yes |
+| Extended CSS the engine rejected (`#?#`, `#$?#`) | partial: in-page evaluator (`:has-text`, `:matches-css*`, `:matches-attr`, `:matches-path`, `:min-text-length`, `:upward`, `:xpath`) | no |
+| `$popup` | parsed only (no opener information in request headers) | n/a |
+| `$stealth`, `$network`, `$referrerpolicy`, other unknown options | parsed only, listed as `unsupported` in `GET /rules/ext` | n/a |
+
+**Trust.** `$replace`, `$urltransform`, `#%#`, snippets and unknown scriptlets let a list author
+rewrite content or run code in every page, so they are dropped (and counted per list in
+`GET /api/v1/engine/build`, `ext_stats`) unless the list is *trusted*. Custom rules are always
+trusted; downloaded lists are not until you turn on `trusted` (Filters page, or
+`PUT /api/v1/lists/{id}` with `lists:write`; the change is audited). Exceptions never need trust.
+
+**Precedence.** An engine block is final. An engine exception (`@@||host^`) does *not* switch off
+extended rules: as in uBlock Origin and AdGuard, each modifier is disabled only by an exception
+naming it (`@@||host^$replace`), with `$important` beating a plain exception; `$removeparam`
+runs before `$urltransform`.
+
+**Apply order for responses.** Header edits and `$header` blocking happen first; then, for a
+document, `$replace` runs on the decoded text, and the HTML stages (content-dependent removals,
+`##^`, cosmetic and script injection) see its result; non-HTML bodies go decode, transform
+(`$replace`, `$jsonprune`, `$xmlprune`, `$hls`, in list order), re-encode. Bodies over a
+transform's cap (or documents over 4 MiB when buffering is needed) pass through untouched and are
+counted. `Cache-Control: no-transform` skips all body work (header edits still apply) unless
+`adblock.respect_no_transform = false`. Documents are recognised from `Sec-Fetch-Dest`, else from
+`Sec-Fetch-Mode: navigate`, `Upgrade-Insecure-Requests: 1` or an `Accept` listing `text/html`.
 
 ## AdGuard Filter Syntax
 
@@ -331,14 +379,14 @@ Remove unwanted HTTP headers:
 # Remove request header
 ||example.com^$removeheader=request:user-agent
 
-# Security headers cannot be removed (Content-Length, Set-Cookie, etc.)
+# Security and framing headers cannot be removed
 ```
 
-**Restricted headers** (cannot be removed for security):
-- Content-Length, Content-Encoding, Transfer-Encoding
-- Cookie, Set-Cookie, Authorization
-- Access-Control-*, Origin, Content-Security-Policy
-- And 20+ others (see source code for full list)
+**Forbidden headers** follow AdGuard's published list (the CORS family `Access-Control-*`,
+`Cross-Origin-*`, `Origin`, `Content-Security-Policy`, `X-Frame-Options`, `Referrer-Policy`,
+`Sec-Fetch-*`, ...) plus the headers that frame the message (`Content-Length`, `Content-Type`,
+`Content-Encoding`, `Transfer-Encoding`, `Connection`, `Host`, `Proxy-*`, ...); such a rule is
+parsed but never applied. The full list is in `crates/ext-rules/src/headers.rs`.
 
 ### $replace - Content Replacement
 
@@ -357,8 +405,8 @@ Replace content in responses using regex:
 
 **Limitations**:
 - Only applies to text content types (HTML, JS, CSS, JSON)
-- Maximum response size: 10 MB
-- Rules from trusted filters only
+- Maximum decoded response size: 3 MiB (larger bodies pass through untouched)
+- Rules from trusted lists only (see below)
 
 ### Exception Rules
 
