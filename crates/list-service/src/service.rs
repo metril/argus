@@ -104,19 +104,22 @@ struct Flight {
 }
 
 /// A list ready to build: fetched (or cached) text plus resolved includes.
-struct BuildInput {
-    id: String,
-    format: ListFormat,
-    allowlist: bool,
+pub(crate) struct BuildInput {
+    pub(crate) id: String,
+    pub(crate) format: ListFormat,
+    pub(crate) allowlist: bool,
     /// Extended rules of this list may run code / rewrite content (custom rules always do).
-    trusted: bool,
-    content: String,
-    includes: HashMap<String, String>,
-    digest: String,
+    pub(crate) trusted: bool,
+    pub(crate) content: String,
+    pub(crate) includes: HashMap<String, String>,
+    pub(crate) digest: String,
 }
 
 /// Stamp [`ExtRule::trusted`] on every rule of a trusted list.
-fn mark_trusted(ext: &mut [filter_engine::ExtRule], trusted: &std::collections::HashSet<String>) {
+pub(crate) fn mark_trusted(
+    ext: &mut [filter_engine::ExtRule],
+    trusted: &std::collections::HashSet<String>,
+) {
     for e in ext {
         if trusted.contains(&e.list) {
             e.trusted = true;
@@ -125,7 +128,7 @@ fn mark_trusted(ext: &mut [filter_engine::ExtRule], trusted: &std::collections::
 }
 
 /// Build the shared extended-rule index (trust comes from [`ExtRule::trusted`] and `trusted`).
-fn build_ext_index(
+pub(crate) fn build_ext_index(
     ext: &[filter_engine::ExtRule],
     trusted: &std::collections::HashSet<String>,
 ) -> Arc<ext_rules::ExtIndex> {
@@ -164,6 +167,8 @@ pub struct ListService {
     pub(crate) bundled_tried: AtomicBool,
     /// Live auto-update schedule: `(auto_update, interval)`.
     schedule: watch::Sender<(bool, Duration)>,
+    /// Per-list-set engines (see [`ListService::engine_for`]).
+    pub(crate) sets: crate::sets::SetRegistry,
     /// Test hook: make the next build panic.
     #[cfg(test)]
     panic_next: AtomicBool,
@@ -328,6 +333,7 @@ impl ListService {
         let summary = store.get_summary().unwrap_or_default();
         Arc::new(Self {
             schedule,
+            sets: Default::default(),
             cfg,
             store,
             engine,
@@ -524,7 +530,10 @@ impl ListService {
                 let build = this.clone();
                 let started = Instant::now();
                 match tokio::spawn(async move { build.build_once(force).await }).await {
-                    Ok(Ok(())) => this.set_state(BuildState::Idle),
+                    Ok(Ok(())) => {
+                        this.set_state(BuildState::Idle);
+                        this.refresh_sets().await;
+                    }
                     Ok(Err(e)) => {
                         warn!("Filter reload failed; the previous engine stays installed: {e}");
                         this.set_state(BuildState::Failed {
@@ -658,7 +667,7 @@ impl ListService {
         })
     }
 
-    fn make_input(
+    pub(crate) fn make_input(
         &self,
         list: &FilterList,
         content: String,
@@ -926,7 +935,7 @@ impl ListService {
     }
 
     /// Fetch one list conditionally; fall back to the cached copy on any failure.
-    async fn fetch_one(&self, mut list: FilterList, force: bool) -> Option<BuildInput> {
+    pub(crate) async fn fetch_one(&self, mut list: FilterList, force: bool) -> Option<BuildInput> {
         let cached = self.store.get_content(&list.id).ok().flatten();
         let mut status = self.store.get_status(&list.id).unwrap_or_default();
 
@@ -997,7 +1006,7 @@ impl ListService {
 
     /// Resolve `!#include` targets of `content` (same origin as the list URL, at most 16, cached
     /// in the store). With `fetch` false only the cache is consulted.
-    async fn resolve_includes(
+    pub(crate) async fn resolve_includes(
         &self,
         list: &FilterList,
         content: &str,
