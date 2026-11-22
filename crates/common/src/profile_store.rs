@@ -223,6 +223,27 @@ impl ProfileStore {
         Ok(out)
     }
 
+    /// Every profile id below the returned bound has been handed out (some may be deleted since);
+    /// every later one is not yet. Read it before listing profiles to tell a deleted profile's
+    /// leftovers from those of one created after the listing.
+    pub fn profile_id_bound(&self) -> Result<u64> {
+        self.db.read(|r| {
+            let mark = r
+                .open_table(tables::META)
+                .map_err(db)?
+                .get(NEXT_PROFILE_ID_KEY)
+                .map_err(db)?
+                .and_then(|v| <[u8; 8]>::try_from(v.value()).ok())
+                .map_or(1, u64::from_be_bytes);
+            let t = r.open_table(tables::PROFILES).map_err(db)?;
+            let top = t
+                .last()
+                .map_err(db)?
+                .map_or(1, |(k, _)| k.value().saturating_add(1));
+            Ok(mark.max(top))
+        })
+    }
+
     pub fn get(&self, id: u64) -> Result<Option<ProfileRecord>> {
         if id == DEFAULT_PROFILE_ID {
             return Ok(Some(default_profile()));

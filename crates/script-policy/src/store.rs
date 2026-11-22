@@ -259,6 +259,32 @@ impl PolicyStore {
     /// settings, panel settings and PIN, PIN lockout state, and the in-memory snapshot and
     /// blocked-source report. A profile created later under the same name starts empty. The
     /// default profile is refused. Blocks for the fsync: call from `spawn_blocking`.
+    /// Names of every profile that has stored policy state (rules, grants, settings, PIN state),
+    /// whether or not the profile still exists.
+    pub fn stored_profiles(&self) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        use common::db::redb::ReadableTable as _;
+        self.db.read(|r| {
+            let mut out = std::collections::BTreeSet::new();
+            for def in [
+                tables::POLICY_SITE_RULES,
+                tables::POLICY_SOURCE_RULES,
+                tables::POLICY_TEMP,
+                tables::POLICY_META,
+            ] {
+                let t = r.open_table(def)?;
+                for row in t.iter()? {
+                    let k = row?.0;
+                    let k = k.value();
+                    let k = k.strip_prefix(PINLOCK_PREFIX).unwrap_or(k);
+                    if let Some((p, _)) = k.split_once('\0') {
+                        out.insert(p.to_string());
+                    }
+                }
+            }
+            Ok::<_, StoreError>(out)
+        })
+    }
+
     pub fn delete_profile(&self, profile: &str) -> Result<(), StoreError> {
         if profile == crate::DEFAULT_PROFILE {
             return Err(StoreError::Conflict(

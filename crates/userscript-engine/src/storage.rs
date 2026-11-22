@@ -192,6 +192,36 @@ impl UserscriptStorage {
         })
     }
 
+    /// Names of the non-default profiles that own stored values. Seeks from one profile's key
+    /// range to the next, so the cost does not grow with the number of values.
+    pub fn value_profiles(&self) -> Result<Vec<String>> {
+        self.db.flush_deferred();
+        self.db.read(|r| {
+            let t = r.open_table(tables::GM_VALUES).map_err(db_err)?;
+            let mut out = Vec::new();
+            let mut cursor = String::from("\u{0}");
+            loop {
+                let next = t
+                    .range(cursor.as_str()..)
+                    .map_err(db_err)?
+                    .next()
+                    .transpose()
+                    .map_err(db_err)?
+                    .map(|(k, _)| k.value().to_string());
+                let Some(k) = next else { break };
+                match k.split_once('\u{1f}') {
+                    Some((profile, _)) if !profile.contains('\0') => {
+                        out.push(profile.to_string());
+                        cursor = format!("{profile}\u{20}");
+                    }
+                    // A default-profile key (`script\0name`): step past it.
+                    _ => cursor = format!("{k}\0"),
+                }
+            }
+            Ok::<_, Error>(out)
+        })
+    }
+
     /// Bytes used per script namespace across `profile`.
     pub fn profile_usage(&self, profile: &str) -> Result<HashMap<String, usize>> {
         self.db.flush_deferred();

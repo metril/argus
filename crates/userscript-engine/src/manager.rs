@@ -200,6 +200,20 @@ impl UserscriptManager {
         Ok(removed)
     }
 
+    /// Names of the non-default profiles that own scripts or stored values (for sweeping data of
+    /// profiles that no longer exist).
+    pub fn stored_profiles(&self) -> Result<std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeSet<String> = self
+            .scripts
+            .read()
+            .keys()
+            .map(|(p, _)| p.clone())
+            .filter(|p| p != DEFAULT_PROFILE)
+            .collect();
+        out.extend(self.storage.value_profiles()?);
+        Ok(out)
+    }
+
     /// Install a new userscript from source code (default profile; no dependencies fetched).
     pub fn install(&self, source: String) -> Result<String> {
         self.install_in(DEFAULT_PROFILE, source)

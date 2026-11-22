@@ -37,6 +37,8 @@ use userscript_engine::UserscriptManager;
 
 /// Quiet time after the last change before a rebuild starts.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(100);
+/// How long to wait before retrying a failed removal of a deleted profile's data.
+const CLEANUP_RETRY: Duration = Duration::from_secs(30);
 
 /// What the builder last did for one profile.
 #[derive(Debug, Clone, Default)]
@@ -77,6 +79,8 @@ struct Inner {
     status: Mutex<HashMap<u64, ProfileStatus>>,
     /// Set-engine contents changed in place: bump every profile's generation at the next pass.
     sets_changed: AtomicBool,
+    /// A removal of a deleted profile's data failed: retry on a timer.
+    cleanup_failed: AtomicBool,
     wake: Notify,
     reloads: watch::Sender<u64>,
 }
@@ -122,6 +126,7 @@ impl ProfileBuilder {
             state: tokio::sync::Mutex::new(State::default()),
             status: Mutex::new(HashMap::new()),
             sets_changed: AtomicBool::new(false),
+            cleanup_failed: AtomicBool::new(false),
             wake: Notify::new(),
             reloads: watch::channel(0).0,
         });
@@ -180,6 +185,7 @@ async fn run(inner: Arc<Inner>, debounce: Duration) {
                 inner.sets_changed.store(true, Ordering::Release);
             }
             _ = inner.wake.notified() => {}
+            _ = tokio::time::sleep(CLEANUP_RETRY), if inner.cleanup_failed.load(Ordering::Relaxed) => {}
         }
         // Absorb a burst: rebuild once the changes stop arriving.
         loop {
@@ -217,10 +223,13 @@ impl Inner {
         };
         let store = self.store.clone();
         let read = tokio::task::spawn_blocking(move || {
-            Ok::<_, common::profile_store::ProfileError>((store.list()?, store.devices()?))
+            // The id bound first: a profile created after it has an id at or above it, so its
+            // data is never mistaken for a deleted profile's.
+            let bound = store.profile_id_bound()?;
+            Ok::<_, common::profile_store::ProfileError>((bound, store.list()?, store.devices()?))
         })
         .await;
-        let (records, devices) = match read {
+        let (bound, records, devices) = match read {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => {
                 warn!("profile builder: reading the profile store failed: {e}");
@@ -235,7 +244,7 @@ impl Inner {
             .into_iter()
             .filter(|r| r.id != DEFAULT_PROFILE_ID)
             .collect();
-        self.build_all(&ctx, &mut st, records, devices).await;
+        self.build_all(&ctx, &mut st, records, devices, bound).await;
         self.reloads.send_modify(|n| *n += 1);
     }
 
@@ -245,6 +254,7 @@ impl Inner {
         st: &mut State,
         records: Vec<ProfileRecord>,
         devices: Vec<DeviceRecord>,
+        bound: u64,
     ) {
         let profiles: &Profiles = ctx.profiles();
         let sets_changed = self.sets_changed.swap(false, Ordering::AcqRel);
@@ -416,9 +426,73 @@ impl Inner {
             .await;
             match res {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("profile cleanup failed: {e}"),
-                Err(e) => warn!("profile cleanup task failed: {e}"),
+                Ok(Err(e)) => {
+                    warn!("profile cleanup failed (will retry): {e}");
+                    self.cleanup_failed.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    warn!("profile cleanup task failed (will retry): {e}");
+                    self.cleanup_failed.store(true, Ordering::Relaxed);
+                }
             }
+        }
+        self.sweep(&live, bound).await;
+    }
+
+    /// Remove the data of every `p<id>` namespace in the policy and userscript stores whose
+    /// profile no longer exists: one created and deleted inside a debounce window, one deleted
+    /// while the proxy was down, or one whose cleanup failed. Runs at startup and after every
+    /// pass; ids below `bound` that are not `live` were handed out and are gone for good.
+    async fn sweep(&self, live: &HashSet<u64>, bound: u64) {
+        let (manager, policy) = (self.manager.clone(), self.policy.clone());
+        if manager.is_none() && policy.is_none() {
+            return;
+        }
+        let live = live.clone();
+        let res = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            let mut names = BTreeSet::new();
+            if let Some(m) = &manager {
+                names.extend(
+                    m.stored_profiles()
+                        .map_err(|e| format!("userscripts: {e}"))?,
+                );
+            }
+            if let Some(p) = &policy {
+                names.extend(
+                    p.stored_profiles()
+                        .map_err(|e| format!("script policy: {e}"))?,
+                );
+            }
+            let mut failed = false;
+            for name in names {
+                let Some(id) = name.strip_prefix('p').and_then(|d| d.parse::<u64>().ok()) else {
+                    continue;
+                };
+                if id == DEFAULT_PROFILE_ID
+                    || id >= bound
+                    || live.contains(&id)
+                    || name != namespace(id)
+                {
+                    continue;
+                }
+                match delete_profile_data(&name, manager.as_deref(), policy.as_deref(), None) {
+                    Ok(()) => info!("removed leftover data of deleted profile {id}"),
+                    Err(e) => {
+                        warn!("leftover data of profile {id} could not be removed: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            Ok(failed)
+        })
+        .await;
+        match res {
+            Ok(Ok(failed)) => self.cleanup_failed.store(failed, Ordering::Relaxed),
+            Ok(Err(e)) => {
+                warn!("profile data sweep failed (will retry): {e}");
+                self.cleanup_failed.store(true, Ordering::Relaxed);
+            }
+            Err(e) => warn!("profile data sweep task failed: {e}"),
         }
     }
 

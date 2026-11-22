@@ -567,6 +567,59 @@ async fn deleting_a_profile_removes_its_data_and_stops_its_expiry_task() {
     assert!(f.policy.rules(&ns).unwrap().site_rules.is_empty());
 }
 
+/// A profile created and deleted inside one debounce window (never built), or deleted while the
+/// proxy was down, leaves data behind; the next pass sweeps it, and never touches live profiles,
+/// the default one, or a profile created after the pass read the store.
+#[tokio::test]
+async fn leftover_data_of_deleted_profiles_is_swept() {
+    use script_policy::{Preset, Scope};
+    let f = fixture().await;
+    let live = f.store.put(profile("live", &["ads"], "")).unwrap();
+    let gone = f.store.put(profile("gone", &["ads"], "")).unwrap();
+    let (live_ns, gone_ns) = (
+        common::profile_store::namespace(live.id),
+        common::profile_store::namespace(gone.id),
+    );
+    for ns in [&live_ns, &gone_ns] {
+        install_script(&f.manager, ns);
+        f.policy
+            .create_site_rule(
+                ns,
+                Scope::parse("example.com").unwrap(),
+                Preset::Trusted,
+                None,
+            )
+            .unwrap();
+        for _ in 0..8 {
+            f.policy.pin_failed(ns, "10.0.0.1").unwrap();
+        }
+    }
+    install_script(&f.manager, userscript_engine::DEFAULT_PROFILE);
+    // Deleted before the builder ever saw it.
+    assert!(f.store.delete(gone.id).unwrap());
+    f.builder.sync().await;
+    assert!(f.manager.get_all_in(&gone_ns).is_empty(), "scripts swept");
+    assert!(f.policy.rules(&gone_ns).unwrap().site_rules.is_empty());
+    assert_eq!(f.policy.pin_wait(&gone_ns, "10.0.0.1").unwrap(), 0);
+    assert!(!f.manager.stored_profiles().unwrap().contains(&gone_ns));
+    assert!(!f.policy.stored_profiles().unwrap().contains(&gone_ns));
+    // Everything else is untouched.
+    assert_eq!(f.manager.get_all_in(&live_ns).len(), 1);
+    assert_eq!(f.policy.rules(&live_ns).unwrap().site_rules.len(), 1);
+    assert_eq!(
+        f.manager
+            .get_all_in(userscript_engine::DEFAULT_PROFILE)
+            .len(),
+        1
+    );
+    // A namespace above the id bound (a profile created after the read) is left alone.
+    let future = common::profile_store::namespace(live.id + gone.id + 100);
+    install_script(&f.manager, &future);
+    f.store.put(profile("next", &[], "")).unwrap();
+    f.builder.sync().await;
+    assert_eq!(f.manager.get_all_in(&future).len(), 1);
+}
+
 #[tokio::test]
 async fn panel_site_off_applies_to_the_requesting_profile_only() {
     let f = fixture().await;

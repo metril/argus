@@ -123,16 +123,22 @@ impl SiteBlocking for ListSiteBlocking {
             .profiles
             .as_ref()
             .ok_or("per-profile blocking control is not available")?;
-        let mut record = store
-            .get(profile.id)
-            .map_err(|e| e.to_string())?
-            .ok_or("this profile no longer exists")?;
-        let new = list_service::site_exceptions::set(&record.rules, site, disabled)
-            .ok_or_else(|| format!("'{site}' is not a valid host name"))?;
-        if new != record.rules {
-            record.rules = new;
-            store.put(record).map_err(|e| e.to_string())?;
-        }
+        store
+            .modify(profile.id, |rec| {
+                rec.rules = list_service::site_exceptions::set(&rec.rules, site, disabled)
+                    .ok_or_else(|| {
+                        common::profile_store::ProfileError::Invalid(format!(
+                            "'{site}' is not a valid host name"
+                        ))
+                    })?;
+                Ok(())
+            })
+            .map_err(|e| match e {
+                common::profile_store::ProfileError::NotFound(_) => {
+                    "this profile no longer exists".to_string()
+                }
+                e => e.to_string(),
+            })?;
         Ok(())
     }
 }
