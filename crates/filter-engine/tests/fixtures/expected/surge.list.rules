@@ -1,0 +1,14 @@
+|http://exact.example.com^
+|https://exact.example.com^
+|ws://exact.example.com^
+|wss://exact.example.com^
+||suffix.example.com^
+||nopolicy.example.com^
+/^[a-z][a-z0-9+.-]*:\/\/[^\/?#]*adtrack/
+/^https?:\/\/x\.example\.com\/ads\//
+|http://qx.example.com^
+|https://qx.example.com^
+|ws://qx.example.com^
+|wss://qx.example.com^
+||qxs.example.com^
+/^[a-z][a-z0-9+.-]*:\/\/[^\/?#]*qxk/

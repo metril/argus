@@ -1,0 +1,18 @@
+format=ip-list
+total_lines=8
+converted=5
+skipped=1
+error_count=1
+translated=0
+ext=0
+ip_block=5
+ip_allow=0
+ext_counts={}
+skipped_reasons={"header": 1}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }
+error line 8: not an IP, CIDR or range
+ip 192.0.2.0-192.0.2.255
+ip 198.51.100.7-198.51.100.7
+ip 203.0.113.5-203.0.113.9
+ip 2001:db8::-2001:db8:ffff:ffff:ffff:ffff:ffff:ffff
+ip 1.2.3.0-1.2.3.255

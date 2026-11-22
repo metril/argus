@@ -1,0 +1,14 @@
+format=pihole
+total_lines=9
+converted=6
+skipped=0
+error_count=2
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }
+error line 8: invalid regex: error: look-around, including look-ahead and look-behind, is not supported
+error line 9: unrecognised line

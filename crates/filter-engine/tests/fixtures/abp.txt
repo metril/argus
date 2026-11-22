@@ -1,0 +1,11 @@
+[Adblock Plus 2.0]
+! Title: Test ABP
+! Homepage: https://example.org
+! Version: 202401010000
+! Expires: 4 days (update frequency)
+! Redirect: https://example.org/new.txt
+||ads.example.com^
+@@||ok.example.com^$document
+example.com##.banner
+example.com#@#.keep
+||cdn.example.com^$script,third-party

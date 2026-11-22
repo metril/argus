@@ -1,0 +1,30 @@
+[Adblock Plus 2.0]
+! Title: AdGuard test
+||a.example^$replace=/foo/bar/
+||b.example^$jsonprune=\$..ads
+||c.example^$cookie=sid
+||d.example^$removeheader=refresh
+||e.example^$hls=ad
+||f.example^$permissions=geolocation=()
+||g.example^$popup
+||h.example^$document,popup
+||i.example^$denyallow=x.example|y.example,script,domain=z.example
+*$to=t1.example|t2.example,image
+||m.example^$method=post
+||hh.example^$header=x-ad
+||u.example^$urltransform=/a/b/
+||s.example^$stealth
+||k.example^$empty
+example.com##^script:has-text(ad)
+example.com$$script[tag-content="ad"]
+example.com#%#//scriptlet('abort-on-property-read', 'foo.bar')
+example.com#%#//scriptlet("prevent-setTimeout", "ads", "500")
+example.com#%#//scriptlet('prevent-xhr', 'a,b')
+example.com#%#//scriptlet('some-unknown-scriptlet')
+example.com#%#window.alert = function() {};
+example.com#@%#//scriptlet('abort-on-property-read', 'foo.bar')
+example.com#$#.sel { display: none !important; }
+example.com#@$#.sel { margin: 0 }
+example.com#$#hide-if-contains 'x'
+example.com#?#div:has(> a)
+example.com##.ok

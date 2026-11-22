@@ -1,19 +1,29 @@
-//! The list service: fetch, compile and install, single-flight.
+//! The list service: fetch, convert, compile and install, single-flight.
+//!
+//! Per list: `fetch -> detect/convert -> dedupe -> compile`. Conversion and parsing run on the
+//! rayon pool inside `spawn_blocking` (never on async workers). After a successful build the
+//! compiled engine is persisted; at startup it is loaded if its cache key still matches.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use filter_engine::{build_engine, compile_engine, FilterList, SharedEngine};
+use filter_engine::{
+    build_engine, build_set, formats::find_includes, try_build_engine, FilterList, ListFormat,
+    ListInput, ListReport, SharedEngine,
+};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::store::{ListStatus, ListStore};
+use crate::persist::{self, KeyEntry};
+use crate::report::BuildSummary;
+use crate::store::{ListStatus, ListStore, CUSTOM_REPORT_ID};
 use crate::{Error, Result};
 
 /// Runtime settings of the list service.
@@ -21,11 +31,12 @@ use crate::{Error, Result};
 pub struct ListServiceConfig {
     /// Master switch: when false, [`ListService::start`] does nothing.
     pub enabled: bool,
-    /// Directory for the list store and the scriptlet resource cache.
+    /// Directory for the list store, the persisted engine and the scriptlet resource cache.
     pub data_dir: PathBuf,
     pub auto_update: bool,
     pub update_interval: Duration,
-    /// Scriptlet resource source; empty disables loading.
+    /// Scriptlet resource source (a directory of uBO resource files, a single `.js`, or a ready
+    /// `.json` array); empty disables loading (and the bundled fallback).
     pub scriptlet_resources_url: String,
     /// Max simultaneous list downloads.
     pub fetch_concurrency: usize,
@@ -35,6 +46,10 @@ pub struct ListServiceConfig {
     pub max_list_bytes: usize,
     pub scriptlet_retry_initial: Duration,
     pub scriptlet_retry_max: Duration,
+    /// Persist the compiled engine to `<data_dir>/engine.bin` and load it at startup. Off by
+    /// default so ad-hoc services (tests) never write to a relative default directory;
+    /// [`Self::from_adblock`] turns it on.
+    pub persist_engine: bool,
 }
 
 impl Default for ListServiceConfig {
@@ -50,6 +65,7 @@ impl Default for ListServiceConfig {
             max_list_bytes: 50 * 1024 * 1024,
             scriptlet_retry_initial: Duration::from_secs(5),
             scriptlet_retry_max: Duration::from_secs(15 * 60),
+            persist_engine: false,
         }
     }
 }
@@ -66,6 +82,7 @@ impl ListServiceConfig {
             fetch_concurrency: a.list_fetch_concurrency.max(1),
             fetch_timeout: Duration::from_secs(a.list_fetch_timeout_secs.max(1)),
             max_list_bytes: a.max_list_bytes,
+            persist_engine: true,
             ..Self::default()
         }
     }
@@ -75,6 +92,18 @@ impl ListServiceConfig {
 struct Flight {
     running: bool,
     pending: bool,
+    /// A pending or starting build must ignore per-list `Expires` and revalidate every list.
+    force: bool,
+}
+
+/// A list ready to build: fetched (or cached) text plus resolved includes.
+struct BuildInput {
+    id: String,
+    format: ListFormat,
+    allowlist: bool,
+    content: String,
+    includes: HashMap<String, String>,
+    digest: String,
 }
 
 /// Owns lists, content, compile and install for one [`SharedEngine`].
@@ -87,7 +116,13 @@ pub struct ListService {
     busy: watch::Sender<bool>,
     builds: AtomicU64,
     installed_once: AtomicBool,
+    /// Cache key of the installed engine, to skip recompiling identical inputs.
+    installed_key: Mutex<Option<persist::Key>>,
+    summary: Mutex<BuildSummary>,
     pub(crate) scriptlets_tx: watch::Sender<bool>,
+    /// `true` once a fetched/cached resource library was applied (it then outranks the bundled one).
+    fetched_resources: Arc<Mutex<bool>>,
+    pub(crate) bundled_tried: AtomicBool,
     /// Live auto-update schedule: `(auto_update, interval)`.
     schedule: watch::Sender<(bool, Duration)>,
     /// Test hook: make the next build panic.
@@ -102,8 +137,7 @@ struct FlightGuard(Arc<ListService>);
 impl Drop for FlightGuard {
     fn drop(&mut self) {
         let mut f = self.0.flight.lock();
-        f.running = false;
-        f.pending = false;
+        *f = Flight::default();
         self.0.busy.send_replace(false);
     }
 }
@@ -126,13 +160,20 @@ pub(crate) async fn read_capped(
     Ok(body)
 }
 
-/// Approximate rule count: non-empty, non-comment lines.
+/// Approximate rule count: non-empty, non-comment lines (replaced by the build report once the
+/// list is compiled).
 fn count_rules(content: &str) -> usize {
     content
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('!'))
+        .filter(|l| !l.is_empty() && !l.starts_with(['!', '#']))
         .count()
+}
+
+fn sorted_includes(m: &HashMap<String, String>) -> Vec<(&String, &String)> {
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort();
+    v
 }
 
 impl ListService {
@@ -144,6 +185,7 @@ impl ListService {
         client: reqwest::Client,
     ) -> Arc<Self> {
         let schedule = watch::channel((cfg.auto_update, cfg.update_interval)).0;
+        let summary = store.get_summary().unwrap_or_default();
         Arc::new(Self {
             schedule,
             cfg,
@@ -154,7 +196,11 @@ impl ListService {
             busy: watch::channel(false).0,
             builds: AtomicU64::new(0),
             installed_once: AtomicBool::new(false),
+            installed_key: Mutex::new(None),
+            summary: Mutex::new(summary),
             scriptlets_tx: watch::channel(false).0,
+            fetched_resources: Arc::new(Mutex::new(false)),
+            bundled_tried: AtomicBool::new(false),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
         })
@@ -176,19 +222,45 @@ impl ListService {
         &self.store
     }
 
+    /// The engine this service installs into (also carries the extended-rule list and IP filter).
+    pub fn engine(&self) -> &Arc<SharedEngine> {
+        &self.engine
+    }
+
+    pub(crate) fn fetched_resources_handle(&self) -> Arc<Mutex<bool>> {
+        self.fetched_resources.clone()
+    }
+
     /// Number of build cycles started so far.
     pub fn build_count(&self) -> u64 {
         self.builds.load(Ordering::Acquire)
     }
 
-    /// Receiver that turns `true` once scriptlet resources are loaded.
+    /// Totals of the last build (also available right after a restart).
+    pub fn summary(&self) -> BuildSummary {
+        self.summary.lock().clone()
+    }
+
+    /// What the last build made of list `id`: detected format, rule counts, first errors,
+    /// header metadata.
+    pub fn report(&self, id: &str) -> Option<ListReport> {
+        self.store.get_report(id).ok().flatten()
+    }
+
+    /// The report of the custom rules.
+    pub fn custom_rules_report(&self) -> Option<ListReport> {
+        self.report(CUSTOM_REPORT_ID)
+    }
+
+    /// Receiver that turns `true` once scriptlet resources are loaded from the network or cache
+    /// (the bundled snapshot is applied earlier and does not count).
     pub fn scriptlets_ready(&self) -> watch::Receiver<bool> {
         self.scriptlets_tx.subscribe()
     }
 
-    /// Start background work and return immediately: an initial load (cached content is
-    /// installed first, then lists are refreshed), scriptlet resource loading and the
-    /// auto-update ticker. No-op when disabled.
+    /// Start background work and return immediately: an initial load (the persisted engine or
+    /// cached content is installed first, then lists are refreshed), scriptlet resource loading
+    /// and the auto-update ticker. No-op when disabled.
     pub fn start(self: &Arc<Self>) {
         if !self.cfg.enabled {
             return;
@@ -208,9 +280,9 @@ impl ListService {
                     continue;
                 }
                 tokio::select! {
-                    _ = tokio::time::sleep(interval) => {
-                        info!("Auto-update: refreshing filter lists");
-                        this.trigger();
+                    _ = tokio::time::sleep(this.next_wake(interval)) => {
+                        info!("Auto-update: checking filter lists");
+                        this.trigger_due();
                     }
                     r = rx.changed() => {
                         if r.is_err() {
@@ -220,6 +292,20 @@ impl ListService {
                 }
             }
         });
+    }
+
+    /// Shortest of the global interval and the `! Expires:` of any enabled list.
+    fn next_wake(&self, interval: Duration) -> Duration {
+        let shortest = self
+            .store
+            .get_all()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.enabled)
+            .filter_map(|l| self.report(&l.id)?.meta.expires_secs)
+            .min()
+            .map(Duration::from_secs);
+        shortest.map_or(interval, |s| s.min(interval))
     }
 
     /// Change the auto-update schedule while running; takes effect immediately.
@@ -232,25 +318,39 @@ impl ListService {
         *self.schedule.borrow()
     }
 
-    /// Request a rebuild without waiting. Overlapping triggers coalesce: at most one build runs,
-    /// and triggers arriving while it runs cause exactly one follow-up build.
+    /// Request a rebuild without waiting; every list is revalidated. Overlapping triggers
+    /// coalesce: at most one build runs, and triggers arriving while it runs cause exactly one
+    /// follow-up build.
     pub fn trigger(self: &Arc<Self>) {
+        self.trigger_with(true);
+    }
+
+    /// Like [`Self::trigger`], but lists whose `! Expires:` interval has not elapsed since their
+    /// last successful fetch are not re-downloaded (used by the auto-update ticker).
+    pub fn trigger_due(self: &Arc<Self>) {
+        self.trigger_with(false);
+    }
+
+    fn trigger_with(self: &Arc<Self>, force: bool) {
         {
             let mut f = self.flight.lock();
             if f.running {
                 f.pending = true;
+                f.force |= force;
                 return;
             }
             f.running = true;
+            f.force = force;
             self.busy.send_replace(true);
         }
         let this = self.clone();
         tokio::spawn(async move {
             let _guard = FlightGuard(this.clone());
             loop {
+                let force = std::mem::take(&mut this.flight.lock().force);
                 // Run the build as its own task so a panic surfaces as a `JoinError` here.
                 let build = this.clone();
-                match tokio::spawn(async move { build.build_once().await }).await {
+                match tokio::spawn(async move { build.build_once(force).await }).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => warn!("Filter reload failed: {e}"),
                     Err(e) => {
@@ -294,19 +394,7 @@ impl ListService {
         let _ = rx.wait_for(|busy| !*busy).await;
     }
 
-    async fn compile_install(&self, contents: Vec<String>) -> Result<()> {
-        let resources = self.engine.resources();
-        let (blob, built) = tokio::task::spawn_blocking(move || {
-            let bytes = compile_engine(&contents);
-            let built = build_engine(&bytes, &resources);
-            (Arc::new(bytes), built)
-        })
-        .await
-        .map_err(|e| Error::Other(format!("compile task failed: {e}")))?;
-        self.engine.install_built(blob, built);
-        self.installed_once.store(true, Ordering::Release);
-        Ok(())
-    }
+    // ---- build -----------------------------------------------------------------------------
 
     fn custom_rules(&self) -> Option<String> {
         self.store
@@ -315,12 +403,232 @@ impl ListService {
             .filter(|r| !r.trim().is_empty())
     }
 
-    async fn build_once(&self) -> Result<()> {
+    fn custom_digest(custom: Option<&str>) -> String {
+        persist::content_digest(custom.unwrap_or(""), std::iter::empty())
+    }
+
+    fn key_of(inputs: &[BuildInput]) -> persist::Key {
+        let mut entries: Vec<KeyEntry<'_>> = inputs
+            .iter()
+            .filter(|i| i.id != CUSTOM_REPORT_ID)
+            .map(|i| KeyEntry {
+                id: &i.id,
+                format: i.format,
+                allowlist: i.allowlist,
+                digest: &i.digest,
+            })
+            .collect();
+        let custom = inputs
+            .iter()
+            .find(|i| i.id == CUSTOM_REPORT_ID)
+            .map(|i| i.content.as_str());
+        persist::engine_key(&mut entries, &Self::custom_digest(custom))
+    }
+
+    /// The cache key of the current store state, from stored content digests (no list text is
+    /// read). `None` if any enabled list has no digest yet.
+    fn key_from_store(&self, enabled: &[FilterList]) -> Option<persist::Key> {
+        let digests: Vec<String> = enabled
+            .iter()
+            .map(|l| self.store.get_status(&l.id).ok()?.content_sha)
+            .collect::<Option<_>>()?;
+        let mut entries: Vec<KeyEntry<'_>> = enabled
+            .iter()
+            .zip(&digests)
+            .map(|(l, d)| KeyEntry {
+                id: &l.id,
+                format: l.format,
+                allowlist: l.allowlist,
+                digest: d,
+            })
+            .collect();
+        let custom = self.custom_rules();
+        Some(persist::engine_key(
+            &mut entries,
+            &Self::custom_digest(custom.as_deref()),
+        ))
+    }
+
+    /// Cached (offline) inputs: list text from the store, includes from the include cache.
+    async fn cached_inputs(&self, enabled: &[FilterList]) -> Vec<BuildInput> {
+        let mut out = Vec::new();
+        for l in enabled {
+            if let Some(content) = self.store.get_content(&l.id).ok().flatten() {
+                let includes = self.resolve_includes(l, &content, false).await;
+                out.push(self.make_input(l, content, includes));
+            }
+        }
+        out.extend(self.custom_input());
+        out
+    }
+
+    fn custom_input(&self) -> Option<BuildInput> {
+        self.custom_rules().map(|c| BuildInput {
+            id: CUSTOM_REPORT_ID.to_string(),
+            format: ListFormat::Abp,
+            allowlist: false,
+            digest: Self::custom_digest(Some(&c)),
+            content: c,
+            includes: HashMap::new(),
+        })
+    }
+
+    fn make_input(
+        &self,
+        list: &FilterList,
+        content: String,
+        includes: HashMap<String, String>,
+    ) -> BuildInput {
+        let digest = persist::content_digest(&content, sorted_includes(&includes));
+        let mut status = self.store.get_status(&list.id).unwrap_or_default();
+        if status.content_sha.as_deref() != Some(&digest) {
+            status.content_sha = Some(digest.clone());
+            if let Err(e) = self.store.set_status(&list.id, &status) {
+                warn!("Failed to persist content digest for {}: {e}", list.name);
+            }
+        }
+        BuildInput {
+            id: list.id.clone(),
+            format: list.format,
+            allowlist: list.allowlist,
+            content,
+            includes,
+            digest,
+        }
+    }
+
+    /// Convert and compile `inputs` off the async threads, install the result and persist it.
+    async fn compile_install(&self, inputs: Vec<BuildInput>) -> Result<()> {
+        let key = Self::key_of(&inputs);
+        let ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
+        let resources = self.engine.resources();
+        let started = Instant::now();
+        let (built, engine) = tokio::task::spawn_blocking(move || {
+            let list_inputs: Vec<ListInput> = inputs
+                .into_iter()
+                .map(|i| ListInput {
+                    id: i.id,
+                    content: i.content,
+                    format: i.format,
+                    allowlist: i.allowlist,
+                    includes: i.includes,
+                })
+                .collect();
+            let built = build_set(&list_inputs);
+            let engine = build_engine(&built.blob, &resources);
+            (built, engine)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("compile task failed: {e}")))?;
+
+        let now = Utc::now();
+        let mut summary = BuildSummary {
+            built_at: Some(now),
+            duration_ms: started.elapsed().as_millis() as u64,
+            lists: ids.len(),
+            engine_key: persist::hex(&key),
+            ..Default::default()
+        };
+        for (id, report) in ids.iter().zip(&built.reports) {
+            summary.network += report.network;
+            summary.cosmetic += report.cosmetic;
+            summary.ext += report.ext;
+            summary.rejected += report.rejected;
+            summary.ip_ranges += report.ip_ranges;
+            summary.duplicates += report.duplicates;
+            if let Err(e) = self.store.set_report(id, report) {
+                warn!("Failed to persist report for {id}: {e}");
+            }
+            if id != CUSTOM_REPORT_ID {
+                if let Ok(Some(mut list)) = self.store.get(id) {
+                    list.rule_count = report.network + report.cosmetic + report.ext;
+                    let _ = self.store.upsert(&list);
+                }
+            }
+        }
+        if built.reports.len() < ids.len() {
+            warn!("build produced fewer reports than lists");
+        }
+        let (ext, ip, blob) = (
+            Arc::new(built.ext),
+            Arc::new(built.ip),
+            Arc::new(built.blob),
+        );
+        info!(
+            "Compiled {} list(s): {} network, {} cosmetic, {} extended, {} rejected, {} duplicate rules dropped in {} ms",
+            summary.lists, summary.network, summary.cosmetic, summary.ext, summary.rejected,
+            summary.duplicates, summary.duration_ms
+        );
+        self.engine
+            .install_full(blob.clone(), engine, ext.clone(), ip.clone());
+        self.installed_once.store(true, Ordering::Release);
+        *self.installed_key.lock() = Some(key);
+        if let Err(e) = self.store.set_summary(&summary) {
+            warn!("Failed to persist build summary: {e}");
+        }
+        *self.summary.lock() = summary.clone();
+
+        if self.cfg.persist_engine {
+            let path = self.cfg.data_dir.join(persist::FILE_NAME);
+            let res = tokio::task::spawn_blocking(move || {
+                persist::save(&path, &key, &blob, &ext, &ip, &summary)
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to persist compiled engine: {e}"),
+                Err(e) => warn!("Persist task failed: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Install the persisted engine if its key matches the store's current state.
+    async fn try_load_persisted(&self, key: persist::Key) -> bool {
+        let path = self.cfg.data_dir.join(persist::FILE_NAME);
+        let resources = self.engine.resources();
+        let res = tokio::task::spawn_blocking(move || {
+            let existed = path.exists();
+            let p = persist::load(&path, &key).map_err(|e| (e, existed))?;
+            let engine = try_build_engine(&p.blob, &resources).map_err(|e| (e, true))?;
+            Ok::<_, (String, bool)>((p, engine))
+        })
+        .await;
+        match res {
+            Ok(Ok((p, engine))) => {
+                let mut summary = p.summary;
+                summary.from_persisted = true;
+                info!(
+                    "Loaded persisted filter engine ({} network, {} cosmetic rules)",
+                    summary.network, summary.cosmetic
+                );
+                self.engine
+                    .install_full(Arc::new(p.blob), engine, Arc::new(p.ext), Arc::new(p.ip));
+                self.installed_once.store(true, Ordering::Release);
+                *self.installed_key.lock() = Some(key);
+                *self.summary.lock() = summary;
+                true
+            }
+            Ok(Err((e, existed))) => {
+                if existed {
+                    warn!("Ignoring persisted filter engine: {e}");
+                }
+                false
+            }
+            Err(e) => {
+                warn!("Persisted-engine load task failed: {e}");
+                false
+            }
+        }
+    }
+
+    async fn build_once(&self, force: bool) -> Result<()> {
         #[cfg(test)]
         if self.panic_next.swap(false, Ordering::AcqRel) {
             panic!("injected build panic");
         }
         self.builds.fetch_add(1, Ordering::AcqRel);
+        self.load_bundled_resources().await;
         let enabled: Vec<FilterList> = self
             .store
             .get_all()?
@@ -332,27 +640,38 @@ impl ListService {
             enabled.len()
         );
 
-        // First build of the process: serve cached rules immediately, before touching the network.
+        // First build of the process: serve the persisted engine (or cached rules) immediately,
+        // before touching the network.
         if !self.installed_once.load(Ordering::Acquire) {
-            let mut cached: Vec<String> = enabled
-                .iter()
-                .filter_map(|l| self.store.get_content(&l.id).ok().flatten())
-                .collect();
-            if !cached.is_empty() {
-                cached.extend(self.custom_rules());
-                self.compile_install(cached).await?;
+            let loaded = match self
+                .cfg
+                .persist_engine
+                .then(|| self.key_from_store(&enabled))
+            {
+                Some(Some(key)) => self.try_load_persisted(key).await,
+                _ => false,
+            };
+            if !loaded {
+                let cached = self.cached_inputs(&enabled).await;
+                if !cached.is_empty() {
+                    self.compile_install(cached).await?;
+                }
             }
         }
 
-        let mut contents: Vec<String> = futures_util::stream::iter(enabled)
-            .map(|l| self.fetch_one(l))
+        let mut inputs: Vec<BuildInput> = futures_util::stream::iter(enabled)
+            .map(|l| self.fetch_one(l, force))
             .buffered(self.cfg.fetch_concurrency.max(1))
             .filter_map(|c| async move { c })
             .collect()
             .await;
         // Custom rules compile last so their `@@` exceptions apply to every list.
-        contents.extend(self.custom_rules());
-        self.compile_install(contents).await
+        inputs.extend(self.custom_input());
+        if *self.installed_key.lock() == Some(Self::key_of(&inputs)) {
+            info!("Filter lists unchanged; keeping the installed engine");
+            return Ok(());
+        }
+        self.compile_install(inputs).await
     }
 
     fn record(&self, list: &FilterList, status: &ListStatus) {
@@ -361,24 +680,40 @@ impl ListService {
         }
     }
 
+    /// Is the cached copy of `list` still within its own `! Expires:` interval?
+    fn fresh_per_expires(&self, list: &FilterList, status: &ListStatus) -> bool {
+        let Some(expires) = self.report(&list.id).and_then(|r| r.meta.expires_secs) else {
+            return false;
+        };
+        status
+            .last_success
+            .is_some_and(|t| (Utc::now() - t).num_seconds() < expires as i64)
+    }
+
     /// Fetch one list conditionally; fall back to the cached copy on any failure.
-    async fn fetch_one(&self, mut list: FilterList) -> Option<String> {
+    async fn fetch_one(&self, mut list: FilterList, force: bool) -> Option<BuildInput> {
         let cached = self.store.get_content(&list.id).ok().flatten();
         let mut status = self.store.get_status(&list.id).unwrap_or_default();
+
+        if !force && cached.is_some() && self.fresh_per_expires(&list, &status) {
+            let content = cached?;
+            let includes = self.resolve_includes(&list, &content, false).await;
+            return Some(self.make_input(&list, content, includes));
+        }
         status.last_checked = Some(Utc::now());
 
-        match self.download(&list, &status, cached.is_some()).await {
+        let text = match self.download(&list, &status, cached.is_some()).await {
             Ok(Fetched::NotModified) => match cached {
                 Some(c) => {
                     status.last_success = status.last_checked;
                     status.last_error = None;
                     self.record(&list, &status);
-                    Some(c)
+                    c
                 }
                 None => {
                     status.last_error = Some("304 without cached content".into());
                     self.record(&list, &status);
-                    None
+                    return None;
                 }
             },
             Ok(Fetched::Body {
@@ -400,15 +735,97 @@ impl ListService {
                 }
                 self.record(&list, &status);
                 info!("Downloaded {} ({} rules)", list.name, list.rule_count);
-                Some(text)
+                text
             }
             Err(e) => {
                 warn!("List {}: {e}; falling back to cache", list.name);
                 status.last_error = Some(e);
                 self.record(&list, &status);
-                cached
+                cached?
+            }
+        };
+        let includes = self.resolve_includes(&list, &text, true).await;
+        Some(self.make_input(&list, text, includes))
+    }
+
+    /// Resolve `!#include` targets of `content` (same origin as the list URL, at most 16, cached
+    /// in the store). With `fetch` false only the cache is consulted.
+    async fn resolve_includes(
+        &self,
+        list: &FilterList,
+        content: &str,
+        fetch: bool,
+    ) -> HashMap<String, String> {
+        const MAX_INCLUDES: usize = 16;
+        let mut map = HashMap::new();
+        if !content.contains("!#include") {
+            return map;
+        }
+        let base = reqwest::Url::parse(&list.url).ok();
+        let mut pending = find_includes(content);
+        while let Some(path) = pending.pop() {
+            if map.len() >= MAX_INCLUDES || map.contains_key(&path) {
+                continue;
+            }
+            let fetched = if fetch {
+                match self.fetch_include(base.as_ref(), &path).await {
+                    Ok(t) => {
+                        let _ = self.store.put_include(&list.id, &path, &t);
+                        Some(t)
+                    }
+                    Err(e) => {
+                        warn!("List {}: include `{path}`: {e}", list.name);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let text = match fetched {
+                Some(t) => Some(t),
+                None => self.store.get_include(&list.id, &path).ok().flatten(),
+            };
+            if let Some(t) = text {
+                pending.extend(find_includes(&t));
+                map.insert(path, t);
             }
         }
+        map
+    }
+
+    async fn fetch_include(
+        &self,
+        base: Option<&reqwest::Url>,
+        path: &str,
+    ) -> std::result::Result<String, String> {
+        let base = base.ok_or("list URL is not absolute")?;
+        let url = base.join(path).map_err(|e| e.to_string())?;
+        // Includes may only come from the list's own origin.
+        if url.scheme() != base.scheme()
+            || url.host_str() != base.host_str()
+            || url.port_or_known_default() != base.port_or_known_default()
+        {
+            return Err("include is on a different origin".into());
+        }
+        self.get_text(url.as_str()).await
+    }
+
+    pub(crate) async fn get_text(
+        &self,
+        url: impl AsRef<str>,
+    ) -> std::result::Result<String, String> {
+        let resp = self
+            .client
+            .get(url.as_ref())
+            .timeout(self.cfg.fetch_timeout)
+            .send()
+            .await
+            .map_err(|e| format!("{}: {e}", url.as_ref()))?;
+        if !resp.status().is_success() {
+            return Err(format!("{}: HTTP {}", url.as_ref(), resp.status()));
+        }
+        let body = read_capped(resp, self.cfg.max_list_bytes).await?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     async fn download(

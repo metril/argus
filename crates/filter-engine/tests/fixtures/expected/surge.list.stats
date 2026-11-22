@@ -1,0 +1,14 @@
+format=surge
+total_lines=16
+converted=16
+skipped=4
+error_count=0
+translated=0
+ext=0
+ip_block=2
+ip_allow=0
+ext_counts={}
+skipped_reasons={"non-reject-policy": 1, "section": 1, "type-final": 1, "type-geoip": 1}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }
+ip 192.0.2.0-192.0.2.255
+ip 2001:db8::-2001:db8:ffff:ffff:ffff:ffff:ffff:ffff

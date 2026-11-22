@@ -1,0 +1,16 @@
+||h.example^$document
+||i.example^$script,domain=z.example
+@@||x.example^$script,domain=z.example
+@@||y.example^$script,domain=z.example
+||t1.example^$image
+||t2.example^$image
+||s.example^$stealth
+||k.example^$redirect=nooptext
+example.com##+js(abort-on-property-read, foo.bar)
+example.com##+js(no-setTimeout-if, ads, 500)
+example.com##+js(no-xhr-if, a\,b)
+example.com#@#+js(abort-on-property-read, foo.bar)
+example.com##.sel:style(display: none !important)
+example.com#@#.sel:style(margin: 0)
+example.com#?#div:has(> a)
+example.com##.ok

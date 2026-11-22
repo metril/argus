@@ -1,0 +1,9 @@
+# pi-hole list
+ads.example.com
+^ads[0-9]+\.example\.com$
+(\.|^)tracker\.example\.net$
+banner.*\.example\.org
+||abp.example.com^
+@@||allowed.example.com^
+(?=lookahead)bad
+has space

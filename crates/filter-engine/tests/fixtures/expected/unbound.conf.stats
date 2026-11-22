@@ -1,0 +1,13 @@
+format=unbound
+total_lines=11
+converted=6
+skipped=3
+error_count=1
+translated=0
+ext=0
+ip_block=0
+ip_allow=0
+ext_counts={}
+skipped_reasons={"custom-answer": 1, "directive": 1, "zone-type": 1}
+meta=ListMeta { title: None, homepage: None, version: None, expires_secs: None, redirect: None }
+error line 10: invalid label length: `bad..com`

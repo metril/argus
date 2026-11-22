@@ -17,6 +17,8 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 sled = { workspace = true }
+sha2 = { workspace = true }
+rayon = { workspace = true }
 filter-engine = { path = "../filter-engine" }
 common = { path = "../common" }
 
