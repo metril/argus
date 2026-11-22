@@ -220,7 +220,10 @@ pub async fn get_userscript(
     profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
+    Ok(Json(respond(
+        &state,
+        &get_script(&state, &profile.name, &id)?,
+    )))
 }
 
 /// Get a userscript's source.
@@ -291,7 +294,10 @@ pub async fn set_enabled(
             _ => ApiError::Internal(format!("Failed to update: {e}")),
         })?;
     info!("Userscript {id} enabled={} by {}", req.enabled, p.username);
-    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
+    Ok(Json(respond(
+        &state,
+        &get_script(&state, &profile.name, &id)?,
+    )))
 }
 
 // ------------------------------------------------------------------ two-step install
@@ -433,12 +439,12 @@ pub async fn confirm_plan(
         .get(&plan_id)
         .filter(|sp| sp.profile == profile.name)
         .ok_or_else(|| {
-        ApiError::coded(
-            StatusCode::NOT_FOUND,
-            "plan_not_found",
-            "Plan not found or expired",
-        )
-    })?;
+            ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "plan_not_found",
+                "Plan not found or expired",
+            )
+        })?;
     if req.allow_connect_all && !sp.plan.grants_summary.connect_all {
         return Err(ApiError::ValidationError(
             "allow_connect_all given but the script does not declare @connect *".into(),
@@ -560,7 +566,10 @@ pub async fn approve_update(
 ) -> ApiResult<Json<UserscriptResponse>> {
     ops::approve_pending(&state, &profile.name, &id, req.allow_connect_all)?;
     info!("Userscript {id} update approved by {}", p.username);
-    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
+    Ok(Json(respond(
+        &state,
+        &get_script(&state, &profile.name, &id)?,
+    )))
 }
 
 /// Discard a script's pending update.
@@ -582,7 +591,10 @@ pub async fn discard_update(
         .modify_script(&profile.name, &id, |s| s.pending_update = None)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     info!("Userscript {id} pending update discarded by {}", p.username);
-    Ok(Json(respond(&state, &get_script(&state, &profile.name, &id)?)))
+    Ok(Json(respond(
+        &state,
+        &get_script(&state, &profile.name, &id)?,
+    )))
 }
 
 // ------------------------------------------------------------------ storage
@@ -659,7 +671,7 @@ pub async fn clear_storage(
 #[utoipa::path(
     delete, path = "/userscripts/{id}/storage/{name}", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(ProfileQuery, 
+    params(ProfileQuery,
         ("id" = String, Path, description = "Userscript id"),
         ("name" = String, Path, description = "Value name")
     ),

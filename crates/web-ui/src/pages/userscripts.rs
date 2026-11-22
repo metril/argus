@@ -4,11 +4,11 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api::userscripts::{
-    ImportUserscriptsResponse, Userscript, UserscriptBundle, UserscriptPlanResponse,
+    ImportUserscriptsResponse, UpdateDiffDto, Userscript, UserscriptBundle, UserscriptPlanResponse,
     UserscriptStorageResponse,
 };
 use crate::api::ApiClient;
-use crate::components::{Card, Layout, Modal};
+use crate::components::{Card, Layout, Modal, ProfileSelector};
 use crate::state::use_app_state;
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,29 @@ fn download_text(filename: &str, text: &str) -> Result<(), String> {
     a.click();
     let _ = web_sys::Url::revoke_object_url(&url);
     Ok(())
+}
+
+/// The change sets of an update diff (added in red, removed plain, other widening flagged).
+fn diff_rows(d: UpdateDiffDto) -> impl IntoView {
+    let row = |label: &'static str, items: Vec<String>, cls: &'static str| {
+        (!items.is_empty()).then(|| {
+            view! {
+                <div class="us-section"><h4>{label}</h4>
+                    <div class="userscript-matches">
+                        {items.into_iter().map(|i| view! { <span class=format!("match-pattern {cls}")>{i}</span> }).collect_view()}
+                    </div></div>
+            }
+        })
+    };
+    view! {
+        {row("Added matches", d.added_matches, "us-hot")}
+        {row("Added connect", d.added_connect, "us-hot")}
+        {row("Added grants", d.added_grants, "us-hot")}
+        {row("Removed matches", d.removed_matches, "")}
+        {row("Removed connect", d.removed_connect, "")}
+        {row("Removed grants", d.removed_grants, "")}
+        {row("Other widening", d.widened, "us-hot")}
+    }
 }
 
 fn tag_list(items: Vec<String>, sensitive: bool) -> impl IntoView {
@@ -432,6 +455,7 @@ pub fn UserscriptsPage() -> impl IntoView {
         <Layout>
             <div class="page-header">
                 <h1 class="page-title">"Userscripts"</h1>
+                <ProfileSelector reload=reload />
                 <div class="userscript-actions">
                     <button class="btn btn-secondary" on:click=move |_| {
                         import_results.set(None);
@@ -574,9 +598,22 @@ pub fn UserscriptsPage() -> impl IntoView {
                             </h3>
                             {p.description.clone().map(|d| view! { <p class="userscript-description">{d}</p> })}
                             {p.already_installed.then(|| view! {
-                                <div class="us-warn">"Already installed"
+                                <div class="us-warn">
+                                    <span class="us-badge us-badge-warn">"update"</span>
+                                    " Already installed"
                                     {p.installed_version.clone().map(|v| format!(" (version {v})"))}
-                                    ". Confirming will fail with a conflict; uninstall it first."</div>
+                                    ". Confirming replaces it with this version."
+                                    {p.update.as_ref().filter(|u| !u.is_newer).map(|_| " This is not a newer version.")}
+                                </div>
+                            })}
+                            {p.update.clone().map(|u| view! {
+                                {u.needs_reapproval.then(|| view! {
+                                    <div class="us-danger">
+                                        <span class="us-badge us-badge-warn">"widened"</span>
+                                        " This version widens what the script may match, reach or run; confirming approves it."
+                                    </div>
+                                })}
+                                {diff_rows(u.diff)}
                             })}
                         </div>
                         <div class="us-section">
@@ -670,6 +707,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                         {row("Removed matches", d.removed_matches, "")}
                         {row("Removed connect", d.removed_connect, "")}
                         {row("Removed grants", d.removed_grants, "")}
+                        {row("Other widening", d.widened, "us-hot")}
                         {adds_all.then(|| view! {
                             <label class="form-checkbox">
                                 <input type="checkbox" class="checkbox-input"

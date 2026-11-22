@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use api_types::{
-    CreateProfileRequest, MessageResponse, Page, ProfileDto, UpdateProfileRequest,
-};
+use api_types::{CreateProfileRequest, MessageResponse, Page, ProfileDto, UpdateProfileRequest};
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use chrono::Utc;
 use common::profile_store::ProfileRecord;

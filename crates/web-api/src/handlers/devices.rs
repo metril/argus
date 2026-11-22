@@ -7,8 +7,7 @@
 use std::sync::Arc;
 
 use api_types::{
-    CreateDeviceRequest, DeviceDto, DeviceTokenCreated, MessageResponse, Page,
-    UpdateDeviceRequest,
+    CreateDeviceRequest, DeviceDto, DeviceTokenCreated, MessageResponse, Page, UpdateDeviceRequest,
 };
 use axum::{
     extract::State,

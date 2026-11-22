@@ -155,7 +155,10 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             devices::update_device,
             devices::delete_device
         ))
-        .routes(routes!(devices::issue_device_token, devices::revoke_device_token))
+        .routes(routes!(
+            devices::issue_device_token,
+            devices::revoke_device_token
+        ))
         // audit
         .routes(routes!(audit::list_audit))
 }

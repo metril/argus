@@ -353,6 +353,7 @@ pub async fn check_update(
 
 /// Apply a planned update (only when `apply` and it does not widen `@match`/`@connect`/
 /// `@grant`) or park it as the script's pending update.
+#[allow(clippy::too_many_arguments)]
 pub fn stage_update(
     mgr: &userscript_engine::UserscriptManager,
     profile: &str,

@@ -173,7 +173,12 @@ async fn devices_crud_validation_and_token_shown_once() {
         json!({"name": "x", "profile_id": pid, "ips": ["127.0.0.1"]}),
     ] {
         let r = admin.post(D).json(&body).await;
-        assert_eq!(r.status_code(), StatusCode::BAD_REQUEST, "{body} {}", r.text());
+        assert_eq!(
+            r.status_code(),
+            StatusCode::BAD_REQUEST,
+            "{body} {}",
+            r.text()
+        );
     }
     admin
         .post(D)
@@ -451,16 +456,24 @@ async fn restricted_token_cannot_mint_a_wider_token() {
     let body: Value = r.json();
     assert_eq!(body["token"]["profiles"], json!([p1]));
     let child = body["secret"].as_str().unwrap().to_string();
-    ctx.bearer("GET", &format!("/api/v1/policy/site-rules?profile={p2}"), &child)
-        .await
-        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer(
+        "GET",
+        &format!("/api/v1/policy/site-rules?profile={p2}"),
+        &child,
+    )
+    .await
+    .assert_status(StatusCode::FORBIDDEN);
     // An empty list is narrower (no profile at all), never wider.
     let r = mint(json!({"name": "e", "scopes": ["policy:read"], "profiles": []})).await;
     r.assert_status(StatusCode::CREATED);
     let none = r.json::<Value>()["secret"].as_str().unwrap().to_string();
-    ctx.bearer("GET", &format!("/api/v1/policy/site-rules?profile={p1}"), &none)
-        .await
-        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer(
+        "GET",
+        &format!("/api/v1/policy/site-rules?profile={p1}"),
+        &none,
+    )
+    .await
+    .assert_status(StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -480,12 +493,16 @@ async fn profile_parameter_isolates_userscripts_policy_and_exceptions() {
     let plan_id = plan["plan_id"].as_str().unwrap();
     // A plan made for p1 cannot be confirmed under p2.
     admin
-        .post(&format!("/api/v1/userscripts/plan/{plan_id}/confirm?profile={p2}"))
+        .post(&format!(
+            "/api/v1/userscripts/plan/{plan_id}/confirm?profile={p2}"
+        ))
         .json(&json!({}))
         .await
         .assert_status(StatusCode::NOT_FOUND);
     let r = admin
-        .post(&format!("/api/v1/userscripts/plan/{plan_id}/confirm?profile={p1}"))
+        .post(&format!(
+            "/api/v1/userscripts/plan/{plan_id}/confirm?profile={p1}"
+        ))
         .json(&json!({}))
         .await;
     r.assert_status(StatusCode::CREATED);

@@ -92,6 +92,36 @@ enum HttpMethod {
 // tokens (it revokes the old `jti` on every refresh), so two parallel refreshes
 // would revoke each other and force a spurious logout.
 thread_local! {
+    /// Profile the profile-scoped pages (script policy, userscripts) operate on; `"0"` is the
+    /// default profile. Set by the profile selector.
+    static CURRENT_PROFILE: std::cell::RefCell<String> = std::cell::RefCell::new("0".to_string());
+}
+
+/// Select the profile that profile-scoped calls (`/policy`, `/userscripts`,
+/// `/rules/site-exceptions`) use from now on.
+pub fn set_current_profile(id: &str) {
+    CURRENT_PROFILE.with(|p| *p.borrow_mut() = id.to_string());
+}
+
+/// The selected profile id.
+pub fn current_profile() -> String {
+    CURRENT_PROFILE.with(|p| p.borrow().clone())
+}
+
+/// Append `profile=<id>` to a path that operates on one profile. Other paths and the default
+/// profile (`0`) are left alone.
+pub fn scope_to_profile(path: &str, profile: &str) -> String {
+    let scoped = ["/userscripts", "/policy", "/rules/site-exceptions"]
+        .iter()
+        .any(|p| path.starts_with(p));
+    if !scoped || profile == "0" || profile.is_empty() {
+        return path.to_string();
+    }
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{sep}profile={profile}")
+}
+
+thread_local! {
     static REFRESH_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
     static REFRESH_OK: Cell<bool> = const { Cell::new(false) };
 }
@@ -123,7 +153,12 @@ impl ApiClient {
 
     /// Build a full URL from a path
     fn url(&self, path: &str) -> String {
-        format!("{}{}{}", self.base_url, API_PREFIX, path)
+        format!(
+            "{}{}{}",
+            self.base_url,
+            API_PREFIX,
+            scope_to_profile(path, &current_profile())
+        )
     }
 
     /// Make a GET request
@@ -372,4 +407,29 @@ fn is_no_retry(path: &str) -> bool {
         || path.starts_with("/auth/login")
         || path.starts_with("/auth/register")
         || path.starts_with("/auth/logout")
+}
+
+#[cfg(test)]
+mod profile_scope_tests {
+    use super::scope_to_profile;
+
+    #[test]
+    fn only_profile_scoped_paths_get_the_parameter() {
+        assert_eq!(
+            scope_to_profile("/userscripts", "3"),
+            "/userscripts?profile=3"
+        );
+        assert_eq!(
+            scope_to_profile("/policy/site-rules?limit=200", "3"),
+            "/policy/site-rules?limit=200&profile=3"
+        );
+        assert_eq!(
+            scope_to_profile("/rules/site-exceptions/a.com", "3"),
+            "/rules/site-exceptions/a.com?profile=3"
+        );
+        assert_eq!(scope_to_profile("/userscripts", "0"), "/userscripts");
+        assert_eq!(scope_to_profile("/lists", "3"), "/lists");
+        assert_eq!(scope_to_profile("/rules/custom", "3"), "/rules/custom");
+        assert_eq!(scope_to_profile("/profiles", "3"), "/profiles");
+    }
 }

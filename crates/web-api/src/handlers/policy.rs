@@ -492,7 +492,11 @@ pub async fn delete_source_rule(
 ) -> ApiResult<Json<MessageResponse>> {
     let st = state.policy.clone();
     let rid = id.clone();
-    blocking(move || st.delete_source_rule(&profile.name, &rid).map_err(store_err)).await?;
+    blocking(move || {
+        st.delete_source_rule(&profile.name, &rid)
+            .map_err(store_err)
+    })
+    .await?;
     Ok(Json(MessageResponse {
         message: format!("Source rule '{id}' deleted"),
     }))
@@ -507,8 +511,10 @@ pub async fn delete_source_rule(
     params(ProfileQuery),
     responses((status = 200, description = "Active grants", body = Vec<TempGrantDto>))
 )]
-pub async fn list_temp(State(state): State<Arc<AppState>>,
-    profile: ProfileParam) -> ApiResult<Json<Vec<TempGrantDto>>> {
+pub async fn list_temp(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+) -> ApiResult<Json<Vec<TempGrantDto>>> {
     let st = state.policy.clone();
     let (rules, now) = blocking(move || {
         let r = st.rules(&profile.name).map_err(store_err)?;
@@ -793,8 +799,10 @@ pub async fn preview(
     params(ProfileQuery),
     responses((status = 200, description = "Policy document", body = PolicyExportDto))
 )]
-pub async fn export(State(state): State<Arc<AppState>>,
-    profile: ProfileParam) -> ApiResult<Json<PolicyExportDto>> {
+pub async fn export(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+) -> ApiResult<Json<PolicyExportDto>> {
     let st = state.policy.clone();
     let rules = blocking(move || st.rules(&profile.name).map_err(store_err)).await?;
     let doc = rules.export();
