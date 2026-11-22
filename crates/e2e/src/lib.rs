@@ -22,7 +22,7 @@ mod ws;
 pub use client::{HttpVersion, TestClient};
 pub use codec::{decode, encode, encode_stacked, Coding};
 pub use origin::{MockResponse, RecordedRequest, StreamSpec, TestOrigin};
-pub use proxy::{TestDst, TestProxy};
+pub use proxy::{ScriptHandles, TestDst, TestProxy};
 pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
 
 use std::sync::Once;

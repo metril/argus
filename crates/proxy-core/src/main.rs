@@ -63,6 +63,80 @@ async fn main() -> Result<()> {
     .map_err(|e| Error::Config(format!("Failed to open filter list service: {e}")))?;
     list_service.start();
 
+    // Userscripts: one manager (one database, one live index) shared by the proxy's injection
+    // and GM endpoints and by the management API. The proxy only uses it when enabled.
+    #[cfg(feature = "webui")]
+    let need_manager = config.userscripts.enabled || config.webui.enabled;
+    #[cfg(not(feature = "webui"))]
+    let need_manager = config.userscripts.enabled;
+    let userscript_manager = if need_manager {
+        let m = Arc::new(
+            userscript_engine::UserscriptManager::new(config.adblock.data_dir.clone()).map_err(
+                |e| Error::Config(format!("Failed to initialize userscript manager: {e}")),
+            )?,
+        );
+        if let Err(e) = m.load_all() {
+            tracing::warn!("Failed to load userscripts: {e}");
+        }
+        Some(m)
+    } else {
+        None
+    };
+    ctx.set_service_worker_policy(config.userscripts.service_worker_policy);
+    if config.userscripts.enabled {
+        ctx.set_userscripts(userscript_manager.clone());
+    } else {
+        info!("Userscripts disabled: scripts are managed but never injected");
+    }
+
+    // In-page panel: reserved confirmation host, per-site blocking over the custom rules.
+    {
+        let sc = &config.script_control;
+        let dashboard = if !sc.dashboard_url.is_empty() {
+            sc.dashboard_url.clone()
+        } else if config.webui.enabled
+            && !matches!(config.webui.host.as_str(), "0.0.0.0" | "::" | "[::]")
+        {
+            format!("http://{}:{}", config.webui.host, config.webui.port)
+        } else {
+            String::new()
+        };
+        let host = proxy_core::authority::normalize_host(&sc.panel_host).ok_or_else(|| {
+            Error::Config(format!(
+                "script_control.panel_host '{}' is not a host name",
+                sc.panel_host
+            ))
+        })?;
+        if !host.ends_with(".invalid") {
+            return Err(Error::Config(format!(
+                "script_control.panel_host '{host}' must end in .invalid (a name no real site can claim)"
+            )));
+        }
+        ctx.configure_panel(
+            proxy_core::panel::PanelConfig {
+                enabled: sc.panel_enabled,
+                host,
+                dashboard_url: dashboard,
+            },
+            Some(Arc::new(proxy_core::panel::ListSiteBlocking(
+                list_service.clone(),
+            ))),
+        );
+    }
+
+    // Script control: rules live in the shared database; the proxy path reads a compiled snapshot
+    // that is rebuilt on every edit and when a temporary grant expires.
+    let policy_store = Arc::new(script_policy::store::PolicyStore::new(
+        common::db::Db::open(&config.adblock.data_dir)
+            .map_err(|e| Error::Config(format!("Failed to open database: {e}")))?,
+    ));
+    let script_control = proxy_core::scriptctl::ScriptControl::new(
+        policy_store.clone(),
+        script_policy::DEFAULT_PROFILE,
+    );
+    script_control.spawn_expiry();
+    ctx.set_script_control(Some(script_control));
+
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
     let webui_handle = if config.webui.enabled {
@@ -73,6 +147,10 @@ async fn main() -> Result<()> {
                 shared_engine.clone(),
                 list_service,
                 ctx.request_timeout_handle(),
+                userscript_manager
+                    .clone()
+                    .expect("manager exists when the web UI is enabled"),
+                policy_store.clone(),
             )
             .await?,
         )
@@ -112,37 +190,17 @@ async fn start_webui_server(
     shared_engine: Arc<SharedEngine>,
     list_service: Arc<ListService>,
     request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    userscript_manager: Arc<userscript_engine::UserscriptManager>,
+    policy_store: Arc<script_policy::store::PolicyStore>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    use tracing::warn;
-    use userscript_engine::{UserscriptManager, UserscriptRuntime};
-    use web_api::{build_state, start_server, ApiConfig};
+    use userscript_engine::UserscriptRuntime;
+    use web_api::{build_state_with_policy, start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
 
     // One database file per process: users, sessions, tokens, audit and userscripts share
     // `<adblock.data_dir>/adblocker.redb` with the filter lists.
     let data_dir = config.adblock.data_dir.clone();
-
-    // Initialize userscript manager
-    let userscript_manager = if config.userscripts.enabled {
-        info!(
-            "Initializing userscript manager with data dir: {:?}",
-            data_dir
-        );
-        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
-            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-        })?)
-    } else {
-        info!("Userscripts disabled, using empty userscript manager");
-        Arc::new(UserscriptManager::new(data_dir.clone()).map_err(|e| {
-            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-        })?)
-    };
-
-    // Load existing userscripts
-    if let Err(e) = userscript_manager.load_all() {
-        warn!("Failed to load userscripts: {}", e);
-    }
 
     // Create userscript runtime
     let storage = userscript_manager.storage_arc();
@@ -195,7 +253,7 @@ async fn start_webui_server(
     };
 
     // Build the application state
-    let state = build_state(
+    let state = build_state_with_policy(
         api_config.clone(),
         config.clone(),
         shared_engine,
@@ -205,6 +263,7 @@ async fn start_webui_server(
         userscript_runtime,
         config_path.into(),
         request_timeout_ms,
+        Some(policy_store),
     )
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;

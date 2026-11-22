@@ -74,14 +74,27 @@ fn db_err(e: impl Into<DbError>) -> Error {
     Error::Storage(e.into().to_string())
 }
 
+/// Storage namespace of a script. The default profile maps to the bare script id (the
+/// pre-profile key layout, so existing data stays reachable); other profiles are prefixed with
+/// `<profile>\u{1f}`.
+pub fn ns(profile: &str, script_id: &str) -> String {
+    if profile == crate::script::DEFAULT_PROFILE {
+        script_id.to_string()
+    } else {
+        format!("{profile}\u{1f}{script_id}")
+    }
+}
+
 /// Userscript storage manager
 ///
 /// Writes are queued to the database's coalescing writer (no fsync, off the calling thread);
-/// an in-memory cache keeps reads consistent with queued writes.
+/// an in-memory cache keeps reads consistent with queued writes. The `*_raw` methods address a
+/// namespace (see [`ns`]) and speak JSON; the plain methods are the default-profile
+/// `StorageValue` API kept for existing callers.
 pub struct UserscriptStorage {
     db: Arc<Db>,
     /// In-memory cache for performance
-    cache: Arc<RwLock<HashMap<String, StorageValue>>>,
+    cache: Arc<RwLock<HashMap<String, Value>>>,
 }
 
 impl UserscriptStorage {
@@ -101,19 +114,16 @@ impl UserscriptStorage {
         }
     }
 
-    /// Generate storage key for a script and value name
-    fn make_key(script_id: &str, name: &str) -> String {
-        format!("{script_id}\0{name}")
+    fn make_key(ns: &str, name: &str) -> String {
+        format!("{ns}\0{name}")
     }
 
-    /// Get a value from storage
-    pub fn get_value(&self, script_id: &str, name: &str) -> Result<Option<StorageValue>> {
-        let key = Self::make_key(script_id, name);
-
+    /// Raw value of `name` in namespace `ns`.
+    pub fn get_raw(&self, ns: &str, name: &str) -> Result<Option<Value>> {
+        let key = Self::make_key(ns, name);
         if let Some(value) = self.cache.read().get(&key) {
             return Ok(Some(value.clone()));
         }
-
         let bytes = self.db.read(|r| {
             let t = r.open_table(tables::GM_VALUES).map_err(db_err)?;
             let v = t
@@ -124,7 +134,7 @@ impl UserscriptStorage {
         })?;
         match bytes {
             Some(bytes) => {
-                let value: StorageValue = serde_json::from_slice(&bytes).map_err(|e| {
+                let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
                     Error::Storage(format!("Failed to deserialize value for {key}: {e}"))
                 })?;
                 self.cache.write().insert(key, value.clone());
@@ -134,23 +144,24 @@ impl UserscriptStorage {
         }
     }
 
-    /// Set a value in storage (queued; visible to reads immediately).
-    pub fn set_value(&self, script_id: &str, name: &str, value: StorageValue) -> Result<()> {
-        let key = Self::make_key(script_id, name);
+    /// Store a raw value (queued; visible to reads immediately). Returns the stored size of the
+    /// entry (name + serialized value), the unit quotas are counted in.
+    pub fn set_raw(&self, ns: &str, name: &str, value: Value) -> Result<usize> {
+        let key = Self::make_key(ns, name);
         let bytes = serde_json::to_vec(&value)
             .map_err(|e| Error::Storage(format!("Failed to serialize value for {key}: {e}")))?;
+        let size = name.len() + bytes.len();
         self.cache.write().insert(key.clone(), value);
         self.db.defer_keep(move |t| {
             t.open_table(tables::GM_VALUES)?
                 .insert(key.as_str(), bytes.as_slice())?;
             Ok(())
         });
-        Ok(())
+        Ok(size)
     }
 
-    /// Delete a value from storage
-    pub fn delete_value(&self, script_id: &str, name: &str) -> Result<()> {
-        let key = Self::make_key(script_id, name);
+    pub fn delete_raw(&self, ns: &str, name: &str) -> Result<()> {
+        let key = Self::make_key(ns, name);
         // Queued sets must land before the delete, or they would resurrect the value.
         self.db.flush_deferred();
         self.db.write(Durability::Eventual, |t| {
@@ -164,26 +175,81 @@ impl UserscriptStorage {
         Ok(())
     }
 
-    /// List all value names for a script
-    pub fn list_values(&self, script_id: &str) -> Result<Vec<String>> {
+    /// `(name, entry size)` of every value in `ns`.
+    pub fn list_sizes(&self, ns: &str) -> Result<Vec<(String, usize)>> {
         self.db.flush_deferred();
-        let (lo, hi) = (format!("{script_id}\0"), format!("{script_id}\u{1}"));
+        let (lo, hi) = (format!("{ns}\0"), format!("{ns}\u{1}"));
         self.db.read(|r| {
             let t = r.open_table(tables::GM_VALUES).map_err(db_err)?;
-            let mut names = Vec::new();
+            let mut out = Vec::new();
             for item in t.range(lo.as_str()..hi.as_str()).map_err(db_err)? {
-                let (k, _) = item.map_err(db_err)?;
+                let (k, v) = item.map_err(db_err)?;
                 if let Some(name) = k.value().strip_prefix(lo.as_str()) {
-                    names.push(name.to_string());
+                    out.push((name.to_string(), name.len() + v.value().len()));
                 }
             }
-            Ok::<_, Error>(names)
+            Ok::<_, Error>(out)
         })
     }
 
-    /// Remove every value of `script_id` inside an existing transaction.
-    pub(crate) fn clear_in_txn(txn: &WriteTransaction, script_id: &str) -> Result<()> {
-        let (lo, hi) = (format!("{script_id}\0"), format!("{script_id}\u{1}"));
+    /// Bytes used per script namespace across `profile`.
+    pub fn profile_usage(&self, profile: &str) -> Result<HashMap<String, usize>> {
+        self.db.flush_deferred();
+        let default = profile == crate::script::DEFAULT_PROFILE;
+        let prefix = format!("{profile}\u{1f}");
+        self.db.read(|r| {
+            let t = r.open_table(tables::GM_VALUES).map_err(db_err)?;
+            let mut out: HashMap<String, usize> = HashMap::new();
+            let mut add = |k: &str, len: usize| {
+                if let Some((ns, name)) = k.split_once('\0') {
+                    *out.entry(ns.to_string()).or_default() += name.len() + len;
+                }
+            };
+            if default {
+                for item in t.iter().map_err(db_err)? {
+                    let (k, v) = item.map_err(db_err)?;
+                    if !k.value().contains('\u{1f}') {
+                        add(k.value(), v.value().len());
+                    }
+                }
+            } else {
+                let hi = format!("{profile}\u{20}");
+                for item in t.range(prefix.as_str()..hi.as_str()).map_err(db_err)? {
+                    let (k, v) = item.map_err(db_err)?;
+                    add(k.value(), v.value().len());
+                }
+            }
+            Ok::<_, Error>(out)
+        })
+    }
+
+    /// Get a value from storage (default profile).
+    pub fn get_value(&self, script_id: &str, name: &str) -> Result<Option<StorageValue>> {
+        Ok(self.get_raw(script_id, name)?.map(StorageValue::from))
+    }
+
+    /// Set a value in storage (default profile).
+    pub fn set_value(&self, script_id: &str, name: &str, value: StorageValue) -> Result<()> {
+        self.set_raw(script_id, name, value.into()).map(|_| ())
+    }
+
+    /// Delete a value from storage (default profile).
+    pub fn delete_value(&self, script_id: &str, name: &str) -> Result<()> {
+        self.delete_raw(script_id, name)
+    }
+
+    /// List all value names for a script (default profile).
+    pub fn list_values(&self, script_id: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_sizes(script_id)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
+    }
+
+    /// Remove every value of namespace `ns` inside an existing transaction.
+    pub(crate) fn clear_in_txn(txn: &WriteTransaction, ns: &str) -> Result<()> {
+        let (lo, hi) = (format!("{ns}\0"), format!("{ns}\u{1}"));
         let mut t = txn.open_table(tables::GM_VALUES).map_err(db_err)?;
         let keys: Vec<String> = t
             .range(lo.as_str()..hi.as_str())
@@ -197,18 +263,18 @@ impl UserscriptStorage {
         Ok(())
     }
 
-    /// Forget cached values of a script.
-    pub(crate) fn drop_cache(&self, script_id: &str) {
-        let prefix = format!("{script_id}\0");
+    /// Forget cached values of a namespace.
+    pub(crate) fn drop_cache(&self, ns: &str) {
+        let prefix = format!("{ns}\0");
         self.cache.write().retain(|k, _| !k.starts_with(&prefix));
     }
 
-    /// Clear all values for a script
-    pub fn clear_script_storage(&self, script_id: &str) -> Result<()> {
+    /// Clear all values of a namespace (the script id, for the default profile).
+    pub fn clear_script_storage(&self, ns: &str) -> Result<()> {
         self.db.flush_deferred();
         self.db
-            .write(Durability::Eventual, |t| Self::clear_in_txn(t, script_id))?;
-        self.drop_cache(script_id);
+            .write(Durability::Eventual, |t| Self::clear_in_txn(t, ns))?;
+        self.drop_cache(ns);
         Ok(())
     }
 

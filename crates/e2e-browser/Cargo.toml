@@ -23,3 +23,12 @@ base64 = "0.22"
 rustls-pemfile = { workspace = true }
 async-compression = { workspace = true, features = ["zstd", "brotli"] }
 encoding_rs = "0.8"
+userscript-engine = { path = "../userscript-engine" }
+script-policy = { path = "../script-policy", features = ["store"] }
+web-api = { path = "../web-api" }
+common = { path = "../common" }
+filter-engine = { path = "../filter-engine", default-features = false }
+axum-test = "18"
+cookie = "0.18"
+reqwest = { workspace = true }
+toml = { workspace = true }

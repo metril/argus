@@ -17,6 +17,8 @@ rt.run=function(kind,name,args){var f=Object.prototype.hasOwnProperty.call(NATIV
 rt.q=[];self.__adblockerRuntime=rt;
 for(var i=0;i<q.length;i++){try{rt.run(q[i][0],q[i][1],q[i][2]);}catch(e){}}
 })();
+/* Sites with a privileged userscript: drop any service worker already registered for this origin (a worker can read the page's bundles and GM traffic). New registrations are refused by the proxy. */
+if(cfg.sw){try{if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations){navigator.serviceWorker.getRegistrations().then(function(rs){for(var i=0;i<rs.length;i++){try{rs[i].unregister();}catch(e){}}}).catch(function(){});}}catch(e){}}
 var me=document.currentScript,nonce=(me&&me.nonce)||'';
 var tt=null;
 try{if(window.trustedTypes&&trustedTypes.createPolicy){tt=trustedTypes.createPolicy('adblock-proxy',{createScriptURL:function(u){if(typeof u==='string'&&u.indexOf('/__adblock__/')===0)return u;throw new TypeError('adblock-proxy: refused');}});}}catch(e){}
@@ -74,4 +76,5 @@ try{new MutationObserver(schedule).observe(document.documentElement,{childList:t
 if(cfg.o)observer();
 procedural(cfg.p);
 if(cfg.l){for(var i=0;i<cfg.l.length;i++)loadScript(cfg.l[i]);}
+if(cfg.k){var K=cfg.k,pl=0;addEventListener('keydown',function(e){if(e.isTrusted&&e.altKey==!!K[0]&&e.ctrlKey==!!K[1]&&e.shiftKey==!!K[2]&&e.metaKey==!!K[3]&&e.code===K[4]){e.preventDefault();var t=window[Symbol.for('adblock.panel')];if(t)t();else if(!pl){pl=1;loadScript(cfg.pn);}}},true);}
 })();

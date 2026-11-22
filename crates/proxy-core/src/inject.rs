@@ -114,6 +114,8 @@ pub fn unsafe_styles_dropped() -> u64 {
 
 /// Inputs for [`build_head`].
 pub struct PageSpec<'a> {
+    /// Unregister the page's service workers at document start (see [`crate::gm`]).
+    pub unregister_sw: bool,
     pub cosmetics: &'a Cosmetics,
     pub internal: &'a Internal,
     /// Host name the beacon token is bound to.
@@ -127,6 +129,12 @@ pub struct PageSpec<'a> {
     /// Scripts from trusted extended rules (`#%#`, scriptlets, snippets): one hash-addressed
     /// bundle loaded after the boot script, which provides their runtime hook.
     pub ext_script: &'a str,
+    /// Per-document userscript bundle URLs (see [`crate::gm`]), one classic synchronous
+    /// `<script src>` each, after the blocker's own scripts so the page sees them first.
+    pub userscripts: &'a [String],
+    /// The in-page panel's hotkey (`[alt, ctrl, shift, meta, code]`), when the panel is on: the
+    /// boot script then registers a key listener that loads the panel on first use.
+    pub panel: Option<&'a serde_json::Value>,
 }
 
 /// The markup for one page, plus what it needs from the page's CSP.
@@ -202,12 +210,20 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
-        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() {
-            let cfg = serde_json::json!({
+        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() || spec.panel.is_some()
+        {
+            let mut cfg = serde_json::json!({
                 "p": proc_items,
                 "o": observer,
                 "t": spec.internal.token_for(spec.host),
             });
+            if spec.unregister_sw {
+                cfg["sw"] = serde_json::Value::from(1);
+            }
+            if let Some(k) = spec.panel {
+                cfg["k"] = k.clone();
+                cfg["pn"] = serde_json::Value::String(crate::internal::panel_path().to_string());
+            }
             let json = json_ascii(&cfg.to_string());
             let _ = write!(
                 head.html,
@@ -224,6 +240,22 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                     "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
                 );
             }
+        }
+        if !spec.userscripts.is_empty() {
+            // The runtime once, before any bundle (bundles carry no runtime of their own).
+            let _ = write!(
+                head.html,
+                "<script src=\"{}\" nonce=\"{nonce}\"></script>",
+                crate::internal::gm_runtime_path()
+            );
+            head.has_script = true;
+        }
+        for src in spec.userscripts {
+            let _ = write!(
+                head.html,
+                "<script src=\"{src}\" nonce=\"{nonce}\"></script>"
+            );
+            head.has_script = true;
         }
     }
     head
@@ -251,6 +283,7 @@ mod tests {
 
     fn spec<'a>(cos: &'a Cosmetics, internal: &'a Internal) -> PageSpec<'a> {
         PageSpec {
+            unregister_sw: false,
             cosmetics: cos,
             internal,
             host: "example.test",
@@ -258,6 +291,8 @@ mod tests {
             script_ok: true,
             observer_ok: true,
             ext_script: "",
+            userscripts: &[],
+            panel: None,
         }
     }
 

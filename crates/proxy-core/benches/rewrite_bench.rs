@@ -52,6 +52,7 @@ fn cosmetics() -> Cosmetics {
 fn plan(internal: &Internal) -> HtmlPlan {
     let cos = cosmetics();
     let head = build_head(&PageSpec {
+        unregister_sw: false,
         cosmetics: &cos,
         internal,
         host: "example.test",
@@ -59,6 +60,8 @@ fn plan(internal: &Internal) -> HtmlPlan {
         script_ok: true,
         observer_ok: true,
         ext_script: "",
+        userscripts: &[],
+        panel: None,
     });
     HtmlPlan {
         head_html: head.html,
@@ -224,6 +227,7 @@ fn benches(c: &mut Criterion) {
     f.bench_function("build_head_small", |b| {
         b.iter(|| {
             build_head(&PageSpec {
+                unregister_sw: false,
                 cosmetics: &cos,
                 internal: &internal,
                 host: "example.test",
@@ -231,6 +235,8 @@ fn benches(c: &mut Criterion) {
                 script_ok: true,
                 observer_ok: true,
                 ext_script: "",
+                userscripts: &[],
+                panel: None,
             })
         })
     });
@@ -256,6 +262,7 @@ fn benches(c: &mut Criterion) {
                 },
             );
             let head = build_head(&PageSpec {
+                unregister_sw: false,
                 cosmetics: &cos,
                 internal: &internal,
                 host: "example.test",
@@ -263,6 +270,8 @@ fn benches(c: &mut Criterion) {
                 script_ok: true,
                 observer_ok: true,
                 ext_script: "",
+                userscripts: &[],
+                panel: None,
             });
             let p = HtmlPlan {
                 head_html: head.html,

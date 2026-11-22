@@ -246,6 +246,39 @@ impl RewriteStage {
             }
         }
 
+        if let Some(ph) = &plan.policy {
+            use script_policy::{HtmlOp, HtmlWhen};
+            for rule in &ph.actions.rules {
+                if rule.selector.parse::<Selector>().is_err() {
+                    continue;
+                }
+                let (ph, rule) = (ph.clone(), *rule);
+                handlers.push(element!(rule.selector, move |el| {
+                    let apply = match rule.when {
+                        HtmlWhen::Always => true,
+                        HtmlWhen::UrlDenied { attr, cap } => {
+                            el.get_attribute(attr).is_some_and(|v| {
+                                let page = ph.compiled.decide(&ph.scheme, &ph.host, ph.port);
+                                if attr == "ping" {
+                                    v.split_whitespace().any(|u| !page.allows_url(cap, u))
+                                } else {
+                                    !page.allows_url(cap, &v)
+                                }
+                            })
+                        }
+                    };
+                    if apply {
+                        match rule.op {
+                            HtmlOp::UnwrapKeepContent => el.remove_and_keep_content(),
+                            HtmlOp::Remove => el.remove(),
+                            HtmlOp::RemoveAttribute(a) => el.remove_attribute(a),
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+        }
+
         for rep in &plan.replacements {
             let sel = rep.selector.clone().unwrap_or_else(|| "*".to_string());
             if sel.parse::<Selector>().is_err() {

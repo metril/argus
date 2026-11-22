@@ -136,6 +136,13 @@ pub const HOSTS: &[&str] = &[
     "gen.test",
     "pp.test",
     "sty.test",
+    "us.test",
+    "us2.test",
+    "api.test",
+    "deny.test",
+    "sp.test",
+    "cdn.test",
+    "adblock.invalid",
 ];
 
 fn leaf_spki(der: &[u8]) -> String {
@@ -478,6 +485,14 @@ impl Session {
         }
     }
 
+    /// A second tab in the same browser profile (same origin storage and BroadcastChannels).
+    pub async fn new_tab(&self) -> Page {
+        let p = self.browser.new_page("about:blank").await.expect("new tab");
+        p.enable_runtime().await.expect("runtime");
+        p.evaluate_on_new_document(INIT_JS).await.expect("init");
+        p
+    }
+
     /// Poll `js` until it is truthy (no fixed sleeps); panics with diagnostics on timeout.
     pub async fn wait_for(&self, what: &str, js: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -612,6 +627,20 @@ impl Session {
         let _ = self.browser.close().await;
         let _ = self.browser.wait().await;
         self.handler.abort();
+    }
+}
+
+/// Evaluate `js` on another page (promises are awaited).
+pub async fn eval_on(page: &Page, js: &str) -> serde_json::Value {
+    let params = EvaluateParams::builder()
+        .expression(js)
+        .await_promise(true)
+        .return_by_value(true)
+        .build()
+        .expect("eval params");
+    match page.evaluate_expression(params).await {
+        Ok(r) => r.value().cloned().unwrap_or(serde_json::Value::Null),
+        Err(e) => panic!("eval `{js}`: {e}"),
     }
 }
 

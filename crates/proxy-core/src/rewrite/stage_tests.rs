@@ -266,6 +266,7 @@ fn removal_replacement_and_extra_injections() {
             replace: "[x]".into(),
         }],
         meta_csp: Some(Arc::new(|c: &str| Some(format!("{c} added")))),
+        policy: None,
     };
     let input = "<html><head><meta http-equiv=\"Content-Security-Policy\" content=\"a\"></head><body><div class=\"ad\">no</div><p>a secret and another secret</p></body></html>";
     for sizes in [&[usize::MAX][..], &[1], &[7]] {

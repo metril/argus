@@ -60,6 +60,7 @@ url = "2.5"
 common = { path = "../common" }
 filter-engine = { path = "../filter-engine", default-features = false }
 userscript-engine = { path = "../userscript-engine" }
+script-policy = { path = "../script-policy", features = ["store"] }
 api-types = { workspace = true, features = ["server"] }
 
 # OpenAPI documentation

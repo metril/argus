@@ -1132,3 +1132,78 @@ a:hover {
         justify-content: flex-end;
     }
 }
+
+/* Script policy */
+.policy-add {
+    display: flex;
+    gap: var(--spacing-sm);
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: var(--spacing-md);
+}
+
+.policy-add .form-input {
+    flex: 1 1 14rem;
+    width: auto;
+}
+
+.policy-add .form-select {
+    width: auto;
+}
+
+.policy-matrix {
+    padding: var(--spacing-sm) 0 var(--spacing-md) var(--spacing-lg);
+}
+
+.policy-matrix .table th,
+.policy-matrix .table td {
+    padding: var(--spacing-xs) var(--spacing-sm);
+    font-size: 0.8125rem;
+}
+
+.policy-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--spacing-sm);
+    margin-bottom: var(--spacing-md);
+}
+
+.policy-badge {
+    display: inline-flex;
+    gap: var(--spacing-sm);
+    align-items: center;
+}
+
+.policy-explain h4 {
+    margin: var(--spacing-md) 0 var(--spacing-xs);
+}
+
+/* Userscripts: approval, updates, details */
+.us-tabs { display: flex; gap: var(--spacing-sm); margin-bottom: var(--spacing-md); }
+.us-section { margin-bottom: var(--spacing-md); }
+.us-section h4 { margin-bottom: var(--spacing-xs); }
+.match-pattern.us-hot { background-color: var(--warning-color); color: #000; }
+.us-badge {
+    font-size: 0.75rem;
+    padding: var(--spacing-xs) var(--spacing-sm);
+    border-radius: var(--radius-full);
+    border: 1px solid var(--info-color);
+    background: transparent;
+    color: var(--info-color);
+    cursor: pointer;
+}
+.us-badge-warn { border-color: var(--warning-color); color: var(--warning-color); }
+.us-warn {
+    border: 1px solid var(--warning-color);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-sm) var(--spacing-md);
+    margin-bottom: var(--spacing-md);
+}
+.us-danger {
+    border: 2px solid var(--error-color);
+    border-radius: var(--radius-md);
+    padding: var(--spacing-sm) var(--spacing-md);
+    margin-bottom: var(--spacing-md);
+    font-weight: 600;
+}
+.us-results { margin-top: var(--spacing-md); padding-left: var(--spacing-lg); }

@@ -181,6 +181,15 @@ pub trait TransformSource: Send + Sync {
 /// Adapts the `content` of a meta CSP; `None` means unchanged.
 pub type MetaCsp = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// Script-policy rewriting for one document: the instructions plus what is needed to judge URLs.
+pub struct PolicyHtml {
+    pub compiled: Arc<script_policy::CompiledPolicy>,
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub actions: script_policy::HtmlActions,
+}
+
 /// The HTML-body work for one response, resolved by the caller.
 #[derive(Clone, Default)]
 pub struct HtmlPlan {
@@ -193,6 +202,8 @@ pub struct HtmlPlan {
     pub element_filters: Vec<ElementFilter>,
     /// Adapts `<meta http-equiv="content-security-policy">` content; `None` return = unchanged.
     pub meta_csp: Option<MetaCsp>,
+    /// Script-policy element rules (`<noscript>` unwrapping, strip mode, `ping`, meta refresh).
+    pub policy: Option<Arc<PolicyHtml>>,
 }
 
 impl HtmlPlan {
@@ -202,6 +213,7 @@ impl HtmlPlan {
             && self.remove_selectors.is_empty()
             && self.replacements.is_empty()
             && self.element_filters.is_empty()
+            && self.policy.is_none()
     }
 }
 

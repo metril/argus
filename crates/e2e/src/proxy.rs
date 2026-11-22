@@ -95,7 +95,15 @@ pub struct TestProxy {
     pub ctx: Arc<ProxyContext>,
     shutdown: broadcast::Sender<()>,
     dir: Option<tempfile::TempDir>,
+    userscripts: Mutex<Option<Arc<userscript_engine::UserscriptManager>>>,
+    script: Mutex<Option<ScriptHandles>>,
 }
+
+/// The script-policy store and the control attached to the proxy.
+pub type ScriptHandles = (
+    Arc<script_policy::store::PolicyStore>,
+    Arc<proxy_core::scriptctl::ScriptControl>,
+);
 
 impl TestProxy {
     /// Replace the installed rules (engine and extended-rule index swap as one generation).
@@ -195,6 +203,7 @@ impl TestProxy {
                 ..AdblockSettings::default()
             },
             userscripts: UserscriptSettings::default(),
+            script_control: Default::default(),
             webui: WebUiSettings::default(),
         };
 
@@ -263,6 +272,8 @@ impl TestProxy {
             ctx,
             shutdown,
             dir: Some(dir),
+            userscripts: Mutex::new(None),
+            script: Mutex::new(None),
         })
     }
 
@@ -270,6 +281,71 @@ impl TestProxy {
     /// transparent port).
     pub fn entry_addr(&self) -> SocketAddr {
         self.transparent_addr.unwrap_or(self.addr)
+    }
+
+    /// The proxy's userscript manager (created and attached on first use, backed by a database
+    /// inside the proxy's data dir).
+    pub fn userscripts(&self) -> Arc<userscript_engine::UserscriptManager> {
+        let mut g = self.userscripts.lock();
+        if let Some(m) = g.as_ref() {
+            return m.clone();
+        }
+        let dir = self.dir.as_ref().expect("data dir").path().join("us");
+        let m = Arc::new(userscript_engine::UserscriptManager::new(dir).expect("manager"));
+        self.ctx.set_userscripts(Some(m.clone()));
+        *g = Some(m.clone());
+        m
+    }
+
+    /// The script-policy store and control of the default profile (created and attached on
+    /// first use, in a database inside the proxy's data dir). `clock` replaces the system clock.
+    pub fn script_control_with(&self, clock: Option<script_policy::store::Clock>) -> ScriptHandles {
+        let mut g = self.script.lock();
+        if let Some(h) = g.as_ref() {
+            return h.clone();
+        }
+        let dir = self.dir.as_ref().expect("data dir").path().join("pol");
+        let db = common::db::Db::open(&dir).expect("policy db");
+        let store = Arc::new(match clock {
+            Some(c) => script_policy::store::PolicyStore::with_clock(db, c),
+            None => script_policy::store::PolicyStore::new(db),
+        });
+        let control = proxy_core::scriptctl::ScriptControl::new(
+            store.clone(),
+            script_policy::DEFAULT_PROFILE,
+        );
+        self.ctx.set_script_control(Some(control.clone()));
+        *g = Some((store, control));
+        g.as_ref().expect("set").clone()
+    }
+
+    pub fn script_control(&self) -> ScriptHandles {
+        self.script_control_with(None)
+    }
+
+    /// Install `source` for the default profile (no dependencies; `@connect *` not approved).
+    pub fn install_userscript(&self, source: &str) -> String {
+        self.install_userscript_with(
+            source,
+            userscript_engine::install::Fetched::default(),
+            false,
+        )
+    }
+
+    /// Install with fetched `@require`/`@resource` bodies and an explicit `@connect *` approval.
+    pub fn install_userscript_with(
+        &self,
+        source: &str,
+        fetched: userscript_engine::install::Fetched,
+        allow_connect_all: bool,
+    ) -> String {
+        use userscript_engine::install::{finish_install, plan_install, Approvals};
+        let plan = plan_install(source, None).expect("plan");
+        let script =
+            finish_install(plan, fetched, Approvals { allow_connect_all }).expect("finish");
+        self.userscripts()
+            .install_script(userscript_engine::DEFAULT_PROFILE, script)
+            .expect("install")
     }
 
     /// `http://127.0.0.1:<port>` of the proxy.

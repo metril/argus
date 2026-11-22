@@ -89,10 +89,11 @@ webpki-roots = "1.0"
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
+script-policy = { path = "../script-policy", features = ["store"] }
 chrono = { workspace = true }
 
-# Userscript engine (optional)
-userscript-engine = { path = "../userscript-engine", optional = true }
+# Userscript engine (always on: delivery and the GM endpoints are part of the proxy path)
+userscript-engine = { path = "../userscript-engine" }
 
 # Web API (optional)
 web-api = { path = "../web-api", optional = true }
@@ -121,8 +122,8 @@ default = ["websockets", "bundled-ubo-resources"]
 # Embed the uBlock Origin resource library (GPL-3.0) as the offline fallback; see docs/LICENSING.md.
 bundled-ubo-resources = ["list-service/bundled-ubo-resources"]
 websockets = ["dep:tokio-tungstenite"]
-userscripts = ["dep:userscript-engine"]
-webui = ["dep:web-api", "dep:userscript-engine"]
+userscripts = []
+webui = ["dep:web-api"]
 full = ["websockets", "userscripts", "webui", "bundled-ubo-resources"]
 
 [dev-dependencies]
@@ -137,4 +138,12 @@ harness = false
 
 [[bench]]
 name = "rewrite_bench"
+harness = false
+
+[[bench]]
+name = "userscripts_bench"
+harness = false
+
+[[bench]]
+name = "script_policy_bench"
 harness = false

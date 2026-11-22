@@ -49,9 +49,9 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `ca:read` | yes | yes | yes | Read CA certificate details (fingerprint, expiry, subject). |
 | `ca:admin` | - | - | yes | Manage the CA certificate (reserved). |
 | `scripts:read` | yes | yes | yes | View userscripts and their source. |
-| `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts. |
-| `policy:read` | yes | yes | yes | Read the script policy (reserved). |
-| `policy:write` | - | yes | yes | Change the script policy (reserved). |
+| `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts; view and clear their stored values. |
+| `policy:read` | yes | yes | yes | View script policy rules, explanations, temporary permissions and blocked-source reports. |
+| `policy:write` | - | yes | yes | Change script policy settings, rules and temporary permissions; import policy. |
 | `profiles:read` | yes | yes | yes | Read filtering profiles (reserved). |
 | `profiles:write` | - | - | yes | Change filtering profiles (reserved). |
 | `devices:read` | yes | yes | yes | Read devices (reserved). |
@@ -140,3 +140,48 @@ host, request type, matched rule, list id (for domain-set hits) and client label
 `stats:read`. URLs are stored without their query string and fragment unless
 `adblock.recent_blocked_keep_query` is set. `GET /system/metrics` also reports `storage`
 (`deferred_dropped`, `deferred_failed`, `deferred_queued`) for the background database writer.
+
+## Userscripts
+
+All routes act on the default profile. Writes are audited.
+
+| Method and path | Scope | Purpose |
+|---|---|---|
+| `GET /userscripts`, `GET /userscripts/{id}`, `/source`, `/stats` | `scripts:read` | List, inspect, source, counters. |
+| `POST /userscripts` | `scripts:write` | Install directly from `source` (no dependencies fetched, no `@connect *` approval). |
+| `POST /userscripts/plan` | `scripts:write` | Body `{source}` or `{url}`: parse, fetch `@require`/`@resource` (integrity hashes verified, size capped, control-plane fetch policy) and return a plan summary with `plan_id` (grants, connect, matches, `broad_match`, `connect_all`, capability flags, warnings, dependencies, `already_installed`). Plans live 15 min in memory (max 32). |
+| `POST /userscripts/plan/{plan_id}/confirm` | `scripts:write` | Body `{allow_connect_all?, enable?}` installs the plan (201). `allow_connect_all` only for scripts declaring `@connect *`. 404 unknown/expired plan, 409 already installed. |
+| `POST /userscripts/{id}/check-update` | `scripts:write` | Body `{apply?}`. Fetches the update URL; result `up_to_date`, `updated` (only with `apply`, and only if the update does not widen `@match`/`@connect`/`@grant`) or `pending_approval` (stored on the script, returned with its diff). |
+| `POST /userscripts/{id}/update/approve` | `scripts:write` | Apply the pending update (`{allow_connect_all?}`). |
+| `DELETE /userscripts/{id}/update` | `scripts:write` | Discard the pending update. |
+| `GET /userscripts/{id}/storage` | `scripts:write` | Stored GM values: `used_bytes`, `quota_bytes`, per value name, size and 200-char preview. |
+| `DELETE /userscripts/{id}/storage`, `/storage/{name}` | `scripts:write` | Clear all values or one. |
+| `GET /userscripts/export?values=` | `scripts:read` | JSON bundle `adblocker-userscripts-v1` (sources, enabled, `@connect *` approval, fetched dependencies). `values=true` adds stored values, which may hold secrets, and needs `scripts:write`. JSON only (no zip). |
+| `POST /userscripts/import` | `scripts:write` | Import a bundle (max 16 MiB), `on_conflict` `skip` (default) or `replace`; per-script results `{id,name,status,error?}`. |
+
+Config (`[userscripts]`): `update_check_interval_hours` (0 = off, default) schedules checks of every
+script with an update URL; `auto_apply_updates` (default false) applies found updates only when they
+do not widen `@match`/`@connect`/`@grant`. Installing from a `.user.js` URL is `POST /userscripts/plan`
+with `url`; there is no proxy interception.
+
+## Script policy and the in-page panel
+
+Routes under `/api/v1/policy` (scopes `policy:read` / `policy:write`); see `docs/SCRIPT-POLICY.md`
+for the model. All act on the default profile and writes are audited.
+
+| Method and path | Scope | Purpose |
+|---|---|---|
+| `GET`, `PUT /policy/settings` | read / write | Master switch (off by default), global preset, default profile, strip mode, network hints. |
+| `GET`, `POST /policy/site-rules`, `PUT`, `DELETE /policy/site-rules/{id}` | read / write | Per-site presets. |
+| `GET`, `POST /policy/source-rules`, `PUT`, `DELETE /policy/source-rules/{id}` | read / write | Per-page source allow/deny rules (the matrix). |
+| `GET`, `POST`, `DELETE /policy/temp`, `DELETE /policy/temp/{id}` | read / write | Temporary grants (TTL, until restart, optionally persisted). |
+| `GET /policy/explain?url=`, `POST /policy/preview` | read | The CSP, HTML actions and hints for a URL; before/after for a proposed change. |
+| `GET /policy/export`, `POST /policy/import` | read / write | JSON document; temporary grants are not exported. |
+| `GET /policy/reports?site=` | read | Blocked sources per page for one-click allow, fed by the proxy's blocks and the browsers' violation reports of the policy the proxy added. |
+| `GET`, `PUT /policy/panel` | read / write | In-page panel: `enabled` (per profile, off by default), `hotkey` (default `Alt+Shift+A`; modifiers plus one key, with Alt, Ctrl or Meta), `auth` (`pin` default, `session`, `none`), `pin` (4 to 64 characters; write-only, `pin_set` says whether one is set), `clear_pin`. Returns `reserved_host`. |
+| `GET /rules/site-exceptions` | `rules:read` | Sites with ad blocking switched off. |
+| `PUT`, `DELETE /rules/site-exceptions/{site}` | `rules:write` | Switch ad blocking off or on for a site (a host name, lowercase punycode). Stored as custom rules (`@@$domain=site` plus the sentinel `\|\|adblock.invalid^`), so they appear in `GET /rules/custom`. |
+
+Deployment settings are in `[script_control]` (`panel_enabled`, `panel_host`, `dashboard_url`). The
+panel's own endpoints (`/__adblock__/panel/state`, `/__adblock__/pv`, and the reserved host) are
+proxy-internal and are not part of this API.

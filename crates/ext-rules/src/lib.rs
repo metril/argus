@@ -25,6 +25,8 @@ mod jsonprune;
 mod parse;
 mod pattern;
 mod permissions;
+/// Merge `Permissions-Policy` headers restrictively (never widening the site's own).
+pub use permissions::merge as merge_permissions_policy;
 mod replace;
 mod style;
 mod types;

@@ -1,145 +1,454 @@
-//! Userscripts management page
+//! Userscripts management page: two-step install, updates, details, storage, import/export.
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
-use crate::api::userscripts::Userscript;
+use crate::api::userscripts::{
+    ImportUserscriptsResponse, Userscript, UserscriptBundle, UserscriptPlanResponse,
+    UserscriptStorageResponse,
+};
 use crate::api::ApiClient;
 use crate::components::{Card, Layout, Modal};
 use crate::state::use_app_state;
 
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+/// Grants that deserve a warning highlight.
+pub fn is_sensitive_grant(grant: &str) -> bool {
+    let g = grant.trim_start_matches("GM.").trim_start_matches("GM_");
+    matches!(
+        g,
+        "xmlHttpRequest"
+            | "xmlhttpRequest"
+            | "cookie"
+            | "download"
+            | "setClipboard"
+            | "notification"
+    )
+}
+
+/// Human readable byte size.
+pub fn fmt_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", n as f64 / 1048576.0)
+    }
+}
+
+/// Counts of results by status, as `(ok, skipped, errors)`.
+pub fn import_summary(r: &ImportUserscriptsResponse) -> (usize, usize, usize) {
+    let mut t = (0, 0, 0);
+    for x in &r.results {
+        match x.status.as_str() {
+            "installed" | "replaced" => t.0 += 1,
+            "skipped" => t.1 += 1,
+            _ => t.2 += 1,
+        }
+    }
+    t
+}
+
+/// Update status label for the list column.
+pub fn update_status(s: &Userscript) -> &'static str {
+    if s.pending_update.is_some() {
+        "Update pending approval"
+    } else if s.update_url.is_some() {
+        "Checkable"
+    } else {
+        "No update URL"
+    }
+}
+
+/// Offer a text file as a browser download via Blob + anchor.
+fn download_text(filename: &str, text: &str) -> Result<(), String> {
+    let err = |e: wasm_bindgen::JsValue| format!("{:?}", e);
+    let parts = js_sys::Array::new();
+    parts.push(&wasm_bindgen::JsValue::from_str(text));
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type("application/json");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).map_err(err)?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(err)?;
+    let doc = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
+    let a: web_sys::HtmlAnchorElement = doc
+        .create_element("a")
+        .map_err(err)?
+        .dyn_into()
+        .map_err(|_| "anchor")?;
+    a.set_href(&url);
+    a.set_download(filename);
+    a.click();
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(())
+}
+
+fn tag_list(items: Vec<String>, sensitive: bool) -> impl IntoView {
+    items
+        .into_iter()
+        .map(|i| {
+            let hot = sensitive && is_sensitive_grant(&i);
+            view! {
+                <span class=if hot { "match-pattern us-hot" } else { "match-pattern" }>{i}</span>
+            }
+        })
+        .collect_view()
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
 /// Userscripts page component
 #[component]
 pub fn UserscriptsPage() -> impl IntoView {
-    let app_state = use_app_state();
+    let app = StoredValue::new(use_app_state());
 
     let scripts = RwSignal::new(Vec::<Userscript>::new());
     let loading = RwSignal::new(true);
-
-    // Install modal state
-    let show_install_modal = RwSignal::new(false);
-    let install_source = RwSignal::new(String::new());
-
-    // View source modal state
-    let show_source_modal = RwSignal::new(false);
-    let source_content = RwSignal::new(String::new());
-
-    // Stats
+    let reload = RwSignal::new(0u32);
     let total_executions = RwSignal::new(0u64);
 
-    // Action signals
-    let do_install = RwSignal::new(false);
-    let view_source_id = RwSignal::new(Option::<String>::None);
-    let delete_id = RwSignal::new(Option::<String>::None);
+    // Install
+    let show_install = RwSignal::new(false);
+    let url_mode = RwSignal::new(false);
+    let install_source = RwSignal::new(String::new());
+    let install_url = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    let plan = RwSignal::new(Option::<UserscriptPlanResponse>::None);
+    let show_plan = RwSignal::new(false);
+    let allow_all = RwSignal::new(false);
 
-    // Load scripts
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            let app_state = app_state.clone();
+    // Details / source / storage
+    let show_detail = RwSignal::new(false);
+    let detail_id = RwSignal::new(Option::<String>::None);
+    let storage = RwSignal::new(Option::<UserscriptStorageResponse>::None);
+    let show_source = RwSignal::new(false);
+    let source_content = RwSignal::new(String::new());
+
+    // Pending update dialog
+    let show_update = RwSignal::new(false);
+    let update_id = RwSignal::new(Option::<String>::None);
+    let update_allow_all = RwSignal::new(false);
+
+    // Import / export
+    let export_values = RwSignal::new(false);
+    let show_import = RwSignal::new(false);
+    let import_text = RwSignal::new(String::new());
+    let import_replace = RwSignal::new(false);
+    let import_results = RwSignal::new(Option::<ImportUserscriptsResponse>::None);
+
+    // Load list
+    Effect::new(move || {
+        reload.track();
+        wasm_bindgen_futures::spawn_local(async move {
+            let client = ApiClient::new();
+            match client.list_userscripts(1, 100, None).await {
+                Ok(r) => scripts.set(r.items),
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to load userscripts: {}", e)),
+            }
+            if let Ok(stats) = client.get_userscript_stats().await {
+                total_executions.set(stats.total_executions);
+            }
+            loading.set(false);
+        });
+    });
+
+    let by_id =
+        move |id: Option<String>| id.and_then(|id| scripts.get().into_iter().find(|s| s.id == id));
+
+    let load_storage = move |id: String| {
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().get_userscript_storage(&id).await {
+                Ok(s) => storage.set(Some(s)),
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to load storage: {}", e)),
+            }
+        });
+    };
+
+    let open_detail = move |id: String| {
+        storage.set(None);
+        detail_id.set(Some(id.clone()));
+        show_detail.set(true);
+        load_storage(id);
+    };
+
+    let do_plan = move |_| {
+        let (source, url) = if url_mode.get() {
+            (None, Some(install_url.get().trim().to_string()))
+        } else {
+            (Some(install_source.get()), None)
+        };
+        busy.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().plan_userscript(source, url).await {
+                Ok(p) => {
+                    allow_all.set(false);
+                    plan.set(Some(p));
+                    show_plan.set(true);
+                }
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to plan install: {}", e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    let do_confirm = move |_| {
+        let Some(p) = plan.get() else { return };
+        let allow = allow_all.get();
+        busy.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new()
+                .confirm_userscript_plan(&p.plan_id, allow)
+                .await
+            {
+                Ok(_) => {
+                    app.get_value().success("Userscript installed");
+                    show_plan.set(false);
+                    show_install.set(false);
+                    plan.set(None);
+                    install_source.set(String::new());
+                    install_url.set(String::new());
+                    reload.update(|n| *n += 1);
+                }
+                Err(e) => app.get_value().error(format!("Failed to install: {}", e)),
+            }
+            busy.set(false);
+        });
+    };
+
+    let toggle = move |id: String, enabled: bool| {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = ApiClient::new().set_userscript_enabled(&id, enabled).await {
+                app.get_value().error(format!("Failed to update: {}", e));
+            }
+            reload.update(|n| *n += 1);
+        });
+    };
+
+    let check_update = move |id: String| {
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().check_userscript_update(&id).await {
+                Ok(r) => {
+                    let msg = match r.status.as_str() {
+                        "up_to_date" => "Already up to date".to_string(),
+                        "pending_approval" => {
+                            format!(
+                                "Update {} needs approval",
+                                r.new_version.unwrap_or_default()
+                            )
+                        }
+                        s => format!("Update check: {}", s),
+                    };
+                    app.get_value().success(msg);
+                }
+                Err(e) => app.get_value().error(format!("Update check failed: {}", e)),
+            }
+            reload.update(|n| *n += 1);
+        });
+    };
+
+    let check_all = move |_| {
+        let ids: Vec<String> = scripts
+            .get()
+            .into_iter()
+            .filter(|s| s.update_url.is_some())
+            .map(|s| s.id)
+            .collect();
+        wasm_bindgen_futures::spawn_local(async move {
+            let client = ApiClient::new();
+            let (mut pending, mut failed) = (0, 0);
+            for id in &ids {
+                match client.check_userscript_update(id).await {
+                    Ok(r) if r.status == "pending_approval" => pending += 1,
+                    Ok(_) => {}
+                    Err(_) => failed += 1,
+                }
+            }
+            let msg = format!(
+                "Checked {} scripts: {} pending approval, {} failed",
+                ids.len(),
+                pending,
+                failed
+            );
+            if failed > 0 {
+                app.get_value().error(msg);
+            } else {
+                app.get_value().success(msg);
+            }
+            reload.update(|n| *n += 1);
+        });
+    };
+
+    let resolve_update = move |approve: bool| {
+        let Some(id) = update_id.get() else { return };
+        let allow = update_allow_all.get();
+        wasm_bindgen_futures::spawn_local(async move {
+            let client = ApiClient::new();
+            let res = if approve {
+                client
+                    .approve_userscript_update(&id, allow)
+                    .await
+                    .map(|_| ())
+            } else {
+                client.discard_userscript_update(&id).await.map(|_| ())
+            };
+            match res {
+                Ok(()) => {
+                    app.get_value().success(if approve {
+                        "Update applied"
+                    } else {
+                        "Update discarded"
+                    });
+                    show_update.set(false);
+                    update_id.set(None);
+                }
+                Err(e) => app.get_value().error(format!("Update failed: {}", e)),
+            }
+            reload.update(|n| *n += 1);
+        });
+    };
+
+    let view_source = move |id: String| {
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().get_userscript_source(&id).await {
+                Ok(r) => {
+                    source_content.set(r.source);
+                    show_source.set(true);
+                }
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to get source: {}", e)),
+            }
+        });
+    };
+
+    let uninstall = move |id: String| {
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().uninstall_userscript(&id).await {
+                Ok(_) => {
+                    app.get_value().success("Userscript uninstalled");
+                    show_detail.set(false);
+                    reload.update(|n| *n += 1);
+                }
+                Err(e) => app.get_value().error(format!("Failed to uninstall: {}", e)),
+            }
+        });
+    };
+
+    let clear_storage = move |id: String, name: Option<String>| {
+        wasm_bindgen_futures::spawn_local(async move {
+            let client = ApiClient::new();
+            let res = match &name {
+                Some(n) => client.delete_userscript_value(&id, n).await,
+                None => client.clear_userscript_storage(&id).await,
+            };
+            match res {
+                Ok(_) => load_storage(id),
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to clear storage: {}", e)),
+            }
+            reload.update(|n| *n += 1);
+        });
+    };
+
+    let do_export = move |_| {
+        let values = export_values.get();
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().export_userscripts(values).await {
+                Ok(b) => {
+                    let text = serde_json::to_string_pretty(&b).unwrap_or_default();
+                    match download_text("userscripts-export.json", &text) {
+                        Ok(()) => app.get_value().success("Exported"),
+                        Err(e) => app.get_value().error(format!("Download failed: {}", e)),
+                    }
+                }
+                Err(e) => app.get_value().error(format!("Export failed: {}", e)),
+            }
+        });
+    };
+
+    let on_file = move |ev: web_sys::Event| {
+        let input = event_target::<web_sys::HtmlInputElement>(&ev);
+        if let Some(file) = input.files().and_then(|f| f.get(0)) {
             wasm_bindgen_futures::spawn_local(async move {
-                let client = ApiClient::new();
-
-                match client.list_userscripts(1, 100, None).await {
-                    Ok(response) => {
-                        scripts.set(response.items);
-                    }
-                    Err(e) => {
-                        app_state.error(format!("Failed to load userscripts: {}", e));
-                    }
+                match wasm_bindgen_futures::JsFuture::from(file.text()).await {
+                    Ok(v) => import_text.set(v.as_string().unwrap_or_default()),
+                    Err(_) => app.get_value().error("Failed to read file"),
                 }
-
-                if let Ok(stats) = client.get_userscript_stats().await {
-                    total_executions.set(stats.total_executions);
-                }
-
-                loading.set(false);
             });
-        });
-    }
+        }
+    };
 
-    // Install script effect
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if do_install.get() {
-                let source = install_source.get();
-                let app_state = app_state.clone();
-
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-
-                    match client.install_userscript(&source).await {
-                        Ok(script) => {
-                            scripts.update(|s| s.push(script));
-                            app_state.success("Userscript installed");
-                            show_install_modal.set(false);
-                            install_source.set(String::new());
-                        }
-                        Err(e) => {
-                            app_state.error(format!("Failed to install: {}", e));
-                        }
-                    }
-                    do_install.set(false);
-                });
+    let do_import = move |_| {
+        let mut bundle: UserscriptBundle = match serde_json::from_str(&import_text.get()) {
+            Ok(b) => b,
+            Err(e) => {
+                app.get_value().error(format!("Invalid bundle JSON: {}", e));
+                return;
             }
-        });
-    }
-
-    // View source effect
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if let Some(id) = view_source_id.get() {
-                let app_state = app_state.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-
-                    match client.get_userscript_source(&id).await {
-                        Ok(response) => {
-                            source_content.set(response.source);
-                            show_source_modal.set(true);
-                        }
-                        Err(e) => {
-                            app_state.error(format!("Failed to get source: {}", e));
-                        }
-                    }
-                    view_source_id.set(None);
-                });
+        };
+        bundle.on_conflict = Some(
+            if import_replace.get() {
+                "replace"
+            } else {
+                "skip"
             }
-        });
-    }
-
-    // Delete script effect
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if let Some(id) = delete_id.get() {
-                let app_state = app_state.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-
-                    match client.uninstall_userscript(&id).await {
-                        Ok(_) => {
-                            scripts.update(|s| s.retain(|script| script.id != id));
-                            app_state.success("Userscript uninstalled");
-                        }
-                        Err(e) => {
-                            app_state.error(format!("Failed to uninstall: {}", e));
-                        }
+            .into(),
+        );
+        busy.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().import_userscripts(&bundle).await {
+                Ok(r) => {
+                    let (ok, skipped, errs) = import_summary(&r);
+                    let msg = format!("Import: {ok} done, {skipped} skipped, {errs} failed");
+                    if errs > 0 {
+                        app.get_value().error(msg);
+                    } else {
+                        app.get_value().success(msg);
                     }
-                    delete_id.set(None);
-                });
+                    import_results.set(Some(r));
+                    reload.update(|n| *n += 1);
+                }
+                Err(e) => app.get_value().error(format!("Import failed: {}", e)),
             }
+            busy.set(false);
         });
-    }
+    };
 
     view! {
         <Layout>
             <div class="page-header">
                 <h1 class="page-title">"Userscripts"</h1>
-                <button class="btn btn-primary" on:click=move |_| show_install_modal.set(true)>
-                    "+ Install Userscript"
-                </button>
+                <div class="userscript-actions">
+                    <button class="btn btn-secondary" on:click=move |_| {
+                        import_results.set(None);
+                        show_import.set(true);
+                    }>"Import"</button>
+                    <button class="btn btn-secondary" on:click=do_export>"Export"</button>
+                    <label class="form-checkbox">
+                        <input type="checkbox" class="checkbox-input"
+                            prop:checked=move || export_values.get()
+                            on:change=move |_| export_values.update(|v| *v = !*v) />
+                        <span class="checkbox-label">"include stored values"</span>
+                    </label>
+                    <button class="btn btn-secondary" on:click=check_all>"Check all"</button>
+                    <button class="btn btn-primary" on:click=move |_| show_install.set(true)>
+                        "+ Install Userscript"
+                    </button>
+                </div>
             </div>
 
             <div class="userscripts-stats">
@@ -159,103 +468,372 @@ pub fn UserscriptsPage() -> impl IntoView {
                 }>
                     <For
                         each=move || scripts.get()
-                        key=|script| script.id.clone()
+                        key=|s| format!("{}|{}|{}|{}", s.id, s.enabled, s.version.clone().unwrap_or_default(), s.pending_update.is_some())
                         children=move |script| {
-                            let id_source = script.id.clone();
-                            let id_delete = script.id.clone();
-                            let name = script.name.clone();
-                            let version = script.version.clone();
-                            let description = script.description.clone();
-                            let exec_count = script.execution_count;
+                            let id = script.id.clone();
+                            let (id_t, id_c, id_d, id_u) = (id.clone(), id.clone(), id.clone(), id.clone());
                             let enabled = script.enabled;
-
+                            let pending = script.pending_update.clone();
+                            let has_url = script.update_url.is_some();
+                            let status = update_status(&script);
                             view! {
-                                <div class={format!(
-                                    "userscript-item {}",
-                                    if enabled { "" } else { "disabled" }
-                                )}>
+                                <div class=format!("userscript-item {}", if enabled { "" } else { "disabled" })>
                                     <div class="userscript-info">
                                         <h3 class="userscript-name">
-                                            {name}
-                                            {version.map(|v| view! {
+                                            {script.name.clone()}
+                                            {script.version.clone().map(|v| view! {
                                                 <span class="userscript-version">{v}</span>
                                             })}
                                         </h3>
-                                        {description.map(|d| view! {
+                                        {script.description.clone().map(|d| view! {
                                             <p class="userscript-description">{d}</p>
                                         })}
                                         <div class="userscript-meta">
-                                            <span class="userscript-executions">
-                                                {exec_count}" executions"
-                                            </span>
+                                            <span>{script.execution_count}" executions"</span>
+                                            <span>"Storage: "{fmt_bytes(script.storage_bytes)}</span>
+                                            <span>{status}</span>
+                                            {pending.map(|p| {
+                                                let cls = if p.needs_reapproval { "us-badge us-badge-warn" } else { "us-badge" };
+                                                let idu = id_u.clone();
+                                                view! {
+                                                    <button class=cls on:click=move |_| {
+                                                        update_allow_all.set(false);
+                                                        update_id.set(Some(idu.clone()));
+                                                        show_update.set(true);
+                                                    }>"Update pending approval"</button>
+                                                }
+                                            })}
                                         </div>
                                     </div>
                                     <div class="userscript-actions">
-                                        <button
-                                            class="btn btn-ghost"
-                                            on:click=move |_| view_source_id.set(Some(id_source.clone()))
-                                        >
-                                            "Source"
+                                        <label class="form-checkbox">
+                                            <input type="checkbox" class="checkbox-input"
+                                                prop:checked=enabled
+                                                on:change=move |ev| toggle(id_t.clone(), event_target_checked(&ev)) />
+                                            <span class="checkbox-label">"Enabled"</span>
+                                        </label>
+                                        <button class="btn btn-ghost" disabled=!has_url
+                                            on:click=move |_| check_update(id_c.clone())>
+                                            "Check for update"
                                         </button>
-                                        <button
-                                            class="btn btn-danger"
-                                            on:click=move |_| delete_id.set(Some(id_delete.clone()))
-                                        >
-                                            "Uninstall"
+                                        <button class="btn btn-ghost"
+                                            on:click=move |_| open_detail(id_d.clone())>
+                                            "Details"
                                         </button>
                                     </div>
                                 </div>
                             }
                         }
                     />
-
                     <Show when=move || scripts.get().is_empty()>
-                        <div class="empty-state">
-                            <p>"No userscripts installed"</p>
-                        </div>
+                        <div class="empty-state"><p>"No userscripts installed"</p></div>
                     </Show>
                 </Show>
             </Card>
 
-            <Modal
-                title="Install Userscript"
-                open=show_install_modal
-                on_close=Callback::new(move |_| show_install_modal.set(false))
-            >
-                <p class="modal-help">
-                    "Paste the userscript source code below."
-                </p>
-                <textarea
-                    class="source-input"
-                    placeholder="// ==UserScript==
-// @name        My Script
-// @match       https://example.com/*
-// ==/UserScript==
-
-// Your code here..."
-                    prop:value=move || install_source.get()
-                    on:input=move |ev| {
-                        install_source.set(event_target_value(&ev));
-                    }
-                ></textarea>
+            // Install modal
+            <Modal title="Install Userscript" open=show_install
+                on_close=Callback::new(move |_| show_install.set(false))>
+                <div class="us-tabs">
+                    <button class=move || if url_mode.get() { "btn btn-ghost" } else { "btn btn-secondary" }
+                        on:click=move |_| url_mode.set(false)>"Paste source"</button>
+                    <button class=move || if url_mode.get() { "btn btn-secondary" } else { "btn btn-ghost" }
+                        on:click=move |_| url_mode.set(true)>"From URL"</button>
+                </div>
+                <Show when=move || url_mode.get() fallback=move || view! {
+                    <textarea class="source-input"
+                        placeholder="// ==UserScript==\n// @name        My Script\n// @match       https://example.com/*\n// ==/UserScript=="
+                        prop:value=move || install_source.get()
+                        on:input=move |ev| install_source.set(event_target_value(&ev))></textarea>
+                }>
+                    <input class="form-input" type="url" placeholder="https://example.com/script.user.js"
+                        prop:value=move || install_url.get()
+                        on:input=move |ev| install_url.set(event_target_value(&ev)) />
+                </Show>
+                <p class="modal-help">"Nothing is installed until you approve the plan."</p>
                 <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_install_modal.set(false)>
-                        "Cancel"
-                    </button>
-                    <button class="btn btn-primary" on:click=move |_| do_install.set(true)>
-                        "Install"
+                    <button class="btn btn-secondary" on:click=move |_| show_install.set(false)>"Cancel"</button>
+                    <button class="btn btn-primary" disabled=move || busy.get() on:click=do_plan>
+                        "Review"
                     </button>
                 </div>
             </Modal>
 
-            <Modal
-                title="Userscript Source"
-                open=show_source_modal
-                on_close=Callback::new(move |_| show_source_modal.set(false))
-                class="source-modal"
-            >
+            // Approval dialog
+            <Modal title="Approve installation" open=show_plan class="source-modal"
+                on_close=Callback::new(move |_| show_plan.set(false))>
+                {move || plan.get().map(|p| {
+                    let sensitive: Vec<(&str, bool)> = vec![
+                        ("Network", p.network), ("Cookies", p.cookies), ("Downloads", p.downloads),
+                        ("Clipboard", p.clipboard), ("Notifications", p.notifications),
+                    ];
+                    view! {
+                        <div class="us-section">
+                            <h3>{p.name.clone()}
+                                {p.version.clone().map(|v| view! { <span class="userscript-version">{v}</span> })}
+                            </h3>
+                            {p.description.clone().map(|d| view! { <p class="userscript-description">{d}</p> })}
+                            {p.already_installed.then(|| view! {
+                                <div class="us-warn">"Already installed"
+                                    {p.installed_version.clone().map(|v| format!(" (version {v})"))}
+                                    ". Confirming will fail with a conflict; uninstall it first."</div>
+                            })}
+                        </div>
+                        <div class="us-section">
+                            <h4>"Requested capabilities"</h4>
+                            <div class="userscript-matches">
+                                {sensitive.into_iter().filter(|(_, on)| *on)
+                                    .map(|(n, _)| view! { <span class="match-pattern us-hot">{n}</span> })
+                                    .collect_view()}
+                                {tag_list(p.grants.clone(), true)}
+                            </div>
+                        </div>
+                        <div class="us-section">
+                            <h4>"@connect hosts"</h4>
+                            {p.connect_all.then(|| view! {
+                                <div class="us-danger">
+                                    "This script asks to connect to ANY host (@connect *). It can send data anywhere."
+                                    <label class="form-checkbox">
+                                        <input type="checkbox" class="checkbox-input"
+                                            prop:checked=move || allow_all.get()
+                                            on:change=move |_| allow_all.update(|v| *v = !*v) />
+                                        <span class="checkbox-label">"Allow @connect *"</span>
+                                    </label>
+                                </div>
+                            })}
+                            <div class="userscript-matches">{tag_list(p.connect.clone(), false)}</div>
+                        </div>
+                        <div class="us-section">
+                            <h4>"Runs on "
+                                {p.broad_match.then(|| view! { <span class="us-badge us-badge-warn">"broad match"</span> })}
+                            </h4>
+                            <div class="userscript-matches">{tag_list(p.matches.clone(), false)}</div>
+                        </div>
+                        {(!p.unsupported.is_empty() || !p.warnings.is_empty()).then(|| view! {
+                            <div class="us-section us-warn">
+                                <h4>"Warnings"</h4>
+                                <ul>
+                                    {p.unsupported.iter().map(|u| view! { <li>"Unsupported: "{u.clone()}</li> }).collect_view()}
+                                    {p.warnings.iter().map(|w| view! { <li>{w.clone()}</li> }).collect_view()}
+                                </ul>
+                            </div>
+                        })}
+                        {(!p.requires.is_empty() || !p.resources.is_empty()).then(|| view! {
+                            <div class="us-section">
+                                <h4>"Dependencies"</h4>
+                                <ul>
+                                    {p.requires.iter().map(|r| view! {
+                                        <li>"@require "{r.url.clone()}" ("{fmt_bytes(r.size_bytes as u64)}
+                                            {if r.sri_verified { ", integrity verified" } else { ", no integrity hash" }}")"</li>
+                                    }).collect_view()}
+                                    {p.resources.iter().map(|r| view! {
+                                        <li>"@resource "{r.name.clone()}": "{r.url.clone()}" ("{fmt_bytes(r.size_bytes as u64)}
+                                            {if r.sri_verified { ", integrity verified" } else { ", no integrity hash" }}")"</li>
+                                    }).collect_view()}
+                                </ul>
+                            </div>
+                        })}
+                    }
+                })}
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" on:click=move |_| show_plan.set(false)>"Cancel"</button>
+                    <button class="btn btn-primary"
+                        disabled=move || busy.get() || plan.get().is_some_and(|p| p.connect_all && !allow_all.get())
+                        on:click=do_confirm>"Approve & install"</button>
+                </div>
+            </Modal>
+
+            // Pending update dialog
+            <Modal title="Pending update" open=show_update class="source-modal"
+                on_close=Callback::new(move |_| show_update.set(false))>
+                {move || by_id(update_id.get()).and_then(|s| s.pending_update.clone().map(|p| (s, p))).map(|(s, p)| {
+                    let d = p.diff.clone();
+                    let adds_all = d.added_connect.iter().any(|c| c == "*");
+                    let row = |label: &'static str, items: Vec<String>, cls: &'static str| {
+                        (!items.is_empty()).then(|| view! {
+                            <div class="us-section"><h4>{label}</h4>
+                                <div class="userscript-matches">
+                                    {items.into_iter().map(|i| view! { <span class=format!("match-pattern {cls}")>{i}</span> }).collect_view()}
+                                </div></div>
+                        })
+                    };
+                    view! {
+                        <p>{s.name.clone()}": "{s.version.clone().unwrap_or_default()}" -> "
+                            {p.new_version.clone().unwrap_or_else(|| "?".into())}
+                            <span class="userscript-version">"found "{p.found_at.clone()}</span></p>
+                        {p.needs_reapproval.then(|| view! {
+                            <div class="us-danger">"This update widens what the script may do and needs your approval."</div>
+                        })}
+                        {row("Added matches", d.added_matches, "us-hot")}
+                        {row("Added connect", d.added_connect, "us-hot")}
+                        {row("Added grants", d.added_grants, "us-hot")}
+                        {row("Removed matches", d.removed_matches, "")}
+                        {row("Removed connect", d.removed_connect, "")}
+                        {row("Removed grants", d.removed_grants, "")}
+                        {adds_all.then(|| view! {
+                            <label class="form-checkbox">
+                                <input type="checkbox" class="checkbox-input"
+                                    prop:checked=move || update_allow_all.get()
+                                    on:change=move |_| update_allow_all.update(|v| *v = !*v) />
+                                <span class="checkbox-label">"Allow @connect *"</span>
+                            </label>
+                        })}
+                    }
+                })}
+                <div class="modal-actions">
+                    <button class="btn btn-danger" on:click=move |_| resolve_update(false)>"Discard"</button>
+                    <button class="btn btn-primary" on:click=move |_| resolve_update(true)>"Approve"</button>
+                </div>
+            </Modal>
+
+            // Details modal
+            <Modal title="Userscript details" open=show_detail class="source-modal"
+                on_close=Callback::new(move |_| show_detail.set(false))>
+                {move || by_id(detail_id.get()).map(|s| {
+                    let (id_src, id_un, id_clear) = (s.id.clone(), s.id.clone(), s.id.clone());
+                    let sid = s.id.clone();
+                    view! {
+                        <h3>{s.name.clone()}
+                            {s.version.clone().map(|v| view! { <span class="userscript-version">{v}</span> })}</h3>
+                        {s.description.clone().map(|d| view! { <p class="userscript-description">{d}</p> })}
+                        <div class="userscript-meta">
+                            {s.author.clone().map(|a| view! { <span>"Author: "{a}</span> })}
+                            {s.namespace.clone().map(|a| view! { <span>"Namespace: "{a}</span> })}
+                            {s.homepage.clone().map(|a| view! { <span>"Homepage: "{a}</span> })}
+                            {s.update_url.clone().map(|a| view! { <span>"Update URL: "{a}</span> })}
+                            {s.last_update_check.clone().map(|a| view! { <span>"Last check: "{a}</span> })}
+                        </div>
+                        <div class="userscript-meta">
+                            <span>"run-at: "{s.run_at.clone().unwrap_or_else(|| "document-idle".into())}</span>
+                            <span>{if s.noframes { "top frame only (noframes)" } else { "runs in frames" }}</span>
+                            <span>{s.require_count}" requires, "{s.resource_count}" resources"</span>
+                            {s.connect_all_approved.then(|| view! { <span class="us-badge us-badge-warn">"@connect * approved"</span> })}
+                        </div>
+                        <div class="us-section"><h4>"Grants"</h4>
+                            <div class="userscript-matches">{tag_list(s.grants.clone(), true)}</div></div>
+                        <div class="us-section"><h4>"@connect"</h4>
+                            <div class="userscript-matches">{tag_list(s.connect.clone(), false)}</div></div>
+                        <div class="us-section"><h4>"Matches"</h4>
+                            <div class="userscript-matches">{tag_list(s.match_patterns.clone(), false)}</div></div>
+                        {(!s.unsupported.is_empty() || !s.warnings.is_empty()).then(|| view! {
+                            <div class="us-section us-warn"><h4>"Warnings"</h4><ul>
+                                {s.unsupported.iter().map(|u| view! { <li>"Unsupported: "{u.clone()}</li> }).collect_view()}
+                                {s.warnings.iter().map(|w| view! { <li>{w.clone()}</li> }).collect_view()}
+                            </ul></div>
+                        })}
+                        <div class="us-section">
+                            <h4>"Stored values"
+                                {move || storage.get().map(|st| view! {
+                                    <span class="userscript-version">
+                                        {fmt_bytes(st.used_bytes)}" / "{fmt_bytes(st.quota_bytes)}</span>
+                                })}
+                            </h4>
+                            {move || {
+                                let sid = sid.clone();
+                                storage.get().map(|st| if st.values.is_empty() {
+                                    view! { <p class="modal-help">"No stored values"</p> }.into_any()
+                                } else {
+                                    view! {
+                                        <div class="table-container"><table class="table">
+                                            <thead><tr><th>"Name"</th><th>"Size"</th><th>"Preview"</th><th></th></tr></thead>
+                                            <tbody>
+                                                {st.values.into_iter().map(|v| {
+                                                    let (sid, name) = (sid.clone(), v.name.clone());
+                                                    view! { <tr>
+                                                        <td>{v.name.clone()}</td>
+                                                        <td>{fmt_bytes(v.size_bytes as u64)}</td>
+                                                        <td><code>{v.preview.clone()}</code></td>
+                                                        <td><button class="btn btn-ghost btn-sm"
+                                                            on:click=move |_| clear_storage(sid.clone(), Some(name.clone()))>"Delete"</button></td>
+                                                    </tr> }
+                                                }).collect_view()}
+                                            </tbody>
+                                        </table></div>
+                                    }.into_any()
+                                })
+                            }}
+                            <button class="btn btn-secondary btn-sm"
+                                on:click=move |_| clear_storage(id_clear.clone(), None)>"Clear all"</button>
+                        </div>
+                        <div class="modal-actions">
+                            <button class="btn btn-ghost" on:click=move |_| view_source(id_src.clone())>"View source"</button>
+                            <button class="btn btn-danger" on:click=move |_| uninstall(id_un.clone())>"Uninstall"</button>
+                        </div>
+                    }
+                })}
+            </Modal>
+
+            // Import modal
+            <Modal title="Import userscripts" open=show_import class="source-modal"
+                on_close=Callback::new(move |_| show_import.set(false))>
+                <p class="modal-help">"Choose an exported bundle file or paste its JSON."</p>
+                <input type="file" accept=".json,application/json" on:change=on_file />
+                <textarea class="source-input" placeholder="{\"format\": \"adblocker-userscripts-v1\", ...}"
+                    prop:value=move || import_text.get()
+                    on:input=move |ev| import_text.set(event_target_value(&ev))></textarea>
+                <label class="form-checkbox">
+                    <input type="checkbox" class="checkbox-input"
+                        prop:checked=move || import_replace.get()
+                        on:change=move |_| import_replace.update(|v| *v = !*v) />
+                    <span class="checkbox-label">"Replace existing scripts (default: skip)"</span>
+                </label>
+                {move || import_results.get().map(|r| view! {
+                    <ul class="us-results">
+                        {r.results.into_iter().map(|x| view! {
+                            <li>
+                                <strong>{x.name.unwrap_or_else(|| x.id.unwrap_or_default())}</strong>": "{x.status}
+                                {x.error.map(|e| format!(" - {e}"))}
+                            </li>
+                        }).collect_view()}
+                    </ul>
+                })}
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" on:click=move |_| show_import.set(false)>"Close"</button>
+                    <button class="btn btn-primary" disabled=move || busy.get() on:click=do_import>"Import"</button>
+                </div>
+            </Modal>
+
+            <Modal title="Userscript Source" open=show_source
+                on_close=Callback::new(move |_| show_source.set(false)) class="source-modal">
                 <pre class="source-code">{source_content}</pre>
             </Modal>
         </Layout>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::userscripts::ImportUserscriptsResponse;
+    use api_types::ImportResultDto;
+
+    #[test]
+    fn sensitive_grants() {
+        assert!(is_sensitive_grant("GM_xmlhttpRequest"));
+        assert!(is_sensitive_grant("GM.cookie"));
+        assert!(is_sensitive_grant("GM_setClipboard"));
+        assert!(!is_sensitive_grant("GM_getValue"));
+    }
+
+    #[test]
+    fn bytes() {
+        assert_eq!(fmt_bytes(10), "10 B");
+        assert_eq!(fmt_bytes(2048), "2.0 KiB");
+        assert_eq!(fmt_bytes(3 * 1048576), "3.0 MiB");
+    }
+
+    #[test]
+    fn summary() {
+        let r = |s: &str| ImportResultDto {
+            id: None,
+            name: None,
+            status: s.into(),
+            error: None,
+            pending_approval: false,
+        };
+        let resp = ImportUserscriptsResponse {
+            results: vec![r("installed"), r("replaced"), r("skipped"), r("error")],
+        };
+        assert_eq!(import_summary(&resp), (2, 1, 1));
     }
 }

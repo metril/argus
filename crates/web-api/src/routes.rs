@@ -3,10 +3,15 @@
 
 use std::sync::Arc;
 
-use utoipa_axum::{router::OpenApiRouter, routes};
+use axum::extract::DefaultBodyLimit;
+use utoipa_axum::{
+    router::{OpenApiRouter, UtoipaMethodRouterExt},
+    routes,
+};
 
 use crate::handlers::{
-    audit, auth, certificate, health, lists, proxy, rules, stats, tokens, users, userscripts,
+    audit, auth, certificate, health, lists, policy, proxy, rules, stats, tokens, users,
+    userscripts,
 };
 use crate::state::AppState;
 
@@ -70,6 +75,11 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         // rules
         .routes(routes!(rules::get_custom_rules, rules::update_custom_rules))
         .routes(routes!(rules::get_custom_report))
+        .routes(routes!(rules::list_site_exceptions))
+        .routes(routes!(
+            rules::put_site_exception,
+            rules::delete_site_exception
+        ))
         .routes(routes!(lists::list_ext_rules))
         .routes(routes!(rules::validate))
         .routes(routes!(rules::test_url))
@@ -87,13 +97,51 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             userscripts::install_userscript
         ))
         .routes(routes!(userscripts::get_stats))
+        .routes(routes!(userscripts::plan_userscript))
+        .routes(routes!(userscripts::confirm_plan))
+        .routes(routes!(userscripts::export_userscripts))
+        .routes(
+            routes!(userscripts::import_userscripts)
+                .layer(DefaultBodyLimit::max(userscripts::MAX_IMPORT_BYTES)),
+        )
+        .routes(routes!(userscripts::check_update))
+        .routes(routes!(userscripts::approve_update))
+        .routes(routes!(userscripts::discard_update))
+        .routes(routes!(
+            userscripts::get_storage,
+            userscripts::clear_storage
+        ))
+        .routes(routes!(userscripts::delete_storage_value))
         .routes(routes!(
             userscripts::get_userscript,
-            userscripts::update_userscript,
             userscripts::uninstall_userscript
         ))
         .routes(routes!(userscripts::get_userscript_source))
         .routes(routes!(userscripts::set_enabled))
+        // script policy
+        .routes(routes!(policy::get_settings, policy::put_settings))
+        .routes(routes!(policy::list_site_rules, policy::create_site_rule))
+        .routes(routes!(policy::update_site_rule, policy::delete_site_rule))
+        .routes(routes!(
+            policy::list_source_rules,
+            policy::create_source_rule
+        ))
+        .routes(routes!(
+            policy::update_source_rule,
+            policy::delete_source_rule
+        ))
+        .routes(routes!(
+            policy::list_temp,
+            policy::grant_temp,
+            policy::revoke_all_temp
+        ))
+        .routes(routes!(policy::revoke_temp))
+        .routes(routes!(policy::explain))
+        .routes(routes!(policy::preview))
+        .routes(routes!(policy::export))
+        .routes(routes!(policy::import))
+        .routes(routes!(policy::reports))
+        .routes(routes!(policy::get_panel, policy::put_panel))
         // audit
         .routes(routes!(audit::list_audit))
 }

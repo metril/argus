@@ -1,0 +1,286 @@
+# Userscript delivery and GM endpoint protocol
+
+Audience: whoever wires `crates/userscript-engine` into the proxy. The JS runtime
+(`assets/gm.js`) is the only client; everything below is what the server side must implement,
+so the JS never needs to be read. Pure-Rust implementations of the operations live in
+`userscript_engine::backend` (`GmBackend`), `token`, and `bundle`.
+
+## 1. Model
+
+Userscripts run **in the page's own JavaScript world**: a proxy has no isolated world. The
+runtime is injected before any page script, captures the built-ins it needs, and talks to
+the proxy over same-origin `fetch` to paths under `/__adblock__/gm/`. Privileged
+operations (value storage, cross-origin requests, cookies, resources) are done by the proxy
+after it authenticates the caller as "script S of profile P on origin O" and enforces the
+script's *server-side* grants and `@connect` list.
+
+Never forward `/__adblock__/` upstream; answer it locally for every host the proxy
+intercepts (the page's origin is the proxied host, so requests are same-origin).
+
+## 2. Delivery
+
+1. For an HTML document: resolve the profile (from the connection), call
+   `ScriptIndex::candidates(host, url, is_top_frame)`. Empty result: inject nothing.
+2. Build the bundle: `bundle::generate(&candidates, &BundleOptions)` with
+   `values` = the scripts' current stored values (`GmBackend::values_get(ctx, None)`), so
+   `GM_getValue` is synchronous. `BundleOptions::page_origin` must be the document's origin
+   in `Origin`-header form (`https://example.com`, no trailing slash, default port omitted).
+3. Serve `Bundle::js` as **an external script** (`Content-Type: application/javascript`,
+   `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`) at an unguessable, short-lived,
+   ideally single-use URL (e.g. `/__adblock__/us/<random>.js`), and inject at the very top of
+   `<head>`: `<script src="/__adblock__/us/<random>.js" nonce="..."></script>`: classic,
+   synchronous, no `async`/`defer`, so `@run-at document-start` scripts run before page code.
+   Do not inline the bundle: script *source* is emitted verbatim (it is code), so a literal
+   `</script` in a script would end an inline tag. `Bundle::inline_safe()` reports when inlining
+   would also be safe. All metadata/values in the bundle are escaped with `bundle::js_json`
+   (`<`, `>`, `&`, U+2028, U+2029 become `\uXXXX`).
+4. CSP: use the same nonce mechanism as `boot.js`. `@unwrap` scripts and `GM_addStyle` copy the
+   bundle's nonce to elements they create. Trusted Types: not handled by the runtime; if the
+   page enforces it, the proxy must allow the policy it creates for `boot.js`, or skip userscripts.
+5. One syntax error in any script makes the whole bundle fail to parse. Call `generate` once
+   per script and inject several bundles if isolation matters more than size (with
+   the shared runtime of 2.1 the 40 KB runtime is not repeated).
+6. The runtime removes its own `<script>` element from the DOM at startup and again removes
+   any element it injected (`@unwrap`) after execution.
+
+Bundle layout: the runtime (`<gm.js>`, installed once, see 2.1) is called as `run({base, top, handler, handlerVersion}, [{d: descriptor, f: fn}, ...], window, shared)`.
+Descriptor `d`: `id, name, runAt, grants (canonical, lowercase), params, token, meta, metaStr,
+unwrap, values?, resources?, code?`. `f` is `function(GM_info, GM, <granted GM_*>, unsafeWindow)`
+wrapping `@require`s + source in one scope (`this === window`; async function with
+`@top-level-await`). `@grant none` gives only `unsafeWindow` (=== `window`). `GM_info`/`GM`
+exist whenever any real grant is present. `@unwrap` scripts get no GM API and are injected as a
+nonce'd inline `<script>`.
+
+### 2.1 As implemented in `proxy-core` (`src/gm.rs`)
+
+* **One file per script**, as 2.5 suggests: `/__adblock__/us/<doc>.<n>.js`, `n` in injection order
+  (run-at group, then install order); a syntax error in one script cannot break another.
+* **The runtime is served once**, from a shared, content-hashed, immutable URL
+  (`/__adblock__/gm.<hash>.js`, `Cache-Control: immutable`, no secret in it): one nonce'd
+  `<script src>` placed before the first bundle. It installs the runtime function, the command
+  registry shared by every script of the document, and one non-writable, non-configurable entry
+  point under `Symbol.for("adblock.userscript.runtime")`. Each bundle is then only
+  `(function(r){if(r)r(cfg,[entries]);})(window[Symbol.for("adblock.userscript.runtime")]);`
+  (`BundleOptions::shared_runtime`; without it the bundle starts with the same installer, and a
+  later bundle reuses the first install). Secrecy is unchanged: capability tokens, stored values
+  and `@resource` bodies still arrive only in the per-document, single-use `no-store` bundle
+  responses. A hostile page that finds the entry point can call it, but with entries of its own
+  and no token it has no GM authority; it can at most add fake menu commands. Consequence:
+  `GM_registerMenuCommand` registers for every script on the page, not just the first.
+* The page's `<head>` carries only the `<script src>` tags: no token, no config. The bundle is
+  generated when the URL is fetched (stored values read then), served once (`404` afterwards),
+  bound to the document's host, and expires 60 s after the document was served. Per-document
+  records live in a bounded map (4096, oldest evicted first).
+* The scripts' `<script>` tags come after the blocker's own tags, still before any page script.
+  The policy gets `script` (nonce), `connect` (when any script has a grant), and `style` (when a
+  script uses `GM_addStyle`/`@unwrap`). A response whose CSP is `sandbox` without `allow-scripts`
+  gets nothing.
+* `origin` for token binding is derived from the connection (scheme, host, port), not from a
+  header; the `Origin` header must equal it. `resource` GETs have no `Origin`, so they need
+  `Sec-Fetch-Site: same-origin`. POSTs need `Origin` and `Content-Type`; a cross-site request,
+  `null` origin or a missing header is `403` with an empty body, and `OPTIONS` is never answered.
+* `values/get` also works for scripts that only `@grant GM_addValueChangeListener`.
+* Outbound concurrency: 8 per script, 32 per profile (`429` + `quota_exceeded`). The request body is
+  buffered up to `Quotas::max_request_body` (64 MiB); the response is streamed with a 256 MiB cap
+  and one overall deadline (`timeout`). `Accept-Encoding: identity` is sent unless the script set one.
+* Not implemented: attaching the browser's own cookies for `anonymous: false` (the proxy cannot
+  see them; only the GM jar is used), and a shared, cacheable runtime URL.
+
+## 3. Capability token
+
+`v1.<b64url(script_id)>.<exp_unix_secs>.<b64url(HMAC-SHA256(key, msg))>`,
+`msg = "adblock-gm-v1" 0 profile 0 script_id 0 script_version 0 origin 0 caps_hash 0 exp`
+(0 = NUL byte; `caps_hash` = `token::caps_hash`: sorted canonical grants, sorted `@connect`,
+`@connect *` approval flag). Key: supplied by the caller (>= 32 random bytes; rotate on restart
+is fine: pages refresh, see `token/refresh`). Default lifetime 1 h; the runtime refreshes at
+half-life, or every 20 s when under 4 min remain.
+
+The token **only identifies the claimed script**. The server must, per request:
+1. take `profile` from the *connection* (never from the request), `origin` from the `Origin`
+   header (reject if absent);
+2. `token::claimed_script_id(token)`, load that script from its own store for that profile;
+3. `token::verify(key, token, now, profile, origin, |id| record)` with the stored script's
+   version and `caps_hash`; reject on any error (`401 unauthorized`);
+4. build `ScriptCtx { profile, script: &stored, page_host: host(origin) }` and call
+   `GmBackend`, which checks the *stored* grants/enabled flag/`@connect`. Nothing from the
+   token or body ever widens authority. Editing a script, changing its grants/`@connect`, a
+   different profile or origin, or expiry invalidates old tokens.
+
+Transport: header `X-GM-Token: <token>`. The only exception is `GET /resource` which also
+accepts `?t=<token>` so it can back `<img src>`-style use.
+
+## 4. Request rules (all endpoints)
+
+* Base path `/__adblock__/gm/v1/`. Method `POST` (JSON) except `resource` (`GET`) and `xhr`
+  (`POST`, binary framing). Fetch is made with `credentials: "omit"`, `cache: "no-store"`,
+  `redirect: "error"`.
+* Require `Sec-Fetch-Site: same-origin` (when present) and `Origin` equal to the token's origin;
+  reject `Origin: null`. Content-Type must be exactly `application/json` (or
+  `application/x-gm-frame` for `xhr`). Never emit CORS headers. Respond with
+  `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`.
+* Cap request bodies (`Quotas::max_request_body` for xhr, 2 MiB JSON otherwise).
+
+### Envelope and errors
+
+Success: `200 {"ok":true,"result":<json>}`. Failure: `{"ok":false,"error":{"code","message"}}`
+with the status from `ErrorCode::http_status()`: `unauthorized` 401, `not_granted` /
+`connect_denied` / `disabled` 403, `quota_exceeded` 413, `bad_request` 400, `not_found` 404,
+`unsupported` 501, `internal` 500. (`GmError::to_json()` builds the body.)
+
+## 5. Endpoints
+
+All map 1:1 onto `GmBackend` methods; "grant" = any of the listed canonical grants.
+
+| Path | Body | Result | Grant |
+|---|---|---|---|
+| `values/get` | `{"names": ["a"] \| null}` (null = all) | `{name: value}` (missing names omitted) | getValue / getValues / listValues |
+| `values/set` | `{"values": {name: json}, "src": "<tab id>"}` | `null` | setValue / setValues |
+| `values/delete` | `{"names": [..], "src": ".."}` | `null` | deleteValue / deleteValues |
+| `values/list` | `{}` | `[names]` | listValues |
+| `values/changes` | `{"since": null \| seq}` | `{"seq": n, "reset": bool, "changes": [{seq,name,old,new,src}]}` | addValueChangeListener |
+| `token/refresh` | `{}` | `{"token": "...", "exp": n}` (mint a new token for the verified script) | none beyond a valid token |
+| `cookie` | `{"op":"list","url","name"?}` / `{"op":"set","url","cookie":{...}}` / `{"op":"delete","url","name"}` | list: `[Cookie]`, else `null` | cookie (+ `@connect` on the URL) |
+| `resource?name=N&t=TOKEN` | (GET) | raw bytes, `Content-Type` = stored MIME | getResourceText / getResourceURL |
+| `xhr` | framed, see 5.1 | framed stream | xmlhttpRequest (`op:"xhr"`) / download (`op:"download"`) |
+
+Values are JSON. Quotas (`Quotas`, per call to `values/set`, all-or-nothing): per value,
+per script, per profile; exceeding any gives `quota_exceeded`. Storage is namespaced by
+(profile, script id) (`storage::ns`). `values/changes` is a bounded (256) per-script log:
+`since` older than the log returns `reset: true` (re-read all values). `src` is the writer's
+opaque tab id so a tab ignores its own writes. Same-origin tabs also notify each other over
+`BroadcastChannel("adblock-gm:<script id>")`; the poll is the cross-origin path and runs
+every 2.5 s only while a value-change listener exists.
+
+`@resource` bodies up to `inline_resource_limit` (256 KiB) are embedded in the bundle
+(sync `GM_getResourceText/URL`); larger ones are fetched through `resource`.
+
+### 5.1 `xhr` framing
+
+Request body (`Content-Type: application/x-gm-frame`):
+`u32 big-endian metaLen | meta JSON (UTF-8) | body bytes (rest)`.
+`meta` = `backend::XhrRequest`: `{op: "xhr"|"download", method, url (absolute), headers: [[name,
+value],...], anonymous, cookie, user, password, timeout (ms), redirect: "follow"|"error"|"manual"}`.
+FormData/Blob/ArrayBuffer/URLSearchParams are serialised by the client; the content type
+(with multipart boundary) is in `headers`.
+
+Server steps: authenticate (section 3), `GmBackend::build_outbound(ctx, &meta, body)` (grant,
+`@connect`, method allow-list, header sanitising, body cap) -> `OutboundRequest`. Execute it with
+the proxy's own HTTP client under the proxy's **destination policy** (SSRF protection: refuse
+loopback/private/link-local/the proxy's own listeners unless the policy explicitly allows
+them; `@connect` is a script-level allowance, not a substitute). For each redirect response
+call `backend::next_hop(ctx, &prev, status, location)` (re-checks `@connect`, strips
+`Authorization`/`Cookie` cross-origin, rewrites method for 301/302/303) unless
+`redirect != follow`. `use_cookie_jar` (= not `anonymous`) selects the script's own GM cookie jar (one per profile and
+script: a script never sees or replays cookies another script obtained; HttpOnly cookies the
+script itself stored or received are listed to that script, as Tampermonkey's `GM_cookie` does with
+its `httpOnly` field; scoping follows RFC 6265: domain-match, path-match, host-only, `Secure` only
+over https, `Domain=` refused for public suffixes and unlisted single-label TLDs)
+for send and `Set-Cookie`; the browser's own cookies for third-party sites are not available to
+a proxy.
+
+Response: `200` + `Content-Type: application/x-gm-frames`, then frames
+`u8 type | u32 big-endian len | payload`:
+
+| type | payload |
+|---|---|
+| 1 head | JSON `{"status", "statusText", "headers": [[name, value],...], "finalUrl", "redirected"?}`; exactly once, first |
+| 2 data | raw body bytes; zero or more, as they arrive (drives `onprogress`, streaming) |
+| 3 end | `{}`; last frame on success |
+| 4 error | JSON `{"kind": "network"\|"timeout"\|"denied"\|"too_large"\|"aborted", "code", "message", "status"?}`; terminal |
+
+If the request is refused before any upstream contact (auth, grants, `@connect`, bad input) the
+server answers with the normal JSON error envelope and its status instead of frames; the client
+tells the two apart by `Content-Type`. Client abort = the fetch is cancelled; the server must
+drop the upstream request when the connection closes. HTTP error statuses (4xx/5xx) are
+ordinary `head` frames. Upload progress is emulated by the client (`loadstart`/`progress`/`load`
+once the body is sent); true upload streaming is not available through `fetch` everywhere.
+
+`download`: same endpoint with `op:"download"`; the client turns the bytes into a Blob and
+clicks an `<a download>` (the proxy cannot write to the user's disk).
+
+## 6. What a hostile page can still do
+
+The runtime shares a world with the page. Mitigations: all built-ins are captured at startup
+(`fetch`, `JSON`, `Promise`, `Object.*`, `Function.prototype.call/apply/bind`, DOM
+prototype methods, `Response`/`Headers`/stream readers, typed-array methods, timers);
+capability tokens live only in closures (never on `window`, the DOM, attributes or
+URLs); GM objects handed to scripts are frozen; the injected `<script>`
+element is removed after it runs.
+
+Still possible, so **backend checks must never rely on page-side secrecy**:
+* a page that runs *before* us in the same frame (inline script ahead of `<head>`'s first
+  child, a browser extension, a pre-existing same-origin frame) can poison
+  built-ins before they are captured; we cannot detect it;
+* it can tamper with prototypes of objects created later (script-visible results such as
+  `Promise.prototype.then` on promises we return, `Array.prototype` seen by user code),
+  and observe/modify anything user scripts put in the DOM;
+* it can read the bundle URL if it is guessable or reusable, and thus steal tokens; a stolen
+  token is usable only from that origin (the `Origin` header is checked), for that script, until
+  expiry, with that script's server-side grants;
+* it can call the endpoints itself with a stolen token, or replace `window.fetch`.
+
+### 6.1 Service workers
+
+A service worker registered for the page's origin is in the path of every same-origin request
+the page makes. Nothing the proxy can add changes that: a `fetch` handler sees page-initiated
+requests whatever their headers, and it can answer any of them. In particular, with
+`service_worker_policy = "allow"` a worker can (a) read the `X-GM-Token` header and body of each
+GM backend call and the responses (values, `xhr` payloads, resources), and so act as the script
+until the token expires; (b) answer the boot script, the runtime or a bundle URL with code of
+its own; (c) `importScripts()` a bundle URL it learned from intercepted markup, which consumes
+the single-use URL and runs the bundle inside the worker. It **cannot** read a bundle through
+`fetch()`: a bundle is served only when `Sec-Fetch-Dest: script` (the browser sets that header and
+page or worker code cannot), and a worker's `fetch()` carries `empty`. Detecting interception from
+the page is not possible either: anything the page could check (a header, a timing, a marker in the
+response) the worker controls, since it can answer the check itself.
+
+What is done about it, per `userscripts.service_worker_policy`:
+
+* `block_when_privileged` (default): on hosts where an enabled userscript with
+  `GM_xmlhttpRequest`, `GM_download` or `GM_cookie` could match (host buckets only, so this
+  over-approximates), a service-worker script fetch (`Service-Worker: script` or
+  `Sec-Fetch-Dest: serviceworker`) is answered 403 and registration fails; and documents of such
+  hosts that get userscripts run `navigator.serviceWorker.getRegistrations()` at document start
+  (in the boot script) and unregister every registration.
+* `block`: the same on every host with at least one userscript installed.
+* `allow`: neither; (a) to (c) above apply.
+
+Still exposed with the default: a worker that was already controlling a page keeps doing so for
+the document load that unregisters it; hosts with only non-privileged scripts keep their workers,
+which can then see those scripts' calls and values; a worker script served from the HTTP cache
+without a request never reaches the proxy, but any update check does; `importScripts` inside an
+already-running worker (not a registration) is not distinguishable by the proxy from the worker's
+own fetches for `Sec-Fetch-Dest` purposes and is covered only by unregistering. The backend still
+checks `Origin`, token, per-script grants and quotas on every call, so a stolen token stays limited
+to that script on that origin for its lifetime.
+
+### 6.2 Authority checks
+
+Hence the server enforces everything itself: authority comes from the stored script, not from
+the token; `@connect`, `@grant`, quotas and the destination policy are checked per request;
+unguessable single-use bundle URLs; short token lifetime; per-profile isolation; scripts the user
+has not approved never get tokens. `@grant none` scripts get no token-bearing API at all (the
+descriptor still carries one, unused).
+
+## 7. API coverage
+
+Implemented: `GM_getValue/setValue/deleteValue/listValues`, `GM_getValues/setValues/
+deleteValues`, `GM_add/removeValueChangeListener`, `GM_addStyle`, `GM_addElement`,
+`GM_getResourceText/URL`, `GM_xmlhttpRequest` (text/json/blob/arraybuffer/document/stream,
+timeout, abort, anonymous, cookie, user/password, overrideMimeType, binary, readystatechange/
+load/error/abort/timeout/progress), `GM_download`, `GM_openInTab`, `GM_setClipboard`,
+`GM_notification` (Notification API; console fallback), `GM_registerMenuCommand/
+unregisterMenuCommand`, `GM_log`, `GM_getTab/saveTab/getTabs`, `GM_cookie.list/set/delete`,
+`GM_info`, `unsafeWindow`, `window.onurlchange`, both `GM_*` and `GM.*` forms.
+Partial: `upload.onprogress` (emulated), `GM_openInTab` options, `GM_notification` (no
+`highlight`), `@sandbox`/`@inject-into` (always the page world; reported as unsupported).
+Unsupported (reported at install): `@run-at context-menu`, `@webRequest`/`GM_webRequest`
+(rejects/throws `unsupported`), `@run-in`.
+
+Menu commands are exposed to an in-page panel through `window[Symbol.for("adblock.userscript.menu")]`:
+a frozen, non-enumerable object `{commands(): [{script, scriptName, id, caption, accessKey}],
+invoke(scriptId, id): boolean, subscribe(callback)}`. It is created once per document by the shared
+runtime script and holds the commands of every script; callbacks are never exposed, only invoked.
+The in-page panel (`docs/SCRIPT-POLICY.md`) lists and fires them. Like everything in the page's
+JavaScript world it is reachable by the page: a hostile page can list the commands (script names
+and captions) and invoke them, which runs code the script already chose to run on a user action.

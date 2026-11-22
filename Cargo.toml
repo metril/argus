@@ -6,6 +6,7 @@ members = [
     "crates/ext-rules",
     "crates/list-service",
     "crates/userscript-engine",
+    "crates/script-policy",
     "crates/web-api",
     "crates/web-ui",
     "crates/common",

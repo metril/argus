@@ -84,6 +84,7 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
         },
         adblock: AdblockSettings::default(),
         userscripts: UserscriptSettings::default(),
+        script_control: Default::default(),
         webui: WebUiSettings::default(),
     }
 }

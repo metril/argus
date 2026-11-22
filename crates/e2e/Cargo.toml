@@ -11,6 +11,10 @@ publish = false
 proxy-core = { path = "../proxy-core", default-features = false, features = ["websockets"] }
 filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
+userscript-engine = { path = "../userscript-engine" }
+script-policy = { path = "../script-policy", features = ["store"] }
+list-service = { path = "../list-service", default-features = false }
+common = { path = "../common" }
 tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -19,7 +23,7 @@ bytes = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }
@@ -28,3 +32,4 @@ async-trait = { workspace = true }
 async-compression = { workspace = true, features = ["zstd"] }
 encoding_rs = "0.8"
 serde_json = { workspace = true }
+base64 = "0.22"

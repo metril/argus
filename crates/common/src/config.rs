@@ -13,6 +13,8 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub userscripts: UserscriptSettings,
     #[serde(default)]
+    pub script_control: ScriptControlSettings,
+    #[serde(default)]
     pub webui: WebUiSettings,
 }
 
@@ -165,9 +167,58 @@ impl Default for AdblockSettings {
     }
 }
 
+/// What the proxy does about service workers on sites that get userscripts. A service worker
+/// sees every same-origin request of its pages, including the userscript bundles (and their
+/// tokens) and GM responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceWorkerPolicy {
+    /// Do nothing: service workers work everywhere and can read what the page can.
+    Allow,
+    /// Refuse service-worker script fetches (registration fails) and unregister existing
+    /// workers, on hosts where a userscript with network, download or cookie grants applies.
+    #[default]
+    BlockWhenPrivileged,
+    /// Same, for every host the proxy filters.
+    Block,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
+    /// Hours between scheduled update checks of scripts that have an update URL (0 = off).
+    #[serde(default)]
+    pub update_check_interval_hours: u64,
+    /// Apply found updates automatically, only when they do not widen `@match`/`@connect`/`@grant`.
+    #[serde(default)]
+    pub auto_apply_updates: bool,
+    /// `allow`, `block_when_privileged` (default) or `block`; see [`ServiceWorkerPolicy`].
+    #[serde(default)]
+    pub service_worker_policy: ServiceWorkerPolicy,
+}
+
+/// Script control (NoScript-style policy) and its in-page panel. The rules and the master switch
+/// live in the database and the management API; these are deployment settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScriptControlSettings {
+    /// Offer the in-page panel at all (each profile can also turn it off).
+    pub panel_enabled: bool,
+    /// Reserved host name the proxy answers itself for panel confirmations. It must never
+    /// resolve on the real internet: keep a `.invalid` name.
+    pub panel_host: String,
+    /// Dashboard base URL the panel links to (empty: derived from the `webui` settings).
+    pub dashboard_url: String,
+}
+
+impl Default for ScriptControlSettings {
+    fn default() -> Self {
+        Self {
+            panel_enabled: true,
+            panel_host: "adblock.invalid".into(),
+            dashboard_url: String::new(),
+        }
+    }
 }
 
 /// When session cookies carry the `Secure` attribute.
@@ -294,6 +345,7 @@ impl Default for ProxyConfig {
             },
             adblock: AdblockSettings::default(),
             userscripts: UserscriptSettings::default(),
+            script_control: ScriptControlSettings::default(),
             webui: WebUiSettings::default(),
         }
     }

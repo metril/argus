@@ -18,6 +18,12 @@ pub struct Profile {
     /// Client label attached to block events (the profile id for now), built once per profile so
     /// the request path allocates nothing.
     pub label: Arc<str>,
+    /// Userscripts of this profile (live index, GM backend, token key). `None`: no userscripts.
+    pub userscripts: Option<Arc<userscript_engine::UserscriptManager>>,
+    /// Script control of this profile (compiled policy, header cache, panel settings). `None`:
+    /// script control is not available; when present and its master switch is off, the request
+    /// path does one atomic load and nothing else.
+    pub script_control: Option<Arc<crate::scriptctl::ScriptControl>>,
 }
 
 impl Profile {
@@ -37,6 +43,36 @@ impl Profile {
             generation,
             engine,
             label: Arc::from(id.to_string()),
+            userscripts: None,
+            script_control: None,
+        }
+    }
+
+    /// The same profile with userscripts attached.
+    pub fn with_userscripts(
+        mut self,
+        manager: Option<Arc<userscript_engine::UserscriptManager>>,
+    ) -> Self {
+        self.userscripts = manager;
+        self
+    }
+
+    /// The same profile with script control attached.
+    pub fn with_script_control(
+        mut self,
+        control: Option<Arc<crate::scriptctl::ScriptControl>>,
+    ) -> Self {
+        self.script_control = control;
+        self
+    }
+
+    /// The userscript manager, only for the profile that owns the stored scripts (the default
+    /// profile until profiles get their own script sets).
+    pub fn userscript_manager(&self) -> Option<&Arc<userscript_engine::UserscriptManager>> {
+        if self.id == DEFAULT_PROFILE_ID {
+            self.userscripts.as_ref()
+        } else {
+            None
         }
     }
 }

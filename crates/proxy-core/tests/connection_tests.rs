@@ -50,6 +50,7 @@ async fn test_server_with_mitm_enabled() {
         },
         adblock: AdblockSettings::default(),
         userscripts: UserscriptSettings::default(),
+        script_control: Default::default(),
         webui: WebUiSettings::default(),
     };
 
@@ -106,6 +107,7 @@ async fn test_server_with_mitm_disabled() {
         },
         adblock: AdblockSettings::default(),
         userscripts: UserscriptSettings::default(),
+        script_control: Default::default(),
         webui: WebUiSettings::default(),
     };
 
@@ -154,6 +156,7 @@ async fn test_certificate_generation() {
         },
         adblock: AdblockSettings::default(),
         userscripts: UserscriptSettings::default(),
+        script_control: Default::default(),
         webui: WebUiSettings::default(),
     };
 
@@ -233,6 +236,7 @@ async fn test_load_manager_integration() {
         },
         adblock: AdblockSettings::default(),
         userscripts: UserscriptSettings::default(),
+        script_control: Default::default(),
         webui: WebUiSettings::default(),
     };
 

@@ -1,14 +1,75 @@
 //! Userscript representation and management
 
-use crate::{metadata::UserscriptMetadata, Error, Result};
+use crate::{
+    matcher::{Options, Rules},
+    metadata::UserscriptMetadata,
+    Error, Result,
+};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Profile namespace used until profiles land.
+pub const DEFAULT_PROFILE: &str = "default";
+
+fn default_profile() -> String {
+    DEFAULT_PROFILE.to_string()
+}
+
+/// Fetched `@require` body (stored at install time so pages never wait on third parties).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequireBlob {
+    pub url: String,
+    pub content: String,
+}
+
+/// Fetched `@resource`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceBlob {
+    pub name: String,
+    pub url: String,
+    pub mime: String,
+    /// Standard base64.
+    pub data_b64: String,
+}
+
+impl ResourceBlob {
+    pub fn bytes(&self) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.data_b64)
+            .unwrap_or_default()
+    }
+}
+
+/// Downloaded dependencies of a script.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScriptAssets {
+    pub requires: Vec<RequireBlob>,
+    pub resources: Vec<ResourceBlob>,
+}
+
+/// A newer version found by an update check, waiting for approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingUpdate {
+    pub source: String,
+    #[serde(default)]
+    pub assets: ScriptAssets,
+    pub diff: crate::install::UpdateDiff,
+    pub new_version: Option<String>,
+    pub found_at: DateTime<Utc>,
+    /// Where the new source came from (resolves relative `@require` URLs).
+    #[serde(default)]
+    pub origin_url: Option<String>,
+}
 
 /// Represents a single userscript
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Userscript {
     /// Unique identifier
     pub id: String,
+    /// Owning profile (storage namespace).
+    #[serde(default = "default_profile")]
+    pub profile: String,
     /// Script metadata
     pub metadata: UserscriptMetadata,
     /// Script source code
@@ -23,6 +84,18 @@ pub struct Userscript {
     pub last_executed: Option<DateTime<Utc>>,
     /// Number of times the script has been executed
     pub execution_count: u64,
+    /// Downloaded `@require`/`@resource` content.
+    #[serde(default)]
+    pub assets: ScriptAssets,
+    /// The user approved `@connect *` for this script at install time.
+    #[serde(default)]
+    pub allow_connect_all: bool,
+    /// A found update awaiting approval.
+    #[serde(default)]
+    pub pending_update: Option<PendingUpdate>,
+    /// When an update check last completed for this script.
+    #[serde(default)]
+    pub last_update_check: Option<DateTime<Utc>>,
 }
 
 impl Userscript {
@@ -34,6 +107,7 @@ impl Userscript {
 
         Ok(Self {
             id,
+            profile: default_profile(),
             metadata,
             source,
             enabled: true,
@@ -41,6 +115,10 @@ impl Userscript {
             updated_at: now,
             last_executed: None,
             execution_count: 0,
+            assets: ScriptAssets::default(),
+            allow_connect_all: false,
+            pending_update: None,
+            last_update_check: None,
         })
     }
 
@@ -70,7 +148,11 @@ impl Userscript {
 
     /// Check if script should run on a given URL
     pub fn should_run_on(&self, url: &str) -> bool {
-        self.enabled && self.metadata.should_run_on(url)
+        if !self.enabled {
+            return false;
+        }
+        let (rules, _) = Rules::compile(&self.metadata, Options::default());
+        rules.is_match_url(url)
     }
 
     /// Get script name
@@ -91,8 +173,7 @@ impl Userscript {
     /// Check if an update is needed based on version comparison
     pub fn needs_update(&self, new_version: &str) -> bool {
         if let Some(current_version) = &self.metadata.version {
-            // Simple version comparison (could be enhanced with semver)
-            new_version > current_version.as_str()
+            crate::install::is_newer(current_version, new_version)
         } else {
             true // No version = always update
         }

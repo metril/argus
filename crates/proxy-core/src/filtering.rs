@@ -14,8 +14,8 @@ use crate::ext;
 use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody};
 use crate::internal::Internal;
 use crate::policy::{is_refusal, DestPolicy};
-use crate::redirect::{block_response, redirect_response, rewrite_redirect};
-use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
+use crate::redirect::{block_response, policy_block_response, redirect_response, rewrite_redirect};
+use crate::request_ctx::{default_profile_slot, Profile, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url, RequestType};
 use crate::rewrite::codec::{choose_encoding, response_codings};
 use crate::rewrite::pipeline::{transform_html, transform_text, Outcome};
@@ -82,6 +82,17 @@ pub fn refused_response() -> Response<ProxyBody> {
         .expect("static response")
 }
 
+/// `Origin`-header form of an authority: scheme, host, and the port unless it is the default.
+fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
+    let scheme = if scheme == "http" { "http" } else { "https" };
+    let default = if scheme == "http" { 80 } else { 443 };
+    if port == default {
+        format!("{scheme}://{url_host}")
+    } else {
+        format!("{scheme}://{url_host}:{port}")
+    }
+}
+
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
 pub struct ProxyContext {
     engine: Arc<SharedEngine>,
@@ -126,6 +137,51 @@ impl ProxyContext {
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// Attach (or detach) the userscripts of the default profile. Live: connections hold the
+    /// profile slot, so the next request sees them.
+    pub fn set_userscripts(&self, manager: Option<Arc<userscript_engine::UserscriptManager>>) {
+        let slot = &self.default_ctx.profile;
+        let cur = slot.load_full();
+        slot.store(Arc::new(
+            Profile::new(cur.id, cur.generation, cur.engine.clone())
+                .with_userscripts(manager)
+                .with_script_control(cur.script_control.clone()),
+        ));
+    }
+
+    /// What to do about service workers on sites that get userscripts.
+    pub fn set_service_worker_policy(&self, p: common::config::ServiceWorkerPolicy) {
+        self.internal.gm.set_sw_policy(p);
+    }
+
+    /// Configure the in-page panel (reserved host, global switch, dashboard link) and the
+    /// per-site blocking backend.
+    pub fn configure_panel(
+        &self,
+        cfg: crate::panel::PanelConfig,
+        blocking: Option<Arc<dyn crate::panel::SiteBlocking>>,
+    ) {
+        self.internal.panel.configure(cfg);
+        self.internal.panel.set_site_blocking(blocking);
+    }
+
+    /// Attach the script control of the default profile (see [`crate::scriptctl`]). Live, like
+    /// [`Self::set_userscripts`].
+    pub fn set_script_control(&self, control: Option<Arc<crate::scriptctl::ScriptControl>>) {
+        let slot = &self.default_ctx.profile;
+        let cur = slot.load_full();
+        slot.store(Arc::new(
+            Profile::new(cur.id, cur.generation, cur.engine.clone())
+                .with_userscripts(cur.userscripts.clone())
+                .with_script_control(control),
+        ));
+    }
+
+    /// Documents currently holding unfetched userscript bundle URLs (bounded; for tests/metrics).
+    pub fn userscript_docs(&self) -> usize {
+        self.internal.gm.docs.len()
     }
 
     /// Scriptlet names that pages reported as unsupported (no uBO equivalent), with report counts.
@@ -296,11 +352,48 @@ impl ProxyContext {
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
         let url_host = authority::url_host(&host);
 
+        // The reserved confirmation host is answered by the proxy alone: never filtered, never
+        // forwarded, whatever the entry mode.
+        if self.internal.panel.is_panel_host(&host) {
+            let origin = origin_of(scheme, &url_host, port);
+            return Ok(self
+                .internal
+                .panel
+                .handle(&self.internal, req, rctx, &origin)
+                .await);
+        }
+
         // Internal endpoints are answered locally for every host: never filtered, never
         // forwarded.
         if uri.path().starts_with(csp::INTERNAL_PREFIX) {
-            let engine = rctx.profile.load().engine.clone();
-            return Ok(self.internal.handle(req, &host, &engine).await);
+            let origin = origin_of(scheme, &url_host, port);
+            let up = crate::gm::Upstream {
+                client: &self.client,
+                strict_client: &self.strict_client,
+                policy: &self.policy,
+                resolve_all_to: self.resolve_all_to,
+            };
+            return Ok(self.internal.handle(req, &host, &origin, rctx, &up).await);
+        }
+
+        // A service-worker script fetch (also `importScripts` inside one) on a host where a
+        // privileged userscript may run: refuse, so registration fails and the worker never sees
+        // the page's bundles or GM traffic (see docs/USERSCRIPT-PROTOCOL.md section 6).
+        if is_service_worker_fetch(req.headers()) {
+            let refuse = rctx
+                .profile
+                .load()
+                .userscript_manager()
+                .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+            if refuse {
+                debug!("Refused a service worker script fetch for {host}");
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::FORBIDDEN)
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "service workers are blocked on this site")
+                    .body(crate::inject::full_body(bytes::Bytes::new()))
+                    .expect("sw refusal"));
+            }
         }
 
         // Take the request apart: the header map is moved, not copied, from here on.
@@ -327,6 +420,9 @@ impl ProxyContext {
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
         let mut csp: Option<String> = None;
+        // A document the user switched ad blocking off for (see `SharedEngine::site_off`): no
+        // cosmetics, scriptlets or extended rules for it.
+        let mut page_off = false;
         // The engine generation this request is judged by (carries the ext-rule index); the
         // response is judged by the same one.
         let mut generation: Option<Arc<filter_engine::Generation>> = None;
@@ -341,11 +437,15 @@ impl ProxyContext {
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
+                    if let Some(sc) = &profile.script_control {
+                        count_page_block(sc, source_url(&headers, &url, rtype));
+                    }
                     if let Some(res) = verdict.redirect_resource() {
                         return Ok(redirect_response(res));
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
+                page_off = rtype.is_frame() && engine.site_off(&url);
                 if let Some(new_url) = verdict.rewritten_url {
                     let navigation =
                         rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
@@ -368,6 +468,9 @@ impl ProxyContext {
                             let rule = idx.rule(id).map(|r| r.raw.clone()).unwrap_or_default();
                             debug!("Blocked {} by extended rule {}", url, rule);
                             let list = idx.rule(id).map(|r| r.list.clone());
+                            if let Some(sc) = &profile.script_control {
+                                count_page_block(sc, source_url(&headers, &url, rtype));
+                            }
                             engine.stats_handle().record_blocked(rtype.as_str(), &host);
                             engine.record_block(&filter_engine::BlockEvent {
                                 timestamp: chrono::Utc::now(),
@@ -391,6 +494,21 @@ impl ProxyContext {
                 }
                 if rtype.is_frame() {
                     csp = engine.csp_for(&url, source_url(&headers, &url, rtype), rtype.as_str());
+                }
+            }
+            // Script policy network hints: one atomic load when the master switch is off.
+            if let Some(sc) = profile.script_control.as_ref().filter(|sc| sc.enabled()) {
+                if sc
+                    .check_request(
+                        &headers,
+                        if scheme == "http" { "http" } else { "https" },
+                        &url_host,
+                        port,
+                    )
+                    .is_some()
+                {
+                    debug!("Blocked {} by script policy", url);
+                    return Ok(policy_block_response(rtype, &url));
                 }
             }
         }
@@ -486,6 +604,21 @@ impl ProxyContext {
         let mut resp = resp;
         let resp_headers = std::mem::take(resp.headers_mut());
         let mut kind = classify_body(is_head, status, rtype, &resp_headers);
+        // Script policy applies to every HTML document, `no-transform` or not: it adds headers
+        // only, never rewrites a body the origin asked us to leave alone.
+        let spol: Option<Arc<crate::scriptctl::DocEntry>> =
+            if kind == BodyKind::Html && !is_head && status.as_u16() >= 200 {
+                rctx.profile.load().script_control.as_ref().and_then(|sc| {
+                    sc.document(
+                        if scheme == "http" { "http" } else { "https" },
+                        &url_host,
+                        port,
+                    )
+                })
+            } else {
+                None
+            };
+        let policy_nonce = spol.as_ref().map(|_| crate::inject::new_nonce());
         // `Cache-Control: no-transform`: no body rewriting at all (header edits still apply).
         if self.respect_no_transform.load(Ordering::Relaxed)
             && resp_headers
@@ -508,13 +641,13 @@ impl ProxyContext {
         let (enabled, cosmetics) = {
             let profile = rctx.profile.load();
             let enabled = profile.engine.is_enabled();
-            let cos = (enabled && kind == BodyKind::Html && body_allowed)
+            let cos = (enabled && !page_off && kind == BodyKind::Html && body_allowed)
                 .then(|| profile.engine.cosmetic_for(&url));
             (enabled, cos)
         };
         // Lock-free read (no refcount traffic); held only across the synchronous lookup.
         let source = self.transform_source.load();
-        let mut transforms: ResponseTransforms = if enabled {
+        let mut transforms: ResponseTransforms = if enabled && !page_off {
             source
                 .as_ref()
                 .as_ref()
@@ -565,13 +698,15 @@ impl ProxyContext {
         let mut utf8_charset = false;
         let mut text_changed = false;
         let body: ProxyBody = match (kind, codings) {
-            (BodyKind::Html, Ok(codings)) if enabled && body_allowed => {
+            (BodyKind::Html, Ok(codings)) if (enabled || spol.is_some()) && body_allowed => {
                 let origin = csp::PageOrigin::new(
                     if scheme == "http" { "http" } else { "https" },
                     &url_host,
                     port,
                 );
-                let nonce = crate::inject::new_nonce();
+                let nonce = policy_nonce
+                    .clone()
+                    .unwrap_or_else(crate::inject::new_nonce);
                 let csp_headers: Vec<&str> = resp_headers
                     .get_all("content-security-policy")
                     .iter()
@@ -591,21 +726,61 @@ impl ProxyContext {
                     );
                 }
                 let ext_script = transforms.scripts.join(";\n");
-                let head = build_head(&PageSpec {
-                    ext_script: &ext_script,
-                    cosmetics: &cos,
-                    internal: &self.internal,
-                    host: &host,
-                    nonce: &nonce,
-                    script_ok: !blocks_scripts,
-                    observer_ok: !opaque,
-                });
+                // Userscripts: matched against the profile's index (one atomic load and an
+                // emptiness check when there are none); nothing at all under `sandbox`.
+                let us = if blocks_scripts || !enabled {
+                    None
+                } else {
+                    rctx.profile.load().userscript_manager().and_then(|m| {
+                        if m.live_index().is_empty() {
+                            return None; // zero cost: no allocation, no probe
+                        }
+                        self.internal.gm.plan_document(
+                            m,
+                            &host,
+                            &url,
+                            &origin_of(scheme, &url_host, port),
+                            rtype != RequestType::Subdocument,
+                        )
+                    })
+                };
+                let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
+                let panel_key = if enabled && !blocks_scripts {
+                    self.internal.panel.hotkey(rctx)
+                } else {
+                    None
+                };
+                let unregister_sw = !blocks_scripts
+                    && us.is_some()
+                    && rctx
+                        .profile
+                        .load()
+                        .userscript_manager()
+                        .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+                let head = if enabled {
+                    build_head(&PageSpec {
+                        unregister_sw,
+                        userscripts: us_srcs,
+                        panel: panel_key.as_ref(),
+                        ext_script: &ext_script,
+                        cosmetics: &cos,
+                        internal: &self.internal,
+                        host: &host,
+                        nonce: &nonce,
+                        script_ok: !blocks_scripts,
+                        observer_ok: !opaque,
+                    })
+                } else {
+                    Default::default()
+                };
                 let needs = csp::Needs {
                     script: head.has_script,
-                    style: head.has_style,
-                    connect: head.observer,
+                    style: head.has_style || us.as_ref().is_some_and(|p| p.style),
+                    connect: head.observer
+                        || panel_key.is_some()
+                        || us.as_ref().is_some_and(|p| p.connect),
                 };
-                let meta_csp: Option<crate::rewrite::MetaCsp> = if head.observer {
+                let meta_csp: Option<crate::rewrite::MetaCsp> = if needs.connect {
                     let (origin, nonce) = (origin.clone(), nonce.clone());
                     Some(Arc::new(move |c: &str| {
                         let a = csp::adapt(
@@ -630,6 +805,7 @@ impl ProxyContext {
                     replacements: transforms.text_replacements.clone(),
                     element_filters: transforms.element_filters.clone(),
                     meta_csp,
+                    policy: spol.as_ref().and_then(|e| e.html.clone()),
                 };
                 // `$replace` & co. on a document run on the decoded text first; the HTML stages
                 // (removals, injections, cosmetics) then see the result.
@@ -804,7 +980,62 @@ impl ProxyContext {
                 }
             }
         }
+        if let Some(e) = &spol {
+            self.add_policy_headers(
+                &mut response,
+                e,
+                policy_nonce.as_deref().unwrap_or(""),
+                &host,
+            );
+        }
         Ok(response)
+    }
+
+    /// Add the generated policy as separate headers (never merged into the site's own: browsers
+    /// intersect, so it can only restrict). Runs after the extended-rule header edits so that
+    /// a `$removeheader` rule cannot strip it.
+    fn add_policy_headers(
+        &self,
+        response: &mut Response<ProxyBody>,
+        entry: &crate::scriptctl::DocEntry,
+        nonce: &str,
+        host: &str,
+    ) {
+        if let Some(c) = entry.csp_for(nonce, &self.internal.doc_token(host)) {
+            if let Ok(v) = HeaderValue::from_str(&c) {
+                response.headers_mut().append("content-security-policy", v);
+            }
+        }
+        if let Some(pp) = entry.permissions.as_deref() {
+            let site: Vec<String> = response
+                .headers()
+                .get_all("permissions-policy")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect();
+            let site_refs: Vec<&str> = site.iter().map(String::as_str).collect();
+            let merged = ext_rules::merge_permissions_policy(&site_refs, &[pp], &[]);
+            if let Ok(v) = HeaderValue::from_str(&merged) {
+                response.headers_mut().insert("permissions-policy", v);
+            }
+        }
+    }
+}
+
+/// Count a blocked request against the page named by `source` (a page URL).
+fn count_page_block(sc: &crate::scriptctl::ScriptControl, source: &str) {
+    let host = source
+        .split_once("://")
+        .map(|(_, r)| r)
+        .and_then(|r| r.split(['/', '?', '#']).next())
+        .map(|a| a.rsplit_once('@').map_or(a, |(_, h)| h))
+        .map(|a| {
+            a.rsplit_once(':')
+                .filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit()))
+                .map_or(a, |(h, _)| h)
+        });
+    if let Some(h) = host {
+        sc.count_blocked(h);
     }
 }
 
@@ -870,6 +1101,17 @@ fn bad_request(msg: &str) -> Response<ProxyBody> {
 
 fn bad_gateway(msg: &str) -> Response<ProxyBody> {
     status_response(StatusCode::BAD_GATEWAY, msg)
+}
+
+/// A request that fetches a service worker's script: `Service-Worker: script` (set by the browser
+/// for the main script and its updates) or `Sec-Fetch-Dest: serviceworker`.
+fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
+    h.get("service-worker")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("script"))
+        || h.get("sec-fetch-dest")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("serviceworker"))
 }
 
 #[cfg(test)]

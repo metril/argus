@@ -152,6 +152,8 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         }
     });
 
+    spawn_userscript_update_checks(state.clone());
+
     let router = create_router(state, &config);
     axum::serve(
         listener,
@@ -160,6 +162,35 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(())
+}
+
+/// Scheduled userscript update checks (`userscripts.update_check_interval_hours`, 0 = off).
+/// Failures are logged, never fatal.
+fn spawn_userscript_update_checks(state: Arc<AppState>) {
+    let hours = state
+        .proxy_state
+        .config
+        .read()
+        .userscripts
+        .update_check_interval_hours;
+    if hours == 0 {
+        return;
+    }
+    tracing::info!("Userscript update checks every {hours} h");
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(hours.saturating_mul(3600));
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        loop {
+            tick.tick().await;
+            let auto = state
+                .proxy_state
+                .config
+                .read()
+                .userscripts
+                .auto_apply_updates;
+            crate::userscript_ops::check_all(&state, auto).await;
+        }
+    });
 }
 
 /// The server speaks plain HTTP. Bound beyond loopback, logins and session cookies cross the
