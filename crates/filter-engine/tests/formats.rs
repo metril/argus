@@ -561,10 +561,10 @@ fn network_modifier_translations() {
         lines(&one("||k.example^$empty")),
         ["||k.example^$redirect=nooptext"]
     );
-    // $header is skipped and counted.
+    // $header is handed off.
     let c = one("||hh.example^$header=x-ad");
-    assert!(c.rules.is_empty() && c.ext.is_empty());
-    assert_eq!(c.stats.skipped_reasons.get("header"), Some(&1));
+    assert!(c.rules.is_empty());
+    assert_eq!(c.ext[0].kind, ExtKind::Header);
 }
 
 #[test]

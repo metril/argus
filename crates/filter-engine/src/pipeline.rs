@@ -195,8 +195,11 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
             skipped_reasons: c.stats.skipped_reasons.clone(),
             meta: c.meta.clone(),
         });
-        ext.extend(c.ext);
-        ext.extend(cs.ext_rules);
+        let (from_conv, from_compile) = (c.ext, cs.ext_rules);
+        ext.extend(from_conv.into_iter().chain(from_compile).map(|mut e| {
+            e.list = input.id.clone();
+            e
+        }));
         ip_block.extend(c.ip_block);
         ip_allow.extend(c.ip_allow);
     }
