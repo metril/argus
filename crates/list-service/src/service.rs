@@ -94,6 +94,7 @@ impl ListServiceConfig {
             max_list_bytes: a.max_list_bytes,
             persist_engine: true,
             allowed_fetch_destinations: a.allowed_fetch_destinations.clone(),
+            build_threads: a.build_threads,
             ..Self::default()
         }
     }

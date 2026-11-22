@@ -145,6 +145,11 @@ pub struct AdblockSettings {
     /// Maximum accepted size of a downloaded list, in bytes.
     #[serde(default = "default_max_list_bytes")]
     pub max_list_bytes: usize,
+    /// Threads of the dedicated list-build pool (parse, convert, compile). 0 = half the cores, at
+    /// least 1. A rebuild runs at low priority on these threads so it does not take the cores the
+    /// proxy workers need; raise it for faster rebuilds on a machine that is otherwise idle.
+    #[serde(default)]
+    pub build_threads: usize,
     /// Destinations the control plane (list, `!#include` and resource downloads) may fetch from
     /// although they are private: CIDRs / IPs, or host names (a listed name may resolve to
     /// private addresses). Private ranges are refused by default and loopback, link-local and
@@ -214,6 +219,7 @@ impl Default for AdblockSettings {
             list_fetch_concurrency: default_list_fetch_concurrency(),
             list_fetch_timeout_secs: default_list_fetch_timeout_secs(),
             max_list_bytes: default_max_list_bytes(),
+            build_threads: 0,
             allowed_fetch_destinations: Vec::new(),
             recent_blocked_keep_query: false,
             respect_no_transform: true,
