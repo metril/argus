@@ -151,6 +151,10 @@ pub struct ProxyContext {
     default_slot: ProfileSlot,
     /// Device-to-profile table; holds only the default profile until something publishes.
     profiles: Profiles,
+    /// The profile and device store and the builder that compiles it into `profiles` (set once
+    /// at startup; see [`Self::set_profile_service`]).
+    profile_store: std::sync::OnceLock<Arc<common::profile_store::ProfileStore>>,
+    profile_builder: std::sync::OnceLock<Arc<crate::profile_build::ProfileBuilder>>,
     /// Refuse explicit-proxy connections without a known device token (`407`).
     require_device_token: std::sync::atomic::AtomicBool,
     /// Upstream request timeout in milliseconds; 0 disables it.
@@ -186,6 +190,8 @@ impl ProxyContext {
             client,
             profiles: Profiles::new(default_slot.clone()),
             default_slot,
+            profile_store: std::sync::OnceLock::new(),
+            profile_builder: std::sync::OnceLock::new(),
             require_device_token: std::sync::atomic::AtomicBool::new(false),
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
             resolve_all_to: None,
@@ -311,6 +317,26 @@ impl ProxyContext {
     /// The default profile's slot.
     pub fn default_profile(&self) -> &ProfileSlot {
         &self.default_slot
+    }
+
+    /// Register the profile store and its builder (once; later calls are ignored).
+    pub fn set_profile_service(
+        &self,
+        store: Arc<common::profile_store::ProfileStore>,
+        builder: Arc<crate::profile_build::ProfileBuilder>,
+    ) {
+        let _ = self.profile_store.set(store);
+        let _ = self.profile_builder.set(builder);
+    }
+
+    /// The persistent profile and device store, once registered.
+    pub fn profile_store(&self) -> Option<&Arc<common::profile_store::ProfileStore>> {
+        self.profile_store.get()
+    }
+
+    /// The builder that keeps the live profile table in step with the store, once registered.
+    pub fn profile_builder(&self) -> Option<&Arc<crate::profile_build::ProfileBuilder>> {
+        self.profile_builder.get()
     }
 
     /// The device-to-profile table.

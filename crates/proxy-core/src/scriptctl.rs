@@ -195,7 +195,7 @@ impl ScriptControl {
 
     /// End the expiry task (the profile is gone). Safe to call more than once.
     pub fn stop(&self) {
-        if let Some(h) = self.expiry.lock().take() {
+        if let Some(h) = self.expiry.lock().as_ref() {
             h.abort();
         }
     }

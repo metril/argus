@@ -89,6 +89,14 @@ async fn main() -> Result<()> {
         info!("Userscripts disabled: scripts are managed but never injected");
     }
 
+    // One database file per process; profiles, devices and script policy live in it.
+    let db = common::db::Db::open(&config.adblock.data_dir)
+        .map_err(|e| Error::Config(format!("Failed to open database: {e}")))?;
+    let profile_store = Arc::new(
+        common::profile_store::ProfileStore::open(&db)
+            .map_err(|e| Error::Config(format!("Failed to open profile store: {e}")))?,
+    );
+
     // In-page panel: reserved confirmation host, per-site blocking over the custom rules.
     {
         let sc = &config.script_control;
@@ -118,24 +126,35 @@ async fn main() -> Result<()> {
                 host,
                 dashboard_url: dashboard,
             },
-            Some(Arc::new(proxy_core::panel::ListSiteBlocking(
+            Some(Arc::new(proxy_core::panel::ListSiteBlocking::new(
                 list_service.clone(),
+                Some(profile_store.clone()),
             ))),
         );
     }
 
     // Script control: rules live in the shared database; the proxy path reads a compiled snapshot
     // that is rebuilt on every edit and when a temporary grant expires.
-    let policy_store = Arc::new(script_policy::store::PolicyStore::new(
-        common::db::Db::open(&config.adblock.data_dir)
-            .map_err(|e| Error::Config(format!("Failed to open database: {e}")))?,
-    ));
+    let policy_store = Arc::new(script_policy::store::PolicyStore::new(db.clone()));
     let script_control = proxy_core::scriptctl::ScriptControl::new(
         policy_store.clone(),
         script_policy::DEFAULT_PROFILE,
     );
     script_control.spawn_expiry();
     ctx.set_script_control(Some(script_control));
+
+    // Per-device profiles: compiles stored profiles and devices into the live lookup table in
+    // the background (also without the web UI). The web API reads them through
+    // `ctx.profile_store()` / `ctx.profile_builder()`.
+    let profile_builder = proxy_core::ProfileBuilder::start(proxy_core::BuilderDeps {
+        ctx: ctx.clone(),
+        store: profile_store.clone(),
+        lists: list_service.clone(),
+        manager: userscript_manager.clone(),
+        policy: Some(policy_store.clone()),
+        debounce: proxy_core::profile_build::DEFAULT_DEBOUNCE,
+    });
+    ctx.set_profile_service(profile_store.clone(), profile_builder.clone());
 
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
