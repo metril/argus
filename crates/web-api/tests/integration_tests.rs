@@ -1267,3 +1267,31 @@ async fn validate_uses_the_real_conversion_pipeline() {
         .await
         .assert_status_bad_request();
 }
+
+#[tokio::test]
+async fn recent_blocked_urls_drop_query_strings_and_need_stats_read() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    ctx.state
+        .shared_engine
+        .install(filter_engine::compile_engine(&[
+            "||ads.example.com^\n".to_string()
+        ]));
+    ctx.state.shared_engine.check_for(
+        "https://ads.example.com/a.js?token=SECRET&u=1#frag",
+        "https://p.test/",
+        "script",
+        "0",
+    );
+    let r = admin.get("/api/v1/stats/blocked/recent").await;
+    r.assert_status_ok();
+    let text = r.text();
+    assert!(!text.contains("SECRET"), "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["entries"][0]["url"], "https://ads.example.com/a.js");
+    // A token without `stats:read` is refused.
+    let secret = ctx.token(&admin, &["lists:read"]).await;
+    ctx.bearer("GET", "/api/v1/stats/blocked/recent", &secret)
+        .await
+        .assert_status_forbidden();
+}

@@ -229,6 +229,11 @@ impl SharedEngine {
         self.block_log.recent(limit)
     }
 
+    /// Keep query strings in the recent-blocked ring (default off: they may hold secrets).
+    pub fn set_recent_keep_query(&self, keep: bool) {
+        self.block_log.set_keep_query(keep);
+    }
+
     /// Capacity of the recent-blocked ring.
     pub fn recent_blocked_capacity(&self) -> usize {
         self.block_log.capacity()

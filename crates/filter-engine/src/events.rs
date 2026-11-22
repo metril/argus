@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -89,6 +90,14 @@ pub struct BlockLog {
     queue: ArrayQueue<Raw>,
     history: Mutex<VecDeque<Raw>>,
     cap: usize,
+    /// Keep the query string and fragment of recorded URLs (they can carry secrets such as
+    /// tokens, so the default is to strip them before anything is stored).
+    keep_query: AtomicBool,
+}
+
+/// `url` without its query string and fragment.
+fn strip_query(url: &str) -> &str {
+    url.find(['?', '#']).map_or(url, |i| &url[..i])
 }
 
 impl BlockLog {
@@ -98,7 +107,13 @@ impl BlockLog {
             queue: ArrayQueue::new(capacity.max(1)),
             history: Mutex::new(VecDeque::new()),
             cap: capacity,
+            keep_query: AtomicBool::new(false),
         }
+    }
+
+    /// Store request URLs with their query string (off by default, see the field docs).
+    pub fn set_keep_query(&self, keep: bool) {
+        self.keep_query.store(keep, Ordering::Relaxed);
     }
 
     pub fn capacity(&self) -> usize {
@@ -118,6 +133,11 @@ impl BlockLog {
         if self.cap == 0 {
             return;
         }
+        let url = if self.keep_query.load(Ordering::Relaxed) {
+            url
+        } else {
+            strip_query(url)
+        };
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
@@ -165,6 +185,32 @@ impl BlockLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn urls_are_stored_without_query_or_fragment_unless_configured() {
+        let log = BlockLog::new(4);
+        log.record(
+            "https://t.test/p?token=SECRET&a=1#frag",
+            "s",
+            "script",
+            "r",
+            None,
+            None,
+        );
+        let url = &log.recent(1)[0].url;
+        assert_eq!(url, "https://t.test/p");
+        assert!(!url.contains("SECRET"));
+        log.set_keep_query(true);
+        log.record(
+            "https://t.test/p?token=SECRET",
+            "s",
+            "script",
+            "r",
+            None,
+            None,
+        );
+        assert_eq!(log.recent(1)[0].url, "https://t.test/p?token=SECRET");
+    }
 
     #[test]
     fn newest_first_bounded_and_overwriting() {
