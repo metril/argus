@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Statistics for blocked and allowed requests
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlockingStats {
     /// Total requests processed
     pub total_requests: u64,
@@ -19,18 +19,6 @@ pub struct BlockingStats {
     pub blocked_by_type: HashMap<String, u64>,
     /// Top blocked domains
     pub top_blocked_domains: Vec<(String, u64)>,
-}
-
-impl Default for BlockingStats {
-    fn default() -> Self {
-        Self {
-            total_requests: 0,
-            blocked_requests: 0,
-            allowed_requests: 0,
-            blocked_by_type: HashMap::new(),
-            top_blocked_domains: Vec::new(),
-        }
-    }
 }
 
 /// Thread-safe filter statistics tracker.

@@ -71,9 +71,7 @@ where
 
     // Connect to target server
     let target_addr = format!("{}:{}", host, port);
-    let target_stream = TcpStream::connect(&target_addr)
-        .await
-        .map_err(|e| Error::Io(e))?;
+    let target_stream = TcpStream::connect(&target_addr).await.map_err(Error::Io)?;
 
     debug!("Connected to target WebSocket server at {}", target_addr);
 

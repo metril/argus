@@ -96,6 +96,12 @@ pub struct ProxyStats {
     pub errors_total: AtomicU64,
 }
 
+impl Default for ProxyStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyStats {
     pub fn new() -> Self {
         Self {

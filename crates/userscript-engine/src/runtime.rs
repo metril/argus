@@ -154,7 +154,7 @@ impl UserscriptRuntime {
             .get(url)
             .send()
             .await
-            .map_err(|e| Error::HttpRequest(e))?;
+            .map_err(Error::HttpRequest)?;
 
         if !response.status().is_success() {
             return Err(Error::InvalidScript(format!(
@@ -164,7 +164,7 @@ impl UserscriptRuntime {
             )));
         }
 
-        let code = response.text().await.map_err(|e| Error::HttpRequest(e))?;
+        let code = response.text().await.map_err(Error::HttpRequest)?;
 
         // Cache for future use
         {
@@ -213,7 +213,7 @@ impl UserscriptRuntime {
             .get(resource_url)
             .send()
             .await
-            .map_err(|e| Error::HttpRequest(e))?;
+            .map_err(Error::HttpRequest)?;
 
         if !response.status().is_success() {
             return Err(Error::InvalidScript(format!(
@@ -223,11 +223,7 @@ impl UserscriptRuntime {
             )));
         }
 
-        let data = response
-            .bytes()
-            .await
-            .map_err(|e| Error::HttpRequest(e))?
-            .to_vec();
+        let data = response.bytes().await.map_err(Error::HttpRequest)?.to_vec();
 
         // Cache for future use
         {

@@ -196,10 +196,8 @@ impl UserscriptStorage {
         let mut batch = sled::Batch::default();
 
         // Collect keys to delete
-        for item in self.db.scan_prefix(&prefix) {
-            if let Ok((key, _)) = item {
-                batch.remove(key);
-            }
+        for (key, _) in self.db.scan_prefix(&prefix).flatten() {
+            batch.remove(key);
         }
 
         // Apply batch deletion
@@ -358,10 +356,7 @@ mod tests {
         // Second access - from cache
         let value2 = storage.get_value("script1", "cached").unwrap();
 
-        assert_eq!(
-            matches!(value1, Some(StorageValue::Number(n)) if n == 100.0),
-            true
-        );
+        assert!(matches!(value1, Some(StorageValue::Number(n)) if n == 100.0));
         assert_eq!(value1, value2);
     }
 }
