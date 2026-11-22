@@ -216,9 +216,15 @@ it was planned for.
 Enforcement is one extractor (`ProfileParam`) on every profile-scoped route: another profile, or
 the default profile when `0` is not listed, is 403 `profile_forbidden`. Such a token lists only its
 profiles and the devices assigned to them, cannot create profiles, and cannot create a device in
-or move one to a profile it lacks. A token minted by a restricted token inherits its restriction
+or move one to a profile it lacks. It may add an address or prefix to a device only when it lies
+inside a range already assigned to a device of its own profiles, and never one that contains or lies
+inside another profile's device range (403 `profile_restricted`); it cannot claim unassigned
+addresses (which fall to `default`). Nested prefixes (a /32 inside another device's /24; the longest
+match wins) are a deliberate feature of unrestricted tokens only; an identical address on two devices
+is 409. A token minted by a restricted token inherits its restriction
 when none is given and may only narrow it (wider is 403 `scope_escalation`). Global resources are
 not profile-scoped, so for restricted tokens: every write is 403 `profile_restricted` (lists,
 custom rules, config, engine, stats reset, users, CA, admin routes); reads of lists, config, stats,
-system status and CA info are allowed; `GET /rules/custom` needs access to profile `0`; users,
+system status and CA info are allowed, but `GET /stats/blocked/recent` returns only blocks of the
+token's profiles (`client` is the profile id) and `GET /stats/filter` omits `top_blocked_domains`; `GET /rules/custom` needs access to profile `0`; users,
 audit and admin reads are refused. Managing the token's own tokens and sessions stays allowed.

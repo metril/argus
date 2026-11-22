@@ -19,7 +19,8 @@ rules are the global list enablement and global custom rules.
 
 ## What is shared
 
-- Statistics and the recent-blocked log are global; block events carry the profile id.
+- Statistics and the recent-blocked log are global; block events carry the profile id (restricted
+  API tokens see only their own profiles' events, and no domain histogram).
 - The adblock master switch is global: turning blocking off turns it off for every profile.
 - Downloaded list contents. Lists enabled by any profile are downloaded and refreshed by the
   update schedule, even if they are not enabled globally.
@@ -36,6 +37,12 @@ a known token wins, then the most specific matching address or prefix, then `def
   that connection.
 - **Transparent mode**: no proxy credentials exist, so the device is identified by its source
   address.
+
+Addresses and prefixes may nest across devices (a /32 inside another device's /24); the longest
+match wins. Nesting is deliberate and available to unrestricted tokens and the owner only: a
+profile-restricted API token may add an address only inside a range already assigned to its own
+profiles' devices and never one overlapping another profile's devices, so it cannot capture
+another device's traffic. An identical address on two devices is refused.
 
 Source addresses on a LAN can be spoofed by another host; tokens are the stronger identity. Use
 tokens where it matters.
