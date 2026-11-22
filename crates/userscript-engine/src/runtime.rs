@@ -96,10 +96,20 @@ impl UserscriptRuntime {
             &format!("Preparing for {}", url),
         );
 
-        self.validator
-            .validate_requires(&script.metadata.requires)?;
-        self.validator
-            .validate_resources(&script.metadata.resources)?;
+        let require_urls: Vec<String> = script
+            .metadata
+            .requires
+            .iter()
+            .map(|r| r.url.clone())
+            .collect();
+        let resource_map: HashMap<String, String> = script
+            .metadata
+            .resources
+            .iter()
+            .map(|r| (r.name.clone(), r.url.clone()))
+            .collect();
+        self.validator.validate_requires(&require_urls)?;
+        self.validator.validate_resources(&resource_map)?;
         self.validator.validate_grants(&script.metadata.grants)?;
 
         if let Err(e) = self.validator.validate_source(&script.source) {
@@ -112,7 +122,7 @@ impl UserscriptRuntime {
         }
 
         let mut full_source = String::new();
-        for require_url in &script.metadata.requires {
+        for require_url in &require_urls {
             match self.security_policy.validate_url(require_url) {
                 Ok(_) => self.auditor.log_event(
                     AuditEvent::ResourceLoaded,
@@ -181,7 +191,9 @@ impl UserscriptRuntime {
         let resource_url = script
             .metadata
             .resources
-            .get(name)
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| &r.url)
             .ok_or_else(|| Error::InvalidScript(format!("Resource not found: {}", name)))?;
 
         // Validate resource URL
