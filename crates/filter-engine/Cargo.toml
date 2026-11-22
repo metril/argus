@@ -33,6 +33,7 @@ url = { workspace = true }
 
 # Caching
 arc-swap = { workspace = true }
+crossbeam = { workspace = true }
 
 # Concurrency
 dashmap = { workspace = true }

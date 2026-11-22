@@ -32,6 +32,10 @@ pub struct MatchResult {
     pub redirect: Option<String>,
     /// URL after `$removeparam`, when the request was not blocked and the URL changed.
     pub rewritten_url: Option<String>,
+    /// Source list of `matched_rule`, when known (hosts/domain-set rules; engine rules do not
+    /// carry their list).
+    #[serde(default)]
+    pub list_id: Option<String>,
 }
 
 impl MatchResult {
@@ -112,7 +116,7 @@ impl RequestMatcher {
         Ok(Self::to_match_result(result))
     }
 
-    fn to_match_result(result: adblock::blocker::BlockerResult) -> MatchResult {
+    pub(crate) fn to_match_result(result: adblock::blocker::BlockerResult) -> MatchResult {
         if let Some(exception) = result.exception {
             // The engine clears `matched` when an exception applies (never for `$important`).
             debug!("Request allowed by exception: {exception}");

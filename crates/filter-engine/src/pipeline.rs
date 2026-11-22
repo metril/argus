@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::compile::compile_lists;
+use crate::compile::{compile_lists, route_domain_rules};
+use crate::domainset::DomainSet;
 use crate::formats::{
     convert, dedupe, ConvertOptions, Converted, ExtRule, IpRange, ListFormat, ListMeta, MAX_ERRORS,
 };
@@ -69,8 +70,10 @@ pub struct ListReport {
 
 /// Output of [`build_set`].
 pub struct BuiltSet {
-    /// Serialized engine.
+    /// Serialized engine (everything except the pure domain rules in [`Self::domains`]).
     pub blob: Vec<u8>,
+    /// Pure domain / exact-host block rules, kept out of the engine.
+    pub domains: DomainSet,
     /// All extended rules, in list order.
     pub ext: Vec<ExtRule>,
     pub ip: IpFilter,
@@ -78,9 +81,25 @@ pub struct BuiltSet {
     pub reports: Vec<ListReport>,
 }
 
+impl BuiltSet {
+    /// Build the live engine from the blob and install everything (engine, domain set, extended
+    /// rules, IP filter) into `engine`. Returns the per-list reports. CPU-bound.
+    pub fn install_into(self, engine: &crate::SharedEngine) -> Vec<ListReport> {
+        let live = crate::build_engine(&self.blob, &engine.resources());
+        engine.install_set(
+            std::sync::Arc::new(self.blob),
+            live,
+            std::sync::Arc::new(self.ext),
+            std::sync::Arc::new(self.ip),
+            std::sync::Arc::new(self.domains),
+        );
+        self.reports
+    }
+}
+
 /// Convert, dedupe and compile `inputs`.
 pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
-    let converted: Vec<Converted> = inputs
+    let mut converted: Vec<Converted> = inputs
         .par_iter()
         .map(|i| {
             convert(
@@ -94,26 +113,47 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
         })
         .collect();
 
+    // Pure domain rules go to the compact domain set (deduplicated there); only the rest is
+    // text-deduplicated and compiled into the engine.
+    let list_ids: Vec<String> = inputs.iter().map(|i| i.id.clone()).collect();
+    let rule_texts: Vec<&str> = converted.iter().map(|c| c.rules.as_str()).collect();
+    let routed = route_domain_rules(&rule_texts, list_ids);
+    drop(rule_texts);
+    for c in &mut converted {
+        c.rules = String::new();
+    }
+
     // Sequential, cheap: a 64-bit hash set across all lists.
-    let total: usize = converted.iter().map(|c| c.stats.converted).sum();
+    let total: usize = routed.engine_text.iter().map(|t| t.len() / 24 + 1).sum();
     let mut seen: HashSet<u64> = HashSet::with_capacity(total);
     let mut deduped: Vec<(String, usize)> = Vec::with_capacity(converted.len());
-    for c in &converted {
-        deduped.push(dedupe(&c.rules, &mut seen));
+    for t in &routed.engine_text {
+        deduped.push(dedupe(t, &mut seen));
     }
     drop(seen);
+    let domain_routed = routed.routed;
+    drop(routed.engine_text);
 
     let texts: Vec<&str> = deduped.iter().map(|(t, _)| t.as_str()).collect();
     let compiled = compile_lists(&texts);
+    drop(texts);
+    let engine_network = compiled.per_list.iter().any(|c| c.network > 0);
+    let domain_build = routed
+        .builder
+        .finish(compiled.engine_overrides, engine_network);
+    let domain_dups = domain_build.duplicates;
 
     let (mut ext, mut ip_block, mut ip_allow) = (Vec::new(), Vec::new(), Vec::<IpRange>::new());
     let mut reports = Vec::with_capacity(inputs.len());
-    for (((input, c), (_, dups)), cs) in inputs
+    for (li, (((input, c), (_, dups)), cs)) in inputs
         .iter()
         .zip(converted)
         .zip(&deduped)
         .zip(compiled.per_list)
+        .enumerate()
     {
+        let domain_dup = domain_dups.get(li).copied().unwrap_or(0);
+        let domain_kept = domain_routed[li].saturating_sub(domain_dup);
         let mut errors: Vec<ReportIssue> = c
             .stats
             .errors
@@ -142,9 +182,9 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
             total_lines: c.stats.total_lines,
             converted: c.stats.converted,
             skipped: c.stats.skipped,
-            duplicates: *dups,
+            duplicates: *dups + domain_dup,
             translated: c.stats.translated,
-            network: cs.network,
+            network: cs.network + domain_kept,
             cosmetic: cs.cosmetic,
             ext: c.ext.len() + cs.ext,
             rejected: cs.rejected,
@@ -162,6 +202,7 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
     }
     BuiltSet {
         blob: compiled.blob,
+        domains: domain_build.set,
         ext,
         ip: IpFilter::from_ranges(&ip_block, &ip_allow),
         reports,

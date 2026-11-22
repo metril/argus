@@ -9,6 +9,7 @@
 //! The compiled blob is kept next to the live engine so it can be persisted
 //! ([`SharedEngine::serialized`]) and so the resource library can be re-applied.
 
+use adblock::request::Request as AdblockRequest;
 use adblock::resources::Resource;
 use adblock::Engine as AdblockEngine;
 use arc_swap::ArcSwap;
@@ -17,8 +18,11 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::compile::compile_lists;
+use crate::domainset::{DomainHit, DomainSet, Scheme};
+use crate::events::{BlockEvent, BlockLog, DEFAULT_CAPACITY};
 use crate::formats::{ExtRule, IpRange, IpSet};
 use crate::matcher::{MatchResult, RequestMatcher};
+use crate::precheck;
 use crate::redirect_resources::builtin_redirect_resources;
 use crate::stats::FilterStats;
 
@@ -66,6 +70,10 @@ pub struct SharedEngine {
     ext_rules: ArcSwap<Vec<ExtRule>>,
     /// Blocked / allowed IP ranges, checked for requests to IP-literal hosts.
     ip_filter: ArcSwap<IpFilter>,
+    /// Pure domain / exact-host block rules kept out of the engine (see [`crate::domainset`]).
+    domains: ArcSwap<DomainSet>,
+    /// Ring of recent block events.
+    block_log: BlockLog,
     /// Master on/off switch, shared (see [`Self::enabled_flag`]) so the web UI toggle is live.
     enabled: Arc<AtomicBool>,
     /// User-loaded scriptlet/redirect resource library (overrides built-ins by name).
@@ -126,11 +134,18 @@ fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Ar
 impl SharedEngine {
     /// Create an empty shared engine (allows everything until rules are installed).
     pub fn new() -> Self {
+        Self::with_event_capacity(DEFAULT_CAPACITY)
+    }
+
+    /// Like [`Self::new`] with a recent-blocked ring of `capacity` events (0 disables it).
+    pub fn with_event_capacity(capacity: usize) -> Self {
         Self {
             engine: ArcSwap::new(build_engine(&[], &[])),
             blob: ArcSwap::new(Arc::new(Vec::new())),
             ext_rules: ArcSwap::new(Arc::new(Vec::new())),
             ip_filter: ArcSwap::new(Arc::new(IpFilter::default())),
+            domains: ArcSwap::new(Arc::new(DomainSet::empty())),
+            block_log: BlockLog::new(capacity),
             enabled: Arc::new(AtomicBool::new(true)),
             resources: ArcSwap::new(Arc::new(Vec::new())),
             write_lock: Mutex::new(()),
@@ -170,7 +185,8 @@ impl SharedEngine {
         self.install_full(blob, engine, Arc::default(), Arc::default());
     }
 
-    /// Like [`Self::install_built`], also replacing the extended-rule list and IP filter.
+    /// Like [`Self::install_built`], also replacing the extended-rule list and IP filter. The
+    /// domain set is emptied (all rules are expected to be in the engine).
     pub fn install_full(
         &self,
         blob: Arc<Vec<u8>>,
@@ -178,13 +194,52 @@ impl SharedEngine {
         ext: Arc<Vec<ExtRule>>,
         ip: Arc<IpFilter>,
     ) {
+        self.install_set(blob, engine, ext, ip, Arc::default());
+    }
+
+    /// Install everything a build produced: engine, extended rules, IP filter and domain set,
+    /// swapped in one writer critical section.
+    pub fn install_set(
+        &self,
+        blob: Arc<Vec<u8>>,
+        engine: Arc<AdblockEngine>,
+        ext: Arc<Vec<ExtRule>>,
+        ip: Arc<IpFilter>,
+        domains: Arc<DomainSet>,
+    ) {
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = blob.len();
         self.blob.store(blob);
         self.engine.store(engine);
         self.ext_rules.store(ext);
         self.ip_filter.store(ip);
-        info!("Installed compiled filter engine ({bytes} bytes)");
+        let n = domains.len();
+        self.domains.store(domains);
+        info!("Installed compiled filter engine ({bytes} bytes, {n} domain-set entries)");
+    }
+
+    /// The installed domain set.
+    pub fn domains(&self) -> Arc<DomainSet> {
+        self.domains.load_full()
+    }
+
+    /// The most recent blocked requests, newest first (at most `limit`, at most the ring
+    /// capacity).
+    pub fn recent_blocked(&self, limit: usize) -> Vec<BlockEvent> {
+        self.block_log.recent(limit)
+    }
+
+    /// Record a block that happened outside [`Self::check`] (for example a request the proxy
+    /// refused for another reason) in the recent-blocked ring.
+    pub fn record_block(&self, event: &BlockEvent) {
+        self.block_log.record(
+            &event.url,
+            &event.source_host,
+            &event.request_type,
+            &event.rule,
+            event.list_id.as_deref(),
+            event.client.as_deref(),
+        );
     }
 
     /// Extended rules (`$replace`, HTML filters, ...) found in the installed lists.
@@ -284,47 +339,190 @@ impl SharedEngine {
         })
     }
 
-    /// Check whether a network request should be blocked, recording statistics.
+    /// Check whether a network request should be blocked, recording statistics and (on a block)
+    /// the recent-blocked event.
     ///
     /// `resource_type` is the adblock resource type (e.g. `script`, `image`, `document`,
-    /// `websocket`, `other`). One atomic load; no lock.
+    /// `websocket`, `other`). Atomic loads only; no lock. Order: IP ranges, then the domain
+    /// set, then the engine (see [`Self::check_for`] to attach a client label).
     pub fn check(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
+        self.check_inner(url, source_url, resource_type, None)
+    }
+
+    /// [`Self::check`] with an opaque client / profile label stored in the block event.
+    pub fn check_for(
+        &self,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: &str,
+    ) -> MatchResult {
+        self.check_inner(url, source_url, resource_type, Some(client))
+    }
+
+    fn check_inner(
+        &self,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: Option<&str>,
+    ) -> MatchResult {
         if !self.enabled.load(Ordering::Relaxed) {
             self.stats.record_allowed();
             return MatchResult::allowed();
         }
+        let r = self.decide(url, source_url, resource_type);
+        if r.blocked {
+            self.stats
+                .record_blocked(resource_type, RequestMatcher::host_of(url));
+            self.block_log.record(
+                url,
+                RequestMatcher::host_of(source_url),
+                resource_type,
+                r.matched_rule.as_deref().unwrap_or(""),
+                r.list_id.as_deref(),
+                client,
+            );
+        } else {
+            self.stats.record_allowed();
+        }
+        r
+    }
 
+    /// The decision, without side effects.
+    fn decide(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
+        // Pre-check layer: IP literals, then the domain set.
         let ipf = self.ip_filter.load();
-        if !ipf.is_empty() {
-            let host = RequestMatcher::host_of(url);
+        let ds = self.domains.load();
+        let host = RequestMatcher::host_of(url);
+        if !ipf.is_empty()
+            && (host.contains(':') || host.bytes().last().is_some_and(|b| b.is_ascii_digit()))
+        {
             if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                 if !ipf.allow.contains(ip) && ipf.block.contains(ip) {
-                    self.stats.record_blocked(resource_type, host);
                     return MatchResult::blocked(format!("ip-list:{ip}"));
                 }
             }
         }
-
-        let result = self.with_engine(|engine| {
-            RequestMatcher::check_request(engine, url, source_url, resource_type)
-        });
-
-        match result {
-            Ok(r) => {
-                if r.blocked {
-                    self.stats
-                        .record_blocked(resource_type, RequestMatcher::host_of(url));
-                } else {
-                    self.stats.record_allowed();
+        let fast = if ds.is_empty() {
+            None
+        } else {
+            precheck::fast(url, resource_type)
+        };
+        if let Some(f) = &fast {
+            // adblock-rust matches `||host^` against the case-preserved hostname (so never a
+            // mixed-case one) but exact rules against the lowercased URL.
+            let found = if f.lower {
+                ds.lookup(f.host, f.scheme)
+            } else {
+                ds.lookup_exact(f.host, f.scheme)
+            };
+            if let Some(hit) = found {
+                let ok = match hit.exact {
+                    // An exact rule needs the scheme to lead the URL: not with `user@`.
+                    Some(_) => !f.userinfo && precheck::applies(true, f.scheme, f.rt),
+                    None => precheck::applies(false, f.scheme, f.rt),
+                };
+                if ok {
+                    return self.domain_block(&ds, hit, f.host, url, source_url, resource_type);
                 }
-                r
-            }
-            Err(e) => {
-                debug!("Filter check error for {url}: {e}; allowing");
-                self.stats.record_allowed();
-                MatchResult::allowed()
             }
         }
+
+        if !ds.is_empty() && !ds.engine_has_network_rules() && fast.is_some() {
+            // The set missed and the engine has no network rules: nothing can block this.
+            return MatchResult::allowed();
+        }
+
+        let request = match AdblockRequest::new(url, source_url, resource_type) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Filter check error for {url}: {e}; allowing");
+                return MatchResult::allowed();
+            }
+        };
+        if fast.is_none()
+            && !ds.is_empty()
+            && request.is_supported
+            && !request.hostname.bytes().any(|c| c.is_ascii_uppercase())
+        {
+            // Unusual URL: probe with the parsed hostname (suffix rules only).
+            let scheme = if request.is_http {
+                Scheme::Http
+            } else if request.is_https {
+                Scheme::Https
+            } else if request.url.as_bytes().get(2) == Some(&b's') {
+                Scheme::Wss
+            } else {
+                Scheme::Ws
+            };
+            // A fully-qualified trailing dot names the same host (adblock-rust's own handling of
+            // it is inconsistent, so rules in the set follow DNS semantics instead).
+            let name = request
+                .hostname
+                .strip_suffix('.')
+                .unwrap_or(&request.hostname);
+            if let Some(hit) = ds.lookup(name, scheme) {
+                if hit.exact.is_none()
+                    && precheck::applies(false, scheme, precheck::idx(&request.request_type))
+                {
+                    let host = name.to_string();
+                    return self.domain_block(&ds, hit, &host, url, source_url, resource_type);
+                }
+            }
+        }
+        let result = self.with_engine(|e| e.check_network_request(&request));
+        RequestMatcher::to_match_result(result)
+    }
+
+    /// A domain-set hit: the block, unless the engine's exceptions / `$important` rules say
+    /// otherwise (`check_network_request_subset` with "something already matched" evaluates exactly
+    /// those, as the full engine would after a normal block match).
+    fn domain_block(
+        &self,
+        ds: &DomainSet,
+        hit: DomainHit,
+        host: &str,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+    ) -> MatchResult {
+        let mut rule = String::with_capacity(host.len() + 12);
+        match hit.exact {
+            Some(s) => {
+                rule.push('|');
+                rule.push_str(s.as_str());
+                rule.push_str("://");
+                rule.push_str(host);
+            }
+            None => {
+                rule.push_str("||");
+                rule.push_str(&host[hit.start..]);
+            }
+        }
+        rule.push('^');
+        // The prefix is already lowercase; only an exact rule's host may be mixed case.
+        rule.make_ascii_lowercase();
+        let list = ds.list_id(hit.list).map(str::to_string);
+        let plain = |rule: String, list: Option<String>| MatchResult {
+            blocked: true,
+            matched_rule: Some(rule),
+            list_id: list,
+            ..MatchResult::default()
+        };
+        if !ds.engine_overrides() {
+            return plain(rule, list);
+        }
+        let Ok(request) = AdblockRequest::new(url, source_url, resource_type) else {
+            return plain(rule, list);
+        };
+        let res = self.with_engine(|e| e.check_network_request_subset(&request, true, true));
+        let mut r = RequestMatcher::to_match_result(res);
+        if r.blocked && !r.important {
+            r.matched_rule = Some(rule);
+            r.list_id = list;
+        }
+        r
     }
 }
 
