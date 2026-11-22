@@ -240,7 +240,12 @@ impl ProxyContext {
     ///
     /// Shared by the HTTP, WebSocket, and HTTP/3 paths.
     pub fn should_block(&self, url: &str, source_url: &str, resource_type: &str) -> bool {
-        self.engine.is_enabled() && self.engine.check(url, source_url, resource_type).blocked
+        self.engine.is_enabled() && {
+            let profile = self.default_ctx.profile.load();
+            self.engine
+                .check_for(url, source_url, resource_type, &profile.label)
+                .blocked
+        }
     }
 
     /// Like [`Self::should_block`] but with the profile in `rctx`.
@@ -252,7 +257,11 @@ impl ProxyContext {
         resource_type: &str,
     ) -> bool {
         let profile = rctx.profile.load();
-        profile.engine.is_enabled() && profile.engine.check(url, source_url, resource_type).blocked
+        profile.engine.is_enabled()
+            && profile
+                .engine
+                .check_for(url, source_url, resource_type, &profile.label)
+                .blocked
     }
 
     /// Forward a proxied request using the default request context.
@@ -312,11 +321,16 @@ impl ProxyContext {
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
         // Absolute URL: prefer the request's own absolute form, else synthesize one.
-        let mut url = if fallback_authority.is_none()
-            && uri.scheme().is_some()
-            && uri.authority().is_some()
+        // The host in it is the normalised one, never the client's spelling.
+        let mut url = if let (None, Some(scheme_str), Some(_)) =
+            (&fallback_authority, uri.scheme_str(), uri.authority())
         {
-            uri.to_string()
+            let port_part = named
+                .as_ref()
+                .and_then(|(_, p)| *p)
+                .map(|p| format!(":{p}"))
+                .unwrap_or_default();
+            format!("{scheme_str}://{url_host}{port_part}{path_and_query}")
         } else {
             format!("{scheme}://{url_host}:{port}{path_and_query}")
         };
@@ -329,7 +343,7 @@ impl ProxyContext {
             let engine = &profile.engine;
             if engine.is_enabled() {
                 let source = source_url(&headers, &url, rtype);
-                let verdict = engine.check(&url, source, rtype.as_str());
+                let verdict = engine.check_for(&url, source, rtype.as_str(), &profile.label);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
                     if let Some(res) = verdict.redirect_resource() {

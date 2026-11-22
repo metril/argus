@@ -13,14 +13,34 @@ pub fn unbracket(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-/// Host (IPv6 brackets removed) and optional port of an authority string such as the `Host`
-/// header value. Userinfo is rejected.
+/// The canonical spelling of a host, applied once where a host enters the proxy (request
+/// authority, `Host` header, CONNECT target, SNI): lower-cased, one trailing dot stripped, IDN
+/// converted to punycode, IP literals in canonical form (IPv6 unbracketed). `None` for an
+/// invalid host. Filter checks and the destination policy then see exactly one spelling.
+pub fn normalize_host(host: &str) -> Option<String> {
+    let h = unbracket(host);
+    if h.contains(':') {
+        return h.parse::<std::net::Ipv6Addr>().ok().map(|a| a.to_string());
+    }
+    let h = h.strip_suffix('.').unwrap_or(h);
+    if h.is_empty() {
+        return None;
+    }
+    match url::Host::parse(h).ok()? {
+        url::Host::Domain(d) => Some(d),
+        url::Host::Ipv4(a) => Some(a.to_string()),
+        url::Host::Ipv6(a) => Some(a.to_string()),
+    }
+}
+
+/// Host (IPv6 brackets removed, normalised: see [`normalize_host`]) and optional port of an
+/// authority string such as the `Host` header value. Userinfo is rejected.
 pub fn parse(authority: &str) -> Option<(String, Option<u16>)> {
     let a: Authority = authority.parse().ok()?;
     if a.as_str().contains('@') {
         return None;
     }
-    Some((unbracket(a.host()).to_string(), a.port_u16()))
+    Some((normalize_host(a.host())?, a.port_u16()))
 }
 
 /// Host and port a request names: the URI's authority (absolute-form, h2 `:authority`) if any,
@@ -100,6 +120,26 @@ mod tests {
         assert_eq!(parse(""), None);
         assert_eq!(url_host("::1"), "[::1]");
         assert_eq!(url_host("a.test"), "a.test");
+    }
+
+    #[test]
+    fn normalises_case_dot_idn_and_literals() {
+        assert_eq!(
+            normalize_host("ExAmPle.TEST").as_deref(),
+            Some("example.test")
+        );
+        assert_eq!(normalize_host("ad.test.").as_deref(), Some("ad.test"));
+        assert_eq!(
+            normalize_host("BÜCHER.example").as_deref(),
+            Some("xn--bcher-kva.example")
+        );
+        assert_eq!(normalize_host("[::1]").as_deref(), Some("::1"));
+        assert_eq!(normalize_host("0x7f.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(normalize_host("."), None);
+        assert_eq!(
+            parse("ExAmPle.TEST:8443"),
+            Some(("example.test".into(), Some(8443)))
+        );
     }
 
     #[test]

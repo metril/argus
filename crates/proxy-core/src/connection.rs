@@ -535,7 +535,8 @@ pub fn parse_connect(head: &[u8]) -> Result<(String, u16)> {
             _ => return Err(invalid("port")),
         },
     };
-    Ok((host.to_string(), port))
+    let host = authority::normalize_host(host).ok_or_else(|| invalid("host"))?;
+    Ok((host, port))
 }
 
 // ---------------------------------------------------------------------------------------------
