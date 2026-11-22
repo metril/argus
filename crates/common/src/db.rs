@@ -63,6 +63,16 @@ pub mod tables {
     pub const USERSCRIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("userscripts");
     /// `<script id>\0<name>` -> JSON GM value.
     pub const GM_VALUES: TableDefinition<&str, &[u8]> = TableDefinition::new("gm_values");
+    /// `<profile>\0<rule id>` -> JSON script-policy site rule.
+    pub const POLICY_SITE_RULES: TableDefinition<&str, &[u8]> =
+        TableDefinition::new("policy_site_rules");
+    /// `<profile>\0<rule id>` -> JSON script-policy source rule.
+    pub const POLICY_SOURCE_RULES: TableDefinition<&str, &[u8]> =
+        TableDefinition::new("policy_source_rules");
+    /// `<profile>\0<grant id>` -> JSON persisted temporary grant.
+    pub const POLICY_TEMP: TableDefinition<&str, &[u8]> = TableDefinition::new("policy_temp");
+    /// `<profile>\0settings` -> JSON settings; `<profile>\0generation` -> u64 big endian.
+    pub const POLICY_META: TableDefinition<&str, &[u8]> = TableDefinition::new("policy_meta");
 }
 
 /// Database error.
@@ -442,6 +452,10 @@ fn init_schema(db: &Database, path: &Path) -> Result<(), DbError> {
         txn.open_table(AUDIT)?;
         txn.open_table(USERSCRIPTS)?;
         txn.open_table(GM_VALUES)?;
+        txn.open_table(POLICY_SITE_RULES)?;
+        txn.open_table(POLICY_SOURCE_RULES)?;
+        txn.open_table(POLICY_TEMP)?;
+        txn.open_table(POLICY_META)?;
         let mut meta = txn.open_table(META)?;
         let found = meta
             .get("schema_version")?
