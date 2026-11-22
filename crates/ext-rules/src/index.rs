@@ -35,6 +35,9 @@ pub struct KindStats {
     pub unsupported: usize,
     /// Malformed.
     pub parse_errors: usize,
+    /// Style blocks refused because they could load resources (counted in `parse_errors` too).
+    #[serde(default)]
+    pub rejected_unsafe_style: usize,
     /// Switched off by a `$badfilter` rule.
     pub badfiltered: usize,
 }
@@ -329,6 +332,9 @@ impl ExtIndex {
                         k.unsupported += 1
                     } else {
                         k.parse_errors += 1
+                    }
+                    if matches!(e, RuleError::Unsafe(_)) {
+                        k.rejected_unsafe_style += 1
                     }
                     if stats.issues.len() < opts.max_issues {
                         stats.issues.push(RuleIssue {

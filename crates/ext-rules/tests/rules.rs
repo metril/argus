@@ -688,3 +688,39 @@ fn trusted_permissions_may_set_any_member() {
         "{out:?}"
     );
 }
+
+// ---- style injection must not be able to load URLs --------------------------------------------
+
+const UNSAFE_STYLES: &[&str] = &[
+    "background: url(http://evil.test/x)",
+    "background:URL( 'http://evil.test/x' )",
+    "background-image: image-set(\"http://evil.test/x\" 1x)",
+    "background: -webkit-image-set(url(x) 1x)",
+    "content: src(\"x\")",
+    "color: red; @import 'http://evil.test/x.css'",
+    "width: expression(alert(1))",
+    "background: u\\72l(http://evil.test/x)",
+    "color: red /* x */",
+    "color: red } body { background: red",
+    "color: red; @font-face { src: x }",
+    "-moz-binding: foo",
+    "background: image(\"x\")",
+    "background: attr(data-u type(<url>))",
+];
+
+#[test]
+fn unsafe_style_declarations_are_rejected_from_any_list() {
+    for st in UNSAFE_STYLES {
+        for trusted in [false, true] {
+            for sep in ["#$?#"] {
+                let raw = format!("a.example{sep}body {{ {st} }}");
+                assert!(parse_rule(&rule(&raw, trusted)).is_err(), "{raw}");
+            }
+        }
+    }
+    let ok = parse_rule(&rule(
+        "a.example#$#body { display: none !important; color: red }",
+        false,
+    ));
+    assert!(ok.is_ok());
+}

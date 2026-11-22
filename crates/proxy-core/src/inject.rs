@@ -100,6 +100,18 @@ fn json_ascii(json: &str) -> String {
     out
 }
 
+static UNSAFE_STYLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_unsafe_style() {
+    UNSAFE_STYLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Style declarations dropped at delivery because they could load resources (engine
+/// `:style()` results; ext-rule rejects are counted in the ext stats at build time).
+pub fn unsafe_styles_dropped() -> u64 {
+    UNSAFE_STYLES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Inputs for [`build_head`].
 pub struct PageSpec<'a> {
     pub cosmetics: &'a Cosmetics,
@@ -168,6 +180,11 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                 }
                 let act = v["action"]["type"].as_str().unwrap_or("hide");
                 let arg = v["action"]["arg"].as_str().unwrap_or("");
+                // Whatever list or engine produced it, a style block is judged here, last.
+                if act == "style" && !ext_rules::is_safe_style(arg) {
+                    note_unsafe_style();
+                    continue;
+                }
                 proc_items.push(serde_json::json!({ "s": sel, "a": act, "g": arg }));
             }
         }
@@ -353,5 +370,28 @@ mod tests {
         assert_eq!(h.matches("</style>").count(), 1);
         assert_eq!(h.matches("</script>").count(), 2, "only our own tags: {h}");
         assert!(!h.contains("x()</script>"));
+    }
+
+    #[test]
+    fn unsafe_style_actions_never_reach_the_page() {
+        let i = Internal::new();
+        let act = |css: &str| {
+            serde_json::json!({"selector":[{"type":"css-selector","arg":"body"}],
+                "action":{"type":"style","arg":css}})
+            .to_string()
+        };
+        let cos = Cosmetics {
+            procedural_actions: vec![
+                act("background: url(http://evil.test/x)"),
+                act("background:image-set('http://evil.test/y' 1x)"),
+                act("color: red; @import 'z'"),
+                act("display: none !important"),
+            ],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(!h.contains("evil.test") && !h.contains("@import"), "{h}");
+        assert!(h.contains("display: none !important"), "{h}");
     }
 }

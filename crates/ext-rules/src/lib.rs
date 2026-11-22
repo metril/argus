@@ -26,6 +26,7 @@ mod parse;
 mod pattern;
 mod permissions;
 mod replace;
+mod style;
 mod types;
 mod util;
 mod xmlprune;
@@ -43,6 +44,7 @@ pub use parse::{
     TextPred, DEFAULT_MAX_ELEMENT_LEN,
 };
 pub use replace::{apply_replace, is_textual_content_type, ReplaceSpec, MAX_REPLACE_BYTES};
+pub use style::is_safe_style;
 pub use types::{
     BodyTransform, RequestDecision, RequestInfo, ResourceType, ResponseInfo, ResponsePlan, RuleId,
 };

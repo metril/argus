@@ -46,12 +46,14 @@ pub enum RuleError {
     Invalid(String),
     /// Well-formed but uses something this crate does not implement.
     Unsupported(String),
+    /// A style block that could load resources or escape the declaration list.
+    Unsafe(String),
 }
 
 impl RuleError {
     pub fn reason(&self) -> &str {
         match self {
-            Self::Invalid(s) | Self::Unsupported(s) => s,
+            Self::Invalid(s) | Self::Unsupported(s) | Self::Unsafe(s) => s,
         }
     }
 }
@@ -61,6 +63,7 @@ impl std::fmt::Display for RuleError {
         match self {
             Self::Invalid(s) => write!(f, "invalid: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
+            Self::Unsafe(s) => write!(f, "unsafe: {s}"),
         }
     }
 }
@@ -1090,6 +1093,14 @@ fn parse_cosmetic(
                     };
                 if selector.is_empty() {
                     return inv("empty selector");
+                }
+                if style
+                    .as_deref()
+                    .is_some_and(|s| !crate::style::is_safe_style(s))
+                {
+                    return Err(RuleError::Unsafe(
+                        "style declaration can load resources or break out of the rule".into(),
+                    ));
                 }
                 (
                     Action::Inject(Injection::ProceduralCss { selector, style }),
