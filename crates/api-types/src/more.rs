@@ -281,7 +281,7 @@ pub struct BlockedEntry {
     pub rule: Option<String>,
     /// List the rule came from, when known (domain-set hits).
     pub list_id: Option<String>,
-    /// Client / profile label.
+    /// Id of the profile that blocked it (decimal).
     pub client: Option<String>,
 }
 

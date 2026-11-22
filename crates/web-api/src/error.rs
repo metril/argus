@@ -233,6 +233,7 @@ impl From<common::profile_store::ProfileError> for ApiError {
             E::Invalid(m) => ApiError::ValidationError(m),
             E::NotFound(what) => ApiError::NotFound(format!("{what} not found")),
             E::Conflict(m) => ApiError::conflict("conflict", m),
+            E::Forbidden(m) => ApiError::coded(StatusCode::FORBIDDEN, "profile_restricted", m),
             E::Db(e) => e.into(),
         }
     }

@@ -81,6 +81,14 @@ async fn target_profile(state: &Arc<AppState>, p: &Principal, raw: &str) -> ApiR
     Ok(id)
 }
 
+/// Profile ids a restricted caller may use (`None`: unrestricted). The store enforces the
+/// address rules against them inside its write transaction.
+fn allowed_ids(p: &Principal) -> Option<Vec<u64>> {
+    p.profiles
+        .as_ref()
+        .map(|v| v.iter().filter_map(|x| x.parse().ok()).collect())
+}
+
 /// Load a device the caller may access (403 when its profile is out of reach, 404 when absent).
 async fn load(state: &Arc<AppState>, p: &Principal, raw: &str) -> ApiResult<DeviceRecord> {
     let id = parse_device_id(raw)?;
@@ -124,7 +132,7 @@ pub async fn list_devices(
     responses(
         (status = 201, description = "Created", body = DeviceDto),
         (status = 400, description = "Invalid name, profile or addresses"),
-        (status = 403, description = "Token is not allowed to use that profile"),
+        (status = 403, description = "Token is not allowed to use that profile, or (restricted tokens) to claim those addresses"),
         (status = 409, description = "An address is already used by another device"),
     )
 )]
@@ -137,16 +145,20 @@ pub async fn create_device(
     let profile_id = target_profile(&state, &p, &req.profile_id).await?;
     let ips = parse_nets(&req.ips)?;
     let st = state.clone();
+    let allowed = allowed_ids(&p);
     let rec = blocking(move || {
-        Ok(st.profiles.put_device(DeviceRecord {
-            id: 0,
-            name: req.name,
-            profile_id,
-            ips,
-            token_digest: None,
-            token_hint: None,
-            created_at: Utc::now(),
-        })?)
+        Ok(st.profiles.put_device_as(
+            DeviceRecord {
+                id: 0,
+                name: req.name,
+                profile_id,
+                ips,
+                token_digest: None,
+                token_hint: None,
+                created_at: Utc::now(),
+            },
+            allowed.as_deref(),
+        )?)
     })
     .await?;
     info!("Device {} created by {}", rec.id, p.username);
@@ -181,7 +193,7 @@ pub async fn get_device(
     responses(
         (status = 200, description = "Updated", body = DeviceDto),
         (status = 400, description = "Invalid name, profile or addresses"),
-        (status = 403, description = "Token is not allowed to use the device's or the new profile"),
+        (status = 403, description = "Token is not allowed to use the device's or the new profile, or (restricted tokens) to claim those addresses"),
         (status = 404, description = "No such device"),
         (status = 409, description = "An address is already used by another device"),
     )
@@ -193,18 +205,29 @@ pub async fn update_device(
     ApiJson(req): ApiJson<UpdateDeviceRequest>,
 ) -> ApiResult<Json<DeviceDto>> {
     req.validate()?;
-    let mut rec = load(&state, &p, &id).await?;
-    if let Some(pid) = &req.profile_id {
-        rec.profile_id = target_profile(&state, &p, pid).await?;
-    }
-    if let Some(n) = req.name {
-        rec.name = n;
-    }
-    if let Some(ips) = &req.ips {
-        rec.ips = parse_nets(ips)?;
-    }
+    let did = load(&state, &p, &id).await?.id;
+    let new_profile = match &req.profile_id {
+        Some(pid) => Some(target_profile(&state, &p, pid).await?),
+        None => None,
+    };
+    let new_ips = req.ips.as_deref().map(parse_nets).transpose()?;
     let st = state.clone();
-    let rec = blocking(move || Ok(st.profiles.put_device(rec)?)).await?;
+    let allowed = allowed_ids(&p);
+    let rec = blocking(move || {
+        Ok(st.profiles.modify_device(did, allowed.as_deref(), |rec| {
+            if let Some(pid) = new_profile {
+                rec.profile_id = pid;
+            }
+            if let Some(n) = req.name {
+                rec.name = n;
+            }
+            if let Some(ips) = new_ips {
+                rec.ips = ips;
+            }
+            Ok(())
+        })?)
+    })
+    .await?;
     info!("Device {} updated by {}", rec.id, p.username);
     Ok(Json(device_dto(&state, &rec)))
 }

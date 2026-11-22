@@ -172,27 +172,24 @@ pub async fn update_profile(
     let st = state.clone();
     let id = profile.id;
     let rec = blocking(move || {
-        let mut rec = st
-            .profiles
-            .get(id)?
-            .ok_or_else(|| ApiError::NotFound("Profile not found".into()))?;
         if let Some(l) = &req.lists {
             check_lists(&st, l)?;
         }
-        if let Some(n) = req.name {
-            rec.name = n;
-        }
-        if let Some(d) = req.description {
-            rec.description = d;
-        }
-        if let Some(l) = req.lists {
-            rec.lists = l;
-        }
-        if let Some(r) = req.rules {
-            rec.rules = r;
-        }
-        rec.updated_at = Utc::now();
-        Ok(st.profiles.put(rec)?)
+        Ok(st.profiles.modify(id, |rec| {
+            if let Some(n) = req.name {
+                rec.name = n;
+            }
+            if let Some(d) = req.description {
+                rec.description = d;
+            }
+            if let Some(l) = req.lists {
+                rec.lists = l;
+            }
+            if let Some(r) = req.rules {
+                rec.rules = r;
+            }
+            Ok(())
+        })?)
     })
     .await?;
     info!("Profile {id} updated by {}", p.username);

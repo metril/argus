@@ -256,10 +256,12 @@ mod tests {
 
 // ---- per-site ad blocking off (document exceptions in the custom rules) ----
 
+fn site_exception_message(site: &str) -> String {
+    format!("'{site}' is not a plain lowercase host name (letters, digits, '-' and '.')")
+}
+
 fn site_exception_error(site: &str) -> ApiError {
-    ApiError::ValidationError(format!(
-        "'{site}' is not a plain lowercase host name (letters, digits, '-' and '.')"
-    ))
+    ApiError::ValidationError(site_exception_message(site))
 }
 
 /// Sites for which ad blocking is switched off. These are `@@||site^$document` lines in the
@@ -314,17 +316,13 @@ async fn set_site_exception(
             }
             return Ok(());
         }
-        let mut rec = st
-            .profiles
-            .get(id)?
-            .ok_or_else(|| ApiError::NotFound("Profile not found".into()))?;
-        let new = list_service::site_exceptions::set(&rec.rules, &s, disabled)
-            .ok_or_else(|| site_exception_error(&s))?;
-        if new != rec.rules {
-            rec.rules = new;
-            rec.updated_at = chrono::Utc::now();
-            st.profiles.put(rec)?;
-        }
+        st.profiles.modify(id, |rec| {
+            rec.rules =
+                list_service::site_exceptions::set(&rec.rules, &s, disabled).ok_or_else(|| {
+                    common::profile_store::ProfileError::Invalid(site_exception_message(&s))
+                })?;
+            Ok(())
+        })?;
         Ok(())
     })
     .await?;

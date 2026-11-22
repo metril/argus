@@ -6267,6 +6267,7 @@ dependencies = [
  "dashmap 5.5.3",
  "ext-rules",
  "filter-engine",
+ "futures-util",
  "governor",
  "ipnet",
  "jsonwebtoken",

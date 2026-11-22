@@ -571,3 +571,117 @@ async fn profile_parameter_isolates_userscripts_policy_and_exceptions() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn restricted_token_cannot_capture_other_devices_or_default_addresses() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let p1 = mk_profile(&admin, "One").await;
+    let p2 = mk_profile(&admin, "Two").await;
+    let d1 = mk_device(&admin, "d1", &p1, &["10.1.0.0/24"]).await;
+    let _d2 = mk_device(&admin, "d2", &p2, &["10.2.0.0/16"]).await;
+    let t = restricted(&admin, &ALL_PROFILE_SCOPES, &[&p1]).await;
+    let post = |name: &str, ips: &[&str]| {
+        ctx.bearer("POST", D, &t)
+            .json(&json!({"name": name, "profile_id": p1, "ips": ips}))
+    };
+    // Inside another profile's range, covering it, or on unassigned (default) addresses.
+    for ips in [
+        &["10.2.3.4"][..],
+        &["10.2.3.0/24"][..],
+        &["10.0.0.0/8"][..],
+        &["192.168.1.5"][..],
+        &["10.1.0.5", "192.168.1.5"][..],
+    ] {
+        let r = post("x", ips).await;
+        assert_eq!(
+            r.status_code(),
+            StatusCode::FORBIDDEN,
+            "{ips:?}: {}",
+            r.text()
+        );
+    }
+    // A subnet of its own device's range is fine.
+    post("ok", &["10.1.0.9"])
+        .await
+        .assert_status(StatusCode::CREATED);
+    // Updating ips follows the same rule; leaving them alone does not matter.
+    let r = ctx
+        .bearer("PUT", &format!("{D}/{d1}"), &t)
+        .json(&json!({"ips": ["10.1.0.0/24", "10.2.9.9"]}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::FORBIDDEN, "{}", r.text());
+    ctx.bearer("PUT", &format!("{D}/{d1}"), &t)
+        .json(&json!({"name": "renamed", "ips": ["10.1.0.0/24"]}))
+        .await
+        .assert_status_ok();
+    // The victim still resolves to its own profile: nothing was stored.
+    let devs: Value = admin.get(D).await.json();
+    assert_eq!(devs["total"], 3);
+    // Unrestricted callers may still nest (deliberate), identical nets conflict.
+    admin
+        .post(D)
+        .json(&json!({"name": "nested", "profile_id": p1, "ips": ["10.2.3.4"]}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    admin
+        .post(D)
+        .json(&json!({"name": "dup", "profile_id": p1, "ips": ["10.2.3.4"]}))
+        .await
+        .assert_status(StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn restricted_token_sees_only_its_profiles_blocked_requests() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let p1 = mk_profile(&admin, "One").await;
+    ctx.state
+        .shared_engine
+        .install(filter_engine::compile_engine(
+            &["||ads.test^\n".to_string()],
+        ));
+    let e = &ctx.state.shared_engine;
+    e.check_for("https://ads.test/mine", "https://p.test/", "script", &p1);
+    e.check_for("https://ads.test/theirs", "https://p.test/", "script", "0");
+    e.check_for("https://ads.test/other", "https://p.test/", "script", "99");
+    e.check("https://ads.test/anon", "https://p.test/", "script");
+    let t = restricted(&admin, &["stats:read"], &[&p1]).await;
+    let r: Value = ctx
+        .bearer("GET", "/api/v1/stats/blocked/recent", &t)
+        .await
+        .json();
+    assert_eq!(r["total"], 1, "{r}");
+    assert_eq!(r["entries"][0]["url"], "https://ads.test/mine");
+    assert_eq!(r["entries"][0]["client"], p1);
+    let all: Value = admin.get("/api/v1/stats/blocked/recent").await.json();
+    assert_eq!(all["total"], 4);
+    // Aggregates that name domains are withheld too.
+    let f: Value = ctx.bearer("GET", "/api/v1/stats/filter", &t).await.json();
+    assert!(
+        f["top_blocked_domains"].as_array().unwrap().is_empty(),
+        "{f}"
+    );
+    let fa: Value = admin.get("/api/v1/stats/filter").await.json();
+    assert!(!fa["top_blocked_domains"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_site_exceptions_do_not_lose_updates() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let p1 = mk_profile(&admin, "One").await;
+    let sites: Vec<String> = (0..24).map(|i| format!("s{i}.example")).collect();
+    let url = |s: &str| format!("/api/v1/rules/site-exceptions/{s}?profile={p1}");
+    let calls = sites.iter().map(|s| async { admin.put(&url(s)).await });
+    let rs = futures_util::future::join_all(calls).await;
+    for r in &rs {
+        assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    }
+    let got: Value = admin
+        .get(&format!("/api/v1/rules/site-exceptions?profile={p1}"))
+        .await
+        .json();
+    let n = got["sites"].as_array().map_or(0, |a| a.len());
+    assert_eq!(n, sites.len(), "lost updates: {got}");
+}

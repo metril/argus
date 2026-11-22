@@ -202,7 +202,7 @@
       "BlockedEntry": {
         "properties": {
           "client": {
-            "description": "Client / profile label.",
+            "description": "Id of the profile that blocked it (decimal).",
             "type": [
               "string",
               "null"
@@ -6833,7 +6833,7 @@
             "description": "Missing, invalid, expired or revoked credentials"
           },
           "403": {
-            "description": "Token is not allowed to use that profile"
+            "description": "Token is not allowed to use that profile, or (restricted tokens) to claim those addresses"
           },
           "409": {
             "description": "An address is already used by another device"
@@ -7082,7 +7082,7 @@
             "description": "Missing, invalid, expired or revoked credentials"
           },
           "403": {
-            "description": "Token is not allowed to use the device's or the new profile"
+            "description": "Token is not allowed to use the device's or the new profile, or (restricted tokens) to claim those addresses"
           },
           "404": {
             "description": "No such device"
@@ -11935,7 +11935,7 @@
             }
           },
           {
-            "description": "Only blocks attributed to this client / profile label.",
+            "description": "Only blocks of this profile (decimal id).",
             "in": "query",
             "name": "client",
             "required": false,
@@ -12026,7 +12026,7 @@
             ]
           }
         ],
-        "summary": "Recently blocked requests from the engine's bounded ring, newest first, filterable by client\nlabel, host and list id.",
+        "summary": "Recently blocked requests from the engine's bounded ring, newest first, filterable by\nprofile, host and list id. A profile-restricted token sees only blocks of its own profiles.",
         "tags": [
           "stats"
         ]

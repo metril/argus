@@ -25,8 +25,9 @@ pub struct Profile {
     /// Small second engine checked after `engine`: an overlay exception or block wins; cosmetic
     /// resources are merged from both.
     pub overlay: Option<Arc<SharedEngine>>,
-    /// Client label attached to block events (the profile id for now), built once per profile so
-    /// the request path allocates nothing.
+    /// Profile id as text, attached to block events as their client (built once per profile so
+    /// the request path allocates nothing). The API filters the block log by it, so it must stay the
+    /// id, never the display name.
     pub label: Arc<str>,
     /// Userscripts of this profile (live index, GM backend, token key). `None`: no userscripts.
     pub userscripts: Option<Arc<userscript_engine::UserscriptManager>>,
