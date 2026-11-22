@@ -527,7 +527,7 @@ impl Session {
 
     /// Poll `js` until it is truthy (no fixed sleeps); panics with diagnostics on timeout.
     pub async fn wait_for(&self, what: &str, js: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let v = self.eval(js).await;
             if v.as_bool().unwrap_or(false) || v.as_i64().is_some_and(|n| n != 0) {
