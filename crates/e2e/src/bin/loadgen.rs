@@ -29,6 +29,7 @@ const HELP: &str = "loadgen: proxy latency load generator
   --scenario steady|reload reload swaps a rebuilt list in during the run (proxy path only)
   --reload-rules N         size of the reloaded list (default 100000)
   --reload-interval S      seconds between reloads (default 5)
+  --build-threads N        reload scenario: list-build pool threads (default 0 = half the cores)
   --repeat N               full repetitions (default 1)
   --seed N                 request sequence seed
   --proxy-addr H:P --ca F  drive an external proxy (explicit mode) trusting its CA file
@@ -56,6 +57,7 @@ struct Args {
     reload: bool,
     reload_rules: usize,
     reload_interval: u64,
+    build_threads: usize,
     repeat: usize,
     seed: u64,
     proxy_addr: Option<String>,
@@ -82,6 +84,7 @@ fn parse() -> Result<Args, String> {
         reload: false,
         reload_rules: 100_000,
         reload_interval: 5,
+        build_threads: 0,
         repeat: 1,
         seed: 1,
         proxy_addr: None,
@@ -154,6 +157,7 @@ fn parse() -> Result<Args, String> {
             }
             "--reload-rules" => a.reload_rules = num(val()?)? as usize,
             "--reload-interval" => a.reload_interval = num(val()?)?,
+            "--build-threads" => a.build_threads = num(val()?)? as usize,
             "--repeat" => a.repeat = num(val()?)? as usize,
             "--seed" => a.seed = num(val()?)?,
             "--proxy-addr" => a.proxy_addr = Some(val()?),
@@ -293,6 +297,7 @@ fn run(a: Args) -> i32 {
                     list_service::ListServiceConfig {
                         data_dir: dir,
                         auto_update: false,
+                        build_threads: a.build_threads,
                         ..Default::default()
                     },
                     Arc::new(store),
