@@ -288,6 +288,41 @@ async fn scriptlet_resources_retry_until_available() {
 }
 
 #[tokio::test]
+async fn list_enabled_only_by_a_profile_is_downloaded_and_refreshed() {
+    let origin = Arc::new(Origin::default());
+    let addr = serve(origin.clone()).await;
+    let f = fixture(addr, |_| {});
+    let mut l = f.svc.store().get("t").unwrap().unwrap();
+    l.enabled = false;
+    f.svc.store().upsert(&l).unwrap();
+
+    // Not enabled anywhere: never downloaded.
+    f.svc.reload_now().await;
+    assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
+
+    // Enabled by a profile: downloaded (cached), but not part of the global engine.
+    f.svc.set_profile_lists(["t".to_string()]);
+    f.svc.reload_now().await;
+    assert_eq!(origin.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.svc.store().get_content("t").unwrap().as_deref(),
+        Some(RULES)
+    );
+    assert!(!blocked(&f.engine));
+
+    // Every later cycle revalidates it (conditional request), like an enabled list.
+    let set = f.svc.engine_for(&["t".to_string()]).await.unwrap();
+    assert!(blocked(&set));
+    f.svc.reload_now().await;
+    assert_eq!(origin.hits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        origin.last_cond.lock().unwrap().0.as_deref(),
+        Some("\"v1\""),
+        "revalidated with the stored etag"
+    );
+}
+
+#[tokio::test]
 async fn auto_update_schedule_can_be_enabled_live() {
     let origin = Arc::new(Origin::default());
     let addr = serve(origin.clone()).await;

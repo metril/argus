@@ -253,6 +253,56 @@ impl PolicyStore {
         Ok(out)
     }
 
+    /// Remove everything stored for a deleted profile: site and source rules, temporary grants,
+    /// settings, panel settings and PIN, PIN lockout state, and the in-memory snapshot and
+    /// blocked-source report. A profile created later under the same name starts empty. The
+    /// default profile is refused. Blocks for the fsync: call from `spawn_blocking`.
+    pub fn delete_profile(&self, profile: &str) -> Result<(), StoreError> {
+        if profile == crate::DEFAULT_PROFILE {
+            return Err(StoreError::Conflict(
+                "the default profile's policy cannot be deleted".into(),
+            ));
+        }
+        use common::db::redb::ReadableTable as _;
+        let mut st = self.state.lock();
+        let (lo, hi) = (format!("{profile}\0"), format!("{profile}\u{1}"));
+        let (plo, phi) = (
+            format!("{PINLOCK_PREFIX}{profile}\0"),
+            format!("{PINLOCK_PREFIX}{profile}\u{1}"),
+        );
+        self.db.write(Durability::Immediate, |txn| {
+            for (def, meta) in [
+                (tables::POLICY_SITE_RULES, false),
+                (tables::POLICY_SOURCE_RULES, false),
+                (tables::POLICY_TEMP, false),
+                (tables::POLICY_META, true),
+            ] {
+                let mut t = txn.open_table(def)?;
+                let mut keys: Vec<String> = Vec::new();
+                let ranges: &[(&str, &str)] = if meta {
+                    &[(&lo, &hi), (&plo, &phi)]
+                } else {
+                    &[(&lo, &hi)]
+                };
+                for (a, b) in ranges {
+                    for row in t.range(*a..*b)? {
+                        keys.push(row?.0.value().to_string());
+                    }
+                }
+                for k in keys {
+                    t.remove(k.as_str())?;
+                }
+            }
+            Ok::<_, StoreError>(())
+        })?;
+        st.remove(profile);
+        self.published.write().remove(profile);
+        self.reports.lock().remove(profile);
+        drop(st);
+        self.notify(profile);
+        Ok(())
+    }
+
     /// Register a callback run (on the writer's thread) after every committed change.
     pub fn on_change(&self, f: impl Fn(&str) + Send + Sync + 'static) {
         self.listeners.write().push(Arc::new(f));

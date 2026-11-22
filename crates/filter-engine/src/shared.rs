@@ -171,6 +171,28 @@ fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Ar
 ///
 /// The result has its own statistics and no block log; the caller records matches itself.
 pub fn overlay_from_rules(rules: &str) -> Result<Option<Arc<SharedEngine>>, String> {
+    overlay_with(rules, || SharedEngine::with_event_capacity(0))
+}
+
+/// [`overlay_from_rules`] over an engine that records into `base`'s statistics and block log and
+/// obeys its master switch.
+pub fn overlay_from_rules_shared(
+    rules: &str,
+    base: &SharedEngine,
+) -> Result<Option<Arc<SharedEngine>>, String> {
+    overlay_with(rules, || {
+        SharedEngine::with_shared(
+            base.stats_handle(),
+            base.block_log_handle(),
+            base.enabled_flag(),
+        )
+    })
+}
+
+fn overlay_with(
+    rules: &str,
+    make: impl FnOnce() -> SharedEngine,
+) -> Result<Option<Arc<SharedEngine>>, String> {
     let has_rules = rules
         .lines()
         .map(str::trim)
@@ -186,7 +208,7 @@ pub fn overlay_from_rules(rules: &str) -> Result<Option<Arc<SharedEngine>>, Stri
         trusted: true,
         includes: Default::default(),
     }]);
-    let engine = SharedEngine::with_event_capacity(0);
+    let engine = make();
     let live = try_build_engine(&built.blob, &engine.resources())?;
     engine.install_set(
         Arc::new(built.blob),
@@ -525,6 +547,49 @@ impl SharedEngine {
         client: &str,
     ) -> MatchResult {
         self.check_inner(url, source_url, resource_type, Some(client))
+    }
+
+    /// [`Self::check_gen`] without the statistics and block-log bookkeeping. The caller combines
+    /// several verdicts (for example a base and an overlay engine) and records the final one once
+    /// with [`Self::record_verdict`].
+    pub fn check_gen_deferred(
+        &self,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+    ) -> (MatchResult, Arc<Generation>) {
+        loop {
+            let generation = self.engine.load_full();
+            let r = if self.enabled.load(Ordering::Relaxed) {
+                self.decide(url, source_url, resource_type)
+            } else {
+                MatchResult::allowed()
+            };
+            if self.engine.load().id == generation.id {
+                return (r, generation);
+            }
+        }
+    }
+
+    /// [`Self::check`] without the bookkeeping (see [`Self::check_gen_deferred`]).
+    pub fn check_deferred(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.decide(url, source_url, resource_type)
+        } else {
+            MatchResult::allowed()
+        }
+    }
+
+    /// Record a finished verdict (statistics and, on a block, the recent-blocked event).
+    pub fn record_verdict(
+        &self,
+        r: MatchResult,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: &str,
+    ) -> MatchResult {
+        self.record(r, url, source_url, resource_type, Some(client))
     }
 
     /// [`Self::check_for`] that also returns the [`Generation`] the verdict was computed

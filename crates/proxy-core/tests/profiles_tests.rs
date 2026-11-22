@@ -392,6 +392,52 @@ async fn overlay_exception_beats_base_block_and_overlay_block_beats_base_allow()
     assert!(request(&mut s, &f, "/fine", None).await.reached_origin());
 }
 
+/// Engine over `rules` that records into `base`'s statistics and obeys its master switch.
+fn shared_engine(base: &SharedEngine, rules: &[&str]) -> Arc<SharedEngine> {
+    let e = Arc::new(SharedEngine::with_shared(
+        base.stats_handle(),
+        base.block_log_handle(),
+        base.enabled_flag(),
+    ));
+    let rules: Vec<String> = rules.iter().map(|r| format!("{r}\n")).collect();
+    e.install(compile_engine(&rules));
+    e
+}
+
+#[tokio::test]
+async fn overlay_verdicts_are_counted_once() {
+    let default = engine(&[]);
+    let f = fixture(default.clone(), false).await;
+    let base = shared_engine(&default, &["/ads/"]);
+    let overlay = shared_engine(&default, &["@@/ads/ok", "/ads/"]);
+    let sa = slot(1, base);
+    sa.store(Arc::new(sa.load().with(|p| p.overlay = Some(overlay))));
+    let t = f.ctx.profiles().table();
+    let table = ProfileTable::builder(t.default_slot().clone())
+        .profile(1, sa)
+        .ip(LOCALHOST.parse().unwrap(), 1)
+        .build();
+    drop(t);
+    f.ctx.profiles().publish(table);
+    let stats = default.stats_handle();
+    let mut s = connect(&f).await;
+    // Overlay exception overrides the base block: allowed, nothing blocked.
+    assert!(request(&mut s, &f, "/ads/ok", None).await.reached_origin());
+    assert_eq!(
+        stats.snapshot().blocked_requests,
+        0,
+        "exception override leaves no block"
+    );
+    // Blocked by both engines: one block, not two.
+    assert!(!request(&mut s, &f, "/ads/x", None).await.reached_origin());
+    assert_eq!(
+        stats.snapshot().blocked_requests,
+        1,
+        "double block counts once"
+    );
+    assert_eq!(default.recent_blocked(10).len(), 1);
+}
+
 #[tokio::test]
 async fn gm_values_are_namespaced_per_profile() {
     use proxy_core::gm::{Caller, GmHost};

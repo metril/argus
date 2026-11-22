@@ -167,6 +167,9 @@ pub struct ListService {
     pub(crate) bundled_tried: AtomicBool,
     /// Live auto-update schedule: `(auto_update, interval)`.
     schedule: watch::Sender<(bool, Duration)>,
+    /// Lists some profile enables: downloaded and refreshed like globally enabled ones, but only
+    /// compiled into the engines of the profiles that use them.
+    profile_lists: Mutex<std::collections::HashSet<String>>,
     /// Per-list-set engines (see [`ListService::engine_for`]).
     pub(crate) sets: crate::sets::SetRegistry,
     /// Test hook: make the next build panic.
@@ -334,6 +337,7 @@ impl ListService {
         Arc::new(Self {
             schedule,
             sets: Default::default(),
+            profile_lists: Mutex::default(),
             cfg,
             store,
             engine,
@@ -472,14 +476,22 @@ impl ListService {
         });
     }
 
+    /// Declare the lists enabled by any profile (the union over all profiles). The update ticker
+    /// and every build cycle then download and refresh them although they are not globally
+    /// enabled. Takes effect at the next cycle.
+    pub fn set_profile_lists(&self, ids: impl IntoIterator<Item = String>) {
+        *self.profile_lists.lock() = ids.into_iter().collect();
+    }
+
     /// Shortest of the global interval and the `! Expires:` of any enabled list.
     fn next_wake(&self, interval: Duration) -> Duration {
+        let extra = self.profile_lists.lock().clone();
         let shortest = self
             .store
             .get_all()
             .unwrap_or_default()
             .into_iter()
-            .filter(|l| l.enabled)
+            .filter(|l| l.enabled || extra.contains(&l.id))
             .filter_map(|l| self.report(&l.id)?.meta.expires_secs)
             .min()
             .map(Duration::from_secs);
@@ -908,6 +920,21 @@ impl ListService {
             .buffered(self.cfg.fetch_concurrency.max(1))
             .filter_map(|c| async move { c })
             .collect()
+            .await;
+        // Lists only profiles use: fetched and cached so their engines can refresh, but not part
+        // of the global engine.
+        let extra: Vec<FilterList> = {
+            let wanted = self.profile_lists.lock().clone();
+            self.store
+                .get_all()?
+                .into_iter()
+                .filter(|l| !l.enabled && wanted.contains(&l.id))
+                .collect()
+        };
+        futures_util::stream::iter(extra)
+            .map(|l| async move { self.fetch_one(l, force).await })
+            .buffered(self.cfg.fetch_concurrency.max(1))
+            .for_each(|_| async {})
             .await;
         // Custom rules compile last so their `@@` exceptions apply to every list.
         inputs.extend(self.custom_input());

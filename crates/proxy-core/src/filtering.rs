@@ -110,7 +110,8 @@ fn apply_overlay(
     if !ov.is_enabled() {
         return base;
     }
-    let o = ov.check_for(url, source_url, resource_type, &profile.label);
+    // Neither verdict is counted here: the caller records the final one once.
+    let o = ov.check_deferred(url, source_url, resource_type);
     if o.blocked || o.exception_rule.is_some() {
         return o;
     }
@@ -150,6 +151,10 @@ pub struct ProxyContext {
     default_slot: ProfileSlot,
     /// Device-to-profile table; holds only the default profile until something publishes.
     profiles: Profiles,
+    /// The profile and device store and the builder that compiles it into `profiles` (set once
+    /// at startup; see [`Self::set_profile_service`]).
+    profile_store: std::sync::OnceLock<Arc<common::profile_store::ProfileStore>>,
+    profile_builder: std::sync::OnceLock<Arc<crate::profile_build::ProfileBuilder>>,
     /// Refuse explicit-proxy connections without a known device token (`407`).
     require_device_token: std::sync::atomic::AtomicBool,
     /// Upstream request timeout in milliseconds; 0 disables it.
@@ -185,6 +190,8 @@ impl ProxyContext {
             client,
             profiles: Profiles::new(default_slot.clone()),
             default_slot,
+            profile_store: std::sync::OnceLock::new(),
+            profile_builder: std::sync::OnceLock::new(),
             require_device_token: std::sync::atomic::AtomicBool::new(false),
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
             resolve_all_to: None,
@@ -312,6 +319,26 @@ impl ProxyContext {
         &self.default_slot
     }
 
+    /// Register the profile store and its builder (once; later calls are ignored).
+    pub fn set_profile_service(
+        &self,
+        store: Arc<common::profile_store::ProfileStore>,
+        builder: Arc<crate::profile_build::ProfileBuilder>,
+    ) {
+        let _ = self.profile_store.set(store);
+        let _ = self.profile_builder.set(builder);
+    }
+
+    /// The persistent profile and device store, once registered.
+    pub fn profile_store(&self) -> Option<&Arc<common::profile_store::ProfileStore>> {
+        self.profile_store.get()
+    }
+
+    /// The builder that keeps the live profile table in step with the store, once registered.
+    pub fn profile_builder(&self) -> Option<&Arc<crate::profile_build::ProfileBuilder>> {
+        self.profile_builder.get()
+    }
+
     /// The device-to-profile table.
     pub fn profiles(&self) -> &Profiles {
         &self.profiles
@@ -339,8 +366,12 @@ impl ProxyContext {
         profile.engine.is_enabled() && {
             let base = profile
                 .engine
-                .check_for(url, source_url, resource_type, &profile.label);
-            apply_overlay(&profile, base, url, source_url, resource_type).blocked
+                .check_deferred(url, source_url, resource_type);
+            let v = apply_overlay(&profile, base, url, source_url, resource_type);
+            profile
+                .engine
+                .record_verdict(v, url, source_url, resource_type, &profile.label)
+                .blocked
         }
     }
 
@@ -461,9 +492,10 @@ impl ProxyContext {
             let engine = &profile.engine;
             if engine.is_enabled() {
                 let source = source_url(&headers, &url, rtype);
-                let (verdict, gen_) =
-                    engine.check_gen(&url, source, rtype.as_str(), &profile.label);
+                let (verdict, gen_) = engine.check_gen_deferred(&url, source, rtype.as_str());
                 let verdict = apply_overlay(&profile, verdict, &url, source, rtype.as_str());
+                let verdict =
+                    engine.record_verdict(verdict, &url, source, rtype.as_str(), &profile.label);
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
@@ -475,7 +507,10 @@ impl ProxyContext {
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
-                page_off = rtype.is_frame() && engine.site_off(&url);
+                // A non-default profile keeps its per-site exceptions in its overlay rules.
+                page_off = rtype.is_frame()
+                    && (engine.site_off(&url)
+                        || profile.overlay.as_ref().is_some_and(|o| o.site_off(&url)));
                 if let Some(new_url) = verdict.rewritten_url {
                     let navigation =
                         rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
