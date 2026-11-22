@@ -65,6 +65,7 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
             allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
+            require_device_token: false,
         },
         mitm: MitmSettings {
             enabled: false,
