@@ -157,7 +157,17 @@ mod tests {
     fn every_synthetic_response_is_tagged_and_uncacheable() {
         use RequestType::*;
         let v = MatchResult::blocked("||a.test^");
-        for ty in [Document, Subdocument, Image, Script, Stylesheet, Xhr, Ping, Media, Other] {
+        for ty in [
+            Document,
+            Subdocument,
+            Image,
+            Script,
+            Stylesheet,
+            Xhr,
+            Ping,
+            Media,
+            Other,
+        ] {
             let r = block_response(ty, &v, "u");
             assert_eq!(r.headers()["x-adblock"], "blocked", "{ty:?}");
             assert_eq!(r.headers()["cache-control"], "no-store", "{ty:?}");
@@ -168,8 +178,7 @@ mod tests {
         });
         assert_eq!(r.headers()["cache-control"], "no-store");
         assert_eq!(
-            rewrite_redirect("https://a.test/")
-                .headers()["cache-control"],
+            rewrite_redirect("https://a.test/").headers()["cache-control"],
             "no-store"
         );
     }

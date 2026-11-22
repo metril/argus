@@ -5,8 +5,8 @@
 //! negotiated end to end therefore keep working, and the proxy never re-frames messages.
 
 use crate::filtering::ProxyContext;
-use crate::request_ctx::RequestCtx;
 use crate::inject::{full_body, ProxyBody};
+use crate::request_ctx::RequestCtx;
 use crate::{Error, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};

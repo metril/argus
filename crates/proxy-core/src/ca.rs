@@ -357,13 +357,7 @@ mod tests {
         .unwrap();
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
         verifier
-            .verify_server_cert(
-                leaf,
-                &[],
-                &name,
-                &[],
-                rustls::pki_types::UnixTime::now(),
-            )
+            .verify_server_cert(leaf, &[], &name, &[], rustls::pki_types::UnixTime::now())
             .unwrap_or_else(|e| panic!("leaf for {host} does not chain to on-disk CA: {e}"));
     }
 

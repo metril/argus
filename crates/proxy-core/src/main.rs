@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     )?);
 
     // Create the proxy server
-    let server = ProxyServer::new(config.clone(), ctx).map_err(|e| {
+    let server = ProxyServer::new(config.clone(), ctx.clone()).map_err(|e| {
         error!("Failed to initialize proxy server: {}", e);
         e
     })?;

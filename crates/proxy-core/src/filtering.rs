@@ -158,11 +158,7 @@ impl ProxyContext {
         resource_type: &str,
     ) -> bool {
         let profile = rctx.profile.load();
-        profile.engine.is_enabled()
-            && profile
-                .engine
-                .check(url, source_url, resource_type)
-                .blocked
+        profile.engine.is_enabled() && profile.engine.check(url, source_url, resource_type).blocked
     }
 
     /// Forward a proxied request using the default request context.
