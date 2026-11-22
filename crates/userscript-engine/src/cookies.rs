@@ -41,6 +41,12 @@ impl GmCookieJar {
         Self::default()
     }
 
+    /// Drop every cookie of every script of `profile`.
+    pub fn forget_profile(&self, profile: &str) {
+        let prefix = format!("{profile}\u{0}");
+        self.stores.lock().retain(|k, _| !k.starts_with(&prefix));
+    }
+
     /// `Cookie` request-header value for `url` (None when nothing matches).
     pub fn header_for(&self, profile: &str, script: &str, url: &Url) -> Option<String> {
         let stores = self.stores.lock();

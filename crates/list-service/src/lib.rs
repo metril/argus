@@ -9,12 +9,14 @@ mod persist;
 mod report;
 mod scriptlets;
 mod service;
+mod sets;
 pub mod site_exceptions;
 mod store;
 
 pub use error::{Error, Result};
 pub use report::{BuildState, BuildSummary};
 pub use service::{ListService, ListServiceConfig};
+pub use sets::SetKey;
 pub use store::{ListStatus, ListStore};
 
 /// Re-exported so API code needs no direct `filter-engine` dependency for these.

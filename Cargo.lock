@@ -933,11 +933,14 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "blake3",
  "bytes",
  "chrono",
  "ipnet",
  "libc",
  "parking_lot",
+ "rand 0.8.6",
  "redb",
  "reqwest 0.12.28",
  "serde",
@@ -2661,6 +2664,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is-terminal"
