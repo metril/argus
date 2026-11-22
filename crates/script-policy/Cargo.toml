@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-license.workspace = true
+publish.workspace = true
 description = "Pure NoScript-style script policy: capability model, per-site rules, CSP generation, HTML actions, network hints, block reports"
 
 [dependencies]

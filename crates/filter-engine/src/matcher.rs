@@ -90,6 +90,52 @@ impl MatchResult {
 /// Request matcher wrapper around adblock-rust
 pub struct RequestMatcher;
 
+/// Parsed source page of the last request on this thread: a page's sub-requests share it, so
+/// its URL parse and public-suffix lookup run once per page instead of once per check.
+struct SourceMemo {
+    url: String,
+    /// `(hostname, registrable domain)`; `None` when the source URL does not parse.
+    parsed: Option<(String, String)>,
+}
+
+thread_local! {
+    static SOURCE: std::cell::RefCell<SourceMemo> =
+        const { std::cell::RefCell::new(SourceMemo { url: String::new(), parsed: None }) };
+}
+
+/// Same request as `AdblockRequest::new(url, source_url, resource_type)`, with the source page
+/// parse memoized (see [`SourceMemo`]).
+pub(crate) fn make_request(
+    url: &str,
+    source_url: &str,
+    resource_type: &str,
+) -> std::result::Result<AdblockRequest, adblock::request::RequestError> {
+    let Some(target) = adblock::url_parser::parse_url(url) else {
+        return AdblockRequest::new(url, source_url, resource_type);
+    };
+    Ok(SOURCE.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.url != source_url || (m.parsed.is_none() && m.url.is_empty()) {
+            m.parsed = adblock::url_parser::parse_url(source_url)
+                .map(|p| (p.hostname().to_string(), p.domain().to_string()));
+            m.url.clear();
+            m.url.push_str(source_url);
+        }
+        match &m.parsed {
+            Some((host, domain)) => AdblockRequest::preparsed(
+                &target.url,
+                target.hostname(),
+                host,
+                resource_type,
+                domain != target.domain(),
+            ),
+            None => {
+                AdblockRequest::preparsed(&target.url, target.hostname(), "", resource_type, true)
+            }
+        }
+    }))
+}
+
 impl RequestMatcher {
     /// Check if a network request should be blocked
     ///
@@ -171,6 +217,51 @@ impl RequestMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memoized_request_matches_plain_request() {
+        let mut set = adblock::lists::FilterSet::new(false);
+        set.add_filters(
+            [
+                "||ads.example.com^$third-party",
+                "/Banner/*$script,domain=page.test",
+                "||cdn.test^$~third-party",
+                "@@||ok.example.com^",
+                "|http://Mixed.test/Path",
+            ],
+            Default::default(),
+        );
+        let engine = adblock::Engine::from_filter_set(set, true);
+        let urls = [
+            "https://ads.example.com/x.js",
+            "https://site.test/Banner/a.js",
+            "https://cdn.test/a",
+            "https://ok.example.com/a",
+            "http://Mixed.test/Path?Q=1",
+            "https://user@ads.example.com:8443/x",
+            "not a url",
+        ];
+        for source in ["https://page.test/", "https://cdn.test/", "garbage", ""] {
+            for url in urls {
+                for _ in 0..2 {
+                    let a = AdblockRequest::new(url, source, "script");
+                    let b = make_request(url, source, "script");
+                    assert_eq!(a.is_ok(), b.is_ok(), "{url} from {source}");
+                    if let (Ok(a), Ok(b)) = (a, b) {
+                        let (ra, rb) = (
+                            engine.check_network_request(&a),
+                            engine.check_network_request(&b),
+                        );
+                        assert_eq!(
+                            (ra.matched, ra.filter, ra.exception),
+                            (rb.matched, rb.filter, rb.exception),
+                            "{url} from {source}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_match_result_creation() {

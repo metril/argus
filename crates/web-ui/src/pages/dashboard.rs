@@ -15,6 +15,10 @@ pub fn DashboardPage() -> impl IntoView {
     let requests_checked = RwSignal::new("--".to_string());
     let userscripts_installed = RwSignal::new("--".to_string());
     let uptime = RwSignal::new("--".to_string());
+    let upstream_timeouts = RwSignal::new("--".to_string());
+    let upstream_errors = RwSignal::new("--".to_string());
+    let dns_failures = RwSignal::new("--".to_string());
+    let destination_refusals = RwSignal::new("--".to_string());
 
     // Fetch stats
     Effect::new(move || {
@@ -24,6 +28,10 @@ pub fn DashboardPage() -> impl IntoView {
             // Fetch proxy stats
             if let Ok(response) = client.get_proxy_stats().await {
                 active_connections.set(format_number(response.connections.active));
+                upstream_timeouts.set(format_number(response.faults.upstream_timeouts));
+                upstream_errors.set(format_number(response.faults.upstream_errors));
+                dns_failures.set(format_number(response.faults.dns_failures));
+                destination_refusals.set(format_number(response.faults.destination_refusals));
                 // Uptime not available from backend stats
                 uptime.set("N/A".to_string());
             }
@@ -83,6 +91,22 @@ pub fn DashboardPage() -> impl IntoView {
                     <div class="status-item">
                         <span class="status-label">"Uptime"</span>
                         <span class="status-value">{uptime}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">"Upstream timeouts"</span>
+                        <span class="status-value">{upstream_timeouts}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">"Upstream errors"</span>
+                        <span class="status-value">{upstream_errors}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">"DNS failures"</span>
+                        <span class="status-value">{dns_failures}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">"Refused destinations"</span>
+                        <span class="status-value">{destination_refusals}</span>
                     </div>
                     <div class="status-item">
                         <span class="status-label">"Proxy Status"</span>

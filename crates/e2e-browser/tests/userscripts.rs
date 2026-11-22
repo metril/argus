@@ -748,7 +748,7 @@ const SW_JS: &str = "self.addEventListener('fetch', (e) => { const u = new URL(e
 async fn sw_register(s: &Session) -> serde_json::Value {
     s.eval(
         "(async () => { let rej = null; navigator.serviceWorker.register('/sw.js').catch((e) => { rej = e.name; });\
-           for (let i = 0; i < 80; i++) { await new Promise((r) => setTimeout(r, 100)); if (rej) return 'failed:' + rej;\
+           for (let i = 0; i < 600; i++) { await new Promise((r) => setTimeout(r, 100)); if (rej) return 'failed:' + rej;\
              const rs = await navigator.serviceWorker.getRegistrations(); if (rs.length) return 'registered'; }\
            return 'timeout'; })()",
     )

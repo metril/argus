@@ -171,6 +171,7 @@ impl ListService {
             .map(|i| i.id.clone())
             .collect();
         let resources = target.resources();
+        let pool = self.build_pool();
         let (built, engine, index) = tokio::task::spawn_blocking(move || {
             let list_inputs: Vec<ListInput> = inputs
                 .into_iter()
@@ -183,7 +184,8 @@ impl ListService {
                     includes: i.includes,
                 })
                 .collect();
-            let mut built = build_set(&list_inputs);
+            let mut built = pool.install(|| build_set(&list_inputs));
+            drop(list_inputs);
             mark_trusted(&mut built.ext, &trusted);
             let engine = try_build_engine(&built.blob, &resources).map_err(Error::Other)?;
             let index = build_ext_index(&built.ext, &trusted);

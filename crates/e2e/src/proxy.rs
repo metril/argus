@@ -53,6 +53,12 @@ impl OriginalDst for TestDst {
 pub fn install_rules(engine: &SharedEngine, rules: &[&str]) {
     let trusted = !rules.contains(&"!untrusted");
     let text: String = rules.iter().map(|r| format!("{r}\n")).collect();
+    install_rules_text(engine, text, trusted);
+}
+
+/// Compile `text` (one ABP list) and install it as [`install_rules`] does; the same steps the
+/// list service runs after a rebuild.
+pub fn install_rules_text(engine: &SharedEngine, text: String, trusted: bool) {
     let built = filter_engine::build_set(&[filter_engine::ListInput {
         id: "test".into(),
         content: text,
@@ -93,6 +99,8 @@ pub struct TestProxy {
     pub mitm: Option<Arc<proxy_core::mitm::MitmHandler>>,
     /// The proxy's filtering/forwarding context (live settings).
     pub ctx: Arc<ProxyContext>,
+    /// The proxy's connection admission (counters for accepted/rejected connections).
+    pub load_manager: Arc<proxy_core::load_manager::LoadManager>,
     shutdown: broadcast::Sender<()>,
     dir: Option<tempfile::TempDir>,
     userscripts: Mutex<Option<Arc<userscript_engine::UserscriptManager>>>,
@@ -280,6 +288,7 @@ impl TestProxy {
             userscripts: UserscriptSettings::default(),
             script_control: Default::default(),
             webui: WebUiSettings::default(),
+            dns: Default::default(),
         };
 
         tweak(&mut config);
@@ -312,6 +321,7 @@ impl TestProxy {
             .map_err(|e| e.to_string())?
             .with_original_dst(dst.clone());
         let mitm = server.mitm_handler().cloned();
+        let load_manager = server.load_manager().clone();
         let ca_pem = std::fs::read(&ca_cert_path).map_err(|e| e.to_string())?;
 
         // Bind and keep the listener: connections queue in the backlog until `serve` accepts, so
@@ -345,6 +355,7 @@ impl TestProxy {
             engine,
             mitm,
             ctx,
+            load_manager,
             shutdown,
             dir: Some(dir),
             userscripts: Mutex::new(None),

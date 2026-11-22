@@ -126,6 +126,8 @@ type Handler = Arc<dyn Fn(&RecordedRequest) -> MockResponse + Send + Sync>;
 
 #[derive(Default)]
 struct State {
+    /// Skip recording requests (load tests: the log would grow without bound).
+    no_record: std::sync::atomic::AtomicBool,
     routes: Mutex<HashMap<String, Handler>>,
     requests: Mutex<Vec<RecordedRequest>>,
 }
@@ -134,6 +136,7 @@ struct State {
 /// HTTP/2 over TLS plus plain HTTP, and echoes WebSocket messages on `/ws`. Unrouted paths get 404.
 pub struct TestOrigin {
     ca_pem: String,
+    ca_key_pem: String,
     https_port: u16,
     http_port: u16,
     state: Arc<State>,
@@ -141,8 +144,7 @@ pub struct TestOrigin {
 }
 
 struct SniResolver {
-    ca_key: KeyPair,
-    ca_params: CertificateParams,
+    issuer: Issuer<'static, KeyPair>,
     cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
 
@@ -172,8 +174,7 @@ impl SniResolver {
             vec![SanType::DnsName(name.try_into().expect("dns name"))]
         };
         let key = KeyPair::generate().expect("leaf key");
-        let issuer = Issuer::from_params(&self.ca_params, &self.ca_key);
-        let cert = params.signed_by(&key, &issuer).expect("sign leaf");
+        let cert = params.signed_by(&key, &self.issuer).expect("sign leaf");
         let der = PrivateKeyDer::try_from(key.serialize_der()).expect("key der");
         let signing = any_supported_type(&der).expect("signing key");
         Arc::new(CertifiedKey::new(
@@ -198,22 +199,37 @@ impl ResolvesServerCert for SniResolver {
 
 impl TestOrigin {
     pub async fn start() -> Self {
-        crate::init_crypto();
-        let mut ca_params = CertificateParams::default();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "e2e origin CA");
-        ca_params.distinguished_name = dn;
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        let ca_key = KeyPair::generate().expect("ca key");
-        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
-        let ca_pem = ca_cert.pem();
+        Self::start_with_ca(None).await
+    }
 
+    /// Start with a given CA (`(cert_pem, key_pem)`, e.g. one saved by an earlier run so an
+    /// external proxy can keep trusting it); a fresh CA when `None`.
+    pub async fn start_with_ca(ca: Option<(&str, &str)>) -> Self {
+        crate::init_crypto();
+        let (issuer, ca_key_pem, ca_pem) = match ca {
+            Some((cert, key)) => (
+                Issuer::from_ca_cert_pem(cert, KeyPair::from_pem(key).expect("ca key pem"))
+                    .expect("ca cert pem"),
+                key.to_string(),
+                cert.to_string(),
+            ),
+            None => {
+                let mut ca_params = CertificateParams::default();
+                let mut dn = DistinguishedName::new();
+                dn.push(DnType::CommonName, "e2e origin CA");
+                ca_params.distinguished_name = dn;
+                ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+                ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+                let ca_key = KeyPair::generate().expect("ca key");
+                let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+                let (pem, key_pem) = (ca_cert.pem(), ca_key.serialize_pem());
+                (Issuer::new(ca_params, ca_key), key_pem, pem)
+            }
+        };
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(SniResolver {
-                ca_key,
-                ca_params,
+                issuer,
                 cache: Mutex::new(HashMap::new()),
             }));
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -234,6 +250,8 @@ impl TestOrigin {
                     let Ok((stream, _)) = listener.accept().await else {
                         break;
                     };
+                    // Nagle plus delayed ACK would add ~40 ms to multi-segment responses.
+                    let _ = stream.set_nodelay(true);
                     let state = state.clone();
                     let tls = tls.clone();
                     tokio::spawn(async move {
@@ -261,6 +279,7 @@ impl TestOrigin {
 
         Self {
             ca_pem,
+            ca_key_pem,
             https_port,
             http_port,
             state,
@@ -279,6 +298,18 @@ impl TestOrigin {
     /// PEM of the origin CA (the proxy must trust it).
     pub fn ca_pem(&self) -> &str {
         &self.ca_pem
+    }
+
+    /// PEM of the origin CA's private key.
+    pub fn ca_key_pem(&self) -> &str {
+        &self.ca_key_pem
+    }
+
+    /// Stop (or resume) recording received requests; load tests turn it off.
+    pub fn set_recording(&self, on: bool) {
+        self.state
+            .no_record
+            .store(!on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// IP all test hostnames resolve to.
@@ -387,7 +418,9 @@ async fn handle(
         headers,
         body,
     };
-    state.requests.lock().push(rec.clone());
+    if !state.no_record.load(std::sync::atomic::Ordering::Relaxed) {
+        state.requests.lock().push(rec.clone());
+    }
 
     if let (Some(up), Some(key), "/ws") = (on_upgrade, ws_key, rec.path()) {
         tokio::spawn(async move {

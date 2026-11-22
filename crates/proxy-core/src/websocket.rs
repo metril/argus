@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_rustls::TlsConnector;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Check if a request is a WebSocket upgrade request
 pub fn is_websocket_upgrade(headers: &hyper::HeaderMap) -> bool {
@@ -270,11 +270,12 @@ pub async fn proxy_upgrade(
     let io = match ws.dial(&target.host, target.port, target.tls).await {
         Ok(io) => io,
         Err(Error::DestinationRefused(why)) => {
+            common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
             debug!("Refused WebSocket to {}: {}", check_url, why);
             return Ok(refused_response());
         }
         Err(e) => {
-            warn!("WebSocket upstream dial to {} failed: {}", check_url, e);
+            debug!("WebSocket upstream dial to {} failed: {}", check_url, e);
             return Ok(status_response(
                 StatusCode::BAD_GATEWAY,
                 "WebSocket upstream unavailable",
@@ -326,7 +327,7 @@ pub async fn proxy_upgrade(
     let mut resp = match tokio::time::timeout(ws.dial_timeout, sender.send_request(up_req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            warn!("WebSocket upstream request failed: {}", e);
+            debug!("WebSocket upstream request failed: {}", e);
             return Ok(status_response(
                 StatusCode::BAD_GATEWAY,
                 "WebSocket upstream error",
@@ -360,7 +361,7 @@ pub async fn proxy_upgrade(
                     Err(e) => debug!("WebSocket {} ended: {}", desc, e),
                 }
             }
-            Err(e) => warn!("WebSocket upgrade failed for {}: {}", desc, e),
+            Err(e) => debug!("WebSocket upgrade failed for {}: {}", desc, e),
         }
     });
 

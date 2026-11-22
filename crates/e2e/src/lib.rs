@@ -16,6 +16,7 @@
 mod api;
 mod client;
 mod codec;
+pub mod loadgen;
 mod origin;
 mod proxy;
 mod relay;
@@ -25,7 +26,7 @@ pub use api::TestApi;
 pub use client::{ClientOpts, HttpVersion, TestClient};
 pub use codec::{decode, encode, encode_stacked, Coding};
 pub use origin::{MockResponse, RecordedRequest, StreamSpec, TestOrigin};
-pub use proxy::{ProfileHandles, ScriptHandles, TestDst, TestProxy};
+pub use proxy::{install_rules_text, ProfileHandles, ScriptHandles, TestDst, TestProxy};
 pub use relay::SourceRelay;
 pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
 

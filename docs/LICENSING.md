@@ -1,10 +1,13 @@
 # Licensing notes
 
-The workspace is `MIT OR Apache-2.0`.
+The workspace is proprietary; all rights are reserved by the owner. The crates are marked
+`publish = false`.
 
-## uBlock Origin resource library (GPL-3.0)
+The notes below are build facts only.
 
-The default build embeds the uBlock Origin resource library (GPL-3.0-or-later):
+## uBlock Origin resource library
+
+The default build embeds a uBlock Origin resource library snapshot:
 `crates/filter-engine/resources/ubo-resources.json`, converted from uBlock Origin's scriptlet
 library. Provenance (upstream commit, date, how to regenerate) is in
 `crates/filter-engine/resources/SOURCE.txt`.
@@ -15,7 +18,7 @@ To build without it, disable default features:
   `webui` as needed; `full` includes the library), or
 - depend on `filter-engine` / `list-service` with `default-features = false`.
 
-Without the library nothing GPL is compiled in; the file stays in the source tree but is never
+Without the library nothing from it is compiled in; the file stays in the source tree but is never
 `include_str!`-ed.
 
 ### Runtime behaviour

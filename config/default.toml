@@ -26,7 +26,10 @@ cert_ttl_days = 30
 cert_idle_timeout_secs = 3600
 
 [performance]
-max_connections = 10000
+# 0 derives the cap from the soft RLIMIT_NOFILE (three descriptors per connection plus a fixed reserve; the soft limit is first raised to the hard limit).
+max_connections = 0
+# New connections admitted per second; a missing key means 10000, 0 = unlimited.
+connection_rate_limit = 10000
 max_cert_generations = 10
 max_html_buffers = 200
 connection_timeout_secs = 30
@@ -47,6 +50,10 @@ scriptlet_resources_url = "https://raw.githubusercontent.com/gorhill/uBlock/mast
 # link-local destinations. List CIDRs, IPs or host names here to fetch from your LAN, e.g.
 # ["192.168.1.0/24", "nas.lan"]. Redirects are followed at most 3 hops and never from https to http.
 allowed_fetch_destinations = []
+# Threads of the list-build pool (parse and compile on a rebuild), run at low priority. 0 = half the
+# cores (at least 1). A 100k-rule rebuild takes about the same (~240 ms) with 1, 2 or 4 threads, so
+# lowering it costs little build time and leaves more cores to the proxy.
+build_threads = 0
 # Keep query strings in the recent-blocked list (off: they are stripped because they can hold tokens).
 recent_blocked_keep_query = false
 # Leave response bodies alone when the origin sends `Cache-Control: no-transform` (header-only rule

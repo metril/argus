@@ -50,3 +50,13 @@ Needs unprivileged user namespaces and `nft`/`ip`; skipped unless enabled:
 
     cargo fmt --all --check
     cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+## Load test (latency, reload under load)
+
+    cargo run --release -p e2e --bin loadgen -- --help
+    cargo run --release -p e2e --bin loadgen -- --model open --rate 3000 --duration 10 --repeat 3
+
+Direct versus proxied latency (h1/h2), open or closed loop, optional list reload scenario, JSON
+with `--json`. Run it on a quiet machine, never alongside the test suite. See `docs/perf/README.md`
+for the exact baseline commands; a fast smoke test (`crates/e2e/tests/loadgen_smoke.rs`) runs in
+the normal suite.

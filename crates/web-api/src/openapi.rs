@@ -18,7 +18,7 @@ use crate::auth::authz::RouteTable;
         version = "1.0.0",
         description = "Control-plane API of the adblocker proxy. Authenticate with a session cookie or \
 `Authorization: Bearer abk_<id>_<secret>`. Every operation lists the scope it requires.",
-        license(name = "MIT OR Apache-2.0"),
+        license(name = "Proprietary"),
     ),
     components(schemas(ErrorEnvelope, Scope)),
     tags(

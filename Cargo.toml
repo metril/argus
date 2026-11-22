@@ -22,7 +22,7 @@ edition = "2021"
 # stable in rust-toolchain.toml; no nightly features are used.
 rust-version = "1.92"
 authors = ["Adblocker Contributors"]
-license = "MIT OR Apache-2.0"
+publish = false
 repository = "https://github.com/yourusername/adblocker"
 
 [workspace.dependencies]

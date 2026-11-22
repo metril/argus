@@ -177,9 +177,30 @@ struct Own {
     addrs: Vec<IpAddr>,
 }
 
+/// Future of a name lookup.
+pub type AddrFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = std::io::Result<Vec<IpAddr>>> + Send + 'static>,
+>;
+
+/// Source of addresses for a host name (the proxy installs a caching resolver). It only returns
+/// addresses: every policy still judges them on every use, so one instance can serve the proxy
+/// path and the stricter control-plane fetches alike.
+pub trait NameResolver: Send + Sync {
+    fn lookup(&self, name: &str) -> AddrFuture;
+}
+
+static SHARED_RESOLVER: std::sync::OnceLock<Arc<dyn NameResolver>> = std::sync::OnceLock::new();
+
+/// Make `resolver` the default for every [`NetPolicy`] without its own (first call wins).
+/// Returns false when one was already installed.
+pub fn install_shared_resolver(resolver: Arc<dyn NameResolver>) -> bool {
+    SHARED_RESOLVER.set(resolver).is_ok()
+}
+
 /// Which upstream addresses the proxy may connect to.
 #[derive(Default)]
 pub struct NetPolicy {
+    resolver: Option<Arc<dyn NameResolver>>,
     block_private: bool,
     allowed: Vec<IpNet>,
     /// Host names whose private (but never reserved) resolved addresses are accepted.
@@ -193,6 +214,27 @@ impl fmt::Debug for NetPolicy {
             .field("block_private", &self.block_private)
             .field("allowed", &self.allowed)
             .finish_non_exhaustive()
+    }
+}
+
+impl NetPolicy {
+    /// Use `resolver` for this policy's lookups instead of the shared one or the OS.
+    pub fn with_resolver(mut self, resolver: Arc<dyn NameResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Addresses of `name` from this policy's resolver, else the shared one, else the OS.
+    async fn lookup(&self, name: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        match self.resolver.as_ref().or_else(|| SHARED_RESOLVER.get()) {
+            Some(r) => Ok(r
+                .lookup(name)
+                .await?
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect()),
+            None => Ok(tokio::net::lookup_host((name, port)).await?.collect()),
+        }
     }
 }
 
@@ -216,6 +258,7 @@ impl NetPolicy {
             allowed: parse_nets(allowed_destinations)?,
             allowed_hosts: Vec::new(),
             own: RwLock::default(),
+            resolver: None,
         })
     }
 
@@ -321,10 +364,7 @@ impl NetPolicy {
             return Ok(SocketAddr::new(over, port));
         }
         let mut denied = None;
-        for addr in tokio::net::lookup_host((bare, port))
-            .await
-            .map_err(ResolveError::Io)?
-        {
+        for addr in self.lookup(bare, port).await.map_err(ResolveError::Io)? {
             match self.check(addr.ip(), port) {
                 Ok(()) => return Ok(addr),
                 Err(r) => {
@@ -453,7 +493,7 @@ impl NetPolicy {
         self.check_url_literal(&url)?;
         if let Some(url::Host::Domain(name)) = url.host() {
             let port = url.port_or_known_default().unwrap_or(443);
-            let Ok(addrs) = tokio::net::lookup_host((name, port)).await else {
+            let Ok(addrs) = self.lookup(name, port).await else {
                 return Ok(url);
             };
             let mut denied = None;
@@ -517,7 +557,7 @@ impl reqwest::dns::Resolve for GuardedResolver {
             }
             let mut allowed = Vec::new();
             let mut denied = None;
-            for addr in tokio::net::lookup_host((name.as_str(), 0)).await? {
+            for addr in policy.lookup(name.as_str(), 0).await? {
                 let verdict = if strict {
                     policy.check_ip_strict(addr.ip())
                 } else if by_host {
@@ -594,6 +634,37 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Always answers one private address and counts lookups.
+    struct Fixed(std::sync::atomic::AtomicUsize);
+    impl NameResolver for Fixed {
+        fn lookup(&self, _name: &str) -> AddrFuture {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(vec![ip("10.1.2.3")]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn one_resolver_serves_both_policies_and_each_judges_the_answer() {
+        let r = Arc::new(Fixed(Default::default()));
+        // Proxy policy allows private ranges; the control plane refuses them (unless allowlisted).
+        let proxy = NetPolicy::new(false, &[]).unwrap().with_resolver(r.clone());
+        let ctl = NetPolicy::control_plane(&[])
+            .unwrap()
+            .with_resolver(r.clone());
+        let a = proxy.resolve("nas.test", 80, None).await.unwrap();
+        assert_eq!(a, SocketAddr::new(ip("10.1.2.3"), 80));
+        assert!(matches!(
+            ctl.resolve("nas.test", 80, None).await,
+            Err(ResolveError::Refused(Refusal::Private))
+        ));
+        assert!(matches!(
+            ctl.check_url("http://nas.test/x").await,
+            Err(UrlRefusal::Destination(Refusal::Private))
+        ));
+        // Same answer, different verdicts: the resolver never decides policy.
+        assert_eq!(r.0.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

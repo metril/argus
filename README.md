@@ -127,6 +127,19 @@ answered `421 Misdirected Request` unless the connection's certificate covers th
 Address-only caveat: names are checked when they resolve, so a name that resolves to one of the
 proxy host's own interface addresses is refused on the proxy's own ports only.
 
+### DNS resolution
+
+Every name the proxy dials (intercepted HTTP, CONNECT and transparent tunnels, WebSocket) and
+every control-plane fetch (filter lists, resources) is resolved through one caching resolver
+(`[dns]`): TTL-clamped, single-flight, and the destination policy is applied to the cached
+addresses on every use (control-plane fetches keep their own, stricter policy). Only NXDOMAIN and
+"no records" answers are cached negatively (`negative_ttl_secs`); timeouts (retried once),
+SERVFAIL and I/O errors never are. When the resolver answers "does not exist", the operating
+system resolver is asked once before the lookup fails, so names only the OS knows (mDNS `.local`,
+NSS sources) still work; the policy judges those addresses too. This is the same on every path.
+Failures (upstream timeouts and errors, DNS failures, refused destinations) are counted in
+`GET /api/v1/stats/proxy` (`faults`) and summarized in one warning per 10 s.
+
 ### Getting started (end-to-end)
 
 The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API), and optionally the transparent-mode port (`proxy.transparent_port`, off by default).
@@ -170,7 +183,6 @@ Edit `config/default.toml`:
 [proxy]
 host = "0.0.0.0"
 port = 8080
-max_connections = 10000
 enable_http2 = true
 enable_websockets = true  # Requires building with --features websockets
 # Who may use the proxy (CIDRs; others are closed at accept). Default: loopback, RFC 1918,
@@ -183,6 +195,10 @@ allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192
 block_private_destinations = false
 # CIDR exceptions that win over the refusals above (never over the proxy's own listeners):
 allowed_destinations = []
+
+[performance]
+max_connections = 0          # 0 = derive from the soft RLIMIT_NOFILE (3 fds per connection plus a reserve; the soft limit is raised to the hard limit first)
+connection_rate_limit = 10000  # new connections per second; a missing key means 10000, 0 = unlimited
 
 [mitm]
 enabled = true
@@ -198,6 +214,7 @@ update_interval_hours = 24
 # Control-plane downloads (lists, `!#include`, scriptlet resources) refuse private, loopback and
 # link-local destinations by default; allow LAN hosts here (CIDRs, IPs or host names).
 allowed_fetch_destinations = []   # e.g. ["192.168.1.0/24", "nas.lan"]
+build_threads = 0               # list-build pool threads (parse/compile on a rebuild, low priority); 0 = half the cores
 recent_blocked_keep_query = false # strip query strings from the recent-blocked list (they can hold tokens)
 respect_no_transform = true # skip body rewriting when the origin sends Cache-Control: no-transform
 
@@ -1321,7 +1338,7 @@ Contributions are welcome! Please:
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+Proprietary. All rights reserved. Not licensed for redistribution.
 
 ## Security
 

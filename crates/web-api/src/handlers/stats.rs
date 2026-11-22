@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use api_types::{
-    BlockedEntry, ConnectionStats, DomainCount, FilterStatsResponse, MessageResponse, MitmStats,
-    Page, ProxyStatsResponse, RecentBlockedResponse, RequestStats,
+    BlockedEntry, ConnectionStats, DomainCount, FaultStats, FilterStatsResponse, MessageResponse,
+    MitmStats, Page, ProxyStatsResponse, RecentBlockedResponse, RequestStats,
 };
 use axum::{extract::State, Extension, Json};
 use serde::Deserialize;
@@ -43,6 +43,15 @@ pub fn proxy_stats(state: &AppState) -> ProxyStatsResponse {
             bytes_received: s.bytes_received,
             bytes_sent: s.bytes_sent,
             errors: s.errors_total,
+        },
+        faults: {
+            let f = common::faults::snapshot();
+            FaultStats {
+                upstream_timeouts: f.upstream_timeouts,
+                upstream_errors: f.upstream_errors,
+                dns_failures: f.dns_failures,
+                destination_refusals: f.policy_refusals,
+            }
         },
         mitm: state.proxy_state.mitm_enabled.then(|| MitmStats {
             cached_certificates: state.proxy_state.mitm_cached_certs.load(Ordering::Relaxed)

@@ -25,7 +25,11 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
     ProxyConfigResponse {
         host: config.proxy.host.clone(),
         port: config.proxy.port,
-        max_connections: config.performance.max_connections as u32,
+        // 0 means auto: report the effective derived limit, not the sentinel.
+        max_connections: match config.performance.max_connections {
+            0 => common::config::derive_max_connections() as u32,
+            n => n as u32,
+        },
         enable_http2: config.proxy.enable_http2,
         enable_websockets: config.proxy.enable_websockets,
         enable_mitm: config.mitm.enabled,
@@ -126,7 +130,17 @@ pub async fn apply_update(
         restart_field!(
             "max_connections",
             config.performance.max_connections,
-            req.max_connections.map(|v| v as usize)
+            // The UI echoes the effective value back; keep "auto" (0) if it is unchanged.
+            req.max_connections.map(|v| {
+                let v = v as usize;
+                if config.performance.max_connections == 0
+                    && v == common::config::derive_max_connections()
+                {
+                    0
+                } else {
+                    v
+                }
+            })
         );
         restart_field!("enable_http2", config.proxy.enable_http2, req.enable_http2);
         restart_field!(
