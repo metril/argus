@@ -3,12 +3,10 @@
 use std::sync::Arc;
 
 use filter_engine::SharedEngine;
+use list_service::{ListService, ListServiceConfig};
 use proxy_core::{
-    config::ProxyConfig,
-    filtering::ProxyContext,
-    server::ProxyServer,
-    upstream::{build_upstream_client, UpstreamOptions},
-    Result,
+    config::ProxyConfig, filtering::ProxyContext, server::ProxyServer, upstream::UpstreamOptions,
+    Error, Result,
 };
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -38,27 +36,43 @@ async fn main() -> Result<()> {
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
 
-    // One pooled upstream client for forwarding proxied requests (no redirect following).
-    let proxy_client = build_upstream_client(&UpstreamOptions::from_config(&config))?;
-
-    let ctx = Arc::new(ProxyContext::new(
+    // One pooled upstream client (connect/read timeouts from config, no redirect following).
+    let ctx = Arc::new(ProxyContext::with_upstream(
         shared_engine.clone(),
-        proxy_client,
+        &UpstreamOptions::from_config(&config),
         config.adblock.enabled,
-    ));
+    )?);
 
     // Create the proxy server
-    let server = ProxyServer::new(config.clone(), ctx).map_err(|e| {
+    let server = ProxyServer::new(config.clone(), ctx.clone()).map_err(|e| {
         error!("Failed to initialize proxy server: {}", e);
         e
     })?;
 
     info!("Proxy server initialized successfully");
 
+    // Filter lists: always on, independent of the web UI. Starts in the background (cached rules
+    // first, then a refresh), so the proxy accepts connections immediately.
+    let list_service = ListService::open(
+        ListServiceConfig::from_adblock(&config.adblock),
+        shared_engine.clone(),
+    )
+    .map_err(|e| Error::Config(format!("Failed to open filter list service: {e}")))?;
+    list_service.start();
+
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
     let webui_handle = if config.webui.enabled {
-        Some(start_webui_server(&config, config_path.clone(), shared_engine.clone()).await?)
+        Some(
+            start_webui_server(
+                &config,
+                config_path.clone(),
+                shared_engine.clone(),
+                list_service,
+                ctx.request_timeout_handle(),
+            )
+            .await?,
+        )
     } else {
         info!("Web UI disabled in configuration");
         None
@@ -87,74 +101,14 @@ async fn start_webui_server(
     config: &ProxyConfig,
     config_path: String,
     shared_engine: Arc<SharedEngine>,
+    list_service: Arc<ListService>,
+    request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    use proxy_core::Error;
     use tracing::warn;
     use userscript_engine::{UserscriptManager, UserscriptRuntime};
-    use web_api::{
-        build_state, ensure_scriptlet_resources, open_filter_store, reload_now, start_server,
-        ApiConfig,
-    };
+    use web_api::{build_state, start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
-
-    // Persistent filter-list store (Sled). Seed the default lists on a fresh install.
-    let filter_store = open_filter_store(&config.adblock.data_dir)
-        .map_err(|e| Error::Config(format!("Failed to open filter store: {e}")))?;
-    filter_store
-        .seed_defaults_if_empty()
-        .map_err(|e| Error::Config(format!("Failed to seed default filter lists: {e}")))?;
-
-    // Pooled client for downloading filter lists (follows redirects, unlike the proxy client).
-    let list_client = reqwest::Client::builder()
-        .user_agent(concat!("AdBlocker/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| Error::Config(format!("Failed to build list-download client: {e}")))?;
-
-    // Initial compile/load (non-blocking: the proxy starts immediately, rules arrive shortly).
-    if config.adblock.enabled {
-        let (store, engine, client) = (
-            filter_store.clone(),
-            shared_engine.clone(),
-            list_client.clone(),
-        );
-        let data_dir = config.adblock.data_dir.clone();
-        let resources_url = config.adblock.scriptlet_resources_url.clone();
-        let resource_engine = shared_engine.clone();
-        let resource_client = list_client.clone();
-        tokio::spawn(async move {
-            // Load the scriptlet resource library first so `##+js(...)` rules can inject, then
-            // compile the lists.
-            ensure_scriptlet_resources(data_dir, resource_engine, resource_client, resources_url)
-                .await;
-            info!("Performing initial filter list load...");
-            if let Err(e) = reload_now(store, engine, client).await {
-                warn!("Initial filter load failed: {}", e);
-            }
-        });
-    }
-
-    // Periodic auto-update.
-    if config.adblock.enabled && config.adblock.auto_update {
-        let (store, engine, client) = (
-            filter_store.clone(),
-            shared_engine.clone(),
-            list_client.clone(),
-        );
-        let hours = config.adblock.update_interval_hours.max(1);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(hours * 3600));
-            ticker.tick().await; // consume the immediate first tick (initial load is separate)
-            loop {
-                ticker.tick().await;
-                info!("Auto-update: refreshing filter lists");
-                if let Err(e) = reload_now(store.clone(), engine.clone(), client.clone()).await {
-                    warn!("Auto-update reload failed: {}", e);
-                }
-            }
-        });
-    }
 
     // Initialize userscript manager
     let userscript_manager = if config.userscripts.enabled {
@@ -231,11 +185,12 @@ async fn start_webui_server(
         api_config.clone(),
         config.clone(),
         shared_engine,
-        filter_store,
-        list_client,
+        list_service,
+        reqwest::Client::new(),
         userscript_manager,
         userscript_runtime,
         config_path.into(),
+        request_timeout_ms,
     )
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;

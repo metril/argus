@@ -6,12 +6,12 @@ use crate::auth::models::User;
 use crate::auth::session::SessionManager;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
-use crate::filter_store::FilterListStore;
 use chrono::Utc;
 use common::config::ProxyConfig;
 use dashmap::DashMap;
 use filter_engine::{FilterStats, SharedEngine};
 use governor::{Quota, RateLimiter};
+use list_service::{ListService, ListStore};
 use parking_lot::RwLock;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -33,7 +33,9 @@ pub struct AppState {
     pub shared_engine: Arc<SharedEngine>,
 
     /// Persistent store of filter-list metadata + cached content.
-    pub filter_store: Arc<FilterListStore>,
+    pub filter_store: Arc<ListStore>,
+    /// Shared list service (fetch/compile/install); also owns `filter_store`.
+    pub list_service: Arc<ListService>,
 
     /// Shared pooled HTTP client for downloading filter lists.
     pub http_client: reqwest::Client,
@@ -67,6 +69,9 @@ pub struct ProxyState {
 
     /// Runtime statistics
     pub stats: Arc<ProxyStats>,
+
+    /// Live upstream request timeout (ms), shared with the proxy's `ProxyContext`.
+    pub request_timeout_ms: Arc<AtomicU64>,
 
     /// MITM enabled flag (for stats display)
     pub mitm_enabled: bool,
@@ -354,11 +359,12 @@ pub async fn build_state(
     api_config: ApiConfig,
     proxy_config: ProxyConfig,
     shared_engine: Arc<SharedEngine>,
-    filter_store: Arc<FilterListStore>,
+    list_service: Arc<ListService>,
     http_client: reqwest::Client,
     userscript_manager: Arc<UserscriptManager>,
     userscript_runtime: Arc<UserscriptRuntime>,
     config_path: PathBuf,
+    request_timeout_ms: Arc<AtomicU64>,
 ) -> ApiResult<Arc<AppState>> {
     // Initialize JWT config
     let jwt_config = Arc::new(JwtConfig {
@@ -387,6 +393,7 @@ pub async fn build_state(
     let proxy_state = Arc::new(ProxyState {
         config: Arc::new(RwLock::new(proxy_config)),
         stats: Arc::new(ProxyStats::new()),
+        request_timeout_ms,
         mitm_enabled,
         mitm_cached_certs: Arc::new(AtomicU64::new(0)),
     });
@@ -398,7 +405,8 @@ pub async fn build_state(
         proxy_state,
         filter_stats,
         shared_engine,
-        filter_store,
+        filter_store: list_service.store().clone(),
+        list_service,
         http_client,
         userscript_manager,
         userscript_runtime,

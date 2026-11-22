@@ -108,8 +108,10 @@ RUN mkdir -p /app/certs /app/data /app/logs && \
 
 USER adblocker
 
-# Expose ports: 8080 (proxy), 8443 (HTTPS proxy), 3000 (Web API + WebUI)
-EXPOSE 8080 8443 3000
+# Expose ports: 8080 (explicit proxy), 3000 (Web API + WebUI), 3129 (optional transparent
+# listener: only active when proxy.transparent_port = 3129; needs host networking, see
+# docs/TRANSPARENT.md)
+EXPOSE 8080 3000 3129
 
 ENV RUST_LOG=info
 ENV CONFIG_PATH=/app/config/default.toml

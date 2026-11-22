@@ -24,7 +24,11 @@ async fn test_server_with_mitm_enabled() {
             host: "127.0.0.1".to_string(),
             port: 0, // Use random port for testing
             enable_http2: false,
-            enable_http3: false,
+            transparent_port: None,
+            tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },
@@ -76,7 +80,11 @@ async fn test_server_with_mitm_disabled() {
             host: "127.0.0.1".to_string(),
             port: 0,
             enable_http2: false,
-            enable_http3: false,
+            transparent_port: None,
+            tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },
@@ -120,7 +128,11 @@ async fn test_certificate_generation() {
             host: "127.0.0.1".to_string(),
             port: 0,
             enable_http2: false,
-            enable_http3: false,
+            transparent_port: None,
+            tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },
@@ -179,7 +191,7 @@ async fn test_certificate_generation() {
     );
 
     // Force cache maintenance to update stats
-    mitm.run_pending_tasks();
+    mitm.run_pending_tasks().await;
 
     // Check cache stats
     let stats = mitm.cache_stats();
@@ -195,7 +207,11 @@ async fn test_load_manager_integration() {
             host: "127.0.0.1".to_string(),
             port: 0,
             enable_http2: false,
-            enable_http3: false,
+            transparent_port: None,
+            tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },

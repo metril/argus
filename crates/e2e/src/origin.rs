@@ -33,6 +33,8 @@ pub struct MockResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Wait this long before answering (for timeout tests).
+    pub delay: std::time::Duration,
 }
 
 impl MockResponse {
@@ -41,7 +43,12 @@ impl MockResponse {
             status,
             headers: Vec::new(),
             body: body.into(),
+            delay: std::time::Duration::ZERO,
         }
+    }
+    pub fn delayed(mut self, delay: std::time::Duration) -> Self {
+        self.delay = delay;
+        self
     }
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
         Self::new(200, body)
@@ -111,7 +118,19 @@ impl SniResolver {
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, name);
         params.distinguished_name = dn;
-        params.subject_alt_names = vec![SanType::DnsName(name.try_into().expect("dns name"))];
+        params.subject_alt_names = if let Ok(ip) = name.parse::<IpAddr>() {
+            vec![SanType::IpAddress(ip)]
+        } else if name == "localhost" {
+            // Clients dialing an IP literal send no SNI; cover loopback and the public-looking
+            // test literal too.
+            vec![
+                SanType::DnsName(name.try_into().expect("dns name")),
+                SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                SanType::IpAddress(crate::PUBLIC_TEST_IP.parse().expect("test ip")),
+            ]
+        } else {
+            vec![SanType::DnsName(name.try_into().expect("dns name"))]
+        };
         let key = KeyPair::generate().expect("leaf key");
         let issuer = Issuer::from_params(&self.ca_params, &self.ca_key);
         let cert = params.signed_by(&key, &issuer).expect("sign leaf");
@@ -207,6 +226,14 @@ impl TestOrigin {
             state,
             tasks,
         }
+    }
+
+    pub fn https_port(&self) -> u16 {
+        self.https_port
+    }
+
+    pub fn http_port(&self) -> u16 {
+        self.http_port
     }
 
     /// PEM of the origin CA (the proxy must trust it).
@@ -353,6 +380,9 @@ async fn handle(
         Some(h) => h(&rec),
         None => MockResponse::new(404, "not found"),
     };
+    if !mock.delay.is_zero() {
+        tokio::time::sleep(mock.delay).await;
+    }
     let mut b = Response::builder().status(mock.status);
     for (k, v) in &mock.headers {
         b = b.header(k, v);

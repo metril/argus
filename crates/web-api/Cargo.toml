@@ -42,6 +42,7 @@ chrono = { workspace = true }
 
 # Database
 sled = { workspace = true }
+list-service = { path = "../list-service" }
 
 # HTTP client (shared, for downloading filter lists)
 reqwest = { workspace = true }

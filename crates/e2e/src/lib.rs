@@ -16,25 +16,27 @@
 mod client;
 mod origin;
 mod proxy;
+mod ws;
 
 pub use client::{HttpVersion, TestClient};
 pub use origin::{MockResponse, RecordedRequest, TestOrigin};
-pub use proxy::TestProxy;
+pub use proxy::{TestDst, TestProxy};
+pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
 
 use std::sync::Once;
 
+/// An IP literal the destination policy accepts (TEST-NET-3), usable as a CONNECT / URL host: the
+/// origin's no-SNI certificate covers it and the proxy's resolve override sends it to the origin.
+pub const PUBLIC_TEST_IP: &str = "203.0.113.9";
+
 /// How traffic reaches the proxy.
-///
-/// Design note for `Transparent` (next phase): the client connects straight to the proxy's
-/// transparent listener (no CONNECT, no proxy configuration) and the proxy learns the original
-/// destination from an injectable resolver instead of `SO_ORIGINAL_DST`. Until that listener
-/// exists, [`TestProxy::start`] returns an error for it and [`e2e_test!`] only instantiates
-/// `Explicit`; add `Transparent` to the macro's mode list once it is supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryMode {
     /// Client is configured with an explicit HTTP proxy (CONNECT for HTTPS).
     Explicit,
-    /// Client connects directly to the transparent listener.
+    /// Client connects directly to the transparent listener (no proxy configured, no CONNECT);
+    /// the proxy learns the origin's address from the injected [`TestDst`] instead of
+    /// `SO_ORIGINAL_DST`, and the hostname from SNI / the `Host` header.
     Transparent,
 }
 
@@ -55,8 +57,30 @@ pub struct TestEnv {
 impl TestEnv {
     /// Start an origin and a proxy (with `rules` compiled as filter-list lines) for `mode`.
     pub async fn start(mode: EntryMode, rules: &[&str]) -> Self {
+        Self::start_with(mode, rules, &[]).await
+    }
+
+    /// Like [`Self::start`] with `proxy.tls_passthrough_hosts` set.
+    pub async fn start_with(mode: EntryMode, rules: &[&str], passthrough: &[&str]) -> Self {
         let origin = TestOrigin::start().await;
-        let proxy = TestProxy::start(mode, &origin, rules)
+        let proxy = TestProxy::start_with(mode, &origin, rules, passthrough)
+            .await
+            .expect("start proxy");
+        Self {
+            origin,
+            proxy,
+            mode,
+        }
+    }
+
+    /// Like [`Self::start`] with the proxy configuration edited by `tweak`.
+    pub async fn start_tweaked(
+        mode: EntryMode,
+        rules: &[&str],
+        tweak: &dyn Fn(&mut proxy_core::config::ProxyConfig),
+    ) -> Self {
+        let origin = TestOrigin::start().await;
+        let proxy = TestProxy::start_tweaked(mode, &origin, rules, tweak)
             .await
             .expect("start proxy");
         Self {
@@ -76,8 +100,12 @@ impl TestEnv {
     }
 }
 
-/// Declare an e2e test once; it is instantiated for every supported [`EntryMode`] as
-/// `<name>::explicit` (and later `<name>::transparent`).
+/// Declare an e2e test once; it is instantiated per [`EntryMode`] as `<name>::explicit` and
+/// `<name>::transparent`.
+///
+/// Forms: `e2e_test!(name, rules = [..], |env| {..})` (both modes), optionally
+/// `passthrough = [..]` after `rules` (sets `proxy.tls_passthrough_hosts`), or `explicit_only` /
+/// `transparent_only` in the same position for scenarios tied to one entry mode.
 ///
 /// ```ignore
 /// e2e_test!(allowed_passes, rules = ["||blocked.test^"], |env| {
@@ -87,16 +115,36 @@ impl TestEnv {
 #[macro_export]
 macro_rules! e2e_test {
     ($name:ident, rules = $rules:expr, |$env:ident| $body:block) => {
+        $crate::e2e_test!(@gen $name, $rules, [],
+            [(explicit, Explicit), (transparent, Transparent)], |$env| $body);
+    };
+    ($name:ident, rules = $rules:expr, passthrough = $pt:expr, |$env:ident| $body:block) => {
+        $crate::e2e_test!(@gen $name, $rules, $pt,
+            [(explicit, Explicit), (transparent, Transparent)], |$env| $body);
+    };
+    ($name:ident, rules = $rules:expr, explicit_only, |$env:ident| $body:block) => {
+        $crate::e2e_test!(@gen $name, $rules, [], [(explicit, Explicit)], |$env| $body);
+    };
+    ($name:ident, rules = $rules:expr, transparent_only, |$env:ident| $body:block) => {
+        $crate::e2e_test!(@gen $name, $rules, [], [(transparent, Transparent)], |$env| $body);
+    };
+    (@gen $name:ident, $rules:expr, $pt:expr, [$(($fn:ident, $variant:ident)),+], |$env:ident| $body:block) => {
         mod $name {
             #[allow(unused_imports)]
             use super::*;
 
             async fn body($env: $crate::TestEnv) $body
 
-            #[tokio::test]
-            async fn explicit() {
-                body($crate::TestEnv::start($crate::EntryMode::Explicit, &$rules).await).await
-            }
+            $(
+                #[tokio::test]
+                async fn $fn() {
+                    body($crate::TestEnv::start_with(
+                        $crate::EntryMode::$variant,
+                        &$rules,
+                        &$pt,
+                    ).await).await
+                }
+            )+
         }
     };
 }

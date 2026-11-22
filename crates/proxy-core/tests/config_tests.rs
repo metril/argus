@@ -14,7 +14,6 @@ fn test_default_config() {
     assert_eq!(config.proxy.host, "0.0.0.0");
     assert_eq!(config.proxy.port, 8080);
     assert!(config.proxy.enable_http2);
-    assert!(!config.proxy.enable_http3);
     assert!(config.proxy.enable_websockets);
 
     // Test MITM settings
@@ -55,7 +54,11 @@ fn test_custom_config() {
             host: "127.0.0.1".to_string(),
             port: 9090,
             enable_http2: false,
-            enable_http3: true,
+            transparent_port: None,
+            tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },
@@ -94,7 +97,6 @@ fn test_config_from_toml_string() {
 host = "localhost"
 port = 3128
 enable_http2 = false
-enable_http3 = false
 enable_websockets = true
 
 [mitm]

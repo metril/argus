@@ -2,7 +2,7 @@
 //!
 //! Spins up a real origin server + the real `ProxyServer` with an engine compiled from a single
 //! block rule, then drives traffic through the proxy: an allowed request is forwarded to the
-//! origin; a blocked host returns `204` without ever contacting an origin.
+//! origin; a blocked host gets a synthetic response without ever contacting an origin.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +58,11 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
             host: "127.0.0.1".to_string(),
             port: proxy_port,
             enable_http2: false,
-            enable_http3: false,
+            transparent_port: None,
+            tls_passthrough_hosts: Vec::new(),
+            block_private_destinations: false,
+            allowed_destinations: Vec::new(),
+            allowed_clients: proxy_core::config::default_allowed_clients(),
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
         },
@@ -117,7 +121,11 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
     // Generic class-hiding rule (delivered via the dynamic class/id path).
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["##.sponsored\n".to_string()]));
-    let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+    let ctx = Arc::new(
+        ProxyContext::new(engine, reqwest::Client::new(), true).with_policy(Arc::new(
+            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+        )),
+    );
 
     let proxy_port = spawn_proxy(ctx).await;
 
@@ -176,7 +184,11 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["||blocked.test^\n".to_string()]));
 
-    let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+    let ctx = Arc::new(
+        ProxyContext::new(engine, reqwest::Client::new(), true).with_policy(Arc::new(
+            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+        )),
+    );
 
     // Real proxy server.
     let proxy_port = spawn_proxy(ctx).await;
@@ -197,7 +209,7 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     assert_eq!(allowed.status(), 200);
     assert_eq!(allowed.text().await.unwrap(), "origin-hello");
 
-    // Blocked host → 204, and it never reaches any origin (the host doesn't even resolve).
+    // Blocked host → synthetic response, and it never reaches any origin (the host doesn't even resolve).
     let blocked = client
         .get("http://blocked.test/ads.js")
         .send()
@@ -205,8 +217,8 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
         .expect("blocked request should still get a synthetic response");
     assert_eq!(
         blocked.status(),
-        204,
-        "blocked host must return 204 No Content"
+        200,
+        "blocked script gets an empty 200 JS body"
     );
     assert_eq!(blocked.headers().get("x-adblock").unwrap(), "blocked");
 }

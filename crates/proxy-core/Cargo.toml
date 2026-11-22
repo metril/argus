@@ -56,8 +56,12 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 
 # Utilities
+async-trait = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
+
+# CIDR matching for the destination policy and client ACL
+ipnet = "2.9"
 
 # Caching
 moka = { workspace = true }
@@ -79,9 +83,7 @@ common = { path = "../common" }
 
 # WebSocket proxying (optional, feature `websockets`)
 tokio-tungstenite = { workspace = true, optional = true }
-
-# HTTP/3 support (optional)
-proxy-http3 = { path = "../proxy-http3", optional = true }
+webpki-roots = "1.0"
 
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine" }
@@ -92,14 +94,24 @@ userscript-engine = { path = "../userscript-engine", optional = true }
 # Web API (optional)
 web-api = { path = "../web-api", optional = true }
 
+# Filter-list service (always on — loads, compiles and refreshes the rules)
+list-service = { path = "../list-service" }
+
+[target.'cfg(unix)'.dependencies]
+# getifaddrs: the proxy host's own interface addresses (destination policy).
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# SO_ORIGINAL_DST / IP6T_SO_ORIGINAL_DST for transparent mode.
+socket2 = { version = "0.6", features = ["all"] }
+
 [features]
 # Request filtering is always compiled in; WebSocket proxying is on by default.
 default = ["websockets"]
-http3 = ["dep:proxy-http3"]
 websockets = ["dep:tokio-tungstenite"]
 userscripts = ["dep:userscript-engine"]
 webui = ["dep:web-api", "dep:userscript-engine"]
-full = ["http3", "websockets", "userscripts", "webui"]
+full = ["websockets", "userscripts", "webui"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

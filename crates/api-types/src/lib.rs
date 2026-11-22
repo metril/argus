@@ -154,12 +154,45 @@ pub struct ProxyConfigResponse {
     pub port: u16,
     pub max_connections: u32,
     pub enable_http2: bool,
-    pub enable_http3: bool,
     pub enable_websockets: bool,
     pub enable_mitm: bool,
     pub connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub enable_adblock: bool,
+    /// Whether filter lists refresh automatically.
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Hours between automatic list refreshes.
+    #[serde(default)]
+    pub update_interval_hours: u64,
+    /// Transparent-gateway listener port (`None` = off).
+    #[serde(default)]
+    pub transparent_port: Option<u16>,
+    /// TLS hosts never intercepted (exact or `*.suffix`).
+    #[serde(default)]
+    pub tls_passthrough_hosts: Vec<String>,
+    /// Also refuse private-range destinations.
+    #[serde(default)]
+    pub block_private_destinations: bool,
+    /// CIDR exceptions to the destination refusals.
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
+    /// CIDRs of clients allowed to use the proxy.
+    #[serde(default)]
+    pub allowed_clients: Vec<String>,
+}
+
+/// Result of a config update: the new config plus which changes are already live and which
+/// need a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UpdateProxyConfigResponse {
+    #[serde(flatten)]
+    pub config: ProxyConfigResponse,
+    /// Fields that took effect immediately.
+    pub applied: Vec<String>,
+    /// Fields saved to the config file that only apply after a restart.
+    pub restart_required: Vec<String>,
 }
 
 /// Partial proxy configuration update. Every field is optional; omitted fields
@@ -177,7 +210,6 @@ pub struct UpdateProxyConfigRequest {
     pub max_connections: Option<u32>,
 
     pub enable_http2: Option<bool>,
-    pub enable_http3: Option<bool>,
     pub enable_websockets: Option<bool>,
     pub enable_mitm: Option<bool>,
 
@@ -188,6 +220,22 @@ pub struct UpdateProxyConfigRequest {
     pub request_timeout_secs: Option<u64>,
 
     pub enable_adblock: Option<bool>,
+
+    pub auto_update: Option<bool>,
+
+    #[cfg_attr(feature = "server", validate(range(min = 1, max = 8760)))]
+    pub update_interval_hours: Option<u64>,
+
+    /// Transparent listener port; `0` turns it off. Needs a restart.
+    pub transparent_port: Option<u16>,
+    /// Replaces the TLS passthrough host list. Needs a restart.
+    pub tls_passthrough_hosts: Option<Vec<String>>,
+    /// Needs a restart.
+    pub block_private_destinations: Option<bool>,
+    /// CIDR list; replaces the current one. Needs a restart.
+    pub allowed_destinations: Option<Vec<String>>,
+    /// CIDR list; replaces the current one. Needs a restart.
+    pub allowed_clients: Option<Vec<String>>,
 }
 
 /// Connection statistics.
@@ -242,6 +290,12 @@ pub struct FilterListResponse {
     pub enabled: bool,
     pub last_updated: Option<String>,
     pub rule_count: usize,
+    /// Error from the most recent fetch attempt, if it failed (cached content is still used).
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// When the list was last fetched or revalidated (RFC 3339).
+    #[serde(default)]
+    pub last_checked: Option<String>,
 }
 
 /// Add a filter list.

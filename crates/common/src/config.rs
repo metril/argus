@@ -21,7 +21,27 @@ pub struct ProxySettings {
     pub host: String,
     pub port: u16,
     pub enable_http2: bool,
-    pub enable_http3: bool,
+    /// Optional second listener for transparent-gateway mode (traffic redirected by the OS, no
+    /// proxy configuration on the client). Off when unset. Linux only.
+    #[serde(default)]
+    pub transparent_port: Option<u16>,
+    /// TLS hosts never intercepted (tunnelled opaquely) in both entry modes: exact names or
+    /// `*.suffix` entries (the latter match subdomains only, not the apex).
+    #[serde(default)]
+    pub tls_passthrough_hosts: Vec<String>,
+    /// Also refuse upstream destinations in private ranges (RFC 1918, ULA `fc00::/7`, CGNAT
+    /// `100.64/10`). Loopback, link-local (cloud metadata), multicast and the proxy's own
+    /// listeners are always refused.
+    #[serde(default)]
+    pub block_private_destinations: bool,
+    /// CIDR exceptions that override the destination refusals (except loops onto the proxy's own
+    /// listeners).
+    #[serde(default)]
+    pub allowed_destinations: Vec<String>,
+    /// CIDRs of clients allowed to use the proxy (both listeners); others are closed at accept.
+    /// Default: loopback, private, link-local, ULA and CGNAT sources. An empty list allows no one.
+    #[serde(default = "default_allowed_clients")]
+    pub allowed_clients: Vec<String>,
     pub enable_websockets: bool,
     /// Extra PEM root CA files trusted when connecting to upstream servers (in addition to the
     /// built-in web roots), e.g. a private/corporate CA.
@@ -60,6 +80,45 @@ pub struct AdblockSettings {
     /// Downloaded once and cached so `##+js(...)` scriptlet rules can inject. Empty disables it.
     #[serde(default = "default_scriptlet_resources_url")]
     pub scriptlet_resources_url: String,
+    /// Max simultaneous filter-list downloads.
+    #[serde(default = "default_list_fetch_concurrency")]
+    pub list_fetch_concurrency: usize,
+    /// Per-list download timeout in seconds.
+    #[serde(default = "default_list_fetch_timeout_secs")]
+    pub list_fetch_timeout_secs: u64,
+    /// Maximum accepted size of a downloaded list, in bytes.
+    #[serde(default = "default_max_list_bytes")]
+    pub max_list_bytes: usize,
+}
+
+/// Default client ACL: local and private networks only.
+pub fn default_allowed_clients() -> Vec<String> {
+    [
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_list_fetch_concurrency() -> usize {
+    4
+}
+
+fn default_list_fetch_timeout_secs() -> u64 {
+    30
+}
+
+fn default_max_list_bytes() -> usize {
+    50 * 1024 * 1024
 }
 
 fn default_scriptlet_resources_url() -> String {
@@ -77,6 +136,9 @@ impl Default for AdblockSettings {
             auto_update: true,
             update_interval_hours: 24,
             scriptlet_resources_url: default_scriptlet_resources_url(),
+            list_fetch_concurrency: default_list_fetch_concurrency(),
+            list_fetch_timeout_secs: default_list_fetch_timeout_secs(),
+            max_list_bytes: default_max_list_bytes(),
         }
     }
 }
@@ -132,7 +194,11 @@ impl Default for ProxyConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 enable_http2: true,
-                enable_http3: false,
+                transparent_port: None,
+                tls_passthrough_hosts: Vec::new(),
+                block_private_destinations: false,
+                allowed_destinations: Vec::new(),
+                allowed_clients: default_allowed_clients(),
                 enable_websockets: true,
                 extra_upstream_ca_paths: Vec::new(),
             },

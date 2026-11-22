@@ -9,8 +9,10 @@ services:
     container_name: adblocker-proxy
     restart: unless-stopped
     ports:
-      - "8080:8080"   # HTTP proxy
-      - "8443:8443"   # HTTPS proxy
+      - "8080:8080"   # Explicit proxy (HTTP + HTTPS via CONNECT)
+      # Optional transparent listener (set proxy.transparent_port = 3129). Redirected traffic only
+      # reveals its original destination with host networking; see docs/TRANSPARENT.md.
+      # - "3129:3129"
       - "3000:3000"   # Web API + WebUI
     volumes:
       # Named volumes (not host bind mounts) so Docker initializes them with the

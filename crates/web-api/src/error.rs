@@ -120,3 +120,9 @@ impl From<anyhow::Error> for ApiError {
         ApiError::Internal(err.to_string())
     }
 }
+
+impl From<list_service::Error> for ApiError {
+    fn from(err: list_service::Error) -> Self {
+        ApiError::Internal(err.to_string())
+    }
+}

@@ -7,16 +7,16 @@ use rcgen::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
-use tracing::info;
+use tracing::{debug, info};
 
 /// Certificate Authority for generating and signing certificates
 pub struct CertificateAuthority {
-    /// The CA key pair
-    ca_key_pair: KeyPair,
-    /// The CA certificate parameters (for issuer)
-    ca_params: CertificateParams,
+    /// Signing identity built from the stored CA certificate itself (subject DN, key id), so
+    /// leaves always chain to the exact certificate on disk.
+    issuer: Issuer<'static, KeyPair>,
     /// The CA certificate in DER format
     ca_cert_der: CertificateDer<'static>,
     /// The CA private key in DER format
@@ -59,10 +59,6 @@ impl CertificateAuthority {
         let ca_key_pair = KeyPair::from_pem(&key_pem)
             .map_err(|e| Error::Certificate(format!("Failed to parse CA private key: {}", e)))?;
 
-        // For loading existing CA, we create default params
-        // The actual certificate parameters will be extracted when creating an Issuer
-        let ca_params = CertificateParams::default();
-
         // Parse PEM to get DER formats
         let cert_der_bytes = pem::parse(&cert_pem)
             .map_err(|e| Error::Certificate(format!("Failed to parse CA certificate PEM: {}", e)))?
@@ -72,10 +68,12 @@ impl CertificateAuthority {
 
         let ca_key_der = PrivateKeyDer::try_from(ca_key_pair.serialize_der())
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
+        let issuer = Issuer::from_ca_cert_pem(&cert_pem, ca_key_pair).map_err(|e| {
+            Error::Certificate(format!("CA certificate does not match its key: {}", e))
+        })?;
 
         Ok(Self {
-            ca_key_pair,
-            ca_params,
+            issuer,
             ca_cert_der,
             ca_key_der,
         })
@@ -153,25 +151,18 @@ impl CertificateAuthority {
 
         info!("Generated new CA certificate");
 
-        // Get DER formats
-        let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
-        let ca_key_der = PrivateKeyDer::try_from(ca_key_pair.serialize_der())
-            .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
-
-        Ok(Self {
-            ca_key_pair,
-            ca_params: params,
-            ca_cert_der,
-            ca_key_der,
-        })
+        // Use the same path as a restart: the signing identity comes from the stored cert.
+        Self::load(cert_path, key_path)
     }
 
-    /// Generate a certificate for the given domain
+    /// Generate a leaf certificate for a host (DNS name or IP literal).
+    ///
+    /// CPU-bound (key generation + signing); call from `spawn_blocking` on async paths.
     pub fn generate_cert(
         &self,
         domain: &str,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-        info!("Generating certificate for domain: {}", domain);
+        debug!("Generating certificate for host: {}", domain);
 
         // Create certificate parameters
         let mut params = CertificateParams::default();
@@ -181,19 +172,7 @@ impl CertificateAuthority {
         dn.push(DnType::CommonName, domain);
         params.distinguished_name = dn;
 
-        // Add subject alternative names
-        params.subject_alt_names =
-            vec![
-                SanType::DnsName(
-                    domain
-                        .try_into()
-                        .map_err(|e| Error::Certificate(format!("Invalid domain name: {:?}", e)))?,
-                ),
-                // Also add wildcard for subdomains
-                SanType::DnsName(format!("*.{}", domain).try_into().map_err(|e| {
-                    Error::Certificate(format!("Invalid wildcard domain: {:?}", e))
-                })?),
-            ];
+        params.subject_alt_names = subject_alt_names(domain)?;
 
         // Set validity period (30 days)
         params.not_before = OffsetDateTime::now_utc();
@@ -209,12 +188,8 @@ impl CertificateAuthority {
         let key_pair = KeyPair::generate()
             .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
 
-        // Create an Issuer from our CA
-        let issuer = Issuer::from_params(&self.ca_params, &self.ca_key_pair);
-
-        // Sign the certificate with our CA
         let cert = params
-            .signed_by(&key_pair, &issuer)
+            .signed_by(&key_pair, &self.issuer)
             .map_err(|e| Error::Certificate(format!("Failed to sign certificate: {}", e)))?;
 
         // Convert to DER format for rustls
@@ -236,9 +211,35 @@ impl CertificateAuthority {
     }
 }
 
+/// Subject alternative names for a leaf certificate.
+///
+/// IP literals get an IP SAN only. DNS names get the name itself plus `*.name` when the name has
+/// at least two labels (a wildcard under a single-label host like `localhost` is meaningless).
+pub fn subject_alt_names(host: &str) -> Result<Vec<SanType>> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![SanType::IpAddress(ip)]);
+    }
+    let mut sans =
+        vec![SanType::DnsName(host.try_into().map_err(|e| {
+            Error::Certificate(format!("Invalid domain name: {:?}", e))
+        })?)];
+    if host.contains('.') && !host.starts_with("*.") {
+        sans.push(SanType::DnsName(format!("*.{host}").try_into().map_err(
+            |e| Error::Certificate(format!("Invalid wildcard domain: {:?}", e)),
+        )?));
+    }
+    Ok(sans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
 
     #[test]
     fn test_ca_generation() {
@@ -288,5 +289,94 @@ mod tests {
         // Clean up
         let _ = fs::remove_file(&cert_path);
         let _ = fs::remove_file(&key_path);
+    }
+
+    fn dns(s: &str) -> SanType {
+        SanType::DnsName(s.try_into().unwrap())
+    }
+
+    #[test]
+    fn san_dns_has_wildcard() {
+        assert_eq!(
+            subject_alt_names("example.com").unwrap(),
+            vec![dns("example.com"), dns("*.example.com")]
+        );
+    }
+
+    #[test]
+    fn san_single_label_has_no_wildcard() {
+        assert_eq!(
+            subject_alt_names("localhost").unwrap(),
+            vec![dns("localhost")]
+        );
+    }
+
+    #[test]
+    fn san_ip_literals() {
+        assert_eq!(
+            subject_alt_names("127.0.0.1").unwrap(),
+            vec![SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST))]
+        );
+        assert_eq!(
+            subject_alt_names("::1").unwrap(),
+            vec![SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST))]
+        );
+        assert_eq!(
+            subject_alt_names("[2001:db8::1]").unwrap(),
+            vec![SanType::IpAddress("2001:db8::1".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn ip_and_single_label_certs_generate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = CertificateAuthority::load_or_generate(
+            tmp.path().join("ca.crt"),
+            tmp.path().join("ca.key"),
+        )
+        .unwrap();
+        for host in ["10.1.2.3", "::1", "localhost", "a.example"] {
+            assert!(ca.generate_cert(host).is_ok(), "{host}");
+        }
+    }
+
+    /// Verify `leaf` for `host` against only the on-disk CA certificate, with a real verifier.
+    fn verify_against_disk(cert_path: &Path, leaf: &CertificateDer<'static>, host: &str) {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::client::WebPkiServerVerifier;
+        let ca_pem = fs::read(cert_path).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut ca_pem.as_slice()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let verifier = WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+        verifier
+            .verify_server_cert(leaf, &[], &name, &[], rustls::pki_types::UnixTime::now())
+            .unwrap_or_else(|e| panic!("leaf for {host} does not chain to on-disk CA: {e}"));
+    }
+
+    #[test]
+    fn leaf_from_reloaded_ca_chains_to_on_disk_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cert, key) = (tmp.path().join("ca.crt"), tmp.path().join("ca.key"));
+        let first = CertificateAuthority::load_or_generate(&cert, &key).unwrap();
+        let (leaf, _) = first.generate_cert("example.com").unwrap();
+        verify_against_disk(&cert, &leaf, "example.com");
+        drop(first);
+
+        // "Restart": reload from disk and issue again.
+        let reloaded = CertificateAuthority::load_or_generate(&cert, &key).unwrap();
+        for host in ["example.com", "www.example.com", "127.0.0.1"] {
+            let (leaf, _) = reloaded.generate_cert(host).unwrap();
+            verify_against_disk(&cert, &leaf, host);
+        }
+        let on_disk = pem::parse(fs::read(&cert).unwrap()).unwrap();
+        assert_eq!(reloaded.ca_cert_der().as_ref(), on_disk.contents());
     }
 }

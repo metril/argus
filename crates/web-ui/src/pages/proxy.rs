@@ -21,7 +21,6 @@ pub fn ProxyPage() -> impl IntoView {
     let max_connections = RwSignal::new(String::new());
     let enable_mitm = RwSignal::new(false);
     let enable_http2 = RwSignal::new(false);
-    let enable_http3 = RwSignal::new(false);
     let enable_websockets = RwSignal::new(false);
     let enable_adblock = RwSignal::new(false);
 
@@ -54,7 +53,6 @@ pub fn ProxyPage() -> impl IntoView {
                         max_connections.set(response.max_connections.to_string());
                         enable_mitm.set(response.enable_mitm);
                         enable_http2.set(response.enable_http2);
-                        enable_http3.set(response.enable_http3);
                         enable_websockets.set(response.enable_websockets);
                         enable_adblock.set(response.enable_adblock);
                     }
@@ -92,9 +90,9 @@ pub fn ProxyPage() -> impl IntoView {
                     max_connections: Some(max_connections.get().parse().unwrap_or(1000)),
                     enable_mitm: Some(enable_mitm.get()),
                     enable_http2: Some(enable_http2.get()),
-                    enable_http3: Some(enable_http3.get()),
                     enable_websockets: Some(enable_websockets.get()),
                     enable_adblock: Some(enable_adblock.get()),
+                    ..Default::default()
                 };
 
                 wasm_bindgen_futures::spawn_local(async move {
@@ -180,15 +178,6 @@ pub fn ProxyPage() -> impl IntoView {
                                         on:change=move |_| enable_http2.update(|v| *v = !*v)
                                     />
                                     <span class="checkbox-label">"Enable HTTP/2"</span>
-                                </label>
-                                <label class="form-checkbox">
-                                    <input
-                                        type="checkbox"
-                                        class="checkbox-input"
-                                        prop:checked=move || enable_http3.get()
-                                        on:change=move |_| enable_http3.update(|v| *v = !*v)
-                                    />
-                                    <span class="checkbox-label">"Enable HTTP/3"</span>
                                 </label>
                                 <label class="form-checkbox">
                                     <input
