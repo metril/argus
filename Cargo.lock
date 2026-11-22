@@ -2971,6 +2971,7 @@ dependencies = [
  "ext-rules",
  "filter-engine",
  "futures-util",
+ "libc",
  "parking_lot",
  "rayon",
  "reqwest 0.12.28",

@@ -110,6 +110,19 @@ pub struct Generation {
     pub id: u64,
 }
 
+impl Drop for Generation {
+    /// Hand the heavy parts to the reaper: the last request-side reference must not free them.
+    fn drop(&mut self) {
+        if let Some(aux) = self.aux.take() {
+            crate::reaper::retire(aux);
+        }
+        // A shared empty engine takes the real one's place so it can move out of `self`.
+        static EMPTY: std::sync::OnceLock<Arc<AdblockEngine>> = std::sync::OnceLock::new();
+        let empty = EMPTY.get_or_init(|| build_engine(&[], &[])).clone();
+        crate::reaper::retire(std::mem::replace(&mut self.engine, empty));
+    }
+}
+
 impl Generation {
     /// The companion data as `T`, if present and of that type.
     pub fn aux<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
@@ -294,11 +307,11 @@ impl SharedEngine {
         }));
         self.resources.store(Arc::new(resources));
         let cur = self.engine.load_full();
-        self.engine.store(Arc::new(Generation {
+        crate::reaper::retire(self.engine.swap(Arc::new(Generation {
             engine: build_engine(&self.blob.load(), &self.resources.load()),
             aux: cur.aux.clone(),
             id: self.next_gen.fetch_add(1, Ordering::Relaxed),
-        }));
+        })));
         info!("Loaded {n} scriptlet/redirect resources");
         Ok(n)
     }
@@ -364,16 +377,18 @@ impl SharedEngine {
     ) {
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = blob.len();
-        self.blob.store(blob);
-        self.engine.store(Arc::new(Generation {
+        let n = domains.len();
+        // Old values go to the reaper: a request may still hold them, and whoever drops last
+        // must not free a large structure on a request thread.
+        crate::reaper::retire(self.blob.swap(blob));
+        crate::reaper::retire(self.engine.swap(Arc::new(Generation {
             engine,
             aux,
             id: self.next_gen.fetch_add(1, Ordering::Relaxed),
-        }));
-        self.ext_rules.store(ext);
-        self.ip_filter.store(ip);
-        let n = domains.len();
-        self.domains.store(domains);
+        })));
+        crate::reaper::retire(self.ext_rules.swap(ext));
+        crate::reaper::retire(self.ip_filter.swap(ip));
+        crate::reaper::retire(self.domains.swap(domains));
         info!("Installed compiled filter engine ({bytes} bytes, {n} domain-set entries)");
     }
 
@@ -527,7 +542,7 @@ impl SharedEngine {
     pub fn site_off(&self, page_url: &str) -> bool {
         self.enabled.load(Ordering::Relaxed)
             && self
-                .decide(SITE_OFF_PROBE, page_url, "other")
+                .decide(&self.engine.load().engine, SITE_OFF_PROBE, page_url, "other")
                 .exception_rule
                 .is_some()
     }
@@ -563,14 +578,14 @@ impl SharedEngine {
         resource_type: &str,
     ) -> (MatchResult, Arc<Generation>) {
         loop {
-            let generation = self.engine.load_full();
+            let guard = self.engine.load();
             let r = if self.enabled.load(Ordering::Relaxed) {
-                self.decide(url, source_url, resource_type)
+                self.decide(&guard.engine, url, source_url, resource_type)
             } else {
                 MatchResult::allowed()
             };
-            if self.engine.load().id == generation.id {
-                return (r, generation);
+            if self.engine.load().id == guard.id {
+                return (r, arc_swap::Guard::into_inner(guard));
             }
         }
     }
@@ -578,7 +593,7 @@ impl SharedEngine {
     /// [`Self::check`] without the bookkeeping (see [`Self::check_gen_deferred`]).
     pub fn check_deferred(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
         if self.enabled.load(Ordering::Relaxed) {
-            self.decide(url, source_url, resource_type)
+            self.decide(&self.engine.load().engine, url, source_url, resource_type)
         } else {
             MatchResult::allowed()
         }
@@ -607,9 +622,10 @@ impl SharedEngine {
         client: &str,
     ) -> (MatchResult, Arc<Generation>) {
         loop {
-            let generation = self.engine.load_full();
+            let guard = self.engine.load();
+            let generation = &*guard;
             let r = if self.enabled.load(Ordering::Relaxed) {
-                self.decide(url, source_url, resource_type)
+                self.decide(&generation.engine, url, source_url, resource_type)
             } else {
                 MatchResult::allowed()
             };
@@ -618,7 +634,7 @@ impl SharedEngine {
             if self.engine.load().id == generation.id {
                 return (
                     self.record(r, url, source_url, resource_type, Some(client)),
-                    generation,
+                    arc_swap::Guard::into_inner(guard),
                 );
             }
         }
@@ -632,7 +648,7 @@ impl SharedEngine {
         client: Option<&str>,
     ) -> MatchResult {
         let r = if self.enabled.load(Ordering::Relaxed) {
-            self.decide(url, source_url, resource_type)
+            self.decide(&self.engine.load().engine, url, source_url, resource_type)
         } else {
             MatchResult::allowed()
         };
@@ -666,7 +682,13 @@ impl SharedEngine {
     }
 
     /// The decision, without side effects.
-    fn decide(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
+    fn decide(
+        &self,
+        eng: &AdblockEngine,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+    ) -> MatchResult {
         // Pre-check layer: IP literals, then the domain set.
         let ipf = self.ip_filter.load();
         let ds = self.domains.load();
@@ -710,7 +732,7 @@ impl SharedEngine {
             return MatchResult::allowed();
         }
 
-        let request = match AdblockRequest::new(url, source_url, resource_type) {
+        let request = match crate::matcher::make_request(url, source_url, resource_type) {
             Ok(r) => r,
             Err(e) => {
                 debug!("Filter check error for {url}: {e}; allowing");
@@ -747,7 +769,7 @@ impl SharedEngine {
                 }
             }
         }
-        let result = self.with_engine(|e| e.check_network_request(&request));
+        let result = eng.check_network_request(&request);
         RequestMatcher::to_match_result(result)
     }
 
@@ -789,7 +811,7 @@ impl SharedEngine {
         if !ds.engine_overrides() {
             return plain(rule, list);
         }
-        let Ok(request) = AdblockRequest::new(url, source_url, resource_type) else {
+        let Ok(request) = crate::matcher::make_request(url, source_url, resource_type) else {
             return plain(rule, list);
         };
         let res = self.with_engine(|e| e.check_network_request_subset(&request, true, true));

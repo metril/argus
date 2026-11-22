@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
 rayon = { workspace = true }
+libc = "0.2"
 filter-engine = { path = "../filter-engine", default-features = false }
 ext-rules = { path = "../ext-rules" }
 common = { path = "../common" }

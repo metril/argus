@@ -17,6 +17,7 @@ pub mod list;
 pub mod matcher;
 pub mod pipeline;
 pub(crate) mod precheck;
+pub mod reaper;
 pub mod redirect_resources;
 pub mod scriptlet_resources;
 pub mod shared;
