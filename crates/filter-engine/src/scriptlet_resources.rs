@@ -416,6 +416,20 @@ fn is_js(r: &Resource) -> bool {
     )
 }
 
+/// Does the script contain a `{{<digits>}}` argument placeholder?
+fn has_placeholder(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(i) = rest.find("{{") {
+        let tail = &rest[i + 2..];
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && tail[digits..].starts_with("}}") {
+            return true;
+        }
+        rest = tail;
+    }
+    false
+}
+
 fn decoded(r: &Resource) -> Result<String, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&r.content)
@@ -437,12 +451,28 @@ pub fn validate_resources(resources: Vec<Resource>) -> Validated {
     let mut dropped: Vec<DroppedResource> = Vec::new();
     let mut live: Vec<(Resource, Option<String>)> = Vec::new(); // (resource, decoded JS)
     for r in resources {
+        // `{{1}}` templates paste the rule's raw argument into the script text, so a quote in
+        // the argument would end the template's own string literal and run as code. Function-style
+        // scriptlets (arguments passed as escaped string literals) are the only form served.
+        if matches!(r.kind, ResourceType::Template) {
+            drop_(
+                &mut dropped,
+                &r.name,
+                "argument templates (`{{1}}`) are not served",
+            );
+            continue;
+        }
         if !is_js(&r) {
             live.push((r, None));
             continue;
         }
         match decoded(&r) {
             Err(e) => drop_(&mut dropped, &r.name, e),
+            Ok(text) if has_placeholder(&text) => drop_(
+                &mut dropped,
+                &r.name,
+                "argument templates (`{{1}}`) are not served",
+            ),
             Ok(text) => match script_error(&text) {
                 Some(e) => drop_(&mut dropped, &r.name, format!("does not parse: {e}")),
                 None => live.push((r, Some(text))),
