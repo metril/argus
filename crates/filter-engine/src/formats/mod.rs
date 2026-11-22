@@ -143,7 +143,7 @@ pub struct ConvertStats {
     pub error_count: usize,
     /// Extended rules diverted to [`Converted::ext`], per [`ExtKind::as_str`].
     pub ext_counts: BTreeMap<String, usize>,
-    /// Rules rewritten into supported syntax (scriptlet aliases, `:style()`, `$denyallow`, ...).
+    /// Rules rewritten into supported syntax (scriptlet aliases, `:style()`, ...).
     pub translated: usize,
     /// Lines skipped by category (e.g. `rpz-nsdname`, `dnstype`, `header`), for the UI.
     pub skipped_reasons: BTreeMap<String, usize>,

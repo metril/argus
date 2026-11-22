@@ -431,33 +431,6 @@ enum Rule {
     Error(&'static str),
 }
 
-/// Network option names kept on the exception rules generated for `$denyallow`.
-const SCOPE_OPTS: &[&str] = &[
-    "third-party",
-    "3p",
-    "first-party",
-    "1p",
-    "script",
-    "image",
-    "stylesheet",
-    "css",
-    "xhr",
-    "xmlhttprequest",
-    "subdocument",
-    "frame",
-    "document",
-    "doc",
-    "media",
-    "font",
-    "object",
-    "ping",
-    "websocket",
-    "other",
-    "domain",
-    "from",
-    "all",
-];
-
 fn network_rule(t: &str) -> Rule {
     let (pattern, Some(opts)) = split_options(t) else {
         // A rule with no pattern (`||`, `@@`) would match every request.
@@ -515,27 +488,11 @@ fn network_rule(t: &str) -> Rule {
     let neg_or_empty =
         |v: &str| v.is_empty() || v.split('|').any(|d| d.starts_with('~') || d.is_empty());
 
-    // $denyallow=a|b: the rule applies except to requests for those domains.
-    if let Some(i) = toks.iter().position(|t| opt_name(t) == "denyallow") {
-        let val = toks[i]
-            .split_once('=')
-            .map(|x| x.1)
-            .unwrap_or("")
-            .to_string();
-        if exception || neg_or_empty(&val) {
-            return ext(ExtKind::DenyAllow);
-        }
-        toks.remove(i);
-        let scope: Vec<String> = toks
-            .iter()
-            .filter(|t| SCOPE_OPTS.contains(&opt_name(t).as_str()))
-            .cloned()
-            .collect();
-        let mut rules = vec![format!("{bare}{}", join_opts(&toks))];
-        for d in val.split('|') {
-            rules.push(format!("@@||{d}^{}", join_opts(&scope)));
-        }
-        return Rule::Emit(rules, true);
+    // $denyallow=a|b: "the rule applies except to requests for those hosts". Not expressible
+    // exactly with native syntax: an `@@||a^` exception would also unblock `a` for every *other*
+    // rule in the same scope, silently changing decisions. So it is handed off, never approximated.
+    if toks.iter().any(|t| opt_name(t) == "denyallow") {
+        return ext(ExtKind::DenyAllow);
     }
     // $to=a|b with a match-all pattern: block those hosts under the remaining options.
     if let Some(i) = toks.iter().position(|t| opt_name(t) == "to") {

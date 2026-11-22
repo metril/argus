@@ -547,16 +547,10 @@ fn network_modifier_translations() {
         lines(&one("||h.example^$from=x.example")),
         ["||h.example^$from=x.example"]
     );
-    // $denyallow becomes the rule plus scoped exceptions.
+    // $denyallow has no exact native form: handed off, nothing emitted.
     let c = one("*$denyallow=x.example|y.example,script,domain=z.example");
-    assert_eq!(
-        lines(&c),
-        [
-            "*$script,domain=z.example",
-            "@@||x.example^$script,domain=z.example",
-            "@@||y.example^$script,domain=z.example"
-        ]
-    );
+    assert!(c.rules.is_empty());
+    assert_eq!(c.ext[0].kind, ExtKind::DenyAllow);
     // $to with a match-all pattern becomes host rules; with a pattern it is handed off.
     let c = one("*$to=t1.example|t2.example,image");
     assert_eq!(lines(&c), ["||t1.example^$image", "||t2.example^$image"]);
@@ -574,14 +568,19 @@ fn network_modifier_translations() {
 }
 
 #[test]
-fn denyallow_translation_semantics() {
-    let c = one("*$denyallow=cdn.test,script,domain=site.test");
+fn denyallow_never_changes_other_rules_decisions() {
+    // The old translation emitted `@@||cdn.test^` for the deny list, which unblocked cdn.test for
+    // the unrelated rule below. Now the denyallow rule is inert (handed off) and the other rule's
+    // decisions are untouched.
+    let c = one("*$denyallow=cdn.test,script,domain=site.test\n||cdn.test^$script");
+    assert_eq!(lines(&c), ["||cdn.test^$script"]);
+    assert_eq!(c.ext.len(), 1);
     let engine = SharedEngine::new();
     engine.install(compile_lists(&[&c.rules]).blob);
     let blocked = |u: &str, src: &str| engine.check(u, src, "script").blocked;
-    assert!(blocked("https://ads.test/a.js", "https://site.test/"));
-    assert!(!blocked("https://cdn.test/a.js", "https://site.test/"));
-    assert!(!blocked("https://ads.test/a.js", "https://other.test/"));
+    assert!(blocked("https://cdn.test/a.js", "https://site.test/"));
+    assert!(blocked("https://cdn.test/a.js", "https://other.test/"));
+    assert!(!blocked("https://ads.test/a.js", "https://site.test/"));
 }
 
 #[test]
