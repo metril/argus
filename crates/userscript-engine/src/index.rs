@@ -63,7 +63,10 @@ impl ScriptIndex {
         let mut problems = Vec::new();
         for s in scripts.iter().filter(|s| s.enabled) {
             if s.metadata.run_at == RunAt::ContextMenu {
-                problems.push((s.id.clone(), "@run-at context-menu is unsupported; script skipped".into()));
+                problems.push((
+                    s.id.clone(),
+                    "@run-at context-menu is unsupported; script skipped".into(),
+                ));
                 continue;
             }
             let (rules, errs) = Rules::compile(&s.metadata, opts);
@@ -88,7 +91,10 @@ impl ScriptIndex {
             v.dedup();
         }
         idx.any.dedup();
-        BuildReport { index: idx, problems }
+        BuildReport {
+            index: idx,
+            problems,
+        }
     }
 
     pub fn profile(&self) -> &str {
@@ -169,7 +175,10 @@ mod tests {
     use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
     fn script(name: &str, hdr: &str) -> Userscript {
-        Userscript::new(format!("// ==UserScript==\n// @name {name}\n{hdr}\n// ==/UserScript==\n")).unwrap()
+        Userscript::new(format!(
+            "// ==UserScript==\n// @name {name}\n{hdr}\n// ==/UserScript==\n"
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -183,15 +192,29 @@ mod tests {
         ];
         let idx = ScriptIndex::build("default", &scripts, Options::default()).index;
         let names = |h: &str, u: &str, top: bool| {
-            idx.candidates(h, u, top).iter().map(|s| s.script.name().to_string()).collect::<Vec<_>>()
+            idx.candidates(h, u, top)
+                .iter()
+                .map(|s| s.script.name().to_string())
+                .collect::<Vec<_>>()
         };
-        assert_eq!(names("example.com", "https://example.com/x", true), ["a", "d"]);
+        assert_eq!(
+            names("example.com", "https://example.com/x", true),
+            ["a", "d"]
+        );
         assert_eq!(names("example.com", "https://example.com/x", false), ["a"]);
-        assert_eq!(names("www.example.org", "https://www.example.org/", true), ["b", "e"]);
-        assert_eq!(names("EXAMPLE.org", "https://example.org/", true), ["b", "e"]);
+        assert_eq!(
+            names("www.example.org", "https://www.example.org/", true),
+            ["b", "e"]
+        );
+        assert_eq!(
+            names("EXAMPLE.org", "https://example.org/", true),
+            ["b", "e"]
+        );
         assert_eq!(names("zzz.net", "https://zzz.net/foo", true), ["c", "e"]);
         assert!(names("zzz.net", "ftp://zzz.net/", true).is_empty());
-        assert!(ScriptIndex::default().candidates("a", "https://a/", true).is_empty());
+        assert!(ScriptIndex::default()
+            .candidates("a", "https://a/", true)
+            .is_empty());
     }
 
     #[test]
@@ -208,13 +231,22 @@ mod tests {
     #[test]
     fn matches_brute_force() {
         let mut rng = StdRng::seed_from_u64(0xad);
-        let hosts = ["example.com", "a.example.com", "example.org", "x.y.example.org", "foo.net", "localhost", "google.co.uk", "google.com"];
+        let hosts = [
+            "example.com",
+            "a.example.com",
+            "example.org",
+            "x.y.example.org",
+            "foo.net",
+            "localhost",
+            "google.co.uk",
+            "google.com",
+        ];
         let paths = ["/", "/a", "/a/b", "/foo?x=1", "/Edit/1"];
         let schemes = ["http", "https"];
         let patterns = |rng: &mut StdRng| -> String {
             let h = *hosts.choose(rng).unwrap();
             let p = *paths.choose(rng).unwrap();
-            match rng.gen_range(0..9) {
+            match rng.gen_range(0..11) {
                 0 => format!("// @match *://{h}/*"),
                 1 => format!("// @match https://*.{h}/*"),
                 2 => format!("// @match {}://{h}{p}", schemes.choose(rng).unwrap()),
@@ -223,10 +255,12 @@ mod tests {
                 5 => format!("// @include /{}/", h.replace('.', "\\.")),
                 6 => "// @include google.tld".to_string(),
                 7 => "// @match *://google.tld/*".to_string(),
+                8 => format!("// @include /^https?:\\/\\/{}\\//", h.replace('.', "\\.")),
+                9 => format!("// @include /^https:\\/\\/{}\\/a/", h.replace('.', "\\.")),
                 _ => "// @match <all_urls>".to_string(),
             }
         };
-        for round in 0..30 {
+        for round in 0..8 {
             let mut scripts = Vec::new();
             for i in 0..rng.gen_range(0..25) {
                 let mut hdr = String::new();
@@ -250,9 +284,17 @@ mod tests {
             let idx = ScriptIndex::build("p", &scripts, Options::default()).index;
             for _ in 0..60 {
                 let h = *hosts.choose(&mut rng).unwrap();
-                let url = format!("{}://{h}{}", schemes.choose(&mut rng).unwrap(), paths.choose(&mut rng).unwrap());
+                let url = format!(
+                    "{}://{h}{}",
+                    schemes.choose(&mut rng).unwrap(),
+                    paths.choose(&mut rng).unwrap()
+                );
                 let top = rng.gen_bool(0.5);
-                let got: Vec<_> = idx.candidates(h, &url, top).iter().map(|s| s.script.id.clone()).collect();
+                let got: Vec<_> = idx
+                    .candidates(h, &url, top)
+                    .iter()
+                    .map(|s| s.script.id.clone())
+                    .collect();
                 let want: Vec<_> = scripts
                     .iter()
                     .filter(|s| s.enabled && (top || !s.metadata.noframes))

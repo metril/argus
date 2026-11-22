@@ -55,7 +55,10 @@ impl<'a> UrlParts<'a> {
         let (host, port) = if let Some(b) = auth.strip_prefix('[') {
             let close = b.find(']')?;
             let after = &b[close + 1..];
-            (&b[..close], after.strip_prefix(':').and_then(|p| p.parse().ok()))
+            (
+                &b[..close],
+                after.strip_prefix(':').and_then(|p| p.parse().ok()),
+            )
         } else {
             match auth.rsplit_once(':') {
                 Some((h, p)) if p.bytes().all(|c| c.is_ascii_digit()) => (h, p.parse().ok()),
@@ -64,7 +67,11 @@ impl<'a> UrlParts<'a> {
         };
         let path_query = if tail.is_empty() || tail.starts_with('?') {
             // `http://h?x` has no path; Chrome treats the path as `/`+query.
-            if tail.is_empty() { "/" } else { tail }
+            if tail.is_empty() {
+                "/"
+            } else {
+                tail
+            }
         } else {
             tail
         };
@@ -104,7 +111,13 @@ struct Glob {
 
 impl Glob {
     fn new(pat: &str, ci: bool) -> Self {
-        let f = |s: &str| if ci { s.to_ascii_lowercase().into_bytes() } else { s.as_bytes().to_vec() };
+        let f = |s: &str| {
+            if ci {
+                s.to_ascii_lowercase().into_bytes()
+            } else {
+                s.as_bytes().to_vec()
+            }
+        };
         Glob {
             parts: pat.split('*').map(f).collect(),
             ci,
@@ -112,7 +125,11 @@ impl Glob {
     }
 
     fn eq(&self, a: &[u8], b: &[u8]) -> bool {
-        if self.ci { a.eq_ignore_ascii_case(b) } else { a == b }
+        if self.ci {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
     }
 
     fn find(&self, hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -200,13 +217,16 @@ impl MatchPattern {
             "*" | "http*" => SchemeSpec::Web,
             s if !s.is_empty()
                 && s.as_bytes()[0].is_ascii_alphabetic()
-                && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)) =>
+                && s.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)) =>
             {
                 SchemeSpec::Exact(s.to_string())
             }
             _ => return Err(format!("invalid scheme '{scheme}'")),
         };
-        let slash = rest.find('/').ok_or("missing path (a pattern must contain '/' after the host)")?;
+        let slash = rest
+            .find('/')
+            .ok_or("missing path (a pattern must contain '/' after the host)")?;
         let (hostport, path) = rest.split_at(slash);
         let (host_s, port) = match hostport.rsplit_once(':') {
             Some((h, "*")) => (h, PortSpec::Any),
@@ -291,7 +311,10 @@ impl MatchPattern {
 
 fn host_in_domain(host: &str, domain: &str) -> bool {
     let (h, d) = (host.as_bytes(), domain.as_bytes());
-    h.eq_ignore_ascii_case(d) || (h.len() > d.len() && h[h.len() - d.len() - 1] == b'.' && h[h.len() - d.len()..].eq_ignore_ascii_case(d))
+    h.eq_ignore_ascii_case(d)
+        || (h.len() > d.len()
+            && h[h.len() - d.len() - 1] == b'.'
+            && h[h.len() - d.len()..].eq_ignore_ascii_case(d))
 }
 
 /// `stem_glob` + `.` + a public suffix == host.
@@ -312,7 +335,11 @@ enum IncKind {
     All,
     Glob(Glob),
     /// scheme glob, host stem glob, path glob (`path` includes query)
-    TldGlob { scheme: Glob, stem: Glob, path: Glob },
+    TldGlob {
+        scheme: Glob,
+        stem: Glob,
+        path: Glob,
+    },
     Regex(Regex),
 }
 
@@ -322,11 +349,43 @@ pub struct IncludeRule {
     key: HostKey,
 }
 
+/// The literal host of a regex anchored like `^https?:\/\/host\.tld\/...`, so the rule can be
+/// bucketed by host. Anything more elaborate (groups, classes, alternation before the first
+/// `/` after the host) returns `None` and the rule stays in the any-host bucket.
+fn regex_host(body: &str) -> Option<String> {
+    let mut s = body.strip_prefix('^')?;
+    s = s
+        .strip_prefix("https?:")
+        .or_else(|| s.strip_prefix("https:"))
+        .or_else(|| s.strip_prefix("http:"))?;
+    s = s.strip_prefix("\\/\\/").or_else(|| s.strip_prefix("//"))?;
+    let mut host = String::new();
+    let mut it = s.chars().peekable();
+    loop {
+        match it.next()? {
+            '\\' => match it.next()? {
+                '.' => host.push('.'),
+                '/' => break,
+                _ => return None,
+            },
+            '/' | '$' => break,
+            c if c.is_ascii_alphanumeric() || c == '-' => host.push(c.to_ascii_lowercase()),
+            _ => return None,
+        }
+    }
+    // The host must end here, not continue into a quantified/grouped tail like `\.com?`.
+    (!host.is_empty() && !host.starts_with('.') && !host.ends_with('.') && !host.ends_with('-'))
+        .then_some(host)
+}
+
 impl IncludeRule {
     pub fn parse(p: &str) -> Result<Self, String> {
         let p = p.trim();
         if p == "*" {
-            return Ok(Self { kind: IncKind::All, key: HostKey::Any });
+            return Ok(Self {
+                kind: IncKind::All,
+                key: HostKey::Any,
+            });
         }
         if p.len() >= 2 && p.starts_with('/') {
             if let Some(close) = p.rfind('/').filter(|&i| i > 0) {
@@ -349,7 +408,16 @@ impl IncludeRule {
                         }
                     }
                     let re = b.build().map_err(|e| format!("bad regex: {e}"))?;
-                    return Ok(Self { kind: IncKind::Regex(re), key: HostKey::Any });
+                    let key = if flags.contains('i') || flags.contains('m') {
+                        // Case-folding / multiline change what the anchors mean: stay safe.
+                        HostKey::Any
+                    } else {
+                        regex_host(body).map_or(HostKey::Any, HostKey::Exact)
+                    };
+                    return Ok(Self {
+                        kind: IncKind::Regex(re),
+                        key,
+                    });
                 }
             }
         }
@@ -382,9 +450,15 @@ impl IncludeRule {
             } else {
                 HostKey::Exact(host_l)
             };
-            return Ok(Self { kind: IncKind::Glob(Glob::new(p, true)), key });
+            return Ok(Self {
+                kind: IncKind::Glob(Glob::new(p, true)),
+                key,
+            });
         }
-        Ok(Self { kind: IncKind::Glob(Glob::new(p, true)), key: HostKey::Any })
+        Ok(Self {
+            kind: IncKind::Glob(Glob::new(p, true)),
+            key: HostKey::Any,
+        })
     }
 
     pub fn is_match(&self, u: &UrlParts<'_>) -> bool {
@@ -476,7 +550,11 @@ impl Rules {
     /// Host buckets of the include side; a single `Any` when rule-less and match-all.
     pub fn host_keys(&self) -> Vec<HostKey> {
         if self.declared_none {
-            return if self.match_all_without_rules { vec![HostKey::Any] } else { vec![] };
+            return if self.match_all_without_rules {
+                vec![HostKey::Any]
+            } else {
+                vec![]
+            };
         }
         let mut v: Vec<HostKey> = self.includes.iter().map(Matcher::host_key).collect();
         v.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
@@ -504,10 +582,14 @@ mod tests {
     use super::*;
 
     fn mp(p: &str, url: &str) -> bool {
-        MatchPattern::parse(p).unwrap().is_match(&UrlParts::parse(url).unwrap())
+        MatchPattern::parse(p)
+            .unwrap()
+            .is_match(&UrlParts::parse(url).unwrap())
     }
     fn inc(p: &str, url: &str) -> bool {
-        IncludeRule::parse(p).unwrap().is_match(&UrlParts::parse(url).unwrap())
+        IncludeRule::parse(p)
+            .unwrap()
+            .is_match(&UrlParts::parse(url).unwrap())
     }
 
     #[test]
@@ -518,17 +600,53 @@ mod tests {
             ("https://*/*", "http://www.google.com/", false),
             ("https://*/foo*", "https://example.org/foo/bar.html", true),
             ("https://*/foo*", "https://example.org/bar", false),
-            ("https://*.google.com/foo*bar", "https://www.google.com/foo/baz/bar", true),
-            ("https://*.google.com/foo*bar", "https://docs.google.com/foobar", true),
-            ("https://*.google.com/foo*bar", "https://google.com/foobar", true),
-            ("https://*.google.com/foo*bar", "https://evilgoogle.com/foobar", false),
-            ("https://example.org/foo/bar.html", "https://example.org/foo/bar.html", true),
-            ("https://example.org/foo/bar.html", "https://example.org/foo/bar.htm", false),
+            (
+                "https://*.google.com/foo*bar",
+                "https://www.google.com/foo/baz/bar",
+                true,
+            ),
+            (
+                "https://*.google.com/foo*bar",
+                "https://docs.google.com/foobar",
+                true,
+            ),
+            (
+                "https://*.google.com/foo*bar",
+                "https://google.com/foobar",
+                true,
+            ),
+            (
+                "https://*.google.com/foo*bar",
+                "https://evilgoogle.com/foobar",
+                false,
+            ),
+            (
+                "https://example.org/foo/bar.html",
+                "https://example.org/foo/bar.html",
+                true,
+            ),
+            (
+                "https://example.org/foo/bar.html",
+                "https://example.org/foo/bar.htm",
+                false,
+            ),
             ("http://127.0.0.1/*", "http://127.0.0.1/", true),
             ("http://127.0.0.1/*", "http://127.0.0.1/foo/bar.html", true),
-            ("*://mail.google.com/*", "http://mail.google.com/foo/baz/bar", true),
-            ("*://mail.google.com/*", "https://mail.google.com/foobar", true),
-            ("*://mail.google.com/*", "ftp://mail.google.com/foobar", false),
+            (
+                "*://mail.google.com/*",
+                "http://mail.google.com/foo/baz/bar",
+                true,
+            ),
+            (
+                "*://mail.google.com/*",
+                "https://mail.google.com/foobar",
+                true,
+            ),
+            (
+                "*://mail.google.com/*",
+                "ftp://mail.google.com/foobar",
+                false,
+            ),
             ("<all_urls>", "http://example.org/foo/bar.html", true),
             ("<all_urls>", "file:///bar/baz.html", true),
             ("<all_urls>", "ftp://example.org/x", true),
@@ -554,7 +672,16 @@ mod tests {
 
     #[test]
     fn invalid_match_patterns() {
-        for p in ["https://*foo/bar", "https://foo.*.org/bar", "https://example.com", "example.com/*", "https:///x", "file://host/x", "*://*.*/x", "://a/*"] {
+        for p in [
+            "https://*foo/bar",
+            "https://foo.*.org/bar",
+            "https://example.com",
+            "example.com/*",
+            "https:///x",
+            "file://host/x",
+            "*://*.*/x",
+            "://a/*",
+        ] {
             assert!(MatchPattern::parse(p).is_err(), "{p}");
         }
     }
@@ -565,7 +692,10 @@ mod tests {
         assert!(mp("*://google.tld/*", "https://google.co.uk/x"));
         assert!(!mp("*://google.tld/*", "https://www.google.com/x"));
         assert!(mp("*://*.google.tld/*", "https://www.google.co.uk/x"));
-        assert!(!mp("*://google.tld/*", "https://google.evil.test.invalidtld.x/"));
+        assert!(!mp(
+            "*://google.tld/*",
+            "https://google.evil.test.invalidtld.x/"
+        ));
     }
 
     #[test]
@@ -578,8 +708,14 @@ mod tests {
         assert!(!inc("*://*.example.com/*", "https://example.com/x"));
         assert!(inc("http*://example.com/*", "https://example.com/"));
         assert!(inc("*example.com*", "https://www.example.com/x"));
-        assert!(inc("https://example.com/*/edit", "https://example.com/a/b/edit"));
-        assert!(!inc("https://example.com/*/edit", "https://example.com/a/b/edit2"));
+        assert!(inc(
+            "https://example.com/*/edit",
+            "https://example.com/a/b/edit"
+        ));
+        assert!(!inc(
+            "https://example.com/*/edit",
+            "https://example.com/a/b/edit2"
+        ));
         assert!(inc("https://example.com/a.b", "https://example.com/a.b"));
         assert!(!inc("https://example.com/a.b", "https://example.com/aXb")); // '.' is literal
         assert!(inc("https://example.com/?q", "https://example.com/?q"));
@@ -588,11 +724,44 @@ mod tests {
 
     #[test]
     fn regex_include() {
-        assert!(inc(r"/^https?:\/\/(www\.)?foo\.com\/.*$/", "https://www.foo.com/x"));
-        assert!(!inc(r"/^https?:\/\/(www\.)?foo\.com\/.*$/", "https://bar.com/x"));
+        assert!(inc(
+            r"/^https?:\/\/(www\.)?foo\.com\/.*$/",
+            "https://www.foo.com/x"
+        ));
+        assert!(!inc(
+            r"/^https?:\/\/(www\.)?foo\.com\/.*$/",
+            "https://bar.com/x"
+        ));
         assert!(inc(r"/FOO\.com/i", "https://foo.com/"));
         assert!(!inc(r"/FOO\.com/", "https://foo.com/"));
         assert!(IncludeRule::parse("/(?<=a)b/").is_err()); // look-behind unsupported
+    }
+
+    #[test]
+    fn regex_host_bucketing() {
+        assert_eq!(
+            regex_host(r"^https:\/\/foo\.bar-x\.com\/a").as_deref(),
+            Some("foo.bar-x.com")
+        );
+        assert_eq!(regex_host(r"^https?:\/\/a\.b$").as_deref(), Some("a.b"));
+        for r in [
+            r"^https?:\/\/(www\.)?foo\.com\/",
+            r"^https?:\/\/foo\.com?\/",
+            r"^https?:\/\/foo.com\/",
+            r"^https?:\/\/foo\.com:8080\/",
+            r"https:\/\/foo\.com\/",
+            r"^https?:\/\/[a-z]+\.com\/",
+        ] {
+            assert_eq!(regex_host(r), None, "{r}");
+        }
+        let rule = IncludeRule::parse(r"/^https?:\/\/foo\.com\/a/").unwrap();
+        assert_eq!(rule.key, HostKey::Exact("foo.com".into()));
+        assert_eq!(
+            IncludeRule::parse(r"/^https?:\/\/foo\.com\/a/i")
+                .unwrap()
+                .key,
+            HostKey::Any
+        );
     }
 
     #[test]
@@ -619,11 +788,20 @@ mod tests {
         assert!(!r.is_match_url("https://c.com/"));
         let r = rules("// ==UserScript==\n// @name x\n// ==/UserScript==");
         assert!(r.is_match_url("https://anything/"));
-        let m = UserscriptMetadata::parse("// ==UserScript==\n// @name x\n// ==/UserScript==").unwrap();
-        let (r, _) = Rules::compile(&m, Options { match_all_without_rules: false });
+        let m =
+            UserscriptMetadata::parse("// ==UserScript==\n// @name x\n// ==/UserScript==").unwrap();
+        let (r, _) = Rules::compile(
+            &m,
+            Options {
+                match_all_without_rules: false,
+            },
+        );
         assert!(!r.is_match_url("https://anything/"));
         // Only invalid @match given: matches nothing, not everything.
-        let m = UserscriptMetadata::parse("// ==UserScript==\n// @name x\n// @match bogus\n// ==/UserScript==").unwrap();
+        let m = UserscriptMetadata::parse(
+            "// ==UserScript==\n// @name x\n// @match bogus\n// ==/UserScript==",
+        )
+        .unwrap();
         let (r, e) = Rules::compile(&m, Options::default());
         assert_eq!(e.len(), 1);
         assert!(!r.is_match_url("https://a.com/"));

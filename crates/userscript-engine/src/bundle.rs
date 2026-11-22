@@ -36,7 +36,10 @@ pub const API_TABLE: &[(&str, &str)] = &[
     ("gm_setvalues", "GM_setValues"),
     ("gm_deletevalues", "GM_deleteValues"),
     ("gm_addvaluechangelistener", "GM_addValueChangeListener"),
-    ("gm_removevaluechangelistener", "GM_removeValueChangeListener"),
+    (
+        "gm_removevaluechangelistener",
+        "GM_removeValueChangeListener",
+    ),
     ("gm_addstyle", "GM_addStyle"),
     ("gm_addelement", "GM_addElement"),
     ("gm_getresourcetext", "GM_getResourceText"),
@@ -76,7 +79,14 @@ pub struct BundleOptions<'a> {
 }
 
 impl<'a> BundleOptions<'a> {
-    pub fn new(profile: &'a str, page_origin: &'a str, is_top_frame: bool, key: &'a TokenKey, now: u64, values: &'a HashMap<String, Map<String, Value>>) -> Self {
+    pub fn new(
+        profile: &'a str,
+        page_origin: &'a str,
+        is_top_frame: bool,
+        key: &'a TokenKey,
+        now: u64,
+        values: &'a HashMap<String, Map<String, Value>>,
+    ) -> Self {
         Self {
             profile,
             page_origin,
@@ -163,7 +173,9 @@ fn group(r: RunAt) -> usize {
 /// `GM_addValueChangeListener` also exposing its remover.
 pub fn runtime_grants(meta: &UserscriptMetadata) -> Vec<String> {
     let mut g = meta.effective_grants();
-    if g.iter().any(|x| x == "gm_addvaluechangelistener") && !g.iter().any(|x| x == "gm_removevaluechangelistener") {
+    if g.iter().any(|x| x == "gm_addvaluechangelistener")
+        && !g.iter().any(|x| x == "gm_removevaluechangelistener")
+    {
         g.push("gm_removevaluechangelistener".into());
     }
     g
@@ -234,7 +246,14 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
     let exp = opts.now + opts.ttl_secs;
     let tok = token::mint(
         opts.key,
-        &TokenClaims { profile: opts.profile, script_id: &s.id, script_version: m.version.as_deref().unwrap_or(""), origin: opts.page_origin, caps_hash: &caps, exp },
+        &TokenClaims {
+            profile: opts.profile,
+            script_id: &s.id,
+            script_version: m.version.as_deref().unwrap_or(""),
+            origin: opts.page_origin,
+            caps_hash: &caps,
+            exp,
+        },
     );
     let mut d = Map::new();
     d.insert("id".into(), json!(s.id));
@@ -247,16 +266,29 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
     d.insert("metaStr".into(), json!(meta_str(m)));
     d.insert("unwrap".into(), json!(m.unwrap));
     let uses = |c: &str| grants.iter().any(|g| g == c);
-    if uses("gm_getvalue") || uses("gm_getvalues") || uses("gm_listvalues") || uses("gm_setvalue") || uses("gm_setvalues") {
+    if uses("gm_getvalue")
+        || uses("gm_getvalues")
+        || uses("gm_listvalues")
+        || uses("gm_setvalue")
+        || uses("gm_setvalues")
+    {
         if let Some(v) = opts.values.get(&s.id) {
             d.insert("values".into(), Value::Object(v.clone()));
         }
     }
     if uses("gm_getresourcetext") || uses("gm_getresourceurl") {
         let mut res = Map::new();
-        for r in s.assets.resources.iter().filter(|r| r.data_b64.len() <= opts.inline_resource_limit * 4 / 3 + 4) {
+        for r in s
+            .assets
+            .resources
+            .iter()
+            .filter(|r| r.data_b64.len() <= opts.inline_resource_limit * 4 / 3 + 4)
+        {
             let bytes = r.bytes();
-            let is_text = r.mime.starts_with("text/") || r.mime.contains("json") || r.mime.contains("javascript") || r.mime.contains("xml");
+            let is_text = r.mime.starts_with("text/")
+                || r.mime.contains("json")
+                || r.mime.contains("javascript")
+                || r.mime.contains("xml");
             match (is_text, String::from_utf8(bytes)) {
                 (true, Ok(t)) => res.insert(r.name.clone(), json!({"mime": r.mime, "text": t})),
                 _ => res.insert(r.name.clone(), json!({"mime": r.mime, "b64": r.data_b64})),
@@ -268,7 +300,11 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
         d.insert("code".into(), json!(body(cs)));
         return format!("{{d:{},f:null}}", js_json(&Value::Object(d)));
     }
-    let kw = if m.top_level_await { "async function" } else { "function" };
+    let kw = if m.top_level_await {
+        "async function"
+    } else {
+        "function"
+    };
     format!(
         "{{d:{},f:function({}){{return ({kw}(){{\n{}}}).call(this);}}}}",
         js_json(&Value::Object(d)),
@@ -281,7 +317,11 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
 pub fn generate(scripts: &[&CompiledScript], opts: &BundleOptions<'_>) -> Bundle {
     let mut chunks: Vec<ScriptChunk> = scripts
         .iter()
-        .map(|cs| ScriptChunk { id: cs.script.id.clone(), run_at: cs.script.metadata.run_at, js: entry_js(cs, opts) })
+        .map(|cs| ScriptChunk {
+            id: cs.script.id.clone(),
+            run_at: cs.script.metadata.run_at,
+            js: entry_js(cs, opts),
+        })
         .collect();
     // Stable: group order start, body, end, idle; install order inside a group.
     chunks.sort_by_key(|c| group(c.run_at));
@@ -290,11 +330,20 @@ pub fn generate(scripts: &[&CompiledScript], opts: &BundleOptions<'_>) -> Bundle
         counts[group(c.run_at)] += 1;
     }
     if chunks.is_empty() {
-        return Bundle { js: String::new(), chunks, counts };
+        return Bundle {
+            js: String::new(),
+            chunks,
+            counts,
+        };
     }
     let cfg = json!({"base": opts.base_path, "top": opts.is_top_frame, "handler": "AdBlocker Userscripts", "handlerVersion": env!("CARGO_PKG_VERSION")});
     let entries: Vec<&str> = chunks.iter().map(|c| c.js.as_str()).collect();
-    let js = format!("({})({},[{}],window);\n", RUNTIME_JS.trim(), js_json(&cfg), entries.join(",\n"));
+    let js = format!(
+        "({})({},[{}],window);\n",
+        RUNTIME_JS.trim(),
+        js_json(&cfg),
+        entries.join(",\n")
+    );
     Bundle { js, chunks, counts }
 }
 
@@ -309,14 +358,20 @@ mod tests {
     };
 
     fn us(hdr: &str, code: &str) -> Userscript {
-        Userscript::new(format!("// ==UserScript==\n{hdr}\n// ==/UserScript==\n{code}")).unwrap()
+        Userscript::new(format!(
+            "// ==UserScript==\n{hdr}\n// ==/UserScript==\n{code}"
+        ))
+        .unwrap()
     }
 
     fn compile(scripts: Vec<Userscript>) -> ScriptIndex {
         ScriptIndex::build("p", &scripts, Options::default()).index
     }
 
-    fn opts<'a>(key: &'a TokenKey, vals: &'a HashMap<String, Map<String, Value>>) -> BundleOptions<'a> {
+    fn opts<'a>(
+        key: &'a TokenKey,
+        vals: &'a HashMap<String, Map<String, Value>>,
+    ) -> BundleOptions<'a> {
         BundleOptions::new("p", "https://example.com", true, key, 1000, vals)
     }
 
@@ -331,7 +386,10 @@ mod tests {
         // Structure (token and metadata JSON are checked separately).
         assert!(js.starts_with("{d:{"), "{js}");
         assert!(js.contains("\"grants\":[\"gm_getvalue\"]"), "{js}");
-        assert!(js.contains("\"params\":[\"GM_info\",\"GM\",\"GM_getValue\",\"unsafeWindow\"]"), "{js}");
+        assert!(
+            js.contains("\"params\":[\"GM_info\",\"GM\",\"GM_getValue\",\"unsafeWindow\"]"),
+            "{js}"
+        );
         assert!(js.contains("\"run-at\":\"document-end\""));
         assert!(js.ends_with("f:function(GM_info,GM,GM_getValue,unsafeWindow){return (function(){\n// ==UserScript==\n// @name Hi\n// @namespace n\n// @version 1.0\n// @match *://*/*\n// @grant GM_getValue\n// ==/UserScript==\nconsole.log(GM_getValue('a'));\n}).call(this);}}"), "{js}");
     }
@@ -340,7 +398,10 @@ mod tests {
     fn grant_none_exposes_no_api_and_unwrap_wrapper_variants() {
         let idx = compile(vec![
             us("// @name A\n// @grant none", "x();"),
-            us("// @name B\n// @grant GM.getValue\n// @top-level-await", "await 1;"),
+            us(
+                "// @name B\n// @grant GM.getValue\n// @top-level-await",
+                "await 1;",
+            ),
             us("// @name C\n// @unwrap", "window.foo = 1;"),
         ]);
         let (key, vals) = (TokenKey::new(vec![1; 32]), HashMap::new());
@@ -349,14 +410,24 @@ mod tests {
         assert!(js[0].contains("f:function(unsafeWindow){") && js[0].contains("\"grants\":[]"));
         assert!(js[1].contains("(async function(){"));
         assert!(js[1].contains("function(GM_info,GM,GM_getValue,unsafeWindow)"));
-        assert!(js[2].contains("f:null") && js[2].contains("\"code\":") && js[2].contains("window.foo = 1;"));
+        assert!(
+            js[2].contains("f:null")
+                && js[2].contains("\"code\":")
+                && js[2].contains("window.foo = 1;")
+        );
     }
 
     #[test]
     fn requires_come_first_in_the_same_scope() {
         let mut s = us("// @name R", "main();");
-        s.assets.requires.push(crate::script::RequireBlob { url: "https://x/a.js".into(), content: "\u{feff}libA();".into() });
-        s.assets.requires.push(crate::script::RequireBlob { url: "https://x/b.js".into(), content: "libB(); // no newline".into() });
+        s.assets.requires.push(crate::script::RequireBlob {
+            url: "https://x/a.js".into(),
+            content: "\u{feff}libA();".into(),
+        });
+        s.assets.requires.push(crate::script::RequireBlob {
+            url: "https://x/b.js".into(),
+            content: "libB(); // no newline".into(),
+        });
         let idx = compile(vec![s]);
         let (key, vals) = (TokenKey::new(vec![1; 32]), HashMap::new());
         let js = entry_js(idx.iter().next().unwrap(), &opts(&key, &vals));
@@ -364,7 +435,10 @@ mod tests {
         let b = js.find("libB();").unwrap();
         let m = js.find("main();").unwrap();
         assert!(a < b && b < m);
-        assert!(js[b..m].contains("\n;\n"), "a trailing line comment must not swallow the next code");
+        assert!(
+            js[b..m].contains("\n;\n"),
+            "a trailing line comment must not swallow the next code"
+        );
         assert!(!js.contains('\u{feff}'));
     }
 
@@ -379,10 +453,18 @@ mod tests {
         let (key, vals) = (TokenKey::new(vec![1; 32]), HashMap::new());
         let all: Vec<_> = idx.iter().collect();
         let b = generate(&all, &opts(&key, &vals));
-        let order: Vec<_> = b.chunks.iter().map(|c| idx.get(&c.id).unwrap().script.name().to_string()).collect();
+        let order: Vec<_> = b
+            .chunks
+            .iter()
+            .map(|c| idx.get(&c.id).unwrap().script.name().to_string())
+            .collect();
         assert_eq!(order, ["start", "body", "end", "idle"]);
         assert_eq!(b.counts, [1, 1, 1, 1]);
-        assert!(b.js.starts_with("(/*") && b.js.contains("})(") && b.js.trim_end().ends_with(",window);"));
+        assert!(
+            b.js.starts_with("(/*")
+                && b.js.contains("})(")
+                && b.js.trim_end().ends_with(",window);")
+        );
         assert!(generate(&[], &opts(&key, &vals)).js.is_empty());
     }
 
@@ -391,7 +473,12 @@ mod tests {
         let evil = "</script><!-- \u{2028}\u{2029} \"\\' */ alert(1) // &amp;";
         let hdr = format!("// @name {evil}\n// @namespace {evil}\n// @version {evil}\n// @description {evil}\n// @author {evil}\n// @match *://*/*\n// @grant GM_getValue\n// @grant GM_getResourceText\n// @resource r https://x/{evil}\n// @connect {evil}");
         let mut s = us(&hdr, "ok();");
-        s.assets.resources.push(crate::script::ResourceBlob { name: "r".into(), url: "https://x/r".into(), mime: "text/plain".into(), data_b64: "PC9zY3JpcHQ+PCEtLQ==".into() }); // "</script><!--"
+        s.assets.resources.push(crate::script::ResourceBlob {
+            name: "r".into(),
+            url: "https://x/r".into(),
+            mime: "text/plain".into(),
+            data_b64: "PC9zY3JpcHQ+PCEtLQ==".into(),
+        }); // "</script><!--"
         let idx = compile(vec![s]);
         let key = TokenKey::new(vec![1; 32]);
         let mut vals = HashMap::new();
@@ -417,13 +504,22 @@ mod tests {
     #[test]
     fn js_json_escapes() {
         let s = js_json(&json!({"a": "</script><!--\u{2028}&"}));
-        assert_eq!(s, "{\"a\":\"\\u003c/script\\u003e\\u003c!--\\u2028\\u0026\"}");
-        assert_eq!(serde_json::from_str::<Value>(&s).unwrap()["a"], "</script><!--\u{2028}&");
+        assert_eq!(
+            s,
+            "{\"a\":\"\\u003c/script\\u003e\\u003c!--\\u2028\\u0026\"}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&s).unwrap()["a"],
+            "</script><!--\u{2028}&"
+        );
     }
 
     #[test]
     fn token_in_bundle_verifies() {
-        let idx = compile(vec![us("// @name T\n// @version 2\n// @grant GM_getValue\n// @connect a.com", "")]);
+        let idx = compile(vec![us(
+            "// @name T\n// @version 2\n// @grant GM_getValue\n// @connect a.com",
+            "",
+        )]);
         let cs = idx.iter().next().unwrap();
         let key = TokenKey::new(vec![9; 32]);
         let vals = HashMap::new();
@@ -432,9 +528,32 @@ mod tests {
         let tok = &js[start..start + js[start..].find('"').unwrap()];
         assert_eq!(claimed_script_id(tok).as_deref(), Some(cs.id()));
         let caps = token::caps_hash(&cs.script.metadata, false);
-        assert_eq!(verify(&key, tok, 1500, "p", "https://example.com", |_| Some(ScriptRecord { version: "2", caps_hash: &caps })).unwrap(), cs.id());
-        assert!(verify(&key, tok, 1500, "p", "https://evil.com", |_| Some(ScriptRecord { version: "2", caps_hash: &caps })).is_err());
-        assert!(verify(&key, tok, 4601, "p", "https://example.com", |_| Some(ScriptRecord { version: "2", caps_hash: &caps })).is_err());
+        assert_eq!(
+            verify(&key, tok, 1500, "p", "https://example.com", |_| Some(
+                ScriptRecord {
+                    version: "2",
+                    caps_hash: &caps
+                }
+            ))
+            .unwrap(),
+            cs.id()
+        );
+        assert!(verify(&key, tok, 1500, "p", "https://evil.com", |_| Some(
+            ScriptRecord {
+                version: "2",
+                caps_hash: &caps
+            }
+        ))
+        .is_err());
+        assert!(
+            verify(&key, tok, 4601, "p", "https://example.com", |_| Some(
+                ScriptRecord {
+                    version: "2",
+                    caps_hash: &caps
+                }
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -452,6 +571,9 @@ mod tests {
         assert!(!b.inline_safe());
         let idx = compile(vec![us("// @name A", "var s = 1;")]);
         let b = generate(&idx.iter().collect::<Vec<_>>(), &opts(&key, &vals));
-        assert!(b.inline_safe(), "the runtime itself must not contain breakout sequences");
+        assert!(
+            b.inline_safe(),
+            "the runtime itself must not contain breakout sequences"
+        );
     }
 }

@@ -240,7 +240,11 @@ impl UserscriptStorage {
 
     /// List all value names for a script (default profile).
     pub fn list_values(&self, script_id: &str) -> Result<Vec<String>> {
-        Ok(self.list_sizes(script_id)?.into_iter().map(|(n, _)| n).collect())
+        Ok(self
+            .list_sizes(script_id)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
     }
 
     /// Remove every value of namespace `ns` inside an existing transaction.

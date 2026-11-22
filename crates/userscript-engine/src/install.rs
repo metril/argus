@@ -106,7 +106,11 @@ pub fn summarize(meta: &UserscriptMetadata) -> GrantsSummary {
         downloads: has("gm_download"),
         clipboard: has("gm_setclipboard"),
         notifications: has("gm_notification"),
-        unsupported: meta.unsupported().iter().map(|w| w.message.clone()).collect(),
+        unsupported: meta
+            .unsupported()
+            .iter()
+            .map(|w| w.message.clone())
+            .collect(),
         grants,
         connect,
         matches,
@@ -116,35 +120,58 @@ pub fn summarize(meta: &UserscriptMetadata) -> GrantsSummary {
 /// Parse `source` and list what must be downloaded. `origin_url` resolves relative URLs.
 pub fn plan_install(source: &str, origin_url: Option<&Url>) -> Result<InstallPlan> {
     let metadata = UserscriptMetadata::parse(source)?;
-    let mut warnings: Vec<String> = metadata.warnings.iter().map(|w| w.message.clone()).collect();
+    let mut warnings: Vec<String> = metadata
+        .warnings
+        .iter()
+        .map(|w| w.message.clone())
+        .collect();
     let (_, errs) = Rules::compile(&metadata, Options::default());
     warnings.extend(errs);
     if metadata.requires.len() > MAX_REQUIRES {
-        return Err(Error::InvalidScript(format!("too many @require ({} > {MAX_REQUIRES})", metadata.requires.len())));
+        return Err(Error::InvalidScript(format!(
+            "too many @require ({} > {MAX_REQUIRES})",
+            metadata.requires.len()
+        )));
     }
     if metadata.resources.len() > MAX_RESOURCES {
-        return Err(Error::InvalidScript(format!("too many @resource ({} > {MAX_RESOURCES})", metadata.resources.len())));
+        return Err(Error::InvalidScript(format!(
+            "too many @resource ({} > {MAX_RESOURCES})",
+            metadata.resources.len()
+        )));
     }
     let mut requires = Vec::new();
     for r in &metadata.requires {
         match resolve(origin_url, &r.url) {
-            Ok(url) => requires.push(FetchSpec { url, sri: r.sri.clone() }),
+            Ok(url) => requires.push(FetchSpec {
+                url,
+                sri: r.sri.clone(),
+            }),
             Err(e) => return Err(Error::InvalidScript(format!("@require {e}"))),
         }
     }
     let mut resources = Vec::new();
     for r in &metadata.resources {
         if r.name.contains(['/', '\\', '\0']) || r.name.contains("..") {
-            return Err(Error::InvalidScript(format!("invalid @resource name {:?}", r.name)));
+            return Err(Error::InvalidScript(format!(
+                "invalid @resource name {:?}",
+                r.name
+            )));
         }
         match resolve(origin_url, &r.url) {
-            Ok(url) => resources.push(ResourceFetch { name: r.name.clone(), url, sri: r.sri.clone() }),
+            Ok(url) => resources.push(ResourceFetch {
+                name: r.name.clone(),
+                url,
+                sri: r.sri.clone(),
+            }),
             Err(e) => return Err(Error::InvalidScript(format!("@resource {e}"))),
         }
     }
     for r in &requires {
         if r.sri.is_empty() && r.url.scheme() == "http" {
-            warnings.push(format!("@require {} is fetched over plain http without an integrity hash", r.url));
+            warnings.push(format!(
+                "@require {} is fetched over plain http without an integrity hash",
+                r.url
+            ));
         }
     }
     Ok(InstallPlan {
@@ -203,29 +230,43 @@ fn mime_guess(url: &Url, ct: Option<&str>) -> String {
 }
 
 /// Verify downloads and build the script. Every planned `@require`/`@resource` must be present.
-pub fn finish_install(plan: InstallPlan, fetched: Fetched, approvals: Approvals) -> Result<Userscript> {
+pub fn finish_install(
+    plan: InstallPlan,
+    fetched: Fetched,
+    approvals: Approvals,
+) -> Result<Userscript> {
     let mut assets = ScriptAssets::default();
     for r in &plan.requires {
-        let body = fetched
-            .requires
-            .get(r.url.as_str())
-            .ok_or_else(|| Error::InvalidScript(format!("@require {} was not downloaded", r.url)))?;
+        let body = fetched.requires.get(r.url.as_str()).ok_or_else(|| {
+            Error::InvalidScript(format!("@require {} was not downloaded", r.url))
+        })?;
         if body.len() > MAX_ASSET_BYTES {
-            return Err(Error::InvalidScript(format!("@require {} is too large", r.url)));
+            return Err(Error::InvalidScript(format!(
+                "@require {} is too large",
+                r.url
+            )));
         }
-        verify_sri(body, &r.sri).map_err(|e| Error::InvalidScript(format!("@require {}: {e}", r.url)))?;
-        let content = String::from_utf8(body.clone()).map_err(|_| Error::InvalidScript(format!("@require {} is not UTF-8", r.url)))?;
-        assets.requires.push(RequireBlob { url: r.url.to_string(), content: content.trim_start_matches('\u{feff}').to_string() });
+        verify_sri(body, &r.sri)
+            .map_err(|e| Error::InvalidScript(format!("@require {}: {e}", r.url)))?;
+        let content = String::from_utf8(body.clone())
+            .map_err(|_| Error::InvalidScript(format!("@require {} is not UTF-8", r.url)))?;
+        assets.requires.push(RequireBlob {
+            url: r.url.to_string(),
+            content: content.trim_start_matches('\u{feff}').to_string(),
+        });
     }
     for r in &plan.resources {
-        let (body, ct) = fetched
-            .resources
-            .get(&r.name)
-            .ok_or_else(|| Error::InvalidScript(format!("@resource {} was not downloaded", r.name)))?;
+        let (body, ct) = fetched.resources.get(&r.name).ok_or_else(|| {
+            Error::InvalidScript(format!("@resource {} was not downloaded", r.name))
+        })?;
         if body.len() > MAX_ASSET_BYTES {
-            return Err(Error::InvalidScript(format!("@resource {} is too large", r.name)));
+            return Err(Error::InvalidScript(format!(
+                "@resource {} is too large",
+                r.name
+            )));
         }
-        verify_sri(body, &r.sri).map_err(|e| Error::InvalidScript(format!("@resource {}: {e}", r.name)))?;
+        verify_sri(body, &r.sri)
+            .map_err(|e| Error::InvalidScript(format!("@resource {}: {e}", r.name)))?;
         assets.resources.push(ResourceBlob {
             name: r.name.clone(),
             url: r.url.to_string(),
@@ -234,7 +275,9 @@ pub fn finish_install(plan: InstallPlan, fetched: Fetched, approvals: Approvals)
         });
     }
     if approvals.allow_connect_all && !plan.grants_summary.connect_all {
-        return Err(Error::InvalidScript("@connect * approved but not requested".into()));
+        return Err(Error::InvalidScript(
+            "@connect * approved but not requested".into(),
+        ));
     }
     let mut s = Userscript::new(plan.source)?;
     s.assets = assets;
@@ -256,7 +299,9 @@ pub struct UpdateDiff {
 impl UpdateDiff {
     /// An update that widens what the script may do needs explicit re-approval.
     pub fn needs_reapproval(&self) -> bool {
-        !(self.added_matches.is_empty() && self.added_connect.is_empty() && self.added_grants.is_empty())
+        !(self.added_matches.is_empty()
+            && self.added_connect.is_empty()
+            && self.added_grants.is_empty())
     }
 }
 
@@ -268,7 +313,12 @@ fn set_diff(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
 
 pub fn diff(old: &UserscriptMetadata, new: &UserscriptMetadata) -> UpdateDiff {
     let pats = |m: &UserscriptMetadata| {
-        let mut v: Vec<String> = m.matches.iter().map(|s| format!("@match {s}")).chain(m.includes.iter().map(|s| format!("@include {s}"))).collect();
+        let mut v: Vec<String> = m
+            .matches
+            .iter()
+            .map(|s| format!("@match {s}"))
+            .chain(m.includes.iter().map(|s| format!("@include {s}")))
+            .collect();
         v.sort();
         v.dedup();
         v
@@ -284,10 +334,18 @@ pub fn diff(old: &UserscriptMetadata, new: &UserscriptMetadata) -> UpdateDiff {
     let (added_connect, removed_connect) = set_diff(&conn(old), &conn(new));
     let (added_grants, removed_grants) = set_diff(&gr(old), &gr(new));
     // Dropping `@match` entirely turns a restricted script into match-everything.
-    let mut d = UpdateDiff { added_matches, added_connect, added_grants, removed_matches, removed_connect, removed_grants };
+    let mut d = UpdateDiff {
+        added_matches,
+        added_connect,
+        added_grants,
+        removed_matches,
+        removed_connect,
+        removed_grants,
+    };
     let was_scoped = !(old.matches.is_empty() && old.includes.is_empty());
     if was_scoped && new.matches.is_empty() && new.includes.is_empty() {
-        d.added_matches.push("(no @match/@include: runs everywhere)".into());
+        d.added_matches
+            .push("(no @match/@include: runs everywhere)".into());
     }
     d
 }
@@ -303,10 +361,16 @@ pub struct UpdatePlan {
 }
 
 /// Plan an update of `installed` to `new_source`. The script identity (name+namespace) must match.
-pub fn plan_update(installed: &Userscript, new_source: &str, origin_url: Option<&Url>) -> Result<UpdatePlan> {
+pub fn plan_update(
+    installed: &Userscript,
+    new_source: &str,
+    origin_url: Option<&Url>,
+) -> Result<UpdatePlan> {
     let plan = plan_install(new_source, origin_url)?;
     if plan.metadata.unique_id() != installed.metadata.unique_id() {
-        return Err(Error::InvalidScript("update has a different @name/@namespace".into()));
+        return Err(Error::InvalidScript(
+            "update has a different @name/@namespace".into(),
+        ));
     }
     let diff = diff(&installed.metadata, &plan.metadata);
     let is_newer = match (&installed.metadata.version, &plan.metadata.version) {
@@ -325,13 +389,29 @@ pub fn plan_update(installed: &Userscript, new_source: &str, origin_url: Option<
 /// Build the updated script. Refuses a widening update unless `approved`. Keeps identity,
 /// enabled state and counters of `installed`; `@connect *` approval survives only if still
 /// requested and previously approved (or newly approved).
-pub fn finish_update(installed: &Userscript, up: UpdatePlan, fetched: Fetched, approved: bool, approve_connect_all: bool) -> Result<Userscript> {
+pub fn finish_update(
+    installed: &Userscript,
+    up: UpdatePlan,
+    fetched: Fetched,
+    approved: bool,
+    approve_connect_all: bool,
+) -> Result<Userscript> {
     if up.diff.needs_reapproval() && !approved {
-        return Err(Error::PermissionDenied("update widens match/connect/grant; approval required".into()));
+        return Err(Error::PermissionDenied(
+            "update widens match/connect/grant; approval required".into(),
+        ));
     }
     let now_connect_all = up.plan.grants_summary.connect_all;
-    let keep = now_connect_all && (approve_connect_all || (installed.allow_connect_all && !up.diff.added_connect.iter().any(|c| c == "*")));
-    let mut s = finish_install(up.plan, fetched, Approvals { allow_connect_all: keep })?;
+    let keep = now_connect_all
+        && (approve_connect_all
+            || (installed.allow_connect_all && !up.diff.added_connect.iter().any(|c| c == "*")));
+    let mut s = finish_install(
+        up.plan,
+        fetched,
+        Approvals {
+            allow_connect_all: keep,
+        },
+    )?;
     s.id = installed.id.clone();
     s.profile = installed.profile.clone();
     s.enabled = installed.enabled;
@@ -346,14 +426,24 @@ pub fn finish_update(installed: &Userscript, up: UpdatePlan, fetched: Fetched, a
 /// script), else the `@downloadURL`. `None` when neither exists or a version is missing.
 pub fn update_check_url(meta: &UserscriptMetadata) -> Option<Url> {
     meta.version.as_ref()?;
-    let u = meta.update_url.as_deref().or(meta.download_url.as_deref())?;
-    Url::parse(u).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+    let u = meta
+        .update_url
+        .as_deref()
+        .or(meta.download_url.as_deref())?;
+    Url::parse(u)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
 }
 
 /// Where to download the full script from.
 pub fn update_download_url(meta: &UserscriptMetadata) -> Option<Url> {
-    let u = meta.download_url.as_deref().or(meta.update_url.as_deref())?;
-    Url::parse(u).ok().filter(|u| matches!(u.scheme(), "http" | "https"))
+    let u = meta
+        .download_url
+        .as_deref()
+        .or(meta.update_url.as_deref())?;
+    Url::parse(u)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
 }
 
 // ---- version comparison -------------------------------------------------------------------
@@ -379,7 +469,12 @@ fn parse_part(s: &str) -> VPart {
     let b = rest[..bn].to_string();
     let rest = &rest[bn..];
     let (c, n) = digits(rest);
-    VPart { a, b, c, d: rest[n..].to_string() }
+    VPart {
+        a,
+        b,
+        c,
+        d: rest[n..].to_string(),
+    }
 }
 
 fn cmp_str(x: &str, y: &str) -> Ordering {
@@ -396,11 +491,18 @@ fn cmp_str(x: &str, y: &str) -> Ordering {
 /// `1.10 > 1.9`; `1.0pre1 < 1.0`. Tampermonkey documents this (Mozilla toolkit) comparison;
 /// Violentmonkey ignores alphabetic characters, which agrees on purely numeric versions.
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let (pa, pb): (Vec<VPart>, Vec<VPart>) = (a.trim().split('.').map(parse_part).collect(), b.trim().split('.').map(parse_part).collect());
+    let (pa, pb): (Vec<VPart>, Vec<VPart>) = (
+        a.trim().split('.').map(parse_part).collect(),
+        b.trim().split('.').map(parse_part).collect(),
+    );
     for i in 0..pa.len().max(pb.len()) {
         let zero = VPart::default();
         let (x, y) = (pa.get(i).unwrap_or(&zero), pb.get(i).unwrap_or(&zero));
-        let o = x.a.cmp(&y.a).then_with(|| cmp_str(&x.b, &y.b)).then_with(|| x.c.cmp(&y.c)).then_with(|| cmp_str(&x.d, &y.d));
+        let o =
+            x.a.cmp(&y.a)
+                .then_with(|| cmp_str(&x.b, &y.b))
+                .then_with(|| x.c.cmp(&y.c))
+                .then_with(|| cmp_str(&x.d, &y.d));
         if o != Ordering::Equal {
             return o;
         }
@@ -423,7 +525,16 @@ mod tests {
     #[test]
     fn version_order() {
         use Ordering::*;
-        for (a, b, o) in [("1.0", "1.0.0", Equal), ("1.10", "1.9", Greater), ("1.0pre1", "1.0", Less), ("1.0a", "1.0b", Less), ("2", "10", Less), ("1.0.1", "1.0", Greater), ("0.9.9", "1.0", Less), ("1.0b1", "1.0b2", Less)] {
+        for (a, b, o) in [
+            ("1.0", "1.0.0", Equal),
+            ("1.10", "1.9", Greater),
+            ("1.0pre1", "1.0", Less),
+            ("1.0a", "1.0b", Less),
+            ("2", "10", Less),
+            ("1.0.1", "1.0", Greater),
+            ("0.9.9", "1.0", Less),
+            ("1.0b1", "1.0b2", Less),
+        ] {
             assert_eq!(compare_versions(a, b), o, "{a} vs {b}");
         }
         assert!(is_newer("1.0", "1.0.1"));
@@ -449,16 +560,47 @@ mod tests {
         let body = b"console.log(1)".to_vec();
         let good = hex(&Sha256::digest(&body));
         let bad = "11".repeat(32);
-        let mk = |h: &str| plan_install(&src("1", &format!("// @require https://a.test/l.js#sha256={h}")), None).unwrap();
-        let f = |b: &[u8]| Fetched { requires: [("https://a.test/l.js".to_string(), b.to_vec())].into(), ..Default::default() };
+        let mk = |h: &str| {
+            plan_install(
+                &src("1", &format!("// @require https://a.test/l.js#sha256={h}")),
+                None,
+            )
+            .unwrap()
+        };
+        let f = |b: &[u8]| Fetched {
+            requires: [("https://a.test/l.js".to_string(), b.to_vec())].into(),
+            ..Default::default()
+        };
         let s = finish_install(mk(&good), f(&body), Approvals::default()).unwrap();
         assert_eq!(s.assets.requires[0].content, "console.log(1)");
-        let e = finish_install(mk(&bad), f(&body), Approvals::default()).unwrap_err().to_string();
+        let e = finish_install(mk(&bad), f(&body), Approvals::default())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("mismatch"), "{e}");
         assert!(finish_install(mk(&good), Fetched::default(), Approvals::default()).is_err());
         // md5 and sha512 too
-        assert!(verify_sri(&body, &[Sri { algo: "md5".into(), digest: Md5::digest(&body).to_vec() }, Sri { algo: "sha512".into(), digest: Sha512::digest(&body).to_vec() }]).is_ok());
-        assert!(verify_sri(&body, &[Sri { algo: "sha384".into(), digest: vec![0; 48] }]).is_err());
+        assert!(verify_sri(
+            &body,
+            &[
+                Sri {
+                    algo: "md5".into(),
+                    digest: Md5::digest(&body).to_vec()
+                },
+                Sri {
+                    algo: "sha512".into(),
+                    digest: Sha512::digest(&body).to_vec()
+                }
+            ]
+        )
+        .is_ok());
+        assert!(verify_sri(
+            &body,
+            &[Sri {
+                algo: "sha384".into(),
+                digest: vec![0; 48]
+            }]
+        )
+        .is_err());
     }
 
     fn hex(b: &[u8]) -> String {
@@ -468,16 +610,50 @@ mod tests {
     #[test]
     fn connect_all_needs_request() {
         let p = plan_install(&src("1", "// @connect a.com"), None).unwrap();
-        assert!(finish_install(p, Fetched::default(), Approvals { allow_connect_all: true }).is_err());
+        assert!(finish_install(
+            p,
+            Fetched::default(),
+            Approvals {
+                allow_connect_all: true
+            }
+        )
+        .is_err());
     }
 
     #[test]
     fn update_diff_detection() {
-        let old = finish_install(plan_install(&src("1", "// @match https://a.com/*\n// @grant GM_getValue\n// @connect a.com"), None).unwrap(), Fetched::default(), Approvals::default()).unwrap();
-        let same = plan_update(&old, &src("1.1", "// @match https://a.com/*\n// @grant GM.getValue\n// @connect a.com"), None).unwrap();
+        let old = finish_install(
+            plan_install(
+                &src(
+                    "1",
+                    "// @match https://a.com/*\n// @grant GM_getValue\n// @connect a.com",
+                ),
+                None,
+            )
+            .unwrap(),
+            Fetched::default(),
+            Approvals::default(),
+        )
+        .unwrap();
+        let same = plan_update(
+            &old,
+            &src(
+                "1.1",
+                "// @match https://a.com/*\n// @grant GM.getValue\n// @connect a.com",
+            ),
+            None,
+        )
+        .unwrap();
         assert!(same.is_newer && !same.diff.needs_reapproval());
-        let narrowed = plan_update(&old, &src("1.2", "// @match https://a.com/*\n// @grant none"), None).unwrap();
-        assert!(!narrowed.diff.needs_reapproval() && narrowed.diff.removed_grants == ["gm_getvalue"]);
+        let narrowed = plan_update(
+            &old,
+            &src("1.2", "// @match https://a.com/*\n// @grant none"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            !narrowed.diff.needs_reapproval() && narrowed.diff.removed_grants == ["gm_getvalue"]
+        );
         for extra in ["// @match https://a.com/*\n// @match https://b.com/*\n// @grant GM_getValue\n// @connect a.com", "// @match https://a.com/*\n// @grant GM_getValue\n// @connect a.com\n// @connect evil.com", "// @match https://a.com/*\n// @grant GM_getValue\n// @grant GM_xmlhttpRequest\n// @connect a.com", "// @grant GM_getValue\n// @connect a.com"] {
             let up = plan_update(&old, &src("2", extra), None).unwrap();
             assert!(up.diff.needs_reapproval(), "{extra}");
@@ -486,15 +662,27 @@ mod tests {
             let s = finish_update(&old, up, Fetched::default(), true, false).unwrap();
             assert_eq!(s.id, old.id);
         }
-        assert!(plan_update(&old, "// ==UserScript==\n// @name Other\n// ==/UserScript==", None).is_err());
+        assert!(plan_update(
+            &old,
+            "// ==UserScript==\n// @name Other\n// ==/UserScript==",
+            None
+        )
+        .is_err());
     }
 
     #[test]
     fn update_urls() {
-        let m = UserscriptMetadata::parse(&src("1", "// @updateURL https://a.test/m.meta.js\n// @downloadURL https://a.test/s.user.js")).unwrap();
+        let m = UserscriptMetadata::parse(&src(
+            "1",
+            "// @updateURL https://a.test/m.meta.js\n// @downloadURL https://a.test/s.user.js",
+        ))
+        .unwrap();
         assert_eq!(update_check_url(&m).unwrap().path(), "/m.meta.js");
         assert_eq!(update_download_url(&m).unwrap().path(), "/s.user.js");
-        let m = UserscriptMetadata::parse("// ==UserScript==\n// @name x\n// @updateURL https://a.test/m\n// ==/UserScript==").unwrap();
+        let m = UserscriptMetadata::parse(
+            "// ==UserScript==\n// @name x\n// @updateURL https://a.test/m\n// ==/UserScript==",
+        )
+        .unwrap();
         assert!(update_check_url(&m).is_none()); // no @version: never auto-updated
     }
 }

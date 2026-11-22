@@ -80,7 +80,14 @@ pub fn caps_hash(meta: &UserscriptMetadata, allow_connect_all: bool) -> String {
 
 fn mac(key: &TokenKey, c: &TokenClaims<'_>) -> Vec<u8> {
     let mut m = HmacSha256::new_from_slice(&key.0).expect("hmac accepts any key length");
-    for part in ["adblock-gm-v1", c.profile, c.script_id, c.script_version, c.origin, c.caps_hash] {
+    for part in [
+        "adblock-gm-v1",
+        c.profile,
+        c.script_id,
+        c.script_version,
+        c.origin,
+        c.caps_hash,
+    ] {
         m.update(part.as_bytes());
         m.update(&[0]);
     }
@@ -90,7 +97,12 @@ fn mac(key: &TokenKey, c: &TokenClaims<'_>) -> Vec<u8> {
 
 /// Mint a token for one script in one document.
 pub fn mint(key: &TokenKey, c: &TokenClaims<'_>) -> String {
-    format!("v1.{}.{}.{}", B64.encode(c.script_id), c.exp, B64.encode(mac(key, c)))
+    format!(
+        "v1.{}.{}.{}",
+        B64.encode(c.script_id),
+        c.exp,
+        B64.encode(mac(key, c))
+    )
 }
 
 /// The claimed script id (unverified). Use to look the script up before [`verify`].
@@ -122,10 +134,18 @@ pub fn verify<'a>(
     if it.next() != Some("v1") {
         return Err(TokenError::Malformed);
     }
-    let id = String::from_utf8(B64.decode(it.next().ok_or(TokenError::Malformed)?).map_err(|_| TokenError::Malformed)?)
+    let id = String::from_utf8(
+        B64.decode(it.next().ok_or(TokenError::Malformed)?)
+            .map_err(|_| TokenError::Malformed)?,
+    )
+    .map_err(|_| TokenError::Malformed)?;
+    let exp: u64 = it
+        .next()
+        .and_then(|e| e.parse().ok())
+        .ok_or(TokenError::Malformed)?;
+    let sig = B64
+        .decode(it.next().ok_or(TokenError::Malformed)?)
         .map_err(|_| TokenError::Malformed)?;
-    let exp: u64 = it.next().and_then(|e| e.parse().ok()).ok_or(TokenError::Malformed)?;
-    let sig = B64.decode(it.next().ok_or(TokenError::Malformed)?).map_err(|_| TokenError::Malformed)?;
     if it.next().is_some() {
         return Err(TokenError::Malformed);
     }
@@ -154,10 +174,23 @@ mod tests {
     use super::*;
 
     fn rec() -> ScriptRecord<'static> {
-        ScriptRecord { version: "1.0", caps_hash: "h" }
+        ScriptRecord {
+            version: "1.0",
+            caps_hash: "h",
+        }
     }
     fn tok(key: &TokenKey) -> String {
-        mint(key, &TokenClaims { profile: "p", script_id: "ns:na me/é", script_version: "1.0", origin: "https://a.com", caps_hash: "h", exp: 100 })
+        mint(
+            key,
+            &TokenClaims {
+                profile: "p",
+                script_id: "ns:na me/é",
+                script_version: "1.0",
+                origin: "https://a.com",
+                caps_hash: "h",
+                exp: 100,
+            },
+        )
     }
 
     #[test]
@@ -165,38 +198,108 @@ mod tests {
         let k = TokenKey::new(vec![7; 32]);
         let t = tok(&k);
         assert_eq!(claimed_script_id(&t).as_deref(), Some("ns:na me/é"));
-        assert_eq!(verify(&k, &t, 50, "p", "https://a.com", |_| Some(rec())).unwrap(), "ns:na me/é");
+        assert_eq!(
+            verify(&k, &t, 50, "p", "https://a.com", |_| Some(rec())).unwrap(),
+            "ns:na me/é"
+        );
     }
 
     #[test]
     fn rejects() {
         let k = TokenKey::new(vec![7; 32]);
         let t = tok(&k);
-        let v = |t: &str, now, p, o, r: Option<ScriptRecord<'static>>| verify(&k, t, now, p, o, move |_| r);
-        assert_eq!(v(&t, 100, "p", "https://a.com", Some(rec())), Err(TokenError::Expired));
-        assert_eq!(v(&t, 1, "q", "https://a.com", Some(rec())), Err(TokenError::BadSignature));
-        assert_eq!(v(&t, 1, "p", "https://b.com", Some(rec())), Err(TokenError::BadSignature));
-        assert_eq!(v(&t, 1, "p", "https://a.com", Some(ScriptRecord { version: "1.1", caps_hash: "h" })), Err(TokenError::BadSignature));
-        assert_eq!(v(&t, 1, "p", "https://a.com", Some(ScriptRecord { version: "1.0", caps_hash: "x" })), Err(TokenError::BadSignature));
-        assert_eq!(v(&t, 1, "p", "https://a.com", None), Err(TokenError::UnknownScript));
-        assert_eq!(v("garbage", 1, "p", "o", Some(rec())), Err(TokenError::Malformed));
+        let v = |t: &str, now, p, o, r: Option<ScriptRecord<'static>>| {
+            verify(&k, t, now, p, o, move |_| r)
+        };
+        assert_eq!(
+            v(&t, 100, "p", "https://a.com", Some(rec())),
+            Err(TokenError::Expired)
+        );
+        assert_eq!(
+            v(&t, 1, "q", "https://a.com", Some(rec())),
+            Err(TokenError::BadSignature)
+        );
+        assert_eq!(
+            v(&t, 1, "p", "https://b.com", Some(rec())),
+            Err(TokenError::BadSignature)
+        );
+        assert_eq!(
+            v(
+                &t,
+                1,
+                "p",
+                "https://a.com",
+                Some(ScriptRecord {
+                    version: "1.1",
+                    caps_hash: "h"
+                })
+            ),
+            Err(TokenError::BadSignature)
+        );
+        assert_eq!(
+            v(
+                &t,
+                1,
+                "p",
+                "https://a.com",
+                Some(ScriptRecord {
+                    version: "1.0",
+                    caps_hash: "x"
+                })
+            ),
+            Err(TokenError::BadSignature)
+        );
+        assert_eq!(
+            v(&t, 1, "p", "https://a.com", None),
+            Err(TokenError::UnknownScript)
+        );
+        assert_eq!(
+            v("garbage", 1, "p", "o", Some(rec())),
+            Err(TokenError::Malformed)
+        );
         // Tampering with the expiry or the claimed id.
         let parts: Vec<_> = t.split('.').collect();
         let t2 = format!("{}.{}.{}.{}", parts[0], parts[1], "9999", parts[3]);
-        assert_eq!(v(&t2, 1, "p", "https://a.com", Some(rec())), Err(TokenError::BadSignature));
-        let t3 = format!("{}.{}.{}.{}", parts[0], B64.encode("other"), parts[2], parts[3]);
-        assert_eq!(v(&t3, 1, "p", "https://a.com", Some(rec())), Err(TokenError::BadSignature));
+        assert_eq!(
+            v(&t2, 1, "p", "https://a.com", Some(rec())),
+            Err(TokenError::BadSignature)
+        );
+        let t3 = format!(
+            "{}.{}.{}.{}",
+            parts[0],
+            B64.encode("other"),
+            parts[2],
+            parts[3]
+        );
+        assert_eq!(
+            v(&t3, 1, "p", "https://a.com", Some(rec())),
+            Err(TokenError::BadSignature)
+        );
         let k2 = TokenKey::new(vec![8; 32]);
-        assert_eq!(verify(&k2, &t, 1, "p", "https://a.com", |_| Some(rec())), Err(TokenError::BadSignature));
+        assert_eq!(
+            verify(&k2, &t, 1, "p", "https://a.com", |_| Some(rec())),
+            Err(TokenError::BadSignature)
+        );
     }
 
     #[test]
     fn caps_hash_tracks_grants_and_connect() {
-        let m = |h: &str| UserscriptMetadata::parse(&format!("// ==UserScript==\n// @name x\n{h}\n// ==/UserScript==")).unwrap();
+        let m = |h: &str| {
+            UserscriptMetadata::parse(&format!(
+                "// ==UserScript==\n// @name x\n{h}\n// ==/UserScript=="
+            ))
+            .unwrap()
+        };
         let a = caps_hash(&m("// @grant GM_getValue"), false);
         assert_eq!(a, caps_hash(&m("// @grant GM.getValue"), false));
-        assert_ne!(a, caps_hash(&m("// @grant GM_getValue\n// @grant GM_log"), false));
-        assert_ne!(a, caps_hash(&m("// @grant GM_getValue\n// @connect a.com"), false));
+        assert_ne!(
+            a,
+            caps_hash(&m("// @grant GM_getValue\n// @grant GM_log"), false)
+        );
+        assert_ne!(
+            a,
+            caps_hash(&m("// @grant GM_getValue\n// @connect a.com"), false)
+        );
         assert_ne!(a, caps_hash(&m("// @grant GM_getValue"), true));
     }
 }

@@ -79,7 +79,9 @@ impl UserscriptManager {
             )));
         }
         self.save_script(&script, Durability::Immediate)?;
-        self.scripts.write().insert(key(profile, &script_id), script);
+        self.scripts
+            .write()
+            .insert(key(profile, &script_id), script);
         Ok(script_id)
     }
 
@@ -361,7 +363,9 @@ console.log('test');
         let id = m.install_in("a", TEST_SCRIPT.to_string()).unwrap();
         m.install_in("b", TEST_SCRIPT.to_string()).unwrap();
         assert!(m.get(&id).is_none());
-        m.storage().set_raw(&ns("a", &id), "k", serde_json::json!(1)).unwrap();
+        m.storage()
+            .set_raw(&ns("a", &id), "k", serde_json::json!(1))
+            .unwrap();
         assert!(m.storage().get_raw(&ns("b", &id), "k").unwrap().is_none());
         m.set_enabled_in("a", &id, false).unwrap();
         assert!(m.build_index("a", Options::default()).index.is_empty());

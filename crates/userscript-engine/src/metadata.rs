@@ -256,7 +256,11 @@ impl UserscriptMetadata {
             return Err(Error::MetadataParsing("No metadata block found".into()));
         }
         if !ended {
-            m.warn(0, WarnKind::Structure, "metadata block is not terminated by ==/UserScript==");
+            m.warn(
+                0,
+                WarnKind::Structure,
+                "metadata block is not terminated by ==/UserScript==",
+            );
         }
         if m.name.is_empty() {
             m.name = "Unnamed Script".into();
@@ -274,13 +278,24 @@ impl UserscriptMetadata {
         });
     }
 
-    fn single(&mut self, slot: fn(&mut Self) -> &mut Option<String>, key: &str, v: &str, line: usize, seen: &mut Vec<String>) {
+    fn single(
+        &mut self,
+        slot: fn(&mut Self) -> &mut Option<String>,
+        key: &str,
+        v: &str,
+        line: usize,
+        seen: &mut Vec<String>,
+    ) {
         if v.is_empty() {
             self.warn(line, WarnKind::Invalid, format!("@{key} has no value"));
             return;
         }
         if slot(self).is_some() {
-            self.warn(line, WarnKind::Duplicate, format!("duplicate @{key}; first one wins"));
+            self.warn(
+                line,
+                WarnKind::Duplicate,
+                format!("duplicate @{key}; first one wins"),
+            );
             return;
         }
         seen.push(key.to_string());
@@ -297,10 +312,15 @@ impl UserscriptMetadata {
                     self.localized_names.insert(loc.to_string(), v.to_string());
                 }
                 "description" if !loc.is_empty() => {
-                    self.localized_descriptions.insert(loc.to_string(), v.to_string());
+                    self.localized_descriptions
+                        .insert(loc.to_string(), v.to_string());
                 }
                 _ => {
-                    self.warn(line, WarnKind::UnknownKey, format!("unknown key @{key_raw}"));
+                    self.warn(
+                        line,
+                        WarnKind::UnknownKey,
+                        format!("unknown key @{key_raw}"),
+                    );
                     self.unknown.push((key_raw.to_string(), v.to_string()));
                 }
             }
@@ -323,7 +343,9 @@ impl UserscriptMetadata {
             "homepage" | "homepageurl" | "website" | "source" => {
                 self.single(|s| &mut s.homepage, "homepage", v, line, seen)
             }
-            "icon" | "iconurl" | "defaulticon" => self.single(|s| &mut s.icon, "icon", v, line, seen),
+            "icon" | "iconurl" | "defaulticon" => {
+                self.single(|s| &mut s.icon, "icon", v, line, seen)
+            }
             "icon64" | "icon64url" => self.single(|s| &mut s.icon64, "icon64", v, line, seen),
             "updateurl" => self.single(|s| &mut s.update_url, "updateURL", v, line, seen),
             "downloadurl" | "installurl" => {
@@ -334,28 +356,45 @@ impl UserscriptMetadata {
             "match" => self.push_nonempty(|s| &mut s.matches, "match", v, line),
             "include" => self.push_nonempty(|s| &mut s.includes, "include", v, line),
             "exclude" => self.push_nonempty(|s| &mut s.excludes, "exclude", v, line),
-            "exclude-match" => self.push_nonempty(|s| &mut s.exclude_matches, "exclude-match", v, line),
+            "exclude-match" => {
+                self.push_nonempty(|s| &mut s.exclude_matches, "exclude-match", v, line)
+            }
             "require" => {
                 if v.is_empty() {
                     self.warn(line, WarnKind::Invalid, "@require has no URL");
                 } else {
                     let (r, bad) = split_sri(v);
                     for b in bad {
-                        self.warn(line, WarnKind::Invalid, format!("@require: bad integrity '{b}'"));
+                        self.warn(
+                            line,
+                            WarnKind::Invalid,
+                            format!("@require: bad integrity '{b}'"),
+                        );
                     }
                     self.requires.push(r);
                 }
             }
             "resource" => {
                 let mut it = v.splitn(2, char::is_whitespace);
-                match (it.next().filter(|s| !s.is_empty()), it.next().map(str::trim)) {
+                match (
+                    it.next().filter(|s| !s.is_empty()),
+                    it.next().map(str::trim),
+                ) {
                     (Some(name), Some(url)) if !url.is_empty() => {
                         let (r, bad) = split_sri(url);
                         for b in bad {
-                            self.warn(line, WarnKind::Invalid, format!("@resource {name}: bad integrity '{b}'"));
+                            self.warn(
+                                line,
+                                WarnKind::Invalid,
+                                format!("@resource {name}: bad integrity '{b}'"),
+                            );
                         }
                         if self.resources.iter().any(|x| x.name == name) {
-                            self.warn(line, WarnKind::Duplicate, format!("duplicate @resource {name}; first wins"));
+                            self.warn(
+                                line,
+                                WarnKind::Duplicate,
+                                format!("duplicate @resource {name}; first wins"),
+                            );
                         } else {
                             self.resources.push(ResourceDecl {
                                 name: name.to_string(),
@@ -385,10 +424,18 @@ impl UserscriptMetadata {
             "run-at" => match RunAt::from_directive(v) {
                 Some(RunAt::ContextMenu) => {
                     self.run_at = RunAt::ContextMenu;
-                    self.warn(line, WarnKind::Unsupported, "@run-at context-menu needs a browser menu; the script will never run");
+                    self.warn(
+                        line,
+                        WarnKind::Unsupported,
+                        "@run-at context-menu needs a browser menu; the script will never run",
+                    );
                 }
                 Some(r) => self.run_at = r,
-                None => self.warn(line, WarnKind::Invalid, format!("unknown @run-at '{v}'; using document-end")),
+                None => self.warn(
+                    line,
+                    WarnKind::Invalid,
+                    format!("unknown @run-at '{v}'; using document-end"),
+                ),
             },
             "noframes" => self.noframes = true,
             "unwrap" => self.unwrap = true,
@@ -401,14 +448,26 @@ impl UserscriptMetadata {
                 }
                 "auto" => {
                     self.inject_into = InjectInto::Auto;
-                    self.warn(line, WarnKind::Unsupported, "@inject-into auto: always resolves to the page world here");
+                    self.warn(
+                        line,
+                        WarnKind::Unsupported,
+                        "@inject-into auto: always resolves to the page world here",
+                    );
                 }
-                _ => self.warn(line, WarnKind::Invalid, format!("unknown @inject-into '{v}'")),
+                _ => self.warn(
+                    line,
+                    WarnKind::Invalid,
+                    format!("unknown @inject-into '{v}'"),
+                ),
             },
             "sandbox" => {
                 self.sandbox = Some(v.to_string());
                 if !v.eq_ignore_ascii_case("raw") {
-                    self.warn(line, WarnKind::Unsupported, format!("@sandbox {v}: scripts always run in the page world"));
+                    self.warn(
+                        line,
+                        WarnKind::Unsupported,
+                        format!("@sandbox {v}: scripts always run in the page world"),
+                    );
                 }
             }
             "antifeature" => self.push_nonempty(|s| &mut s.antifeatures, "antifeature", v, line),
@@ -420,23 +479,42 @@ impl UserscriptMetadata {
             "compatible" => self.push_nonempty(|s| &mut s.compatible, "compatible", v, line),
             "run-in" => {
                 self.run_in.push(v.to_string());
-                self.warn(line, WarnKind::Unsupported, "@run-in is browser-tab specific; ignored");
+                self.warn(
+                    line,
+                    WarnKind::Unsupported,
+                    "@run-in is browser-tab specific; ignored",
+                );
             }
             "webrequest" => {
                 self.web_request.push(v.to_string());
-                self.warn(line, WarnKind::Unsupported, "@webRequest rules cannot be applied; ignored");
+                self.warn(
+                    line,
+                    WarnKind::Unsupported,
+                    "@webRequest rules cannot be applied; ignored",
+                );
             }
-            "priority" | "require-ts" | "nocompat" | "contributionurl" | "contributionamount" | "copyright" | "contributors" | "contributor" | "updatedelay" | "downloadurl2" => {
+            "priority" | "require-ts" | "nocompat" | "contributionurl" | "contributionamount"
+            | "copyright" | "contributors" | "contributor" | "updatedelay" | "downloadurl2" => {
                 self.unknown.push((key_raw.to_string(), v.to_string()));
             }
             _ => {
-                self.warn(line, WarnKind::UnknownKey, format!("unknown key @{key_raw}"));
+                self.warn(
+                    line,
+                    WarnKind::UnknownKey,
+                    format!("unknown key @{key_raw}"),
+                );
                 self.unknown.push((key_raw.to_string(), v.to_string()));
             }
         }
     }
 
-    fn push_nonempty(&mut self, slot: fn(&mut Self) -> &mut Vec<String>, key: &str, v: &str, line: usize) {
+    fn push_nonempty(
+        &mut self,
+        slot: fn(&mut Self) -> &mut Vec<String>,
+        key: &str,
+        v: &str,
+        line: usize,
+    ) {
         if v.is_empty() {
             self.warn(line, WarnKind::Invalid, format!("@{key} has no value"));
         } else {
@@ -460,7 +538,11 @@ impl UserscriptMetadata {
             }
         }
         for w in ws {
-            let kind = if w.starts_with("unknown") { WarnKind::UnknownGrant } else { WarnKind::Unsupported };
+            let kind = if w.starts_with("unknown") {
+                WarnKind::UnknownGrant
+            } else {
+                WarnKind::Unsupported
+            };
             self.warn(0, kind, w);
         }
     }
@@ -488,7 +570,9 @@ impl UserscriptMetadata {
     }
 
     pub fn localized_description(&self, locale: &str) -> Option<&str> {
-        lookup_locale(&self.localized_descriptions, locale).map(String::as_str).or(self.description.as_deref())
+        lookup_locale(&self.localized_descriptions, locale)
+            .map(String::as_str)
+            .or(self.description.as_deref())
     }
 
     /// Unique id (namespace + name), as managers identify scripts.
@@ -501,18 +585,27 @@ impl UserscriptMetadata {
 
     /// Features requested that this proxy cannot provide.
     pub fn unsupported(&self) -> Vec<&MetaWarning> {
-        self.warnings.iter().filter(|w| w.kind == WarnKind::Unsupported).collect()
+        self.warnings
+            .iter()
+            .filter(|w| w.kind == WarnKind::Unsupported)
+            .collect()
     }
 }
 
 fn lookup_locale<'a>(map: &'a BTreeMap<String, String>, locale: &str) -> Option<&'a String> {
     let l = locale.to_ascii_lowercase();
-    let find = |want: &str| map.iter().find(|(k, _)| k.to_ascii_lowercase() == want).map(|(_, v)| v);
+    let find = |want: &str| {
+        map.iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == want)
+            .map(|(_, v)| v)
+    };
     find(&l).or_else(|| l.split(['-', '_']).next().and_then(find))
 }
 
 fn is_fence(line: &str, end: bool) -> bool {
-    let Some(rest) = line.strip_prefix("//") else { return false };
+    let Some(rest) = line.strip_prefix("//") else {
+        return false;
+    };
     let rest = rest.trim().to_ascii_lowercase();
     if end {
         rest == "==/userscript=="
@@ -525,12 +618,22 @@ fn is_fence(line: &str, end: bool) -> bool {
 pub fn split_sri(s: &str) -> (Require, Vec<String>) {
     let s = s.trim();
     let Some((url, frag)) = s.split_once('#') else {
-        return (Require { url: s.to_string(), sri: vec![] }, vec![]);
+        return (
+            Require {
+                url: s.to_string(),
+                sri: vec![],
+            },
+            vec![],
+        );
     };
     let mut sri = Vec::new();
     let mut bad = Vec::new();
     let mut keep_frag = false;
-    for part in frag.split([',', ';']).map(str::trim).filter(|p| !p.is_empty()) {
+    for part in frag
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         let (algo, val) = match part.split_once(['=', '-']) {
             Some((a, v)) => (a.to_ascii_lowercase(), v),
             None => {
@@ -554,7 +657,11 @@ pub fn split_sri(s: &str) -> (Require, Vec<String>) {
         }
     }
     // A fragment that is not integrity data belongs to the URL.
-    let url = if keep_frag && sri.is_empty() && bad.is_empty() { s.to_string() } else { url.to_string() };
+    let url = if keep_frag && sri.is_empty() && bad.is_empty() {
+        s.to_string()
+    } else {
+        url.to_string()
+    };
     (Require { url, sri }, bad)
 }
 
@@ -562,10 +669,15 @@ fn decode_digest(v: &str, len: usize) -> Option<Vec<u8>> {
     use base64::Engine;
     let v = v.trim();
     if v.len() == len * 2 && v.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return (0..len).map(|i| u8::from_str_radix(&v[i * 2..i * 2 + 2], 16).ok()).collect();
+        return (0..len)
+            .map(|i| u8::from_str_radix(&v[i * 2..i * 2 + 2], 16).ok())
+            .collect();
     }
     let t = v.trim_end_matches('=');
-    for e in [&base64::engine::general_purpose::STANDARD_NO_PAD, &base64::engine::general_purpose::URL_SAFE_NO_PAD] {
+    for e in [
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ] {
         if let Ok(b) = e.decode(t) {
             if b.len() == len {
                 return Some(b);
@@ -681,7 +793,10 @@ code();"#);
     #[test]
     fn sri_forms() {
         let hex = "ab".repeat(32);
-        let (r, bad) = split_sri(&format!("https://x/a.js#sha256={hex},md5={}", "cd".repeat(16)));
+        let (r, bad) = split_sri(&format!(
+            "https://x/a.js#sha256={hex},md5={}",
+            "cd".repeat(16)
+        ));
         assert!(bad.is_empty());
         assert_eq!(r.sri.len(), 2);
         use base64::Engine;
@@ -689,19 +804,27 @@ code();"#);
         let (r, _) = split_sri(&format!("https://x/a.js#sha384-{b}"));
         assert_eq!(r.sri[0].digest, vec![7u8; 48]);
         // Non-integrity fragments stay in the URL.
-        assert_eq!(split_sri("https://x/a.js#frag").0.url, "https://x/a.js#frag");
+        assert_eq!(
+            split_sri("https://x/a.js#frag").0.url,
+            "https://x/a.js#frag"
+        );
     }
 
     #[test]
     fn legacy_string_require_deserializes() {
-        let r: Require = serde_json::from_str("\"https://x/a.js#md5=00000000000000000000000000000000\"").unwrap();
+        let r: Require =
+            serde_json::from_str("\"https://x/a.js#md5=00000000000000000000000000000000\"")
+                .unwrap();
         assert_eq!(r.url, "https://x/a.js");
         assert_eq!(r.sri.len(), 1);
     }
 
     #[test]
     fn canonical_grants() {
-        assert_eq!(canonical_grant("GM.xmlHttpRequest"), canonical_grant("GM_xmlhttpRequest"));
+        assert_eq!(
+            canonical_grant("GM.xmlHttpRequest"),
+            canonical_grant("GM_xmlhttpRequest")
+        );
         assert_eq!(canonical_grant("GM.getResourceUrl"), "gm_getresourceurl");
     }
 }
