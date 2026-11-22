@@ -14,12 +14,19 @@ use proxy_core::config::{
 };
 use proxy_core::{ProxyContext, ProxyServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
-/// Grab a currently-free localhost port.
-async fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    l.local_addr().unwrap().port()
+/// Start the proxy on an already-bound port-0 listener (kept open, so no bind-then-drop race).
+/// Returns the proxy port; connections queue in the backlog until the server accepts.
+async fn spawn_proxy(ctx: Arc<ProxyContext>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = ProxyServer::new(test_config(port), ctx).unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(1);
+    tokio::spawn(async move {
+        let _ = server.serve(listener, tx).await;
+    });
+    port
 }
 
 /// Minimal HTTP/1.1 origin that answers every request with `200 OK` / "origin-hello".
@@ -45,16 +52,6 @@ async fn spawn_origin(listener: TcpListener) {
     });
 }
 
-async fn wait_until_listening(port: u16) {
-    for _ in 0..100 {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("proxy on port {port} never came up");
-}
-
 fn test_config(proxy_port: u16) -> ProxyConfig {
     ProxyConfig {
         proxy: ProxySettings {
@@ -63,6 +60,7 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -121,12 +119,7 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
     engine.install(compile_engine(&["##.sponsored\n".to_string()]));
     let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
 
-    let proxy_port = free_port().await;
-    let server = ProxyServer::new(test_config(proxy_port), ctx).unwrap();
-    tokio::spawn(async move {
-        let _ = server.start().await;
-    });
-    wait_until_listening(proxy_port).await;
+    let proxy_port = spawn_proxy(ctx).await;
 
     let client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
@@ -186,12 +179,7 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
 
     // Real proxy server.
-    let proxy_port = free_port().await;
-    let server = ProxyServer::new(test_config(proxy_port), ctx).unwrap();
-    tokio::spawn(async move {
-        let _ = server.start().await;
-    });
-    wait_until_listening(proxy_port).await;
+    let proxy_port = spawn_proxy(ctx).await;
 
     // Client that routes through our proxy.
     let client = reqwest::Client::builder()
