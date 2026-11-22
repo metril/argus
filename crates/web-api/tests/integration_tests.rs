@@ -454,6 +454,66 @@ async fn config_get_update_with_etag() {
     assert_eq!(again.status_code(), StatusCode::PRECONDITION_FAILED);
 }
 
+/// `max_connections = 0` (auto) reports the derived number; saving the echoed value back leaves
+/// the stored setting at 0, while a different value pins it.
+#[tokio::test]
+async fn max_connections_auto_reports_derived_value_and_is_not_pinned_by_saving() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let derived = ::common::config::derive_max_connections() as u64;
+    assert_eq!(
+        ctx.state
+            .proxy_state
+            .config
+            .read()
+            .performance
+            .max_connections,
+        0
+    );
+
+    let got = admin.get("/api/v1/config").await;
+    got.assert_status_ok();
+    assert_eq!(got.json::<Value>()["max_connections"], derived);
+
+    // The dashboard echoes the effective value back with another edit.
+    let r = put_config(
+        &admin,
+        json!({"max_connections": derived, "request_timeout_secs": 45}),
+    )
+    .await;
+    r.assert_status_ok();
+    let body = r.json::<Value>();
+    assert_eq!(body["max_connections"], derived);
+    assert_eq!(body["restart_required"], json!([]));
+    assert_eq!(
+        ctx.state
+            .proxy_state
+            .config
+            .read()
+            .performance
+            .max_connections,
+        0
+    );
+    let saved = std::fs::read_to_string(ctx.temp_dir.path().join("proxy.toml")).unwrap();
+    assert!(saved.contains("max_connections = 0"), "{saved}");
+
+    let r = put_config(&admin, json!({"max_connections": derived - 1})).await;
+    r.assert_status_ok();
+    assert_eq!(
+        r.json::<Value>()["restart_required"],
+        json!(["max_connections"])
+    );
+    assert_eq!(
+        ctx.state
+            .proxy_state
+            .config
+            .read()
+            .performance
+            .max_connections,
+        derived as usize - 1
+    );
+}
+
 async fn put_config(sess: &common::Sess, body: Value) -> axum_test::TestResponse {
     let etag = sess
         .get("/api/v1/config")
