@@ -5280,7 +5280,6 @@ dependencies = [
 name = "web-api"
 version = "0.1.0"
 dependencies = [
- "adblock",
  "anyhow",
  "api-types",
  "axum",

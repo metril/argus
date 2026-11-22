@@ -1,15 +1,13 @@
-//! Bounded, persisted audit log and the in-memory ring of recently blocked requests.
+//! Bounded, persisted audit log.
 //!
 //! The audit log never stores request bodies, cookies or tokens: only who/what/when/where and
 //! the outcome. It is pruned by count and age as entries are appended.
 
-use api_types::{AuditEntry, BlockedEntry};
+use api_types::AuditEntry;
 use chrono::{DateTime, Duration, Utc};
 use common::db::redb::{Durability, ReadableTable, ReadableTableMetadata, Table};
 use common::db::{tables, Db, DbError};
-use parking_lot::Mutex;
 use serde::Deserialize;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -178,54 +176,6 @@ impl AuditStore {
     }
 }
 
-/// Bounded ring of recently blocked requests.
-///
-/// The endpoint contract exists now; the filter engine has no observer hook yet, so nothing
-/// calls [`RecentBlocked::push`] and the endpoint reports `available: false` until it does.
-pub struct RecentBlocked {
-    cap: usize,
-    inner: Mutex<VecDeque<BlockedEntry>>,
-    fed: std::sync::atomic::AtomicBool,
-}
-
-impl RecentBlocked {
-    pub fn new(cap: usize) -> Self {
-        Self {
-            cap,
-            inner: Mutex::new(VecDeque::with_capacity(cap.min(1024))),
-            fed: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    pub fn push(&self, entry: BlockedEntry) {
-        self.fed.store(true, Ordering::Relaxed);
-        let mut q = self.inner.lock();
-        if q.len() == self.cap {
-            q.pop_front();
-        }
-        q.push_back(entry);
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.cap
-    }
-
-    pub fn is_fed(&self) -> bool {
-        self.fed.load(Ordering::Relaxed)
-    }
-
-    /// Newest first, at most `limit`.
-    pub fn recent(&self, limit: usize) -> Vec<BlockedEntry> {
-        self.inner
-            .lock()
-            .iter()
-            .rev()
-            .take(limit)
-            .cloned()
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,22 +284,5 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(store.len(), 100);
-    }
-
-    #[test]
-    fn ring_is_bounded() {
-        let r = RecentBlocked::new(2);
-        for i in 0..3 {
-            r.push(BlockedEntry {
-                time: String::new(),
-                url: i.to_string(),
-                source_url: None,
-                resource_type: "x".into(),
-                rule: None,
-            });
-        }
-        let v = r.recent(10);
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0].url, "2");
     }
 }

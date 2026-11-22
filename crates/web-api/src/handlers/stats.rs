@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use api_types::{
-    ConnectionStats, DomainCount, FilterStatsResponse, MessageResponse, MitmStats,
-    ProxyStatsResponse, RecentBlockedResponse, RequestStats,
+    BlockedEntry, ConnectionStats, DomainCount, FilterStatsResponse, MessageResponse, MitmStats,
+    Page, ProxyStatsResponse, RecentBlockedResponse, RequestStats,
 };
 use axum::{extract::State, Extension, Json};
 use serde::Deserialize;
@@ -91,12 +91,19 @@ pub async fn get_proxy_stats(State(state): State<Arc<AppState>>) -> Json<ProxySt
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct RecentQuery {
-    /// Maximum entries, newest first (default 100).
-    pub limit: Option<usize>,
+    pub page: Option<u32>,
+    /// Page size (1..=200, default 50).
+    pub limit: Option<u32>,
+    /// Only blocks attributed to this client / profile label.
+    pub client: Option<String>,
+    /// Only requests to this host or its subdomains.
+    pub host: Option<String>,
+    /// Only blocks from this list id.
+    pub list_id: Option<String>,
 }
 
-/// Recently blocked requests (bounded in-memory ring, newest first). `available` is false until
-/// the filter engine feeds the buffer.
+/// Recently blocked requests from the engine's bounded ring, newest first, filterable by client
+/// label, host and list id.
 #[utoipa::path(
     get, path = "/stats/blocked/recent", tag = "stats",
     security(("bearer_auth" = ["stats:read"])),
@@ -107,10 +114,45 @@ pub async fn get_recent_blocked(
     State(state): State<Arc<AppState>>,
     ApiQuery(q): ApiQuery<RecentQuery>,
 ) -> ApiResult<Json<RecentBlockedResponse>> {
-    let ring = &state.recent_blocked;
+    let capacity = state.shared_engine.recent_blocked_capacity();
+    let host = q.host.as_deref().map(|h| h.trim().to_ascii_lowercase());
+    let events: Vec<BlockedEntry> = state
+        .shared_engine
+        .recent_blocked(capacity)
+        .into_iter()
+        .filter(|e| {
+            q.client
+                .as_deref()
+                .is_none_or(|c| e.client.as_deref() == Some(c))
+        })
+        .filter(|e| {
+            q.list_id
+                .as_deref()
+                .is_none_or(|l| e.list_id.as_deref() == Some(l))
+        })
+        .filter(|e| {
+            host.as_deref().is_none_or(|h| {
+                let eh = filter_engine::RequestMatcher::host_of(&e.url).to_ascii_lowercase();
+                eh == h || eh.strip_suffix(h).is_some_and(|p| p.ends_with('.'))
+            })
+        })
+        .map(|e| BlockedEntry {
+            time: e.timestamp.to_rfc3339(),
+            url: e.url,
+            source_host: (!e.source_host.is_empty()).then_some(e.source_host),
+            resource_type: e.request_type,
+            rule: (!e.rule.is_empty()).then_some(e.rule),
+            list_id: e.list_id,
+            client: e.client,
+        })
+        .collect();
+    let p = Page::from_vec(events, q.page, q.limit);
     Ok(Json(RecentBlockedResponse {
-        available: ring.is_fed(),
-        capacity: ring.capacity(),
-        entries: ring.recent(q.limit.unwrap_or(100).min(ring.capacity())),
+        capacity,
+        total: p.total,
+        page: p.page,
+        limit: p.limit,
+        has_more: p.has_more,
+        entries: p.items,
     }))
 }

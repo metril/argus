@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use api_types::{
-    CustomRulesResponse, RuleLineResult, TestUrlRequest, TestUrlResponse, UpdateCustomRulesRequest,
-    ValidateRulesRequest, ValidateRulesResponse,
+    CustomRulesResponse, ListReport, RuleLineResult, TestUrlRequest, TestUrlResponse,
+    UpdateCustomRulesRequest, ValidateRulesRequest, ValidateRulesResponse,
 };
 use axum::{
     extract::State,
@@ -69,36 +69,103 @@ pub async fn update_custom_rules(
     Ok(rules_response(req.rules))
 }
 
-fn is_comment(line: &str) -> bool {
-    line.starts_with('!') || (line.starts_with('[') && line.ends_with(']'))
-}
+/// Max rule lines dry-run in one request.
+const MAX_VALIDATE_LINES: usize = 20_000;
 
-/// Parse each line exactly as the engine would, without installing anything.
-pub fn validate_rules(text: &str) -> ValidateRulesResponse {
-    let mut lines = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || is_comment(line) {
-            continue;
-        }
-        let res =
-            adblock::lists::parse_filter(line, false, adblock::lists::ParseOptions::default());
-        lines.push(RuleLineResult {
+/// Run each line through the real conversion pipeline for `format` (detected from the whole text
+/// when `Auto`) and the engine's rule compiler, without installing anything. Each non-comment
+/// line is reported as translated, accepted, handed off, skipped or rejected.
+pub fn validate_rules(
+    text: &str,
+    format: filter_engine::ListFormat,
+    allowlist: bool,
+) -> ValidateRulesResponse {
+    use filter_engine::{compile_lists, convert, detect, ConvertOptions, ListFormat};
+    let used = if format == ListFormat::Auto {
+        detect(text)
+    } else {
+        format
+    };
+    let opts = ConvertOptions {
+        format: used,
+        allowlist,
+        includes: Default::default(),
+    };
+    struct Row<'a> {
+        line: usize,
+        raw: &'a str,
+        conv: filter_engine::Converted,
+    }
+    let rows: Vec<Row> = text
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .take(MAX_VALIDATE_LINES)
+        .map(|(i, l)| Row {
             line: i + 1,
-            rule: line.to_string(),
-            accepted: res.is_ok(),
-            error: res.err().map(|e| e.to_string()),
+            raw: l.trim(),
+            conv: convert(l, &opts),
+        })
+        .collect();
+    let texts: Vec<&str> = rows.iter().map(|r| r.conv.rules.as_str()).collect();
+    let compiled = compile_lists(&texts);
+    let mut lines = Vec::new();
+    for (r, cs) in rows.iter().zip(&compiled.per_list) {
+        let st = &r.conv.stats;
+        let (outcome, error): (&str, Option<String>) = if st.error_count > 0 {
+            (
+                "rejected",
+                st.errors
+                    .first()
+                    .map(|e| e.1.clone())
+                    .or(Some("invalid rule".into())),
+            )
+        } else if let Some(e) = r.conv.ext.first() {
+            ("handed_off", Some(e.kind.as_str().to_string()))
+        } else if cs.rejected > 0 {
+            (
+                "rejected",
+                cs.errors
+                    .first()
+                    .map(|e| e.1.clone())
+                    .or(Some("rejected by the engine".into())),
+            )
+        } else if let Some(e) = cs.ext_rules.first() {
+            ("handed_off", Some(e.kind.as_str().to_string()))
+        } else if !r.conv.ip_block.is_empty() || !r.conv.ip_allow.is_empty() {
+            ("accepted", None)
+        } else if r.conv.rules.trim().is_empty() {
+            if st.skipped == 0 {
+                continue; // comment or header line
+            }
+            ("skipped", st.skipped_reasons.keys().next().cloned())
+        } else if st.translated > 0 {
+            ("translated", None)
+        } else {
+            ("accepted", None)
+        };
+        lines.push(RuleLineResult {
+            line: r.line,
+            rule: r.raw.to_string(),
+            outcome: outcome.to_string(),
+            accepted: outcome != "rejected",
+            error,
         });
     }
-    let accepted = lines.iter().filter(|l| l.accepted).count();
+    let count = |o: &str| lines.iter().filter(|l| l.outcome == o).count();
     ValidateRulesResponse {
-        accepted,
-        rejected: lines.len() - accepted,
+        format: used.as_str().to_string(),
+        translated: count("translated"),
+        handed_off: count("handed_off"),
+        skipped: count("skipped"),
+        rejected: count("rejected"),
+        accepted: lines.len() - count("rejected"),
         lines,
     }
 }
 
-/// Dry-run: report per-line accept/reject for a block of rules. Nothing is stored or installed.
+/// Dry-run through the real conversion pipeline for `format`: per-line translated / handed off /
+/// skipped / rejected. Nothing is stored or installed.
 #[utoipa::path(
     post, path = "/rules/validate", tag = "rules",
     security(("bearer_auth" = ["rules:read"])),
@@ -111,7 +178,30 @@ pub async fn validate(
     if req.rules.len() > 1_000_000 {
         return Err(ApiError::ValidationError("Rules exceed 1 MB".into()));
     }
-    Ok(Json(validate_rules(&req.rules)))
+    let format = req
+        .format
+        .as_deref()
+        .map(str::parse::<filter_engine::ListFormat>)
+        .transpose()
+        .map_err(ApiError::ValidationError)?
+        .unwrap_or_default();
+    let allow = req.allowlist.unwrap_or(false);
+    let out = blocking(move || Ok(validate_rules(&req.rules, format, allow))).await?;
+    Ok(Json(out))
+}
+
+/// What the last build made of the custom rules.
+#[utoipa::path(
+    get, path = "/rules/custom/report", tag = "rules",
+    security(("bearer_auth" = ["rules:read"])),
+    responses((status = 200, description = "Build report of the custom rules", body = ListReport))
+)]
+pub async fn get_custom_report(State(state): State<Arc<AppState>>) -> ApiResult<Json<ListReport>> {
+    let r = state
+        .list_service
+        .custom_rules_report()
+        .ok_or_else(|| ApiError::NotFound("No custom rules have been built yet".into()))?;
+    Ok(Json(super::lists::report_dto("custom", &r, None)))
 }
 
 /// Would this request be blocked, and by which rule? Uses the live engine; statistics are not
@@ -150,6 +240,8 @@ mod tests {
     fn validates_per_line() {
         let r = validate_rules(
             "! comment\n\n||ads.example.com^\nexample.com##.banner\n||bad$unknownoption=1\n",
+            filter_engine::ListFormat::Auto,
+            false,
         );
         assert_eq!(r.accepted + r.rejected, r.lines.len());
         assert!(r.lines[0].accepted);

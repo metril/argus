@@ -4,9 +4,23 @@
       "AddFilterListRequest": {
         "description": "Add a filter list.",
         "properties": {
+          "allowlist": {
+            "description": "Treat every rule as an exception (default false).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "enabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "format": {
+            "description": "Format override; default `auto`.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -170,6 +184,20 @@
       },
       "BlockedEntry": {
         "properties": {
+          "client": {
+            "description": "Client / profile label.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_id": {
+            "description": "List the rule came from, when known (domain-set hits).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "resource_type": {
             "type": "string"
           },
@@ -179,7 +207,8 @@
               "null"
             ]
           },
-          "source_url": {
+          "source_host": {
+            "description": "Host of the initiating page, when known.",
             "type": [
               "string",
               "null"
@@ -196,6 +225,183 @@
           "time",
           "url",
           "resource_type"
+        ],
+        "type": "object"
+      },
+      "BuildState": {
+        "description": "Where the build pipeline is.",
+        "oneOf": [
+          {
+            "properties": {
+              "state": {
+                "enum": [
+                  "idle"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "done": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "state": {
+                "enum": [
+                  "fetching"
+                ],
+                "type": "string"
+              },
+              "total": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "done",
+              "total",
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "state": {
+                "enum": [
+                  "compiling"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The last build failed; the previous engine keeps serving.",
+            "properties": {
+              "error": {
+                "type": "string"
+              },
+              "state": {
+                "enum": [
+                  "failed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "error",
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "BuildSummary": {
+        "description": "Build state and totals of the installed engine.",
+        "properties": {
+          "building": {
+            "description": "A rebuild is queued or running.",
+            "type": "boolean"
+          },
+          "built_at": {
+            "description": "When the installed engine was compiled (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "compile_ms": {
+            "description": "Compile time of the installed engine.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cosmetic": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "domain_set": {
+            "description": "Pure domain rules in the compact domain set.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "duplicates": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext_counts": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Handed-off rules by kind.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "from_persisted": {
+            "type": "boolean"
+          },
+          "ip_ranges": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_build_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_build_ms": {
+            "description": "Duration of the last whole build cycle (downloads and compile).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lists": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "network": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rejected": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/BuildState"
+          }
+        },
+        "required": [
+          "state",
+          "building",
+          "compile_ms",
+          "last_build_ms",
+          "lists",
+          "network",
+          "cosmetic",
+          "ext",
+          "rejected",
+          "ip_ranges",
+          "domain_set",
+          "duplicates",
+          "from_persisted",
+          "ext_counts"
         ],
         "type": "object"
       },
@@ -240,6 +446,43 @@
           "fingerprint_sha256",
           "pem_url",
           "der_url"
+        ],
+        "type": "object"
+      },
+      "CatalogueEntryResponse": {
+        "description": "A well-known list that can be added with `POST /lists/catalogue/{id}`.",
+        "properties": {
+          "added": {
+            "description": "Already added as a list.",
+            "type": "boolean"
+          },
+          "category": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "licence": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "url",
+          "format",
+          "category",
+          "licence",
+          "added"
         ],
         "type": "object"
       },
@@ -441,6 +684,29 @@
         ],
         "type": "object"
       },
+      "ExtRuleResponse": {
+        "description": "A rule that parsed but is not enforced yet.",
+        "properties": {
+          "domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "raw": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "raw",
+          "domains"
+        ],
+        "type": "object"
+      },
       "FieldError": {
         "description": "One field-level validation problem.",
         "properties": {
@@ -464,8 +730,16 @@
       "FilterListResponse": {
         "description": "Filter list description.",
         "properties": {
+          "allowlist": {
+            "description": "Every rule of the list is treated as an exception.",
+            "type": "boolean"
+          },
           "enabled": {
             "type": "boolean"
+          },
+          "format": {
+            "description": "Format override (`auto` detects from the content; see the supported-formats table).",
+            "type": "string"
           },
           "id": {
             "type": "string"
@@ -576,6 +850,165 @@
         },
         "required": [
           "source"
+        ],
+        "type": "object"
+      },
+      "ListMetaDto": {
+        "description": "Header metadata (`! Title:`, `! Expires:` ...) found in a list.",
+        "properties": {
+          "expires_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "homepage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "redirect": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ListReport": {
+        "description": "What the last build made of one list (or of the custom rules).",
+        "properties": {
+          "allowlist": {
+            "type": "boolean"
+          },
+          "content_sha": {
+            "description": "SHA-256 of the list content (and includes) the report was built from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cosmetic": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deduped": {
+            "description": "Rules dropped as duplicates.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext": {
+            "description": "Parsed but not enforced yet (see `GET /rules/ext`).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext_counts": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "format": {
+            "description": "Format used (detected when the override is `auto`).",
+            "type": "string"
+          },
+          "format_override": {
+            "type": "string"
+          },
+          "id": {
+            "description": "List id (`custom` for the custom rules).",
+            "type": "string"
+          },
+          "ip_ranges": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "issues": {
+            "description": "First parse issues.",
+            "items": {
+              "$ref": "#/components/schemas/ReportIssueDto"
+            },
+            "type": "array"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/ListMetaDto"
+          },
+          "network": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rejected": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Recognised but inexpressible lines.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_reasons": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "total_lines": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "translated": {
+            "description": "Rules rewritten into engine syntax.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "format",
+          "format_override",
+          "allowlist",
+          "total_lines",
+          "network",
+          "cosmetic",
+          "ext",
+          "skipped",
+          "deduped",
+          "translated",
+          "rejected",
+          "ip_ranges",
+          "error_count",
+          "issues",
+          "ext_counts",
+          "skipped_reasons",
+          "meta"
         ],
         "type": "object"
       },
@@ -910,6 +1343,63 @@
         ],
         "type": "object"
       },
+      "Page_ExtRuleResponse": {
+        "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "description": "A rule that parsed but is not enforced yet.",
+              "properties": {
+                "domains": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "kind": {
+                  "type": "string"
+                },
+                "raw": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "raw",
+                "domains"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total matching items across all pages.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "limit",
+          "has_more"
+        ],
+        "type": "object"
+      },
       "Page_FilterListResponse": {
         "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
         "properties": {
@@ -920,8 +1410,16 @@
             "items": {
               "description": "Filter list description.",
               "properties": {
+                "allowlist": {
+                  "description": "Every rule of the list is treated as an exception.",
+                  "type": "boolean"
+                },
                 "enabled": {
                   "type": "boolean"
+                },
+                "format": {
+                  "description": "Format override (`auto` detects from the content; see the supported-formats table).",
+                  "type": "string"
                 },
                 "id": {
                   "type": "string"
@@ -1364,24 +1862,43 @@
       },
       "RecentBlockedResponse": {
         "properties": {
-          "available": {
-            "description": "False until the filter engine feeds the buffer (see docs/API.md).",
-            "type": "boolean"
-          },
           "capacity": {
+            "description": "Ring capacity (older events are overwritten).",
             "minimum": 0,
             "type": "integer"
           },
           "entries": {
+            "description": "Newest first.",
             "items": {
               "$ref": "#/components/schemas/BlockedEntry"
             },
             "type": "array"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Matching events across all pages.",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
-          "available",
           "capacity",
+          "total",
+          "page",
+          "limit",
+          "has_more",
           "entries"
         ],
         "type": "object"
@@ -1403,6 +1920,23 @@
           "username",
           "password",
           "password_confirm"
+        ],
+        "type": "object"
+      },
+      "ReportIssueDto": {
+        "description": "One problem found while building a list.",
+        "properties": {
+          "line": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "line",
+          "reason"
         ],
         "type": "object"
       },
@@ -1441,9 +1975,11 @@
       "RuleLineResult": {
         "properties": {
           "accepted": {
+            "description": "False only for `rejected`.",
             "type": "boolean"
           },
           "error": {
+            "description": "Why the line was rejected or skipped, or the kind of a handed-off rule.",
             "type": [
               "string",
               "null"
@@ -1454,6 +1990,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "outcome": {
+            "description": "`translated` (rewritten into engine syntax), `accepted` (used as written), `handed_off`\n(parsed but not enforced yet), `skipped` (recognised, inexpressible) or `rejected`.",
+            "type": "string"
+          },
           "rule": {
             "type": "string"
           }
@@ -1461,6 +2001,7 @@
         "required": [
           "line",
           "rule",
+          "outcome",
           "accepted"
         ],
         "type": "object"
@@ -1676,9 +2217,21 @@
       "UpdateFilterListRequest": {
         "description": "Update a filter list.",
         "properties": {
+          "allowlist": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "enabled": {
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "format": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2066,6 +2619,20 @@
       },
       "ValidateRulesRequest": {
         "properties": {
+          "allowlist": {
+            "description": "Validate as an allowlist (every rule becomes an exception).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "format": {
+            "description": "Format to convert with (default `auto`: detected from the text).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rules": {
             "type": "string"
           }
@@ -2078,6 +2645,15 @@
       "ValidateRulesResponse": {
         "properties": {
           "accepted": {
+            "description": "Lines that are not rejected (translated, accepted, handed off or skipped).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "format": {
+            "description": "Format used (detected when not given).",
+            "type": "string"
+          },
+          "handed_off": {
             "minimum": 0,
             "type": "integer"
           },
@@ -2089,6 +2665,14 @@
             "type": "array"
           },
           "rejected": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "translated": {
             "minimum": 0,
             "type": "integer"
           }
@@ -3655,6 +4239,79 @@
         ]
       }
     },
+    "/api/v1/engine/build": {
+      "get": {
+        "operationId": "get_build_summary",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildSummary"
+                }
+              }
+            },
+            "description": "Build summary"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "stats:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "stats:read"
+            ]
+          }
+        ],
+        "summary": "Build state and totals of the installed engine.",
+        "tags": [
+          "engine"
+        ]
+      }
+    },
     "/api/v1/engine/reload": {
       "post": {
         "operationId": "reload_engine",
@@ -4025,6 +4682,166 @@
           }
         ],
         "summary": "Add a filter list and rebuild the engine.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue": {
+      "get": {
+        "operationId": "get_catalogue",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/CatalogueEntryResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Catalogue"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:read"
+            ]
+          }
+        ],
+        "summary": "The default-disabled catalogue of well-known lists (hosts, domain and IP lists).",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/{id}": {
+      "post": {
+        "operationId": "add_from_catalogue",
+        "parameters": [
+          {
+            "description": "Catalogue id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FilterListResponse"
+                }
+              }
+            },
+            "description": "Added"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Add a catalogue entry as an enabled list and rebuild the engine.",
         "tags": [
           "lists"
         ]
@@ -4599,6 +5416,90 @@
         ]
       }
     },
+    "/api/v1/lists/{id}/report": {
+      "get": {
+        "operationId": "get_list_report",
+        "parameters": [
+          {
+            "description": "List id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListReport"
+                }
+              }
+            },
+            "description": "Build report of the list"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:read"
+            ]
+          }
+        ],
+        "summary": "What the last build made of one list: detected format, rule counts, first parse issues,\nheader metadata and content digest.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
     "/api/v1/lists/{id}/status": {
       "get": {
         "operationId": "get_list_status",
@@ -4896,6 +5797,183 @@
         ]
       }
     },
+    "/api/v1/rules/custom/report": {
+      "get": {
+        "operationId": "get_custom_report",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListReport"
+                }
+              }
+            },
+            "description": "Build report of the custom rules"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:read"
+            ]
+          }
+        ],
+        "summary": "What the last build made of the custom rules.",
+        "tags": [
+          "rules"
+        ]
+      }
+    },
+    "/api/v1/rules/ext": {
+      "get": {
+        "operationId": "list_ext_rules",
+        "parameters": [
+          {
+            "description": "Only this kind (`replace`, `cookie`, `html-filter`, ...).",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ExtRuleResponse"
+                }
+              }
+            },
+            "description": "Handed-off rules"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:read"
+            ]
+          }
+        ],
+        "summary": "Rules that parsed but are not enforced yet (handed off), read-only.",
+        "tags": [
+          "rules"
+        ]
+      }
+    },
     "/api/v1/rules/test": {
       "post": {
         "operationId": "test_url",
@@ -5056,7 +6134,7 @@
             ]
           }
         ],
-        "summary": "Dry-run: report per-line accept/reject for a block of rules. Nothing is stored or installed.",
+        "summary": "Dry-run through the real conversion pipeline for `format`: per-line translated / handed off /\nskipped / rejected. Nothing is stored or installed.",
         "tags": [
           "rules"
         ]
@@ -5067,13 +6145,51 @@
         "operationId": "get_recent_blocked",
         "parameters": [
           {
-            "description": "Maximum entries, newest first (default 100).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (1..=200, default 50).",
             "in": "query",
             "name": "limit",
             "required": false,
             "schema": {
+              "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "Only blocks attributed to this client / profile label.",
+            "in": "query",
+            "name": "client",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only requests to this host or its subdomains.",
+            "in": "query",
+            "name": "host",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only blocks from this list id.",
+            "in": "query",
+            "name": "list_id",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5141,7 +6257,7 @@
             ]
           }
         ],
-        "summary": "Recently blocked requests (bounded in-memory ring, newest first). `available` is false until\nthe filter engine feeds the buffer.",
+        "summary": "Recently blocked requests from the engine's bounded ring, newest first, filterable by client\nlabel, host and list id.",
         "tags": [
           "stats"
         ]

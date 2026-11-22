@@ -71,7 +71,6 @@ blake3 = "1.5"
 # CA certificate details
 x509-parser = "0.18"
 sha2 = "0.10"
-adblock = { workspace = true }
 
 [dev-dependencies]
 axum-test = "18"

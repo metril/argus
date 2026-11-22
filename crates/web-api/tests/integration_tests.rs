@@ -586,7 +586,8 @@ async fn proxy_stats_and_filter_stats() {
     let f: Value = admin.get("/api/v1/stats/filter").await.json();
     assert!(f["total_requests"].is_number() && f["top_blocked_domains"].is_array());
     let recent: Value = admin.get("/api/v1/stats/blocked/recent").await.json();
-    assert_eq!(recent["available"], false);
+    assert_eq!(recent["total"], 0);
+    assert!(recent["entries"].is_array());
 }
 
 // ---------------------------------------------------------------- lists
@@ -981,4 +982,240 @@ async fn audit_log_is_bounded() {
     }
     ctx.state.audit.prune();
     assert!(ctx.state.audit.len() <= 5);
+}
+
+// ---------------------------------------------------------------- formats, reports, catalogue
+
+#[tokio::test]
+async fn list_format_allowlist_and_catalogue() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let add = admin
+        .post("/api/v1/lists")
+        .json(
+            &json!({"id": "h", "name": "H", "url": "https://example.com/h.txt",
+            "enabled": false, "format": "hosts", "allowlist": true}),
+        )
+        .await;
+    assert_eq!(add.status_code(), StatusCode::CREATED);
+    let l: Value = add.json();
+    assert_eq!(
+        (l["format"].as_str(), l["allowlist"].as_bool()),
+        (Some("hosts"), Some(true))
+    );
+    admin
+        .post("/api/v1/lists")
+        .json(&json!({"id": "bad", "name": "B", "url": "https://example.com/b.txt", "format": "nope"}))
+        .await
+        .assert_status_bad_request();
+    let u: Value = admin
+        .put("/api/v1/lists/h")
+        .json(&json!({"format": "auto", "allowlist": false}))
+        .await
+        .json();
+    assert_eq!(
+        (u["format"].as_str(), u["allowlist"].as_bool()),
+        (Some("auto"), Some(false))
+    );
+
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    let cat = cat.as_array().unwrap();
+    assert!(cat.len() >= 10 && cat.iter().all(|e| e["added"] == false));
+    let added = admin.post("/api/v1/lists/catalogue/adaway").await;
+    assert_eq!(added.status_code(), StatusCode::CREATED);
+    let a: Value = added.json();
+    assert_eq!(
+        (a["format"].as_str(), a["enabled"].as_bool()),
+        (Some("hosts"), Some(true))
+    );
+    assert_eq!(
+        admin
+            .post("/api/v1/lists/catalogue/adaway")
+            .await
+            .status_code(),
+        StatusCode::CONFLICT
+    );
+    admin
+        .post("/api/v1/lists/catalogue/nope")
+        .await
+        .assert_status_not_found();
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    assert!(cat
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["id"] == "adaway" && e["added"] == true));
+}
+
+#[tokio::test]
+async fn reports_build_summary_and_ext_rules_reflect_a_real_build() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    // Content comes from the store; the unreachable origin makes the build fall back to it.
+    let mut l = filter_engine::FilterList::new(
+        "ag".into(),
+        "AG".into(),
+        "https://127.0.0.1:1/ag.txt".into(),
+    );
+    l.format = filter_engine::ListFormat::Adguard;
+    ctx.state.filter_store.upsert(&l).unwrap();
+    ctx.state
+        .filter_store
+        .put_content("ag", "! Title: Test list\n||ads.example^\n||x.example^$replace=/a/b/\nexample.com##.banner\n")
+        .unwrap();
+    ctx.state.list_service.reload_now().await;
+
+    let r: Value = admin.get("/api/v1/lists/ag/report").await.json();
+    assert_eq!(r["format"], "adguard");
+    assert_eq!(r["meta"]["title"], "Test list");
+    assert_eq!(
+        (
+            r["network"].as_u64(),
+            r["cosmetic"].as_u64(),
+            r["ext"].as_u64()
+        ),
+        (Some(1), Some(1), Some(1))
+    );
+    assert!(r["content_sha"].is_string() && r["issues"].is_array() && r["deduped"].is_number());
+    admin
+        .get("/api/v1/lists/nope/report")
+        .await
+        .assert_status_not_found();
+
+    let b: Value = admin.get("/api/v1/engine/build").await.json();
+    assert_eq!(b["state"]["state"], "idle");
+    assert_eq!(b["building"], false);
+    assert_eq!(b["ext_counts"]["replace"], 1);
+    assert_eq!(b["domain_set"], 1);
+    assert!(b["built_at"].is_string() && b["last_build_at"].is_string());
+
+    let e: Value = admin.get("/api/v1/rules/ext").await.json();
+    assert_eq!(e["total"], 1);
+    assert_eq!(e["items"][0]["kind"], "replace");
+    assert!(e["items"][0]["raw"].as_str().unwrap().contains("$replace"));
+    assert_eq!(
+        admin
+            .get("/api/v1/rules/ext?kind=cookie")
+            .await
+            .json::<Value>()["total"],
+        0
+    );
+
+    // Custom rules report appears once custom rules are built.
+    admin
+        .get("/api/v1/rules/custom/report")
+        .await
+        .assert_status_not_found();
+    let etag = admin.get("/api/v1/rules/custom").await.header("etag");
+    admin
+        .put("/api/v1/rules/custom")
+        .add_header("If-Match", etag.to_str().unwrap())
+        .json(&json!({"rules": "||mine.example^\n"}))
+        .await
+        .assert_status_ok();
+    ctx.state.list_service.reload_now().await;
+    let c: Value = admin.get("/api/v1/rules/custom/report").await.json();
+    assert_eq!(c["id"], "custom");
+    assert_eq!(c["network"], 1);
+}
+
+#[tokio::test]
+async fn recent_blocked_reports_real_events_with_filters() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    ctx.state
+        .shared_engine
+        .install(filter_engine::compile_engine(&[
+            "||ads.example.com^\n||trk.example.net^\n".to_string(),
+        ]));
+    let e = &ctx.state.shared_engine;
+    e.check_for(
+        "https://ads.example.com/a.js",
+        "https://p.test/",
+        "script",
+        "0",
+    );
+    e.check_for(
+        "https://trk.example.net/t.js",
+        "https://p.test/",
+        "script",
+        "kid",
+    );
+    e.check_for("https://fine.test/x.js", "https://p.test/", "script", "0");
+    let all: Value = admin.get("/api/v1/stats/blocked/recent").await.json();
+    assert_eq!(all["total"], 2);
+    assert_eq!(all["entries"][0]["url"], "https://trk.example.net/t.js");
+    assert_eq!(all["entries"][0]["client"], "kid");
+    assert_eq!(all["entries"][0]["source_host"], "p.test");
+    let by_client: Value = admin
+        .get("/api/v1/stats/blocked/recent?client=0")
+        .await
+        .json();
+    assert_eq!(by_client["total"], 1);
+    assert_eq!(by_client["entries"][0]["rule"], "||ads.example.com^");
+    let by_host: Value = admin
+        .get("/api/v1/stats/blocked/recent?host=EXAMPLE.net")
+        .await
+        .json();
+    assert_eq!(by_host["total"], 1);
+    let none: Value = admin
+        .get("/api/v1/stats/blocked/recent?list_id=zzz")
+        .await
+        .json();
+    assert_eq!(none["total"], 0);
+    let p: Value = admin
+        .get("/api/v1/stats/blocked/recent?limit=1&page=2")
+        .await
+        .json();
+    assert_eq!(
+        (
+            p["has_more"].as_bool(),
+            p["entries"].as_array().unwrap().len()
+        ),
+        (Some(false), 1)
+    );
+}
+
+#[tokio::test]
+async fn validate_uses_the_real_conversion_pipeline() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let v: Value = admin
+        .post("/api/v1/rules/validate")
+        .json(&json!({"format": "hosts",
+            "rules": "# c\n127.0.0.1 localhost\n0.0.0.0 ad.example\nnot a host line here\n"}))
+        .await
+        .json();
+    assert_eq!(v["format"], "hosts");
+    let out = |i: usize| v["lines"][i]["outcome"].as_str().unwrap().to_string();
+    assert_eq!(out(0), "skipped"); // localhost entry: recognised, inexpressible
+    assert_eq!(out(1), "accepted");
+    assert_eq!(out(2), "rejected");
+    assert_eq!(
+        (v["rejected"].as_u64(), v["skipped"].as_u64()),
+        (Some(1), Some(1))
+    );
+
+    let v: Value = admin
+        .post("/api/v1/rules/validate")
+        .json(
+            &json!({"format": "adguard", "rules": "||x.example^$replace=/a/b/\n||ads.example^\n"}),
+        )
+        .await
+        .json();
+    assert_eq!(v["lines"][0]["outcome"], "handed_off");
+    assert_eq!(v["lines"][0]["accepted"], true);
+    assert_eq!(v["handed_off"], 1);
+
+    let v: Value = admin
+        .post("/api/v1/rules/validate")
+        .json(&json!({"rules": "||a.example^\n", "allowlist": true, "format": "abp"}))
+        .await
+        .json();
+    assert_eq!(v["accepted"], 1);
+    admin
+        .post("/api/v1/rules/validate")
+        .json(&json!({"rules": "x", "format": "bogus"}))
+        .await
+        .assert_status_bad_request();
 }

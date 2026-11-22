@@ -229,6 +229,11 @@ impl SharedEngine {
         self.block_log.recent(limit)
     }
 
+    /// Capacity of the recent-blocked ring.
+    pub fn recent_blocked_capacity(&self) -> usize {
+        self.block_log.capacity()
+    }
+
     /// Record a block that happened outside [`Self::check`] (for example a request the proxy
     /// refused for another reason) in the recent-blocked ring.
     pub fn record_block(&self, event: &BlockEvent) {

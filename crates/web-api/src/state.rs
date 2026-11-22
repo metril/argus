@@ -2,7 +2,7 @@
 //!
 //! Defines the shared state that is passed to all handlers via Arc<AppState>.
 
-use crate::audit::{AuditStore, RecentBlocked};
+use crate::audit::AuditStore;
 use crate::auth::authz::RouteTable;
 use crate::auth::models::User;
 use crate::auth::session::SessionManager;
@@ -75,9 +75,6 @@ pub struct AppState {
 
     /// Persisted audit log.
     pub audit: Arc<AuditStore>,
-
-    /// Recently blocked requests (fed by the filter engine once it has an observer hook).
-    pub recent_blocked: Arc<RecentBlocked>,
 
     /// Process start, for uptime.
     pub started_at: Instant,
@@ -540,7 +537,6 @@ pub async fn build_state(
         api_config,
         tokens,
         audit,
-        recent_blocked: Arc::new(RecentBlocked::new(500)),
         started_at: Instant::now(),
         spec_json: OnceLock::new(),
         route_auth: OnceLock::new(),

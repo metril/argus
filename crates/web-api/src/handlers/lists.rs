@@ -1,12 +1,13 @@
 //! Filter-list handlers: CRUD, per-list status, refresh, update schedule and engine rebuilds.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use api_types::{
-    AddFilterListRequest, EngineStatusResponse, FilterListResponse, ListStatusResponse,
-    MessageResponse, Page, ScheduleResponse, UpdateFilterListRequest, UpdateProxyConfigRequest,
-    UpdateScheduleRequest,
+    AddFilterListRequest, BuildState, BuildSummary, CatalogueEntryResponse, EngineStatusResponse,
+    ExtRuleResponse, FilterListResponse, ListMetaDto, ListReport, ListStatusResponse,
+    MessageResponse, Page, ReportIssueDto, ScheduleResponse, UpdateFilterListRequest,
+    UpdateProxyConfigRequest, UpdateScheduleRequest,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Deserialize;
@@ -30,17 +31,20 @@ fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> F
         rule_count: list.rule_count,
         last_error: status.last_error,
         last_checked: status.last_checked.map(|dt| dt.to_rfc3339()),
+        format: list.format.as_str().to_string(),
+        allowlist: list.allowlist,
     }
 }
 
-/// Engine build state. `building` is derived from `wait_idle` because list-service exposes no
-/// accessor for it (an `is_building()` there would replace this probe).
+fn parse_format(f: &str) -> ApiResult<filter_engine::ListFormat> {
+    f.parse::<filter_engine::ListFormat>()
+        .map_err(ApiError::ValidationError)
+}
+
+/// Engine build state.
 pub async fn engine_status(state: &AppState) -> EngineStatusResponse {
-    let building = tokio::time::timeout(Duration::ZERO, state.list_service.wait_idle())
-        .await
-        .is_err();
     EngineStatusResponse {
-        building,
+        building: state.list_service.is_building(),
         build_count: state.list_service.build_count(),
         enabled: state.shared_engine.is_enabled(),
         scriptlets_ready: *state.list_service.scriptlets_ready().borrow(),
@@ -97,6 +101,10 @@ pub async fn add_filter_list(
     let mut list =
         filter_engine::FilterList::new(req.id.clone(), req.name.clone(), req.url.clone());
     list.enabled = req.enabled.unwrap_or(true);
+    if let Some(f) = &req.format {
+        list.format = parse_format(f)?;
+    }
+    list.allowlist = req.allowlist.unwrap_or(false);
     let (st, l) = (state.clone(), list.clone());
     blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
     info!("Filter list '{}' added by {}", req.id, p.username);
@@ -142,6 +150,7 @@ pub async fn update_filter_list(
     if let Some(url) = &req.url {
         validate_filter_url(url)?;
     }
+    let format = req.format.as_deref().map(parse_format).transpose()?;
     let mut list = state
         .filter_store
         .get(&id)?
@@ -160,6 +169,12 @@ pub async fn update_filter_list(
     }
     if let Some(enabled) = req.enabled {
         list.enabled = enabled;
+    }
+    if let Some(f) = format {
+        list.format = f;
+    }
+    if let Some(a) = req.allowlist {
+        list.allowlist = a;
     }
     let (st, l) = (state.clone(), list.clone());
     blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
@@ -326,6 +341,224 @@ pub async fn reload_engine(
 )]
 pub async fn get_engine_status(State(state): State<Arc<AppState>>) -> Json<EngineStatusResponse> {
     Json(engine_status(&state).await)
+}
+
+pub(crate) fn report_dto(
+    id: &str,
+    r: &filter_engine::ListReport,
+    content_sha: Option<String>,
+) -> ListReport {
+    ListReport {
+        id: id.to_string(),
+        format: r.format.as_str().into(),
+        format_override: r.format_override.as_str().into(),
+        allowlist: r.allowlist,
+        total_lines: r.total_lines,
+        network: r.network,
+        cosmetic: r.cosmetic,
+        ext: r.ext,
+        skipped: r.skipped,
+        deduped: r.duplicates,
+        translated: r.translated,
+        rejected: r.rejected,
+        ip_ranges: r.ip_ranges,
+        error_count: r.error_count,
+        issues: r
+            .errors
+            .iter()
+            .map(|e| ReportIssueDto {
+                line: e.line,
+                reason: e.reason.clone(),
+            })
+            .collect(),
+        ext_counts: r.ext_counts.clone(),
+        skipped_reasons: r.skipped_reasons.clone(),
+        meta: ListMetaDto {
+            title: r.meta.title.clone(),
+            homepage: r.meta.homepage.clone(),
+            version: r.meta.version.clone(),
+            expires_secs: r.meta.expires_secs,
+            redirect: r.meta.redirect.clone(),
+        },
+        content_sha,
+    }
+}
+
+/// What the last build made of one list: detected format, rule counts, first parse issues,
+/// header metadata and content digest.
+#[utoipa::path(
+    get, path = "/lists/{id}/report", tag = "lists",
+    security(("bearer_auth" = ["lists:read"])),
+    params(("id" = String, Path, description = "List id")),
+    responses((status = 200, description = "Build report of the list", body = ListReport))
+)]
+pub async fn get_list_report(
+    State(state): State<Arc<AppState>>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<Json<ListReport>> {
+    if !state.filter_store.exists(&id)? {
+        return Err(ApiError::NotFound(format!("Filter list '{id}' not found")));
+    }
+    let r = state
+        .list_service
+        .report(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("No build report for '{id}' yet (not built)")))?;
+    let sha = state
+        .filter_store
+        .get_status(&id)
+        .ok()
+        .and_then(|s| s.content_sha);
+    Ok(Json(report_dto(&id, &r, sha)))
+}
+
+/// Build state and totals of the installed engine.
+#[utoipa::path(
+    get, path = "/engine/build", tag = "engine",
+    security(("bearer_auth" = ["stats:read"])),
+    responses((status = 200, description = "Build summary", body = BuildSummary))
+)]
+pub async fn get_build_summary(State(state): State<Arc<AppState>>) -> Json<BuildSummary> {
+    let s = state.list_service.summary();
+    let mut ext_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for r in state.shared_engine.ext_rules().iter() {
+        *ext_counts.entry(r.kind.as_str().to_string()).or_default() += 1;
+    }
+    use list_service::BuildState as S;
+    Json(BuildSummary {
+        state: match s.state {
+            S::Idle => BuildState::Idle,
+            S::Fetching { done, total } => BuildState::Fetching { done, total },
+            S::Compiling => BuildState::Compiling,
+            S::Failed { error } => BuildState::Failed { error },
+        },
+        building: state.list_service.is_building(),
+        built_at: s.built_at.map(|t| t.to_rfc3339()),
+        compile_ms: s.duration_ms,
+        last_build_ms: s.last_build_ms,
+        last_build_at: s.last_build_at.map(|t| t.to_rfc3339()),
+        lists: s.lists,
+        network: s.network,
+        cosmetic: s.cosmetic,
+        ext: s.ext,
+        rejected: s.rejected,
+        ip_ranges: s.ip_ranges,
+        domain_set: s.domain_set,
+        duplicates: s.duplicates,
+        from_persisted: s.from_persisted,
+        ext_counts,
+    })
+}
+
+/// The default-disabled catalogue of well-known lists (hosts, domain and IP lists).
+#[utoipa::path(
+    get, path = "/lists/catalogue", tag = "lists",
+    security(("bearer_auth" = ["lists:read"])),
+    responses((status = 200, description = "Catalogue", body = Vec<CatalogueEntryResponse>))
+)]
+pub async fn get_catalogue(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<Vec<CatalogueEntryResponse>>> {
+    let have: std::collections::HashSet<String> = state
+        .filter_store
+        .get_all()?
+        .into_iter()
+        .map(|l| l.id)
+        .collect();
+    Ok(Json(
+        filter_engine::catalogue()
+            .into_iter()
+            .map(|e| CatalogueEntryResponse {
+                added: have.contains(e.id),
+                id: e.id.into(),
+                name: e.name.into(),
+                url: e.url.into(),
+                format: e.format.as_str().into(),
+                category: e.category.into(),
+                licence: e.licence.into(),
+            })
+            .collect(),
+    ))
+}
+
+/// Add a catalogue entry as an enabled list and rebuild the engine.
+#[utoipa::path(
+    post, path = "/lists/catalogue/{id}", tag = "lists",
+    security(("bearer_auth" = ["lists:write"])),
+    params(("id" = String, Path, description = "Catalogue id")),
+    responses((status = 201, description = "Added", body = FilterListResponse))
+)]
+pub async fn add_from_catalogue(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<(StatusCode, Json<FilterListResponse>)> {
+    let entry = filter_engine::catalogue()
+        .into_iter()
+        .find(|e| e.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("Catalogue entry '{id}' not found")))?;
+    if state.filter_store.exists(&id)? {
+        return Err(ApiError::AlreadyExists(format!("Filter list '{id}'")));
+    }
+    let mut list = entry.to_filter_list();
+    list.enabled = true;
+    let (st, l) = (state.clone(), list.clone());
+    blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
+    info!(
+        "Filter list '{id}' added from the catalogue by {}",
+        p.username
+    );
+    state.list_service.trigger();
+    Ok((
+        StatusCode::CREATED,
+        Json(filter_list_response(&state, &list)),
+    ))
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ExtRulesQuery {
+    /// Only this kind (`replace`, `cookie`, `html-filter`, ...).
+    pub kind: Option<String>,
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+/// Rules that parsed but are not enforced yet (handed off), read-only.
+#[utoipa::path(
+    get, path = "/rules/ext", tag = "rules",
+    security(("bearer_auth" = ["rules:read"])),
+    params(ExtRulesQuery),
+    responses((status = 200, description = "Handed-off rules", body = Page<ExtRuleResponse>))
+)]
+pub async fn list_ext_rules(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(q): ApiQuery<ExtRulesQuery>,
+) -> Json<Page<ExtRuleResponse>> {
+    let rules = state.shared_engine.ext_rules();
+    let total_matching = rules
+        .iter()
+        .filter(|r| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
+        .count();
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let page = q.page.unwrap_or(1).max(1);
+    let items: Vec<ExtRuleResponse> = rules
+        .iter()
+        .filter(|r| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
+        .skip((page as usize - 1).saturating_mul(limit as usize))
+        .take(limit as usize)
+        .map(|r| ExtRuleResponse {
+            kind: r.kind.as_str().into(),
+            raw: r.raw.clone(),
+            domains: r.domains.clone(),
+        })
+        .collect();
+    Json(Page {
+        has_more: (page as usize - 1) * limit as usize + items.len() < total_matching,
+        items,
+        total: total_matching,
+        page,
+        limit,
+    })
 }
 
 fn validate_filter_url(url: &str) -> ApiResult<()> {

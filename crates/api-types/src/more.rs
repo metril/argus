@@ -169,6 +169,12 @@ pub struct UpdateScheduleRequest {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ValidateRulesRequest {
     pub rules: String,
+    /// Format to convert with (default `auto`: detected from the text).
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Validate as an allowlist (every rule becomes an exception).
+    #[serde(default)]
+    pub allowlist: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,14 +183,29 @@ pub struct RuleLineResult {
     /// 1-based line number.
     pub line: usize,
     pub rule: String,
+    /// `translated` (rewritten into engine syntax), `accepted` (used as written), `handed_off`
+    /// (parsed but not enforced yet), `skipped` (recognised, inexpressible) or `rejected`.
+    pub outcome: String,
+    /// False only for `rejected`.
     pub accepted: bool,
+    /// Why the line was rejected or skipped, or the kind of a handed-off rule.
     pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ValidateRulesResponse {
+    /// Format used (detected when not given).
+    #[serde(default)]
+    pub format: String,
+    /// Lines that are not rejected (translated, accepted, handed off or skipped).
     pub accepted: usize,
+    #[serde(default)]
+    pub translated: usize,
+    #[serde(default)]
+    pub handed_off: usize,
+    #[serde(default)]
+    pub skipped: usize,
     pub rejected: usize,
     /// Comments and blank lines are skipped; every other line appears here.
     pub lines: Vec<RuleLineResult>,
@@ -240,17 +261,27 @@ pub struct FilterStatsResponse {
 pub struct BlockedEntry {
     pub time: String,
     pub url: String,
-    pub source_url: Option<String>,
+    /// Host of the initiating page, when known.
+    pub source_host: Option<String>,
     pub resource_type: String,
     pub rule: Option<String>,
+    /// List the rule came from, when known (domain-set hits).
+    pub list_id: Option<String>,
+    /// Client / profile label.
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct RecentBlockedResponse {
-    /// False until the filter engine feeds the buffer (see docs/API.md).
-    pub available: bool,
+    /// Ring capacity (older events are overwritten).
     pub capacity: usize,
+    /// Matching events across all pages.
+    pub total: usize,
+    pub page: u32,
+    pub limit: u32,
+    pub has_more: bool,
+    /// Newest first.
     pub entries: Vec<BlockedEntry>,
 }
 
@@ -325,4 +356,129 @@ pub struct AuditEntry {
 pub struct UserscriptSourceResponse {
     pub id: String,
     pub source: String,
+}
+
+// ---------------------------------------------------------------------------
+// List formats, reports, build state, catalogue, handed-off rules
+// ---------------------------------------------------------------------------
+
+/// One problem found while building a list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReportIssueDto {
+    pub line: usize,
+    pub reason: String,
+}
+
+/// Header metadata (`! Title:`, `! Expires:` ...) found in a list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListMetaDto {
+    pub title: Option<String>,
+    pub homepage: Option<String>,
+    pub version: Option<String>,
+    pub expires_secs: Option<u64>,
+    pub redirect: Option<String>,
+}
+
+/// What the last build made of one list (or of the custom rules).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListReport {
+    /// List id (`custom` for the custom rules).
+    pub id: String,
+    /// Format used (detected when the override is `auto`).
+    pub format: String,
+    pub format_override: String,
+    pub allowlist: bool,
+    pub total_lines: usize,
+    pub network: usize,
+    pub cosmetic: usize,
+    /// Parsed but not enforced yet (see `GET /rules/ext`).
+    pub ext: usize,
+    /// Recognised but inexpressible lines.
+    pub skipped: usize,
+    /// Rules dropped as duplicates.
+    pub deduped: usize,
+    /// Rules rewritten into engine syntax.
+    pub translated: usize,
+    pub rejected: usize,
+    pub ip_ranges: usize,
+    pub error_count: usize,
+    /// First parse issues.
+    pub issues: Vec<ReportIssueDto>,
+    pub ext_counts: std::collections::BTreeMap<String, usize>,
+    pub skipped_reasons: std::collections::BTreeMap<String, usize>,
+    pub meta: ListMetaDto,
+    /// SHA-256 of the list content (and includes) the report was built from.
+    pub content_sha: Option<String>,
+}
+
+/// Where the build pipeline is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BuildState {
+    #[default]
+    Idle,
+    Fetching {
+        done: usize,
+        total: usize,
+    },
+    Compiling,
+    /// The last build failed; the previous engine keeps serving.
+    Failed {
+        error: String,
+    },
+}
+
+/// Build state and totals of the installed engine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BuildSummary {
+    pub state: BuildState,
+    /// A rebuild is queued or running.
+    pub building: bool,
+    /// When the installed engine was compiled (RFC 3339).
+    pub built_at: Option<String>,
+    /// Compile time of the installed engine.
+    pub compile_ms: u64,
+    /// Duration of the last whole build cycle (downloads and compile).
+    pub last_build_ms: u64,
+    pub last_build_at: Option<String>,
+    pub lists: usize,
+    pub network: usize,
+    pub cosmetic: usize,
+    pub ext: usize,
+    pub rejected: usize,
+    pub ip_ranges: usize,
+    /// Pure domain rules in the compact domain set.
+    pub domain_set: usize,
+    pub duplicates: usize,
+    pub from_persisted: bool,
+    /// Handed-off rules by kind.
+    pub ext_counts: std::collections::BTreeMap<String, usize>,
+}
+
+/// A well-known list that can be added with `POST /lists/catalogue/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CatalogueEntryResponse {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub format: String,
+    pub category: String,
+    pub licence: String,
+    /// Already added as a list.
+    pub added: bool,
+}
+
+/// A rule that parsed but is not enforced yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtRuleResponse {
+    pub kind: String,
+    pub raw: String,
+    pub domains: Vec<String>,
 }

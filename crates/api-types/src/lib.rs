@@ -341,6 +341,12 @@ pub struct FilterListResponse {
     /// When the list was last fetched or revalidated (RFC 3339).
     #[serde(default)]
     pub last_checked: Option<String>,
+    /// Format override (`auto` detects from the content; see the supported-formats table).
+    #[serde(default)]
+    pub format: String,
+    /// Every rule of the list is treated as an exception.
+    #[serde(default)]
+    pub allowlist: bool,
 }
 
 /// Add a filter list.
@@ -360,6 +366,12 @@ pub struct AddFilterListRequest {
     pub url: String,
 
     pub enabled: Option<bool>,
+    /// Format override; default `auto`.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Treat every rule as an exception (default false).
+    #[serde(default)]
+    pub allowlist: Option<bool>,
 }
 
 /// Update a filter list.
@@ -376,6 +388,10 @@ pub struct UpdateFilterListRequest {
     pub url: Option<String>,
 
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub allowlist: Option<bool>,
 }
 
 /// The user's custom filter rules (raw adblock syntax).

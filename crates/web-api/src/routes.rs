@@ -52,6 +52,8 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         // lists
         .routes(routes!(lists::list_filter_lists, lists::add_filter_list))
         .routes(routes!(lists::refresh_all_lists))
+        .routes(routes!(lists::get_catalogue))
+        .routes(routes!(lists::add_from_catalogue))
         .routes(routes!(lists::get_schedule, lists::put_schedule))
         .routes(routes!(
             lists::get_filter_list,
@@ -59,12 +61,16 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             lists::delete_filter_list
         ))
         .routes(routes!(lists::get_list_status))
+        .routes(routes!(lists::get_list_report))
         .routes(routes!(lists::refresh_list))
         // engine
         .routes(routes!(lists::reload_engine))
         .routes(routes!(lists::get_engine_status))
+        .routes(routes!(lists::get_build_summary))
         // rules
         .routes(routes!(rules::get_custom_rules, rules::update_custom_rules))
+        .routes(routes!(rules::get_custom_report))
+        .routes(routes!(lists::list_ext_rules))
         .routes(routes!(rules::validate))
         .routes(routes!(rules::test_url))
         // stats
