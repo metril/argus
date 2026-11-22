@@ -8,7 +8,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use validator::Validate;
 
 pub use api_types::{LoginRequest, LoginResponse, RegisterRequest, UserInfo, UserRole};
 
@@ -61,8 +60,10 @@ pub struct Claims {
     pub iat: i64,
     /// Expiration (Unix timestamp)
     pub exp: i64,
-    /// JWT ID (for revocation)
+    /// JWT ID (for refresh-token rotation)
     pub jti: String,
+    /// Session this token belongs to; the token is dead once the session is revoked.
+    pub sid: String,
     /// Token type (access or refresh)
     #[serde(rename = "type")]
     pub token_type: TokenType,
@@ -85,24 +86,8 @@ impl From<&User> for UserInfo {
             role: user.role,
             created_at: user.created_at.to_rfc3339(),
             last_login: user.last_login.map(|t| t.to_rfc3339()),
+            enabled: user.enabled,
+            scopes: user.role.scopes(),
         }
     }
-}
-
-/// Token refresh request
-#[derive(Debug, Deserialize)]
-pub struct RefreshRequest {
-    // Refresh token is read from httpOnly cookie, not request body
-}
-
-/// Change password request
-#[derive(Debug, Deserialize, Validate)]
-pub struct ChangePasswordRequest {
-    pub current_password: String,
-
-    #[validate(length(min = 8, max = 128, message = "Password must be 8-128 characters"))]
-    pub new_password: String,
-
-    #[validate(must_match(other = "new_password", message = "Passwords must match"))]
-    pub new_password_confirm: String,
 }

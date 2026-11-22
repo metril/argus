@@ -2,15 +2,17 @@
 //!
 //! Defines the shared state that is passed to all handlers via Arc<AppState>.
 
+use crate::audit::{AuditStore, RecentBlocked};
+use crate::auth::authz::RouteTable;
 use crate::auth::models::User;
 use crate::auth::session::SessionManager;
+use crate::auth::tokens::TokenStore;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
 use chrono::Utc;
 use common::config::ProxyConfig;
-use dashmap::DashMap;
 use filter_engine::{FilterStats, SharedEngine};
-use governor::{Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
 use list_service::{ListService, ListStore};
 use parking_lot::RwLock;
 use std::net::IpAddr;
@@ -18,6 +20,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 use userscript_engine::{UserscriptManager, UserscriptRuntime};
 use uuid::Uuid;
 
@@ -60,6 +64,27 @@ pub struct AppState {
 
     /// Path to proxy configuration file for reloading
     pub config_path: Arc<RwLock<PathBuf>>,
+
+    /// API server settings (CSRF, cookies, trusted proxies, ...).
+    pub api_config: ApiConfig,
+
+    /// Personal access tokens.
+    pub tokens: Arc<TokenStore>,
+
+    /// Persisted audit log.
+    pub audit: Arc<AuditStore>,
+
+    /// Recently blocked requests (fed by the filter engine once it has an observer hook).
+    pub recent_blocked: Arc<RecentBlocked>,
+
+    /// Process start, for uptime.
+    pub started_at: Instant,
+
+    /// Serialised OpenAPI document; set once by `create_router`.
+    pub spec_json: OnceLock<String>,
+
+    /// Route -> required scopes, derived from the OpenAPI spec by `create_router`.
+    pub route_auth: OnceLock<RouteTable>,
 }
 
 /// Proxy state wrapper
@@ -192,12 +217,31 @@ pub struct JwtConfig {
 pub struct SessionStore {
     /// Sled database for persistent storage
     db: sled::Db,
+    /// Serialises changes that must preserve the "at least one enabled admin" invariant.
+    pub admin_lock: parking_lot::Mutex<()>,
 }
 
 impl SessionStore {
     pub fn new(path: PathBuf) -> ApiResult<Self> {
         let db = sled::open(path)?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            admin_lock: parking_lot::Mutex::new(()),
+        })
+    }
+
+    /// The underlying database (other stores keep their own trees in it).
+    pub fn db(&self) -> sled::Db {
+        self.db.clone()
+    }
+
+    /// Number of enabled administrators.
+    pub fn enabled_admin_count(&self) -> ApiResult<usize> {
+        Ok(self
+            .get_all_users()?
+            .iter()
+            .filter(|u| u.enabled && u.role.is_admin())
+            .count())
     }
 
     /// Get the users tree
@@ -299,57 +343,56 @@ impl SessionStore {
     }
 }
 
-/// Multi-tier rate limiters
+/// Rate limiters: global, per client IP, stricter per-IP for auth endpoints, and per principal
+/// (user session or API token).
 pub struct RateLimiters {
-    /// Global rate limiter (all requests)
-    pub global: Arc<
-        RwLock<
-            RateLimiter<
-                governor::state::direct::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
+    global: DefaultDirectRateLimiter,
+    ip: DefaultKeyedRateLimiter<IpAddr>,
+    auth: DefaultKeyedRateLimiter<IpAddr>,
+    principal: DefaultKeyedRateLimiter<String>,
+    checks: std::sync::atomic::AtomicU64,
+}
 
-    /// Per-IP rate limiters
-    pub per_ip: Arc<
-        DashMap<
-            IpAddr,
-            RateLimiter<
-                governor::state::direct::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
-
-    /// Per-user rate limiters
-    pub per_user: Arc<
-        DashMap<
-            String,
-            RateLimiter<
-                governor::state::direct::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
+fn per_minute(n: u64) -> Quota {
+    Quota::per_minute(
+        NonZeroU32::new(n.clamp(1, u32::MAX as u64) as u32).unwrap_or(NonZeroU32::MIN),
+    )
 }
 
 impl RateLimiters {
-    pub fn new(global_rpm: u64, _ip_rpm: u64, _user_rpm: u64) -> Self {
-        // Convert to NonZeroU32, defaulting to 1 if 0 or too large
-        let global_rpm_u32 = NonZeroU32::new(global_rpm.min(u32::MAX as u64) as u32)
-            .unwrap_or(NonZeroU32::new(1).unwrap());
-        let global_quota = Quota::per_minute(global_rpm_u32);
-        let global_limiter = RateLimiter::direct(global_quota);
-
+    pub fn new(global_rpm: u64, ip_rpm: u64, principal_rpm: u64, auth_rpm: u64) -> Self {
         Self {
-            global: Arc::new(RwLock::new(global_limiter)),
-            per_ip: Arc::new(DashMap::new()),
-            per_user: Arc::new(DashMap::new()),
+            global: governor::RateLimiter::direct(per_minute(global_rpm)),
+            ip: governor::RateLimiter::keyed(per_minute(ip_rpm)),
+            auth: governor::RateLimiter::keyed(per_minute(auth_rpm)),
+            principal: governor::RateLimiter::keyed(per_minute(principal_rpm)),
+            checks: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn housekeeping(&self) {
+        if self.checks.fetch_add(1, Ordering::Relaxed) % 4096 == 4095 {
+            self.ip.retain_recent();
+            self.auth.retain_recent();
+            self.principal.retain_recent();
+        }
+    }
+
+    pub fn check_global(&self) -> bool {
+        self.global.check().is_ok()
+    }
+
+    pub fn check_ip(&self, ip: IpAddr) -> bool {
+        self.housekeeping();
+        self.ip.check_key(&ip).is_ok()
+    }
+
+    pub fn check_auth(&self, ip: IpAddr) -> bool {
+        self.auth.check_key(&ip).is_ok()
+    }
+
+    pub fn check_principal(&self, key: &str) -> bool {
+        self.principal.check_key(&key.to_string()).is_ok()
     }
 }
 
@@ -377,15 +420,23 @@ pub async fn build_state(
 
     // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
+    let db = session_store.db();
 
-    // Initialize session manager (in-memory active sessions)
-    let session_manager = Arc::new(SessionManager::default());
+    // Sessions (write-through, so revocation survives restarts), tokens and audit share the db.
+    let session_manager = Arc::new(SessionManager::new(Some(db.open_tree("sessions")?)));
+    let tokens = Arc::new(TokenStore::new(Some(db.open_tree("api_tokens")?)));
+    let audit = Arc::new(AuditStore::new(
+        db,
+        api_config.audit.max_entries,
+        api_config.audit.retention_days,
+    )?);
 
     // Initialize rate limiters
     let rate_limiters = Arc::new(RateLimiters::new(
         api_config.rate_limit.global_requests_per_minute,
         api_config.rate_limit.ip_requests_per_minute,
         api_config.rate_limit.user_requests_per_minute,
+        api_config.network.auth_requests_per_minute as u64,
     ));
 
     // Create proxy state
@@ -415,6 +466,13 @@ pub async fn build_state(
         jwt_config,
         rate_limiters,
         config_path: Arc::new(RwLock::new(config_path)),
+        api_config,
+        tokens,
+        audit,
+        recent_blocked: Arc::new(RecentBlocked::new(500)),
+        started_at: Instant::now(),
+        spec_json: OnceLock::new(),
+        route_auth: OnceLock::new(),
     }))
 }
 
