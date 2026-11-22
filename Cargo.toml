@@ -148,3 +148,17 @@ panic = "abort"
 opt-level = 0
 debug = true
 
+# Hot byte-crunching dependencies stay optimised in dev/test builds so streaming tests are fast.
+[profile.dev.package.lol_html]
+opt-level = 3
+[profile.dev.package.encoding_rs]
+opt-level = 3
+[profile.dev.package.brotli]
+opt-level = 3
+[profile.dev.package.brotli-decompressor]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
+

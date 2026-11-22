@@ -9,7 +9,15 @@
 //! cosmetic injection on the way back.
 
 use crate::authority;
-use crate::inject::{build_payload, full_body, inject_body, passthrough_body, ProxyBody};
+use crate::csp;
+use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody};
+use crate::internal::Internal;
+use crate::rewrite::codec::{choose_encoding, response_codings};
+use crate::rewrite::pipeline::{transform_html, transform_text, Outcome};
+use crate::rewrite::{
+    classify_body, media_type, BodyKind, HeaderEdit, HtmlPlan, ResponseInfo, ResponseTransforms,
+    TransformSource,
+};
 use crate::policy::{is_refusal, DestPolicy};
 use crate::redirect::{block_response, redirect_response, rewrite_redirect};
 use crate::request_ctx::{default_profile_slot, ProfileSlot, RequestCtx};
@@ -19,9 +27,9 @@ use crate::{Error, Result};
 use bytes::Bytes;
 use filter_engine::SharedEngine;
 use futures_util::TryStreamExt;
-use http_body_util::{BodyExt, Limited};
+use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
-use hyper::header::{HeaderMap, HeaderName, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HOST};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, HOST};
 use hyper::{Request, Response, StatusCode};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,9 +53,6 @@ const HOP_BY_HOP: &[&str] = &[
 /// Default cap on time-to-response-headers for an upstream call (includes uploading the body).
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
-/// Largest `/__adblock__/cc` request body accepted.
-const MAX_INTERNAL_BODY: usize = 64 * 1024;
-
 fn is_hop_by_hop(name: &HeaderName) -> bool {
     HOP_BY_HOP
         .iter()
@@ -63,55 +68,6 @@ fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
         .flat_map(|v| v.split(','))
         .filter_map(|t| HeaderName::from_bytes(t.trim().as_bytes()).ok())
         .collect()
-}
-
-/// Encodings the HTML injector can decode.
-fn injector_can_decode(token: &str) -> bool {
-    ["gzip", "x-gzip", "br", "deflate", "identity"]
-        .iter()
-        .any(|e| token.eq_ignore_ascii_case(e))
-}
-
-/// `Accept-Encoding` restricted to what the injector can decode (entries keep their q-values);
-/// `None` when the client sent none. Falls back to `identity` when nothing is left.
-fn restricted_accept_encoding(headers: &HeaderMap) -> Option<String> {
-    if !headers.contains_key(ACCEPT_ENCODING) {
-        return None;
-    }
-    let kept: Vec<&str> = headers
-        .get_all(ACCEPT_ENCODING)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .filter(|e| injector_can_decode(e.split(';').next().unwrap_or("").trim()))
-        .collect();
-    Some(if kept.is_empty() {
-        "identity".to_string()
-    } else {
-        kept.join(", ")
-    })
-}
-
-/// Whether the response body can be decoded by the injector: no encoding, or exactly one of the
-/// supported ones (stacked encodings are not).
-fn response_encoding_supported(headers: &HeaderMap) -> bool {
-    let mut tokens = headers
-        .get_all(CONTENT_ENCODING)
-        .iter()
-        .map(|v| v.to_str().ok())
-        .flat_map(|v| {
-            v.unwrap_or("?")
-                .split(',')
-                .map(str::trim)
-                .collect::<Vec<_>>()
-        })
-        .filter(|t| !t.is_empty());
-    match (tokens.next(), tokens.next()) {
-        (None, _) => true,
-        (Some(t), None) => injector_can_decode(t),
-        _ => false,
-    }
 }
 
 /// The 403 answer for a destination the policy refuses.
@@ -139,6 +95,10 @@ pub struct ProxyContext {
     policy: Arc<DestPolicy>,
     /// Client for requests aimed at the proxy's own ports (see [`build_strict_upstream_client`]).
     strict_client: reqwest::Client,
+    /// The `/__adblock__/` endpoints and their state.
+    internal: Arc<Internal>,
+    /// Optional per-response transforms (extended rules), see [`crate::rewrite`].
+    transform_source: parking_lot::RwLock<Option<Arc<dyn TransformSource>>>,
 }
 
 impl ProxyContext {
@@ -157,7 +117,14 @@ impl ProxyContext {
             default_ctx,
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
             resolve_all_to: None,
+            internal: Arc::new(Internal::new()),
+            transform_source: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Install (or clear) the source of per-response transforms.
+    pub fn set_transform_source(&self, source: Option<Arc<dyn TransformSource>>) {
+        *self.transform_source.write() = source;
     }
 
     /// Build the context and its pooled upstream client from `opts` in one step, so the HTTP
@@ -292,11 +259,6 @@ impl ProxyContext {
         let uri = req.uri().clone();
         let headers = req.headers().clone();
 
-        // Internal endpoints (dynamic cosmetic hiding callback) are answered locally, not forwarded.
-        if uri.path().starts_with("/__adblock__/") {
-            return Ok(self.handle_internal(req, &uri, rctx).await);
-        }
-
         // Target host/port: absolute-form URI / `:authority`, else the `Host` header, else the
         // MITM fallback. Authorities are parsed properly (bracketed IPv6, userinfo rejected).
         let named = authority::of_request(&uri, &headers);
@@ -317,6 +279,13 @@ impl ProxyContext {
             .or(named.as_ref().and_then(|(_, p)| *p))
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
         let url_host = authority::url_host(&host);
+
+        // Internal endpoints are answered locally for every host: never filtered, never
+        // forwarded.
+        if uri.path().starts_with(csp::INTERNAL_PREFIX) {
+            let engine = rctx.profile.load().engine.clone();
+            return Ok(self.internal.handle(req, &host, &engine).await);
+        }
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -383,7 +352,7 @@ impl ProxyContext {
         };
 
         let listed = connection_listed(&headers);
-        let restrict_encoding = rtype.is_frame();
+        let transformable_request = rtype.is_frame();
         // Code-only resolve override: reqwest never resolves IP literals, so aim those at the
         // override explicitly (the policy has already judged the requested literal) and keep the
         // original authority in `Host`.
@@ -408,18 +377,14 @@ impl ProxyContext {
             if is_hop_by_hop(name)
                 || listed.contains(name)
                 || name == HOST
-                || (restrict_encoding && name == ACCEPT_ENCODING)
+                // A document we may rewrite must come back whole, never as a 206 fragment.
+                || (transformable_request
+                    && (name == hyper::header::RANGE || name == hyper::header::IF_RANGE))
                 || (!has_body && name.as_str().eq_ignore_ascii_case("content-length"))
             {
                 continue;
             }
             rb = rb.header(name, value);
-        }
-        // Documents may be injected: only ask for encodings the injector can decode.
-        if restrict_encoding {
-            if let Some(v) = restricted_accept_encoding(&headers) {
-                rb = rb.header(ACCEPT_ENCODING, v);
-            }
         }
         if has_body {
             let stream = body
@@ -457,129 +422,263 @@ impl ProxyContext {
 
         let status = resp.status();
         let resp_headers = resp.headers().clone();
-
-        // Decide whether to inject cosmetics into an HTML document.
-        let is_html = resp_headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.to_ascii_lowercase().contains("text/html"))
-            .unwrap_or(false);
-
-        // Only inject into responses that actually carry an HTML body.
+        let kind = classify_body(is_head, status, rtype, &resp_headers);
+        // HEAD / 1xx / 204 / 205 / 304 never carry a body, whatever the origin's length says.
         let body_allowed = !is_head
             && status.as_u16() >= 200
             && status != StatusCode::NO_CONTENT
+            && status != StatusCode::RESET_CONTENT
             && status != StatusCode::NOT_MODIFIED;
-        // A body the injector cannot decode (zstd, stacked encodings) is passed through untouched.
-        let payload = if is_html && body_allowed && response_encoding_supported(&resp_headers) {
+
+        // Per-response work, decided once from the URL, type and headers.
+        let (enabled, cosmetics) = {
             let profile = rctx.profile.load();
-            if profile.engine.is_enabled() {
-                let cos = profile.engine.cosmetic_for(&url);
-                build_payload(&cos, !cos.generichide)
-            } else {
-                None
-            }
+            let enabled = profile.engine.is_enabled();
+            let cos = (enabled && kind == BodyKind::Html && body_allowed)
+                .then(|| profile.engine.cosmetic_for(&url));
+            (enabled, cos)
+        };
+        let source = self.transform_source.read().clone();
+        let transforms: ResponseTransforms = if enabled && kind != BodyKind::None {
+            source
+                .and_then(|s| {
+                    s.transforms_for(&ResponseInfo {
+                        url: &url,
+                        request_type: rtype,
+                        status,
+                        request_headers: &headers,
+                        response_headers: &resp_headers,
+                    })
+                })
+                .unwrap_or_default()
         } else {
-            None
+            ResponseTransforms::default()
         };
 
-        let inject = payload.is_some();
-        let content_encoding = resp_headers
-            .get(hyper::header::CONTENT_ENCODING)
+        let codings = response_codings(&resp_headers);
+        let out_coding = match &codings {
+            Ok(c) if !c.is_empty() => choose_encoding(&headers),
+            _ => None,
+        };
+        let origin_coded = matches!(&codings, Ok(c) if !c.is_empty());
+        let content_type = resp_headers
+            .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(str::to_string);
+
+        let mut csp_values: Vec<Option<String>> = Vec::new();
+        let mut rewritten = false;
+        let mut utf8_charset = false;
+        let mut text_changed = false;
+        let body: ProxyBody = match (kind, codings) {
+            (BodyKind::Html, Ok(codings)) if enabled && body_allowed => {
+                let origin = csp::PageOrigin::new(
+                    if scheme == "http" { "http" } else { "https" },
+                    &url_host,
+                    port,
+                );
+                let nonce = crate::inject::new_nonce();
+                let csp_headers: Vec<&str> = resp_headers
+                    .get_all("content-security-policy")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect();
+                let (blocks_scripts, opaque) = csp::sandbox_facts(&csp_headers);
+                let cos = cosmetics.unwrap_or_default();
+                let head = build_head(&PageSpec {
+                    cosmetics: &cos,
+                    internal: &self.internal,
+                    host: &host,
+                    nonce: &nonce,
+                    script_ok: !blocks_scripts,
+                    observer_ok: !opaque,
+                });
+                let needs = csp::Needs {
+                    script: head.has_script,
+                    style: head.has_style,
+                    connect: head.observer,
+                };
+                let meta_csp: Option<crate::rewrite::MetaCsp> = if head.observer {
+                    let (origin, nonce) = (origin.clone(), nonce.clone());
+                    Some(Arc::new(move |c: &str| {
+                        let a = csp::adapt(
+                            c,
+                            csp::PolicyKind::Meta,
+                            &origin,
+                            &nonce,
+                            csp::Needs {
+                                connect: true,
+                                ..Default::default()
+                            },
+                        );
+                        a.changed.then_some(a.text)
+                    }))
+                } else {
+                    None
+                };
+                let plan = HtmlPlan {
+                    head_html: head.html,
+                    injections: transforms.injections.clone(),
+                    remove_selectors: transforms.remove_selectors.clone(),
+                    replacements: transforms.text_replacements.clone(),
+                    meta_csp,
+                };
+                if plan.is_empty() {
+                    passthrough_body(resp)
+                } else {
+                    csp_values = csp::adapt_headers(&csp_headers, &origin, &nonce, needs).0;
+                    match transform_html(resp, codings, out_coding, content_type.clone(), plan)
+                        .await
+                    {
+                        Outcome::Html {
+                            body,
+                            utf8_charset: u,
+                        } => {
+                            rewritten = true;
+                            utf8_charset = u;
+                            body
+                        }
+                        Outcome::Untouched(b) => {
+                            csp_values.clear();
+                            b
+                        }
+                        Outcome::Text { body } => body,
+                    }
+                }
+            }
+            (BodyKind::Other | BodyKind::Html, Ok(codings))
+                if body_allowed
+                    && transforms.body.as_ref().is_some_and(|t| {
+                        media_type(&resp_headers).is_some_and(|m| t.applies_to(&m))
+                    }) =>
+            {
+                let t = transforms.body.clone().expect("checked");
+                match transform_text(resp, codings, out_coding, t).await {
+                    Outcome::Text { body } => {
+                        text_changed = true;
+                        body
+                    }
+                    Outcome::Untouched(b) => b,
+                    Outcome::Html { body, .. } => body,
+                }
+            }
+            _ if !body_allowed => full_body(Bytes::new()),
+            _ => passthrough_body(resp),
+        };
+        let changed = rewritten || text_changed;
 
         let listed_resp = connection_listed(&resp_headers);
         let mut builder = Response::builder().status(status);
+        let mut csp_idx = 0usize;
+        let mut vary_seen = false;
         for (name, value) in resp_headers.iter() {
-            // Content-Length is kept (HEAD and 304 answers must report the origin's length, and
-            // passed-through bodies are byte-identical); it is dropped only for injected HTML,
-            // whose length changes. That body also drops Content-Encoding: it is re-emitted as
-            // identity.
-            if is_hop_by_hop(name)
-                || listed_resp.contains(name)
-                || (inject && name == hyper::header::CONTENT_LENGTH)
-            {
+            if is_hop_by_hop(name) || listed_resp.contains(name) {
                 continue;
             }
             // Never advertise HTTP/3 (QUIC bypasses the proxy): clients keep using TCP.
             if name == hyper::header::ALT_SVC {
                 continue;
             }
-            if inject && name == hyper::header::CONTENT_ENCODING {
-                continue;
+            if changed {
+                // The body is new: framing, encoding, validators and digests no longer describe it.
+                let n = name.as_str();
+                if name == hyper::header::CONTENT_LENGTH
+                    || name == hyper::header::CONTENT_ENCODING
+                    || name == hyper::header::ACCEPT_RANGES
+                    || matches!(n, "content-md5" | "digest" | "repr-digest" | "content-digest")
+                {
+                    continue;
+                }
+                if name == hyper::header::ETAG {
+                    if let Ok(v) = value.to_str() {
+                        let weak = if v.starts_with("W/") {
+                            v.to_string()
+                        } else {
+                            format!("W/{v}")
+                        };
+                        if let Ok(hv) = HeaderValue::from_str(&weak) {
+                            builder = builder.header(name, hv);
+                            continue;
+                        }
+                    }
+                }
+                if name == CONTENT_TYPE && utf8_charset {
+                    if let Ok(v) = value.to_str() {
+                        if let Ok(hv) = HeaderValue::from_str(
+                            &crate::rewrite::charset::with_charset(v, "utf-8"),
+                        ) {
+                            builder = builder.header(name, hv);
+                            continue;
+                        }
+                    }
+                }
+                if name == hyper::header::VARY {
+                    vary_seen = true;
+                    if let Ok(v) = value.to_str() {
+                        if v.trim() == "*" {
+                            builder = builder.header(name, value);
+                        } else if let Ok(hv) = HeaderValue::from_str(&format!(
+                            "{v}, {}",
+                            vary_additions(origin_coded)
+                        )) {
+                            builder = builder.header(name, hv);
+                        }
+                        continue;
+                    }
+                }
+            }
+            if rewritten && name.as_str() == "content-security-policy" {
+                let adapted = csp_values.get(csp_idx).cloned().flatten();
+                csp_idx += 1;
+                if let Some(v) = adapted.and_then(|v| HeaderValue::from_str(&v).ok()) {
+                    builder = builder.header(name, v);
+                    continue;
+                }
             }
             builder = builder.header(name, value);
+        }
+        if changed {
+            if !vary_seen {
+                builder = builder.header(hyper::header::VARY, vary_additions(origin_coded));
+            }
+            if let Some(c) = out_coding {
+                builder = builder.header(hyper::header::CONTENT_ENCODING, c.token());
+            }
         }
         // `$csp`: an additional policy header; the browser enforces the intersection with any
         // policy the origin sent.
         if let Some(csp) = csp {
-            if let Ok(v) = hyper::header::HeaderValue::from_str(&csp) {
+            if let Ok(v) = HeaderValue::from_str(&csp) {
                 builder = builder.header("content-security-policy", v);
             }
         }
-
-        let body = match payload {
-            Some(p) => inject_body(resp, p, content_encoding.as_deref()),
-            // HEAD / 204 / 304 never carry a body, whatever the origin's length header says.
-            None if !body_allowed => full_body(Bytes::new()),
-            None => passthrough_body(resp),
-        };
-
-        builder
+        let mut response = builder
             .body(body)
-            .map_err(|e| Error::Connection(format!("build response: {e}")))
-    }
-
-    /// Handle a `/__adblock__/...` internal request (never forwarded upstream).
-    async fn handle_internal(
-        &self,
-        req: Request<Incoming>,
-        uri: &hyper::Uri,
-        rctx: &RequestCtx,
-    ) -> Response<ProxyBody> {
-        if uri.path() == "/__adblock__/cc" && req.method() == hyper::Method::POST {
-            let bytes = match Limited::new(req.into_body(), MAX_INTERNAL_BODY)
-                .collect()
-                .await
-            {
-                Ok(c) => c.to_bytes(),
-                Err(e)
-                    if e.downcast_ref::<http_body_util::LengthLimitError>()
-                        .is_some() =>
-                {
-                    return status_response(StatusCode::PAYLOAD_TOO_LARGE, "Body too large")
+            .map_err(|e| Error::Connection(format!("build response: {e}")))?;
+        for edit in &transforms.header_edits {
+            match edit {
+                HeaderEdit::Set(n, v) => {
+                    response.headers_mut().insert(n.clone(), v.clone());
                 }
-                Err(_) => return bad_request("body"),
-            };
-            #[derive(serde::Deserialize)]
-            struct CcReq {
-                url: String,
-                #[serde(default)]
-                classes: Vec<String>,
-                #[serde(default)]
-                ids: Vec<String>,
+                HeaderEdit::Append(n, v) => {
+                    response.headers_mut().append(n.clone(), v.clone());
+                }
+                HeaderEdit::Remove(n) => {
+                    response.headers_mut().remove(n);
+                }
             }
-            let parsed: CcReq = match serde_json::from_slice(&bytes) {
-                Ok(p) => p,
-                Err(_) => return bad_request("json"),
-            };
-            let selectors = rctx.profile.load().engine.dynamic_hide_selectors(
-                &parsed.url,
-                &parsed.classes,
-                &parsed.ids,
-            );
-            let json = serde_json::json!({ "selectors": selectors }).to_string();
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "application/json")
-                .body(full_body(Bytes::from(json)))
-                .expect("internal json response");
         }
-        Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(full_body(Bytes::new()))
-            .expect("internal 404")
+        Ok(response)
+    }
+}
+
+/// `Vary` members added to a rewritten response: the body depends on the request type and on
+/// the negotiated coding.
+fn vary_additions(encoded: bool) -> &'static str {
+    if encoded {
+        "Accept-Encoding, Sec-Fetch-Dest"
+    } else {
+        "Sec-Fetch-Dest"
     }
 }
 
