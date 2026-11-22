@@ -121,9 +121,26 @@ pub struct PerformanceSettings {
     pub max_html_buffers: usize,
     pub connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
-    /// New connections admitted per second; 0 or unset = unlimited (default 10000).
-    #[serde(default)]
+    /// New connections admitted per second. A missing key means [`DEFAULT_CONNECTION_RATE_LIMIT`];
+    /// unlimited must be asked for explicitly with `0`.
+    #[serde(default = "default_connection_rate_limit")]
     pub connection_rate_limit: Option<u32>,
+}
+
+/// Default for `performance.connection_rate_limit` (connections per second).
+pub const DEFAULT_CONNECTION_RATE_LIMIT: u32 = 10_000;
+
+fn default_connection_rate_limit() -> Option<u32> {
+    Some(DEFAULT_CONNECTION_RATE_LIMIT)
+}
+
+impl PerformanceSettings {
+    /// The admission rate in connections per second; `0` is unlimited. `None` (only possible
+    /// when built in code) means the default, never unlimited.
+    pub fn effective_connection_rate_limit(&self) -> u32 {
+        self.connection_rate_limit
+            .unwrap_or(DEFAULT_CONNECTION_RATE_LIMIT)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -474,32 +491,137 @@ pub enum ConfigError {
     Serialize(String),
 }
 
-/// Connection cap derived from the soft `RLIMIT_NOFILE`: two descriptors per proxied connection
-/// (client and upstream) after reserving headroom for listeners, pool, files and the API.
-pub fn derive_max_connections() -> usize {
-    const HEADROOM: u64 = 512;
-    const CAP: usize = 100_000;
-    const FLOOR: usize = 256;
-    #[cfg(unix)]
-    {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes into the provided struct.
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
-            #[allow(clippy::unnecessary_cast)] // rlim_t differs per platform
-            let soft = lim.rlim_cur as u64;
-            let usable = soft.saturating_sub(HEADROOM) / 2;
-            return (usable as usize).clamp(FLOOR, CAP);
-        }
+/// Descriptors budgeted per proxied connection: the client socket, its upstream socket and one
+/// idle pooled upstream socket.
+pub const FDS_PER_CONNECTION: u64 = 3;
+/// Fixed descriptors set aside for listeners, files, the database and the control plane.
+pub const FD_RESERVE: u64 = 512;
+const MAX_CONNECTIONS_CAP: usize = 100_000;
+const MAX_CONNECTIONS_FLOOR: usize = 16;
+
+/// Connection cap for a descriptor limit (`u64::MAX` = unlimited): [`FDS_PER_CONNECTION`] per
+/// connection after [`FD_RESERVE`], so clients + upstreams + idle pool stay within the limit.
+pub fn max_connections_for_limit(limit: u64) -> usize {
+    let usable = limit.saturating_sub(FD_RESERVE) / FDS_PER_CONNECTION;
+    usize::try_from(usable)
+        .unwrap_or(usize::MAX)
+        .clamp(MAX_CONNECTIONS_FLOOR, MAX_CONNECTIONS_CAP)
+}
+
+/// Idle upstream connections kept per origin, scaled down when descriptors are scarce so the
+/// pool's share of the budget (one descriptor per connection slot) stays small.
+pub fn pool_idle_per_host(max_connections: usize) -> usize {
+    (max_connections / 16).clamp(1, 32)
+}
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit (once per process) and return the limit now
+/// in force; `u64::MAX` means unlimited. `None` when it cannot be read.
+pub fn raise_nofile_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(raise_nofile_limit_once)
+}
+
+#[cfg(unix)]
+fn raise_nofile_limit_once() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes into the provided struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
     }
-    10_000
+    if lim.rlim_cur < lim.rlim_max {
+        let want = libc::rlimit {
+            rlim_cur: lim.rlim_max,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: setrlimit only reads the provided struct.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &want) } == 0 {
+            lim.rlim_cur = lim.rlim_max;
+        }
+        // On failure (some platforms reject an infinite or oversized value) the soft limit
+        // stays as it was and is what gets budgeted.
+    }
+    #[allow(clippy::unnecessary_cast)] // rlim_t differs per platform
+    let cur = lim.rlim_cur as u64;
+    Some(if cur == libc::RLIM_INFINITY as u64 {
+        u64::MAX
+    } else {
+        cur
+    })
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit_once() -> Option<u64> {
+    None
+}
+
+/// Connection cap derived from the (raised) soft `RLIMIT_NOFILE`.
+pub fn derive_max_connections() -> usize {
+    raise_nofile_limit().map_or(10_000, max_connections_for_limit)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_budget_for_soft_limits() {
+        // 1024: (1024 - 512) / 3
+        assert_eq!(max_connections_for_limit(1024), 170);
+        assert_eq!(max_connections_for_limit(65_536), 21_674);
+        assert_eq!(max_connections_for_limit(u64::MAX), 100_000);
+        for limit in [1024u64, 4096, 65_536, 1_048_576] {
+            let n = max_connections_for_limit(limit) as u64;
+            assert!(
+                n * FDS_PER_CONNECTION + FD_RESERVE <= limit,
+                "{limit}: {n} connections overflow the limit"
+            );
+        }
+        assert_eq!(pool_idle_per_host(170), 10);
+        assert_eq!(pool_idle_per_host(100_000), 32);
+        assert_eq!(pool_idle_per_host(1), 1);
+    }
+
+    #[test]
+    fn raising_the_limit_reaches_the_hard_limit() {
+        let now = raise_nofile_limit().unwrap();
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into the provided struct.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
+        // Either the soft limit equals the hard one, or raising was refused and it is unchanged.
+        assert!(now >= lim.rlim_cur as u64 || now == u64::MAX);
+    }
+
+    #[test]
+    fn missing_rate_limit_is_the_default_and_zero_is_explicit_unlimited() {
+        let base = toml::to_string(&ProxyConfig::default()).unwrap();
+        let without: String = base
+            .lines()
+            .filter(|l| !l.starts_with("connection_rate_limit"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!without.contains("connection_rate_limit"));
+        let c = ProxyConfig::from_toml(&without).unwrap();
+        assert_eq!(c.performance.effective_connection_rate_limit(), 10_000);
+        let zero = base
+            .lines()
+            .map(|l| {
+                if l.starts_with("connection_rate_limit") {
+                    "connection_rate_limit = 0"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let c = ProxyConfig::from_toml(&zero).unwrap();
+        assert_eq!(c.performance.effective_connection_rate_limit(), 0);
+    }
 
     #[test]
     fn removed_settings_are_rejected_with_a_clear_message() {

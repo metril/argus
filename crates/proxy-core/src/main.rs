@@ -25,6 +25,8 @@ async fn main() -> Result<()> {
     // Load configuration
     let config_path =
         std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config/default.toml".to_string());
+    // Raise the soft descriptor limit before anything derives a budget from it.
+    common::config::raise_nofile_limit();
     info!("Loading configuration from: {}", config_path);
 
     let config = ProxyConfig::from_file(&config_path).map_err(|e| {

@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn derived_max_connections_is_sane() {
         let n = derive_max_connections();
-        assert!((256..=100_000).contains(&n));
+        assert!((16..=100_000).contains(&n));
     }
 
     #[test]

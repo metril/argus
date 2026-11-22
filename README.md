@@ -184,8 +184,8 @@ block_private_destinations = false
 allowed_destinations = []
 
 [performance]
-max_connections = 0          # 0 = derive from the soft RLIMIT_NOFILE (2 fds per connection)
-connection_rate_limit = 10000  # new connections per second (0 = unlimited)
+max_connections = 0          # 0 = derive from the soft RLIMIT_NOFILE (3 fds per connection plus a reserve; the soft limit is raised to the hard limit first)
+connection_rate_limit = 10000  # new connections per second; a missing key means 10000, 0 = unlimited
 
 [mitm]
 enabled = true

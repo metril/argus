@@ -75,13 +75,23 @@ impl ProxyServer {
                 0 => crate::load_manager::derive_max_connections(),
                 n => n,
             },
-            connection_rate_limit: config.performance.connection_rate_limit.unwrap_or(0),
+            connection_rate_limit: config.performance.effective_connection_rate_limit(),
             adaptive_concurrency: true,
             ..Default::default()
         };
         info!(
-            "Load manager initialized: max_connections={}, rate_limit={}/s",
-            load_manager_config.max_connections, load_manager_config.connection_rate_limit
+            "Load manager initialized: max_connections={}, rate_limit={}/s, fd_limit={}, \
+             fds_per_connection={}, fd_reserve={}, pool_idle_per_host={}",
+            load_manager_config.max_connections,
+            load_manager_config.connection_rate_limit,
+            match common::config::raise_nofile_limit() {
+                Some(u64::MAX) => "unlimited".to_string(),
+                Some(n) => n.to_string(),
+                None => "unknown".to_string(),
+            },
+            common::config::FDS_PER_CONNECTION,
+            common::config::FD_RESERVE,
+            common::config::pool_idle_per_host(load_manager_config.max_connections),
         );
         let load_manager = Arc::new(LoadManager::new(load_manager_config));
 
@@ -310,13 +320,9 @@ impl ProxyServer {
                             let shared = shared.clone();
                             let entry = entry.clone();
                             let mut shutdown_rx = shutdown_tx.subscribe();
-                            let load_manager = self.load_manager.clone();
-
-                            // Spawn a new task to handle this connection
-                            tokio::spawn(async move {
-                                // Create connection guard for automatic cleanup
-                                let _guard = ConnectionGuard::new(load_manager);
-
+                            // Spawn a new task to handle this connection; admission already
+                            // counted it, and the guard releases it even if the task never runs.
+                            spawn_admitted(&self.load_manager, async move {
                                 let handler = ConnectionHandler::new(client_addr, shared);
                                 tokio::select! {
                                     result = async {
@@ -333,7 +339,6 @@ impl ProxyServer {
                                         debug!("Connection from {} terminated due to shutdown", client_addr);
                                     }
                                 }
-                                // _guard is dropped here, releasing the connection
                             });
                         }
                         Err(e) => {
@@ -366,6 +371,19 @@ impl ProxyServer {
 }
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
+/// Spawn the task of an admitted connection. The guard is created here, before the spawn, so a
+/// task dropped or aborted before its first poll still releases the admission it holds.
+fn spawn_admitted<F>(load_manager: &Arc<LoadManager>, fut: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let guard = ConnectionGuard::new(load_manager.clone());
+    tokio::spawn(async move {
+        let _guard = guard;
+        fut.await
+    })
+}
+
 async fn shutdown_signal_handler() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -391,5 +409,22 @@ async fn shutdown_signal_handler() {
         _ = terminate => {
             info!("Received SIGTERM signal");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_task_aborted_before_its_first_poll_releases_its_admission() {
+        let lm = Arc::new(LoadManager::with_defaults());
+        assert_eq!(lm.check_admission(), AdmissionResult::Admitted);
+        assert_eq!(lm.stats().active_connections, 1);
+        let h = spawn_admitted(&lm, std::future::pending());
+        // Current-thread runtime: the spawned task has not been polled yet.
+        h.abort();
+        let _ = h.await;
+        assert_eq!(lm.stats().active_connections, 0);
     }
 }

@@ -26,6 +26,8 @@ pub struct UpstreamOptions {
     pub policy: Arc<DestPolicy>,
     /// Shared caching resolver; a default one is created per client when `None`.
     pub dns: Option<Arc<CachedResolver>>,
+    /// Idle pooled connections kept per origin; `None` keeps the default of 32.
+    pub pool_max_idle_per_host: Option<usize>,
 }
 
 impl UpstreamOptions {
@@ -41,6 +43,12 @@ impl UpstreamOptions {
                 config.performance.request_timeout_secs.max(1),
             )),
             dns: Some(Arc::new(CachedResolver::from_settings(&config.dns))),
+            pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
+                match config.performance.max_connections {
+                    0 => common::config::derive_max_connections(),
+                    n => n,
+                },
+            )),
             policy: Arc::new(DestPolicy::from_config(config).unwrap_or_else(|e| {
                 // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
                 tracing::warn!("destination policy config invalid: {e}");
@@ -170,8 +178,10 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Detect dead pooled connections (NAT timeouts, vanished peers) before a request is
         // sent down one.
         .tcp_keepalive(Some(Duration::from_secs(60)))
-        // Bound idle descriptors per origin; connections beyond this are closed when idle.
-        .pool_max_idle_per_host(32)
+        // Bound idle descriptors per origin (scaled to the descriptor budget); connections
+        // beyond this are closed when idle. reqwest has no total cap, so the budget also
+        // reserves one descriptor per connection slot for the pool.
+        .pool_max_idle_per_host(opts.pool_max_idle_per_host.unwrap_or(32))
         .pool_idle_timeout(Duration::from_secs(60))
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
@@ -238,6 +248,16 @@ mod tests {
         // A config file cannot carry the override: unknown keys are not part of the schema.
         let toml = toml::to_string(&cfg).unwrap();
         assert!(!toml.contains("resolve_all_to"));
+    }
+
+    #[test]
+    fn pool_idle_cap_follows_the_connection_budget() {
+        let mut cfg = crate::ProxyConfig::default();
+        cfg.performance.max_connections = 170;
+        assert_eq!(
+            UpstreamOptions::from_config(&cfg).pool_max_idle_per_host,
+            Some(10)
+        );
     }
 
     struct Fixed(std::sync::atomic::AtomicU64, IpAddr);

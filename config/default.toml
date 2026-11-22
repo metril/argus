@@ -26,9 +26,9 @@ cert_ttl_days = 30
 cert_idle_timeout_secs = 3600
 
 [performance]
-# 0 derives the cap from the soft RLIMIT_NOFILE (two descriptors per connection).
+# 0 derives the cap from the soft RLIMIT_NOFILE (three descriptors per connection plus a fixed reserve; the soft limit is first raised to the hard limit).
 max_connections = 0
-# New connections admitted per second (0 = unlimited).
+# New connections admitted per second; a missing key means 10000, 0 = unlimited.
 connection_rate_limit = 10000
 max_cert_generations = 10
 max_html_buffers = 200
