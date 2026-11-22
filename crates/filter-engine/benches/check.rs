@@ -82,7 +82,11 @@ fn bench_real(c: &mut Criterion) {
     let t = Instant::now();
     let engine = try_build_engine(&built.blob, &[]).expect("engine");
     let t_load = t.elapsed();
-    let rules: usize = built.reports.iter().map(|r| r.network + r.cosmetic + r.ext).sum();
+    let rules: usize = built
+        .reports
+        .iter()
+        .map(|r| r.network + r.cosmetic + r.ext)
+        .sum();
     eprintln!(
         "real lists: {rules} rules, build_set {t_build:?}, engine load {t_load:?}, blob {} KiB, \
          domain set {} entries, rss delta {} KiB",

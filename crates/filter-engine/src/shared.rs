@@ -9,7 +9,6 @@
 //! The compiled blob is kept next to the live engine so it can be persisted
 //! ([`SharedEngine::serialized`]) and so the resource library can be re-applied.
 
-use adblock::request::Request as AdblockRequest;
 use adblock::resources::Resource;
 use adblock::Engine as AdblockEngine;
 use arc_swap::ArcSwap;
@@ -542,7 +541,12 @@ impl SharedEngine {
     pub fn site_off(&self, page_url: &str) -> bool {
         self.enabled.load(Ordering::Relaxed)
             && self
-                .decide(&self.engine.load().engine, SITE_OFF_PROBE, page_url, "other")
+                .decide(
+                    &self.engine.load().engine,
+                    SITE_OFF_PROBE,
+                    page_url,
+                    "other",
+                )
                 .exception_rule
                 .is_some()
     }
