@@ -39,3 +39,5 @@ async-compression = { workspace = true, features = ["zstd"] }
 encoding_rs = "0.8"
 serde_json = { workspace = true }
 base64 = "0.22"
+hdrhistogram = { version = "7", default-features = false }
+libc = "0.2"

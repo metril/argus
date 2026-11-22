@@ -113,6 +113,44 @@ impl TestClient {
         }
     }
 
+    fn load_builder(ca: &[u8], version: HttpVersion) -> reqwest::ClientBuilder {
+        crate::init_crypto();
+        let b = reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_root_certs(false)
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(4096)
+            .add_root_certificate(reqwest::Certificate::from_pem(ca).expect("CA pem"));
+        match version {
+            HttpVersion::Auto => b,
+            HttpVersion::Http1 => b.http1_only(),
+            HttpVersion::Http2 => b.http2_prior_knowledge(),
+        }
+    }
+
+    /// Client for load tests that dials `origin` directly (every hostname resolves to it; no
+    /// proxy), trusting only the origin CA.
+    pub fn direct(origin: &crate::TestOrigin, version: HttpVersion) -> Self {
+        let b = Self::load_builder(origin.ca_pem().as_bytes(), version)
+            .dns_resolver(std::sync::Arc::new(ToListener(origin.ip())));
+        Self {
+            inner: b.build().expect("client"),
+            transparent_port: None,
+        }
+    }
+
+    /// Client for load tests behind the explicit proxy at `proxy_url` (any process), trusting
+    /// only `ca_pem`, the proxy's CA.
+    pub fn explicit(proxy_url: &str, ca_pem: &[u8], version: HttpVersion) -> Self {
+        let b = Self::load_builder(ca_pem, version)
+            .proxy(reqwest::Proxy::all(proxy_url).expect("proxy url"));
+        Self {
+            inner: b.build().expect("client"),
+            transparent_port: None,
+        }
+    }
+
     /// `url` as this client must request it (port rewritten in transparent mode).
     fn map(&self, url: &str) -> reqwest::Url {
         let mut u = reqwest::Url::parse(url).expect("url");

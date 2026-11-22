@@ -53,6 +53,12 @@ impl OriginalDst for TestDst {
 pub fn install_rules(engine: &SharedEngine, rules: &[&str]) {
     let trusted = !rules.contains(&"!untrusted");
     let text: String = rules.iter().map(|r| format!("{r}\n")).collect();
+    install_rules_text(engine, text, trusted);
+}
+
+/// Compile `text` (one ABP list) and install it as [`install_rules`] does; the same steps the
+/// list service runs after a rebuild.
+pub fn install_rules_text(engine: &SharedEngine, text: String, trusted: bool) {
     let built = filter_engine::build_set(&[filter_engine::ListInput {
         id: "test".into(),
         content: text,
