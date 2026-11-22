@@ -62,7 +62,17 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse
     Json(MetricsResponse {
         proxy: proxy_stats(&state),
         filter: filter_stats(&state),
+        storage: storage_metrics(&state),
     })
+}
+
+fn storage_metrics(state: &AppState) -> api_types::StorageMetrics {
+    let s = state.session_store.db().deferred_stats();
+    api_types::StorageMetrics {
+        deferred_dropped: s.dropped,
+        deferred_failed: s.failed,
+        deferred_queued: s.queued,
+    }
 }
 
 /// The same metrics in Prometheus text exposition format.
@@ -134,6 +144,25 @@ pub async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl Into
         "counter",
         "Requests allowed.",
         f.allowed_requests,
+    );
+    let st = storage_metrics(&state);
+    metric(
+        "adblocker_db_deferred_dropped_total",
+        "counter",
+        "Telemetry database writes dropped because the queue was full.",
+        st.deferred_dropped,
+    );
+    metric(
+        "adblocker_db_deferred_failed_total",
+        "counter",
+        "Deferred database writes that failed or panicked.",
+        st.deferred_failed,
+    );
+    metric(
+        "adblocker_db_deferred_queued",
+        "gauge",
+        "Deferred database writes waiting to be committed.",
+        st.deferred_queued,
     );
     metric(
         "adblocker_uptime_seconds",

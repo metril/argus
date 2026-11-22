@@ -51,9 +51,13 @@ async fn metrics_require_system_read() {
     let r = admin.get("/api/v1/system/metrics").await;
     r.assert_status_ok();
     assert!(r.json::<Value>()["proxy"]["connections"]["total"].is_number());
+    let m: Value = admin.get("/api/v1/system/metrics").await.json();
+    assert_eq!(m["storage"]["deferred_dropped"], 0);
+    assert_eq!(m["storage"]["deferred_failed"], 0);
     let p = admin.get("/api/v1/system/metrics/prometheus").await;
     p.assert_status_ok();
     assert!(p.text().contains("adblocker_filter_blocked_total"));
+    assert!(p.text().contains("adblocker_db_deferred_dropped_total"));
     admin.get("/api/v1/system/status").await.assert_status_ok();
 }
 

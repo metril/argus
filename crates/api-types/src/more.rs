@@ -326,6 +326,19 @@ pub struct SystemStatusResponse {
 pub struct MetricsResponse {
     pub proxy: ProxyStatsResponse,
     pub filter: FilterStatsResponse,
+    pub storage: StorageMetrics,
+}
+
+/// Health of the deferred (background) database writes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct StorageMetrics {
+    /// Telemetry writes discarded because the write queue was full.
+    pub deferred_dropped: u64,
+    /// Deferred writes that failed or panicked.
+    pub deferred_failed: u64,
+    /// Deferred writes waiting to be committed.
+    pub deferred_queued: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

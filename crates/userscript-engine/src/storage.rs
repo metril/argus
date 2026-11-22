@@ -140,7 +140,7 @@ impl UserscriptStorage {
         let bytes = serde_json::to_vec(&value)
             .map_err(|e| Error::Storage(format!("Failed to serialize value for {key}: {e}")))?;
         self.cache.write().insert(key.clone(), value);
-        self.db.defer(move |t| {
+        self.db.defer_keep(move |t| {
             t.open_table(tables::GM_VALUES)?
                 .insert(key.as_str(), bytes.as_slice())?;
             Ok(())

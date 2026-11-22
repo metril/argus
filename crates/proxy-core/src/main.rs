@@ -85,7 +85,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "webui")]
     if let Some(handle) = webui_handle {
         handle.abort();
+        // Wait for the task to wind down so it no longer holds the database.
+        let _ = handle.await;
     }
+
+    // Commit queued background writes and fsync before exiting; do not rely on the drop order
+    // of `Arc`s held by aborted tasks.
+    common::db::Db::sync_all();
 
     proxy_result.map_err(|e| {
         error!("Proxy server error: {}", e);
