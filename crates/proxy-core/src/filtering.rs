@@ -110,7 +110,8 @@ fn apply_overlay(
     if !ov.is_enabled() {
         return base;
     }
-    let o = ov.check_for(url, source_url, resource_type, &profile.label);
+    // Neither verdict is counted here: the caller records the final one once.
+    let o = ov.check_deferred(url, source_url, resource_type);
     if o.blocked || o.exception_rule.is_some() {
         return o;
     }
@@ -339,8 +340,12 @@ impl ProxyContext {
         profile.engine.is_enabled() && {
             let base = profile
                 .engine
-                .check_for(url, source_url, resource_type, &profile.label);
-            apply_overlay(&profile, base, url, source_url, resource_type).blocked
+                .check_deferred(url, source_url, resource_type);
+            let v = apply_overlay(&profile, base, url, source_url, resource_type);
+            profile
+                .engine
+                .record_verdict(v, url, source_url, resource_type, &profile.label)
+                .blocked
         }
     }
 
@@ -461,9 +466,10 @@ impl ProxyContext {
             let engine = &profile.engine;
             if engine.is_enabled() {
                 let source = source_url(&headers, &url, rtype);
-                let (verdict, gen_) =
-                    engine.check_gen(&url, source, rtype.as_str(), &profile.label);
+                let (verdict, gen_) = engine.check_gen_deferred(&url, source, rtype.as_str());
                 let verdict = apply_overlay(&profile, verdict, &url, source, rtype.as_str());
+                let verdict =
+                    engine.record_verdict(verdict, &url, source, rtype.as_str(), &profile.label);
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
@@ -475,7 +481,10 @@ impl ProxyContext {
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
-                page_off = rtype.is_frame() && engine.site_off(&url);
+                // A non-default profile keeps its per-site exceptions in its overlay rules.
+                page_off = rtype.is_frame()
+                    && (engine.site_off(&url)
+                        || profile.overlay.as_ref().is_some_and(|o| o.site_off(&url)));
                 if let Some(new_url) = verdict.rewritten_url {
                     let navigation =
                         rtype == RequestType::Document && (method == hyper::Method::GET || is_head);

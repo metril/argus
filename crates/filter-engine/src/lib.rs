@@ -43,7 +43,7 @@ pub use scriptlet_resources::{
     validate_resources, DroppedResource, ScriptletConversion, Validated, TRUSTED_PERMISSION,
 };
 pub use shared::{
-    build_engine, compile_engine, overlay_from_rules, try_build_engine, Cosmetics, Generation,
+    build_engine, compile_engine, overlay_from_rules, overlay_from_rules_shared, try_build_engine, Cosmetics, Generation,
     IpFilter, ResourceReport, SharedEngine,
 };
 pub use stats::{BlockingStats, FilterStats};
