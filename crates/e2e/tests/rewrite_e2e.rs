@@ -549,7 +549,10 @@ e2e_test!(strict_nonce_csp_gets_our_nonce, rules = AD, |env| {
             "{c}"
         );
         assert!(c.contains(&format!("style-src 'nonce-page' {want}")), "{c}");
-        assert!(c.contains("connect-src 'none' https://rw.test"), "{c}");
+        // A `'none'` source list is replaced by our source, never extended (that would make the
+        // browser ignore the `'none'`).
+        assert!(c.contains("connect-src https://rw.test"), "{c}");
+        assert!(!c.contains("'none' https://"), "{c}");
         assert!(
             c.contains("default-src 'none';"),
             "default-src untouched: {c}"
@@ -616,7 +619,13 @@ e2e_test!(multiple_and_report_only_policies, rules = AD, |env| {
         .to_str()
         .unwrap()
         .to_string();
-    assert_eq!(ro, "script-src 'none'");
+    // Report-Only policies get the same narrow additions (so our tags cause no reports); the
+    // original `script-src 'none'` is left as written.
+    assert!(
+        ro.starts_with("script-src 'none'; script-src-elem 'nonce-"),
+        "{ro}"
+    );
+    assert!(!ro.contains("'none' 'nonce"), "{ro}");
     let c = csp_values(&r);
     assert_eq!(c.len(), 2);
     assert_eq!(c[0], "script-src 'self'");
