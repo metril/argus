@@ -31,24 +31,7 @@ pub use e2e::{EntryMode, MockResponse, TestOrigin, TestProxy};
 /// Scenarios that currently fail because of a real proxy bug. A test listed here still runs and
 /// still prints its failure; it just does not fail the suite. Keep empty when everything passes.
 /// Each entry: (test name, bug description).
-pub const KNOWN_FAILING: &[(&str, &str)] = &[
-    (
-        "csp_default_src_none",
-        "csp.rs adapt() appends sources to `default-src 'none'` without dropping 'none'; browsers then log \
-         \"'none' alongside other source expressions ... ignored\" (policy text becomes malformed)",
-    ),
-    (
-        "csp_report_only_untouched",
-        "Content-Security-Policy-Report-Only is left untouched, so every injected resource (inline style, \
-         boot.js, scriptlet, /cc beacon) generates a violation report",
-    ),
-    (
-        "bundled_ubo_set_constant_runs",
-        "filter-engine scriptlet_resources.rs truncates `validate-constant.fn` in the bundled snapshot \
-         (default param `extraArgs = {}` breaks brace matching), so the served scriptlet bundle is a \
-         SyntaxError and no scriptlet depending on it runs",
-    ),
-];
+pub const KNOWN_FAILING: &[(&str, &str)] = &[];
 
 /// Run a scenario body; if the test is in [`KNOWN_FAILING`], report instead of failing.
 pub async fn run_known<F: std::future::Future<Output = ()> + Send + 'static>(name: &str, body: F) {
@@ -174,6 +157,18 @@ pub struct ResponseInfo {
     pub protocol: String,
     pub issuer: Option<String>,
     pub sans: Vec<String>,
+    /// Response headers (names as the browser reports them).
+    pub headers: serde_json::Value,
+}
+
+impl ResponseInfo {
+    /// First header named `name` (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers.as_object()?.iter().find_map(|(k, v)| {
+            k.eq_ignore_ascii_case(name)
+                .then(|| v.as_str().unwrap_or("").to_string())
+        })
+    }
 }
 
 /// Init script run in every document: records CSP violations (frames forward theirs to the top
@@ -226,7 +221,8 @@ pub enum Resources {
     /// A tiny local `set-constant` (no dependencies), so browser behaviour can be tested
     /// independently of the converted uBO library.
     Minimal,
-    /// The repo's pinned uBO snapshot, read at runtime (never compiled in: GPL data).
+    /// The repo's pinned uBO snapshot, read at runtime (never compiled in: GPL data). Goes through
+    /// the same validation as any library, so what the page runs is what the proxy would serve.
     Bundled,
 }
 
@@ -413,6 +409,7 @@ impl Session {
                     protocol: r.protocol.clone().unwrap_or_default(),
                     issuer: sd.map(|s| s.issuer.clone()),
                     sans: sd.map(|s| s.san_list.clone()).unwrap_or_default(),
+                    headers: serde_json::to_value(r.headers.inner()).unwrap_or_default(),
                 });
             }
         });

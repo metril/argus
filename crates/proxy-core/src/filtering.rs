@@ -127,6 +127,11 @@ impl ProxyContext {
         }
     }
 
+    /// Scriptlet names that pages reported as unsupported (no uBO equivalent), with report counts.
+    pub fn unsupported_scriptlets(&self) -> Vec<(String, u64)> {
+        self.internal.unsupported_scriptlets()
+    }
+
     /// Honour `Cache-Control: no-transform` on responses (default on).
     pub fn set_respect_no_transform(&self, respect: bool) {
         self.respect_no_transform.store(respect, Ordering::Relaxed);

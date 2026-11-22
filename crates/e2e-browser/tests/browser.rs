@@ -410,21 +410,130 @@ csp_test!(
     }
 );
 
-browser_test!(csp_report_only_header_is_not_modified, [COSMETIC], |s| {
-    let ro = "default-src 'none'; script-src 'nonce-N0'";
-    s.origin.route(
-        "/",
-        MockResponse::html("<!doctype html><title>t</title>")
-            .header("content-security-policy-report-only", ro),
-    );
-    s.goto(&s.url("csp.test", "/")).await;
-    let h = s
-        .eval(
-            "fetch(location.href).then(r => r.headers.get('content-security-policy-report-only'))",
+/// The document response the browser got for `url` (as the proxy rewrote it).
+fn document(s: &Session, url: &str) -> e2e_browser::ResponseInfo {
+    s.responses()
+        .into_iter()
+        .find(|r| r.url == url)
+        .unwrap_or_else(|| panic!("no response for {url}: {:?}", s.responses()))
+}
+
+/// `name value` pairs of a CSP header, in order.
+fn directives(h: &str) -> Vec<(String, String)> {
+    h.split(';')
+        .map(|d| d.trim())
+        .filter(|d| !d.is_empty())
+        .map(|d| match d.split_once(' ') {
+            Some((n, v)) => (n.to_string(), v.to_string()),
+            None => (d.to_string(), String::new()),
+        })
+        .collect()
+}
+
+fn no_none_mixed(h: &str) {
+    for (n, v) in directives(h) {
+        let toks: Vec<&str> = v.split(' ').collect();
+        assert!(
+            !(toks.len() > 1 && toks.contains(&"'none'")),
+            "{n} mixes 'none' with other sources in `{h}`"
+        );
+    }
+}
+
+browser_test!(
+    csp_default_src_none_is_narrowed_not_edited,
+    [COSMETIC, SCRIPTLET],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><div class=ad id=a1>x</div>")
+                .header("content-security-policy", "default-src 'none'"),
+        );
+        let url = s.url("csp.test", "/");
+        s.goto(&url).await;
+        let h = document(&s, &url)
+            .header("content-security-policy")
+            .expect("csp header");
+        eprintln!("default-src 'none' became: {h}");
+        let d = directives(&h);
+        assert_eq!(d[0], ("default-src".into(), "'none'".into()), "{h}");
+        let get = |n: &str| d.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+        assert!(
+            get("script-src-elem").is_some_and(|v| v.starts_with("'nonce-") && !v.contains(' '))
+        );
+        assert!(get("style-src-elem").is_some_and(|v| v.starts_with("'nonce-") && !v.contains(' ')));
+        assert!(
+            get("connect-src").is_some_and(|v| v.ends_with("/__adblock__/") && !v.contains(' '))
+        );
+        for other in [
+            "script-src",
+            "script-src-attr",
+            "style-src",
+            "style-src-attr",
+            "worker-src",
+            "img-src",
+        ] {
+            assert!(
+                get(other).is_none(),
+                "{other} must keep falling back to default-src: {h}"
+            );
+        }
+        no_none_mixed(&h);
+        assert_eq!(s.display("#a1").await, "none");
+        s.wait_for("boot loaded", "performance.getEntriesByType('resource').some(e => e.name.includes('/__adblock__/boot.') && e.responseStatus === 200)").await;
+        s.assert_clean().await;
+        // The page's own resources are still all blocked (this violation is the page's, not ours).
+        assert_eq!(
+            s.eval("new Promise(r => { const i = new Image(); i.onload = () => r('loaded'); i.onerror = () => r('blocked'); i.src = '/p.png'; })").await,
+            "blocked"
+        );
+        // Workers are still governed by the untouched `default-src 'none'`.
+        s.eval("(() => { try { new Worker('/__adblock__/boot.js').onerror = e => e.preventDefault(); } catch (_) {} return 1; })()").await;
+        s.wait_for(
+            "worker blocked by default-src",
+            "window.__viol.some(v => v.eff === 'worker-src' && v.disp === 'enforce')",
         )
         .await;
-    assert_eq!(h, ro);
-});
+    }
+);
+
+browser_test!(
+    csp_report_only_is_adapted_and_report_endpoints_kept,
+    [COSMETIC, SCRIPTLET],
+    |s| {
+        let ro = "default-src 'none'; report-uri /ro-report; report-to grp";
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><div class=ad id=a1>x</div>")
+                .header("content-security-policy-report-only", ro),
+        );
+        let url = s.url("csp.test", "/");
+        s.goto(&url).await;
+        s.wait_for("boot loaded", "performance.getEntriesByType('resource').some(e => e.name.includes('/__adblock__/boot.') && e.responseStatus === 200)").await;
+        let h = document(&s, &url)
+            .header("content-security-policy-report-only")
+            .expect("report-only header");
+        eprintln!("report-only became: {h}");
+        assert!(
+            h.starts_with(ro),
+            "original directives (incl. report endpoints) kept: {h}"
+        );
+        assert!(
+            h.contains("script-src-elem 'nonce-") && h.contains("style-src-elem 'nonce-"),
+            "{h}"
+        );
+        assert!(h.contains("connect-src https://csp.test:"), "{h}");
+        no_none_mixed(&h);
+        s.assert_clean().await; // no violation events of any disposition
+                                // Let a late report flush, then check the site's endpoint heard nothing.
+        s.eval("new Promise(r => setTimeout(r, 300))").await;
+        assert!(
+            s.origin.requests_for("/ro-report").is_empty(),
+            "our resources caused violation reports: {:?}",
+            s.origin.requests_for("/ro-report")
+        );
+    }
+);
 
 // ---- COEP ------------------------------------------------------------------------------------------
 
@@ -641,10 +750,178 @@ async fn transparent_mode_smoke() {
     s.finish().await;
 }
 
+// ---- extended rules ----------------------------------------------------------------------------------
+
+browser_test!(
+    replace_from_trusted_list_changes_the_script_the_page_runs,
+    ["||csp.test^$script,replace=/BAD_VALUE/GOOD_VALUE/"],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><script src=\"/app.js\"></script>"),
+        );
+        s.origin.route(
+            "/app.js",
+            MockResponse::ok("window.__v = 'BAD_VALUE';")
+                .header("content-type", "application/javascript"),
+        );
+        s.goto(&s.url("csp.test", "/")).await;
+        assert_eq!(s.eval("window.__v").await, "GOOD_VALUE");
+        s.assert_clean().await;
+    }
+);
+
+browser_test!(
+    replace_from_untrusted_list_is_ignored,
+    [
+        "!untrusted",
+        "/app.js$script,replace=/BAD_VALUE/GOOD_VALUE/"
+    ],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><script src=\"/app.js\"></script>"),
+        );
+        s.origin.route(
+            "/app.js",
+            MockResponse::ok("window.__v = 'BAD_VALUE';")
+                .header("content-type", "application/javascript"),
+        );
+        s.goto(&s.url("csp.test", "/")).await;
+        assert_eq!(s.eval("window.__v").await, "BAD_VALUE");
+    }
+);
+
+browser_test!(
+    html_filter_removes_an_inline_script_before_it_runs,
+    ["csp.test##^script:has-text(EVIL_MARKER)"],
+    |s| {
+        s.origin.route(
+        "/",
+        MockResponse::html(
+            "<!doctype html><title>t</title><script>window.__evil = 1; /* EVIL_MARKER */</script>\
+             <script>window.__ok = 1;</script><p id=p>text</p>",
+        ),
+    );
+        s.goto(&s.url("csp.test", "/")).await;
+        assert_eq!(
+            s.eval("typeof window.__evil").await,
+            "undefined",
+            "the removed script must never run"
+        );
+        assert_eq!(s.eval("window.__ok").await, 1);
+        assert_eq!(
+            s.eval("document.documentElement.outerHTML.includes('EVIL_MARKER')")
+                .await,
+            false
+        );
+        assert_eq!(
+            s.eval("[...document.scripts].filter(x => !x.src.includes('/__adblock__/') && x.type !== 'application/json').length").await,
+            1,
+            "only the benign inline script remains"
+        );
+        s.assert_clean().await;
+    }
+);
+
+browser_test!(
+    hash_percent_injection_from_a_trusted_list_runs,
+    ["csp.test#%#window.__inj = 'ran';"],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><p>x</p>"),
+        );
+        s.goto(&s.url("csp.test", "/")).await;
+        s.wait_for("injected script ran", "window.__inj === 'ran'")
+            .await;
+        s.assert_clean().await;
+    }
+);
+
+browser_test!(
+    hash_percent_injection_from_an_untrusted_list_does_not_run,
+    ["!untrusted", "csp.test#%#window.__inj = 'ran';", COSMETIC],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><div class=ad id=a1>x</div>"),
+        );
+        s.goto(&s.url("csp.test", "/")).await;
+        // The cosmetic rule of the same list still applies (so the page was processed), the code did not.
+        assert_eq!(s.display("#a1").await, "none");
+        s.wait_for("boot loaded", "performance.getEntriesByType('resource').some(e => e.name.includes('/__adblock__/boot.') && e.responseStatus === 200)").await;
+        assert_eq!(s.eval("typeof window.__inj").await, "undefined");
+        let loads = s.internal_loads().await;
+        assert!(
+            !loads.iter().any(|(p, _)| p.contains("/__adblock__/s/")),
+            "no script bundle may be served for an untrusted `#%#`: {loads:?}"
+        );
+        s.assert_clean().await;
+    }
+);
+
+browser_test!(
+    unsupported_scriptlet_report_reaches_the_beacon_without_violations,
+    [
+        "csp.test#%#//scriptlet('no-such-scriptlet-xyz', 'a')",
+        COSMETIC
+    ],
+    |s| {
+        // Strict policy: the beacon fetch needs the narrowed connect-src we add.
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><div class=ad id=a1>x</div>")
+                .header("content-security-policy", "default-src 'none'"),
+        );
+        s.goto(&s.url("csp.test", "/")).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let seen = s.proxy.ctx.unsupported_scriptlets();
+            if seen
+                .iter()
+                .any(|(n, c)| n == "no-such-scriptlet-xyz" && *c == 1)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "report never reached the beacon: {seen:?}\n{}",
+                s.dump()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(s.display("#a1").await, "none");
+        s.assert_clean().await;
+    }
+);
+
+browser_test!(
+    procedural_css_from_an_ext_rule_hides_the_element,
+    ["csp.test#$?#div.card:has-text(Sponsored) { display: none !important }"],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html(
+                "<!doctype html><title>t</title><div class=card id=c1>Sponsored offer</div>\
+             <div class=card id=c2>Plain card</div>",
+            ),
+        );
+        s.goto(&s.url("csp.test", "/")).await;
+        s.wait_for(
+            "procedural style applied",
+            "getComputedStyle(document.getElementById('c1')).display === 'none'",
+        )
+        .await;
+        assert_eq!(s.display("#c2").await, "block");
+        s.assert_clean().await;
+    }
+);
+
 // ---- the converted uBO library ---------------------------------------------------------------------
 
-/// Uses the repo's bundled uBO snapshot unmodified. Fails today because the converter truncates
-/// `validate-constant.fn` (see KNOWN_FAILING in the crate root).
+/// Uses the repo's bundled uBO snapshot unmodified: `set-constant` depends on `validate-constant.fn`
+/// (default parameter `extraArgs = {}`), the shape that broke the old text-scanning converter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bundled_ubo_set_constant_runs() {
     let Some(s) = Session::start_full(EntryMode::Explicit, &[SCRIPTLET], Resources::Bundled).await

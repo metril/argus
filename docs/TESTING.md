@@ -38,9 +38,12 @@ Needs unprivileged user namespaces and `nft`/`ip`; skipped unless enabled:
   injected resources.
 * Scriptlets use a tiny local `set-constant` by default; `Resources::Bundled` loads the repo's
   uBO snapshot from `crates/filter-engine/resources/` at runtime.
-* `KNOWN_FAILING` in `crates/e2e-browser/src/lib.rs` lists scenarios that expose real proxy bugs.
+* `KNOWN_FAILING` in `crates/e2e-browser/src/lib.rs` lists scenarios that expose real proxy bugs
+  (currently empty).
   They still run and print their failure but do not fail the suite. Remove an entry when its
-  bug is fixed (the runner says when an entry starts passing).
+  bug is fixed (the runner says when an entry starts passing). Rules in these scenarios see
+  non-default ports in every URL, so write host rules as `||host^` (a path rule such as
+  `||host/p` matches only default-port URLs, as in uBO).
 * Debug a run with `ADBLOCKER_BROWSER_NETLOG=/path/net.json` (Chromium net-log of the session).
 
 ## Lint
