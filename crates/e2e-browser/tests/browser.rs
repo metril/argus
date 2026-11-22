@@ -937,3 +937,113 @@ async fn bundled_ubo_set_constant_runs() {
     })
     .await;
 }
+
+// ---- hostile lists ---------------------------------------------------------------------------------------
+
+// An untrusted list cannot loosen the site's own Permissions-Policy (`camera=*` after the site's
+// `camera=()` would override it); it can still tighten.
+browser_test!(
+    untrusted_permissions_rule_cannot_loosen_the_policy,
+    [
+        "!untrusted",
+        "||pp.test^$permissions=camera=*",
+        "||pp.test^$permissions=geolocation=()"
+    ],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><p>x</p>")
+                .header("permissions-policy", "camera=(), microphone=self"),
+        );
+        s.goto(&s.url("pp.test", "/")).await;
+        let doc = s
+            .responses()
+            .into_iter()
+            .find(|r| r.url.ends_with("/") && r.url.contains("pp.test"))
+            .expect("document response");
+        let lines = doc.header("permissions-policy").expect("header");
+        assert!(!lines.contains("camera=*"), "{lines}");
+        let allows = |f: &str| format!("document.featurePolicy.allowsFeature('{f}')");
+        assert_eq!(
+            s.eval(&allows("camera")).await,
+            false,
+            "camera stayed restricted"
+        );
+        assert_eq!(
+            s.eval(&allows("geolocation")).await,
+            false,
+            "tightening applied"
+        );
+        assert_eq!(
+            s.eval("navigator.permissions.query({name:'camera'}).then(p => p.state)")
+                .await,
+            "denied"
+        );
+        s.assert_clean().await;
+    }
+);
+
+// An untrusted style injection with `url()` loads nothing; a plain declaration still applies.
+browser_test!(
+    untrusted_style_rule_with_url_makes_no_request,
+    [
+        "!untrusted",
+        "sty.test#$?#body { background: url(https://sty.test/leak-ext.png) }",
+        "sty.test##body:style(background: url(https://sty.test/leak-engine.png))",
+        "sty.test##body:style(background-image: image-set('https://sty.test/leak-set.png' 1x))",
+        "sty.test##html:style(outline: 4px solid rgb(1, 2, 3))"
+    ],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><p>x</p>"),
+        );
+        for leak in ["/leak-ext.png", "/leak-engine.png", "/leak-set.png"] {
+            s.origin.route(leak, MockResponse::ok("x"));
+        }
+        s.goto(&s.url("sty.test", "/")).await;
+        // The safe declaration shows the style channel works at all.
+        s.wait_for(
+            "safe style applied",
+            "getComputedStyle(document.documentElement).outlineWidth === '4px'",
+        )
+        .await;
+        assert!(s
+            .eval("document.body.style.cssText + document.documentElement.style.cssText")
+            .await
+            .as_str()
+            .is_some_and(|c| !c.contains("url(") && !c.contains("image-set")));
+        for leak in ["/leak-ext.png", "/leak-engine.png", "/leak-set.png"] {
+            assert!(
+                s.origin.requests_for(leak).is_empty(),
+                "{leak} was requested"
+            );
+        }
+        s.assert_clean().await;
+    }
+);
+
+// A page's beacon token only works for its own host's cosmetic lookups.
+browser_test!(
+    beacon_refuses_cross_host_probe_in_browser,
+    ["##.dyn-ad", "victim.test##.secret"],
+    |s| {
+        s.origin.route(
+            "/",
+            MockResponse::html("<!doctype html><title>t</title><p class=dyn-ad>x</p>"),
+        );
+        s.goto(&s.url("evil.test", "/")).await;
+        let js = "(async () => {
+            const t = JSON.parse(document.getElementById('__ab_cfg').textContent).t;
+            const ask = async (u, cls) => (await fetch('/__adblock__/cc', {method:'POST',
+              headers:{'content-type':'application/json','x-adblock-token':t},
+              body: JSON.stringify({url:u, classes:[cls], ids:[]})})).status;
+            return JSON.stringify({own: await ask(location.href, 'dyn-ad'),
+              other: await ask('https://victim.test/', 'secret')});
+        })()";
+        let v: serde_json::Value =
+            serde_json::from_str(s.eval(js).await.as_str().unwrap()).unwrap();
+        assert_eq!(v["own"], 200, "{v}");
+        assert_eq!(v["other"], 403, "{v}");
+    }
+);

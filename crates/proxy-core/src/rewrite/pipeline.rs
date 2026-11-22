@@ -360,7 +360,7 @@ where
             let next = match input.next().now_or_never() {
                 Some(n) => n,
                 None => {
-                    enc.flush().await?;
+                    enc.flush_off().await?;
                     let out = enc.take();
                     if !out.is_empty() {
                         yield out;
@@ -372,9 +372,10 @@ where
                 None => break,
                 Some(Err(e)) => Err(e)?,
                 Some(Ok(chunk)) => {
-                    enc.write(&chunk).await?;
-                    note_buffered(chunk.len());
-                    since_yield += chunk.len();
+                    let n = chunk.len();
+                    enc.write_off(chunk).await?;
+                    note_buffered(n);
+                    since_yield += n;
                     let out = enc.take();
                     if !out.is_empty() {
                         yield out;
@@ -386,7 +387,7 @@ where
                 }
             }
         }
-        let tail = enc.finish().await?;
+        let tail = enc.finish_off().await?;
         if !tail.is_empty() {
             yield tail;
         }
@@ -429,9 +430,9 @@ pub async fn transform_text(
     };
     let mut enc = Encoder::new(out_coding);
     let encoded = async {
-        enc.write(&new).await?;
+        enc.write_off(Bytes::from(new)).await?;
         let mut v = enc.take().to_vec();
-        v.extend_from_slice(&enc.finish().await?);
+        v.extend_from_slice(&enc.finish_off().await?);
         io::Result::Ok(v)
     }
     .await;
@@ -440,5 +441,63 @@ pub async fn transform_text(
             body: full_body(Bytes::from(v)),
         },
         Err(_) => Outcome::Untouched(raw.replay()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Re-encoding is CPU-bound (a brotli encoder's first write alone takes tens of
+    /// milliseconds): it must not run on the async worker, where it would stall every other
+    /// connection scheduled there. A 1 ms heartbeat on the same single-threaded runtime shows how
+    /// long the worker was held up.
+    #[tokio::test]
+    async fn reencoding_does_not_stall_the_async_worker() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let chunks: Vec<Bytes> = (0..24)
+            .map(|_| {
+                let mut s = String::new();
+                while s.len() < 32 * 1024 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    s.push_str(&format!(
+                        "<div class=\"c{}\"><a href=\"/p/{x:x}\">item {}</a></div>\n",
+                        x % 23,
+                        x % 5000
+                    ));
+                }
+                Bytes::from(s)
+            })
+            .collect();
+        for coding in [Coding::Brotli, Coding::Zstd, Coding::Gzip] {
+            let worst_us = Arc::new(AtomicUsize::new(0));
+            let w = worst_us.clone();
+            let beat = tokio::spawn(async move {
+                let mut last = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let now = tokio::time::Instant::now();
+                    w.fetch_max((now - last).as_micros() as usize, Ordering::Relaxed);
+                    last = now;
+                }
+            });
+            tokio::task::yield_now().await;
+            worst_us.store(0, Ordering::Relaxed);
+            let input = stream::iter(chunks.clone().into_iter().map(Ok));
+            let mut out = Box::pin(encode_stream(input, Some(coding)));
+            let mut n = 0usize;
+            while let Some(c) = out.next().await {
+                n += c.unwrap().len();
+            }
+            beat.abort();
+            assert!(n > 0);
+            let worst = worst_us.load(Ordering::Relaxed);
+            assert!(
+                worst < 12_000,
+                "{coding:?}: the async worker was held for {worst} us by one poll"
+            );
+        }
     }
 }

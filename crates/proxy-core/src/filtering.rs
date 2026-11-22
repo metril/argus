@@ -26,6 +26,7 @@ use crate::rewrite::{
 use crate::upstream::{build_strict_upstream_client, build_upstream_client, UpstreamOptions};
 use crate::{Error, Result};
 use bytes::Bytes;
+use filter_engine::ArcSwap;
 use filter_engine::SharedEngine;
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
@@ -99,7 +100,7 @@ pub struct ProxyContext {
     /// The `/__adblock__/` endpoints and their state.
     internal: Arc<Internal>,
     /// Optional per-response transforms (extended rules), see [`crate::rewrite`].
-    transform_source: parking_lot::RwLock<Option<Arc<dyn TransformSource>>>,
+    transform_source: ArcSwap<Option<Arc<dyn TransformSource>>>,
     /// Leave bodies alone when the origin says `Cache-Control: no-transform` (header-only edits
     /// still apply). Many CDNs set it on everything, hence the switch.
     respect_no_transform: std::sync::atomic::AtomicBool,
@@ -122,7 +123,7 @@ impl ProxyContext {
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
             resolve_all_to: None,
             internal: Arc::new(Internal::new()),
-            transform_source: parking_lot::RwLock::new(Some(Arc::new(ext::ExtTransformSource))),
+            transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
         }
     }
@@ -140,7 +141,7 @@ impl ProxyContext {
     /// Install (or clear) the source of per-response transforms (the default is the extended
     /// rule index, see [`crate::ext`]).
     pub fn set_transform_source(&self, source: Option<Arc<dyn TransformSource>>) {
-        *self.transform_source.write() = source;
+        self.transform_source.store(Arc::new(source));
     }
 
     /// Build the context and its pooled upstream client from `opts` in one step, so the HTTP
@@ -273,11 +274,10 @@ impl ProxyContext {
         let method = req.method().clone();
         let is_head = method == hyper::Method::HEAD;
         let uri = req.uri().clone();
-        let mut headers = req.headers().clone();
 
         // Target host/port: absolute-form URI / `:authority`, else the `Host` header, else the
         // MITM fallback. Authorities are parsed properly (bracketed IPv6, userinfo rejected).
-        let named = authority::of_request(&uri, &headers);
+        let named = authority::of_request(&uri, req.headers());
         let host = match named
             .as_ref()
             .map(|(h, _)| h.clone())
@@ -302,6 +302,10 @@ impl ProxyContext {
             let engine = rctx.profile.load().engine.clone();
             return Ok(self.internal.handle(req, &host, &engine).await);
         }
+
+        // Take the request apart: the header map is moved, not copied, from here on.
+        let (parts, body) = req.into_parts();
+        let mut headers = parts.headers;
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -394,8 +398,7 @@ impl ProxyContext {
         ext::apply_request_edits(&mut headers, &request_edits);
 
         // Stream the request body upstream; nothing is buffered.
-        let has_body = !req.body().is_end_stream();
-        let body = req.into_body();
+        let has_body = !body.is_end_stream();
 
         // Destination policy. reqwest skips its resolver for IP-literal hosts, so literals are
         // judged here; names are judged on what they resolve to, inside the client's resolver.
@@ -479,7 +482,9 @@ impl ProxyContext {
         };
 
         let status = resp.status();
-        let resp_headers = resp.headers().clone();
+        // Moved out of the response (the body stream does not need them): no header-map copy.
+        let mut resp = resp;
+        let resp_headers = std::mem::take(resp.headers_mut());
         let mut kind = classify_body(is_head, status, rtype, &resp_headers);
         // `Cache-Control: no-transform`: no body rewriting at all (header edits still apply).
         if self.respect_no_transform.load(Ordering::Relaxed)
@@ -507,9 +512,12 @@ impl ProxyContext {
                 .then(|| profile.engine.cosmetic_for(&url));
             (enabled, cos)
         };
-        let source = self.transform_source.read().clone();
+        // Lock-free read (no refcount traffic); held only across the synchronous lookup.
+        let source = self.transform_source.load();
         let mut transforms: ResponseTransforms = if enabled {
             source
+                .as_ref()
+                .as_ref()
                 .and_then(|s| {
                     s.transforms_for(&ResponseInfo {
                         generation: generation.as_ref(),
@@ -813,14 +821,30 @@ fn request_url(
     port: u16,
     path_and_query: &str,
 ) -> String {
-    let url = match (absolute_form, uri_scheme) {
-        (true, Some(s)) => {
-            let port_part = named_port.map(|p| format!(":{p}")).unwrap_or_default();
-            format!("{s}://{url_host}{port_part}{path_and_query}")
-        }
-        _ => format!("{scheme}://{url_host}:{port}{path_and_query}"),
+    // Built once, with the scheme's default port left out (see `ext::rule_url`, which still
+    // normalises any other spelling).
+    let (s, p) = match (absolute_form, uri_scheme) {
+        (true, Some(s)) => (s, named_port),
+        _ => (scheme, Some(port)),
     };
-    ext::rule_url(&url).into_owned()
+    let default = match s {
+        "https" | "wss" => 443,
+        "http" | "ws" => 80,
+        _ => 0,
+    };
+    let mut url = String::with_capacity(s.len() + url_host.len() + path_and_query.len() + 9);
+    url.push_str(s);
+    url.push_str("://");
+    url.push_str(url_host);
+    if let Some(p) = p.filter(|&p| p != default) {
+        use std::fmt::Write as _;
+        let _ = write!(url, ":{p}");
+    }
+    url.push_str(path_and_query);
+    match ext::rule_url(&url) {
+        std::borrow::Cow::Owned(fixed) => fixed,
+        std::borrow::Cow::Borrowed(_) => url,
+    }
 }
 
 /// `Vary` members added to a rewritten response: the body depends on the request type and on

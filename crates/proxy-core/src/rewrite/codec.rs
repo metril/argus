@@ -347,6 +347,12 @@ pub async fn decode_chain(input: DynBufRead, codings: &[Coding]) -> io::Result<D
     }))
 }
 
+enum Op {
+    Write(Bytes),
+    Flush,
+    Finish,
+}
+
 /// Incremental encoder into an in-memory buffer that the caller drains with [`Encoder::take`].
 #[allow(clippy::large_enum_variant)]
 pub enum Encoder {
@@ -412,6 +418,48 @@ impl Encoder {
             Encoder::Zstd(e) => e.get_mut(),
         };
         Bytes::from(std::mem::take(v))
+    }
+
+    /// [`Self::write`] on the blocking pool: compression is CPU-bound (a brotli encoder's first
+    /// write takes tens of milliseconds, a 32 KiB gzip chunk about a millisecond), which must not
+    /// be spent on an async worker.
+    pub async fn write_off(&mut self, data: Bytes) -> io::Result<()> {
+        self.run_off(Op::Write(data)).await.map(drop)
+    }
+
+    /// [`Self::flush`] on the blocking pool.
+    pub async fn flush_off(&mut self) -> io::Result<()> {
+        self.run_off(Op::Flush).await.map(drop)
+    }
+
+    /// [`Self::finish`] on the blocking pool.
+    pub async fn finish_off(&mut self) -> io::Result<Bytes> {
+        self.run_off(Op::Finish).await
+    }
+
+    async fn apply(&mut self, op: Op) -> io::Result<Bytes> {
+        match op {
+            Op::Write(d) => self.write(&d).await.map(|()| Bytes::new()),
+            Op::Flush => self.flush().await.map(|()| Bytes::new()),
+            Op::Finish => self.finish().await,
+        }
+    }
+
+    async fn run_off(&mut self, op: Op) -> io::Result<Bytes> {
+        if let Encoder::Identity(_) = self {
+            return self.apply(op).await;
+        }
+        let mut taken = std::mem::replace(self, Encoder::Identity(Vec::new()));
+        let handle = tokio::runtime::Handle::current();
+        let (enc, r) = tokio::task::spawn_blocking(move || {
+            // The encoders write into a `Vec`: their futures never wait on I/O.
+            let r = handle.block_on(taken.apply(op));
+            (taken, r)
+        })
+        .await
+        .map_err(io::Error::other)?;
+        *self = enc;
+        r
     }
 
     /// Finish the stream (trailer) and drain the rest.
@@ -675,5 +723,55 @@ mod tests {
             w.write_all(&data).unwrap();
         }
         assert_eq!(decode(out, &[Coding::Brotli]).await.unwrap(), data);
+    }
+
+    /// Manual measurement (`cargo test --release -p proxy-core --lib encode_chunk_timing --
+    /// --ignored --nocapture`): CPU time of one encoder write, which is what a single poll of the
+    /// response stream spends on compression.
+    #[tokio::test]
+    #[ignore]
+    async fn encode_chunk_timing() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut doc = String::new();
+        while doc.len() < 8 * 1024 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            doc.push_str(&format!(
+                "<div class=\"c{}\" data-id=\"{}\"><a href=\"/p/{}?ref={:x}\">item {} title text</a></div>\n",
+                x % 23,
+                x % 100_000,
+                x % 977,
+                x,
+                x % 5000
+            ));
+        }
+        let data = doc.as_bytes();
+        for coding in [Coding::Zstd, Coding::Brotli, Coding::Gzip, Coding::Deflate] {
+            for chunk in [32 * 1024usize, 256 * 1024] {
+                let mut e = Encoder::new(Some(coding));
+                let (mut max, mut sum, mut n) =
+                    (std::time::Duration::ZERO, std::time::Duration::ZERO, 0u32);
+                for c in data.chunks(chunk) {
+                    let t = std::time::Instant::now();
+                    e.write(c).await.unwrap();
+                    let d = t.elapsed();
+                    max = max.max(d);
+                    sum += d;
+                    n += 1;
+                    let _ = e.take();
+                }
+                let t = std::time::Instant::now();
+                e.flush().await.unwrap();
+                let fl = t.elapsed();
+                println!(
+                    "{coding:?} chunk {:>3} KiB: mean {:>7.1?} max {:>7.1?} flush {:>7.1?}",
+                    chunk / 1024,
+                    sum / n,
+                    max,
+                    fl
+                );
+            }
+        }
     }
 }

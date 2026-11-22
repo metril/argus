@@ -134,6 +134,8 @@ pub const HOSTS: &[&str] = &[
     "tok.test",
     "proc.test",
     "gen.test",
+    "pp.test",
+    "sty.test",
 ];
 
 fn leaf_spki(der: &[u8]) -> String {

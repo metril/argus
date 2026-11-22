@@ -166,7 +166,7 @@ pub fn is_restrictive(value: &str) -> bool {
 /// browser), then each restriction intersected in, then each trusted member set outright.
 pub fn merge(site_lines: &[&str], restrictions: &[&str], trusted: &[&str]) -> String {
     let mut members: Vec<Member> = Vec::new();
-    let mut put = |m: Member, members: &mut Vec<Member>| match members
+    let put = |m: Member, members: &mut Vec<Member>| match members
         .iter_mut()
         .find(|x| x.name == m.name)
     {

@@ -296,7 +296,6 @@ e2e_test!(
             ("gzip", vec![Coding::Gzip]),
             ("deflate", vec![Coding::Deflate]),
             ("stack", vec![Coding::Gzip, Coding::Br]),
-            ("stack3", vec![Coding::Deflate, Coding::Zstd, Coding::Gzip]),
         ] {
             let enc = encode_stacked(&codings, PAGE.as_bytes()).await;
             let ce = codings
@@ -312,7 +311,7 @@ e2e_test!(
             );
         }
         for v in VERSIONS {
-            for name in ["zstd", "br", "gzip", "deflate", "stack", "stack3"] {
+            for name in ["zstd", "br", "gzip", "deflate", "stack"] {
                 for (accept, want) in [
                     ("gzip, deflate, br, zstd", Some(Coding::Zstd)),
                     ("gzip, br", Some(Coding::Br)),
@@ -953,6 +952,31 @@ e2e_test!(
             // The proxy carries on serving.
             let ok = body_text(get_doc(&env, v, "/p", &[]).await).await;
             assert!(ok.contains("<p>hello</p>"), "{v:?}");
+        }
+    }
+);
+
+// More stacked codings than the proxy decodes (two) is hostile or broken: the body is forwarded
+// exactly as received, with its original headers.
+e2e_test!(
+    too_many_stacked_codings_pass_through_untouched,
+    rules = AD,
+    |env| {
+        let codings = [Coding::Deflate, Coding::Zstd, Coding::Gzip];
+        let enc = encode_stacked(&codings, PAGE.as_bytes()).await;
+        env.origin.route(
+            "/stack3",
+            MockResponse::ok(enc.clone())
+                .header("content-type", "text/html; charset=utf-8")
+                .header("content-encoding", "deflate, zstd, gzip"),
+        );
+        for v in VERSIONS {
+            let r = get_doc(&env, v, "/stack3", &[("accept-encoding", "gzip, br, zstd")]).await;
+            assert_eq!(r.status(), 200);
+            assert_eq!(r.headers()["content-encoding"], "deflate, zstd, gzip");
+            let raw = r.bytes().await.unwrap();
+            assert_eq!(raw.to_vec(), enc);
+            assert!(!String::from_utf8_lossy(&raw).contains("__adblock"));
         }
     }
 );
