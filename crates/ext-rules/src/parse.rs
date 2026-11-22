@@ -153,7 +153,8 @@ impl HeaderMatch {
     }
 }
 
-/// AdGuard's default cap on the length of an element a `$$` / `##^` filter may remove.
+/// Default cap on the length of an element a `$$` / `##^` filter may remove.
+// TODO(verify): the AdGuard KB documents `max-length` but states no default; 8192 is unverified.
 pub const DEFAULT_MAX_ELEMENT_LEN: usize = 8192;
 
 #[derive(Debug, Clone)]

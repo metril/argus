@@ -84,6 +84,7 @@ fn now_secs() -> u64 {
 pub struct Internal {
     key: [u8; 32],
     scriptlets: moka::sync::Cache<String, Arc<str>>,
+    unsupported: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl Default for Internal {
@@ -102,6 +103,7 @@ impl Internal {
                 .max_capacity(SCRIPTLET_CACHE)
                 .time_to_idle(Duration::from_secs(3600))
                 .build(),
+            unsupported: Default::default(),
         }
     }
 
@@ -143,6 +145,28 @@ impl Internal {
             self.scriptlets.insert(hash.clone(), Arc::from(code));
         }
         format!("{}s/{hash}.js", crate::csp::INTERNAL_PREFIX)
+    }
+
+    /// Count one "unsupported scriptlet <name>" report (names bounded in number and length).
+    fn note_unsupported(&self, note: &str) {
+        const MAX_NAMES: usize = 256;
+        let Some(name) = note.strip_prefix("unsupported scriptlet ") else {
+            return;
+        };
+        let name: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+        let mut m = self.unsupported.lock();
+        if m.len() < MAX_NAMES || m.contains_key(&name) {
+            *m.entry(name).or_insert(0) += 1;
+        }
+    }
+
+    /// Scriptlet names pages reported as unsupported, with report counts (one per page load).
+    pub fn unsupported_scriptlets(&self) -> Vec<(String, u64)> {
+        self.unsupported
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     /// Answer an internal request. `host` is the request's normalised host name (no port).
@@ -262,10 +286,16 @@ impl Internal {
             classes: Vec<String>,
             #[serde(default)]
             ids: Vec<String>,
+            /// "unsupported scriptlet <name>" notes from the in-page runtime.
+            #[serde(default)]
+            unsupported: Vec<String>,
         }
         let Ok(parsed) = serde_json::from_slice::<CcReq>(&bytes) else {
             return deny(StatusCode::BAD_REQUEST);
         };
+        for note in parsed.unsupported.iter().take(32) {
+            self.note_unsupported(note);
+        }
         let selectors = engine.dynamic_hide_selectors(&parsed.url, &parsed.classes, &parsed.ids);
         let json = serde_json::json!({ "selectors": selectors }).to_string();
         Response::builder()
@@ -318,6 +348,21 @@ mod tests {
             hex,
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+    }
+
+    #[test]
+    fn unsupported_notes_are_counted_and_bounded() {
+        let i = Internal::new();
+        i.note_unsupported("unsupported scriptlet foo");
+        i.note_unsupported("unsupported scriptlet foo");
+        i.note_unsupported("bogus");
+        assert_eq!(i.unsupported_scriptlets(), vec![("foo".to_string(), 2)]);
+    }
+
+    #[test]
+    fn boot_defines_runtime_hook() {
+        assert!(BOOT_JS.contains("__adblockerRuntime"));
+        assert!(BOOT_JS.contains("unsupported scriptlet "));
     }
 
     #[test]

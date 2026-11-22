@@ -1,13 +1,16 @@
 //! `$removeheader` policy and the header-edit vocabulary shared by request and response plans.
 //!
-//! AdGuard KB "$removeheader" forbids removing the CORS family (`Access-Control-*`), `Origin`,
-//! `Timing-Allow-Origin`, `Allow`, the `Cross-Origin-*-Policy` family and `Content-Security-Policy`
-//! because stripping them silently weakens or breaks site security; uBO restricts response removal
-//! to an even smaller allowlist (`location`, `refresh`, `report-to`, `set-cookie`). This
-//! implementation enforces AdGuard's list plus the headers that frame the message (so a rule can
-//! never corrupt the proxied connection): `content-length`, `content-type`, `content-encoding`,
-//! `content-range`, `transfer-encoding`, `connection`, `host`, `upgrade`, `te`, `trailer`,
-//! `proxy-*`, `strict-transport-security`.
+//! The forbidden list is AdGuard KB "$removeheader" ("cannot remove headers from the list
+//! below", checked against the published page): the `access-control-*` CORS family, `origin`,
+//! `timing-allow-origin`, `allow`, the `cross-origin-*-policy` family, CSP (+ report-only),
+//! `expect-ct`, `feature-policy`, `origin-isolation`, `strict-transport-security`,
+//! `upgrade-insecure-requests`, `x-content-type-options`, `x-download-options`, `x-frame-options`,
+//! `x-permitted-cross-domain-policies`, `x-powered-by`, `x-xss-protection`, `public-key-pins(-report-only)`,
+//! `sec-websocket-*`, `p3p`, `sec-fetch-*`, `referrer-policy`, `content-type`, `content-length`,
+//! `accept`, `accept-encoding`, `host`, `connection`, `transfer-encoding`, `upgrade`.
+//! uBO restricts response removal to an even smaller allowlist (`location`, `refresh`,
+//! `report-to`, `set-cookie`). Beyond AdGuard's list we also protect headers that frame the
+//! message: `content-encoding`, `content-range`, `te`, `trailer`, `proxy-*`.
 
 /// One header modification, in terms plain enough for any HTTP library to apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +39,23 @@ pub fn is_removable_header(name: &str) -> bool {
         "allow",
         "content-security-policy",
         "content-security-policy-report-only",
+        "expect-ct",
+        "feature-policy",
+        "origin-isolation",
         "strict-transport-security",
+        "upgrade-insecure-requests",
+        "x-content-type-options",
+        "x-download-options",
+        "x-frame-options",
+        "x-permitted-cross-domain-policies",
+        "x-powered-by",
+        "x-xss-protection",
+        "public-key-pins",
+        "public-key-pins-report-only",
+        "p3p",
+        "referrer-policy",
+        "accept",
+        "accept-encoding",
         "content-length",
         "content-type",
         "content-encoding",
@@ -52,6 +71,8 @@ pub fn is_removable_header(name: &str) -> bool {
         || EXACT.contains(&name)
         || name.starts_with("access-control-")
         || name.starts_with("cross-origin-")
+        || name.starts_with("sec-websocket-")
+        || name.starts_with("sec-fetch-")
         || name.starts_with("proxy-")
         || !name
             .bytes()
@@ -76,7 +97,7 @@ mod tests {
             "refresh",
             "location",
             "set-cookie",
-            "x-powered-by",
+            "x-cache",
             "report-to",
         ] {
             assert!(is_removable_header(ok), "{ok}");
@@ -85,6 +106,9 @@ mod tests {
             "access-control-allow-origin",
             "content-length",
             "origin",
+            "x-powered-by",
+            "referrer-policy",
+            "sec-fetch-mode",
             "cross-origin-opener-policy",
             "content-security-policy",
             "",
