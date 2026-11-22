@@ -172,8 +172,10 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             }
         }
         let observer = spec.observer_ok && !cos.generichide;
-        let scriptlet = (!cos.injected_script.is_empty())
-            .then(|| spec.internal.put_scriptlet(&cos.injected_script));
+        let scriptlet = (!cos.injected_script.is_empty()).then(|| {
+            spec.internal
+                .put_scriptlet(&wrap_scriptlets(&cos.injected_script))
+        });
 
         // Scriptlets first: they must run before any page script.
         if let Some(path) = &scriptlet {
@@ -210,9 +212,25 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
     head
 }
 
+/// Run the engine's scriptlet bundle in a private function scope that provides uBO's
+/// `scriptletGlobals` (state shared by the page's scriptlets; `safeSelf` and others read it and
+/// throw without it). The scope also keeps the helper functions (`safeSelf`, `setConstant`, ...)
+/// off the page's global object.
+fn wrap_scriptlets(js: &str) -> String {
+    format!("(function(){{\nconst scriptletGlobals = {{}};\n{js}\n}})();")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scriptlets_get_a_private_scope_with_scriptlet_globals() {
+        let w = wrap_scriptlets("a();");
+        assert!(w.starts_with("(function(){"));
+        assert!(w.contains("const scriptletGlobals = {};"));
+        assert!(w.trim_end().ends_with("})();"));
+    }
 
     fn spec<'a>(cos: &'a Cosmetics, internal: &'a Internal) -> PageSpec<'a> {
         PageSpec {
