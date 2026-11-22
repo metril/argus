@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod bundle;
+pub mod cookies;
 
 pub mod error;
 pub mod index;

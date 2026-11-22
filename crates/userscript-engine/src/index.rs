@@ -47,6 +47,7 @@ pub struct ScriptIndex {
     exact: HashMap<Box<str>, Vec<u32>>,
     suffix: HashMap<Box<str>, Vec<u32>>,
     any: Vec<u32>,
+    by_id: HashMap<Box<str>, u32>,
 }
 
 /// Matched scripts for one document, in install order.
@@ -72,6 +73,7 @@ impl ScriptIndex {
             let (rules, errs) = Rules::compile(&s.metadata, opts);
             problems.extend(errs.into_iter().map(|e| (s.id.clone(), e)));
             let n = idx.scripts.len() as u32;
+            idx.by_id.insert(s.id.as_str().into(), n);
             for k in rules.host_keys() {
                 match k {
                     HostKey::Any => idx.any.push(n),
@@ -114,7 +116,7 @@ impl ScriptIndex {
     }
 
     pub fn get(&self, id: &str) -> Option<&CompiledScript> {
-        self.scripts.iter().find(|s| s.script.id == id)
+        self.by_id.get(id).map(|&n| &self.scripts[n as usize])
     }
 
     /// Scripts that run on this document. `host` is the document's hostname, `url` its full

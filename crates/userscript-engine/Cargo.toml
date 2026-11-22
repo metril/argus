@@ -45,6 +45,9 @@ base64 = "0.22"
 
 smallvec = "1.13"
 arc-swap = { workspace = true }
+cookie_store = "0.22"
+cookie = "0.18"
+time = { workspace = true }
 rand = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }

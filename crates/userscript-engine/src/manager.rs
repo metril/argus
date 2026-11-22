@@ -32,6 +32,7 @@ pub struct UserscriptManager {
     live_index: ArcSwap<ScriptIndex>,
     /// The GM value/xhr/resource logic shared by the proxy endpoints and the management API.
     gm: GmBackend,
+    cookies: crate::cookies::GmCookieJar,
     /// Capability-token key: random per process (pages refresh tokens after a restart).
     token_key: TokenKey,
 }
@@ -65,6 +66,7 @@ impl UserscriptManager {
             db,
             live_index: ArcSwap::from_pointee(ScriptIndex::default()),
             gm: GmBackend::new(storage.clone(), Quotas::default()),
+            cookies: Default::default(),
             token_key: {
                 use rand::RngCore;
                 let mut k = [0u8; 32];
@@ -73,6 +75,11 @@ impl UserscriptManager {
             },
             storage,
         })
+    }
+
+    /// The GM cookie jar (what `GM_cookie` and non-anonymous `GM_xmlhttpRequest` use).
+    pub fn cookies(&self) -> &crate::cookies::GmCookieJar {
+        &self.cookies
     }
 
     pub fn gm(&self) -> &GmBackend {
