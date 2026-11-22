@@ -70,9 +70,6 @@ const JSON_ROUTES: &[&str] = &[
     "cookie",
 ];
 
-/// Name of the one profile that has userscripts today.
-pub const PROFILE: &str = userscript_engine::DEFAULT_PROFILE;
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -87,6 +84,8 @@ struct Doc {
     /// Script ids in injection order (run-at group, then install order).
     ids: Vec<String>,
     fetched: Vec<bool>,
+    /// Storage namespace the document was planned for.
+    profile: String,
     host: String,
     origin: String,
     top: bool,
@@ -151,12 +150,17 @@ impl DocStore {
     }
 
     /// Take chunk `n` of document `id` for a request to `host`. Each chunk is served once; a
-    /// wrong host or an expired record yields `None` (a wrong host does not consume it).
-    fn take(&self, id: &str, n: usize, host: &str) -> Option<Chunk> {
+    /// wrong host or profile, or an expired record, yields `None` (which does not consume the chunk).
+    fn take(&self, id: &str, n: usize, host: &str, profile: &str) -> Option<Chunk> {
         let mut g = self.inner.lock();
         let (map, _) = &mut *g;
         let d = map.get_mut(id)?;
-        if d.created.elapsed() > self.ttl || d.host != host || n >= d.ids.len() || d.fetched[n] {
+        if d.created.elapsed() > self.ttl
+            || d.host != host
+            || d.profile != profile
+            || n >= d.ids.len()
+            || d.fetched[n]
+        {
             return None;
         }
         d.fetched[n] = true;
@@ -210,12 +214,15 @@ pub struct Caller<'a> {
     pub host: &'a str,
     /// Origin of the connection's authority in `Origin`-header form.
     pub origin: &'a str,
+    /// The requesting profile's name: the namespace of tokens, GM values and cookies.
+    pub profile: &'a str,
 }
 
 #[derive(Default)]
 struct Counts {
     per_script: HashMap<String, usize>,
-    profile: usize,
+    /// In-flight requests per profile name, so one profile cannot use up everyone's slots.
+    per_profile: HashMap<String, usize>,
 }
 
 #[derive(Default)]
@@ -233,6 +240,7 @@ enum Kind {
 /// Releases a request slot on drop.
 struct Permit {
     host: Arc<GmHost>,
+    profile: String,
     script: String,
     kind: Kind,
 }
@@ -244,7 +252,12 @@ impl Drop for Permit {
             Kind::Xhr => &mut l.xhr,
             Kind::Json => &mut l.json,
         };
-        c.profile = c.profile.saturating_sub(1);
+        if let Some(n) = c.per_profile.get_mut(&self.profile) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                c.per_profile.remove(&self.profile);
+            }
+        }
         if let Some(n) = c.per_script.get_mut(&self.script) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -280,6 +293,7 @@ impl Default for GmHost {
 }
 
 struct Authed {
+    profile: String,
     idx: Arc<ScriptIndex>,
     id: String,
     origin: String,
@@ -292,7 +306,7 @@ impl Authed {
     }
     fn ctx(&self) -> ScriptCtx<'_> {
         ScriptCtx {
-            profile: PROFILE,
+            profile: &self.profile,
             script: self.script(),
             page_host: &self.page_host,
         }
@@ -408,31 +422,62 @@ impl GmHost {
 
     /// Must service workers be kept off `host`? (`block`: always; `block_when_privileged`: when a
     /// script with network, download or cookie grants may run there.)
-    pub fn blocks_service_workers(&self, manager: &UserscriptManager, host: &str) -> bool {
+    pub fn blocks_service_workers(
+        &self,
+        manager: &UserscriptManager,
+        profile: &str,
+        host: &str,
+    ) -> bool {
+        self.blocks_service_workers_in(&manager.index_for(profile), host)
+    }
+
+    /// [`Self::blocks_service_workers`] over an index the caller already holds (a profile keeps
+    /// its own handle, so the request path takes no lock).
+    pub fn blocks_service_workers_in(&self, index: &ScriptIndex, host: &str) -> bool {
         use common::config::ServiceWorkerPolicy::*;
         match self.sw_policy() {
             Allow => false,
-            Block => !manager.live_index().is_empty(),
-            BlockWhenPrivileged => manager
-                .live_index()
-                .for_host(host)
-                .any(|c| is_privileged(&c.script)),
+            Block => !index.is_empty(),
+            BlockWhenPrivileged => index.for_host(host).any(|c| is_privileged(&c.script)),
         }
     }
 
     // ---- delivery ---------------------------------------------------------------------------
 
-    /// Match `url` against the profile's scripts and register the document. `None` (no
-    /// allocation beyond the index probe) when nothing applies.
+    /// Match `url` against the scripts of storage namespace `profile` and register the document.
+    /// `None` (no allocation beyond the index probe) when nothing applies.
     pub fn plan_document(
         &self,
         manager: &UserscriptManager,
+        profile: &str,
         host: &str,
         url: &str,
         origin: &str,
         is_top_frame: bool,
     ) -> Option<DocPlan> {
-        let guard = manager.live_index();
+        self.plan_document_in(
+            &manager.index_for(profile),
+            profile,
+            host,
+            url,
+            origin,
+            is_top_frame,
+        )
+    }
+
+    /// [`Self::plan_document`] over the index of `profile` (the storage namespace) the caller
+    /// already holds. The registered document remembers the namespace: its chunks are served
+    /// only to requests of the same profile.
+    pub fn plan_document_in(
+        &self,
+        index: &Arc<ScriptIndex>,
+        profile: &str,
+        host: &str,
+        url: &str,
+        origin: &str,
+        is_top_frame: bool,
+    ) -> Option<DocPlan> {
+        let guard = index;
         if guard.is_empty() {
             return None;
         }
@@ -453,9 +498,10 @@ impl GmHost {
             })
             .collect();
         let doc = Doc {
-            index: Arc::clone(&guard),
+            index: Arc::clone(guard),
             fetched: vec![false; ids.len()],
             ids,
+            profile: profile.to_string(),
             host: host.to_string(),
             origin: origin.to_string(),
             top: is_top_frame,
@@ -503,7 +549,7 @@ impl GmHost {
         let Some((id, n)) = parsed else {
             return not_found();
         };
-        let Some(chunk) = self.docs.take(id, n, c.host) else {
+        let Some(chunk) = self.docs.take(id, n, c.host, c.profile) else {
             return not_found();
         };
         let Some(cs) = chunk.index.get(&chunk.script_id) else {
@@ -511,7 +557,7 @@ impl GmHost {
         };
         let mut values = HashMap::new();
         let ctx = ScriptCtx {
-            profile: PROFILE,
+            profile: c.profile,
             script: &cs.script,
             page_host: c.host,
         };
@@ -519,7 +565,7 @@ impl GmHost {
             values.insert(cs.script.id.clone(), v);
         }
         let mut opts = BundleOptions::new(
-            PROFILE,
+            c.profile,
             &chunk.origin,
             chunk.top,
             manager.token_key(),
@@ -548,7 +594,7 @@ impl GmHost {
     ) -> GmResult<Authed> {
         let unauth = |m: &str| GmError::new(ErrorCode::Unauthorized, m);
         let id = token::claimed_script_id(tok).ok_or_else(|| unauth("bad token"))?;
-        let idx: Arc<ScriptIndex> = Arc::clone(&manager.live_index());
+        let idx: Arc<ScriptIndex> = Arc::clone(&manager.index_for(c.profile));
         let cs = idx.get(&id).ok_or_else(|| unauth("unknown script"))?;
         let caps = token::caps_hash(&cs.script.metadata, cs.script.allow_connect_all);
         let version = cs.script.metadata.version.clone().unwrap_or_default();
@@ -556,7 +602,7 @@ impl GmHost {
             manager.token_key(),
             tok,
             now_secs(),
-            PROFILE,
+            c.profile,
             c.origin,
             |_| {
                 Some(ScriptRecord {
@@ -567,6 +613,7 @@ impl GmHost {
         )
         .map_err(|e| unauth(&format!("token rejected: {e:?}")))?;
         Ok(Authed {
+            profile: c.profile.to_string(),
             idx,
             id,
             origin: c.origin.to_string(),
@@ -674,7 +721,7 @@ impl GmHost {
                 let t = token::mint(
                     manager.token_key(),
                     &TokenClaims {
-                        profile: PROFILE,
+                        profile: &a.profile,
                         script_id: &s.id,
                         script_version: s.metadata.version.as_deref().unwrap_or(""),
                         origin: &a.origin,
@@ -762,7 +809,7 @@ impl GmHost {
         };
         if is_xhr {
             // The xhr slot is taken here and held until the response has been streamed.
-            let Some(permit) = self.permit(&a.id, Kind::Xhr) else {
+            let Some(permit) = self.permit(&a.profile, &a.id, Kind::Xhr) else {
                 return quota();
             };
             let Some(bytes) = self.reserve(XHR_RESERVE) else {
@@ -772,7 +819,7 @@ impl GmHost {
                 .xhr(manager, c, up, &h, a, req.into_body(), (permit, bytes))
                 .await;
         }
-        let Some(_permit) = self.permit(&a.id, Kind::Json) else {
+        let Some(_permit) = self.permit(&a.profile, &a.id, Kind::Json) else {
             return quota();
         };
         let Some(_bytes) = self.reserve(declared.unwrap_or(JSON_CAP).min(JSON_CAP)) else {
@@ -856,20 +903,22 @@ impl GmHost {
         }
     }
 
-    fn permit(self: &Arc<Self>, script: &str, kind: Kind) -> Option<Permit> {
+    fn permit(self: &Arc<Self>, profile: &str, script: &str, kind: Kind) -> Option<Permit> {
         let mut l = self.limits.lock();
         let (c, per, all) = match kind {
             Kind::Xhr => (&mut l.xhr, MAX_XHR_PER_SCRIPT, MAX_XHR_PER_PROFILE),
             Kind::Json => (&mut l.json, MAX_JSON_PER_SCRIPT, MAX_JSON_PER_PROFILE),
         };
         let n = c.per_script.get(script).copied().unwrap_or(0);
-        if n >= per || c.profile >= all {
+        let p = c.per_profile.get(profile).copied().unwrap_or(0);
+        if n >= per || p >= all {
             return None;
         }
-        c.profile += 1;
+        *c.per_profile.entry(profile.to_string()).or_insert(0) += 1;
         *c.per_script.entry(script.to_string()).or_insert(0) += 1;
         Some(Permit {
             host: Arc::clone(self),
+            profile: profile.to_string(),
             script: script.to_string(),
             kind,
         })
@@ -1128,7 +1177,7 @@ async fn run_outbound(
         }
         let jar_cookie = cur
             .use_cookie_jar
-            .then(|| manager.cookies().header_for(PROFILE, &a.id, &cur.url))
+            .then(|| manager.cookies().header_for(&a.profile, &a.id, &cur.url))
             .flatten();
         let cookie = match (jar_cookie, explicit_cookie) {
             (Some(j), Some(e)) => Some(format!("{j}; {e}")),
@@ -1191,7 +1240,7 @@ async fn run_outbound(
             if !sc.is_empty() {
                 manager
                     .cookies()
-                    .store_response(PROFILE, &a.id, &cur.url, sc.into_iter());
+                    .store_response(&a.profile, &a.id, &cur.url, sc.into_iter());
             }
         }
         let status = resp.status().as_u16();
@@ -1292,11 +1341,34 @@ async fn run_outbound(
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_slots_are_capped_per_profile() {
+        let host = Arc::new(GmHost::new());
+        let mut held = Vec::new();
+        // Profile "a" fills its cap across several scripts.
+        for i in 0..MAX_XHR_PER_PROFILE {
+            let p = host.permit("a", &format!("a{}", i / MAX_XHR_PER_SCRIPT), Kind::Xhr);
+            held.push(p.expect("within the cap"));
+        }
+        assert!(
+            host.permit("a", "a-extra", Kind::Xhr).is_none(),
+            "a is full"
+        );
+        // Another profile is not starved by it.
+        assert!(host.permit("b", "b0", Kind::Xhr).is_some());
+        // Releasing a slot frees room for "a" again.
+        held.pop();
+        assert!(host.permit("a", "a-extra", Kind::Xhr).is_some());
+        // The JSON pool is separate.
+        assert!(host.permit("a", "a0", Kind::Json).is_some());
+    }
+
     fn doc(host: &str, n: usize) -> Doc {
         Doc {
             index: Arc::new(ScriptIndex::default()),
             ids: (0..n).map(|i| format!("s{i}")).collect(),
             fetched: vec![false; n],
+            profile: "p".into(),
             host: host.into(),
             origin: format!("https://{host}"),
             top: true,
@@ -1308,11 +1380,12 @@ mod tests {
     fn chunks_are_single_use_and_bound_to_the_host() {
         let s = DocStore::new(8, Duration::from_secs(60));
         let id = s.insert(doc("a.test", 2));
-        assert!(s.take(&id, 0, "b.test").is_none(), "wrong host");
-        assert!(s.take(&id, 0, "a.test").is_some());
-        assert!(s.take(&id, 0, "a.test").is_none(), "replay");
-        assert!(s.take(&id, 5, "a.test").is_none());
-        assert!(s.take(&id, 1, "a.test").is_some());
+        assert!(s.take(&id, 0, "b.test", "p").is_none(), "wrong host");
+        assert!(s.take(&id, 0, "a.test", "q").is_none(), "wrong profile");
+        assert!(s.take(&id, 0, "a.test", "p").is_some());
+        assert!(s.take(&id, 0, "a.test", "p").is_none(), "replay");
+        assert!(s.take(&id, 5, "a.test", "p").is_none());
+        assert!(s.take(&id, 1, "a.test", "p").is_some());
         assert!(s.is_empty(), "fully fetched documents are dropped");
     }
 
@@ -1321,8 +1394,11 @@ mod tests {
         let s = DocStore::new(3, Duration::from_secs(60));
         let ids: Vec<String> = (0..10).map(|_| s.insert(doc("a.test", 1))).collect();
         assert!(s.len() <= 3);
-        assert!(s.take(&ids[0], 0, "a.test").is_none(), "oldest evicted");
-        assert!(s.take(&ids[9], 0, "a.test").is_some());
+        assert!(
+            s.take(&ids[0], 0, "a.test", "p").is_none(),
+            "oldest evicted"
+        );
+        assert!(s.take(&ids[9], 0, "a.test", "p").is_some());
     }
 
     #[test]
@@ -1330,7 +1406,7 @@ mod tests {
         let s = DocStore::new(8, Duration::from_millis(10));
         let id = s.insert(doc("a.test", 1));
         std::thread::sleep(Duration::from_millis(30));
-        assert!(s.take(&id, 0, "a.test").is_none());
+        assert!(s.take(&id, 0, "a.test", "p").is_none());
         s.insert(doc("a.test", 1));
         assert_eq!(s.len(), 1, "insert purges expired entries");
     }

@@ -933,11 +933,14 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "blake3",
  "bytes",
  "chrono",
  "ipnet",
  "libc",
  "parking_lot",
+ "rand 0.8.6",
  "redb",
  "reqwest 0.12.28",
  "serde",
@@ -1556,9 +1559,12 @@ version = "0.1.0"
 dependencies = [
  "async-compression",
  "async-trait",
+ "axum-test",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "common",
+ "cookie",
  "encoding_rs",
  "ext-rules",
  "filter-engine",
@@ -1566,6 +1572,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "list-service",
  "parking_lot",
  "proxy-core",
@@ -1578,7 +1585,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.24.0",
+ "toml 0.8.23",
  "userscript-engine",
+ "web-api",
 ]
 
 [[package]]
@@ -2661,6 +2670,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is-terminal"
@@ -3959,11 +3971,14 @@ dependencies = [
 name = "proxy-core"
 version = "0.1.0"
 dependencies = [
+ "adblock",
  "age",
+ "arc-swap",
  "async-compression",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "brotli",
  "bytes",
  "chrono",
@@ -3991,6 +4006,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "rustc-hash 2.1.2",
  "rustls",
  "rustls-pemfile",
  "script-policy",
@@ -6251,7 +6267,9 @@ dependencies = [
  "dashmap 5.5.3",
  "ext-rules",
  "filter-engine",
+ "futures-util",
  "governor",
+ "ipnet",
  "jsonwebtoken",
  "list-service",
  "parking_lot",

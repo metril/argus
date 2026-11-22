@@ -57,8 +57,16 @@ pub fn proxy_stats(state: &AppState) -> ProxyStatsResponse {
     security(("bearer_auth" = ["stats:read"])),
     responses((status = 200, description = "Blocking statistics", body = FilterStatsResponse))
 )]
-pub async fn get_filter_stats(State(state): State<Arc<AppState>>) -> Json<FilterStatsResponse> {
-    Json(filter_stats(&state))
+pub async fn get_filter_stats(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+) -> Json<FilterStatsResponse> {
+    let mut s = filter_stats(&state);
+    if p.profiles.is_some() {
+        // The domain histogram spans every profile's browsing: not for a restricted token.
+        s.top_blocked_domains.clear();
+    }
+    Json(s)
 }
 
 /// Reset blocking statistics.
@@ -94,7 +102,7 @@ pub struct RecentQuery {
     pub page: Option<u32>,
     /// Page size (1..=200, default 50).
     pub limit: Option<u32>,
-    /// Only blocks attributed to this client / profile label.
+    /// Only blocks of this profile (decimal id).
     pub client: Option<String>,
     /// Only requests to this host or its subdomains.
     pub host: Option<String>,
@@ -102,8 +110,8 @@ pub struct RecentQuery {
     pub list_id: Option<String>,
 }
 
-/// Recently blocked requests from the engine's bounded ring, newest first, filterable by client
-/// label, host and list id.
+/// Recently blocked requests from the engine's bounded ring, newest first, filterable by
+/// profile, host and list id. A profile-restricted token sees only blocks of its own profiles.
 #[utoipa::path(
     get, path = "/stats/blocked/recent", tag = "stats",
     security(("bearer_auth" = ["stats:read"])),
@@ -112,6 +120,7 @@ pub struct RecentQuery {
 )]
 pub async fn get_recent_blocked(
     State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
     ApiQuery(q): ApiQuery<RecentQuery>,
 ) -> ApiResult<Json<RecentBlockedResponse>> {
     let capacity = state.shared_engine.recent_blocked_capacity();
@@ -120,6 +129,11 @@ pub async fn get_recent_blocked(
         .shared_engine
         .recent_blocked(capacity)
         .into_iter()
+        .filter(|e| {
+            // `client` is the profile id (see `Profile::label`). Events without one cannot be
+            // attributed, so a restricted token never sees them.
+            p.profiles.is_none() || e.client.as_deref().is_some_and(|c| p.may_access_profile(c))
+        })
         .filter(|e| {
             q.client
                 .as_deref()

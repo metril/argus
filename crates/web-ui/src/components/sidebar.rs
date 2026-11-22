@@ -44,6 +44,16 @@ const NAV_ITEMS: &[NavItem] = &[
         icon: "N",
     },
     NavItem {
+        path: "/profiles",
+        label: "Profiles",
+        icon: "R",
+    },
+    NavItem {
+        path: "/devices",
+        label: "Devices",
+        icon: "V",
+    },
+    NavItem {
         path: "/tokens",
         label: "API Tokens",
         icon: "T",

@@ -103,7 +103,8 @@ pub struct PolicyStore {
     /// Blocked-source reports, one aggregator per profile.
     reports: Mutex<HashMap<String, ReportAggregator>>,
     /// Called with the profile name after every committed change (rules, panel settings).
-    listeners: RwLock<Vec<Listener>>,
+    listeners: RwLock<Vec<(u64, Listener)>>,
+    next_listener: std::sync::atomic::AtomicU64,
 }
 
 impl PolicyStore {
@@ -119,6 +120,7 @@ impl PolicyStore {
             published: RwLock::new(HashMap::new()),
             reports: Mutex::new(HashMap::new()),
             listeners: RwLock::new(Vec::new()),
+            next_listener: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -253,13 +255,109 @@ impl PolicyStore {
         Ok(out)
     }
 
+    /// Remove everything stored for a deleted profile: site and source rules, temporary grants,
+    /// settings, panel settings and PIN, PIN lockout state, and the in-memory snapshot and
+    /// blocked-source report. A profile created later under the same name starts empty. The
+    /// default profile is refused. Blocks for the fsync: call from `spawn_blocking`.
+    /// Names of every profile that has stored policy state (rules, grants, settings, PIN state),
+    /// whether or not the profile still exists.
+    pub fn stored_profiles(&self) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        use common::db::redb::ReadableTable as _;
+        self.db.read(|r| {
+            let mut out = std::collections::BTreeSet::new();
+            for def in [
+                tables::POLICY_SITE_RULES,
+                tables::POLICY_SOURCE_RULES,
+                tables::POLICY_TEMP,
+                tables::POLICY_META,
+            ] {
+                let t = r.open_table(def)?;
+                for row in t.iter()? {
+                    let k = row?.0;
+                    let k = k.value();
+                    let k = k.strip_prefix(PINLOCK_PREFIX).unwrap_or(k);
+                    if let Some((p, _)) = k.split_once('\0') {
+                        out.insert(p.to_string());
+                    }
+                }
+            }
+            Ok::<_, StoreError>(out)
+        })
+    }
+
+    pub fn delete_profile(&self, profile: &str) -> Result<(), StoreError> {
+        if profile == crate::DEFAULT_PROFILE {
+            return Err(StoreError::Conflict(
+                "the default profile's policy cannot be deleted".into(),
+            ));
+        }
+        use common::db::redb::ReadableTable as _;
+        let mut st = self.state.lock();
+        let (lo, hi) = (format!("{profile}\0"), format!("{profile}\u{1}"));
+        let (plo, phi) = (
+            format!("{PINLOCK_PREFIX}{profile}\0"),
+            format!("{PINLOCK_PREFIX}{profile}\u{1}"),
+        );
+        self.db.write(Durability::Immediate, |txn| {
+            for (def, meta) in [
+                (tables::POLICY_SITE_RULES, false),
+                (tables::POLICY_SOURCE_RULES, false),
+                (tables::POLICY_TEMP, false),
+                (tables::POLICY_META, true),
+            ] {
+                let mut t = txn.open_table(def)?;
+                let mut keys: Vec<String> = Vec::new();
+                let ranges: &[(&str, &str)] = if meta {
+                    &[(&lo, &hi), (&plo, &phi)]
+                } else {
+                    &[(&lo, &hi)]
+                };
+                for (a, b) in ranges {
+                    for row in t.range(*a..*b)? {
+                        keys.push(row?.0.value().to_string());
+                    }
+                }
+                for k in keys {
+                    t.remove(k.as_str())?;
+                }
+            }
+            Ok::<_, StoreError>(())
+        })?;
+        st.remove(profile);
+        self.published.write().remove(profile);
+        self.reports.lock().remove(profile);
+        drop(st);
+        self.notify(profile);
+        Ok(())
+    }
+
     /// Register a callback run (on the writer's thread) after every committed change.
-    pub fn on_change(&self, f: impl Fn(&str) + Send + Sync + 'static) {
-        self.listeners.write().push(Arc::new(f));
+    /// Returns an id for [`Self::remove_listener`].
+    pub fn on_change(&self, f: impl Fn(&str) + Send + Sync + 'static) -> u64 {
+        let id = self
+            .next_listener
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.listeners.write().push((id, Arc::new(f)));
+        id
+    }
+
+    /// Unregister a callback (a deleted profile's control). Unknown ids are ignored.
+    pub fn remove_listener(&self, id: u64) {
+        self.listeners.write().retain(|(i, _)| *i != id);
+    }
+
+    /// Number of registered callbacks (tests).
+    pub fn listener_count(&self) -> usize {
+        self.listeners.read().len()
     }
 
     fn notify(&self, profile: &str) {
-        let ls: Vec<_> = self.listeners.read().clone();
+        let ls: Vec<_> = self
+            .listeners
+            .read()
+            .iter()
+            .map(|(_, l)| l.clone())
+            .collect();
         for l in ls {
             l(profile);
         }

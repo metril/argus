@@ -38,6 +38,9 @@ pub struct Cosmetics {
     pub procedural_actions: Vec<String>,
     /// True if this page is excepted from generic (class/id) hiding.
     pub generichide: bool,
+    /// Selectors the page's `site#@#selector` rules except, so another engine's hides of the
+    /// same selector can be cancelled (see `merge_cosmetics` in proxy-core).
+    pub exceptions: Vec<String>,
 }
 
 /// IP-literal host matcher (CIDR lists cannot be hostname rules); `allow` wins over `block`.
@@ -84,7 +87,7 @@ pub struct SharedEngine {
     /// Pure domain / exact-host block rules kept out of the engine (see [`crate::domainset`]).
     domains: ArcSwap<DomainSet>,
     /// Ring of recent block events.
-    block_log: BlockLog,
+    block_log: Arc<BlockLog>,
     /// Master on/off switch, shared (see [`Self::enabled_flag`]) so the web UI toggle is live.
     enabled: Arc<AtomicBool>,
     /// User-loaded scriptlet/redirect resource library (overrides built-ins by name).
@@ -161,6 +164,65 @@ fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Ar
     Arc::new(engine)
 }
 
+/// Build a small engine from a profile's custom overlay rules (adblock syntax), or `None` when
+/// `rules` has no rules. The text is treated as trusted custom rules, exactly like the global
+/// custom rules. CPU-bound: call from `spawn_blocking`.
+///
+/// Only network, cosmetic and exception rules are supported. Extended rules (`$replace`,
+/// `$urltransform`, `#%#` scripts, snippets, scriptlets needing the extended index) from an
+/// overlay are out of scope: they are not applied.
+///
+/// The result has its own statistics and no block log; the caller records matches itself.
+pub fn overlay_from_rules(rules: &str) -> Result<Option<Arc<SharedEngine>>, String> {
+    overlay_with(rules, || SharedEngine::with_event_capacity(0))
+}
+
+/// [`overlay_from_rules`] over an engine that records into `base`'s statistics and block log and
+/// obeys its master switch.
+pub fn overlay_from_rules_shared(
+    rules: &str,
+    base: &SharedEngine,
+) -> Result<Option<Arc<SharedEngine>>, String> {
+    overlay_with(rules, || {
+        SharedEngine::with_shared(
+            base.stats_handle(),
+            base.block_log_handle(),
+            base.enabled_flag(),
+        )
+    })
+}
+
+fn overlay_with(
+    rules: &str,
+    make: impl FnOnce() -> SharedEngine,
+) -> Result<Option<Arc<SharedEngine>>, String> {
+    let has_rules = rules
+        .lines()
+        .map(str::trim)
+        .any(|l| !l.is_empty() && (l.starts_with("##") || !l.starts_with(['!', '#'])));
+    if !has_rules {
+        return Ok(None);
+    }
+    let built = crate::build_set(&[crate::ListInput {
+        id: "profile-overlay".into(),
+        content: rules.to_string(),
+        format: crate::ListFormat::Abp,
+        allowlist: false,
+        trusted: true,
+        includes: Default::default(),
+    }]);
+    let engine = make();
+    let live = try_build_engine(&built.blob, &engine.resources())?;
+    engine.install_set(
+        Arc::new(built.blob),
+        live,
+        Arc::new(built.ext),
+        Arc::new(built.ip),
+        Arc::new(built.domains),
+    );
+    Ok(Some(Arc::new(engine)))
+}
+
 /// URL probed by [`SharedEngine::site_off`]; the sentinel rule `||adblock.invalid^` blocks it.
 pub const SITE_OFF_PROBE: &str = "https://adblock.invalid/__site_off__";
 
@@ -172,6 +234,17 @@ impl SharedEngine {
 
     /// Like [`Self::new`] with a recent-blocked ring of `capacity` events (0 disables it).
     pub fn with_event_capacity(capacity: usize) -> Self {
+        Self::with_shared(
+            FilterStats::new(),
+            Arc::new(BlockLog::new(capacity)),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    /// An empty engine that records into the given statistics and block log and obeys the given
+    /// master switch, so several engines (one per list set) share them: counters, the recent
+    /// blocked ring and the on/off toggle stay global.
+    pub fn with_shared(stats: FilterStats, log: Arc<BlockLog>, enabled: Arc<AtomicBool>) -> Self {
         Self {
             engine: ArcSwap::new(Arc::new(Generation {
                 engine: build_engine(&[], &[]),
@@ -183,13 +256,18 @@ impl SharedEngine {
             ext_rules: ArcSwap::new(Arc::new(Vec::new())),
             ip_filter: ArcSwap::new(Arc::new(IpFilter::default())),
             domains: ArcSwap::new(Arc::new(DomainSet::empty())),
-            block_log: BlockLog::new(capacity),
-            enabled: Arc::new(AtomicBool::new(true)),
+            block_log: log,
+            enabled,
             resources: ArcSwap::new(Arc::new(Vec::new())),
             resource_report: ArcSwap::new(Arc::new(ResourceReport::default())),
             write_lock: Mutex::new(()),
-            stats: FilterStats::new(),
+            stats,
         }
+    }
+
+    /// The shared block log (pass to [`Self::with_shared`]).
+    pub fn block_log_handle(&self) -> Arc<BlockLog> {
+        self.block_log.clone()
     }
 
     /// Load the scriptlet/redirect resource library from a JSON array of uBO-compatible resources
@@ -414,6 +492,7 @@ impl SharedEngine {
                 injected_script: res.injected_script,
                 procedural_actions: res.procedural_actions.into_iter().collect(),
                 generichide: res.generichide,
+                exceptions: res.exceptions.into_iter().collect(),
             }
         })
     }
@@ -472,6 +551,49 @@ impl SharedEngine {
         client: &str,
     ) -> MatchResult {
         self.check_inner(url, source_url, resource_type, Some(client))
+    }
+
+    /// [`Self::check_gen`] without the statistics and block-log bookkeeping. The caller combines
+    /// several verdicts (for example a base and an overlay engine) and records the final one once
+    /// with [`Self::record_verdict`].
+    pub fn check_gen_deferred(
+        &self,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+    ) -> (MatchResult, Arc<Generation>) {
+        loop {
+            let generation = self.engine.load_full();
+            let r = if self.enabled.load(Ordering::Relaxed) {
+                self.decide(url, source_url, resource_type)
+            } else {
+                MatchResult::allowed()
+            };
+            if self.engine.load().id == generation.id {
+                return (r, generation);
+            }
+        }
+    }
+
+    /// [`Self::check`] without the bookkeeping (see [`Self::check_gen_deferred`]).
+    pub fn check_deferred(&self, url: &str, source_url: &str, resource_type: &str) -> MatchResult {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.decide(url, source_url, resource_type)
+        } else {
+            MatchResult::allowed()
+        }
+    }
+
+    /// Record a finished verdict (statistics and, on a block, the recent-blocked event).
+    pub fn record_verdict(
+        &self,
+        r: MatchResult,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: &str,
+    ) -> MatchResult {
+        self.record(r, url, source_url, resource_type, Some(client))
     }
 
     /// [`Self::check_for`] that also returns the [`Generation`] the verdict was computed
@@ -702,6 +824,46 @@ mod tests {
             "image",
         );
         assert!(!r.blocked);
+    }
+
+    #[test]
+    fn overlay_rules_block_and_except() {
+        assert!(overlay_from_rules("").unwrap().is_none());
+        assert!(overlay_from_rules("! only a comment\n\n")
+            .unwrap()
+            .is_none());
+        let o = overlay_from_rules("||ads.test^\n||x.test^\n@@||x.test^$domain=ok.test\n")
+            .unwrap()
+            .unwrap();
+        let chk = |u: &str, src: &str| o.check(u, src, "image").blocked;
+        assert!(chk("https://ads.test/a.gif", "https://page.test/"));
+        assert!(chk("https://x.test/a.gif", "https://page.test/"));
+        assert!(!chk("https://x.test/a.gif", "https://ok.test/"));
+        assert!(!chk("https://fine.test/a.gif", "https://page.test/"));
+    }
+
+    #[test]
+    fn shared_stats_log_and_switch_across_engines() {
+        let a = SharedEngine::new();
+        let b = SharedEngine::with_shared(a.stats_handle(), a.block_log_handle(), a.enabled_flag());
+        a.install(compile_engine(&["||ad.test^\n".to_string()]));
+        b.install(compile_engine(&["||tracker.test^\n".to_string()]));
+        assert!(
+            a.check("https://ad.test/x", "https://p.test/", "image")
+                .blocked
+        );
+        assert!(
+            b.check("https://tracker.test/x", "https://p.test/", "image")
+                .blocked
+        );
+        assert_eq!(a.stats_handle().snapshot().blocked_requests, 2);
+        assert_eq!(b.recent_blocked(10).len(), 2);
+        a.set_enabled(false);
+        assert!(!b.is_enabled());
+        assert!(
+            !b.check("https://tracker.test/x", "https://p.test/", "image")
+                .blocked
+        );
     }
 
     #[test]

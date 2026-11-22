@@ -202,7 +202,7 @@
       "BlockedEntry": {
         "properties": {
           "client": {
-            "description": "Client / profile label.",
+            "description": "Id of the profile that blocked it (decimal).",
             "type": [
               "string",
               "null"
@@ -671,6 +671,52 @@
         ],
         "type": "object"
       },
+      "CreateDeviceRequest": {
+        "description": "Create a device.",
+        "properties": {
+          "ips": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "profile_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "profile_id"
+        ],
+        "type": "object"
+      },
+      "CreateProfileRequest": {
+        "description": "Create a profile.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "lists": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rules": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateTokenRequest": {
         "properties": {
           "expires_in_days": {
@@ -771,6 +817,67 @@
         },
         "required": [
           "rules"
+        ],
+        "type": "object"
+      },
+      "DeviceDto": {
+        "description": "A device (response).",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "has_token": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "ips": {
+            "description": "Addresses or CIDR prefixes identifying the device.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "last_seen": {
+            "description": "When a connection last resolved to this device (RFC 3339, second resolution). Kept in\nproxy memory: absent until the device connects after a proxy start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "profile_id": {
+            "type": "string"
+          },
+          "token_hint": {
+            "description": "Last 4 characters of the current token, to tell tokens apart.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "profile_id",
+          "has_token",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "DeviceTokenCreated": {
+        "description": "A freshly issued device token. The raw value is shown once and never stored.",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
         ],
         "type": "object"
       },
@@ -1961,6 +2068,89 @@
         ],
         "type": "object"
       },
+      "Page_DeviceDto": {
+        "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "description": "A device (response).",
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "has_token": {
+                  "type": "boolean"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "ips": {
+                  "description": "Addresses or CIDR prefixes identifying the device.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "last_seen": {
+                  "description": "When a connection last resolved to this device (RFC 3339, second resolution). Kept in\nproxy memory: absent until the device connects after a proxy start.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                },
+                "profile_id": {
+                  "type": "string"
+                },
+                "token_hint": {
+                  "description": "Last 4 characters of the current token, to tell tokens apart.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "profile_id",
+                "has_token",
+                "created_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total matching items across all pages.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "limit",
+          "has_more"
+        ],
+        "type": "object"
+      },
       "Page_ExtRuleResponse": {
         "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
         "properties": {
@@ -2169,6 +2359,92 @@
                 "dropped",
                 "events",
                 "last_seen"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total matching items across all pages.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "limit",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "Page_ProfileDto": {
+        "description": "Generic paginated list response.\nUniform page of results for every list endpoint (`?page=1&limit=50`, limit 1..=200).",
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "description": "A profile (response). `id` is the decimal profile id; `\"0\"` is the default profile.",
+              "properties": {
+                "created_at": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "last_built": {
+                  "description": "When the proxy last built this profile successfully (RFC 3339).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "last_error": {
+                  "description": "Why the proxy's last build of this profile failed (it keeps serving the previous state);\nabsent when the last build succeeded or the proxy reports no build status.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "lists": {
+                  "description": "Enabled filter list ids.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "rules": {
+                  "description": "Custom overlay rules (adblock syntax).",
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "created_at",
+                "updated_at"
               ],
               "type": "object"
             },
@@ -3113,6 +3389,58 @@
         ],
         "type": "object"
       },
+      "ProfileDto": {
+        "description": "A profile (response). `id` is the decimal profile id; `\"0\"` is the default profile.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_built": {
+            "description": "When the proxy last built this profile successfully (RFC 3339).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the proxy's last build of this profile failed (it keeps serving the previous state);\nabsent when the last build succeeded or the proxy reports no build status.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lists": {
+            "description": "Enabled filter list ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rules": {
+            "description": "Custom overlay rules (adblock syntax).",
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "ProxyConfigResponse": {
         "description": "Current proxy configuration (response).",
         "properties": {
@@ -3959,6 +4287,33 @@
         ],
         "type": "object"
       },
+      "UpdateDeviceRequest": {
+        "description": "Update a device; omitted fields are unchanged.",
+        "properties": {
+          "ips": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateDiffDto": {
         "description": "Capability changes of an update.",
         "properties": {
@@ -4051,6 +4406,39 @@
             ]
           },
           "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateProfileRequest": {
+        "description": "Update a profile; omitted fields are unchanged. The default profile cannot be renamed.",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lists": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rules": {
             "type": [
               "string",
               "null"
@@ -4777,15 +5165,15 @@
       "ca:read": "Read CA certificate details (fingerprint, expiry, subject).",
       "config:read": "Read the proxy configuration.",
       "config:write": "Change or reload the proxy configuration.",
-      "devices:read": "Read devices (reserved).",
-      "devices:write": "Change devices (reserved).",
+      "devices:read": "List and view devices (profile, addresses, token state; never the token).",
+      "devices:write": "Create, edit and delete devices; issue and revoke device tokens.",
       "engine:reload": "Trigger a rebuild of the blocking engine.",
       "lists:read": "View filter lists, their status and the update schedule.",
       "lists:write": "Add, edit, remove and refresh filter lists; change the update schedule.",
       "policy:read": "View script policy rules, explanations, temporary permissions and blocked-source reports.",
       "policy:write": "Change script policy settings, rules and temporary permissions; import policy.",
-      "profiles:read": "Read filtering profiles (reserved).",
-      "profiles:write": "Change filtering profiles (reserved).",
+      "profiles:read": "List and view filtering profiles (lists and overlay rules) the token may access.",
+      "profiles:write": "Create, edit and delete filtering profiles.",
       "rules:read": "Read custom rules; validate rules and test URLs against the engine (no changes).",
       "rules:write": "Replace the custom rules.",
       "scripts:read": "View userscripts and their source.",
@@ -6312,6 +6700,593 @@
         ]
       }
     },
+    "/api/v1/devices": {
+      "get": {
+        "operationId": "list_devices",
+        "parameters": [
+          {
+            "description": "1-based page number (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page, 1..=200 (default 50).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_DeviceDto"
+                }
+              }
+            },
+            "description": "Devices"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:read"
+            ]
+          }
+        ],
+        "summary": "List the devices the caller may see.",
+        "tags": [
+          "devices"
+        ]
+      },
+      "post": {
+        "operationId": "create_device",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeviceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDto"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "description": "Invalid name, profile or addresses"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Token is not allowed to use that profile, or (restricted tokens) to claim those addresses"
+          },
+          "409": {
+            "description": "An address is already used by another device"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:write"
+            ]
+          }
+        ],
+        "summary": "Create a device (no token yet; issue one with `POST /devices/{device_id}/token`).",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}": {
+      "delete": {
+        "operationId": "delete_device",
+        "parameters": [
+          {
+            "description": "Device id (decimal)",
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Device belongs to a profile this token cannot access"
+          },
+          "404": {
+            "description": "No such device"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:write"
+            ]
+          }
+        ],
+        "summary": "Delete a device (its token stops working).",
+        "tags": [
+          "devices"
+        ]
+      },
+      "get": {
+        "operationId": "get_device",
+        "parameters": [
+          {
+            "description": "Device id (decimal)",
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDto"
+                }
+              }
+            },
+            "description": "Device"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Device belongs to a profile this token cannot access"
+          },
+          "404": {
+            "description": "No such device"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:read"
+            ]
+          }
+        ],
+        "summary": "Get one device.",
+        "tags": [
+          "devices"
+        ]
+      },
+      "put": {
+        "operationId": "update_device",
+        "parameters": [
+          {
+            "description": "Device id (decimal)",
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateDeviceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceDto"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "400": {
+            "description": "Invalid name, profile or addresses"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Token is not allowed to use the device's or the new profile, or (restricted tokens) to claim those addresses"
+          },
+          "404": {
+            "description": "No such device"
+          },
+          "409": {
+            "description": "An address is already used by another device"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:write"
+            ]
+          }
+        ],
+        "summary": "Update a device's name, profile or addresses; omitted fields are unchanged.",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
+    "/api/v1/devices/{device_id}/token": {
+      "delete": {
+        "operationId": "revoke_device_token",
+        "parameters": [
+          {
+            "description": "Device id (decimal)",
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Device belongs to a profile this token cannot access"
+          },
+          "404": {
+            "description": "No such device, or it has no token"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:write"
+            ]
+          }
+        ],
+        "summary": "Revoke a device's token; it stops working immediately.",
+        "tags": [
+          "devices"
+        ]
+      },
+      "post": {
+        "operationId": "issue_device_token",
+        "parameters": [
+          {
+            "description": "Device id (decimal)",
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceTokenCreated"
+                }
+              }
+            },
+            "description": "Issued; `token` is shown only here"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Device belongs to a profile this token cannot access"
+          },
+          "404": {
+            "description": "No such device"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "devices:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "devices:write"
+            ]
+          }
+        ],
+        "summary": "Issue a new token for a device, replacing the current one. The raw token is in this response\nonly (`Cache-Control: no-store`); it cannot be retrieved again. Use it as the proxy\ncredential: `http://device:<token>@<proxy-host>:<port>`.",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
     "/api/v1/engine/build": {
       "get": {
         "operationId": "get_build_summary",
@@ -7704,6 +8679,15 @@
         "operationId": "explain",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Absolute http(s) URL of the page.",
             "in": "query",
             "name": "url",
@@ -7786,6 +8770,17 @@
     "/api/v1/policy/export": {
       "get": {
         "operationId": "export",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -7859,6 +8854,17 @@
     "/api/v1/policy/import": {
       "post": {
         "operationId": "import",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -7942,6 +8948,17 @@
     "/api/v1/policy/panel": {
       "get": {
         "operationId": "get_panel",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -8013,6 +9030,17 @@
       },
       "put": {
         "operationId": "put_panel",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8099,6 +9127,17 @@
     "/api/v1/policy/preview": {
       "post": {
         "operationId": "preview",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8183,6 +9222,15 @@
       "get": {
         "operationId": "reports",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "query",
             "name": "page",
@@ -8286,6 +9334,17 @@
     "/api/v1/policy/settings": {
       "get": {
         "operationId": "get_settings",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -8350,13 +9409,24 @@
             ]
           }
         ],
-        "summary": "Get the global policy settings.",
+        "summary": "Get the policy settings of a profile.",
         "tags": [
           "policy"
         ]
       },
       "put": {
         "operationId": "put_settings",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8431,7 +9501,7 @@
             ]
           }
         ],
-        "summary": "Replace the global policy settings (master switch, global default preset, default profile).",
+        "summary": "Replace the policy settings of a profile (master switch, global default preset, default\ncapability profile).",
         "tags": [
           "policy"
         ]
@@ -8441,6 +9511,15 @@
       "get": {
         "operationId": "list_site_rules",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "query",
             "name": "page",
@@ -8551,6 +9630,17 @@
       },
       "post": {
         "operationId": "create_site_rule",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -8636,6 +9726,15 @@
         "operationId": "delete_site_rule",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Site rule id",
             "in": "path",
             "name": "id",
@@ -8717,6 +9816,15 @@
       "put": {
         "operationId": "update_site_rule",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Site rule id",
             "in": "path",
@@ -8811,6 +9919,15 @@
       "get": {
         "operationId": "list_source_rules",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "in": "query",
             "name": "page",
@@ -8930,6 +10047,17 @@
       },
       "post": {
         "operationId": "create_source_rule",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -9015,6 +10143,15 @@
         "operationId": "delete_source_rule",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Source rule id",
             "in": "path",
             "name": "id",
@@ -9096,6 +10233,15 @@
       "put": {
         "operationId": "update_source_rule",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Source rule id",
             "in": "path",
@@ -9189,6 +10335,17 @@
     "/api/v1/policy/temp": {
       "delete": {
         "operationId": "revoke_all_temp",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -9260,6 +10417,17 @@
       },
       "get": {
         "operationId": "list_temp",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -9334,6 +10502,17 @@
       },
       "post": {
         "operationId": "grant_temp",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -9419,6 +10598,15 @@
         "operationId": "revoke_temp",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Grant id",
             "in": "path",
             "name": "id",
@@ -9495,6 +10683,441 @@
         "summary": "Revoke one temporary permission.",
         "tags": [
           "policy"
+        ]
+      }
+    },
+    "/api/v1/profiles": {
+      "get": {
+        "operationId": "list_profiles",
+        "parameters": [
+          {
+            "description": "1-based page number (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page, 1..=200 (default 50).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ProfileDto"
+                }
+              }
+            },
+            "description": "Profiles"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "profiles:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "profiles:read"
+            ]
+          }
+        ],
+        "summary": "List the profiles the caller may access.",
+        "tags": [
+          "profiles"
+        ]
+      },
+      "post": {
+        "operationId": "create_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDto"
+                }
+              }
+            },
+            "description": "Created"
+          },
+          "400": {
+            "description": "Invalid name, lists or rules"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Token is restricted to specific profiles"
+          },
+          "409": {
+            "description": "Name already in use"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "profiles:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "profiles:write"
+            ]
+          }
+        ],
+        "summary": "Create a profile. Not available to profile-restricted tokens.",
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/profiles/{profile_id}": {
+      "delete": {
+        "operationId": "delete_profile",
+        "parameters": [
+          {
+            "description": "Profile id (decimal)",
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "The default profile cannot be deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Token is not allowed to access this profile"
+          },
+          "404": {
+            "description": "No such profile"
+          },
+          "409": {
+            "description": "Devices are assigned to the profile"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "profiles:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "profiles:write"
+            ]
+          }
+        ],
+        "summary": "Delete a profile. Refused (409) while devices are assigned to it.",
+        "tags": [
+          "profiles"
+        ]
+      },
+      "get": {
+        "operationId": "get_profile",
+        "parameters": [
+          {
+            "description": "Profile id (decimal; 0 is the default profile)",
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDto"
+                }
+              }
+            },
+            "description": "Profile"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Token is not allowed to access this profile"
+          },
+          "404": {
+            "description": "No such profile"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "profiles:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "profiles:read"
+            ]
+          }
+        ],
+        "summary": "Get one profile.",
+        "tags": [
+          "profiles"
+        ]
+      },
+      "put": {
+        "operationId": "update_profile",
+        "parameters": [
+          {
+            "description": "Profile id (decimal)",
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDto"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "400": {
+            "description": "Invalid input, or the default profile"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "Token is not allowed to access this profile"
+          },
+          "404": {
+            "description": "No such profile"
+          },
+          "409": {
+            "description": "Name already in use"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "profiles:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "profiles:write"
+            ]
+          }
+        ],
+        "summary": "Update a profile; omitted fields are unchanged. The default profile cannot be changed here\n(its lists and rules are the global ones).",
+        "tags": [
+          "profiles"
         ]
       }
     },
@@ -9849,6 +11472,17 @@
     "/api/v1/rules/site-exceptions": {
       "get": {
         "operationId": "list_site_exceptions",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -9923,6 +11557,15 @@
       "delete": {
         "operationId": "delete_site_exception",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Host name, lowercase punycode",
             "in": "path",
@@ -10008,6 +11651,15 @@
       "put": {
         "operationId": "put_site_exception",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Host name, lowercase punycode",
             "in": "path",
@@ -10283,7 +11935,7 @@
             }
           },
           {
-            "description": "Only blocks attributed to this client / profile label.",
+            "description": "Only blocks of this profile (decimal id).",
             "in": "query",
             "name": "client",
             "required": false,
@@ -10374,7 +12026,7 @@
             ]
           }
         ],
-        "summary": "Recently blocked requests from the engine's bounded ring, newest first, filterable by client\nlabel, host and list id.",
+        "summary": "Recently blocked requests from the engine's bounded ring, newest first, filterable by\nprofile, host and list id. A profile-restricted token sees only blocks of its own profiles.",
         "tags": [
           "stats"
         ]
@@ -11521,6 +13173,15 @@
         "operationId": "list_userscripts",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Only enabled / only disabled scripts.",
             "in": "query",
             "name": "enabled",
@@ -11621,6 +13282,17 @@
       },
       "post": {
         "operationId": "install_userscript",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -11707,6 +13379,15 @@
         "operationId": "export_userscripts",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Include stored GM values. Values may hold secrets and need `scripts:write`.",
             "in": "query",
             "name": "values",
@@ -11790,6 +13471,17 @@
       "post": {
         "description": "`on_conflict` is `skip` (default) or `replace`. Each script is validated like an install;\none bad script does not stop the others.",
         "operationId": "import_userscripts",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -11874,6 +13566,17 @@
       "post": {
         "description": "Parses the script, fetches its `@require`/`@resource` dependencies (integrity hashes\nverified, size capped, control-plane fetch policy) and returns what installing would grant.\nNothing is installed until `confirm`.",
         "operationId": "plan_userscript",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -11958,6 +13661,15 @@
       "post": {
         "operationId": "confirm_plan",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Plan id",
             "in": "path",
@@ -12067,6 +13779,17 @@
     "/api/v1/userscripts/stats": {
       "get": {
         "operationId": "get_stats",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -12141,6 +13864,15 @@
       "delete": {
         "operationId": "uninstall_userscript",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Userscript id",
             "in": "path",
@@ -12223,6 +13955,15 @@
       "get": {
         "operationId": "get_userscript",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Userscript id",
             "in": "path",
@@ -12308,6 +14049,15 @@
         "description": "A newer version that widens `@match`/`@connect`/`@grant` (or any newer version when `apply`\nis false) is stored as the script's pending update for approval.",
         "operationId": "check_update",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Userscript id",
             "in": "path",
@@ -12403,6 +14153,15 @@
         "operationId": "set_enabled",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Userscript id",
             "in": "path",
             "name": "id",
@@ -12497,6 +14256,15 @@
         "operationId": "get_userscript_source",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Userscript id",
             "in": "path",
             "name": "id",
@@ -12581,6 +14349,15 @@
         "operationId": "clear_storage",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Userscript id",
             "in": "path",
             "name": "id",
@@ -12662,6 +14439,15 @@
       "get": {
         "operationId": "get_storage",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Userscript id",
             "in": "path",
@@ -12746,6 +14532,15 @@
       "delete": {
         "operationId": "delete_storage_value",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Userscript id",
             "in": "path",
@@ -12840,6 +14635,15 @@
         "operationId": "discard_update",
         "parameters": [
           {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Userscript id",
             "in": "path",
             "name": "id",
@@ -12923,6 +14727,15 @@
       "post": {
         "operationId": "approve_update",
         "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "description": "Userscript id",
             "in": "path",
@@ -13068,6 +14881,14 @@
     {
       "description": "Script policy (NoScript-style per-site capabilities)",
       "name": "policy"
+    },
+    {
+      "description": "Per-device filtering profiles",
+      "name": "profiles"
+    },
+    {
+      "description": "Devices and their tokens",
+      "name": "devices"
     },
     {
       "description": "Audit log",

@@ -18,10 +18,15 @@ const PIN: &str = "471100";
 #[derive(Default)]
 struct Sites(Mutex<HashSet<String>>);
 impl SiteBlocking for Sites {
-    fn disabled(&self, site: &str) -> bool {
+    fn disabled(&self, _profile: &proxy_core::Profile, site: &str) -> bool {
         self.0.lock().unwrap().contains(site)
     }
-    fn set_disabled(&self, site: &str, d: bool) -> Result<(), String> {
+    fn set_disabled(
+        &self,
+        _profile: &proxy_core::Profile,
+        site: &str,
+        d: bool,
+    ) -> Result<(), String> {
         let mut g = self.0.lock().unwrap();
         if d {
             g.insert(site.into());
@@ -415,7 +420,10 @@ panel_test!(
             rules.temps.is_empty() && rules.source_rules.is_empty(),
             "no grants"
         );
-        assert!(!sites.disabled("sp.test"), "ad blocking still on");
+        assert!(
+            !sites.0.lock().unwrap().contains("sp.test"),
+            "ad blocking still on"
+        );
         assert!(
             s.proxy.userscripts().get(&us).unwrap().enabled,
             "userscript still enabled"

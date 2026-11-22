@@ -13,16 +13,20 @@
 //! hostname to the origin's IP and the port comes from the URL, so use [`TestOrigin::https_url`]
 //! / [`TestOrigin::http_url`] to build them.
 
+mod api;
 mod client;
 mod codec;
 mod origin;
 mod proxy;
+mod relay;
 mod ws;
 
-pub use client::{HttpVersion, TestClient};
+pub use api::TestApi;
+pub use client::{ClientOpts, HttpVersion, TestClient};
 pub use codec::{decode, encode, encode_stacked, Coding};
 pub use origin::{MockResponse, RecordedRequest, StreamSpec, TestOrigin};
-pub use proxy::{ScriptHandles, TestDst, TestProxy};
+pub use proxy::{ProfileHandles, ScriptHandles, TestDst, TestProxy};
+pub use relay::SourceRelay;
 pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
 
 use std::sync::Once;
@@ -99,6 +103,15 @@ impl TestEnv {
 
     pub fn client_with(&self, version: HttpVersion) -> TestClient {
         TestClient::new(&self.proxy, version)
+    }
+
+    /// Client presenting a device identity (token and/or source address).
+    pub fn client_as(&self, opts: &ClientOpts) -> TestClient {
+        TestClient::with_opts(&self.proxy, HttpVersion::Auto, opts)
+    }
+
+    pub fn client_as_with(&self, version: HttpVersion, opts: &ClientOpts) -> TestClient {
+        TestClient::with_opts(&self.proxy, version, opts)
     }
 }
 

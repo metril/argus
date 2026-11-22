@@ -77,6 +77,12 @@ fn is_restrictive(store: &PolicyStore, profile: &str) -> bool {
                 .any(|x| x.effect == sp::Effect::Deny))
 }
 
+impl Drop for ScriptControl {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// One profile's script control.
 pub struct ScriptControl {
     store: Arc<PolicyStore>,
@@ -89,6 +95,10 @@ pub struct ScriptControl {
     panel: ArcSwap<PanelSettings>,
     docs: moka::sync::Cache<DocKey, Arc<DocEntry>>,
     wake: Arc<tokio::sync::Notify>,
+    /// The store listener, removed by [`Self::stop`] and on drop.
+    listener: std::sync::atomic::AtomicU64,
+    /// The expiry task, aborted by [`Self::stop`] and on drop.
+    expiry: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
     /// Number of `decide` calls made (tests and benches assert the disabled path makes none).
     decides: AtomicU64,
     /// Blocked requests per page host (ads and policy), for the panel.
@@ -110,6 +120,8 @@ impl ScriptControl {
             profile: profile.to_string(),
             docs: moka::sync::Cache::builder().max_capacity(4096).build(),
             wake: Arc::new(tokio::sync::Notify::new()),
+            expiry: parking_lot::Mutex::new(None),
+            listener: AtomicU64::new(0),
             decides: AtomicU64::new(0),
             blocked: moka::sync::Cache::builder()
                 .max_capacity(2048)
@@ -118,13 +130,14 @@ impl ScriptControl {
         });
         let weak: Weak<ScriptControl> = Arc::downgrade(&this);
         let name = profile.to_string();
-        store.on_change(move |p| {
+        let lid = store.on_change(move |p| {
             if p == name {
                 if let Some(s) = weak.upgrade() {
                     s.refresh();
                 }
             }
         });
+        this.listener.store(lid, Ordering::Release);
         this
     }
 
@@ -153,7 +166,7 @@ impl ScriptControl {
     /// sleeps until `valid_until()` (no polling) and exits when the control is dropped.
     pub fn spawn_expiry(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 let Some(this) = weak.upgrade() else { return };
                 let until = this.compiled.load().valid_until();
@@ -179,6 +192,28 @@ impl ScriptControl {
                 }
             }
         });
+        if let Some(old) = self.expiry.lock().replace(task.abort_handle()) {
+            old.abort();
+        }
+    }
+
+    /// End the expiry task and unregister the store listener (the profile is gone). Safe to call more than once.
+    pub fn stop(&self) {
+        let lid = self.listener.swap(0, Ordering::AcqRel);
+        if lid != 0 {
+            self.store.remove_listener(lid);
+        }
+        if let Some(h) = self.expiry.lock().as_ref() {
+            h.abort();
+        }
+    }
+
+    /// Whether the expiry task is alive (tests).
+    pub fn expiry_running(&self) -> bool {
+        self.expiry
+            .lock()
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
     }
 
     pub fn store(&self) -> &Arc<PolicyStore> {

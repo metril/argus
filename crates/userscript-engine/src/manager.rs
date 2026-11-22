@@ -29,7 +29,11 @@ pub struct UserscriptManager {
     db: Arc<Db>,
     /// Live per-document index of the default profile, rebuilt (and swapped atomically) after
     /// every change; the proxy reads it lock-free.
-    live_index: ArcSwap<ScriptIndex>,
+    live_index: Arc<ArcSwap<ScriptIndex>>,
+    /// Live indexes of the non-default profiles, by profile name.
+    profile_indexes: RwLock<HashMap<String, Arc<ArcSwap<ScriptIndex>>>>,
+    /// Served for a profile without an index (never mutated).
+    empty_index: ArcSwap<ScriptIndex>,
     /// The GM value/xhr/resource logic shared by the proxy endpoints and the management API.
     gm: GmBackend,
     cookies: crate::cookies::GmCookieJar,
@@ -64,7 +68,9 @@ impl UserscriptManager {
         Ok(Self {
             scripts: Arc::new(RwLock::new(HashMap::new())),
             db,
-            live_index: ArcSwap::from_pointee(ScriptIndex::default()),
+            live_index: Arc::new(ArcSwap::from_pointee(ScriptIndex::default())),
+            profile_indexes: RwLock::new(HashMap::new()),
+            empty_index: ArcSwap::from_pointee(ScriptIndex::default()),
             gm: GmBackend::new(storage.clone(), Quotas::default()),
             cookies: Default::default(),
             token_key: {
@@ -102,14 +108,110 @@ impl UserscriptManager {
         self.live_index.load()
     }
 
+    /// The current index of `profile` (one atomic load plus a short read lock). `"default"` is
+    /// [`Self::live_index`]; a profile with no scripts (or an unknown one) gets a shared empty
+    /// index, with no allocation.
+    pub fn index_for(&self, profile: &str) -> arc_swap::Guard<Arc<ScriptIndex>> {
+        if profile == DEFAULT_PROFILE {
+            return self.live_index.load();
+        }
+        match self.profile_indexes.read().get(profile) {
+            Some(slot) => slot.load(),
+            None => self.empty_index.load(),
+        }
+    }
+
+    /// The swappable handle of `profile`'s live index (created empty when missing). Keep it (a
+    /// compiled profile holds one) and `load()` it on the request path: no lock, no hashing.
+    /// [`Self::refresh_index_for`] swaps new indexes into the same handle; only
+    /// [`Self::drop_profile_index`] detaches it.
+    pub fn index_handle(&self, profile: &str) -> Arc<ArcSwap<ScriptIndex>> {
+        if profile == DEFAULT_PROFILE {
+            return self.live_index.clone();
+        }
+        if let Some(h) = self.profile_indexes.read().get(profile) {
+            return h.clone();
+        }
+        self.profile_indexes
+            .write()
+            .entry(profile.to_string())
+            .or_insert_with(|| Arc::new(ArcSwap::from_pointee(ScriptIndex::default())))
+            .clone()
+    }
+
     /// Rebuild the default profile's live index from its scripts and swap it in. Called after
     /// every mutation (never on the proxy request path).
     pub fn refresh_index(&self) {
-        let report = self.build_index(DEFAULT_PROFILE, Options::default());
+        self.refresh_index_for(DEFAULT_PROFILE);
+    }
+
+    /// Rebuild `profile`'s live index from its scripts and swap it in.
+    pub fn refresh_index_for(&self, profile: &str) {
+        let report = self.build_index(profile, Options::default());
         for (id, msg) in &report.problems {
             warn!("userscript {id}: {msg}");
         }
-        self.live_index.store(Arc::new(report.index));
+        let index = Arc::new(report.index);
+        if profile == DEFAULT_PROFILE {
+            self.live_index.store(index);
+            return;
+        }
+        let existing = self.profile_indexes.read().get(profile).cloned();
+        match existing {
+            Some(slot) => slot.store(index),
+            None => {
+                self.profile_indexes
+                    .write()
+                    .entry(profile.to_string())
+                    .or_insert_with(|| Arc::new(ArcSwap::from(index.clone())))
+                    .store(index);
+            }
+        }
+    }
+
+    /// Forget a non-default profile's live index (it then reads as empty). Does not touch its
+    /// scripts; see [`Self::delete_profile_scripts`].
+    pub fn drop_profile_index(&self, profile: &str) {
+        if profile != DEFAULT_PROFILE {
+            self.profile_indexes.write().remove(profile);
+        }
+    }
+
+    /// Delete every script of a non-default profile with its stored values, change log and
+    /// cookies, and drop its index. For when the profile itself is deleted; returns how many
+    /// scripts were removed. The default profile is refused.
+    pub fn delete_profile_scripts(&self, profile: &str) -> Result<usize> {
+        if profile == DEFAULT_PROFILE {
+            return Err(Error::InvalidScript(
+                "the default profile's scripts cannot be bulk-deleted".into(),
+            ));
+        }
+        let ids: Vec<String> = self.get_all_in(profile).into_iter().map(|s| s.id).collect();
+        let mut removed = 0;
+        for id in &ids {
+            match self.uninstall_in_raw(profile, id) {
+                Ok(()) => removed += 1,
+                Err(Error::ScriptNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.cookies.forget_profile(profile);
+        self.drop_profile_index(profile);
+        Ok(removed)
+    }
+
+    /// Names of the non-default profiles that own scripts or stored values (for sweeping data of
+    /// profiles that no longer exist).
+    pub fn stored_profiles(&self) -> Result<std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeSet<String> = self
+            .scripts
+            .read()
+            .keys()
+            .map(|(p, _)| p.clone())
+            .filter(|p| p != DEFAULT_PROFILE)
+            .collect();
+        out.extend(self.storage.value_profiles()?);
+        Ok(out)
     }
 
     /// Install a new userscript from source code (default profile; no dependencies fetched).
@@ -125,7 +227,7 @@ impl UserscriptManager {
     pub fn install_script(&self, profile: &str, script: Userscript) -> Result<String> {
         let r = self.install_script_raw(profile, script);
         if r.is_ok() {
-            self.refresh_index();
+            self.refresh_index_for(profile);
         }
         r
     }
@@ -156,7 +258,7 @@ impl UserscriptManager {
     pub fn update_in(&self, profile: &str, script_id: &str, new_source: String) -> Result<()> {
         let r = self.update_in_raw(profile, script_id, new_source);
         if r.is_ok() {
-            self.refresh_index();
+            self.refresh_index_for(profile);
         }
         r
     }
@@ -177,7 +279,7 @@ impl UserscriptManager {
     pub fn replace_script(&self, profile: &str, script: Userscript) -> Result<()> {
         let r = self.replace_script_raw(profile, script);
         if r.is_ok() {
-            self.refresh_index();
+            self.refresh_index_for(profile);
         }
         r
     }
@@ -218,7 +320,7 @@ impl UserscriptManager {
     pub fn uninstall_in(&self, profile: &str, script_id: &str) -> Result<()> {
         let r = self.uninstall_in_raw(profile, script_id);
         if r.is_ok() {
-            self.refresh_index();
+            self.refresh_index_for(profile);
         }
         r
     }
@@ -300,7 +402,7 @@ impl UserscriptManager {
     pub fn set_enabled_in(&self, profile: &str, script_id: &str, enabled: bool) -> Result<()> {
         let r = self.set_enabled_in_raw(profile, script_id, enabled);
         if r.is_ok() {
-            self.refresh_index();
+            self.refresh_index_for(profile);
         }
         r
     }
@@ -378,7 +480,12 @@ impl UserscriptManager {
                 scripts.insert(key(&script.profile, &script.id), script);
             }
         }
+        let profiles: std::collections::HashSet<String> =
+            self.scripts.read().keys().map(|(p, _)| p.clone()).collect();
         self.refresh_index();
+        for p in profiles.iter().filter(|p| *p != DEFAULT_PROFILE) {
+            self.refresh_index_for(p);
+        }
         info!("Loaded {} userscripts", count);
         Ok(count)
     }
@@ -511,6 +618,89 @@ console.log('test');
         m.load_all().unwrap();
         assert!(m.get_all_in("a").is_empty());
         assert_eq!(m.get_all_in("b").len(), 1);
+    }
+
+    #[test]
+    fn index_handles_follow_every_refresh() {
+        let temp_dir = tempdir().unwrap();
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let (kids, def) = (m.index_handle("kids"), m.index_handle(DEFAULT_PROFILE));
+        assert!(kids.load().is_empty() && def.load().is_empty());
+        let id = m.install_in("kids", TEST_SCRIPT.to_string()).unwrap();
+        m.install(TEST_SCRIPT.to_string()).unwrap();
+        assert_eq!(kids.load().len(), 1, "same handle after refresh");
+        assert_eq!(def.load().len(), 1);
+        assert!(Arc::ptr_eq(&kids, &m.index_handle("kids")));
+        m.set_enabled_in("kids", &id, false).unwrap();
+        assert!(kids.load().is_empty());
+    }
+
+    #[test]
+    fn per_profile_live_indexes_are_isolated() {
+        let temp_dir = tempdir().unwrap();
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        assert!(
+            m.index_for("kids").is_empty(),
+            "unknown profile reads empty"
+        );
+        assert!(m.index_for(DEFAULT_PROFILE).is_empty());
+        let id = m.install_in("kids", TEST_SCRIPT.to_string()).unwrap();
+        assert_eq!(m.index_for("kids").len(), 1);
+        assert!(m.index_for("guests").is_empty());
+        assert!(m.index_for(DEFAULT_PROFILE).is_empty());
+        assert!(m.live_index().is_empty());
+        m.install(TEST_SCRIPT.to_string()).unwrap();
+        assert_eq!(m.index_for(DEFAULT_PROFILE).len(), 1);
+        assert_eq!(m.live_index().len(), 1);
+        m.set_enabled_in("kids", &id, false).unwrap();
+        assert!(m.index_for("kids").is_empty());
+        assert_eq!(m.index_for(DEFAULT_PROFILE).len(), 1, "default unaffected");
+        m.set_enabled_in("kids", &id, true).unwrap();
+        assert_eq!(m.index_for("kids").len(), 1);
+        // Indexes come back after a restart.
+        drop(m);
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        m.load_all().unwrap();
+        assert_eq!(m.index_for("kids").len(), 1);
+        m.drop_profile_index("kids");
+        assert!(m.index_for("kids").is_empty());
+        m.refresh_index_for("kids");
+        assert_eq!(m.index_for("kids").len(), 1);
+    }
+
+    #[test]
+    fn delete_profile_scripts_removes_scripts_values_and_cookies() {
+        let temp_dir = tempdir().unwrap();
+        let m = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let id = m.install_in("kids", TEST_SCRIPT.to_string()).unwrap();
+        let keep = m.install_in("other", TEST_SCRIPT.to_string()).unwrap();
+        m.storage()
+            .set_raw(&ns("kids", &id), "k", serde_json::json!(1))
+            .unwrap();
+        m.storage()
+            .set_raw(&ns("other", &keep), "k", serde_json::json!(2))
+            .unwrap();
+        let url = url::Url::parse("https://example.com/").unwrap();
+        m.cookies()
+            .store_response("kids", &id, &url, ["a=1"].into_iter());
+        assert!(m.cookies().header_for("kids", &id, &url).is_some());
+        assert!(m.delete_profile_scripts(DEFAULT_PROFILE).is_err());
+        assert_eq!(m.delete_profile_scripts("kids").unwrap(), 1);
+        assert!(m.get_all_in("kids").is_empty());
+        assert!(m.index_for("kids").is_empty());
+        assert!(m
+            .storage()
+            .get_raw(&ns("kids", &id), "k")
+            .unwrap()
+            .is_none());
+        assert!(m.cookies().header_for("kids", &id, &url).is_none());
+        assert_eq!(m.index_for("other").len(), 1);
+        assert!(m
+            .storage()
+            .get_raw(&ns("other", &keep), "k")
+            .unwrap()
+            .is_some());
+        assert_eq!(m.delete_profile_scripts("kids").unwrap(), 0);
     }
 
     #[test]

@@ -73,6 +73,12 @@ pub mod tables {
     pub const POLICY_TEMP: TableDefinition<&str, &[u8]> = TableDefinition::new("policy_temp");
     /// `<profile>\0settings` -> JSON settings; `<profile>\0generation` -> u64 big endian.
     pub const POLICY_META: TableDefinition<&str, &[u8]> = TableDefinition::new("policy_meta");
+    /// profile id -> JSON profile (the built-in default, id 0, is not stored).
+    pub const PROFILES: TableDefinition<u64, &[u8]> = TableDefinition::new("profiles");
+    /// device id -> JSON device.
+    pub const DEVICES: TableDefinition<u64, &[u8]> = TableDefinition::new("devices");
+    /// BLAKE3 digest of a device token -> device id. Raw tokens are never stored.
+    pub const DEVICE_TOKENS: TableDefinition<&[u8], u64> = TableDefinition::new("device_tokens");
 }
 
 /// Database error.
@@ -456,6 +462,9 @@ fn init_schema(db: &Database, path: &Path) -> Result<(), DbError> {
         txn.open_table(POLICY_SOURCE_RULES)?;
         txn.open_table(POLICY_TEMP)?;
         txn.open_table(POLICY_META)?;
+        txn.open_table(PROFILES)?;
+        txn.open_table(DEVICES)?;
+        txn.open_table(DEVICE_TOKENS)?;
         let mut meta = txn.open_table(META)?;
         let found = meta
             .get("schema_version")?

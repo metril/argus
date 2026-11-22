@@ -226,6 +226,19 @@ impl From<common::db::DbError> for ApiError {
     }
 }
 
+impl From<common::profile_store::ProfileError> for ApiError {
+    fn from(e: common::profile_store::ProfileError) -> Self {
+        use common::profile_store::ProfileError as E;
+        match e {
+            E::Invalid(m) => ApiError::ValidationError(m),
+            E::NotFound(what) => ApiError::NotFound(format!("{what} not found")),
+            E::Conflict(m) => ApiError::conflict("conflict", m),
+            E::Forbidden(m) => ApiError::coded(StatusCode::FORBIDDEN, "profile_restricted", m),
+            E::Db(e) => e.into(),
+        }
+    }
+}
+
 impl From<anyhow::Error> for ApiError {
     fn from(err: anyhow::Error) -> Self {
         ApiError::Internal(err.to_string())

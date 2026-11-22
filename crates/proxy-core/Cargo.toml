@@ -64,6 +64,11 @@ bytes = { workspace = true }
 # CIDR matching for the destination policy and client ACL
 ipnet = "2.9"
 
+adblock = { workspace = true }
+arc-swap = { workspace = true }
+blake3 = "1.5"
+rustc-hash = "2"
+
 # Caching
 moka = { workspace = true }
 
@@ -146,4 +151,8 @@ harness = false
 
 [[bench]]
 name = "script_policy_bench"
+harness = false
+
+[[bench]]
+name = "profiles_bench"
 harness = false

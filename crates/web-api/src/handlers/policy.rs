@@ -1,6 +1,5 @@
 //! Script policy (NoScript-style) endpoints. Writes are audited by the audit middleware like
-//! every other state-changing call. Everything operates on the default profile until profiles
-//! land (`script_policy::DEFAULT_PROFILE`).
+//! every other state-changing call. Each route operates on one profile (`?profile=`, default `0`).
 
 use std::sync::Arc;
 
@@ -17,10 +16,10 @@ use script_policy::store::StoreError;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
+use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
 
-const PROFILE: &str = sp::DEFAULT_PROFILE;
 const MAX_NOTE: usize = 500;
 
 // ---- conversions ----
@@ -227,11 +226,14 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
             .contains(&needle.to_ascii_lowercase())
 }
 
-async fn settings_response(state: &Arc<AppState>) -> ApiResult<PolicySettingsResponse> {
+async fn settings_response(
+    state: &Arc<AppState>,
+    profile: String,
+) -> ApiResult<PolicySettingsResponse> {
     let st = state.policy.clone();
     blocking(move || {
-        let rules = st.rules(PROFILE).map_err(store_err)?;
-        let generation = st.generation(PROFILE).map_err(store_err)?;
+        let rules = st.rules(&profile).map_err(store_err)?;
+        let generation = st.generation(&profile).map_err(store_err)?;
         Ok(PolicySettingsResponse {
             settings: settings_out(&rules.settings),
             generation,
@@ -242,33 +244,39 @@ async fn settings_response(state: &Arc<AppState>) -> ApiResult<PolicySettingsRes
 
 // ---- settings ----
 
-/// Get the global policy settings.
+/// Get the policy settings of a profile.
 #[utoipa::path(
     get, path = "/policy/settings", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Settings", body = PolicySettingsResponse))
 )]
 pub async fn get_settings(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
 ) -> ApiResult<Json<PolicySettingsResponse>> {
-    Ok(Json(settings_response(&state).await?))
+    Ok(Json(settings_response(&state, profile.name).await?))
 }
 
-/// Replace the global policy settings (master switch, global default preset, default profile).
+/// Replace the policy settings of a profile (master switch, global default preset, default
+/// capability profile).
 #[utoipa::path(
     put, path = "/policy/settings", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     request_body = PolicySettingsDto,
     responses((status = 200, description = "Saved", body = PolicySettingsResponse))
 )]
 pub async fn put_settings(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<PolicySettingsDto>,
 ) -> ApiResult<Json<PolicySettingsResponse>> {
     let settings = settings_in(&req)?;
     let st = state.policy.clone();
-    blocking(move || st.set_settings(PROFILE, settings).map_err(store_err)).await?;
-    Ok(Json(settings_response(&state).await?))
+    let name = profile.name.clone();
+    blocking(move || st.set_settings(&name, settings).map_err(store_err)).await?;
+    Ok(Json(settings_response(&state, profile.name).await?))
 }
 
 // ---- site rules ----
@@ -288,15 +296,16 @@ pub struct SiteRulesQuery {
 #[utoipa::path(
     get, path = "/policy/site-rules", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
-    params(SiteRulesQuery),
+    params(ProfileQuery, SiteRulesQuery),
     responses((status = 200, description = "Site rules", body = Page<SiteRuleDto>))
 )]
 pub async fn list_site_rules(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiQuery(q): ApiQuery<SiteRulesQuery>,
 ) -> ApiResult<Json<Page<SiteRuleDto>>> {
     let st = state.policy.clone();
-    let rules = blocking(move || st.rules(PROFILE).map_err(store_err)).await?;
+    let rules = blocking(move || st.rules(&profile.name).map_err(store_err)).await?;
     let mut all: Vec<SiteRuleDto> = rules
         .site_rules
         .values()
@@ -312,18 +321,20 @@ pub async fn list_site_rules(
 #[utoipa::path(
     post, path = "/policy/site-rules", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     request_body = SiteRuleInput,
     responses((status = 201, description = "Created", body = SiteRuleDto))
 )]
 pub async fn create_site_rule(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<SiteRuleInput>,
 ) -> ApiResult<(StatusCode, Json<SiteRuleDto>)> {
     check_note(&req.note)?;
     let (scope, preset) = (scope_in(&req.scope)?, preset_in(&req.preset)?);
     let st = state.policy.clone();
     let r = blocking(move || {
-        st.create_site_rule(PROFILE, scope, preset, req.note)
+        st.create_site_rule(&profile.name, scope, preset, req.note)
             .map_err(store_err)
     })
     .await?;
@@ -334,12 +345,13 @@ pub async fn create_site_rule(
 #[utoipa::path(
     put, path = "/policy/site-rules/{id}", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
-    params(("id" = String, Path, description = "Site rule id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Site rule id")),
     request_body = SiteRuleUpdate,
     responses((status = 200, description = "Updated", body = SiteRuleDto))
 )]
 pub async fn update_site_rule(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<SiteRuleUpdate>,
 ) -> ApiResult<Json<SiteRuleDto>> {
@@ -347,7 +359,7 @@ pub async fn update_site_rule(
     let preset = preset_in(&req.preset)?;
     let st = state.policy.clone();
     let r = blocking(move || {
-        st.update_site_rule(PROFILE, &id, preset, req.note)
+        st.update_site_rule(&profile.name, &id, preset, req.note)
             .map_err(store_err)
     })
     .await?;
@@ -358,16 +370,17 @@ pub async fn update_site_rule(
 #[utoipa::path(
     delete, path = "/policy/site-rules/{id}", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
-    params(("id" = String, Path, description = "Site rule id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Site rule id")),
     responses((status = 200, description = "Deleted", body = MessageResponse))
 )]
 pub async fn delete_site_rule(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
     let st = state.policy.clone();
     let rid = id.clone();
-    blocking(move || st.delete_site_rule(PROFILE, &rid).map_err(store_err)).await?;
+    blocking(move || st.delete_site_rule(&profile.name, &rid).map_err(store_err)).await?;
     Ok(Json(MessageResponse {
         message: format!("Site rule '{id}' deleted"),
     }))
@@ -392,15 +405,16 @@ pub struct SourceRulesQuery {
 #[utoipa::path(
     get, path = "/policy/source-rules", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
-    params(SourceRulesQuery),
+    params(ProfileQuery, SourceRulesQuery),
     responses((status = 200, description = "Source rules", body = Page<SourceRuleDto>))
 )]
 pub async fn list_source_rules(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiQuery(q): ApiQuery<SourceRulesQuery>,
 ) -> ApiResult<Json<Page<SourceRuleDto>>> {
     let st = state.policy.clone();
-    let rules = blocking(move || st.rules(PROFILE).map_err(store_err)).await?;
+    let rules = blocking(move || st.rules(&profile.name).map_err(store_err)).await?;
     let needle = q.site.as_deref().unwrap_or("");
     let mut all: Vec<SourceRuleDto> = rules
         .source_rules
@@ -418,11 +432,13 @@ pub async fn list_source_rules(
 #[utoipa::path(
     post, path = "/policy/source-rules", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     request_body = SourceRuleInput,
     responses((status = 201, description = "Created", body = SourceRuleDto))
 )]
 pub async fn create_source_rule(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<SourceRuleInput>,
 ) -> ApiResult<(StatusCode, Json<SourceRuleDto>)> {
     check_note(&req.note)?;
@@ -430,7 +446,7 @@ pub async fn create_source_rule(
     let (caps, effect) = (caps_in(&req.caps)?, effect_in(&req.effect)?);
     let st = state.policy.clone();
     let r = blocking(move || {
-        st.create_source_rule(PROFILE, page, source, caps, effect, req.note)
+        st.create_source_rule(&profile.name, page, source, caps, effect, req.note)
             .map_err(store_err)
     })
     .await?;
@@ -441,12 +457,13 @@ pub async fn create_source_rule(
 #[utoipa::path(
     put, path = "/policy/source-rules/{id}", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
-    params(("id" = String, Path, description = "Source rule id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Source rule id")),
     request_body = SourceRuleUpdate,
     responses((status = 200, description = "Updated", body = SourceRuleDto))
 )]
 pub async fn update_source_rule(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<SourceRuleUpdate>,
 ) -> ApiResult<Json<SourceRuleDto>> {
@@ -454,7 +471,7 @@ pub async fn update_source_rule(
     let caps = caps_in(&req.caps)?;
     let st = state.policy.clone();
     let r = blocking(move || {
-        st.update_source_rule(PROFILE, &id, caps, req.note)
+        st.update_source_rule(&profile.name, &id, caps, req.note)
             .map_err(store_err)
     })
     .await?;
@@ -465,16 +482,21 @@ pub async fn update_source_rule(
 #[utoipa::path(
     delete, path = "/policy/source-rules/{id}", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
-    params(("id" = String, Path, description = "Source rule id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Source rule id")),
     responses((status = 200, description = "Deleted", body = MessageResponse))
 )]
 pub async fn delete_source_rule(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
     let st = state.policy.clone();
     let rid = id.clone();
-    blocking(move || st.delete_source_rule(PROFILE, &rid).map_err(store_err)).await?;
+    blocking(move || {
+        st.delete_source_rule(&profile.name, &rid)
+            .map_err(store_err)
+    })
+    .await?;
     Ok(Json(MessageResponse {
         message: format!("Source rule '{id}' deleted"),
     }))
@@ -486,12 +508,16 @@ pub async fn delete_source_rule(
 #[utoipa::path(
     get, path = "/policy/temp", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Active grants", body = Vec<TempGrantDto>))
 )]
-pub async fn list_temp(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<TempGrantDto>>> {
+pub async fn list_temp(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+) -> ApiResult<Json<Vec<TempGrantDto>>> {
     let st = state.policy.clone();
     let (rules, now) = blocking(move || {
-        let r = st.rules(PROFILE).map_err(store_err)?;
+        let r = st.rules(&profile.name).map_err(store_err)?;
         Ok((r, st.now()))
     })
     .await?;
@@ -504,18 +530,20 @@ pub async fn list_temp(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec
 #[utoipa::path(
     post, path = "/policy/temp", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     request_body = TempGrantInput,
     responses((status = 201, description = "Granted", body = TempGrantDto))
 )]
 pub async fn grant_temp(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<TempGrantInput>,
 ) -> ApiResult<(StatusCode, Json<TempGrantDto>)> {
     let (page, kind) = temp_parts(&req)?;
     let st = state.policy.clone();
     let g = blocking(move || {
         st.grant_temp(
-            PROFILE,
+            &profile.name,
             page,
             kind,
             req.ttl_secs,
@@ -533,13 +561,15 @@ pub async fn grant_temp(
 #[utoipa::path(
     delete, path = "/policy/temp", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Revoked", body = MessageResponse))
 )]
 pub async fn revoke_all_temp(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
 ) -> ApiResult<Json<MessageResponse>> {
     let st = state.policy.clone();
-    let n = blocking(move || st.revoke_all_temps(PROFILE).map_err(store_err)).await?;
+    let n = blocking(move || st.revoke_all_temps(&profile.name).map_err(store_err)).await?;
     Ok(Json(MessageResponse {
         message: format!("{n} temporary permission(s) revoked"),
     }))
@@ -549,16 +579,17 @@ pub async fn revoke_all_temp(
 #[utoipa::path(
     delete, path = "/policy/temp/{id}", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
-    params(("id" = String, Path, description = "Grant id")),
+    params(ProfileQuery, ("id" = String, Path, description = "Grant id")),
     responses((status = 200, description = "Revoked", body = MessageResponse))
 )]
 pub async fn revoke_temp(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
     let st = state.policy.clone();
     let rid = id.clone();
-    blocking(move || st.revoke_temp(PROFILE, &rid).map_err(store_err)).await?;
+    blocking(move || st.revoke_temp(&profile.name, &rid).map_err(store_err)).await?;
     Ok(Json(MessageResponse {
         message: format!("Temporary permission '{id}' revoked"),
     }))
@@ -643,17 +674,18 @@ pub struct ExplainQuery {
 #[utoipa::path(
     get, path = "/policy/explain", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
-    params(ExplainQuery),
+    params(ProfileQuery, ExplainQuery),
     responses((status = 200, description = "Explanation", body = ExplainResponse))
 )]
 pub async fn explain(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiQuery(q): ApiQuery<ExplainQuery>,
 ) -> ApiResult<Json<ExplainResponse>> {
     let st = state.policy.clone();
     let out = blocking(move || {
-        let rules = st.rules(PROFILE).map_err(store_err)?;
-        let compiled = st.snapshot(PROFILE).map_err(store_err)?;
+        let rules = st.rules(&profile.name).map_err(store_err)?;
+        let compiled = st.snapshot(&profile.name).map_err(store_err)?;
         explain_url(&rules, &compiled, &q.url, st.now())
     })
     .await?;
@@ -664,19 +696,21 @@ pub async fn explain(
 #[utoipa::path(
     post, path = "/policy/preview", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
+    params(ProfileQuery),
     request_body = PreviewRequest,
     responses((status = 200, description = "Before/after", body = PreviewResponse))
 )]
 pub async fn preview(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<PreviewRequest>,
 ) -> ApiResult<Json<PreviewResponse>> {
     check_note(&req.add_site_rule.as_ref().and_then(|r| r.note.clone()))?;
     let st = state.policy.clone();
     let out = blocking(move || {
         let now = st.now();
-        let rules = st.rules(PROFILE).map_err(store_err)?;
-        let before_c = st.snapshot(PROFILE).map_err(store_err)?;
+        let rules = st.rules(&profile.name).map_err(store_err)?;
+        let before_c = st.snapshot(&profile.name).map_err(store_err)?;
         let mut m = rules.clone();
         for id in &req.remove_ids {
             m.site_rules.remove(id);
@@ -762,11 +796,15 @@ pub async fn preview(
 #[utoipa::path(
     get, path = "/policy/export", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Policy document", body = PolicyExportDto))
 )]
-pub async fn export(State(state): State<Arc<AppState>>) -> ApiResult<Json<PolicyExportDto>> {
+pub async fn export(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+) -> ApiResult<Json<PolicyExportDto>> {
     let st = state.policy.clone();
-    let rules = blocking(move || st.rules(PROFILE).map_err(store_err)).await?;
+    let rules = blocking(move || st.rules(&profile.name).map_err(store_err)).await?;
     let doc = rules.export();
     Ok(Json(PolicyExportDto {
         version: doc.version,
@@ -801,11 +839,13 @@ const MAX_IMPORT_RULES: usize = 5000;
 #[utoipa::path(
     post, path = "/policy/import", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     request_body = PolicyImportRequest,
     responses((status = 200, description = "Imported", body = MessageResponse))
 )]
 pub async fn import(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<PolicyImportRequest>,
 ) -> ApiResult<Json<MessageResponse>> {
     let replace = match req.mode.as_str() {
@@ -851,7 +891,7 @@ pub async fn import(
     };
     let (ns, nr) = (doc.site_rules.len(), doc.source_rules.len());
     let st = state.policy.clone();
-    blocking(move || st.import(PROFILE, doc, replace).map_err(store_err)).await?;
+    blocking(move || st.import(&profile.name, doc, replace).map_err(store_err)).await?;
     Ok(Json(MessageResponse {
         message: format!("Imported {ns} site rule(s) and {nr} source rule(s)"),
     }))
@@ -900,11 +940,12 @@ fn report_out(r: &sp::PageReport) -> PolicyReportDto {
 #[utoipa::path(
     get, path = "/policy/reports", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
-    params(ReportsQuery),
+    params(ProfileQuery, ReportsQuery),
     responses((status = 200, description = "Per-page blocked sources", body = Page<PolicyReportDto>))
 )]
 pub async fn reports(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiQuery(q): ApiQuery<ReportsQuery>,
 ) -> ApiResult<Json<Page<PolicyReportDto>>> {
     let want = q
@@ -914,7 +955,7 @@ pub async fn reports(
         .filter(|s| !s.is_empty());
     let all: Vec<PolicyReportDto> = state
         .policy
-        .report_pages(PROFILE)
+        .report_pages(&profile.name)
         .iter()
         .filter(|r| {
             want.as_ref()
@@ -950,13 +991,15 @@ fn panel_out(p: &script_policy::panel::PanelSettings) -> api_types::PanelSetting
 #[utoipa::path(
     get, path = "/policy/panel", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
+    params(ProfileQuery),
     responses((status = 200, description = "Panel settings", body = api_types::PanelSettingsDto))
 )]
 pub async fn get_panel(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
 ) -> ApiResult<Json<api_types::PanelSettingsDto>> {
     let st = state.policy.clone();
-    let p = blocking(move || st.panel_settings(PROFILE).map_err(store_err)).await?;
+    let p = blocking(move || st.panel_settings(&profile.name).map_err(store_err)).await?;
     let mut dto = panel_out(&p);
     dto.reserved_host = state
         .proxy_state
@@ -974,6 +1017,7 @@ pub async fn get_panel(
 #[utoipa::path(
     put, path = "/policy/panel", tag = "policy",
     security(("bearer_auth" = ["policy:write"])),
+    params(ProfileQuery),
     request_body = api_types::PanelSettingsInput,
     responses(
         (status = 200, description = "Saved", body = api_types::PanelSettingsDto),
@@ -982,12 +1026,13 @@ pub async fn get_panel(
 )]
 pub async fn put_panel(
     State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
     ApiJson(req): ApiJson<api_types::PanelSettingsInput>,
 ) -> ApiResult<Json<api_types::PanelSettingsDto>> {
     use script_policy::panel::{hash_pin, valid_hotkey, PanelAuth};
     let st = state.policy.clone();
     let out = blocking(move || {
-        let mut p = st.panel_settings(PROFILE).map_err(store_err)?;
+        let mut p = st.panel_settings(&profile.name).map_err(store_err)?;
         if let Some(e) = req.enabled {
             p.enabled = e;
         }
@@ -1013,7 +1058,7 @@ pub async fn put_panel(
         if let Some(pin) = &req.pin {
             p.pin_hash = Some(hash_pin(pin).map_err(|e| ApiError::ValidationError(e.into()))?);
         }
-        st.set_panel_settings(PROFILE, &p).map_err(store_err)?;
+        st.set_panel_settings(&profile.name, &p).map_err(store_err)?;
         Ok(p)
     })
     .await?;

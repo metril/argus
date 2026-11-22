@@ -47,8 +47,9 @@ pub struct Principal {
     /// creator can still do (for tokens).
     pub scopes: BTreeSet<Scope>,
     pub actor: Actor,
-    /// Profile restriction (tokens only). `None` = unrestricted. Enforced by
-    /// [`Principal::may_access_profile`] once profile routes exist.
+    /// Profile restriction (tokens only). `None` = unrestricted. Profile-scoped routes are
+    /// enforced by `ProfileParam` through [`Principal::may_access_profile`]; global routes by
+    /// [`restricted_may_use`].
     pub profiles: Option<Vec<String>>,
 }
 
@@ -68,7 +69,7 @@ impl Principal {
         }
     }
 
-    /// Profile filter hook: may this principal touch `profile_id`?
+    /// May this principal touch `profile_id` (decimal id)?
     pub fn may_access_profile(&self, profile_id: &str) -> bool {
         self.profiles
             .as_ref()
@@ -110,6 +111,43 @@ pub struct RouteTable {
     pub undeclared: Vec<String>,
     /// Operations naming a scope that does not exist (must be empty).
     pub invalid: Vec<String>,
+    /// Operations that bind to a profile (a `profile` query or `profile_id` path parameter), or
+    /// whose scope family (`profiles:*`, `devices:*`) checks the profile itself.
+    profile_aware: std::collections::HashSet<(String, String)>,
+}
+
+/// Global (not profile-scoped) reads a profile-restricted token may make.
+const RESTRICTED_GLOBAL_READS: [Scope; 5] = [
+    Scope::ListsRead,
+    Scope::StatsRead,
+    Scope::SystemRead,
+    Scope::CaRead,
+    Scope::ConfigRead,
+];
+
+/// Rule for a profile-restricted token on a route that is not profile-aware (global state).
+///
+/// - own-token and own-session management and plain authenticated routes: allowed (a token can
+///   never mint more than its parent holds, restriction included);
+/// - global reads of lists, stats, system status, CA info and the config: allowed;
+/// - custom rules are the default profile's overlay: readable only with access to profile `0`;
+/// - everything else (any write to global state, users, audit, admin routes): refused.
+pub fn restricted_may_use(p: &Principal, rule: &RouteAuth, method: &Method) -> bool {
+    let RouteAuth::Scopes(required) = rule else {
+        return true;
+    };
+    if required
+        .iter()
+        .all(|s| matches!(s, Scope::TokensSelf | Scope::SessionsSelf))
+    {
+        return true;
+    }
+    if is_unsafe(method) {
+        return false;
+    }
+    required.iter().all(|s| {
+        RESTRICTED_GLOBAL_READS.contains(s) || (*s == Scope::RulesRead && p.may_access_profile("0"))
+    })
 }
 
 const METHODS: [&str; 7] = ["get", "put", "post", "delete", "patch", "head", "options"];
@@ -151,6 +189,9 @@ impl RouteTable {
                         }
                     }
                 }
+                let profile_scoped = scopes
+                    .iter()
+                    .any(|s| matches!(s.resource(), "profiles" | "devices"));
                 let auth = if public {
                     RouteAuth::Public
                 } else if scopes.is_empty() {
@@ -158,6 +199,20 @@ impl RouteTable {
                 } else {
                     RouteAuth::Scopes(scopes)
                 };
+                let has_param = op
+                    .get("parameters")
+                    .and_then(Value::as_array)
+                    .is_some_and(|ps| {
+                        ps.iter().any(|p| {
+                            matches!(
+                                p.get("name").and_then(Value::as_str),
+                                Some("profile") | Some("profile_id")
+                            )
+                        })
+                    });
+                if has_param || profile_scoped {
+                    t.profile_aware.insert((m.to_uppercase(), path.clone()));
+                }
                 t.map.insert((m.to_uppercase(), path.clone()), auth);
             }
         }
@@ -166,6 +221,12 @@ impl RouteTable {
 
     pub fn get(&self, method: &str, path: &str) -> Option<&RouteAuth> {
         self.map.get(&(method.to_string(), path.to_string()))
+    }
+
+    /// Whether the route binds itself to a profile (see the field docs).
+    pub fn is_profile_aware(&self, method: &str, path: &str) -> bool {
+        self.profile_aware
+            .contains(&(method.to_string(), path.to_string()))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&(String, String), &RouteAuth)> {
@@ -307,6 +368,7 @@ fn check(
     state: &Arc<AppState>,
     req: &Request,
     rule: Option<&RouteAuth>,
+    aware: bool,
     meta: &mut AuditMeta,
 ) -> Result<Option<Principal>, ApiError> {
     let rule = rule.ok_or_else(|| {
@@ -350,6 +412,16 @@ fn check(
             ));
         }
     }
+    // Profile-restricted tokens: global routes are refused here; profile-aware routes check the
+    // profile themselves (`ProfileParam`).
+    if principal.profiles.is_some() && !aware && !restricted_may_use(&principal, rule, req.method())
+    {
+        return Err(ApiError::coded(
+            axum::http::StatusCode::FORBIDDEN,
+            "profile_restricted",
+            "This token is restricted to specific profiles and cannot use this global route",
+        ));
+    }
     Ok(Some(principal))
 }
 
@@ -374,12 +446,16 @@ pub async fn authorize(
         .get()
         .and_then(|t| t.get(&method, &route))
         .cloned();
+    let aware = state
+        .route_auth
+        .get()
+        .is_some_and(|t| t.is_profile_aware(&method, &route));
     let mut meta = AuditMeta {
         route,
         ..Default::default()
     };
 
-    let mut response = match check(&state, &req, rule.as_ref(), &mut meta) {
+    let mut response = match check(&state, &req, rule.as_ref(), aware, &mut meta) {
         Ok(principal) => {
             if let Some(p) = principal {
                 req.extensions_mut().insert(p);

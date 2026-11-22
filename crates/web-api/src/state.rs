@@ -28,6 +28,22 @@ use userscript_engine::{UserscriptManager, UserscriptRuntime};
 use uuid::Uuid;
 
 /// Main application state shared across all handlers
+/// Build outcome of one profile, as the proxy last saw it.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileBuildInfo {
+    pub last_error: Option<String>,
+    pub last_built: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Live proxy facts about profiles and devices that the stores do not hold. Implemented by the
+/// proxy and passed in at startup, so this crate does not depend on it.
+pub trait ProfileRuntime: Send + Sync {
+    /// Last build result of profile `id` (`None`: never built or unknown).
+    fn build_info(&self, profile_id: u64) -> Option<ProfileBuildInfo>;
+    /// When a connection last resolved to device `id`.
+    fn device_last_seen(&self, device_id: u64) -> Option<chrono::DateTime<chrono::Utc>>;
+}
+
 pub struct AppState {
     /// Proxy state wrapper
     pub proxy_state: Arc<ProxyState>,
@@ -82,6 +98,12 @@ pub struct AppState {
 
     /// Persisted audit log.
     pub audit: Arc<AuditStore>,
+
+    /// Profiles and devices (shared with the proxy, which reacts to its change notifications).
+    pub profiles: Arc<common::profile_store::ProfileStore>,
+
+    /// Live build status and device activity from the proxy (`None` without a proxy).
+    pub profile_runtime: Option<Arc<dyn ProfileRuntime>>,
 
     /// Script policy rules (per profile), compiled snapshots and blocked-source reports.
     pub policy: Arc<script_policy::store::PolicyStore>,
@@ -508,6 +530,40 @@ pub async fn build_state_with_policy(
     request_timeout_ms: Arc<AtomicU64>,
     policy: Option<Arc<script_policy::store::PolicyStore>>,
 ) -> ApiResult<Arc<AppState>> {
+    build_state_full(
+        api_config,
+        proxy_config,
+        shared_engine,
+        list_service,
+        http_client,
+        userscript_manager,
+        userscript_runtime,
+        config_path,
+        request_timeout_ms,
+        policy,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Like [`build_state_with_policy`], also sharing `profiles` (the proxy resolves devices through
+/// the same store) when given. When `None`, a store is opened over the session database.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_state_full(
+    api_config: ApiConfig,
+    proxy_config: ProxyConfig,
+    shared_engine: Arc<SharedEngine>,
+    list_service: Arc<ListService>,
+    http_client: reqwest::Client,
+    userscript_manager: Arc<UserscriptManager>,
+    userscript_runtime: Arc<UserscriptRuntime>,
+    config_path: PathBuf,
+    request_timeout_ms: Arc<AtomicU64>,
+    policy: Option<Arc<script_policy::store::PolicyStore>>,
+    profiles: Option<Arc<common::profile_store::ProfileStore>>,
+    profile_runtime: Option<Arc<dyn ProfileRuntime>>,
+) -> ApiResult<Arc<AppState>> {
     crate::auth::password::validate_bcrypt_cost(api_config.auth.bcrypt_cost)?;
     if api_config.auth.bcrypt_cost < crate::auth::password::RECOMMENDED_MIN_BCRYPT_COST {
         tracing::warn!(
@@ -538,6 +594,13 @@ pub async fn build_state_with_policy(
     // Initialize session store (persistent user data)
     let session_store = Arc::new(SessionStore::new(api_config.session.storage_path.clone())?);
     let db = session_store.db();
+    let profiles = match profiles {
+        Some(p) => p,
+        None => Arc::new(
+            common::profile_store::ProfileStore::open(&db)
+                .map_err(|e| ApiError::Internal(format!("profile store: {e}")))?,
+        ),
+    };
     let policy =
         policy.unwrap_or_else(|| Arc::new(script_policy::store::PolicyStore::new(db.clone())));
 
@@ -590,6 +653,8 @@ pub async fn build_state_with_policy(
         api_config,
         tokens,
         audit,
+        profiles,
+        profile_runtime,
         policy,
         started_at: Instant::now(),
         spec_json: OnceLock::new(),

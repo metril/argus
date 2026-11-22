@@ -54,37 +54,91 @@ impl Default for PanelConfig {
     }
 }
 
-/// Per-site "ad blocking off", backed by the custom rules (see `list_service::site_exceptions`).
+/// Per-site "ad blocking off" for the requesting device's profile.
 pub trait SiteBlocking: Send + Sync {
-    fn disabled(&self, site: &str) -> bool;
-    fn set_disabled(&self, site: &str, disabled: bool) -> Result<(), String>;
+    fn disabled(&self, profile: &crate::request_ctx::Profile, site: &str) -> bool;
+    fn set_disabled(
+        &self,
+        profile: &crate::request_ctx::Profile,
+        site: &str,
+        disabled: bool,
+    ) -> Result<(), String>;
 }
 
-/// [`SiteBlocking`] over the list service's custom rules.
-pub struct ListSiteBlocking(pub Arc<list_service::ListService>);
+/// [`SiteBlocking`] over rule text: the list service's global custom rules for the default
+/// profile (see `list_service::site_exceptions`), the profile's own rules for any other.
+pub struct ListSiteBlocking {
+    lists: Arc<list_service::ListService>,
+    profiles: Option<Arc<common::profile_store::ProfileStore>>,
+}
+
+impl ListSiteBlocking {
+    pub fn new(
+        lists: Arc<list_service::ListService>,
+        profiles: Option<Arc<common::profile_store::ProfileStore>>,
+    ) -> Self {
+        Self { lists, profiles }
+    }
+}
 
 impl SiteBlocking for ListSiteBlocking {
-    fn disabled(&self, site: &str) -> bool {
-        self.0
-            .store()
-            .get_custom_rules()
-            .is_ok_and(|r| list_service::site_exceptions::is_disabled(&r, site))
+    fn disabled(&self, profile: &crate::request_ctx::Profile, site: &str) -> bool {
+        let rules = if profile.id == crate::request_ctx::DEFAULT_PROFILE_ID {
+            self.lists.store().get_custom_rules().ok()
+        } else {
+            self.profiles
+                .as_ref()
+                .and_then(|p| p.get(profile.id).ok().flatten())
+                .map(|r| r.rules)
+        };
+        rules.is_some_and(|r| list_service::site_exceptions::is_disabled(&r, site))
     }
-    fn set_disabled(&self, site: &str, disabled: bool) -> Result<(), String> {
-        let rules = self
-            .0
-            .store()
-            .get_custom_rules()
-            .map_err(|e| e.to_string())?;
-        let new = list_service::site_exceptions::set(&rules, site, disabled)
-            .ok_or_else(|| format!("'{site}' is not a valid host name"))?;
-        if new != rules {
-            self.0
+
+    fn set_disabled(
+        &self,
+        profile: &crate::request_ctx::Profile,
+        site: &str,
+        disabled: bool,
+    ) -> Result<(), String> {
+        if profile.id == crate::request_ctx::DEFAULT_PROFILE_ID {
+            let rules = self
+                .lists
                 .store()
-                .set_custom_rules(&new)
+                .get_custom_rules()
                 .map_err(|e| e.to_string())?;
-            self.0.trigger();
+            let new = list_service::site_exceptions::set(&rules, site, disabled)
+                .ok_or_else(|| format!("'{site}' is not a valid host name"))?;
+            if new != rules {
+                self.lists
+                    .store()
+                    .set_custom_rules(&new)
+                    .map_err(|e| e.to_string())?;
+                self.lists.trigger();
+            }
+            return Ok(());
         }
+        // Another profile: its own rules only, never the global ones. The profile builder
+        // recompiles on the store's change notification.
+        let store = self
+            .profiles
+            .as_ref()
+            .ok_or("per-profile blocking control is not available")?;
+        store
+            .modify(profile.id, |rec| {
+                rec.rules = list_service::site_exceptions::set(&rec.rules, site, disabled)
+                    .ok_or_else(|| {
+                        common::profile_store::ProfileError::Invalid(format!(
+                            "'{site}' is not a valid host name"
+                        ))
+                    })?;
+                Ok(())
+            })
+            .map_err(|e| match e {
+                common::profile_store::ProfileError::NotFound(_) => {
+                    "this profile no longer exists".to_string()
+                }
+                e => e.to_string(),
+            })?;
         Ok(())
     }
 }
@@ -355,12 +409,12 @@ impl PanelHost {
             .blocking
             .read()
             .as_ref()
-            .is_some_and(|b| b.disabled(&site));
+            .is_some_and(|b| b.disabled(&profile, &site));
         let mut us_gen = String::new();
         let userscripts: Vec<Value> = profile
             .userscript_manager()
             .map(|m| {
-                m.get_all_in(userscript_engine::DEFAULT_PROFILE)
+                m.get_all_in(&profile.name)
                     .iter()
                     .filter(|s| {
                         userscript_engine::matcher::Rules::compile(
@@ -668,12 +722,7 @@ impl PanelHost {
         let profile = rctx.profile.load_full();
         let results: Vec<(String, Result<(), String>)> = ops
             .iter()
-            .map(|o| {
-                (
-                    describe(o),
-                    self.apply_op(&sc, profile.userscript_manager(), o),
-                )
-            })
+            .map(|o| (describe(o), self.apply_op(&sc, &profile, o)))
             .collect();
         let items: String = results
             .iter()
@@ -704,9 +753,10 @@ impl PanelHost {
     fn apply_op(
         &self,
         sc: &crate::scriptctl::ScriptControl,
-        manager: Option<&Arc<userscript_engine::UserscriptManager>>,
+        profile: &crate::request_ctx::Profile,
         op: &PanelOp,
     ) -> Result<(), String> {
+        let manager = profile.userscript_manager();
         let store = sc.store();
         let prof = sc.profile_name();
         let scope = |s: &str| -> Result<sp::Scope, String> {
@@ -803,7 +853,7 @@ impl PanelHost {
             }
             PanelOp::RevokeTemps => store.revoke_all_temps(prof).map(|_| ()).map_err(e),
             PanelOp::Adblock { site, enabled } => match self.blocking.read().as_ref() {
-                Some(b) => b.set_disabled(site, !*enabled),
+                Some(b) => b.set_disabled(profile, site, !*enabled),
                 None => Err("per-site blocking control is not available".into()),
             },
             PanelOp::Userscript { id, enabled } => match manager {

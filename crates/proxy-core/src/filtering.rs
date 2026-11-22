@@ -14,6 +14,7 @@ use crate::ext;
 use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody};
 use crate::internal::Internal;
 use crate::policy::{is_refusal, DestPolicy};
+use crate::profiles::Profiles;
 use crate::redirect::{block_response, policy_block_response, redirect_response, rewrite_redirect};
 use crate::request_ctx::{default_profile_slot, Profile, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url, RequestType};
@@ -33,7 +34,7 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Incoming};
 use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE, HOST};
 use hyper::{Request, Response, StatusCode};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,12 +94,110 @@ fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
     }
 }
 
+/// Combine the base verdict with the profile's overlay engine, if any: an overlay exception or
+/// block wins over the base verdict (so an overlay block beats a base allow and an overlay
+/// exception beats a base block).
+fn apply_overlay(
+    profile: &Profile,
+    base: filter_engine::MatchResult,
+    url: &str,
+    source_url: &str,
+    resource_type: &str,
+) -> filter_engine::MatchResult {
+    let Some(ov) = &profile.overlay else {
+        return base;
+    };
+    if !ov.is_enabled() {
+        return base;
+    }
+    // Neither verdict is counted here: the caller records the final one once.
+    let o = ov.check_deferred(url, source_url, resource_type);
+    if o.blocked || o.exception_rule.is_some() {
+        return o;
+    }
+    // An exception-only overlay rule is only reported by the engine next to a block it
+    // overrides, so when the base blocked, ask the overlay for its exceptions explicitly.
+    if base.blocked {
+        if let Ok(req) = adblock::request::Request::new(url, source_url, resource_type) {
+            let r = ov.engine().check_network_request_subset(&req, false, true);
+            if !r.matched {
+                if let Some(rule) = r.exception {
+                    return filter_engine::MatchResult::allowed_by_exception(rule);
+                }
+            }
+        }
+    }
+    base
+}
+
+/// Merge overlay cosmetic resources into the base's. The overlay wins: its `site#@#selector`
+/// exceptions cancel the base's hides of that selector, and its `$generichide` exception makes
+/// the page generic-hide free.
+///
+/// Limits of the engine API, deliberately documented in `docs/PROFILES.md`: only host-scoped
+/// overlay exceptions are visible here (a bare `#@#.x` is resolved inside the overlay engine
+/// alone), an overlay exception cannot cancel a base *procedural* filter, and `$generichide`
+/// cannot strip the non-class/id "misc" generic selectors already in the base's static list;
+/// `$elemhide` is not understood by the engine at all (base or overlay).
+fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosmetics) {
+    if !ov.exceptions.is_empty() {
+        base.hide_selectors.retain(|s| !ov.exceptions.contains(s));
+    }
+    base.hide_selectors.extend(ov.hide_selectors);
+    base.procedural_actions.extend(ov.procedural_actions);
+    if !ov.injected_script.is_empty() {
+        if !base.injected_script.is_empty() {
+            base.injected_script.push('\n');
+        }
+        base.injected_script.push_str(&ov.injected_script);
+    }
+    base.generichide |= ov.generichide;
+    base.exceptions.extend(ov.exceptions);
+}
+
+/// Generic hide selectors for the classes and ids a page reports, from both of the profile's
+/// engines: the base's minus the overlay's exceptions, plus the overlay's own; nothing when
+/// either engine excepts the page from generic hiding.
+pub(crate) fn dynamic_selectors(
+    profile: &Profile,
+    url: &str,
+    classes: &[String],
+    ids: &[String],
+) -> Vec<String> {
+    let mut out = profile.engine.dynamic_hide_selectors(url, classes, ids);
+    let Some(ov) = &profile.overlay else {
+        return out;
+    };
+    if !ov.is_enabled() {
+        return out;
+    }
+    let cos = ov.cosmetic_for(url);
+    if cos.generichide {
+        return Vec::new();
+    }
+    out.retain(|s| !cos.exceptions.contains(s));
+    for s in ov.dynamic_hide_selectors(url, classes, ids) {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
 pub struct ProxyContext {
     engine: Arc<SharedEngine>,
     client: reqwest::Client,
-    /// Context used by [`Self::forward`] (default profile, unattributed client).
-    default_ctx: RequestCtx,
+    /// The default profile's slot (also held by the profile table).
+    default_slot: ProfileSlot,
+    /// Device-to-profile table; holds only the default profile until something publishes.
+    profiles: Profiles,
+    /// The profile and device store and the builder that compiles it into `profiles` (set once
+    /// at startup; see [`Self::set_profile_service`]).
+    profile_store: std::sync::OnceLock<Arc<common::profile_store::ProfileStore>>,
+    profile_builder: std::sync::OnceLock<Arc<crate::profile_build::ProfileBuilder>>,
+    /// Refuse explicit-proxy connections without a known device token (`407`).
+    require_device_token: std::sync::atomic::AtomicBool,
     /// Upstream request timeout in milliseconds; 0 disables it.
     request_timeout_ms: Arc<AtomicU64>,
     /// Code-only upstream dial override (tests/controlled setups); shared by the HTTP client and
@@ -124,13 +223,17 @@ impl ProxyContext {
         if !adblock_enabled {
             engine.set_enabled(false);
         }
-        let default_ctx = RequestCtx::anonymous(default_profile_slot(engine.clone()));
+        let default_slot = default_profile_slot(engine.clone());
         Self {
             engine,
             strict_client: client.clone(),
             policy: Arc::default(),
             client,
-            default_ctx,
+            profiles: Profiles::new(default_slot.clone()),
+            default_slot,
+            profile_store: std::sync::OnceLock::new(),
+            profile_builder: std::sync::OnceLock::new(),
+            require_device_token: std::sync::atomic::AtomicBool::new(false),
             request_timeout_ms: Arc::new(AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_MS)),
             resolve_all_to: None,
             internal: Arc::new(Internal::new()),
@@ -142,12 +245,10 @@ impl ProxyContext {
     /// Attach (or detach) the userscripts of the default profile. Live: connections hold the
     /// profile slot, so the next request sees them.
     pub fn set_userscripts(&self, manager: Option<Arc<userscript_engine::UserscriptManager>>) {
-        let slot = &self.default_ctx.profile;
-        let cur = slot.load_full();
+        let slot = &self.default_slot;
         slot.store(Arc::new(
-            Profile::new(cur.id, cur.generation, cur.engine.clone())
-                .with_userscripts(manager)
-                .with_script_control(cur.script_control.clone()),
+            slot.load()
+                .with(|p| *p = p.clone().with_userscripts(manager)),
         ));
     }
 
@@ -170,13 +271,8 @@ impl ProxyContext {
     /// Attach the script control of the default profile (see [`crate::scriptctl`]). Live, like
     /// [`Self::set_userscripts`].
     pub fn set_script_control(&self, control: Option<Arc<crate::scriptctl::ScriptControl>>) {
-        let slot = &self.default_ctx.profile;
-        let cur = slot.load_full();
-        slot.store(Arc::new(
-            Profile::new(cur.id, cur.generation, cur.engine.clone())
-                .with_userscripts(cur.userscripts.clone())
-                .with_script_control(control),
-        ));
+        let slot = &self.default_slot;
+        slot.store(Arc::new(slot.load().with(|p| p.script_control = control)));
     }
 
     /// Documents currently holding unfetched userscript bundle URLs (bounded; for tests/metrics).
@@ -262,33 +358,47 @@ impl ProxyContext {
             .store(timeout.as_millis() as u64, Ordering::Relaxed);
     }
 
-    /// The default profile's slot (what connections without a resolved profile use).
+    /// The default profile's slot.
     pub fn default_profile(&self) -> &ProfileSlot {
-        &self.default_ctx.profile
+        &self.default_slot
     }
 
-    /// Context for a connection on the default profile.
-    pub fn request_ctx_for(
+    /// Register the profile store and its builder (once; later calls are ignored).
+    pub fn set_profile_service(
         &self,
-        client_addr: SocketAddr,
-        auth_user: Option<Arc<str>>,
-    ) -> RequestCtx {
-        RequestCtx::new(self.default_ctx.profile.clone(), client_addr, auth_user)
+        store: Arc<common::profile_store::ProfileStore>,
+        builder: Arc<crate::profile_build::ProfileBuilder>,
+    ) {
+        let _ = self.profile_store.set(store);
+        let _ = self.profile_builder.set(builder);
     }
 
-    /// Whether a request should be blocked (respects the master adblock toggle, records stats).
-    ///
-    /// Shared by the HTTP, WebSocket, and HTTP/3 paths.
-    pub fn should_block(&self, url: &str, source_url: &str, resource_type: &str) -> bool {
-        self.engine.is_enabled() && {
-            let profile = self.default_ctx.profile.load();
-            self.engine
-                .check_for(url, source_url, resource_type, &profile.label)
-                .blocked
-        }
+    /// The persistent profile and device store, once registered.
+    pub fn profile_store(&self) -> Option<&Arc<common::profile_store::ProfileStore>> {
+        self.profile_store.get()
     }
 
-    /// Like [`Self::should_block`] but with the profile in `rctx`.
+    /// The builder that keeps the live profile table in step with the store, once registered.
+    pub fn profile_builder(&self) -> Option<&Arc<crate::profile_build::ProfileBuilder>> {
+        self.profile_builder.get()
+    }
+
+    /// The device-to-profile table.
+    pub fn profiles(&self) -> &Profiles {
+        &self.profiles
+    }
+
+    /// Require a known device token on explicit-proxy connections (`proxy.require_device_token`).
+    pub fn set_require_device_token(&self, require: bool) {
+        self.require_device_token.store(require, Ordering::Relaxed);
+    }
+
+    pub fn require_device_token(&self) -> bool {
+        self.require_device_token.load(Ordering::Relaxed)
+    }
+
+    /// Whether a request should be blocked by the profile in `rctx` (respects the engine's
+    /// master toggle, records stats). Shared by the WebSocket and HTTP/3 paths.
     pub fn should_block_with(
         &self,
         rctx: &RequestCtx,
@@ -297,22 +407,16 @@ impl ProxyContext {
         resource_type: &str,
     ) -> bool {
         let profile = rctx.profile.load();
-        profile.engine.is_enabled()
-            && profile
+        profile.engine.is_enabled() && {
+            let base = profile
                 .engine
-                .check_for(url, source_url, resource_type, &profile.label)
+                .check_deferred(url, source_url, resource_type);
+            let v = apply_overlay(&profile, base, url, source_url, resource_type);
+            profile
+                .engine
+                .record_verdict(v, url, source_url, resource_type, &profile.label)
                 .blocked
-    }
-
-    /// Forward a proxied request using the default request context.
-    pub async fn forward(
-        &self,
-        req: Request<Incoming>,
-        scheme: &str,
-        fallback_authority: Option<(String, u16)>,
-    ) -> Result<Response<ProxyBody>> {
-        self.forward_with(req, scheme, fallback_authority, &self.default_ctx)
-            .await
+        }
     }
 
     /// Forward a proxied request upstream, filtering it first with the profile in `rctx`.
@@ -380,11 +484,12 @@ impl ProxyContext {
         // privileged userscript may run: refuse, so registration fails and the worker never sees
         // the page's bundles or GM traffic (see docs/USERSCRIPT-PROTOCOL.md section 6).
         if is_service_worker_fetch(req.headers()) {
-            let refuse = rctx
-                .profile
-                .load()
-                .userscript_manager()
-                .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+            let prof = rctx.profile.load();
+            let refuse = prof.script_index.as_ref().is_some_and(|ix| {
+                self.internal
+                    .gm
+                    .blocks_service_workers_in(&ix.load(), &host)
+            });
             if refuse {
                 debug!("Refused a service worker script fetch for {host}");
                 return Ok(Response::builder()
@@ -432,8 +537,10 @@ impl ProxyContext {
             let engine = &profile.engine;
             if engine.is_enabled() {
                 let source = source_url(&headers, &url, rtype);
-                let (verdict, gen_) =
-                    engine.check_gen(&url, source, rtype.as_str(), &profile.label);
+                let (verdict, gen_) = engine.check_gen_deferred(&url, source, rtype.as_str());
+                let verdict = apply_overlay(&profile, verdict, &url, source, rtype.as_str());
+                let verdict =
+                    engine.record_verdict(verdict, &url, source, rtype.as_str(), &profile.label);
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
@@ -445,7 +552,10 @@ impl ProxyContext {
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
-                page_off = rtype.is_frame() && engine.site_off(&url);
+                // A non-default profile keeps its per-site exceptions in its overlay rules.
+                page_off = rtype.is_frame()
+                    && (engine.site_off(&url)
+                        || profile.overlay.as_ref().is_some_and(|o| o.site_off(&url)));
                 if let Some(new_url) = verdict.rewritten_url {
                     let navigation =
                         rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
@@ -641,8 +751,13 @@ impl ProxyContext {
         let (enabled, cosmetics) = {
             let profile = rctx.profile.load();
             let enabled = profile.engine.is_enabled();
-            let cos = (enabled && !page_off && kind == BodyKind::Html && body_allowed)
-                .then(|| profile.engine.cosmetic_for(&url));
+            let cos = (enabled && !page_off && kind == BodyKind::Html && body_allowed).then(|| {
+                let mut c = profile.engine.cosmetic_for(&url);
+                if let Some(ov) = &profile.overlay {
+                    merge_cosmetics(&mut c, ov.cosmetic_for(&url));
+                }
+                c
+            });
             (enabled, cos)
         };
         // Lock-free read (no refcount traffic); held only across the synchronous lookup.
@@ -731,12 +846,15 @@ impl ProxyContext {
                 let us = if blocks_scripts || !enabled {
                     None
                 } else {
-                    rctx.profile.load().userscript_manager().and_then(|m| {
-                        if m.live_index().is_empty() {
+                    let prof = rctx.profile.load();
+                    prof.script_index.as_ref().and_then(|ix| {
+                        let idx = ix.load();
+                        if idx.is_empty() {
                             return None; // zero cost: no allocation, no probe
                         }
-                        self.internal.gm.plan_document(
-                            m,
+                        self.internal.gm.plan_document_in(
+                            &idx,
+                            &prof.name,
                             &host,
                             &url,
                             &origin_of(scheme, &url_host, port),
@@ -752,11 +870,11 @@ impl ProxyContext {
                 };
                 let unregister_sw = !blocks_scripts
                     && us.is_some()
-                    && rctx
-                        .profile
-                        .load()
-                        .userscript_manager()
-                        .is_some_and(|m| self.internal.gm.blocks_service_workers(m, &host));
+                    && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
+                        self.internal
+                            .gm
+                            .blocks_service_workers_in(&ix.load(), &host)
+                    });
                 let head = if enabled {
                     build_head(&PageSpec {
                         unregister_sw,
@@ -1162,6 +1280,60 @@ mod url_tests {
                 "/x"
             ),
             "http://example.com:8080/x"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_merge_tests {
+    use super::merge_cosmetics;
+    use filter_engine::{compile_engine, overlay_from_rules, SharedEngine};
+
+    const URL: &str = "https://example.com/page";
+
+    fn engine(list: &str) -> SharedEngine {
+        let e = SharedEngine::new();
+        e.install(compile_engine(&[list.to_string()]));
+        e
+    }
+
+    #[test]
+    fn overlay_cosmetic_exception_cancels_a_base_hide() {
+        let base = engine("example.com##.x\nexample.com##.y\n");
+        let ov = overlay_from_rules("example.com#@#.x").unwrap().unwrap();
+        let mut c = base.cosmetic_for(URL);
+        assert!(c.hide_selectors.iter().any(|s| s == ".x"));
+        merge_cosmetics(&mut c, ov.cosmetic_for(URL));
+        assert!(!c.hide_selectors.iter().any(|s| s == ".x"), "{c:?}");
+        assert!(c.hide_selectors.iter().any(|s| s == ".y"), "{c:?}");
+        // Another site is unaffected.
+        let mut other = base.cosmetic_for("https://other.test/");
+        merge_cosmetics(&mut other, ov.cosmetic_for("https://other.test/"));
+        assert!(other.hide_selectors.is_empty());
+    }
+
+    #[test]
+    fn overlay_generichide_and_exceptions_apply_to_dynamic_selectors() {
+        use crate::request_ctx::Profile;
+        use std::sync::Arc;
+        let classes = ["gen".to_string()];
+        let profile = |rules: &str| {
+            let base = Arc::new(engine("##.gen\n"));
+            let p = Profile::new(1, 1, base);
+            p.with_overlay(overlay_from_rules(rules).unwrap())
+        };
+        let sel = |p: &Profile| super::dynamic_selectors(p, URL, &classes, &[]);
+        assert_eq!(sel(&profile("")), vec![".gen"]);
+        assert!(sel(&profile("example.com#@#.gen")).is_empty());
+        assert!(sel(&profile("@@||example.com^$generichide")).is_empty());
+        // An overlay's own generic rule is served too, and other sites keep the base's.
+        let p = profile("##.own");
+        let both = super::dynamic_selectors(&p, URL, &["gen".into(), "own".into()], &[]);
+        assert!(both.contains(&".gen".to_string()) && both.contains(&".own".to_string()));
+        let p = profile("example.com#@#.gen");
+        assert_eq!(
+            super::dynamic_selectors(&p, "https://other.test/", &classes, &[]),
+            vec![".gen"]
         );
     }
 }

@@ -89,6 +89,14 @@ async fn main() -> Result<()> {
         info!("Userscripts disabled: scripts are managed but never injected");
     }
 
+    // One database file per process; profiles, devices and script policy live in it.
+    let db = common::db::Db::open(&config.adblock.data_dir)
+        .map_err(|e| Error::Config(format!("Failed to open database: {e}")))?;
+    let profile_store = Arc::new(
+        common::profile_store::ProfileStore::open(&db)
+            .map_err(|e| Error::Config(format!("Failed to open profile store: {e}")))?,
+    );
+
     // In-page panel: reserved confirmation host, per-site blocking over the custom rules.
     {
         let sc = &config.script_control;
@@ -118,24 +126,35 @@ async fn main() -> Result<()> {
                 host,
                 dashboard_url: dashboard,
             },
-            Some(Arc::new(proxy_core::panel::ListSiteBlocking(
+            Some(Arc::new(proxy_core::panel::ListSiteBlocking::new(
                 list_service.clone(),
+                Some(profile_store.clone()),
             ))),
         );
     }
 
     // Script control: rules live in the shared database; the proxy path reads a compiled snapshot
     // that is rebuilt on every edit and when a temporary grant expires.
-    let policy_store = Arc::new(script_policy::store::PolicyStore::new(
-        common::db::Db::open(&config.adblock.data_dir)
-            .map_err(|e| Error::Config(format!("Failed to open database: {e}")))?,
-    ));
+    let policy_store = Arc::new(script_policy::store::PolicyStore::new(db.clone()));
     let script_control = proxy_core::scriptctl::ScriptControl::new(
         policy_store.clone(),
         script_policy::DEFAULT_PROFILE,
     );
     script_control.spawn_expiry();
     ctx.set_script_control(Some(script_control));
+
+    // Per-device profiles: compiles stored profiles and devices into the live lookup table in
+    // the background (also without the web UI). The web API reads them through
+    // `ctx.profile_store()` / `ctx.profile_builder()`.
+    let profile_builder = proxy_core::ProfileBuilder::start(proxy_core::BuilderDeps {
+        ctx: ctx.clone(),
+        store: profile_store.clone(),
+        lists: list_service.clone(),
+        manager: userscript_manager.clone(),
+        policy: Some(policy_store.clone()),
+        debounce: proxy_core::profile_build::DEFAULT_DEBOUNCE,
+    });
+    ctx.set_profile_service(profile_store.clone(), profile_builder.clone());
 
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
@@ -146,7 +165,7 @@ async fn main() -> Result<()> {
                 config_path.clone(),
                 shared_engine.clone(),
                 list_service,
-                ctx.request_timeout_handle(),
+                &ctx,
                 userscript_manager
                     .clone()
                     .expect("manager exists when the web UI is enabled"),
@@ -189,25 +208,17 @@ async fn start_webui_server(
     config_path: String,
     shared_engine: Arc<SharedEngine>,
     list_service: Arc<ListService>,
-    request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    ctx: &Arc<ProxyContext>,
     userscript_manager: Arc<userscript_engine::UserscriptManager>,
     policy_store: Arc<script_policy::store::PolicyStore>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    use userscript_engine::UserscriptRuntime;
-    use web_api::{build_state_with_policy, start_server, ApiConfig};
+    use web_api::{start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
 
     // One database file per process: users, sessions, tokens, audit and userscripts share
     // `<adblock.data_dir>/adblocker.redb` with the filter lists.
     let data_dir = config.adblock.data_dir.clone();
-
-    // Create userscript runtime
-    let storage = userscript_manager.storage_arc();
-    let userscript_runtime = Arc::new(UserscriptRuntime::new(
-        Arc::clone(&userscript_manager),
-        storage,
-    ));
 
     // Build API configuration from proxy config
     let api_config = ApiConfig {
@@ -252,18 +263,18 @@ async fn start_webui_server(
         ..Default::default()
     };
 
-    // Build the application state
-    let state = build_state_with_policy(
-        api_config.clone(),
-        config.clone(),
-        shared_engine,
-        list_service,
-        reqwest::Client::new(),
-        userscript_manager,
-        userscript_runtime,
-        config_path.into(),
-        request_timeout_ms,
-        Some(policy_store),
+    // Build the application state over the proxy's own stores (profiles, policy, userscripts).
+    let state = proxy_core::webui::build_api_state(
+        ctx,
+        proxy_core::webui::ApiInputs {
+            api_config: api_config.clone(),
+            proxy_config: config.clone(),
+            shared_engine,
+            list_service,
+            manager: userscript_manager,
+            policy: policy_store,
+            config_path: config_path.into(),
+        },
     )
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;

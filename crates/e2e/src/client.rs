@@ -30,6 +30,29 @@ pub enum HttpVersion {
 /// In [`EntryMode::Transparent`] there is no proxy configured: names resolve to the transparent
 /// listener and request URLs have their port rewritten to it (SNI and `Host` keep the hostname),
 /// so callers always pass the origin-facing URL.
+/// Who the client presents itself as: a device token (explicit mode: the proxy password) and/or
+/// a chosen local source address (`127.0.0.N`), which the proxy sees as the device address.
+#[derive(Debug, Clone, Default)]
+pub struct ClientOpts {
+    pub token: Option<String>,
+    pub source: Option<IpAddr>,
+}
+
+impl ClientOpts {
+    pub fn token(t: &str) -> Self {
+        Self {
+            token: Some(t.into()),
+            source: None,
+        }
+    }
+    pub fn source(ip: &str) -> Self {
+        Self {
+            token: None,
+            source: Some(ip.parse().expect("ip")),
+        }
+    }
+}
+
 pub struct TestClient {
     inner: reqwest::Client,
     transparent_port: Option<u16>,
@@ -43,12 +66,22 @@ impl TestClient {
     /// Client trusting exactly the given PEM CAs (e.g. the origin CA, to prove a connection
     /// reached the origin without interception).
     pub fn trusting(proxy: &TestProxy, version: HttpVersion, cas: &[&[u8]]) -> Self {
+        Self::build(proxy, version, cas, &ClientOpts::default())
+    }
+
+    /// Client with a device identity (see [`ClientOpts`]).
+    pub fn with_opts(proxy: &TestProxy, version: HttpVersion, opts: &ClientOpts) -> Self {
+        Self::build(proxy, version, &[&proxy.ca_pem], opts)
+    }
+
+    fn build(proxy: &TestProxy, version: HttpVersion, cas: &[&[u8]], opts: &ClientOpts) -> Self {
         crate::init_crypto();
         let mut b = reqwest::Client::builder()
             .use_rustls_tls()
             .tls_built_in_root_certs(false)
             .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(opts.source);
         for ca in cas {
             b = b.add_root_certificate(reqwest::Certificate::from_pem(ca).expect("CA pem"));
         }
@@ -56,7 +89,11 @@ impl TestClient {
         match proxy.mode {
             // CONNECT for https://, absolute-form for http://.
             EntryMode::Explicit => {
-                b = b.proxy(reqwest::Proxy::all(proxy.url()).expect("proxy url"));
+                let mut p = reqwest::Proxy::all(proxy.url()).expect("proxy url");
+                if let Some(t) = &opts.token {
+                    p = p.basic_auth("device", t);
+                }
+                b = b.proxy(p);
             }
             // Transparent: no proxy configured; the client dials the transparent listener.
             EntryMode::Transparent => {

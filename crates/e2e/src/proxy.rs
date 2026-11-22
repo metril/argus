@@ -97,6 +97,80 @@ pub struct TestProxy {
     dir: Option<tempfile::TempDir>,
     userscripts: Mutex<Option<Arc<userscript_engine::UserscriptManager>>>,
     script: Mutex<Option<ScriptHandles>>,
+    profiles: Mutex<Option<ProfileHandles>>,
+}
+
+/// Per-device profile service attached to the proxy (see [`TestProxy::profiles`]).
+#[derive(Clone)]
+pub struct ProfileHandles {
+    pub store: Arc<common::profile_store::ProfileStore>,
+    pub builder: Arc<proxy_core::ProfileBuilder>,
+    pub lists: Arc<list_service::ListService>,
+    pub policy: Arc<script_policy::store::PolicyStore>,
+    pub manager: Arc<userscript_engine::UserscriptManager>,
+}
+
+impl ProfileHandles {
+    /// Create a profile with overlay `rules`; returns its id.
+    pub fn profile(&self, name: &str, rules: &str) -> u64 {
+        use common::profile_store::ProfileRecord;
+        let now = chrono_now();
+        self.store
+            .put(ProfileRecord {
+                id: 0,
+                name: name.into(),
+                description: String::new(),
+                lists: vec![],
+                rules: rules.into(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("put profile")
+            .id
+    }
+
+    /// Create a device on `profile` selected by `ips`; returns its id.
+    pub fn device(&self, name: &str, profile: u64, ips: &[&str]) -> u64 {
+        use common::profile_store::DeviceRecord;
+        self.store
+            .put_device(DeviceRecord {
+                id: 0,
+                name: name.into(),
+                profile_id: profile,
+                ips: ips
+                    .iter()
+                    .map(|s| {
+                        s.parse::<ipnet::IpNet>().unwrap_or_else(|_| {
+                            ipnet::IpNet::from(s.parse::<std::net::IpAddr>().expect("ip"))
+                        })
+                    })
+                    .collect(),
+                token_digest: None,
+                token_hint: None,
+                created_at: chrono_now(),
+            })
+            .expect("put device")
+            .id
+    }
+
+    /// Issue a token for `device`.
+    pub fn token(&self, device: u64) -> String {
+        self.store.issue_token(device).expect("issue token")
+    }
+
+    /// Rebuild the live table from the stored state now.
+    pub async fn sync(&self) {
+        self.builder.sync().await;
+    }
+
+    /// The storage namespace (userscripts, GM values, policy) of `profile`.
+    pub fn namespace(&self, profile: u64) -> String {
+        common::profile_store::namespace(profile)
+    }
+}
+
+fn chrono_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 /// The script-policy store and the control attached to the proxy.
@@ -181,6 +255,7 @@ impl TestProxy {
                 allowed_clients: proxy_core::config::default_allowed_clients(),
                 enable_websockets: true,
                 extra_upstream_ca_paths: vec![origin_ca_path],
+                require_device_token: false,
             },
             mitm: MitmSettings {
                 enabled: true,
@@ -274,6 +349,7 @@ impl TestProxy {
             dir: Some(dir),
             userscripts: Mutex::new(None),
             script: Mutex::new(None),
+            profiles: Mutex::new(None),
         })
     }
 
@@ -319,6 +395,50 @@ impl TestProxy {
         g.as_ref().expect("set").clone()
     }
 
+    /// The per-device profile service (created and attached on first use): a profile store that
+    /// accepts loopback device addresses (so devices can be told apart by `127.0.0.N` source
+    /// addresses), the policy store, the userscript manager and a running profile builder.
+    pub fn profiles(&self) -> ProfileHandles {
+        if let Some(h) = self.profiles.lock().as_ref() {
+            return h.clone();
+        }
+        let dir = self.dir.as_ref().expect("data dir").path().to_path_buf();
+        let manager = self.userscripts();
+        let policy = self.script_control().0;
+        let db = common::db::Db::open(&dir.join("prof")).expect("profile db");
+        let store = Arc::new(
+            common::profile_store::ProfileStore::open_allowing_loopback(&db).expect("store"),
+        );
+        let list_store = list_service::ListStore::open(&dir.join("lists")).expect("list store");
+        let lists = list_service::ListService::new(
+            list_service::ListServiceConfig {
+                data_dir: dir.join("lists"),
+                ..Default::default()
+            },
+            list_store,
+            self.engine.clone(),
+            reqwest::Client::new(),
+        );
+        let builder = proxy_core::ProfileBuilder::start(proxy_core::BuilderDeps {
+            ctx: self.ctx.clone(),
+            store: store.clone(),
+            lists: lists.clone(),
+            manager: Some(manager.clone()),
+            policy: Some(policy.clone()),
+            debounce: std::time::Duration::from_millis(20),
+        });
+        self.ctx.set_profile_service(store.clone(), builder.clone());
+        let h = ProfileHandles {
+            store,
+            builder,
+            lists,
+            policy,
+            manager,
+        };
+        *self.profiles.lock() = Some(h.clone());
+        h
+    }
+
     pub fn script_control(&self) -> ScriptHandles {
         self.script_control_with(None)
     }
@@ -339,12 +459,28 @@ impl TestProxy {
         fetched: userscript_engine::install::Fetched,
         allow_connect_all: bool,
     ) -> String {
+        self.install_userscript_in(
+            userscript_engine::DEFAULT_PROFILE,
+            source,
+            fetched,
+            allow_connect_all,
+        )
+    }
+
+    /// Install into the storage namespace `ns` (see [`ProfileHandles::namespace`]).
+    pub fn install_userscript_in(
+        &self,
+        ns: &str,
+        source: &str,
+        fetched: userscript_engine::install::Fetched,
+        allow_connect_all: bool,
+    ) -> String {
         use userscript_engine::install::{finish_install, plan_install, Approvals};
         let plan = plan_install(source, None).expect("plan");
         let script =
             finish_install(plan, fetched, Approvals { allow_connect_all }).expect("finish");
         self.userscripts()
-            .install_script(userscript_engine::DEFAULT_PROFILE, script)
+            .install_script(ns, script)
             .expect("install")
     }
 

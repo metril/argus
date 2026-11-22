@@ -26,7 +26,7 @@ use chromiumoxide::Page;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
-pub use e2e::{EntryMode, MockResponse, TestOrigin, TestProxy};
+pub use e2e::{EntryMode, MockResponse, SourceRelay, TestOrigin, TestProxy};
 
 /// Scenarios that currently fail because of a real proxy bug. A test listed here still runs and
 /// still prints its failure; it just does not fail the suite. Keep empty when everything passes.
@@ -488,6 +488,38 @@ impl Session {
     /// A second tab in the same browser profile (same origin storage and BroadcastChannels).
     pub async fn new_tab(&self) -> Page {
         let p = self.browser.new_page("about:blank").await.expect("new tab");
+        p.enable_runtime().await.expect("runtime");
+        p.evaluate_on_new_document(INIT_JS).await.expect("init");
+        p
+    }
+
+    /// A tab in a fresh browser context (own storage) whose traffic goes through `proxy_server`
+    /// (`http://host:port`), e.g. a [`SourceRelay`] giving it its own device address. Explicit
+    /// mode only.
+    pub async fn new_context_tab(&self, proxy_server: &str) -> Page {
+        use chromiumoxide::cdp::browser_protocol::target::{
+            CreateBrowserContextParams, CreateTargetParams,
+        };
+        let ctx = self
+            .browser
+            .create_browser_context(
+                CreateBrowserContextParams::builder()
+                    .proxy_server(proxy_server)
+                    .build(),
+            )
+            .await
+            .expect("browser context");
+        let p = self
+            .browser
+            .new_page(
+                CreateTargetParams::builder()
+                    .url("about:blank")
+                    .browser_context_id(ctx)
+                    .build()
+                    .expect("target params"),
+            )
+            .await
+            .expect("context tab");
         p.enable_runtime().await.expect("runtime");
         p.evaluate_on_new_document(INIT_JS).await.expect("init");
         p
