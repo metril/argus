@@ -60,9 +60,7 @@ impl From<StorageValue> for Value {
                 }
             }
             StorageValue::String(s) => Value::String(s),
-            StorageValue::Array(arr) => {
-                Value::Array(arr.into_iter().map(Value::from).collect())
-            }
+            StorageValue::Array(arr) => Value::Array(arr.into_iter().map(Value::from).collect()),
             StorageValue::Object(obj) => {
                 let map = obj.into_iter().map(|(k, v)| (k, Value::from(v))).collect();
                 Value::Object(map)
@@ -137,9 +135,8 @@ impl UserscriptStorage {
         let key = Self::make_key(script_id, name);
 
         // Serialize value
-        let bytes = serde_json::to_vec(&value).map_err(|e| {
-            Error::Storage(format!("Failed to serialize value for {}: {}", key, e))
-        })?;
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|e| Error::Storage(format!("Failed to serialize value for {}: {}", key, e)))?;
 
         // Write to database
         self.db
@@ -199,10 +196,8 @@ impl UserscriptStorage {
         let mut batch = sled::Batch::default();
 
         // Collect keys to delete
-        for item in self.db.scan_prefix(&prefix) {
-            if let Ok((key, _)) = item {
-                batch.remove(key);
-            }
+        for (key, _) in self.db.scan_prefix(&prefix).flatten() {
+            batch.remove(key);
         }
 
         // Apply batch deletion
@@ -245,11 +240,7 @@ mod tests {
 
         // Test set and get
         storage
-            .set_value(
-                "test-script",
-                "count",
-                StorageValue::Number(42.0),
-            )
+            .set_value("test-script", "count", StorageValue::Number(42.0))
             .unwrap();
 
         let value = storage.get_value("test-script", "count").unwrap();
@@ -268,11 +259,7 @@ mod tests {
 
         // String
         storage
-            .set_value(
-                "script1",
-                "name",
-                StorageValue::String("test".to_string()),
-            )
+            .set_value("script1", "name", StorageValue::String("test".to_string()))
             .unwrap();
 
         // Boolean
@@ -285,10 +272,7 @@ mod tests {
             .set_value(
                 "script1",
                 "items",
-                StorageValue::Array(vec![
-                    StorageValue::Number(1.0),
-                    StorageValue::Number(2.0),
-                ]),
+                StorageValue::Array(vec![StorageValue::Number(1.0), StorageValue::Number(2.0)]),
             )
             .unwrap();
 
@@ -312,13 +296,25 @@ mod tests {
         let storage = UserscriptStorage::new(temp_dir.path().to_path_buf()).unwrap();
 
         storage
-            .set_value("script1", "key1", StorageValue::String("value1".to_string()))
+            .set_value(
+                "script1",
+                "key1",
+                StorageValue::String("value1".to_string()),
+            )
             .unwrap();
         storage
-            .set_value("script1", "key2", StorageValue::String("value2".to_string()))
+            .set_value(
+                "script1",
+                "key2",
+                StorageValue::String("value2".to_string()),
+            )
             .unwrap();
         storage
-            .set_value("script2", "key1", StorageValue::String("value3".to_string()))
+            .set_value(
+                "script2",
+                "key1",
+                StorageValue::String("value3".to_string()),
+            )
             .unwrap();
 
         let keys = storage.list_values("script1").unwrap();
@@ -360,10 +356,7 @@ mod tests {
         // Second access - from cache
         let value2 = storage.get_value("script1", "cached").unwrap();
 
-        assert_eq!(
-            matches!(value1, Some(StorageValue::Number(n)) if n == 100.0),
-            true
-        );
+        assert!(matches!(value1, Some(StorageValue::Number(n)) if n == 100.0));
         assert_eq!(value1, value2);
     }
 }

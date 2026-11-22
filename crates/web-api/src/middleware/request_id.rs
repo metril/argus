@@ -3,12 +3,7 @@
 //! Generates unique request IDs for tracing and logging.
 //! Adds X-Request-ID header to responses.
 
-use axum::{
-    extract::Request,
-    http::HeaderValue,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::HeaderValue, middleware::Next, response::Response};
 use uuid::Uuid;
 
 /// Request ID extension for access in handlers
@@ -50,7 +45,9 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
 
     // Add request ID to response headers
     if let Ok(header_value) = HeaderValue::from_str(&request_id) {
-        response.headers_mut().insert(REQUEST_ID_HEADER, header_value);
+        response
+            .headers_mut()
+            .insert(REQUEST_ID_HEADER, header_value);
     }
 
     response

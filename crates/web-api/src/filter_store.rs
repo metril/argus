@@ -63,7 +63,8 @@ impl FilterListStore {
 
     /// Cache the downloaded raw text of a list (used to rebuild the engine on a `304`/failure).
     pub fn put_content(&self, id: &str, content: &str) -> ApiResult<()> {
-        self.content_tree()?.insert(id.as_bytes(), content.as_bytes())?;
+        self.content_tree()?
+            .insert(id.as_bytes(), content.as_bytes())?;
         Ok(())
     }
 
@@ -88,8 +89,8 @@ impl FilterListStore {
         let tree = self.tree()?;
         match tree.get(id.as_bytes())? {
             Some(bytes) => {
-                let list: FilterList =
-                    serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal(e.to_string()))?;
+                let list: FilterList = serde_json::from_slice(&bytes)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
                 Ok(Some(list))
             }
             None => Ok(None),
@@ -143,7 +144,10 @@ impl FilterListStore {
         for list in default_filter_lists() {
             self.upsert(&list)?;
         }
-        info!("Seeded {} default filter lists", default_filter_lists().len());
+        info!(
+            "Seeded {} default filter lists",
+            default_filter_lists().len()
+        );
         Ok(())
     }
 }
@@ -188,7 +192,9 @@ mod tests {
         {
             let store = FilterListStore::new(path.clone()).unwrap();
             assert_eq!(store.get_custom_rules().unwrap(), "");
-            store.set_custom_rules("||my.ads^\n@@||good.example^\n").unwrap();
+            store
+                .set_custom_rules("||my.ads^\n@@||good.example^\n")
+                .unwrap();
         }
         let store = FilterListStore::new(path).unwrap();
         assert_eq!(
@@ -205,17 +211,24 @@ mod tests {
         let path = dir.path().join("lists");
         {
             let store = FilterListStore::new(path.clone()).unwrap();
-            let mut list = FilterList::new("keep".into(), "Keep Me".into(), "https://e/k.txt".into());
+            let mut list =
+                FilterList::new("keep".into(), "Keep Me".into(), "https://e/k.txt".into());
             list.rule_count = 42;
             store.upsert(&list).unwrap();
             store.put_content("keep", "||ads.example^\n").unwrap();
         } // store dropped — simulates shutdown
 
         let store = FilterListStore::new(path).unwrap();
-        let got = store.get("keep").unwrap().expect("list persisted across reopen");
+        let got = store
+            .get("keep")
+            .unwrap()
+            .expect("list persisted across reopen");
         assert_eq!(got.name, "Keep Me");
         assert_eq!(got.rule_count, 42);
-        assert_eq!(store.get_content("keep").unwrap().as_deref(), Some("||ads.example^\n"));
+        assert_eq!(
+            store.get_content("keep").unwrap().as_deref(),
+            Some("||ads.example^\n")
+        );
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Tests for connection handling
 
-use proxy_core::config::{MitmSettings, PerformanceSettings, AdblockSettings, ProxyConfig, UserscriptSettings, WebUiSettings};
+use proxy_core::config::{
+    AdblockSettings, MitmSettings, PerformanceSettings, ProxyConfig, UserscriptSettings,
+    WebUiSettings,
+};
 use proxy_core::{ProxyContext, ProxyServer};
 use std::sync::Arc;
 
@@ -15,6 +18,7 @@ fn test_ctx() -> Arc<ProxyContext> {
 
 #[tokio::test]
 async fn test_server_with_mitm_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
     let config = ProxyConfig {
         proxy: proxy_core::config::ProxySettings {
             host: "127.0.0.1".to_string(),
@@ -22,11 +26,12 @@ async fn test_server_with_mitm_enabled() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: true,
-            ca_cert_path: std::env::temp_dir().join("test-conn-ca.crt"),
-            ca_key_path: std::env::temp_dir().join("test-conn-ca.key"),
+            ca_cert_path: tmp.path().join("test-conn-ca.crt"),
+            ca_key_path: tmp.path().join("test-conn-ca.key"),
             cert_cache_size: 100,
             cert_ttl_days: 30,
             cert_idle_timeout_secs: 3600,
@@ -45,8 +50,6 @@ async fn test_server_with_mitm_enabled() {
     };
 
     // Clean up any existing CA files
-    let _ = std::fs::remove_file(&config.mitm.ca_cert_path);
-    let _ = std::fs::remove_file(&config.mitm.ca_key_path);
 
     // Create server with MITM enabled
     let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server with MITM");
@@ -64,8 +67,6 @@ async fn test_server_with_mitm_enabled() {
     }
 
     // Clean up
-    let _ = std::fs::remove_file(std::env::temp_dir().join("test-conn-ca.crt"));
-    let _ = std::fs::remove_file(std::env::temp_dir().join("test-conn-ca.key"));
 }
 
 #[tokio::test]
@@ -77,6 +78,7 @@ async fn test_server_with_mitm_disabled() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -100,7 +102,8 @@ async fn test_server_with_mitm_disabled() {
     };
 
     // Create server with MITM disabled
-    let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server without MITM");
+    let server =
+        ProxyServer::new(config, test_ctx()).expect("Failed to create server without MITM");
 
     // Verify MITM handler does not exist
     assert!(
@@ -111,6 +114,7 @@ async fn test_server_with_mitm_disabled() {
 
 #[tokio::test]
 async fn test_certificate_generation() {
+    let tmp = tempfile::tempdir().unwrap();
     let config = ProxyConfig {
         proxy: proxy_core::config::ProxySettings {
             host: "127.0.0.1".to_string(),
@@ -118,11 +122,12 @@ async fn test_certificate_generation() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: true,
-            ca_cert_path: std::env::temp_dir().join("test-certgen-ca.crt"),
-            ca_key_path: std::env::temp_dir().join("test-certgen-ca.key"),
+            ca_cert_path: tmp.path().join("test-certgen-ca.crt"),
+            ca_key_path: tmp.path().join("test-certgen-ca.key"),
             cert_cache_size: 100,
             cert_ttl_days: 30,
             cert_idle_timeout_secs: 3600,
@@ -141,8 +146,6 @@ async fn test_certificate_generation() {
     };
 
     // Clean up any existing CA files
-    let _ = std::fs::remove_file(&config.mitm.ca_cert_path);
-    let _ = std::fs::remove_file(&config.mitm.ca_key_path);
 
     // Create server
     let server = ProxyServer::new(config, test_ctx()).expect("Failed to create server");
@@ -183,8 +186,6 @@ async fn test_certificate_generation() {
     assert_eq!(stats.entry_count, 1, "Cache should have 1 entry");
 
     // Clean up
-    let _ = std::fs::remove_file(std::env::temp_dir().join("test-certgen-ca.crt"));
-    let _ = std::fs::remove_file(std::env::temp_dir().join("test-certgen-ca.key"));
 }
 
 #[tokio::test]
@@ -196,6 +197,7 @@ async fn test_load_manager_integration() {
             enable_http2: false,
             enable_http3: false,
             enable_websockets: false,
+            extra_upstream_ca_paths: Vec::new(),
         },
         mitm: MitmSettings {
             enabled: false,

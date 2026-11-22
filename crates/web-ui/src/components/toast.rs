@@ -1,7 +1,7 @@
 //! Toast notification component
 
-use leptos::prelude::*;
 use gloo_timers::callback::Timeout;
+use leptos::prelude::*;
 
 use crate::state::{use_app_state, Toast};
 
@@ -43,10 +43,7 @@ pub fn ToastContainer() -> impl IntoView {
 
 /// Individual toast item
 #[component]
-fn ToastItem(
-    toast: Toast,
-    on_close: Callback<()>,
-) -> impl IntoView {
+fn ToastItem(toast: Toast, on_close: Callback<()>) -> impl IntoView {
     view! {
         <div class=format!("toast {}", toast.toast_type.class())>
             <div class="toast-content">

@@ -191,8 +191,7 @@ pub async fn login(
         user.id,
         user.username.clone(),
         // Extract JTI from refresh token for revocation tracking
-        validate_refresh_token(&tokens.refresh_token, &state.jwt_config)?
-            .jti,
+        validate_refresh_token(&tokens.refresh_token, &state.jwt_config)?.jti,
         None, // TODO: Extract from request
         None, // TODO: Extract from request
     );
@@ -259,7 +258,10 @@ pub async fn logout(
         HeaderValue::from_str(&create_expired_cookie(REFRESH_TOKEN_COOKIE)).unwrap(),
     );
 
-    Ok((headers, Json(json!({ "message": "Logged out successfully" }))))
+    Ok((
+        headers,
+        Json(json!({ "message": "Logged out successfully" })),
+    ))
 }
 
 /// Refresh token endpoint
@@ -310,13 +312,9 @@ pub async fn refresh(
 
     // Update session with new refresh token JTI
     let new_jti = validate_refresh_token(&tokens.refresh_token, &state.jwt_config)?.jti;
-    state.session_manager.create_session(
-        user_id,
-        claims.username.clone(),
-        new_jti,
-        None,
-        None,
-    );
+    state
+        .session_manager
+        .create_session(user_id, claims.username.clone(), new_jti, None, None);
 
     info!("Token refreshed for user: {}", claims.username);
 

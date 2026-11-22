@@ -3,7 +3,13 @@
 use std::sync::Arc;
 
 use filter_engine::SharedEngine;
-use proxy_core::{config::ProxyConfig, filtering::ProxyContext, server::ProxyServer, Error, Result};
+use proxy_core::{
+    config::ProxyConfig,
+    filtering::ProxyContext,
+    server::ProxyServer,
+    upstream::{build_upstream_client, UpstreamOptions},
+    Result,
+};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -12,10 +18,14 @@ async fn main() -> Result<()> {
     // Initialize logging
     init_logging();
 
-    info!("Starting adblocker proxy server v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting adblocker proxy server v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // Load configuration
-    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config/default.toml".to_string());
+    let config_path =
+        std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config/default.toml".to_string());
     info!("Loading configuration from: {}", config_path);
 
     let config = ProxyConfig::from_file(&config_path).map_err(|e| {
@@ -28,12 +38,8 @@ async fn main() -> Result<()> {
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
 
-    // One pooled upstream client for forwarding proxied requests. Redirects are passed through to
-    // the client (the proxy must not follow them itself).
-    let proxy_client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))?;
+    // One pooled upstream client for forwarding proxied requests (no redirect following).
+    let proxy_client = build_upstream_client(&UpstreamOptions::from_config(&config))?;
 
     let ctx = Arc::new(ProxyContext::new(
         shared_engine.clone(),
@@ -82,6 +88,7 @@ async fn start_webui_server(
     config_path: String,
     shared_engine: Arc<SharedEngine>,
 ) -> Result<tokio::task::JoinHandle<()>> {
+    use proxy_core::Error;
     use tracing::warn;
     use userscript_engine::{UserscriptManager, UserscriptRuntime};
     use web_api::{
@@ -107,8 +114,11 @@ async fn start_webui_server(
 
     // Initial compile/load (non-blocking: the proxy starts immediately, rules arrive shortly).
     if config.adblock.enabled {
-        let (store, engine, client) =
-            (filter_store.clone(), shared_engine.clone(), list_client.clone());
+        let (store, engine, client) = (
+            filter_store.clone(),
+            shared_engine.clone(),
+            list_client.clone(),
+        );
         let data_dir = config.adblock.data_dir.clone();
         let resources_url = config.adblock.scriptlet_resources_url.clone();
         let resource_engine = shared_engine.clone();
@@ -127,8 +137,11 @@ async fn start_webui_server(
 
     // Periodic auto-update.
     if config.adblock.enabled && config.adblock.auto_update {
-        let (store, engine, client) =
-            (filter_store.clone(), shared_engine.clone(), list_client.clone());
+        let (store, engine, client) = (
+            filter_store.clone(),
+            shared_engine.clone(),
+            list_client.clone(),
+        );
         let hours = config.adblock.update_interval_hours.max(1);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(hours * 3600));
@@ -145,15 +158,22 @@ async fn start_webui_server(
 
     // Initialize userscript manager
     let userscript_manager = if config.userscripts.enabled {
-        info!("Initializing userscript manager with data dir: {:?}", config.userscripts.data_dir);
-        Arc::new(UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
-            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-        })?)
+        info!(
+            "Initializing userscript manager with data dir: {:?}",
+            config.userscripts.data_dir
+        );
+        Arc::new(
+            UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
+                proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
+            })?,
+        )
     } else {
         info!("Userscripts disabled, using empty userscript manager");
-        Arc::new(UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
-            proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
-        })?)
+        Arc::new(
+            UserscriptManager::new(config.userscripts.data_dir.clone()).map_err(|e| {
+                proxy_core::Error::Config(format!("Failed to initialize userscript manager: {}", e))
+            })?,
+        )
     };
 
     // Load existing userscripts
@@ -177,7 +197,7 @@ async fn start_webui_server(
         },
         auth: web_api::config::AuthConfig {
             jwt_secret_path: config.webui.jwt_secret_path.clone(),
-            access_token_expiry_seconds: 900,    // 15 minutes
+            access_token_expiry_seconds: 900,     // 15 minutes
             refresh_token_expiry_seconds: 604800, // 7 days
             bcrypt_cost: 12,
             issuer: "adblocker-api".to_string(),
@@ -237,8 +257,7 @@ async fn start_webui_server(
 
 /// Initialize tracing subscriber for structured logging
 fn init_logging() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -247,7 +266,7 @@ fn init_logging() {
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_line_number(true)
-                .with_file(true)
+                .with_file(true),
         )
         .init();
 }

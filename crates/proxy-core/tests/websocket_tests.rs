@@ -1,6 +1,8 @@
 //! Integration tests for WebSocket proxying
 
-use proxy_http3::{extract_ws_target, is_websocket_upgrade};
+#![cfg(feature = "websockets")]
+
+use proxy_core::websocket::{extract_ws_target, is_websocket_upgrade};
 
 #[test]
 fn test_websocket_upgrade_detection() {
@@ -28,7 +30,9 @@ fn test_not_websocket_upgrade() {
 
 #[test]
 fn test_extract_ws_target_with_full_uri() {
-    let uri = "https://example.com:443/ws/chat".parse::<hyper::Uri>().unwrap();
+    let uri = "https://example.com:443/ws/chat"
+        .parse::<hyper::Uri>()
+        .unwrap();
     let headers = hyper::HeaderMap::new();
 
     let target = extract_ws_target(&uri, &headers).unwrap();

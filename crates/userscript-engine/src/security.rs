@@ -44,9 +44,9 @@ pub struct SecurityPolicy {
 impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
-            max_execution_time_ms: 30_000, // 30 seconds
+            max_execution_time_ms: 30_000,       // 30 seconds
             max_memory_bytes: 100 * 1024 * 1024, // 100 MB
-            allowed_domains: HashSet::new(), // Empty = allow all
+            allowed_domains: HashSet::new(),     // Empty = allow all
             blocked_domains: Self::default_blocked_domains(),
             require_https: true,
             strict_csp: true,
@@ -161,9 +161,8 @@ impl SecurityPolicy {
 
     /// Validate URL against security policy
     pub fn validate_url(&self, url_str: &str) -> Result<Url> {
-        let url = Url::parse(url_str).map_err(|e| {
-            Error::PermissionDenied(format!("Invalid URL: {}", e))
-        })?;
+        let url = Url::parse(url_str)
+            .map_err(|e| Error::PermissionDenied(format!("Invalid URL: {}", e)))?;
 
         // Check HTTPS requirement
         if self.require_https && url.scheme() != "https" && url.scheme() != "data" {
@@ -234,7 +233,9 @@ impl SecurityAuditor {
         };
 
         match event {
-            AuditEvent::PermissionDenied | AuditEvent::PolicyViolation | AuditEvent::SuspiciousActivity => {
+            AuditEvent::PermissionDenied
+            | AuditEvent::PolicyViolation
+            | AuditEvent::SuspiciousActivity => {
                 warn!("Security event: {:?} - {} - {}", event, script_id, details);
             }
             _ => {
@@ -359,8 +360,14 @@ impl ScriptValidator {
         let suspicious_patterns = [
             ("eval(", "Use of eval() is not allowed"),
             ("Function(", "Use of Function constructor is not allowed"),
-            ("setTimeout(\"", "setTimeout with string argument is not allowed"),
-            ("setInterval(\"", "setInterval with string argument is not allowed"),
+            (
+                "setTimeout(\"",
+                "setTimeout with string argument is not allowed",
+            ),
+            (
+                "setInterval(\"",
+                "setInterval with string argument is not allowed",
+            ),
         ];
 
         for (pattern, message) in &suspicious_patterns {
@@ -538,9 +545,17 @@ mod tests {
         let policy = Arc::new(SecurityPolicy::default());
         let auditor = SecurityAuditor::new(policy);
 
-        auditor.log_event(AuditEvent::ExecutionStart, "test-script", "Starting execution");
+        auditor.log_event(
+            AuditEvent::ExecutionStart,
+            "test-script",
+            "Starting execution",
+        );
         auditor.log_event(AuditEvent::ApiCall, "test-script", "GM_setValue called");
-        auditor.log_event(AuditEvent::ExecutionComplete, "test-script", "Execution finished");
+        auditor.log_event(
+            AuditEvent::ExecutionComplete,
+            "test-script",
+            "Execution finished",
+        );
 
         let entries = auditor.get_recent_entries(10);
         assert_eq!(entries.len(), 3);
@@ -577,7 +592,9 @@ mod tests {
         // Dangerous patterns should fail
         assert!(validator.validate_source("eval('alert(1)')").is_err());
         assert!(validator.validate_source("Function('return 1')()").is_err());
-        assert!(validator.validate_source("setTimeout(\"alert(1)\", 100)").is_err());
+        assert!(validator
+            .validate_source("setTimeout(\"alert(1)\", 100)")
+            .is_err());
     }
 
     #[test]
@@ -607,12 +624,18 @@ mod tests {
 
         // Valid resources
         let mut valid_resources = HashMap::new();
-        valid_resources.insert("icon".to_string(), "https://example.com/icon.png".to_string());
+        valid_resources.insert(
+            "icon".to_string(),
+            "https://example.com/icon.png".to_string(),
+        );
         assert!(validator.validate_resources(&valid_resources).is_ok());
 
         // Invalid resource name
         let mut invalid_name = HashMap::new();
-        invalid_name.insert("../evil".to_string(), "https://example.com/file".to_string());
+        invalid_name.insert(
+            "../evil".to_string(),
+            "https://example.com/file".to_string(),
+        );
         assert!(validator.validate_resources(&invalid_name).is_err());
     }
 

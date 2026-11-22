@@ -39,13 +39,10 @@ rustls-pemfile = { workspace = true }
 pem = { workspace = true }
 
 # Tower middleware
-tower = { workspace = true }
-tower-http = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-bincode = { workspace = true }
 
 # Configuration
 config = { workspace = true }
@@ -57,35 +54,31 @@ tracing-subscriber = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Utilities
 url = { workspace = true }
 bytes = { workspace = true }
-async-trait = { workspace = true }
 
 # Caching
 moka = { workspace = true }
-arc-swap = { workspace = true }
 
 # Concurrency
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 
 # Time
-chrono = { workspace = true }
 time = { workspace = true }
 
 # Encryption (for CA key encryption at rest)
 age = { workspace = true }
 secrecy = { workspace = true }
-argon2 = { workspace = true }
-zeroize = { workspace = true }
 rand = "0.8"
-base64 = "0.22"
 
 # Common utilities
 common = { path = "../common" }
+
+# WebSocket proxying (optional, feature `websockets`)
+tokio-tungstenite = { workspace = true, optional = true }
 
 # HTTP/3 support (optional)
 proxy-http3 = { path = "../proxy-http3", optional = true }
@@ -100,16 +93,16 @@ userscript-engine = { path = "../userscript-engine", optional = true }
 web-api = { path = "../web-api", optional = true }
 
 [features]
-default = []
-http3 = ["proxy-http3"]
-websockets = ["proxy-http3"]
-adblock = []
-userscripts = ["userscript-engine"]
-webui = ["web-api", "userscript-engine"]
-full = ["http3", "websockets", "adblock", "userscripts", "webui"]
+# Request filtering is always compiled in; WebSocket proxying is on by default.
+default = ["websockets"]
+http3 = ["dep:proxy-http3"]
+websockets = ["dep:tokio-tungstenite"]
+userscripts = ["dep:userscript-engine"]
+webui = ["dep:web-api", "dep:userscript-engine"]
+full = ["http3", "websockets", "userscripts", "webui"]
 
 [dev-dependencies]
-mockall = { workspace = true }
+tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 

@@ -57,8 +57,7 @@ fn collect_functions(js: &str) -> HashMap<String, String> {
 
         // Must be top-level: at column 0, or `export function` at column 0.
         let at_line_start = p >= 1 && b[p - 1] == b'\n';
-        let after_export =
-            p >= 8 && &js[p - 7..p] == "export " && b[p - 8] == b'\n';
+        let after_export = p >= 8 && &js[p - 7..p] == "export " && b[p - 8] == b'\n';
         if !at_line_start && !after_export {
             continue;
         }
@@ -114,7 +113,12 @@ fn field_arr(block: &str, key: &str) -> Vec<String> {
     };
     rest[ob + 1..ob + cb]
         .split(',')
-        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').trim().to_string())
+        .map(|s| {
+            s.trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .trim()
+                .to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect()
 }
@@ -124,7 +128,11 @@ fn field_arr(block: &str, key: &str) -> Vec<String> {
 fn requires_trust(block: &str) -> bool {
     block
         .find("requiresTrust:")
-        .map(|p| block[p + "requiresTrust:".len()..].trim_start().starts_with("true"))
+        .map(|p| {
+            block[p + "requiresTrust:".len()..]
+                .trim_start()
+                .starts_with("true")
+        })
         .unwrap_or(false)
 }
 
@@ -164,7 +172,9 @@ fn parse_entries(js: &str) -> Vec<Entry> {
 
         let (fn_ref, block, next) = if is_push {
             let start = at + "builtinScriptlets.push({".len();
-            let Some(end) = brace_end(b, start - 1) else { break };
+            let Some(end) = brace_end(b, start - 1) else {
+                break;
+            };
             let block = js[start..end].to_string();
             let fn_ref = field_ident(&block, "fn:").unwrap_or_default();
             (fn_ref, block, end + 1)
@@ -176,7 +186,9 @@ fn parse_entries(js: &str) -> Vec<Entry> {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            let Some(end) = brace_end(b, after) else { break };
+            let Some(end) = brace_end(b, after) else {
+                break;
+            };
             let ob = (after..b.len()).find(|&k| b[k] == b'{').unwrap_or(after);
             let block = js[ob + 1..end].to_string();
             (fn_ref, block, end + 1)
@@ -307,8 +319,11 @@ function trustedThing() { /* dangerous */ }
 
         let resources = convert_ubo_scriptlets(SAMPLE);
         let mut fs = FilterSet::new(false);
-        fs.add_filter("example.com##+js(set-constant, foo, 1)", ParseOptions::default())
-            .unwrap();
+        fs.add_filter(
+            "example.com##+js(set-constant, foo, 1)",
+            ParseOptions::default(),
+        )
+        .unwrap();
         let mut engine = Engine::from_filter_set(fs, true);
         engine.use_resources(resources);
 

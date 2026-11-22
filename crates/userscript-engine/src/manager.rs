@@ -21,7 +21,10 @@ pub struct UserscriptManager {
 impl UserscriptManager {
     /// Create a new userscript manager
     pub fn new(data_dir: PathBuf) -> Result<Self> {
-        info!("Initializing userscript manager with data dir: {:?}", data_dir);
+        info!(
+            "Initializing userscript manager with data dir: {:?}",
+            data_dir
+        );
 
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&data_dir)?;

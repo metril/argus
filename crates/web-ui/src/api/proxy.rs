@@ -1,7 +1,7 @@
 //! Proxy management API calls
 
-use super::client::{ApiClient, ApiError};
 use super::auth::MessageResponse;
+use super::client::{ApiClient, ApiError};
 
 // Wire DTOs come from the shared `api-types` crate (single source of truth).
 pub use api_types::{

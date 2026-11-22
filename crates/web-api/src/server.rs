@@ -1,12 +1,12 @@
 //! Axum web server setup and routing
 
+use axum::http::{header, HeaderValue, Method};
 use axum::{
     middleware,
     routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
-use axum::http::{header, HeaderValue, Method};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -36,8 +36,14 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
         .route("/logout", post(handlers::auth::logout))
         .route("/me", get(handlers::auth::me))
         .route("/sessions", get(handlers::auth::list_sessions))
-        .route("/sessions/{session_id}", delete(handlers::auth::revoke_session))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/sessions/{session_id}",
+            delete(handlers::auth::revoke_session),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Combine auth routes
     let auth_router = Router::new()
@@ -55,35 +61,65 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
 
     // Proxy management routes (protected)
     let proxy_router = Router::new()
-        .route("/config", get(handlers::proxy::get_config).put(handlers::proxy::update_config))
+        .route(
+            "/config",
+            get(handlers::proxy::get_config).put(handlers::proxy::update_config),
+        )
         .route("/stats", get(handlers::proxy::get_stats))
         .route("/reload-config", post(handlers::proxy::reload_config))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state.clone());
 
     // Filter management routes (protected)
     let filters_router = Router::new()
-        .route("/lists", get(handlers::filters::list_filter_lists).post(handlers::filters::add_filter_list))
-        .route("/lists/{id}", get(handlers::filters::get_filter_list)
-            .put(handlers::filters::update_filter_list)
-            .delete(handlers::filters::delete_filter_list))
-        .route("/custom-rules", get(handlers::filters::get_custom_rules)
-            .put(handlers::filters::update_custom_rules))
+        .route(
+            "/lists",
+            get(handlers::filters::list_filter_lists).post(handlers::filters::add_filter_list),
+        )
+        .route(
+            "/lists/{id}",
+            get(handlers::filters::get_filter_list)
+                .put(handlers::filters::update_filter_list)
+                .delete(handlers::filters::delete_filter_list),
+        )
+        .route(
+            "/custom-rules",
+            get(handlers::filters::get_custom_rules).put(handlers::filters::update_custom_rules),
+        )
         .route("/stats", get(handlers::filters::get_stats))
         .route("/stats/reset", post(handlers::filters::reset_stats))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state.clone());
 
     // Userscript management routes (protected)
     let userscripts_router = Router::new()
-        .route("/", get(handlers::userscripts::list_userscripts).post(handlers::userscripts::install_userscript))
+        .route(
+            "/",
+            get(handlers::userscripts::list_userscripts)
+                .post(handlers::userscripts::install_userscript),
+        )
         .route("/stats", get(handlers::userscripts::get_stats))
-        .route("/{id}", get(handlers::userscripts::get_userscript)
-            .put(handlers::userscripts::update_userscript)
-            .delete(handlers::userscripts::uninstall_userscript))
-        .route("/{id}/source", get(handlers::userscripts::get_userscript_source))
+        .route(
+            "/{id}",
+            get(handlers::userscripts::get_userscript)
+                .put(handlers::userscripts::update_userscript)
+                .delete(handlers::userscripts::uninstall_userscript),
+        )
+        .route(
+            "/{id}/source",
+            get(handlers::userscripts::get_userscript_source),
+        )
         .route("/{id}/enabled", put(handlers::userscripts::set_enabled))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state.clone());
 
     // Build the main router with global middleware
@@ -103,13 +139,15 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
 
             // Serve static files from dist directory
             // fallback_service routes all non-API requests to index.html for SPA routing
-            let serve_dir = ServeDir::new(dist_path)
-                .not_found_service(ServeFile::new(&index_file));
+            let serve_dir = ServeDir::new(dist_path).not_found_service(ServeFile::new(&index_file));
 
             router = router.fallback_service(serve_dir);
             tracing::info!("WebUI static files enabled from {:?}", dist_path);
         } else {
-            tracing::warn!("WebUI dist path {:?} does not exist, static files disabled", dist_path);
+            tracing::warn!(
+                "WebUI dist path {:?} does not exist, static files disabled",
+                dist_path
+            );
         }
     }
 
@@ -128,10 +166,7 @@ pub fn create_router(state: Arc<AppState>, config: &ApiConfig) -> Router {
 }
 
 /// Start the web server
-pub async fn start_server(
-    state: Arc<AppState>,
-    config: ApiConfig,
-) -> crate::error::ApiResult<()> {
+pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::error::ApiResult<()> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 

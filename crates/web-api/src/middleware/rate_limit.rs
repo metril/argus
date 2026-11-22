@@ -66,7 +66,7 @@ fn extract_client_ip(req: &Request) -> Option<IpAddr> {
     if let Some(forwarded) = req.headers().get("x-forwarded-for") {
         if let Ok(forwarded_str) = forwarded.to_str() {
             // Take the LAST IP (added by trusted reverse proxy)
-            if let Some(last_ip) = forwarded_str.split(',').last() {
+            if let Some(last_ip) = forwarded_str.split(',').next_back() {
                 if let Ok(ip) = last_ip.trim().parse() {
                     return Some(ip);
                 }

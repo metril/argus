@@ -9,6 +9,7 @@ members = [
     "crates/web-ui",
     "crates/common",
     "crates/api-types",
+    "crates/e2e",
 ]
 
 [workspace.package]
@@ -102,9 +103,6 @@ selectors = "0.25"
 ammonia = "4.0"
 
 # JavaScript engine
-boa_engine = "0.21"
-boa_parser = "0.21"
-boa_gc = "0.21"
 
 # HTTP client (rustls only — default-features=false avoids pulling native-tls/openssl-sys)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies", "http2", "charset"] }

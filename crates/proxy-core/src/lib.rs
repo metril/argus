@@ -3,7 +3,6 @@
 //! This crate provides the foundational MITM proxy functionality including:
 //! - HTTP/1.1 and HTTP/2 support
 //! - TLS interception and certificate generation
-//! - Request/response pipeline
 //! - Connection management
 //! - Circuit breaker pattern for upstream failures
 //! - Memory pressure monitoring and load shedding
@@ -22,13 +21,15 @@ pub mod inject;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
-pub mod pipeline;
 pub mod server;
 pub mod tls;
+pub mod upstream;
+#[cfg(feature = "websockets")]
+pub mod websocket;
 
 pub use ca_encryption::{
-    decrypt_ca_key, encrypt_ca_key, is_encrypted_key, read_encrypted_key,
-    validate_passphrase, write_encrypted_key, CaEncryptionConfig,
+    decrypt_ca_key, encrypt_ca_key, is_encrypted_key, read_encrypted_key, validate_passphrase,
+    write_encrypted_key, CaEncryptionConfig,
 };
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitCheck, CircuitState};
 pub use config::ProxyConfig;

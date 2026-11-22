@@ -48,7 +48,10 @@ async fn fetch_list_content(
             match store.get_content(&list.id) {
                 Ok(Some(content)) => Some(content),
                 _ => {
-                    warn!("List {} returned 304 but no cached content; will refetch next cycle", list.name);
+                    warn!(
+                        "List {} returned 304 but no cached content; will refetch next cycle",
+                        list.name
+                    );
                     None
                 }
             }
@@ -74,17 +77,27 @@ async fn fetch_list_content(
                     Some(content)
                 }
                 Err(e) => {
-                    warn!("Failed to read body for {}: {}; falling back to cache", list.name, e);
+                    warn!(
+                        "Failed to read body for {}: {}; falling back to cache",
+                        list.name, e
+                    );
                     store.get_content(&list.id).ok().flatten()
                 }
             }
         }
         Ok(resp) => {
-            warn!("List {} HTTP {}; falling back to cache", list.name, resp.status());
+            warn!(
+                "List {} HTTP {}; falling back to cache",
+                list.name,
+                resp.status()
+            );
             store.get_content(&list.id).ok().flatten()
         }
         Err(e) => {
-            warn!("List {} download error: {}; falling back to cache", list.name, e);
+            warn!(
+                "List {} download error: {}; falling back to cache",
+                list.name, e
+            );
             store.get_content(&list.id).ok().flatten()
         }
     }
@@ -98,7 +111,10 @@ pub async fn reload_now(
 ) -> ApiResult<()> {
     let lists = store.get_all()?;
     let enabled: Vec<FilterList> = lists.into_iter().filter(|l| l.enabled).collect();
-    info!("Reloading filter engine from {} enabled list(s)", enabled.len());
+    info!(
+        "Reloading filter engine from {} enabled list(s)",
+        enabled.len()
+    );
 
     let mut contents = Vec::new();
     for mut list in enabled {

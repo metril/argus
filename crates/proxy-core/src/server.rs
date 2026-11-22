@@ -91,6 +91,29 @@ impl ProxyServer {
             .await
             .map_err(|e| Error::Connection(format!("Failed to bind to {}: {}", addr, e)))?;
 
+        // Create shutdown channel and spawn the signal handler.
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let shutdown_signal = shutdown_tx.clone();
+        tokio::spawn(async move {
+            shutdown_signal_handler().await;
+            info!("Shutdown signal received, stopping server...");
+            let _ = shutdown_signal.send(());
+        });
+
+        self.serve(listener, shutdown_tx).await
+    }
+
+    /// Serve on an already-bound listener until `shutdown_tx` fires. Lets callers (and tests)
+    /// bind port 0 and keep the listener, avoiding bind-then-drop races.
+    pub async fn serve(
+        &self,
+        listener: TcpListener,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> Result<()> {
+        let addr = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         info!("Proxy server listening on {}", addr);
         info!("HTTP/2: {}", self.config.proxy.enable_http2);
         info!("HTTP/3: {}", self.config.proxy.enable_http3);
@@ -109,22 +132,11 @@ impl ProxyServer {
         let _monitoring_handle = self.load_manager.start_monitoring();
         info!("Load manager monitoring started");
 
-        // Create shutdown channel
-        let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
         // Start HTTP/3 server if enabled
         #[cfg(feature = "http3")]
         if self.config.proxy.enable_http3 {
             self.start_http3_server(shutdown_tx.subscribe()).await?;
         }
-
-        // Spawn signal handler
-        let shutdown_signal = shutdown_tx.clone();
-        tokio::spawn(async move {
-            shutdown_signal_handler().await;
-            info!("Shutdown signal received, stopping server...");
-            let _ = shutdown_signal.send(());
-        });
 
         // Subscribe to shutdown signal for the main loop
         let mut main_shutdown_rx = shutdown_tx.subscribe();
@@ -230,7 +242,9 @@ impl ProxyServer {
         use proxy_http3::{Http3Filter, Http3Server, QuicConfig};
 
         // HTTP/3 requires MITM to be enabled for certificate generation
-        let mitm_handler = self.mitm_handler.as_ref()
+        let mitm_handler = self
+            .mitm_handler
+            .as_ref()
             .ok_or_else(|| Error::Config("HTTP/3 requires MITM to be enabled".to_string()))?;
 
         // Get CA reference for QUIC/TLS
@@ -264,7 +278,8 @@ impl ProxyServer {
             .map_err(|e| Error::Connection(format!("Invalid address: {}", e)))?;
 
         let quic_config = QuicConfig::new(udp_addr, Arc::new(tls_config));
-        let endpoint = quic_config.create_endpoint()
+        let endpoint = quic_config
+            .create_endpoint()
             .map_err(|e| Error::Connection(format!("Failed to create QUIC endpoint: {}", e)))?;
 
         info!("HTTP/3 server will start on UDP {}", udp_addr);

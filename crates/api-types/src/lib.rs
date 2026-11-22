@@ -19,19 +19,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum UserRole {
     /// Full administrative access.
     Admin,
     /// Read/write access to configurations.
     User,
     /// Read-only access (dashboard viewing).
+    #[default]
     Viewer,
-}
-
-impl Default for UserRole {
-    fn default() -> Self {
-        Self::Viewer
-    }
 }
 
 impl UserRole {
@@ -50,10 +46,16 @@ impl UserRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
 pub struct LoginRequest {
-    #[cfg_attr(feature = "server", validate(length(min = 3, max = 50, message = "Username must be 3-50 characters")))]
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))
+    )]
     pub username: String,
 
-    #[cfg_attr(feature = "server", validate(length(min = 8, max = 128, message = "Password must be 8-128 characters")))]
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 8, max = 128, message = "Password must be 8-128 characters"))
+    )]
     pub password: String,
 }
 
@@ -61,14 +63,23 @@ pub struct LoginRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
 pub struct RegisterRequest {
-    #[cfg_attr(feature = "server", validate(length(min = 3, max = 50, message = "Username must be 3-50 characters")))]
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))
+    )]
     #[cfg_attr(feature = "server", validate(custom(function = "validate_username")))]
     pub username: String,
 
-    #[cfg_attr(feature = "server", validate(length(min = 8, max = 128, message = "Password must be 8-128 characters")))]
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 8, max = 128, message = "Password must be 8-128 characters"))
+    )]
     pub password: String,
 
-    #[cfg_attr(feature = "server", validate(must_match(other = "password", message = "Passwords must match")))]
+    #[cfg_attr(
+        feature = "server",
+        validate(must_match(other = "password", message = "Passwords must match"))
+    )]
     pub password_confirm: String,
 }
 
@@ -243,7 +254,10 @@ pub struct AddFilterListRequest {
     #[cfg_attr(feature = "server", validate(length(min = 1, max = 200)))]
     pub name: String,
 
-    #[cfg_attr(feature = "server", validate(url(message = "Invalid URL"), length(max = 2000)))]
+    #[cfg_attr(
+        feature = "server",
+        validate(url(message = "Invalid URL"), length(max = 2000))
+    )]
     pub url: String,
 
     pub enabled: Option<bool>,
@@ -256,7 +270,10 @@ pub struct UpdateFilterListRequest {
     #[cfg_attr(feature = "server", validate(length(min = 1, max = 200)))]
     pub name: Option<String>,
 
-    #[cfg_attr(feature = "server", validate(url(message = "Invalid URL"), length(max = 2000)))]
+    #[cfg_attr(
+        feature = "server",
+        validate(url(message = "Invalid URL"), length(max = 2000))
+    )]
     pub url: Option<String>,
 
     pub enabled: Option<bool>,

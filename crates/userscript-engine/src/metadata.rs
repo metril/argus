@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Execution timing for userscripts
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RunAt {
     /// Run as soon as possible (before page loads)
     DocumentStart,
     /// Run after DOM is ready but before images load
+    #[default]
     DocumentEnd,
     /// Run after page is fully loaded
     DocumentIdle,
@@ -21,15 +22,9 @@ pub enum RunAt {
     ContextMenu,
 }
 
-impl Default for RunAt {
-    fn default() -> Self {
-        RunAt::DocumentEnd
-    }
-}
-
 impl RunAt {
     /// Parse from metadata value
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_directive(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "document-start" => RunAt::DocumentStart,
             "document-end" => RunAt::DocumentEnd,
@@ -211,7 +206,7 @@ impl UserscriptMetadata {
                     "include" => includes.push(value.to_string()),
                     "match" => matches.push(value.to_string()),
                     "exclude" => excludes.push(value.to_string()),
-                    "run-at" => run_at = RunAt::from_str(value),
+                    "run-at" => run_at = RunAt::from_directive(value),
                     "noframes" => noframes = true,
                     "require" => requires.push(value.to_string()),
                     "resource" => {
@@ -236,9 +231,8 @@ impl UserscriptMetadata {
             }
         }
 
-        let name = name.ok_or_else(|| {
-            Error::MetadataParsing("Missing required @name field".to_string())
-        })?;
+        let name =
+            name.ok_or_else(|| Error::MetadataParsing("Missing required @name field".to_string()))?;
 
         Ok(Self {
             name,
@@ -385,10 +379,13 @@ console.log('test');
 
     #[test]
     fn test_run_at_parsing() {
-        assert_eq!(RunAt::from_str("document-start"), RunAt::DocumentStart);
-        assert_eq!(RunAt::from_str("document-end"), RunAt::DocumentEnd);
-        assert_eq!(RunAt::from_str("document-idle"), RunAt::DocumentIdle);
-        assert_eq!(RunAt::from_str("unknown"), RunAt::DocumentEnd);
+        assert_eq!(
+            RunAt::from_directive("document-start"),
+            RunAt::DocumentStart
+        );
+        assert_eq!(RunAt::from_directive("document-end"), RunAt::DocumentEnd);
+        assert_eq!(RunAt::from_directive("document-idle"), RunAt::DocumentIdle);
+        assert_eq!(RunAt::from_directive("unknown"), RunAt::DocumentEnd);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// API server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApiConfig {
     /// Server settings
     pub server: ServerConfig,
@@ -25,19 +25,6 @@ pub struct ApiConfig {
 
     /// WebUI settings
     pub webui: WebUiConfig,
-}
-
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            auth: AuthConfig::default(),
-            rate_limit: RateLimitConfig::default(),
-            security: SecurityConfig::default(),
-            session: SessionConfig::default(),
-            webui: WebUiConfig::default(),
-        }
-    }
 }
 
 /// Server configuration
@@ -190,15 +177,17 @@ impl ApiConfig {
     /// Load configuration from TOML file
     pub fn from_file(path: &str) -> crate::error::ApiResult<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: ApiConfig = toml::from_str(&content)
-            .map_err(|e| crate::error::ApiError::Internal(format!("Failed to parse config: {}", e)))?;
+        let config: ApiConfig = toml::from_str(&content).map_err(|e| {
+            crate::error::ApiError::Internal(format!("Failed to parse config: {}", e))
+        })?;
         Ok(config)
     }
 
     /// Save configuration to TOML file
     pub fn to_file(&self, path: &str) -> crate::error::ApiResult<()> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| crate::error::ApiError::Internal(format!("Failed to serialize config: {}", e)))?;
+        let content = toml::to_string_pretty(self).map_err(|e| {
+            crate::error::ApiError::Internal(format!("Failed to serialize config: {}", e))
+        })?;
         std::fs::write(path, content)?;
         Ok(())
     }

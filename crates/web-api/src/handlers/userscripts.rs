@@ -65,11 +65,15 @@ pub async fn list_userscripts(
     let limit = query.limit.unwrap_or(50).min(100);
 
     // Convert to responses
-    let script_responses: Vec<UserscriptResponse> = scripts.iter().map(userscript_response).collect();
+    let script_responses: Vec<UserscriptResponse> =
+        scripts.iter().map(userscript_response).collect();
 
     // Filter by enabled status if specified
     let filtered: Vec<_> = if let Some(enabled) = query.enabled {
-        script_responses.into_iter().filter(|s| s.enabled == enabled).collect()
+        script_responses
+            .into_iter()
+            .filter(|s| s.enabled == enabled)
+            .collect()
     } else {
         script_responses
     };
@@ -78,7 +82,11 @@ pub async fn list_userscripts(
 
     // Paginate
     let start = ((page - 1) * limit) as usize;
-    let paginated: Vec<_> = filtered.into_iter().skip(start).take(limit as usize).collect();
+    let paginated: Vec<_> = filtered
+        .into_iter()
+        .skip(start)
+        .take(limit as usize)
+        .collect();
 
     Ok(Json(PaginatedResponse {
         data: paginated,
@@ -233,16 +241,21 @@ pub async fn uninstall_userscript(
     }
 
     // Uninstall the userscript
-    state.userscript_manager.uninstall(&id).map_err(|e| match e {
-        userscript_engine::Error::ScriptNotFound(_) => {
-            ApiError::NotFound(format!("Userscript '{}' not found", id))
-        }
-        _ => ApiError::Internal(format!("Failed to uninstall: {}", e)),
-    })?;
+    state
+        .userscript_manager
+        .uninstall(&id)
+        .map_err(|e| match e {
+            userscript_engine::Error::ScriptNotFound(_) => {
+                ApiError::NotFound(format!("Userscript '{}' not found", id))
+            }
+            _ => ApiError::Internal(format!("Failed to uninstall: {}", e)),
+        })?;
 
     info!("Userscript uninstalled by {}: {}", auth_user.username(), id);
 
-    Ok(Json(json!({ "message": format!("Userscript '{}' uninstalled", id) })))
+    Ok(Json(
+        json!({ "message": format!("Userscript '{}' uninstalled", id) }),
+    ))
 }
 
 /// Enable or disable a userscript

@@ -2,8 +2,8 @@
 
 use crate::{Error, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
@@ -31,7 +31,10 @@ impl CertificateAuthority {
 
         // Try to load existing CA
         if cert_path.exists() && key_path.exists() {
-            info!("Loading existing CA from {:?} and {:?}", cert_path, key_path);
+            info!(
+                "Loading existing CA from {:?} and {:?}",
+                cert_path, key_path
+            );
             Self::load(cert_path, key_path)
         } else {
             info!("Generating new CA at {:?} and {:?}", cert_path, key_path);
@@ -45,9 +48,8 @@ impl CertificateAuthority {
         let key_path = key_path.as_ref();
 
         // Read certificate PEM
-        let cert_pem = fs::read_to_string(cert_path).map_err(|e| {
-            Error::Certificate(format!("Failed to read CA certificate: {}", e))
-        })?;
+        let cert_pem = fs::read_to_string(cert_path)
+            .map_err(|e| Error::Certificate(format!("Failed to read CA certificate: {}", e)))?;
 
         // Read private key PEM
         let key_pem = fs::read_to_string(key_path)
@@ -120,7 +122,8 @@ impl CertificateAuthority {
             .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
 
         // Generate self-signed certificate
-        let ca_cert = params.self_signed(&ca_key_pair)
+        let ca_cert = params
+            .self_signed(&ca_key_pair)
             .map_err(|e| Error::Certificate(format!("Failed to generate CA certificate: {}", e)))?;
 
         // Get PEM formats
@@ -128,9 +131,8 @@ impl CertificateAuthority {
         let key_pem = ca_key_pair.serialize_pem();
 
         // Write certificate to file
-        fs::write(cert_path, &cert_pem).map_err(|e| {
-            Error::Certificate(format!("Failed to write CA certificate: {}", e))
-        })?;
+        fs::write(cert_path, &cert_pem)
+            .map_err(|e| Error::Certificate(format!("Failed to write CA certificate: {}", e)))?;
 
         // Write private key to file
         fs::write(key_path, &key_pem)
@@ -165,7 +167,10 @@ impl CertificateAuthority {
     }
 
     /// Generate a certificate for the given domain
-    pub fn generate_cert(&self, domain: &str) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    pub fn generate_cert(
+        &self,
+        domain: &str,
+    ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
         info!("Generating certificate for domain: {}", domain);
 
         // Create certificate parameters
@@ -177,11 +182,18 @@ impl CertificateAuthority {
         params.distinguished_name = dn;
 
         // Add subject alternative names
-        params.subject_alt_names = vec![
-            SanType::DnsName(domain.try_into().map_err(|e| Error::Certificate(format!("Invalid domain name: {:?}", e)))?),
-            // Also add wildcard for subdomains
-            SanType::DnsName(format!("*.{}", domain).try_into().map_err(|e| Error::Certificate(format!("Invalid wildcard domain: {:?}", e)))?),
-        ];
+        params.subject_alt_names =
+            vec![
+                SanType::DnsName(
+                    domain
+                        .try_into()
+                        .map_err(|e| Error::Certificate(format!("Invalid domain name: {:?}", e)))?,
+                ),
+                // Also add wildcard for subdomains
+                SanType::DnsName(format!("*.{}", domain).try_into().map_err(|e| {
+                    Error::Certificate(format!("Invalid wildcard domain: {:?}", e))
+                })?),
+            ];
 
         // Set validity period (30 days)
         params.not_before = OffsetDateTime::now_utc();
@@ -201,7 +213,8 @@ impl CertificateAuthority {
         let issuer = Issuer::from_params(&self.ca_params, &self.ca_key_pair);
 
         // Sign the certificate with our CA
-        let cert = params.signed_by(&key_pair, &issuer)
+        let cert = params
+            .signed_by(&key_pair, &issuer)
             .map_err(|e| Error::Certificate(format!("Failed to sign certificate: {}", e)))?;
 
         // Convert to DER format for rustls
@@ -226,11 +239,11 @@ impl CertificateAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_ca_generation() {
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-ca.crt");
         let key_path = temp_dir.join("test-ca.key");
 
@@ -253,7 +266,8 @@ mod tests {
 
     #[test]
     fn test_cert_generation() {
-        let temp_dir = env::temp_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_dir = tmp.path().to_path_buf();
         let cert_path = temp_dir.join("test-ca2.crt");
         let key_path = temp_dir.join("test-ca2.key");
 

@@ -96,6 +96,12 @@ pub struct ProxyStats {
     pub errors_total: AtomicU64,
 }
 
+impl Default for ProxyStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProxyStats {
     pub fn new() -> Self {
         Self {
@@ -204,8 +210,7 @@ impl SessionStore {
         let users = self.users_tree()?;
         let index = self.username_index()?;
 
-        let user_bytes =
-            serde_json::to_vec(user).map_err(|e| ApiError::Internal(e.to_string()))?;
+        let user_bytes = serde_json::to_vec(user).map_err(|e| ApiError::Internal(e.to_string()))?;
 
         // Store user by ID
         users.insert(user.id.as_bytes(), user_bytes)?;
@@ -236,8 +241,8 @@ impl SessionStore {
 
         match index.get(username.as_bytes())? {
             Some(id_bytes) => {
-                let id = Uuid::from_slice(&id_bytes)
-                    .map_err(|e| ApiError::Internal(e.to_string()))?;
+                let id =
+                    Uuid::from_slice(&id_bytes).map_err(|e| ApiError::Internal(e.to_string()))?;
                 self.get_user(&id)
             }
             None => Ok(None),
@@ -280,8 +285,8 @@ impl SessionStore {
 
         for item in users.iter() {
             let (_, value) = item.map_err(|e| ApiError::Internal(e.to_string()))?;
-            let user: User = serde_json::from_slice(&value)
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            let user: User =
+                serde_json::from_slice(&value).map_err(|e| ApiError::Internal(e.to_string()))?;
             result.push(user);
         }
 
@@ -292,19 +297,46 @@ impl SessionStore {
 /// Multi-tier rate limiters
 pub struct RateLimiters {
     /// Global rate limiter (all requests)
-    pub global: Arc<RwLock<RateLimiter<governor::state::direct::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>>,
+    pub global: Arc<
+        RwLock<
+            RateLimiter<
+                governor::state::direct::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
+    >,
 
     /// Per-IP rate limiters
-    pub per_ip: Arc<DashMap<IpAddr, RateLimiter<governor::state::direct::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>>,
+    pub per_ip: Arc<
+        DashMap<
+            IpAddr,
+            RateLimiter<
+                governor::state::direct::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
+    >,
 
     /// Per-user rate limiters
-    pub per_user: Arc<DashMap<String, RateLimiter<governor::state::direct::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>>,
+    pub per_user: Arc<
+        DashMap<
+            String,
+            RateLimiter<
+                governor::state::direct::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
+    >,
 }
 
 impl RateLimiters {
     pub fn new(global_rpm: u64, _ip_rpm: u64, _user_rpm: u64) -> Self {
         // Convert to NonZeroU32, defaulting to 1 if 0 or too large
-        let global_rpm_u32 = NonZeroU32::new(global_rpm.min(u32::MAX as u64) as u32).unwrap_or(NonZeroU32::new(1).unwrap());
+        let global_rpm_u32 = NonZeroU32::new(global_rpm.min(u32::MAX as u64) as u32)
+            .unwrap_or(NonZeroU32::new(1).unwrap());
         let global_quota = Quota::per_minute(global_rpm_u32);
         let global_limiter = RateLimiter::direct(global_quota);
 

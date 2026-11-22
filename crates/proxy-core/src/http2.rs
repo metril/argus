@@ -11,10 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, error};
 
 /// Serve HTTP/2 over a connection
-pub async fn serve_http2<IO, S, F, B>(
-    io: IO,
-    service: S,
-) -> Result<()>
+pub async fn serve_http2<IO, S, F, B>(io: IO, service: S) -> Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Fn(Request<Incoming>) -> F + Clone + Send + 'static,

@@ -16,7 +16,9 @@ use serde_json::json;
 
 #[tokio::test]
 async fn test_health_check() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server.get("/api/health").await;
@@ -29,7 +31,9 @@ async fn test_health_check() {
 
 #[tokio::test]
 async fn test_metrics_endpoint() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server.get("/api/metrics").await;
@@ -45,7 +49,9 @@ async fn test_ca_download_is_public() {
     // The CA certificate endpoint must be reachable WITHOUT authentication so any
     // device can fetch and trust it by URL. Whether the cert file exists in the
     // test environment or not, the auth layer must never reject the request.
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server.get("/api/ca.crt").await;
@@ -67,7 +73,9 @@ async fn test_ca_download_is_public() {
 
 #[tokio::test]
 async fn test_register_first_user_becomes_admin() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server
@@ -92,7 +100,9 @@ async fn test_register_first_user_becomes_admin() {
 
 #[tokio::test]
 async fn test_register_second_user_becomes_user() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register first user (admin)
@@ -122,7 +132,9 @@ async fn test_register_second_user_becomes_user() {
 
 #[tokio::test]
 async fn test_register_duplicate_username() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register first user
@@ -149,7 +161,9 @@ async fn test_register_duplicate_username() {
 
 #[tokio::test]
 async fn test_register_weak_password() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server
@@ -165,7 +179,9 @@ async fn test_register_weak_password() {
 
 #[tokio::test]
 async fn test_login_success() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -195,7 +211,9 @@ async fn test_login_success() {
 
 #[tokio::test]
 async fn test_login_wrong_password() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -222,7 +240,9 @@ async fn test_login_wrong_password() {
 
 #[tokio::test]
 async fn test_login_nonexistent_user() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server
@@ -238,7 +258,9 @@ async fn test_login_nonexistent_user() {
 
 #[tokio::test]
 async fn test_me_endpoint() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register and get token
@@ -266,7 +288,9 @@ async fn test_me_endpoint() {
 
 #[tokio::test]
 async fn test_me_endpoint_unauthorized() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server.get("/api/auth/me").await;
@@ -276,7 +300,9 @@ async fn test_me_endpoint_unauthorized() {
 
 #[tokio::test]
 async fn test_logout() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -312,7 +338,9 @@ async fn test_logout() {
 
 #[tokio::test]
 async fn test_refresh_token() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -343,7 +371,9 @@ async fn test_refresh_token() {
 
 #[tokio::test]
 async fn test_get_proxy_config_requires_auth() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     let response = server.get("/api/proxy/config").await;
@@ -352,7 +382,9 @@ async fn test_get_proxy_config_requires_auth() {
 
 #[tokio::test]
 async fn test_get_proxy_config() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register and get token
@@ -379,7 +411,9 @@ async fn test_get_proxy_config() {
 
 #[tokio::test]
 async fn test_update_proxy_config() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register admin
@@ -410,7 +444,9 @@ async fn test_update_proxy_config() {
 
 #[tokio::test]
 async fn test_update_proxy_config_validation() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -437,7 +473,9 @@ async fn test_update_proxy_config_validation() {
 
 #[tokio::test]
 async fn test_get_proxy_stats() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -468,7 +506,9 @@ async fn test_get_proxy_stats() {
 
 #[tokio::test]
 async fn test_list_filter_lists() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -496,7 +536,9 @@ async fn test_list_filter_lists() {
 
 #[tokio::test]
 async fn test_add_filter_list_ssrf_protection() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -551,7 +593,9 @@ async fn test_add_filter_list_ssrf_protection() {
 
 #[tokio::test]
 async fn test_add_filter_list_valid_url() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -585,7 +629,9 @@ async fn test_add_filter_list_valid_url() {
 /// listing is reloaded (it used to vanish because the handlers were stubs).
 #[tokio::test]
 async fn test_added_filter_list_appears_in_listing() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     let reg_response = server
@@ -641,7 +687,9 @@ async fn test_added_filter_list_appears_in_listing() {
 
 #[tokio::test]
 async fn test_custom_rules_get_and_update() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     let reg = server
@@ -682,7 +730,9 @@ async fn test_custom_rules_get_and_update() {
 
 #[tokio::test]
 async fn test_get_filter_stats() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -709,7 +759,9 @@ async fn test_get_filter_stats() {
 
 #[tokio::test]
 async fn test_reset_filter_stats_requires_admin() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register first user (admin)
@@ -746,7 +798,9 @@ async fn test_reset_filter_stats_requires_admin() {
 
 #[tokio::test]
 async fn test_list_userscripts() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -773,7 +827,9 @@ async fn test_list_userscripts() {
 
 #[tokio::test]
 async fn test_install_userscript() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -816,7 +872,9 @@ console.log("Hello from test script!");
 
 #[tokio::test]
 async fn test_install_invalid_userscript() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -843,7 +901,9 @@ async fn test_install_invalid_userscript() {
 
 #[tokio::test]
 async fn test_install_empty_userscript() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -870,7 +930,9 @@ async fn test_install_empty_userscript() {
 
 #[tokio::test]
 async fn test_get_userscript_stats() {
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
 
     // Register
@@ -904,7 +966,9 @@ async fn test_viewer_cannot_modify() {
     // This test verifies role-based access control
     // Since viewers don't exist yet in the registration flow,
     // this is a placeholder for when that feature is added
-    let ctx = TestContext::new().await.expect("Failed to create test context");
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
     let _server = TestServer::new(ctx.router).expect("Failed to create test server");
 
     // TODO: Once viewer role can be assigned, test that viewers cannot modify

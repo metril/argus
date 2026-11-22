@@ -26,23 +26,11 @@ pub struct ConnectionInfo {
 }
 
 /// Request statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RequestStats {
     pub total_requests: u64,
     pub blocked_requests: u64,
     pub allowed_requests: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
-}
-
-impl Default for RequestStats {
-    fn default() -> Self {
-        Self {
-            total_requests: 0,
-            blocked_requests: 0,
-            allowed_requests: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-        }
-    }
 }

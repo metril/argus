@@ -7,9 +7,9 @@ use super::client::{ApiClient, ApiError};
 
 // Wire DTOs come from the shared `api-types` crate (single source of truth).
 // Aliases preserve the names the UI pages already use.
-pub use api_types::{InstallUserscriptRequest, SetEnabledRequest, UpdateUserscriptRequest};
 pub use api_types::UserscriptResponse as Userscript;
 pub use api_types::UserscriptStatsResponse as UserscriptStats;
+pub use api_types::{InstallUserscriptRequest, SetEnabledRequest, UpdateUserscriptRequest};
 pub type UserscriptsResponse = api_types::PaginatedResponse<Userscript>;
 
 /// Userscript source response (server returns an ad-hoc `{id, source}` object)

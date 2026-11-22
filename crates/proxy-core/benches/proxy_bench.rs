@@ -5,14 +5,11 @@
 //! - Circuit breaker operations
 //! - Memory monitoring
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::Duration;
 
 // Import the crates we're benchmarking
-use proxy_core::{
-    CircuitBreaker, CircuitBreakerConfig,
-    MemoryMonitor, MemoryMonitorConfig,
-};
+use proxy_core::{CircuitBreaker, CircuitBreakerConfig, MemoryMonitor, MemoryMonitorConfig};
 
 /// Benchmark circuit breaker check operations
 fn bench_circuit_breaker_check(c: &mut Criterion) {
@@ -45,17 +42,13 @@ fn bench_circuit_breaker_many_hosts(c: &mut Criterion) {
     let mut group = c.benchmark_group("circuit_breaker_scaling");
 
     for num_hosts in [100, 500, 1000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("check", num_hosts),
-            num_hosts,
-            |b, &n| {
-                b.iter(|| {
-                    for i in 0..n {
-                        black_box(cb.check(&hosts[i as usize]));
-                    }
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("check", num_hosts), num_hosts, |b, &n| {
+            b.iter(|| {
+                for i in 0..n {
+                    black_box(cb.check(&hosts[i as usize]));
+                }
+            });
+        });
     }
 
     group.finish();
@@ -115,7 +108,7 @@ fn bench_memory_monitor(c: &mut Criterion) {
 
 /// Benchmark CA encryption (if enabled)
 fn bench_ca_encryption(c: &mut Criterion) {
-    use proxy_core::{encrypt_ca_key, decrypt_ca_key};
+    use proxy_core::{decrypt_ca_key, encrypt_ca_key};
 
     let test_key = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgY2N5YmVyIHNlY3Vy\naXR5IHRlc3Qga2V5IGhlcmUhIWhRANCAATy6x+3k7qb7rSWWyRYR7v8zR6+Fxv1B\ngKvLmXgqQqQr7k8wJWLDMwYwO+D7oXDkYLsSTg8O+D7oXDkYLsSTg8\n-----END PRIVATE KEY-----\n";
     let passphrase = "BenchmarkP@ssw0rd!";

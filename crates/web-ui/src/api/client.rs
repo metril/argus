@@ -3,9 +3,9 @@
 use std::cell::Cell;
 
 use gloo_net::http::Request;
-use web_sys::RequestCredentials;
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
+use web_sys::RequestCredentials;
 
 use crate::utils::api_base_url;
 
@@ -163,12 +163,14 @@ impl ApiClient {
         .credentials(RequestCredentials::Include);
 
         let result = match body {
-            Some(b) => builder
-                .header("Content-Type", "application/json")
-                .body(b.to_string())
-                .map_err(|e| ApiError::Parse(e.to_string()))?
-                .send()
-                .await,
+            Some(b) => {
+                builder
+                    .header("Content-Type", "application/json")
+                    .body(b.to_string())
+                    .map_err(|e| ApiError::Parse(e.to_string()))?
+                    .send()
+                    .await
+            }
             None => builder.send().await,
         };
 
@@ -227,12 +229,10 @@ impl ApiClient {
         let status = response.status();
 
         match status {
-            200..=299 => {
-                response
-                    .json::<T>()
-                    .await
-                    .map_err(|e| ApiError::Parse(e.to_string()))
-            }
+            200..=299 => response
+                .json::<T>()
+                .await
+                .map_err(|e| ApiError::Parse(e.to_string())),
             400 => {
                 let text = response.text().await.unwrap_or_default();
                 Err(ApiError::Validation(text))
@@ -257,7 +257,10 @@ impl ApiClient {
             }
             _ => {
                 let text = response.text().await.unwrap_or_default();
-                Err(ApiError::Network(format!("Unexpected status {}: {}", status, text)))
+                Err(ApiError::Network(format!(
+                    "Unexpected status {}: {}",
+                    status, text
+                )))
             }
         }
     }
