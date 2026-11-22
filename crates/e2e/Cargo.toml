@@ -23,7 +23,7 @@ bytes = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 parking_lot = { workspace = true }

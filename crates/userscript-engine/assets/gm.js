@@ -383,7 +383,7 @@ function (cfg, entries, W) {
     function inlineRes(name) { return d.resources && hasOwn(d.resources, name) ? d.resources[name] : null; }
     function fetchRes(name) {
       if (resCache[name]) { return resCache[name]; }
-      return (resCache[name] = pThen(_fetch(cfg.base + "/v1/resource?name=" + encURI(name) + "&t=" + encURI(client.token()), {
+      return (resCache[name] = pThen(_fetch(cfg.base + "/v1/resource?name=" + encURI(name), {
         credentials: "omit", cache: "no-store", redirect: "error", headers: client.headers()
       }), function (res) {
         if (!res.ok) { throw mkError("not_found", "no such @resource: " + name); }

@@ -884,18 +884,30 @@ e2e_test!(
         let c = env.client();
         let origin = origin_of(&env, "app.test");
         let tok = token_for(&env, &c, "app.test", "/r", 0).await;
-        let u = env.origin.https_url(
-            "app.test",
-            &format!("/__adblock__/gm/v1/resource?name=css&t={tok}"),
-        );
+        let u = env
+            .origin
+            .https_url("app.test", "/__adblock__/gm/v1/resource?name=css");
         let r = c
             .request(reqwest::Method::GET, &u)
             .header("sec-fetch-site", "same-origin")
+            .header("x-gm-token", &tok)
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
         assert_eq!(r.text().await.unwrap(), "body{color:red}");
+        // A token in the query string is not accepted.
+        let q = env.origin.https_url(
+            "app.test",
+            &format!("/__adblock__/gm/v1/resource?name=css&t={tok}"),
+        );
+        let r = c
+            .request(reqwest::Method::GET, &q)
+            .header("sec-fetch-site", "same-origin")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401, "query tokens are refused");
         // cross-site GET is refused
         let r = c
             .request(reqwest::Method::GET, &u)
@@ -929,5 +941,151 @@ e2e_test!(
         .await;
         assert_eq!(v["result"][0]["value"], "v", "{v}");
         let _ = EntryMode::Explicit;
+    }
+);
+
+/// A body that yields `n` chunks of 1 MiB (then pends forever if `stall`), counting consumption.
+fn counted_body(
+    consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    chunks: usize,
+    stall: bool,
+) -> reqwest::Body {
+    use std::sync::atomic::Ordering;
+    let s = futures_util::stream::unfold(0usize, move |i| {
+        let consumed = consumed.clone();
+        async move {
+            if i >= chunks {
+                if stall {
+                    futures_util::future::pending::<()>().await;
+                }
+                return None;
+            }
+            consumed.fetch_add(1 << 20, Ordering::SeqCst);
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0u8; 1 << 20])),
+                i + 1,
+            ))
+        }
+    });
+    reqwest::Body::wrap_stream(s)
+}
+
+e2e_test!(
+    gm_bodies_are_not_read_before_the_token_is_verified,
+    rules = [],
+    |env| {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        env.proxy.install_userscript(&script(
+            "pre",
+            "// @grant GM_xmlhttpRequest\n// @connect api.test",
+        ));
+        let c = env.client();
+        let origin = origin_of(&env, "app.test");
+        for (route, ct) in [
+            ("xhr", "application/x-gm-frame"),
+            ("values/get", "application/json"),
+        ] {
+            let consumed = std::sync::Arc::new(AtomicUsize::new(0));
+            let u = env
+                .origin
+                .https_url("app.test", &format!("/__adblock__/gm/v1/{route}"));
+            let r = c
+                .request(reqwest::Method::POST, &u)
+                .header("content-type", ct)
+                .header("sec-fetch-site", "same-origin")
+                .header("origin", &origin)
+                .body(counted_body(consumed.clone(), 100, false))
+                .send()
+                .await;
+            let seen = consumed.load(Ordering::SeqCst);
+            if let Ok(r) = r {
+                assert_eq!(r.status(), 401, "{route}");
+            }
+            assert!(
+                seen <= 8 << 20,
+                "{route}: {seen} bytes were pulled from a tokenless request"
+            );
+        }
+    }
+);
+
+e2e_test!(
+    gm_json_bodies_are_bounded_by_permits_and_a_byte_budget,
+    rules = [],
+    explicit_only,
+    |env| {
+        use std::sync::atomic::AtomicUsize;
+        env.proxy
+            .install_userscript(&script("bud", "// @grant GM_getValue"));
+        let c = std::sync::Arc::new(env.client());
+        let origin = origin_of(&env, "app.test");
+        let tok = token_for(&env, &c, "app.test", "/b", 0).await;
+        let u = env
+            .origin
+            .https_url("app.test", "/__adblock__/gm/v1/values/get");
+        let mut hs = Vec::new();
+        for _ in 0..40 {
+            let (c, u, tok, origin) = (c.clone(), u.clone(), tok.clone(), origin.clone());
+            hs.push(tokio::spawn(async move {
+                let consumed = std::sync::Arc::new(AtomicUsize::new(0));
+                let r = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    c.request(reqwest::Method::POST, &u)
+                        .header("content-type", "application/json")
+                        .header("sec-fetch-site", "same-origin")
+                        .header("origin", &origin)
+                        .header("x-gm-token", &tok)
+                        .body(counted_body(consumed, 1, true))
+                        .send(),
+                )
+                .await;
+                match r {
+                    Ok(Ok(r)) => r.status().as_u16(),
+                    _ => 0,
+                }
+            }));
+        }
+        let mut codes = Vec::new();
+        for h in hs {
+            codes.push(h.await.unwrap());
+        }
+        let limited = codes.iter().filter(|c| **c == 429).count();
+        assert!(
+            limited >= 8,
+            "stalled bodies must hit the limits: {codes:?}"
+        );
+    }
+);
+
+e2e_test!(
+    xhr_uploads_are_streamed_whole_and_capped,
+    rules = [],
+    |env| {
+        env.proxy.install_userscript(&script(
+            "up",
+            "// @grant GM_xmlhttpRequest\n// @connect api.test",
+        ));
+        let c = env.client();
+        let origin = origin_of(&env, "app.test");
+        let tok = token_for(&env, &c, "app.test", "/u", 0).await;
+        env.origin.route("/up", MockResponse::ok("ok"));
+        let big = vec![7u8; 9 << 20];
+        let meta = json!({"op": "xhr", "method": "POST", "url": env.origin.https_url("api.test", "/up"), "headers": [["Content-Type", "application/octet-stream"]]});
+        let (_, _, body) = xhr(&env, &c, &tok, &origin, meta, &big).await;
+        assert!(
+            find_frame(&frames(&body), 3).is_some(),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(env.origin.requests_for("/up")[0].body.len(), big.len());
+        // Over the quota: refused before the origin sees a complete body.
+        let huge = vec![1u8; (64 << 20) + 1024];
+        let meta = json!({"op": "xhr", "method": "POST", "url": env.origin.https_url("api.test", "/up"), "headers": []});
+        let (st, _, body) = xhr(&env, &c, &tok, &origin, meta, &huge).await;
+        let txt = String::from_utf8_lossy(&body);
+        assert!(
+            st == 413 || st == 429 || txt.contains("quota") || txt.contains("too large"),
+            "{st} {txt}"
+        );
     }
 );

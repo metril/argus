@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use userscript_engine::backend::{
     next_hop, CookieOp, ErrorCode, GmError, GmResult, Redirect, ScriptCtx, XhrRequest,
 };
@@ -48,6 +49,26 @@ pub const MAX_RESPONSE: u64 = 256 * 1024 * 1024;
 /// Concurrent outbound requests per script and per profile.
 pub const MAX_XHR_PER_SCRIPT: usize = 8;
 pub const MAX_XHR_PER_PROFILE: usize = 32;
+/// Concurrent JSON calls per script and per profile (they hold a slot only while the body is read).
+pub const MAX_JSON_PER_SCRIPT: usize = 32;
+pub const MAX_JSON_PER_PROFILE: usize = 128;
+/// Global budget for request bytes buffered under `/__adblock__/gm/` (the worst case, in bytes).
+pub const BODY_BUDGET: usize = 64 * 1024 * 1024;
+/// Reserved per in-flight `xhr`: the frame head, the first data frame and the bounded upload
+/// channel (two frames). The upload itself is streamed and never buffered whole.
+pub const XHR_RESERVE: usize = 2 * 1024 * 1024;
+/// A body frame must arrive within this long once a request holds its slot.
+const BODY_IDLE: Duration = Duration::from_secs(30);
+/// Every `POST` route other than `xhr`.
+const JSON_ROUTES: &[&str] = &[
+    "values/get",
+    "values/set",
+    "values/delete",
+    "values/list",
+    "values/changes",
+    "token/refresh",
+    "cookie",
+];
 
 /// Name of the one profile that has userscripts today.
 pub const PROFILE: &str = userscript_engine::DEFAULT_PROFILE;
@@ -192,33 +213,53 @@ pub struct Caller<'a> {
 }
 
 #[derive(Default)]
-struct Limits {
+struct Counts {
     per_script: HashMap<String, usize>,
     profile: usize,
 }
 
-/// Releases an outbound-request slot on drop.
+#[derive(Default)]
+struct Limits {
+    xhr: Counts,
+    json: Counts,
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Xhr,
+    Json,
+}
+
+/// Releases a request slot on drop.
 struct Permit {
     host: Arc<GmHost>,
     script: String,
+    kind: Kind,
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
         let mut l = self.host.limits.lock();
-        l.profile = l.profile.saturating_sub(1);
-        if let Some(n) = l.per_script.get_mut(&self.script) {
+        let c = match self.kind {
+            Kind::Xhr => &mut l.xhr,
+            Kind::Json => &mut l.json,
+        };
+        c.profile = c.profile.saturating_sub(1);
+        if let Some(n) = c.per_script.get_mut(&self.script) {
             *n = n.saturating_sub(1);
             if *n == 0 {
-                l.per_script.remove(&self.script);
+                c.per_script.remove(&self.script);
             }
         }
     }
 }
 
+type Held = (Permit, OwnedSemaphorePermit);
+
 pub struct GmHost {
     pub docs: DocStore,
     limits: Mutex<Limits>,
+    budget: Arc<Semaphore>,
 }
 
 impl Default for GmHost {
@@ -333,6 +374,7 @@ impl GmHost {
         Self {
             docs: DocStore::new(DOC_CAP, DOC_TTL),
             limits: Mutex::new(Limits::default()),
+            budget: Arc::new(Semaphore::new(BODY_BUDGET)),
         }
     }
 
@@ -513,6 +555,17 @@ impl GmHost {
         let tok =
             token_hdr.ok_or_else(|| GmError::new(ErrorCode::Unauthorized, "missing token"))?;
         let a = self.authenticate(manager, c, tok)?;
+        self.json_run(manager, &a, route, body)
+    }
+
+    /// The JSON endpoints once the caller is authenticated.
+    fn json_run(
+        &self,
+        manager: &UserscriptManager,
+        a: &Authed,
+        route: &str,
+        body: &[u8],
+    ) -> GmResult<Value> {
         let bad = |m: &str| GmError::new(ErrorCode::BadRequest, m.to_string());
         let req: Value = if body.is_empty() {
             json!({})
@@ -613,6 +666,11 @@ impl GmHost {
         if req.method() != Method::POST {
             return forbidden();
         }
+        // Order matters: nothing is read from the body until the caller is a verified script
+        // with a free slot and the global byte budget has room.
+        if route != "xhr" && !JSON_ROUTES.contains(&route) {
+            return not_found();
+        }
         let h = req.headers().clone();
         if !same_origin_ok(&h, c.origin, true) {
             return forbidden();
@@ -633,21 +691,47 @@ impl GmHost {
                 .to_json(),
             );
         }
-        let cap = if is_xhr {
-            manager.gm().quotas().max_request_body + META_CAP + 4
-        } else {
-            JSON_CAP
-        };
-        if header(&h, "content-length")
-            .and_then(|v| v.parse::<usize>().ok())
-            .is_some_and(|n| n > cap)
-        {
+        let cap = if is_xhr { META_CAP + 4 } else { JSON_CAP };
+        let declared = header(&h, "content-length").and_then(|v| v.parse::<usize>().ok());
+        if !is_xhr && declared.is_some_and(|n| n > cap) {
             return gm_err(&GmError::new(
                 ErrorCode::QuotaExceeded,
                 "request body too large",
             ));
         }
-        let body = match Limited::new(req.into_body(), cap).collect().await {
+        let Some(tok) = header(&h, "x-gm-token") else {
+            return gm_err(&GmError::new(ErrorCode::Unauthorized, "missing token"));
+        };
+        let a = match self.authenticate(manager, c, tok) {
+            Ok(a) => a,
+            Err(e) => return gm_err(&e),
+        };
+        let quota = || {
+            gm_json(
+                429,
+                GmError::new(ErrorCode::QuotaExceeded, "too many concurrent requests").to_json(),
+            )
+        };
+        if is_xhr {
+            // The xhr slot is taken here and held until the response has been streamed.
+            let Some(permit) = self.permit(&a.id, Kind::Xhr) else {
+                return quota();
+            };
+            let Some(bytes) = self.reserve(XHR_RESERVE) else {
+                return quota();
+            };
+            return self
+                .xhr(manager, c, up, &h, a, req.into_body(), (permit, bytes))
+                .await;
+        }
+        let Some(_permit) = self.permit(&a.id, Kind::Json) else {
+            return quota();
+        };
+        let Some(_bytes) = self.reserve(declared.unwrap_or(JSON_CAP).min(JSON_CAP)) else {
+            return quota();
+        };
+        let limit = declared.unwrap_or(JSON_CAP).min(JSON_CAP);
+        let body = match Limited::new(req.into_body(), limit).collect().await {
             Ok(b) => b.to_bytes(),
             Err(e)
                 if e.downcast_ref::<http_body_util::LengthLimitError>()
@@ -660,12 +744,17 @@ impl GmHost {
             }
             Err(_) => return gm_err(&GmError::new(ErrorCode::BadRequest, "body read failed")),
         };
-        let tok = header(&h, "x-gm-token");
-        if is_xhr {
-            return self.xhr(manager, c, up, &h, tok, body).await;
+        match self.json_run(manager, &a, route, &body) {
+            Ok(v) => gm_json(200, json!({"ok": true, "result": v})),
+            Err(e) => gm_err(&e),
         }
-        let (status, v) = self.json_call(manager, c, route, tok, &body);
-        gm_json(status, v)
+    }
+
+    /// Reserve `n` bytes of the global request-body budget (released on drop).
+    fn reserve(&self, n: usize) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.budget)
+            .try_acquire_many_owned(n as u32)
+            .ok()
     }
 
     fn resource(
@@ -677,18 +766,16 @@ impl GmHost {
         if !same_origin_ok(req.headers(), c.origin, false) {
             return forbidden();
         }
+        // The token is accepted from the header only: a URL would show up in the page's
+        // `performance` entries.
         let q = req.uri().query().unwrap_or("");
-        let (mut name, mut tok) = (None, None);
+        let mut name = None;
         for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
-            match &*k {
-                "name" => name = Some(v.into_owned()),
-                "t" => tok = Some(v.into_owned()),
-                _ => {}
+            if &*k == "name" {
+                name = Some(v.into_owned());
             }
         }
-        let tok = header(req.headers(), "x-gm-token")
-            .map(str::to_string)
-            .or(tok);
+        let tok = header(req.headers(), "x-gm-token").map(str::to_string);
         let res: GmResult<(String, Vec<u8>)> = (|| {
             let tok = tok.ok_or_else(|| GmError::new(ErrorCode::Unauthorized, "missing token"))?;
             let name = name.ok_or_else(|| GmError::new(ErrorCode::BadRequest, "missing name"))?;
@@ -721,67 +808,188 @@ impl GmHost {
         }
     }
 
-    fn permit(self: &Arc<Self>, script: &str) -> Option<Permit> {
+    fn permit(self: &Arc<Self>, script: &str, kind: Kind) -> Option<Permit> {
         let mut l = self.limits.lock();
-        let n = l.per_script.get(script).copied().unwrap_or(0);
-        if n >= MAX_XHR_PER_SCRIPT || l.profile >= MAX_XHR_PER_PROFILE {
+        let (c, per, all) = match kind {
+            Kind::Xhr => (&mut l.xhr, MAX_XHR_PER_SCRIPT, MAX_XHR_PER_PROFILE),
+            Kind::Json => (&mut l.json, MAX_JSON_PER_SCRIPT, MAX_JSON_PER_PROFILE),
+        };
+        let n = c.per_script.get(script).copied().unwrap_or(0);
+        if n >= per || c.profile >= all {
             return None;
         }
-        l.profile += 1;
-        *l.per_script.entry(script.to_string()).or_insert(0) += 1;
+        c.profile += 1;
+        *c.per_script.entry(script.to_string()).or_insert(0) += 1;
         Some(Permit {
             host: Arc::clone(self),
             script: script.to_string(),
+            kind,
         })
     }
 
     // ---- xmlhttpRequest / download ----------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn xhr(
         self: &Arc<Self>,
         manager: &Arc<UserscriptManager>,
         c: &Caller<'_>,
         up: &Upstream<'_>,
         req_headers: &HeaderMap,
-        tok: Option<&str>,
-        body: Bytes,
+        a: Authed,
+        mut body: Incoming,
+        held: Held,
     ) -> Response<ProxyBody> {
-        // Everything up to the first byte upstream answers with the JSON envelope.
-        let pre = || -> GmResult<(Authed, userscript_engine::backend::OutboundRequest)> {
-            let tok = tok.ok_or_else(|| GmError::new(ErrorCode::Unauthorized, "missing token"))?;
-            let a = self.authenticate(manager, c, tok)?;
-            if body.len() < 4 {
-                return Err(GmError::new(ErrorCode::BadRequest, "short frame"));
+        let _ = c;
+        let max = manager.gm().quotas().max_request_body;
+        if header(req_headers, "content-length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > max + META_CAP + 4)
+        {
+            return gm_err(&GmError::new(
+                ErrorCode::QuotaExceeded,
+                "request body too large",
+            ));
+        }
+        // Head: 4-byte meta length, the meta block; whatever follows in the same frames is the
+        // start of the upload.
+        let mut buf: Vec<u8> = Vec::new();
+        let head = loop {
+            if buf.len() >= 4 {
+                let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if n > META_CAP {
+                    return gm_err(&GmError::new(ErrorCode::BadRequest, "bad frame length"));
+                }
+                if buf.len() >= 4 + n {
+                    break 4 + n;
+                }
             }
-            let meta_len = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) as usize;
-            if meta_len > META_CAP || body.len() < 4 + meta_len {
-                return Err(GmError::new(ErrorCode::BadRequest, "bad frame length"));
+            match tokio::time::timeout(BODY_IDLE, body.frame()).await {
+                Ok(Some(Ok(f))) => {
+                    if let Ok(d) = f.into_data() {
+                        buf.extend_from_slice(&d);
+                    }
+                }
+                Ok(None) => {
+                    return gm_err(&GmError::new(ErrorCode::BadRequest, "short frame"));
+                }
+                _ => return gm_err(&GmError::new(ErrorCode::BadRequest, "body read failed")),
             }
-            let meta: XhrRequest = serde_json::from_slice(&body[4..4 + meta_len])
-                .map_err(|e| GmError::new(ErrorCode::BadRequest, format!("bad meta: {e}")))?;
-            let out =
-                manager
-                    .gm()
-                    .build_outbound(&a.ctx(), &meta, body[4 + meta_len..].to_vec())?;
-            Ok((a, out))
         };
-        let (a, out) = match pre() {
-            Ok(x) => x,
+        let meta: XhrRequest = match serde_json::from_slice(&buf[4..head]) {
+            Ok(m) => m,
+            Err(e) => {
+                return gm_err(&GmError::new(
+                    ErrorCode::BadRequest,
+                    format!("bad meta: {e}"),
+                ))
+            }
+        };
+        let prefix = buf.split_off(head);
+        drop(buf);
+        let mut out = match manager.gm().build_outbound(&a.ctx(), &meta, prefix.clone()) {
+            Ok(o) => o,
             Err(e) => return gm_err(&e),
         };
         // A literal address the destination policy refuses never gets dialled.
         if let Err(e) = check_dest(up, &out.url) {
             return gm_err(&e);
         }
-        let Some(permit) = self.permit(&a.id) else {
-            return gm_json(
-                429,
-                GmError::new(ErrorCode::QuotaExceeded, "too many concurrent requests").to_json(),
-            );
-        };
+        let mut upload = None;
+        if matches!(out.method.as_str(), "GET" | "HEAD") {
+            // No body allowed: anything after the head is an error.
+            loop {
+                match tokio::time::timeout(BODY_IDLE, body.frame()).await {
+                    Ok(None) => break,
+                    Ok(Some(Ok(f))) => {
+                        if f.into_data().is_ok_and(|d| !d.is_empty()) {
+                            return gm_err(&GmError::new(
+                                ErrorCode::BadRequest,
+                                "GET/HEAD requests cannot have a body",
+                            ));
+                        }
+                    }
+                    _ => return gm_err(&GmError::new(ErrorCode::BadRequest, "body read failed")),
+                }
+            }
+        } else {
+            out.body.clear();
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+            let exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&exceeded);
+            tokio::spawn(pump_upload(body, prefix, max, tx, flag));
+            let len = header(req_headers, "content-length")
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|n| n.saturating_sub(head));
+            upload = Some(Upload { rx, len, exceeded });
+        }
         let default_ua = header(req_headers, "user-agent").map(str::to_string);
-        run_outbound(manager.clone(), a, out, up, default_ua, permit).await
+        run_outbound(manager.clone(), a, out, up, default_ua, held, upload).await
     }
+}
+
+/// An in-flight, bounded upload for the first hop.
+struct Upload {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    len: Option<usize>,
+    exceeded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Move the request body to upstream through a two-slot channel, enforcing the size quota and
+/// an idle timeout. Dropping `tx` ends the upload; an `Err` aborts it.
+async fn pump_upload(
+    mut body: Incoming,
+    prefix: Vec<u8>,
+    max: usize,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    exceeded: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut total = 0usize;
+    let mut send = |chunk: Bytes| {
+        total += chunk.len();
+        (total > max, chunk)
+    };
+    if !prefix.is_empty() {
+        let (over, chunk) = send(Bytes::from(prefix));
+        if over || tx.send(Ok(chunk)).await.is_err() {
+            exceeded.store(over, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+    }
+    loop {
+        match tokio::time::timeout(BODY_IDLE, body.frame()).await {
+            Ok(None) => return,
+            Ok(Some(Ok(f))) => {
+                let Ok(d) = f.into_data() else { continue };
+                if d.is_empty() {
+                    continue;
+                }
+                let (over, chunk) = send(d);
+                if over {
+                    exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = tx
+                        .send(Err(std::io::Error::other("request body too large")))
+                        .await;
+                    return;
+                }
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return;
+                }
+            }
+            _ => {
+                let _ = tx
+                    .send(Err(std::io::Error::other("request body read failed")))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
+fn tokio_stream_from(
+    mut rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
 
 fn not_found() -> Response<ProxyBody> {
@@ -813,11 +1021,13 @@ async fn run_outbound(
     first: userscript_engine::backend::OutboundRequest,
     up: &Upstream<'_>,
     default_ua: Option<String>,
-    permit: Permit,
+    permit: Held,
+    mut upload: Option<Upload>,
 ) -> Response<ProxyBody> {
     let deadline = tokio::time::Instant::now() + first.timeout;
     let mut cur = first;
     let mut redirected = false;
+    let mut exceeded: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     let resp = loop {
         if let Err(e) = check_dest(up, &cur.url) {
             return single_error_frame("denied", "connect_denied", &e.message);
@@ -879,7 +1089,16 @@ async fn run_outbound(
         if let Some(c) = cookie {
             rb = rb.header("cookie", c);
         }
-        if !cur.body.is_empty() {
+        let mut streamed = false;
+        if let Some(u) = upload.take() {
+            if let Some(n) = u.len {
+                rb = rb.header("content-length", n);
+            }
+            let stream = tokio_stream_from(u.rx);
+            rb = rb.body(reqwest::Body::wrap_stream(stream));
+            exceeded = Some(u.exceeded);
+            streamed = true;
+        } else if !cur.body.is_empty() {
             rb = rb.body(cur.body.clone());
         }
         let sent = tokio::time::timeout_at(deadline, rb.send()).await;
@@ -892,11 +1111,28 @@ async fn run_outbound(
                     "destination refused by the proxy's policy",
                 )
             }
+            Ok(Err(_))
+                if exceeded
+                    .as_ref()
+                    .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)) =>
+            {
+                return single_error_frame("denied", "quota_exceeded", "request body too large")
+            }
             Ok(Err(e)) => {
                 return single_error_frame("network", "network", &format!("upstream error: {e}"))
             }
             Ok(Ok(r)) => r,
         };
+        if streamed
+            && matches!(resp.status().as_u16(), 307 | 308)
+            && cur.redirect == Redirect::Follow
+        {
+            return single_error_frame(
+                "network",
+                "redirect",
+                "a redirect that must resend a streamed request body is refused",
+            );
+        }
         if cur.use_cookie_jar {
             let sc: Vec<&str> = resp
                 .headers()
