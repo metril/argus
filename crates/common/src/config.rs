@@ -544,12 +544,8 @@ fn raise_nofile_limit_once() -> Option<u64> {
         // stays as it was and is what gets budgeted.
     }
     #[allow(clippy::unnecessary_cast)] // rlim_t differs per platform
-    let cur = lim.rlim_cur as u64;
-    Some(if cur == libc::RLIM_INFINITY as u64 {
-        u64::MAX
-    } else {
-        cur
-    })
+    let (cur, infinity) = (lim.rlim_cur as u64, libc::RLIM_INFINITY as u64);
+    Some(if cur == infinity { u64::MAX } else { cur })
 }
 
 #[cfg(not(unix))]
@@ -594,7 +590,9 @@ mod tests {
         // SAFETY: getrlimit writes into the provided struct.
         assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) }, 0);
         // Either the soft limit equals the hard one, or raising was refused and it is unchanged.
-        assert!(now >= lim.rlim_cur as u64 || now == u64::MAX);
+        #[allow(clippy::unnecessary_cast)] // rlim_t differs per platform
+        let soft = lim.rlim_cur as u64;
+        assert!(now >= soft || now == u64::MAX);
     }
 
     #[test]
