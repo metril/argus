@@ -1,16 +1,17 @@
-//! Userscript storage using sled database
+//! Userscript storage (GM_setValue/GM_getValue) on the shared redb database
 //!
 //! Provides persistent storage for userscript data (GM_setValue/GM_getValue)
 
 use crate::{Error, Result};
+use common::db::redb::{Durability, ReadableTable, WriteTransaction};
+use common::db::{tables, Db, DbError};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sled::Db;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Storage value that can be any JSON-serializable type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,161 +70,156 @@ impl From<StorageValue> for Value {
     }
 }
 
+fn db_err(e: impl Into<DbError>) -> Error {
+    Error::Storage(e.into().to_string())
+}
+
 /// Userscript storage manager
+///
+/// Writes are queued to the database's coalescing writer (no fsync, off the calling thread);
+/// an in-memory cache keeps reads consistent with queued writes.
 pub struct UserscriptStorage {
-    /// Sled database
     db: Arc<Db>,
     /// In-memory cache for performance
     cache: Arc<RwLock<HashMap<String, StorageValue>>>,
 }
 
 impl UserscriptStorage {
-    /// Create a new storage instance
+    /// Open the shared database in `data_dir`.
     pub fn new(data_dir: PathBuf) -> Result<Self> {
-        let db_path = data_dir.join("userscript-storage");
-        let db = sled::open(&db_path).map_err(|e| {
-            Error::Storage(format!("Failed to open database at {:?}: {}", db_path, e))
-        })?;
+        let db = Db::open(&data_dir)
+            .map_err(|e| Error::Storage(format!("Failed to open database at {data_dir:?}: {e}")))?;
+        Ok(Self::with_db(db))
+    }
 
-        debug!("Opened userscript storage database at {:?}", db_path);
-
-        Ok(Self {
-            db: Arc::new(db),
+    /// Use an already-open shared database.
+    pub fn with_db(db: Arc<Db>) -> Self {
+        debug!("Userscript storage on {:?}", db.dir());
+        Self {
+            db,
             cache: Arc::new(RwLock::new(HashMap::new())),
-        })
+        }
     }
 
     /// Generate storage key for a script and value name
     fn make_key(script_id: &str, name: &str) -> String {
-        format!("{}:{}", script_id, name)
+        format!("{script_id}\0{name}")
     }
 
     /// Get a value from storage
     pub fn get_value(&self, script_id: &str, name: &str) -> Result<Option<StorageValue>> {
         let key = Self::make_key(script_id, name);
 
-        // Check cache first
-        {
-            let cache = self.cache.read();
-            if let Some(value) = cache.get(&key) {
-                return Ok(Some(value.clone()));
-            }
+        if let Some(value) = self.cache.read().get(&key) {
+            return Ok(Some(value.clone()));
         }
 
-        // Fetch from database
-        match self.db.get(&key) {
-            Ok(Some(bytes)) => {
+        let bytes = self.db.read(|r| {
+            let t = r.open_table(tables::GM_VALUES).map_err(db_err)?;
+            let v = t
+                .get(key.as_str())
+                .map_err(db_err)?
+                .map(|g| g.value().to_vec());
+            Ok::<_, Error>(v)
+        })?;
+        match bytes {
+            Some(bytes) => {
                 let value: StorageValue = serde_json::from_slice(&bytes).map_err(|e| {
-                    Error::Storage(format!("Failed to deserialize value for {}: {}", key, e))
+                    Error::Storage(format!("Failed to deserialize value for {key}: {e}"))
                 })?;
-
-                // Update cache
                 self.cache.write().insert(key, value.clone());
-
                 Ok(Some(value))
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(Error::Storage(format!(
-                "Failed to get value for {}: {}",
-                key, e
-            ))),
+            None => Ok(None),
         }
     }
 
-    /// Set a value in storage
+    /// Set a value in storage (queued; visible to reads immediately).
     pub fn set_value(&self, script_id: &str, name: &str, value: StorageValue) -> Result<()> {
         let key = Self::make_key(script_id, name);
-
-        // Serialize value
         let bytes = serde_json::to_vec(&value)
-            .map_err(|e| Error::Storage(format!("Failed to serialize value for {}: {}", key, e)))?;
-
-        // Write to database
-        self.db
-            .insert(&key, bytes)
-            .map_err(|e| Error::Storage(format!("Failed to set value for {}: {}", key, e)))?;
-
-        // Update cache
-        self.cache.write().insert(key, value);
-
-        // Flush to disk
-        self.db.flush().ok();
-
+            .map_err(|e| Error::Storage(format!("Failed to serialize value for {key}: {e}")))?;
+        self.cache.write().insert(key.clone(), value);
+        self.db.defer(move |t| {
+            t.open_table(tables::GM_VALUES)?
+                .insert(key.as_str(), bytes.as_slice())?;
+            Ok(())
+        });
         Ok(())
     }
 
     /// Delete a value from storage
     pub fn delete_value(&self, script_id: &str, name: &str) -> Result<()> {
         let key = Self::make_key(script_id, name);
-
-        // Remove from database
-        self.db
-            .remove(&key)
-            .map_err(|e| Error::Storage(format!("Failed to delete value for {}: {}", key, e)))?;
-
-        // Remove from cache
+        // Queued sets must land before the delete, or they would resurrect the value.
+        self.db.flush_deferred();
+        self.db.write(Durability::Eventual, |t| {
+            t.open_table(tables::GM_VALUES)
+                .map_err(db_err)?
+                .remove(key.as_str())
+                .map_err(db_err)?;
+            Ok::<_, Error>(())
+        })?;
         self.cache.write().remove(&key);
-
         Ok(())
     }
 
     /// List all value names for a script
     pub fn list_values(&self, script_id: &str) -> Result<Vec<String>> {
-        let prefix = format!("{}:", script_id);
-        let mut names = Vec::new();
-
-        for item in self.db.scan_prefix(&prefix) {
-            match item {
-                Ok((key_bytes, _)) => {
-                    if let Ok(key) = std::str::from_utf8(&key_bytes) {
-                        if let Some(name) = key.strip_prefix(&prefix) {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Error scanning storage: {}", e);
+        self.db.flush_deferred();
+        let (lo, hi) = (format!("{script_id}\0"), format!("{script_id}\u{1}"));
+        self.db.read(|r| {
+            let t = r.open_table(tables::GM_VALUES).map_err(db_err)?;
+            let mut names = Vec::new();
+            for item in t.range(lo.as_str()..hi.as_str()).map_err(db_err)? {
+                let (k, _) = item.map_err(db_err)?;
+                if let Some(name) = k.value().strip_prefix(lo.as_str()) {
+                    names.push(name.to_string());
                 }
             }
-        }
+            Ok::<_, Error>(names)
+        })
+    }
 
-        Ok(names)
+    /// Remove every value of `script_id` inside an existing transaction.
+    pub(crate) fn clear_in_txn(txn: &WriteTransaction, script_id: &str) -> Result<()> {
+        let (lo, hi) = (format!("{script_id}\0"), format!("{script_id}\u{1}"));
+        let mut t = txn.open_table(tables::GM_VALUES).map_err(db_err)?;
+        let keys: Vec<String> = t
+            .range(lo.as_str()..hi.as_str())
+            .map_err(db_err)?
+            .map(|i| i.map(|(k, _)| k.value().to_string()))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(db_err)?;
+        for k in keys {
+            t.remove(k.as_str()).map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// Forget cached values of a script.
+    pub(crate) fn drop_cache(&self, script_id: &str) {
+        let prefix = format!("{script_id}\0");
+        self.cache.write().retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Clear all values for a script
     pub fn clear_script_storage(&self, script_id: &str) -> Result<()> {
-        let prefix = format!("{}:", script_id);
-        let mut batch = sled::Batch::default();
-
-        // Collect keys to delete
-        for (key, _) in self.db.scan_prefix(&prefix).flatten() {
-            batch.remove(key);
-        }
-
-        // Apply batch deletion
+        self.db.flush_deferred();
         self.db
-            .apply_batch(batch)
-            .map_err(|e| Error::Storage(format!("Failed to clear storage: {}", e)))?;
-
-        // Clear from cache
-        let mut cache = self.cache.write();
-        cache.retain(|k, _| !k.starts_with(&prefix));
-
+            .write(Durability::Eventual, |t| Self::clear_in_txn(t, script_id))?;
+        self.drop_cache(script_id);
         Ok(())
     }
 
     /// Get database size in bytes
     pub fn size_on_disk(&self) -> Result<u64> {
-        self.db
-            .size_on_disk()
-            .map_err(|e| Error::Storage(format!("Failed to get database size: {}", e)))
+        Ok(self.db.file_size())
     }
 
-    /// Flush all pending writes to disk
+    /// Wait for queued writes to be committed.
     pub fn flush(&self) -> Result<()> {
-        self.db
-            .flush()
-            .map_err(|e| Error::Storage(format!("Failed to flush database: {}", e)))?;
+        self.db.flush_deferred();
         Ok(())
     }
 }
@@ -358,5 +354,35 @@ mod tests {
 
         assert!(matches!(value1, Some(StorageValue::Number(n)) if n == 100.0));
         assert_eq!(value1, value2);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn values_survive_reopen_and_delete_sticks() {
+        let dir = tempdir().unwrap();
+        {
+            let s = UserscriptStorage::new(dir.path().to_path_buf()).unwrap();
+            s.set_value("s", "keep", StorageValue::Number(1.0)).unwrap();
+            s.set_value("s", "gone", StorageValue::Bool(true)).unwrap();
+            s.delete_value("s", "gone").unwrap();
+            s.set_value("t", "other", StorageValue::Null).unwrap();
+        }
+        let s = UserscriptStorage::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            s.get_value("s", "keep").unwrap(),
+            Some(StorageValue::Number(1.0))
+        );
+        assert_eq!(s.get_value("s", "gone").unwrap(), None);
+        assert_eq!(s.list_values("s").unwrap(), vec!["keep".to_string()]);
+        // Prefix ids do not leak into each other.
+        s.set_value("s2", "x", StorageValue::Null).unwrap();
+        s.clear_script_storage("s").unwrap();
+        assert_eq!(s.get_value("s2", "x").unwrap(), Some(StorageValue::Null));
+        assert!(s.list_values("s").unwrap().is_empty());
     }
 }

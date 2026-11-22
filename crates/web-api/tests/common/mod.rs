@@ -38,6 +38,8 @@ impl TestContext {
         let mut api_config = ApiConfig::default();
         api_config.auth.jwt_secret_path = temp_path.join("jwt_secret");
         api_config.session.storage_path = temp_path.join("sessions");
+        // Tests hash many passwords in an unoptimised build: use bcrypt's minimum cost explicitly.
+        api_config.auth.bcrypt_cost = 4;
         tweak(&mut api_config);
 
         let proxy_config = ProxyConfig::default();

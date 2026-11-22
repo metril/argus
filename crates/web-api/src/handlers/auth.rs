@@ -27,7 +27,7 @@ use crate::auth::password::{hash_password, validate_password_strength, verify_pa
 use crate::auth::session::{RotateOutcome, SessionData};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::middleware::ClientInfo;
-use crate::state::AppState;
+use crate::state::{blocking, AppState};
 
 fn cookie_string(
     name: &'static str,
@@ -52,8 +52,8 @@ fn set_cookie(headers: &mut HeaderMap, value: String) {
 }
 
 /// Run bcrypt off the async executor threads.
-async fn hash_blocking(password: String) -> ApiResult<String> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
+async fn hash_blocking(password: String, cost: u32) -> ApiResult<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password, cost))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
 }
@@ -80,11 +80,21 @@ fn start_session(
         client.ip,
         client.user_agent.clone(),
         tokens.refresh_expires_in,
-    );
+    )?;
     Ok((
         session_cookies(state, &tokens, &sid),
         tokens.access_expires_in,
     ))
+}
+
+/// [`start_session`] on the blocking pool (the session is committed to disk).
+async fn start_session_blocking(
+    state: &Arc<AppState>,
+    user: User,
+    client: ClientInfo,
+) -> ApiResult<(HeaderMap, u64)> {
+    let st = state.clone();
+    blocking(move || start_session(&st, &user, &client)).await
 }
 
 fn session_cookies(state: &AppState, t: &crate::auth::TokenPair, sid: &Uuid) -> HeaderMap {
@@ -162,24 +172,29 @@ pub async fn register(
 ) -> ApiResult<Authed> {
     req.validate()?;
     validate_password_strength(&req.password)?;
-    let hash = hash_blocking(req.password.clone()).await?;
+    let hash = hash_blocking(req.password.clone(), state.api_config.auth.bcrypt_cost).await?;
 
     let user = {
-        let _g = state.session_store.admin_lock.lock();
-        if !state.session_store.get_all_users()?.is_empty() {
-            return Err(ApiError::coded(
-                StatusCode::FORBIDDEN,
-                "registration_closed",
-                "Registration is closed; ask an administrator to create your account",
-            ));
-        }
-        let user = User::new(req.username.clone(), hash, UserRole::Admin);
-        state.session_store.store_user(&user)?;
-        user
+        let st = state.clone();
+        let username = req.username.clone();
+        blocking(move || {
+            let _g = st.session_store.admin_lock.lock();
+            if !st.session_store.get_all_users()?.is_empty() {
+                return Err(ApiError::coded(
+                    StatusCode::FORBIDDEN,
+                    "registration_closed",
+                    "Registration is closed; ask an administrator to create your account",
+                ));
+            }
+            let user = User::new(username, hash, UserRole::Admin);
+            st.session_store.store_user(&user)?;
+            Ok(user)
+        })
+        .await?
     };
     info!("First user registered as admin: {}", user.username);
 
-    let (headers, expires_in) = start_session(&state, &user, &client)?;
+    let (headers, expires_in) = start_session_blocking(&state, user.clone(), client).await?;
     Ok((
         Extension(AuditActor {
             id: Some(user.id.to_string()),
@@ -222,7 +237,7 @@ pub async fn login(
     if !user.enabled {
         return Err(ApiError::AuthenticationFailed("Account is disabled".into()));
     }
-    let (headers, expires_in) = start_session(&state, &user, &client)?;
+    let (headers, expires_in) = start_session_blocking(&state, user.clone(), client).await?;
     state.session_store.update_last_login(&user.id)?;
     info!("User logged in: {}", user.username);
     Ok((
@@ -263,10 +278,12 @@ pub async fn refresh(
         .ok_or_else(|| ApiError::AuthenticationFailed("Account is disabled or deleted".into()))?;
 
     let tokens = generate_token_pair(&user.id, &user.username, user.role, &sid, &state.jwt_config)?;
-    match state
-        .session_manager
-        .rotate(&sid, &claims.jti, tokens.refresh_jti.clone())
-    {
+    let outcome = {
+        let st = state.clone();
+        let (jti, new_jti) = (claims.jti.clone(), tokens.refresh_jti.clone());
+        blocking(move || st.session_manager.rotate(&sid, &jti, new_jti)).await?
+    };
+    match outcome {
         RotateOutcome::Rotated => {}
         RotateOutcome::Reused => {
             warn!(
@@ -302,7 +319,8 @@ pub async fn logout(
             "Logout applies to cookie sessions; revoke API tokens via DELETE /tokens/{id}",
         )
     })?;
-    state.session_manager.revoke_session(&sid);
+    let st = state.clone();
+    blocking(move || st.session_manager.revoke_session(&sid)).await?;
     Ok((expired_cookies(), msg("Logged out successfully")))
 }
 
@@ -350,12 +368,15 @@ pub async fn change_password(
             "Current password is incorrect",
         ));
     }
-    user.password_hash = hash_blocking(req.new_password).await?;
-    state.session_store.store_user(&user)?;
+    user.password_hash = hash_blocking(req.new_password, state.api_config.auth.bcrypt_cost).await?;
     let sid = p.session_id();
-    state
-        .session_manager
-        .revoke_user_sessions(&user.id, sid.as_ref());
+    let st = state.clone();
+    blocking(move || {
+        st.session_store.store_user(&user)?;
+        st.session_manager
+            .revoke_user_sessions(&user.id, sid.as_ref())
+    })
+    .await?;
     Ok(msg("Password changed; other sessions were signed out"))
 }
 
@@ -409,7 +430,8 @@ pub async fn revoke_session(
     let sid = parse_uuid(&id)?;
     match state.session_manager.get_session(&sid) {
         Some(s) if s.user_id == p.user_id => {
-            state.session_manager.revoke_session(&sid);
+            let st = state.clone();
+            blocking(move || st.session_manager.revoke_session(&sid)).await?;
             Ok(msg("Session revoked"))
         }
         _ => Err(ApiError::NotFound("Session not found".into())),
@@ -460,7 +482,9 @@ pub async fn admin_revoke_session(
     State(state): State<Arc<AppState>>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<axum::Json<MessageResponse>> {
-    if state.session_manager.revoke_session(&parse_uuid(&id)?) {
+    let sid = parse_uuid(&id)?;
+    let st = state.clone();
+    if blocking(move || st.session_manager.revoke_session(&sid)).await? {
         Ok(msg("Session revoked"))
     } else {
         Err(ApiError::NotFound("Session not found".into()))

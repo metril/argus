@@ -17,7 +17,7 @@ use validator::Validate;
 use super::{check_if_match, etag_of};
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiResult};
-use crate::state::AppState;
+use crate::state::{blocking, AppState};
 
 type WithEtag<T> = ([(axum::http::HeaderName, String); 1], Json<T>);
 
@@ -62,7 +62,8 @@ pub async fn update_custom_rules(
     req.validate()?;
     let current = state.filter_store.get_custom_rules()?;
     check_if_match(&headers, &etag_of(current.as_bytes()))?;
-    state.filter_store.set_custom_rules(&req.rules)?;
+    let (st, rules) = (state.clone(), req.rules.clone());
+    blocking(move || Ok(st.filter_store.set_custom_rules(&rules)?)).await?;
     info!("Custom filter rules updated by {}", p.username);
     state.list_service.trigger();
     Ok(rules_response(req.rules))

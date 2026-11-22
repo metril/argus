@@ -11,8 +11,8 @@ license.workspace = true
 tokio = { workspace = true }
 
 
-# Database
-sled = { workspace = true }
+# Database (shared redb handle lives in `common`)
+common = { path = "../common" }
 
 # HTTP client
 reqwest = { workspace = true }

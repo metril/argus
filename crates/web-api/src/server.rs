@@ -142,7 +142,12 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            sessions.purge_expired();
+            let s = sessions.clone();
+            match tokio::task::spawn_blocking(move || s.purge_expired()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!("session purge failed: {e}"),
+                Err(e) => tracing::warn!("session purge task failed: {e}"),
+            }
         }
     });
 

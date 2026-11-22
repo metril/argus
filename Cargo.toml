@@ -88,7 +88,7 @@ moka = { version = "0.12", features = ["sync", "future"] }
 arc-swap = "1.7"
 
 # Database
-sled = "0.34"
+redb = "2.6"
 
 # Adblocking
 # No `single-thread`: makes `adblock::Engine` Send + Sync so one Arc<Engine> is shared by all workers.

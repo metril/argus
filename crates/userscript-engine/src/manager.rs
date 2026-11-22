@@ -1,8 +1,9 @@
 //! Userscript manager for handling multiple scripts
 
 use crate::{script::Userscript, storage::UserscriptStorage, Error, Result};
+use common::db::redb::{Durability, ReadableTable};
+use common::db::{tables, Db, DbError};
 use parking_lot::RwLock;
-use serde_json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,8 +15,8 @@ pub struct UserscriptManager {
     scripts: Arc<RwLock<HashMap<String, Userscript>>>,
     /// Storage for script data
     storage: Arc<UserscriptStorage>,
-    /// Data directory
-    data_dir: PathBuf,
+    /// Shared database (userscripts and GM values)
+    db: Arc<Db>,
 }
 
 impl UserscriptManager {
@@ -29,12 +30,13 @@ impl UserscriptManager {
         // Create data directory if it doesn't exist
         std::fs::create_dir_all(&data_dir)?;
 
-        let storage = Arc::new(UserscriptStorage::new(data_dir.clone())?);
+        let db = Db::open(&data_dir)?;
+        let storage = Arc::new(UserscriptStorage::with_db(db.clone()));
 
         Ok(Self {
             scripts: Arc::new(RwLock::new(HashMap::new())),
             storage,
-            data_dir,
+            db,
         })
     }
 
@@ -56,8 +58,8 @@ impl UserscriptManager {
             }
         }
 
-        // Save to disk
-        self.save_script(&script)?;
+        // Persist
+        self.save_script(&script, Durability::Immediate)?;
 
         // Add to in-memory collection
         self.scripts.write().insert(script_id.clone(), script);
@@ -77,8 +79,7 @@ impl UserscriptManager {
 
         script.update(new_source)?;
 
-        // Save to disk
-        self.save_script(script)?;
+        self.save_script(script, Durability::Immediate)?;
 
         Ok(())
     }
@@ -94,14 +95,16 @@ impl UserscriptManager {
             .remove(script_id)
             .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
 
-        // Remove script file
-        let script_path = self.get_script_path(script_id);
-        if script_path.exists() {
-            std::fs::remove_file(script_path)?;
-        }
-
-        // Clear script storage
-        self.storage.clear_script_storage(script_id)?;
+        // Remove the script and its stored values in one transaction.
+        self.storage.flush()?;
+        self.db.write::<_, Error>(Durability::Immediate, |t| {
+            t.open_table(tables::USERSCRIPTS)
+                .map_err(DbError::from)?
+                .remove(script_id)
+                .map_err(DbError::from)?;
+            UserscriptStorage::clear_in_txn(t, script_id)
+        })?;
+        self.storage.drop_cache(script_id);
 
         info!("Uninstalled userscript: {}", script.name());
 
@@ -144,8 +147,7 @@ impl UserscriptManager {
 
         script.enabled = enabled;
 
-        // Save to disk
-        self.save_script(script)?;
+        self.save_script(script, Durability::Immediate)?;
 
         Ok(())
     }
@@ -160,43 +162,36 @@ impl UserscriptManager {
 
         script.record_execution();
 
-        // Periodically save to disk (every 10 executions)
+        // Periodically persist (every 10 executions; no fsync, counters are best-effort)
         if script.execution_count % 10 == 0 {
-            self.save_script(script)?;
+            self.save_script(script, Durability::Eventual)?;
         }
 
         Ok(())
     }
 
-    /// Load all userscripts from disk
+    /// Load all userscripts from the database
     pub fn load_all(&self) -> Result<usize> {
-        info!("Loading userscripts from disk");
+        info!("Loading userscripts");
 
-        let scripts_dir = self.data_dir.join("scripts");
-        if !scripts_dir.exists() {
-            debug!("Scripts directory does not exist, creating");
-            std::fs::create_dir_all(&scripts_dir)?;
-            return Ok(0);
-        }
-
-        let mut count = 0;
-
-        for entry in std::fs::read_dir(&scripts_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                match self.load_script(&path) {
-                    Ok(script) => {
-                        debug!("Loaded userscript: {}", script.name());
-                        self.scripts.write().insert(script.id.clone(), script);
-                        count += 1;
-                    }
-                    Err(e) => {
-                        warn!("Failed to load script from {:?}: {}", path, e);
-                    }
+        let loaded: Vec<Userscript> = self.db.read(|r| {
+            let t = r.open_table(tables::USERSCRIPTS).map_err(DbError::from)?;
+            let mut out = Vec::new();
+            for item in t.iter().map_err(DbError::from)? {
+                let (k, v) = item.map_err(DbError::from)?;
+                match serde_json::from_slice::<Userscript>(v.value()) {
+                    Ok(s) => out.push(s),
+                    Err(e) => warn!("Failed to load script {}: {}", k.value(), e),
                 }
             }
+            Ok::<_, Error>(out)
+        })?;
+
+        let count = loaded.len();
+        let mut scripts = self.scripts.write();
+        for script in loaded {
+            debug!("Loaded userscript: {}", script.name());
+            scripts.insert(script.id.clone(), script);
         }
 
         info!("Loaded {} userscripts", count);
@@ -213,32 +208,16 @@ impl UserscriptManager {
         Arc::clone(&self.storage)
     }
 
-    /// Get path for a script file
-    fn get_script_path(&self, script_id: &str) -> PathBuf {
-        let safe_id = script_id.replace([':', '/', '\\'], "_");
-        self.data_dir
-            .join("scripts")
-            .join(format!("{}.json", safe_id))
-    }
-
-    /// Save a script to disk
-    fn save_script(&self, script: &Userscript) -> Result<()> {
-        let scripts_dir = self.data_dir.join("scripts");
-        std::fs::create_dir_all(&scripts_dir)?;
-
-        let path = self.get_script_path(&script.id);
-        let json = serde_json::to_string_pretty(script)?;
-        std::fs::write(&path, json)?;
-
-        debug!("Saved userscript to {:?}", path);
-        Ok(())
-    }
-
-    /// Load a script from disk
-    fn load_script(&self, path: &PathBuf) -> Result<Userscript> {
-        let json = std::fs::read_to_string(path)?;
-        let script: Userscript = serde_json::from_str(&json)?;
-        Ok(script)
+    /// Persist a script
+    fn save_script(&self, script: &Userscript, durability: Durability) -> Result<()> {
+        let json = serde_json::to_vec(script)?;
+        self.db.write::<_, Error>(durability, |t| {
+            t.open_table(tables::USERSCRIPTS)
+                .map_err(DbError::from)?
+                .insert(script.id.as_str(), json.as_slice())
+                .map_err(DbError::from)?;
+            Ok(())
+        })
     }
 
     /// Get statistics
@@ -334,7 +313,7 @@ console.log('test');
             // Create first manager and install script
             let manager = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
             script_id = manager.install(TEST_SCRIPT.to_string()).unwrap();
-            // manager is dropped here, releasing the sled lock
+            // manager is dropped here, closing the database
         }
 
         // Create new manager instance - now the lock is released
