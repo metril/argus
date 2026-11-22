@@ -547,21 +547,30 @@ impl reqwest::dns::Resolve for GuardedResolver {
 /// Maximum redirect hops a control-plane fetch follows.
 pub const MAX_FETCH_REDIRECTS: usize = 3;
 
-/// Redirect policy for control-plane fetches: a few hops, http/https only, no https to http
-/// downgrade, and IP-literal targets judged by `policy` (names are vetted by the resolver).
+/// Whether a control-plane fetch may follow a redirect to `next` after `previous` hops: a few
+/// hops, http/https only, no https to http downgrade (unless the fetch began on http), and
+/// IP-literal targets judged by `policy` (names are vetted by the resolver when connecting).
+pub fn redirect_verdict(
+    policy: &NetPolicy,
+    previous: &[url::Url],
+    next: &url::Url,
+) -> std::result::Result<(), String> {
+    if previous.len() >= MAX_FETCH_REDIRECTS {
+        return Err("too many redirects".into());
+    }
+    let began_https = previous.first().is_none_or(|u| u.scheme() == "https");
+    if next.scheme() == "http" && began_https {
+        return Err("redirect would downgrade https to http".into());
+    }
+    policy.check_url_literal(next).map_err(|e| e.to_string())
+}
+
+/// Redirect policy for control-plane fetches, see [`redirect_verdict`].
 pub fn control_plane_redirects(policy: Arc<NetPolicy>) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_FETCH_REDIRECTS {
-            return attempt.error("too many redirects");
-        }
-        let next = attempt.url();
-        let first_https = attempt.previous().first().is_none_or(|u| u.scheme() == "https");
-        if next.scheme() == "http" && first_https {
-            return attempt.error("redirect would downgrade https to http");
-        }
-        match policy.check_url_literal(next) {
+        match redirect_verdict(&policy, attempt.previous(), attempt.url()) {
             Ok(()) => attempt.follow(),
-            Err(e) => attempt.error(e.to_string()),
+            Err(e) => attempt.error(e),
         }
     })
 }
@@ -717,5 +726,79 @@ mod tests {
         assert!(p.resolve("localhost", 80, over).await.is_err());
         assert!(p.resolve("a.localhost", 80, over).await.is_err());
         assert!(p.resolve("203.0.113.9", 80, over).await.is_ok());
+    }
+
+    #[test]
+    fn control_plane_refuses_private_and_bracketed_ipv6_literals() {
+        let p = NetPolicy::control_plane(&[]).unwrap();
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        for bad in [
+            "http://[::1]/x",
+            "https://[::ffff:127.0.0.1]/x",
+            "https://[fd00::1]/x",
+            "https://[fe80::1]/x",
+            "http://127.0.0.1/x",
+            "http://10.1.2.3/x",
+            "http://192.168.0.1/x",
+            "http://100.64.0.1/x",
+            "http://169.254.169.254/x",
+            "http://[64:ff9b::a9fe:a9fe]/x",
+        ] {
+            assert!(
+                matches!(
+                    p.check_url_literal(&u(bad)),
+                    Err(UrlRefusal::Destination(_))
+                ),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            p.check_url_literal(&u("ftp://8.8.8.8/x")),
+            Err(UrlRefusal::Scheme)
+        );
+        assert_eq!(
+            p.check_url_literal(&u("file:///etc/passwd")),
+            Err(UrlRefusal::Scheme)
+        );
+        assert!(p.check_url_literal(&u("https://8.8.8.8/x")).is_ok());
+        assert!(p
+            .check_url_literal(&u("https://[2606:4700::1111]/x"))
+            .is_ok());
+        assert!(p.check_url_literal(&u("https://example.com/x")).is_ok());
+    }
+
+    #[test]
+    fn control_plane_allowlist_takes_cidrs_and_hosts() {
+        let p = NetPolicy::control_plane(&strs(&["192.168.1.0/24", "nas.lan"])).unwrap();
+        assert_eq!(p.check_ip(ip("192.168.1.5")), Ok(()));
+        assert_eq!(p.check_ip(ip("192.168.2.5")), Err(Refusal::Private));
+        // A listed host may resolve to private, but never to reserved, addresses.
+        assert_eq!(p.check_resolved("NAS.lan.", ip("10.0.0.9")), Ok(()));
+        assert_eq!(
+            p.check_resolved("other.lan", ip("10.0.0.9")),
+            Err(Refusal::Private)
+        );
+        assert_eq!(
+            p.check_resolved("nas.lan", ip("127.0.0.1")),
+            Err(Refusal::Reserved)
+        );
+        assert!(NetPolicy::control_plane(&strs(&["bad entry/x"])).is_err());
+    }
+
+    #[test]
+    fn redirects_are_bounded_checked_and_never_downgrade() {
+        let p = NetPolicy::control_plane(&[]).unwrap();
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let hop = u("https://a.example/");
+        assert!(redirect_verdict(&p, &[hop.clone()], &u("https://b.example/")).is_ok());
+        assert!(redirect_verdict(&p, &[hop.clone()], &u("http://b.example/")).is_err());
+        // A fetch that began on http may stay on http.
+        let h = u("http://a.example/");
+        assert!(redirect_verdict(&p, &[h.clone()], &u("http://b.example/")).is_ok());
+        assert!(redirect_verdict(&p, &[hop.clone()], &u("https://[::1]/")).is_err());
+        assert!(redirect_verdict(&p, &[hop.clone()], &u("https://169.254.169.254/")).is_err());
+        assert!(redirect_verdict(&p, &[hop.clone()], &u("ftp://b.example/")).is_err());
+        let many = vec![hop; MAX_FETCH_REDIRECTS];
+        assert!(redirect_verdict(&p, &many, &u("https://b.example/")).is_err());
     }
 }

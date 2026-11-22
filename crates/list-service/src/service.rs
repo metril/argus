@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use common::net_policy::{control_plane_client, is_refusal, NetPolicy};
 use filter_engine::{
     build_set, formats::find_includes, try_build_engine, FilterList, ListFormat, ListInput,
     ListReport, SharedEngine,
@@ -50,6 +51,10 @@ pub struct ListServiceConfig {
     /// default so ad-hoc services (tests) never write to a relative default directory;
     /// [`Self::from_adblock`] turns it on.
     pub persist_engine: bool,
+    /// Extra control-plane fetch destinations (CIDRs, IPs, host names) allowed although they are
+    /// private; loopback, link-local and other reserved addresses stay refused unless listed as
+    /// a CIDR/IP.
+    pub allowed_fetch_destinations: Vec<String>,
 }
 
 impl Default for ListServiceConfig {
@@ -66,6 +71,7 @@ impl Default for ListServiceConfig {
             scriptlet_retry_initial: Duration::from_secs(5),
             scriptlet_retry_max: Duration::from_secs(15 * 60),
             persist_engine: false,
+            allowed_fetch_destinations: Vec::new(),
         }
     }
 }
@@ -83,6 +89,7 @@ impl ListServiceConfig {
             fetch_timeout: Duration::from_secs(a.list_fetch_timeout_secs.max(1)),
             max_list_bytes: a.max_list_bytes,
             persist_engine: true,
+            allowed_fetch_destinations: a.allowed_fetch_destinations.clone(),
             ..Self::default()
         }
     }
@@ -112,6 +119,9 @@ pub struct ListService {
     store: Arc<ListStore>,
     pub(crate) engine: Arc<SharedEngine>,
     pub(crate) client: reqwest::Client,
+    /// Control-plane destination policy; `None` only for ad-hoc services built with
+    /// [`ListService::new`] (tests), which fetch from anywhere.
+    guard: Option<Arc<NetPolicy>>,
     flight: Mutex<Flight>,
     busy: watch::Sender<bool>,
     builds: AtomicU64,
@@ -149,11 +159,43 @@ impl Drop for FlightGuard {
     }
 }
 
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Render a request error, naming a policy refusal plainly.
+fn send_error(e: &reqwest::Error) -> String {
+    if is_refusal(e) {
+        "destination refused by the fetch policy (see adblock.allowed_fetch_destinations)".into()
+    } else {
+        // Include the cause (for example why a redirect was refused).
+        let mut out = e.to_string();
+        let mut cur = std::error::Error::source(e);
+        while let Some(c) = cur {
+            out.push_str(": ");
+            out.push_str(&c.to_string());
+            cur = c.source();
+        }
+        out
+    }
+}
+
 /// Read a response body, failing once it exceeds `cap` bytes.
 pub(crate) async fn read_capped(
     mut resp: reqwest::Response,
     cap: usize,
 ) -> std::result::Result<Vec<u8>, String> {
+    // Lists are fetched with `Accept-Encoding: identity`; a compressed reply would make the cap
+    // apply to the wrong bytes, so it is refused outright.
+    if resp
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err("compressed responses are not accepted".into());
+    }
     if resp.content_length().is_some_and(|n| n > cap as u64) {
         return Err(format!("response exceeds size cap of {cap} bytes"));
     }
@@ -191,6 +233,18 @@ impl ListService {
         engine: Arc<SharedEngine>,
         client: reqwest::Client,
     ) -> Arc<Self> {
+        Self::new_guarded(cfg, store, engine, client, None)
+    }
+
+    /// Like [`Self::new`] with a control-plane fetch policy applied to every URL (the client
+    /// should be built with [`common::net_policy::control_plane_client`] on the same policy).
+    pub fn new_guarded(
+        cfg: ListServiceConfig,
+        store: Arc<ListStore>,
+        engine: Arc<SharedEngine>,
+        client: reqwest::Client,
+        guard: Option<Arc<NetPolicy>>,
+    ) -> Arc<Self> {
         let schedule = watch::channel((cfg.auto_update, cfg.update_interval)).0;
         let summary = store.get_summary().unwrap_or_default();
         Arc::new(Self {
@@ -199,6 +253,7 @@ impl ListService {
             store,
             engine,
             client,
+            guard,
             flight: Mutex::new(Flight::default()),
             busy: watch::channel(false).0,
             builds: AtomicU64::new(0),
@@ -223,11 +278,20 @@ impl ListService {
     pub fn open(cfg: ListServiceConfig, engine: Arc<SharedEngine>) -> Result<Arc<Self>> {
         let store = ListStore::open(&cfg.data_dir)?;
         store.seed_defaults_if_empty()?;
-        let client = reqwest::Client::builder()
+        let guard = Arc::new(
+            NetPolicy::control_plane(&cfg.allowed_fetch_destinations)
+                .map_err(|e| Error::Other(e.to_string()))?,
+        );
+        let client = control_plane_client(guard.clone())
             .user_agent(concat!("AdBlocker/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::Other(format!("build list-download client: {e}")))?;
-        Ok(Self::new(cfg, store, engine, client))
+        Ok(Self::new_guarded(cfg, store, engine, client, Some(guard)))
+    }
+
+    /// The control-plane fetch policy (every list, include and resource URL is held to it).
+    pub fn fetch_policy(&self) -> Option<&Arc<NetPolicy>> {
+        self.guard.as_ref()
     }
 
     pub fn store(&self) -> &Arc<ListStore> {
@@ -584,6 +648,9 @@ impl ListService {
             summary.rejected += report.rejected;
             summary.ip_ranges += report.ip_ranges;
             summary.duplicates += report.duplicates;
+            let mut report = report.clone();
+            crate::report::sanitize_report(&mut report);
+            let report = &report;
             if let Err(e) = self.store.set_report(id, report) {
                 warn!("Failed to persist report for {id}: {e}");
             }
@@ -844,13 +911,16 @@ impl ListService {
         }
         let base = reqwest::Url::parse(&list.url).ok();
         let mut pending = find_includes(content);
+        // All includes of one list together may not exceed the per-list size cap.
+        let mut budget = self.cfg.max_list_bytes;
         while let Some(path) = pending.pop() {
             if map.len() >= MAX_INCLUDES || map.contains_key(&path) {
                 continue;
             }
             let fetched = if fetch {
-                match self.fetch_include(base.as_ref(), &path).await {
+                match self.fetch_include(base.as_ref(), &path, budget).await {
                     Ok(t) => {
+                        budget = budget.saturating_sub(t.len());
                         let _ = self.store.put_include(&list.id, &path, &t);
                         Some(t)
                     }
@@ -878,34 +948,72 @@ impl ListService {
         &self,
         base: Option<&reqwest::Url>,
         path: &str,
+        budget: usize,
     ) -> std::result::Result<String, String> {
         let base = base.ok_or("list URL is not absolute")?;
         let url = base.join(path).map_err(|e| e.to_string())?;
         // Includes may only come from the list's own origin.
-        if url.scheme() != base.scheme()
-            || url.host_str() != base.host_str()
-            || url.port_or_known_default() != base.port_or_known_default()
-        {
+        if !same_origin(&url, base) {
             return Err("include is on a different origin".into());
         }
-        self.get_text(url.as_str()).await
+        self.fetch_text(url.as_str(), Some(base), budget).await
     }
 
     pub(crate) async fn get_text(
         &self,
         url: impl AsRef<str>,
     ) -> std::result::Result<String, String> {
+        self.fetch_text(url.as_ref(), None, self.cfg.max_list_bytes)
+            .await
+    }
+
+    /// Check a URL before connecting: http(s) only and, under a guard, the control-plane policy.
+    fn precheck(&self, url: &str) -> std::result::Result<(), String> {
+        let u = reqwest::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
+        match &self.guard {
+            Some(g) => g.check_url_literal(&u).map_err(|e| e.to_string()),
+            None if matches!(u.scheme(), "http" | "https") => Ok(()),
+            None => Err("only http and https URLs are allowed".into()),
+        }
+    }
+
+    /// Check where a response actually came from (after redirects) before reading its body: the
+    /// final URL must pass the policy and, for includes, stay on the list's origin.
+    fn vet_response(
+        &self,
+        resp: &reqwest::Response,
+        origin: Option<&reqwest::Url>,
+    ) -> std::result::Result<(), String> {
+        self.precheck(resp.url().as_str())?;
+        if let Some(o) = origin {
+            if !same_origin(resp.url(), o) {
+                return Err("include redirected to a different origin".into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_text(
+        &self,
+        url: &str,
+        origin: Option<&reqwest::Url>,
+        cap: usize,
+    ) -> std::result::Result<String, String> {
+        self.precheck(url).map_err(|e| format!("{url}: {e}"))?;
         let resp = self
             .client
-            .get(url.as_ref())
+            .get(url)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .timeout(self.cfg.fetch_timeout)
             .send()
             .await
-            .map_err(|e| format!("{}: {e}", url.as_ref()))?;
+            .map_err(|e| format!("{url}: {}", send_error(&e)))?;
+        self.vet_response(&resp, origin)
+            .map_err(|e| format!("{url}: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("{}: HTTP {}", url.as_ref(), resp.status()));
+            return Err(format!("{url}: HTTP {}", resp.status()));
         }
-        let body = read_capped(resp, self.cfg.max_list_bytes).await?;
+        let body = read_capped(resp, cap).await?;
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
@@ -915,7 +1023,12 @@ impl ListService {
         status: &ListStatus,
         have_cache: bool,
     ) -> std::result::Result<Fetched, String> {
-        let mut req = self.client.get(&list.url).timeout(self.cfg.fetch_timeout);
+        self.precheck(&list.url)?;
+        let mut req = self
+            .client
+            .get(&list.url)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .timeout(self.cfg.fetch_timeout);
         // Validators are only useful when there is cached content to reuse on a 304.
         if have_cache {
             if let Some(etag) = &list.etag {
@@ -925,7 +1038,8 @@ impl ListService {
                 req = req.header(IF_MODIFIED_SINCE, lm);
             }
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let resp = req.send().await.map_err(|e| send_error(&e))?;
+        self.vet_response(&resp, None)?;
         let code = resp.status();
         if code == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(Fetched::NotModified);

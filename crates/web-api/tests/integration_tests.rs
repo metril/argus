@@ -593,14 +593,58 @@ async fn proxy_stats_and_filter_stats() {
 // ---------------------------------------------------------------- lists
 
 #[tokio::test]
-async fn lists_ssrf_protection_and_crud() {
+async fn list_urls_to_internal_destinations_are_refused_with_a_stable_code() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;
     for url in [
-        "http://localhost/f.txt",
-        "https://192.168.1.1/f.txt",
-        "https://internal.corp.local/f.txt",
+        "http://[::1]/x.txt",
+        "https://[::ffff:127.0.0.1]/x.txt",
+        "https://[fd00::1]/x.txt",
+        "https://[fe80::1]/x.txt",
+        "http://10.0.0.1/x.txt",
+        "http://100.64.0.1/x.txt",
+        "http://169.254.169.254/latest/meta-data",
+        // A name that resolves to loopback.
+        "https://localhost/x.txt",
     ] {
+        let resp = admin
+            .post("/api/v1/lists")
+            .json(&json!({"id": "t", "name": "T", "url": url}))
+            .await;
+        resp.assert_status_bad_request();
+        let body: Value = resp.json();
+        assert_eq!(
+            body["error"]["code"], "fetch_destination_not_allowed",
+            "{url}: {body}"
+        );
+    }
+    for url in ["ftp://example.com/x.txt", "file:///etc/passwd"] {
+        let resp = admin
+            .post("/api/v1/lists")
+            .json(&json!({"id": "t", "name": "T", "url": url}))
+            .await;
+        resp.assert_status_bad_request();
+        let body: Value = resp.json();
+        assert_eq!(body["error"]["code"], "invalid_fetch_url", "{url}: {body}");
+    }
+    // The same applies when changing the URL of an existing list.
+    admin
+        .post("/api/v1/lists")
+        .json(&json!({"id": "ok", "name": "Ok", "url": "https://example.com/x.txt", "enabled": false}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    admin
+        .put("/api/v1/lists/ok")
+        .json(&json!({"url": "http://[::1]:8080/x"}))
+        .await
+        .assert_status_bad_request();
+}
+
+#[tokio::test]
+async fn lists_ssrf_protection_and_crud() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    for url in ["http://localhost/f.txt", "https://192.168.1.1/f.txt"] {
         admin
             .post("/api/v1/lists")
             .json(&json!({"id": "t", "name": "T", "url": url}))

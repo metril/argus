@@ -94,7 +94,7 @@ pub async fn add_filter_list(
     ApiJson(req): ApiJson<AddFilterListRequest>,
 ) -> ApiResult<(StatusCode, Json<FilterListResponse>)> {
     req.validate()?;
-    validate_filter_url(&req.url)?;
+    validate_filter_url(&state, &req.url).await?;
     if state.filter_store.exists(&req.id)? {
         return Err(ApiError::AlreadyExists(format!("Filter list '{}'", req.id)));
     }
@@ -148,7 +148,7 @@ pub async fn update_filter_list(
 ) -> ApiResult<Json<FilterListResponse>> {
     req.validate()?;
     if let Some(url) = &req.url {
-        validate_filter_url(url)?;
+        validate_filter_url(&state, url).await?;
     }
     let format = req.format.as_deref().map(parse_format).transpose()?;
     let mut list = state
@@ -499,6 +499,7 @@ pub async fn add_from_catalogue(
     if state.filter_store.exists(&id)? {
         return Err(ApiError::AlreadyExists(format!("Filter list '{id}'")));
     }
+    validate_filter_url(&state, &entry.url).await?;
     let mut list = entry.to_filter_list();
     list.enabled = true;
     let (st, l) = (state.clone(), list.clone());
@@ -561,49 +562,30 @@ pub async fn list_ext_rules(
     })
 }
 
-fn validate_filter_url(url: &str) -> ApiResult<()> {
-    let parsed =
-        url::Url::parse(url).map_err(|_| ApiError::ValidationError("Invalid URL".to_string()))?;
-    if parsed.scheme() != "https" {
-        return Err(ApiError::ValidationError(
-            "Only HTTPS URLs are allowed for security".to_string(),
-        ));
-    }
-    if let Some(host) = parsed.host_str() {
-        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
-            return Err(ApiError::ValidationError(
-                "Local addresses are not allowed".to_string(),
-            ));
-        }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            if is_private_ip(&ip) {
-                return Err(ApiError::ValidationError(
-                    "Private IP addresses are not allowed".to_string(),
-                ));
-            }
-        }
-        let host_lower = host.to_lowercase();
-        for pattern in ["internal", "intranet", "local", "private", "corp", "lan"] {
-            if host_lower.contains(pattern) {
-                return Err(ApiError::ValidationError(
-                    "Internal hostnames are not allowed".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
+/// Stable error code for a fetch URL that is not an allowed destination.
+pub const FETCH_DESTINATION_CODE: &str = "fetch_destination_not_allowed";
 
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-        }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+/// Check a list URL against the control-plane fetch policy (the same one the fetcher enforces,
+/// again at fetch time since DNS can change): http(s) only, no refused literal address, and a
+/// name must not resolve only to refused addresses.
+pub(crate) async fn validate_filter_url(state: &AppState, url: &str) -> ApiResult<()> {
+    let policy = match state.list_service.fetch_policy() {
+        Some(p) => p.clone(),
+        None => Arc::new(
+            common::net_policy::NetPolicy::control_plane(&[])
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        ),
+    };
+    use common::net_policy::UrlRefusal;
+    match policy.check_url(url).await {
+        Ok(_) => Ok(()),
+        Err(e @ (UrlRefusal::Invalid | UrlRefusal::Scheme | UrlRefusal::NoHost)) => Err(
+            ApiError::coded(StatusCode::BAD_REQUEST, "invalid_fetch_url", e.to_string()),
+        ),
+        Err(e) => Err(ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            FETCH_DESTINATION_CODE,
+            e.to_string(),
+        )),
     }
 }

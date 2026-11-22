@@ -51,3 +51,31 @@ pub struct BuildSummary {
     /// Hex cache key of the live engine.
     pub engine_key: String,
 }
+
+/// Longest echoed source text kept in a stored report.
+const MAX_ECHO: usize = 80;
+
+/// Shorten text echoed from a fetched list (conversion errors repeat raw source lines) so a
+/// report cannot be used to read a response back, and drop control characters.
+pub(crate) fn clip_echo(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_ECHO)
+        .collect();
+    if s.chars().filter(|c| !c.is_control()).count() > MAX_ECHO {
+        out.push_str("...");
+    }
+    out
+}
+
+/// Applied to every report before it is stored.
+pub(crate) fn sanitize_report(r: &mut filter_engine::ListReport) {
+    for e in &mut r.errors {
+        e.reason = clip_echo(&e.reason);
+    }
+    r.skipped_reasons = std::mem::take(&mut r.skipped_reasons)
+        .into_iter()
+        .map(|(k, v)| (clip_echo(&k), v))
+        .collect();
+}

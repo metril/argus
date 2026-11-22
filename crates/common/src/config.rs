@@ -89,6 +89,16 @@ pub struct AdblockSettings {
     /// Maximum accepted size of a downloaded list, in bytes.
     #[serde(default = "default_max_list_bytes")]
     pub max_list_bytes: usize,
+    /// Destinations the control plane (list, `!#include` and resource downloads) may fetch from
+    /// although they are private: CIDRs / IPs, or host names (a listed name may resolve to
+    /// private addresses). Private ranges are refused by default and loopback, link-local and
+    /// other reserved addresses always (unless given as a CIDR/IP here).
+    #[serde(default)]
+    pub allowed_fetch_destinations: Vec<String>,
+    /// Keep the query string of URLs in the recent-blocked list. Off by default: query strings
+    /// often carry tokens, so they are stripped before storing.
+    #[serde(default)]
+    pub recent_blocked_keep_query: bool,
 }
 
 /// Default client ACL: local and private networks only.
@@ -139,6 +149,8 @@ impl Default for AdblockSettings {
             list_fetch_concurrency: default_list_fetch_concurrency(),
             list_fetch_timeout_secs: default_list_fetch_timeout_secs(),
             max_list_bytes: default_max_list_bytes(),
+            allowed_fetch_destinations: Vec::new(),
+            recent_blocked_keep_query: false,
         }
     }
 }
@@ -146,6 +158,60 @@ impl Default for AdblockSettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserscriptSettings {
     pub enabled: bool,
+}
+
+/// When session cookies carry the `Secure` attribute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CookieSecure {
+    /// Only for requests that arrived over HTTPS, so plain-HTTP LAN access keeps working.
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl Serialize for CookieSecure {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            CookieSecure::Auto => "auto",
+            CookieSecure::Always => "always",
+            CookieSecure::Never => "never",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for CookieSecure {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bool(bool),
+            Str(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Bool(true) => Ok(CookieSecure::Always),
+            Raw::Bool(false) => Ok(CookieSecure::Never),
+            Raw::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "auto" => Ok(CookieSecure::Auto),
+                "always" => Ok(CookieSecure::Always),
+                "never" => Ok(CookieSecure::Never),
+                other => Err(serde::de::Error::custom(format!(
+                    "cookie_secure must be auto, always or never, not {other:?}"
+                ))),
+            },
+        }
+    }
+}
+
+impl CookieSecure {
+    /// Whether to set `Secure` for a request that did (`https`) or did not arrive over HTTPS.
+    pub fn applies(self, https: bool) -> bool {
+        match self {
+            CookieSecure::Auto => https,
+            CookieSecure::Always => true,
+            CookieSecure::Never => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +224,14 @@ pub struct WebUiSettings {
     pub rate_limit_global_rpm: u64,
     pub rate_limit_ip_rpm: u64,
     pub rate_limit_user_rpm: u64,
+    /// `Secure` flag on session cookies: `auto` (default; set when the request arrived over
+    /// HTTPS through a trusted proxy), `always` or `never`.
+    #[serde(default)]
+    pub cookie_secure: CookieSecure,
+    /// Reverse proxies (IP addresses) whose `X-Forwarded-For` / `X-Forwarded-Proto` headers are
+    /// trusted. Empty: the socket peer is always used and requests count as plain HTTP.
+    #[serde(default)]
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for WebUiSettings {
@@ -171,6 +245,8 @@ impl Default for WebUiSettings {
             rate_limit_global_rpm: 10000,
             rate_limit_ip_rpm: 100,
             rate_limit_user_rpm: 1000,
+            cookie_secure: CookieSecure::Auto,
+            trusted_proxies: Vec::new(),
         }
     }
 }

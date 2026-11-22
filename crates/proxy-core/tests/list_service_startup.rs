@@ -46,6 +46,8 @@ async fn start_without_webui_installs_rules_from_list_server() {
         enabled: true,
         data_dir: dir.path().to_path_buf(),
         scriptlet_resources_url: String::new(),
+        // The list server is on loopback, which the control plane refuses unless allowed.
+        allowed_fetch_destinations: vec!["127.0.0.0/8".to_string()],
         ..Default::default()
     };
     let engine = Arc::new(SharedEngine::new());

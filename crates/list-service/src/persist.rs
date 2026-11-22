@@ -173,8 +173,7 @@ pub(crate) fn load(path: &Path, key: &Key) -> Result<Persisted, String> {
     let (blob, rest) = split_chunk(body).ok_or("short engine blob")?;
     let (dom, side_bytes) = split_chunk(rest).ok_or("short domain set")?;
     let domains = DomainSet::from_bytes(dom)?;
-    let side: Sidecar =
-        serde_json::from_slice(side_bytes).map_err(|e| format!("sidecar: {e}"))?;
+    let side: Sidecar = serde_json::from_slice(side_bytes).map_err(|e| format!("sidecar: {e}"))?;
     Ok(Persisted {
         blob: blob.to_vec(),
         domains,
@@ -258,7 +257,9 @@ mod tests {
             let r = std::panic::catch_unwind(|| {
                 if let Ok(p) = load(&path, &key) {
                     let _ = filter_engine::try_build_engine(&p.blob, &[]);
-                    let _ = p.domains.lookup("a.blocked.test", filter_engine::Scheme::Https);
+                    let _ = p
+                        .domains
+                        .lookup("a.blocked.test", filter_engine::Scheme::Https);
                 }
             });
             let _ = tx.send(r.is_ok());
