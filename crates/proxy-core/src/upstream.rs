@@ -47,6 +47,12 @@ pub fn build_upstream_client(opts: &UpstreamOptions) -> Result<reqwest::Client> 
         })?;
         let certs = reqwest::Certificate::from_pem_bundle(&pem)
             .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
+        if certs.is_empty() {
+            return Err(Error::Config(format!(
+                "Upstream CA {} contains no PEM certificates",
+                path.display()
+            )));
+        }
         for cert in certs {
             builder = builder.add_root_certificate(cert);
         }
@@ -57,4 +63,35 @@ pub fn build_upstream_client(opts: &UpstreamOptions) -> Result<reqwest::Client> 
     builder
         .build()
         .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts_with(path: PathBuf) -> UpstreamOptions {
+        UpstreamOptions {
+            extra_ca_paths: vec![path],
+            resolve_all_to: None,
+        }
+    }
+
+    #[test]
+    fn ca_file_without_certificates_is_a_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-ca.pem");
+        std::fs::write(&path, "this is not a certificate\n").unwrap();
+        let err = build_upstream_client(&opts_with(path)).unwrap_err();
+        assert!(err.to_string().contains("no PEM certificates"), "{err}");
+    }
+
+    #[test]
+    fn missing_ca_file_is_a_config_error() {
+        let err =
+            build_upstream_client(&opts_with(PathBuf::from("/nonexistent/ca.pem"))).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to read upstream CA"),
+            "{err}"
+        );
+    }
 }

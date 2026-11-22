@@ -60,6 +60,27 @@ pub struct AdblockSettings {
     /// Downloaded once and cached so `##+js(...)` scriptlet rules can inject. Empty disables it.
     #[serde(default = "default_scriptlet_resources_url")]
     pub scriptlet_resources_url: String,
+    /// Max simultaneous filter-list downloads.
+    #[serde(default = "default_list_fetch_concurrency")]
+    pub list_fetch_concurrency: usize,
+    /// Per-list download timeout in seconds.
+    #[serde(default = "default_list_fetch_timeout_secs")]
+    pub list_fetch_timeout_secs: u64,
+    /// Maximum accepted size of a downloaded list, in bytes.
+    #[serde(default = "default_max_list_bytes")]
+    pub max_list_bytes: usize,
+}
+
+fn default_list_fetch_concurrency() -> usize {
+    4
+}
+
+fn default_list_fetch_timeout_secs() -> u64 {
+    30
+}
+
+fn default_max_list_bytes() -> usize {
+    50 * 1024 * 1024
 }
 
 fn default_scriptlet_resources_url() -> String {
@@ -77,6 +98,9 @@ impl Default for AdblockSettings {
             auto_update: true,
             update_interval_hours: 24,
             scriptlet_resources_url: default_scriptlet_resources_url(),
+            list_fetch_concurrency: default_list_fetch_concurrency(),
+            list_fetch_timeout_secs: default_list_fetch_timeout_secs(),
+            max_list_bytes: default_max_list_bytes(),
         }
     }
 }
