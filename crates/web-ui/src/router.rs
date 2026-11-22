@@ -21,6 +21,7 @@ pub fn AppRouter() -> impl IntoView {
                 <Route path=path!("/proxy") view=ProxyPage />
                 <Route path=path!("/filters") view=FiltersPage />
                 <Route path=path!("/userscripts") view=UserscriptsPage />
+                <Route path=path!("/tokens") view=TokensPage />
                 <Route path=path!("/settings") view=SettingsPage />
             </Routes>
         </Router>

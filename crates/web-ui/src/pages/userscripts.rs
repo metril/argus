@@ -41,7 +41,7 @@ pub fn UserscriptsPage() -> impl IntoView {
 
                 match client.list_userscripts(1, 100, None).await {
                     Ok(response) => {
-                        scripts.set(response.data);
+                        scripts.set(response.items);
                     }
                     Err(e) => {
                         app_state.error(format!("Failed to load userscripts: {}", e));

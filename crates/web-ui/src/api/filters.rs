@@ -1,7 +1,5 @@
 //! Filter list management API calls
 
-use serde::Deserialize;
-
 use super::auth::MessageResponse;
 use super::client::{ApiClient, ApiError};
 
@@ -11,19 +9,10 @@ pub use api_types::FilterListResponse as FilterList;
 pub use api_types::{
     AddFilterListRequest, CustomRulesResponse, UpdateCustomRulesRequest, UpdateFilterListRequest,
 };
-pub type FilterListsResponse = api_types::PaginatedResponse<FilterList>;
+pub type FilterListsResponse = api_types::Page<FilterList>;
 
-/// Filter blocking statistics (mirrors filter_engine::BlockingStats, server-only)
-#[derive(Debug, Clone, Deserialize)]
-pub struct FilterStats {
-    pub total_requests: u64,
-    pub blocked_requests: u64,
-    pub allowed_requests: u64,
-    #[serde(default)]
-    pub blocked_by_type: std::collections::HashMap<String, u64>,
-    #[serde(default)]
-    pub top_blocked_domains: Vec<(String, u64)>,
-}
+/// Filter blocking statistics.
+pub use api_types::FilterStatsResponse as FilterStats;
 
 impl ApiClient {
     /// List filter lists with pagination
@@ -32,13 +21,13 @@ impl ApiClient {
         page: u32,
         limit: u32,
     ) -> Result<FilterListsResponse, ApiError> {
-        self.get(&format!("/api/filters/lists?page={}&limit={}", page, limit))
+        self.get(&format!("/lists?page={}&limit={}", page, limit))
             .await
     }
 
     /// Get a specific filter list
     pub async fn get_filter_list(&self, id: &str) -> Result<FilterList, ApiError> {
-        self.get(&format!("/api/filters/lists/{}", id)).await
+        self.get(&format!("/lists/{}", id)).await
     }
 
     /// Add a new filter list
@@ -55,7 +44,7 @@ impl ApiClient {
             url: url.to_string(),
             enabled: Some(enabled),
         };
-        self.post("/api/filters/lists", &req).await
+        self.post("/lists", &req).await
     }
 
     /// Update a filter list
@@ -64,35 +53,40 @@ impl ApiClient {
         id: &str,
         update: &UpdateFilterListRequest,
     ) -> Result<FilterList, ApiError> {
-        self.put(&format!("/api/filters/lists/{}", id), update)
-            .await
+        self.put(&format!("/lists/{}", id), update).await
     }
 
     /// Delete a filter list
     pub async fn delete_filter_list(&self, id: &str) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!("/api/filters/lists/{}", id)).await
+        self.delete(&format!("/lists/{}", id)).await
     }
 
     /// Get filter statistics
     pub async fn get_filter_stats(&self) -> Result<FilterStats, ApiError> {
-        self.get("/api/filters/stats").await
+        self.get("/stats/filter").await
     }
 
     /// Reset filter statistics
     pub async fn reset_filter_stats(&self) -> Result<MessageResponse, ApiError> {
-        self.post("/api/filters/stats/reset", &()).await
+        self.post("/stats/filter/reset", &()).await
     }
 
-    /// Get the user's custom filter rules
-    pub async fn get_custom_rules(&self) -> Result<CustomRulesResponse, ApiError> {
-        self.get("/api/filters/custom-rules").await
+    /// Get the custom filter rules and their `ETag`
+    pub async fn get_custom_rules(
+        &self,
+    ) -> Result<(CustomRulesResponse, Option<String>), ApiError> {
+        self.get_etag("/rules/custom").await
     }
 
-    /// Replace the user's custom filter rules
-    pub async fn update_custom_rules(&self, rules: &str) -> Result<CustomRulesResponse, ApiError> {
+    /// Replace the custom filter rules; `etag` is the one from the last read (lost-update guard)
+    pub async fn update_custom_rules(
+        &self,
+        rules: &str,
+        etag: &str,
+    ) -> Result<(CustomRulesResponse, Option<String>), ApiError> {
         let req = UpdateCustomRulesRequest {
             rules: rules.to_string(),
         };
-        self.put("/api/filters/custom-rules", &req).await
+        self.put_if_match("/rules/custom", &req, etag).await
     }
 }

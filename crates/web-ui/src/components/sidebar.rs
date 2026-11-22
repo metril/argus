@@ -34,6 +34,11 @@ const NAV_ITEMS: &[NavItem] = &[
         icon: "U",
     },
     NavItem {
+        path: "/tokens",
+        label: "API Tokens",
+        icon: "T",
+    },
+    NavItem {
         path: "/settings",
         label: "Settings",
         icon: "S",

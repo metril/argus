@@ -28,6 +28,8 @@ pub fn FiltersPage() -> impl IntoView {
 
     // Custom rules editor
     let custom_rules = RwSignal::new(String::new());
+    // ETag of the rules as last read; sent as If-Match so concurrent edits are not overwritten.
+    let rules_etag = RwSignal::new(Option::<String>::None);
     let saving_rules = RwSignal::new(false);
     let do_save_rules = RwSignal::new(false);
 
@@ -45,7 +47,7 @@ pub fn FiltersPage() -> impl IntoView {
 
                 match client.list_filter_lists(1, 100).await {
                     Ok(response) => {
-                        filters.set(response.data);
+                        filters.set(response.items);
                     }
                     Err(e) => {
                         app_state.error(format!("Failed to load filters: {}", e));
@@ -57,8 +59,9 @@ pub fn FiltersPage() -> impl IntoView {
                     requests_blocked.set(stats.blocked_requests);
                 }
 
-                if let Ok(resp) = client.get_custom_rules().await {
+                if let Ok((resp, etag)) = client.get_custom_rules().await {
                     custom_rules.set(resp.rules);
+                    rules_etag.set(etag);
                 }
 
                 loading.set(false);
@@ -105,10 +108,14 @@ pub fn FiltersPage() -> impl IntoView {
                 saving_rules.set(true);
                 let app_state = app_state.clone();
                 let rules = custom_rules.get();
+                let etag = rules_etag.get_untracked().unwrap_or_default();
                 wasm_bindgen_futures::spawn_local(async move {
                     let client = ApiClient::new();
-                    match client.update_custom_rules(&rules).await {
-                        Ok(_) => app_state.success("Custom rules saved"),
+                    match client.update_custom_rules(&rules, &etag).await {
+                        Ok((_, new_etag)) => {
+                            rules_etag.set(new_etag);
+                            app_state.success("Custom rules saved")
+                        }
                         Err(e) => app_state.error(format!("Failed to save rules: {}", e)),
                     }
                     saving_rules.set(false);

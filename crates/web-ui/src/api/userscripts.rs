@@ -1,7 +1,5 @@
 //! Userscript management API calls
 
-use serde::Deserialize;
-
 use super::auth::MessageResponse;
 use super::client::{ApiClient, ApiError};
 
@@ -10,14 +8,9 @@ use super::client::{ApiClient, ApiError};
 pub use api_types::UserscriptResponse as Userscript;
 pub use api_types::UserscriptStatsResponse as UserscriptStats;
 pub use api_types::{InstallUserscriptRequest, SetEnabledRequest, UpdateUserscriptRequest};
-pub type UserscriptsResponse = api_types::PaginatedResponse<Userscript>;
+pub type UserscriptsResponse = api_types::Page<Userscript>;
 
-/// Userscript source response (server returns an ad-hoc `{id, source}` object)
-#[derive(Debug, Deserialize)]
-pub struct UserscriptSourceResponse {
-    pub id: String,
-    pub source: String,
-}
+pub use api_types::UserscriptSourceResponse;
 
 impl ApiClient {
     /// List userscripts with pagination
@@ -27,7 +20,7 @@ impl ApiClient {
         limit: u32,
         enabled: Option<bool>,
     ) -> Result<UserscriptsResponse, ApiError> {
-        let mut url = format!("/api/userscripts?page={}&limit={}", page, limit);
+        let mut url = format!("/userscripts?page={}&limit={}", page, limit);
         if let Some(enabled) = enabled {
             url.push_str(&format!("&enabled={}", enabled));
         }
@@ -36,7 +29,7 @@ impl ApiClient {
 
     /// Get a specific userscript
     pub async fn get_userscript(&self, id: &str) -> Result<Userscript, ApiError> {
-        self.get(&format!("/api/userscripts/{}", id)).await
+        self.get(&format!("/userscripts/{}", id)).await
     }
 
     /// Get userscript source code
@@ -44,7 +37,7 @@ impl ApiClient {
         &self,
         id: &str,
     ) -> Result<UserscriptSourceResponse, ApiError> {
-        self.get(&format!("/api/userscripts/{}/source", id)).await
+        self.get(&format!("/userscripts/{}/source", id)).await
     }
 
     /// Install a new userscript
@@ -52,7 +45,7 @@ impl ApiClient {
         let req = InstallUserscriptRequest {
             source: source.to_string(),
         };
-        self.post("/api/userscripts", &req).await
+        self.post("/userscripts", &req).await
     }
 
     /// Update a userscript
@@ -60,12 +53,12 @@ impl ApiClient {
         let req = UpdateUserscriptRequest {
             source: source.to_string(),
         };
-        self.put(&format!("/api/userscripts/{}", id), &req).await
+        self.put(&format!("/userscripts/{}", id), &req).await
     }
 
     /// Uninstall a userscript
     pub async fn uninstall_userscript(&self, id: &str) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!("/api/userscripts/{}", id)).await
+        self.delete(&format!("/userscripts/{}", id)).await
     }
 
     /// Enable or disable a userscript
@@ -75,12 +68,12 @@ impl ApiClient {
         enabled: bool,
     ) -> Result<Userscript, ApiError> {
         let req = SetEnabledRequest { enabled };
-        self.put(&format!("/api/userscripts/{}/enabled", id), &req)
+        self.put(&format!("/userscripts/{}/enabled", id), &req)
             .await
     }
 
     /// Get userscript statistics
     pub async fn get_userscript_stats(&self) -> Result<UserscriptStats, ApiError> {
-        self.get("/api/userscripts/stats").await
+        self.get("/userscripts/stats").await
     }
 }
