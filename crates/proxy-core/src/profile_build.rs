@@ -98,12 +98,15 @@ struct Tracked {
     fell_back: bool,
 }
 
+/// `(device id, profile id, addresses, token digest)`.
+type DeviceSig = (u64, u64, Vec<IpNet>, Option<[u8; 32]>);
+
 /// The part of the stored state that decides the table: which profiles exist and what each
 /// device resolves to.
 #[derive(Default, PartialEq)]
 struct MapSig {
     ids: Vec<u64>,
-    devices: Vec<(u64, u64, Vec<IpNet>, Option<[u8; 32]>)>,
+    devices: Vec<DeviceSig>,
 }
 
 impl ProfileBuilder {

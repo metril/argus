@@ -912,6 +912,16 @@ service_worker_policy = "block_when_privileged"  # allow | block_when_privileged
 Stored scripts from before the rewrite (`resources` map format) cannot be read; they are dropped
 with a log line when the database is loaded.
 
+## Per-device profiles
+
+A profile is a set of enabled filter lists plus its own custom rules; devices are mapped to
+profiles and everything else uses the built-in `default` profile. Explicit-proxy devices are
+identified by a token sent as the proxy password, transparent-mode devices by source address
+(tokens are the stronger identity). `proxy.require_device_token = true` makes explicit-proxy
+connections without a known token fail with `407`. Statistics and the master on/off switch stay
+global. Profiles and devices are compiled in the background whenever they change. Details, limits
+and delete behaviour: [docs/PROFILES.md](docs/PROFILES.md).
+
 ## Script control
 
 NoScript-style control of what a page may run and load, per site, enforced by the proxy. It is

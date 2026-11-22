@@ -549,7 +549,7 @@ async fn deleting_a_profile_removes_its_data_and_stops_its_expiry_task() {
     assert!(f.policy.rules("doomed").unwrap().site_rules.is_empty());
     assert_eq!(f.policy.pin_wait("doomed", "10.0.0.1").unwrap(), 0);
     assert!(f.ctx.profiles().table().slot(a.id).is_none());
-    assert!(f.builder.status().get(&a.id).is_none());
+    assert!(!f.builder.status().contains_key(&a.id));
     wait_until("the expiry task to end", || !control.expiry_running()).await;
 
     // Recreated under the same name: starts empty.
