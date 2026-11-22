@@ -3965,11 +3965,14 @@ dependencies = [
 name = "proxy-core"
 version = "0.1.0"
 dependencies = [
+ "adblock",
  "age",
+ "arc-swap",
  "async-compression",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "brotli",
  "bytes",
  "chrono",
@@ -3997,6 +4000,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest 0.12.28",
+ "rustc-hash 2.1.2",
  "rustls",
  "rustls-pemfile",
  "script-policy",

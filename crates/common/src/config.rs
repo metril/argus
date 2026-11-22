@@ -49,6 +49,10 @@ pub struct ProxySettings {
     /// built-in web roots), e.g. a private/corporate CA.
     #[serde(default)]
     pub extra_upstream_ca_paths: Vec<PathBuf>,
+    /// Explicit-proxy connections must present a known device token (`Proxy-Authorization:
+    /// Basic`, password = token); others get `407`. Off: unknown devices fall back to their IP.
+    #[serde(default)]
+    pub require_device_token: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +330,7 @@ impl Default for ProxyConfig {
                 allowed_clients: default_allowed_clients(),
                 enable_websockets: true,
                 extra_upstream_ca_paths: Vec::new(),
+                require_device_token: false,
             },
             mitm: MitmSettings {
                 enabled: true,

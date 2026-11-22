@@ -29,6 +29,7 @@ pub mod mitm;
 pub mod panel;
 pub mod passthrough;
 pub mod policy;
+pub mod profiles;
 pub mod redirect;
 pub mod request_ctx;
 pub mod request_type;
@@ -54,6 +55,7 @@ pub use load_manager::{
     SharedLoadManager,
 };
 pub use memory_monitor::{LoadSheddingAction, MemoryMonitor, MemoryMonitorConfig, MemoryPressure};
-pub use request_ctx::{Profile, ProfileSlot, RequestCtx};
+pub use profiles::{token_digest, ProfileTable, Profiles};
+pub use request_ctx::{ConnCtx, Profile, ProfileSlot, RequestCtx};
 pub use request_type::RequestType;
 pub use server::ProxyServer;
