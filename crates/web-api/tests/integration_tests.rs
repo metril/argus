@@ -443,6 +443,68 @@ async fn test_update_proxy_config() {
 }
 
 #[tokio::test]
+async fn test_update_proxy_config_applies_live_settings() {
+    let ctx = TestContext::new()
+        .await
+        .expect("Failed to create test context");
+    let server = TestServer::new(ctx.router.clone()).expect("Failed to create test server");
+    let reg_response = server
+        .post("/api/auth/register")
+        .json(&json!({
+            "username": "live_cfg",
+            "password": "SecurePassword123!", "password_confirm": "SecurePassword123!"
+        }))
+        .await;
+    let access_token = extract_access_token(&reg_response).expect("No access token");
+    assert!(ctx.state.shared_engine.is_enabled());
+
+    let response = server
+        .put("/api/proxy/config")
+        .add_cookie(Cookie::new("access_token", access_token))
+        .json(&json!({
+            "enable_adblock": false,
+            "request_timeout_secs": 7,
+            "auto_update": false,
+            "update_interval_hours": 2,
+            "port": 9191
+        }))
+        .await;
+    response.assert_status_ok();
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["port"], 9191);
+    assert_eq!(body["request_timeout_secs"], 7);
+    let applied: Vec<&str> = body["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for f in [
+        "enable_adblock",
+        "request_timeout_secs",
+        "auto_update",
+        "update_interval_hours",
+    ] {
+        assert!(applied.contains(&f), "{f} should be applied: {applied:?}");
+    }
+    assert_eq!(body["restart_required"], json!(["port"]));
+
+    // The running proxy handles actually changed.
+    assert!(!ctx.state.shared_engine.is_enabled());
+    assert_eq!(
+        ctx.state
+            .proxy_state
+            .request_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
+        7000
+    );
+    assert_eq!(
+        ctx.state.list_service.schedule(),
+        (false, std::time::Duration::from_secs(2 * 3600))
+    );
+}
+
+#[tokio::test]
 async fn test_update_proxy_config_validation() {
     let ctx = TestContext::new()
         .await

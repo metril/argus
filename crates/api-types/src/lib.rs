@@ -160,6 +160,25 @@ pub struct ProxyConfigResponse {
     pub connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub enable_adblock: bool,
+    /// Whether filter lists refresh automatically.
+    #[serde(default)]
+    pub auto_update: bool,
+    /// Hours between automatic list refreshes.
+    #[serde(default)]
+    pub update_interval_hours: u64,
+}
+
+/// Result of a config update: the new config plus which changes are already live and which
+/// need a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UpdateProxyConfigResponse {
+    #[serde(flatten)]
+    pub config: ProxyConfigResponse,
+    /// Fields that took effect immediately.
+    pub applied: Vec<String>,
+    /// Fields saved to the config file that only apply after a restart.
+    pub restart_required: Vec<String>,
 }
 
 /// Partial proxy configuration update. Every field is optional; omitted fields
@@ -188,6 +207,11 @@ pub struct UpdateProxyConfigRequest {
     pub request_timeout_secs: Option<u64>,
 
     pub enable_adblock: Option<bool>,
+
+    pub auto_update: Option<bool>,
+
+    #[cfg_attr(feature = "server", validate(range(min = 1, max = 8760)))]
+    pub update_interval_hours: Option<u64>,
 }
 
 /// Connection statistics.

@@ -52,11 +52,12 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
         })?;
         let mut n = 0;
         for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-            let cert = cert
-                .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
-            roots
-                .add(cert)
-                .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
+            let cert = cert.map_err(|e| {
+                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
+            })?;
+            roots.add(cert).map_err(|e| {
+                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
+            })?;
             n += 1;
         }
         if n == 0 {
@@ -124,6 +125,29 @@ mod tests {
             extra_ca_paths: vec![path],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resolve_override_and_timeouts_come_from_code_not_config() {
+        let mut cfg = crate::ProxyConfig::default();
+        cfg.performance.connection_timeout_secs = 3;
+        cfg.performance.request_timeout_secs = 9;
+        let o = UpstreamOptions::from_config(&cfg);
+        assert_eq!(o.resolve_all_to, None);
+        assert_eq!(o.connect_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(o.read_timeout, Some(Duration::from_secs(9)));
+        // A config file cannot carry the override: unknown keys are not part of the schema.
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(!toml.contains("resolve_all_to"));
+    }
+
+    #[test]
+    fn root_store_includes_web_roots_and_rejects_empty_ca_file() {
+        assert!(!build_root_store(&[]).unwrap().is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.pem");
+        std::fs::write(&p, "nope").unwrap();
+        assert!(build_root_store(&[p]).is_err());
     }
 
     #[test]

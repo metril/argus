@@ -70,6 +70,9 @@ pub struct ProxyState {
     /// Runtime statistics
     pub stats: Arc<ProxyStats>,
 
+    /// Live upstream request timeout (ms), shared with the proxy's `ProxyContext`.
+    pub request_timeout_ms: Arc<AtomicU64>,
+
     /// MITM enabled flag (for stats display)
     pub mitm_enabled: bool,
 
@@ -361,6 +364,7 @@ pub async fn build_state(
     userscript_manager: Arc<UserscriptManager>,
     userscript_runtime: Arc<UserscriptRuntime>,
     config_path: PathBuf,
+    request_timeout_ms: Arc<AtomicU64>,
 ) -> ApiResult<Arc<AppState>> {
     // Initialize JWT config
     let jwt_config = Arc::new(JwtConfig {
@@ -389,6 +393,7 @@ pub async fn build_state(
     let proxy_state = Arc::new(ProxyState {
         config: Arc::new(RwLock::new(proxy_config)),
         stats: Arc::new(ProxyStats::new()),
+        request_timeout_ms,
         mitm_enabled,
         mitm_cached_certs: Arc::new(AtomicU64::new(0)),
     });

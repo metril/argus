@@ -5,10 +5,7 @@ use std::sync::Arc;
 use filter_engine::SharedEngine;
 use list_service::{ListService, ListServiceConfig};
 use proxy_core::{
-    config::ProxyConfig,
-    filtering::ProxyContext,
-    server::ProxyServer,
-    upstream::UpstreamOptions,
+    config::ProxyConfig, filtering::ProxyContext, server::ProxyServer, upstream::UpstreamOptions,
     Error, Result,
 };
 use tracing::{error, info};
@@ -72,6 +69,7 @@ async fn main() -> Result<()> {
                 config_path.clone(),
                 shared_engine.clone(),
                 list_service,
+                ctx.request_timeout_handle(),
             )
             .await?,
         )
@@ -104,6 +102,7 @@ async fn start_webui_server(
     config_path: String,
     shared_engine: Arc<SharedEngine>,
     list_service: Arc<ListService>,
+    request_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use tracing::warn;
     use userscript_engine::{UserscriptManager, UserscriptRuntime};
@@ -191,6 +190,7 @@ async fn start_webui_server(
         userscript_manager,
         userscript_runtime,
         config_path.into(),
+        request_timeout_ms,
     )
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;

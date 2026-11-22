@@ -4,7 +4,7 @@
 //! For now, see lib.rs for complete API endpoint documentation.
 
 use crate::auth::models::{LoginRequest, LoginResponse, RegisterRequest, UserInfo, UserRole};
-use crate::handlers::proxy::ProxyConfigResponse;
+use crate::handlers::proxy::{ProxyConfigResponse, UpdateProxyConfigResponse};
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
@@ -50,6 +50,7 @@ See lib.rs documentation for complete endpoint reference.
             LoginResponse,
             RegisterRequest,
             ProxyConfigResponse,
+            UpdateProxyConfigResponse,
         )
     ),
     modifiers(&SecurityAddon),

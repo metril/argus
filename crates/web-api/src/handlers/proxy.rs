@@ -14,13 +14,14 @@ use common::config::ProxyConfig;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 use validator::Validate;
 
 // Wire-facing DTOs live in the shared `api-types` crate.
 pub use api_types::{
     ConnectionStats, MitmStats, ProxyConfigResponse, ProxyStatsResponse, RequestStats,
-    UpdateProxyConfigRequest,
+    UpdateProxyConfigRequest, UpdateProxyConfigResponse,
 };
 
 /// Build the sanitized config response (no sensitive paths) from the full config.
@@ -36,7 +37,22 @@ fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         connection_timeout_secs: config.performance.connection_timeout_secs,
         request_timeout_secs: config.performance.request_timeout_secs,
         enable_adblock: config.adblock.enabled,
+        auto_update: config.adblock.auto_update,
+        update_interval_hours: config.adblock.update_interval_hours,
     }
+}
+
+/// Push the settings that can change at runtime into the running proxy.
+fn apply_live(state: &AppState, config: &ProxyConfig) {
+    state.shared_engine.set_enabled(config.adblock.enabled);
+    state.proxy_state.request_timeout_ms.store(
+        config.performance.request_timeout_secs.saturating_mul(1000),
+        Ordering::Relaxed,
+    );
+    state.list_service.set_schedule(
+        config.adblock.auto_update,
+        Duration::from_secs(config.adblock.update_interval_hours.max(1) * 3600),
+    );
 }
 
 /// Get proxy configuration
@@ -56,13 +72,14 @@ pub async fn get_config(
 ///
 /// PUT /api/proxy/config
 ///
-/// Updates proxy configuration. Requires User or Admin role.
-/// Note: Some changes may require a restart to take effect.
+/// Updates proxy configuration. Requires User or Admin role. The response lists which fields took
+/// effect immediately (`applied`: adblock on/off, request timeout, list auto-update schedule) and
+/// which were only saved (`restart_required`: ports, MITM/CA, protocol toggles, limits).
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<UpdateProxyConfigRequest>,
-) -> ApiResult<Json<ProxyConfigResponse>> {
+) -> ApiResult<Json<UpdateProxyConfigResponse>> {
     // Check authorization (User or Admin role required)
     if !auth_user.role().can_modify() {
         return Err(ApiError::AuthorizationFailed(
@@ -74,48 +91,60 @@ pub async fn update_config(
     req.validate()
         .map_err(|e| ApiError::ValidationError(e.to_string()))?;
 
-    // Update configuration and prepare response (all sync, in a block to release lock)
-    let (config_str, config_path, response) = {
+    // Update the in-memory config and note what changed (sync, lock released before any await).
+    let mut applied: Vec<String> = Vec::new();
+    let mut restart_required: Vec<String> = Vec::new();
+    let (config_str, config_path, response, new_config) = {
         let mut config = state.proxy_state.config.write();
 
-        if let Some(host) = req.host {
-            config.proxy.host = host;
+        // Needs a restart: only reported when the value actually changes.
+        macro_rules! restart_field {
+            ($name:literal, $slot:expr, $val:expr) => {
+                if let Some(v) = $val {
+                    if $slot != v {
+                        $slot = v;
+                        restart_required.push($name.to_string());
+                    }
+                }
+            };
         }
+        restart_field!("host", config.proxy.host, req.host);
+        restart_field!("port", config.proxy.port, req.port);
+        restart_field!(
+            "max_connections",
+            config.performance.max_connections,
+            req.max_connections.map(|v| v as usize)
+        );
+        restart_field!("enable_http2", config.proxy.enable_http2, req.enable_http2);
+        restart_field!("enable_http3", config.proxy.enable_http3, req.enable_http3);
+        restart_field!(
+            "enable_websockets",
+            config.proxy.enable_websockets,
+            req.enable_websockets
+        );
+        restart_field!("enable_mitm", config.mitm.enabled, req.enable_mitm);
+        restart_field!(
+            "connection_timeout_secs",
+            config.performance.connection_timeout_secs,
+            req.connection_timeout_secs
+        );
 
-        if let Some(port) = req.port {
-            config.proxy.port = port;
+        // Live: applied to the running proxy below, after the file is saved.
+        if let Some(v) = req.request_timeout_secs {
+            config.performance.request_timeout_secs = v;
+            applied.push("request_timeout_secs".into());
         }
-
-        if let Some(max_connections) = req.max_connections {
-            config.performance.max_connections = max_connections as usize;
+        if let Some(v) = req.enable_adblock {
+            config.adblock.enabled = v;
+            applied.push("enable_adblock".into());
         }
-
-        if let Some(enable_http2) = req.enable_http2 {
-            config.proxy.enable_http2 = enable_http2;
+        if let Some(v) = req.auto_update {
+            config.adblock.auto_update = v;
+            applied.push("auto_update".into());
         }
-
-        if let Some(enable_http3) = req.enable_http3 {
-            config.proxy.enable_http3 = enable_http3;
-        }
-
-        if let Some(enable_websockets) = req.enable_websockets {
-            config.proxy.enable_websockets = enable_websockets;
-        }
-
-        if let Some(enable_mitm) = req.enable_mitm {
-            config.mitm.enabled = enable_mitm;
-        }
-
-        if let Some(connection_timeout_secs) = req.connection_timeout_secs {
-            config.performance.connection_timeout_secs = connection_timeout_secs;
-        }
-
-        if let Some(request_timeout_secs) = req.request_timeout_secs {
-            config.performance.request_timeout_secs = request_timeout_secs;
-        }
-
-        if let Some(enable_adblock) = req.enable_adblock {
-            config.adblock.enabled = enable_adblock;
+        if let Some(v) = req.update_interval_hours {
+            config.adblock.update_interval_hours = v;
+            applied.push("update_interval_hours".into());
         }
 
         let config_str =
@@ -123,7 +152,7 @@ pub async fn update_config(
         let config_path = state.config_path.read().clone();
         let response = proxy_config_response(&config);
 
-        (config_str, config_path, response)
+        (config_str, config_path, response, config.clone())
     }; // config lock released here
 
     info!(
@@ -136,7 +165,13 @@ pub async fn update_config(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to save config: {}", e)))?;
 
-    Ok(Json(response))
+    apply_live(&state, &new_config);
+
+    Ok(Json(UpdateProxyConfigResponse {
+        config: response,
+        applied,
+        restart_required,
+    }))
 }
 
 /// Get proxy statistics
@@ -202,6 +237,7 @@ pub async fn reload_config(
         .map_err(|e| ApiError::Internal(format!("Invalid config: {}", e)))?;
 
     // Update configuration
+    apply_live(&state, &new_config);
     {
         let mut config = state.proxy_state.config.write();
         *config = new_config;

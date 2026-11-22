@@ -78,6 +78,7 @@ impl TestContext {
             userscript_manager,
             userscript_runtime,
             config_path,
+            Arc::new(std::sync::atomic::AtomicU64::new(60_000)),
         )
         .await?;
 

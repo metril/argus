@@ -95,6 +95,7 @@ pub fn ProxyPage() -> impl IntoView {
                     enable_http3: Some(enable_http3.get()),
                     enable_websockets: Some(enable_websockets.get()),
                     enable_adblock: Some(enable_adblock.get()),
+                    ..Default::default()
                 };
 
                 wasm_bindgen_futures::spawn_local(async move {
