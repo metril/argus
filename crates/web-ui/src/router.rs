@@ -22,6 +22,7 @@ pub fn AppRouter() -> impl IntoView {
                 <Route path=path!("/filters") view=FiltersPage />
                 <Route path=path!("/blocked") view=BlockedPage />
                 <Route path=path!("/userscripts") view=UserscriptsPage />
+                <Route path=path!("/policy") view=PolicyPage />
                 <Route path=path!("/tokens") view=TokensPage />
                 <Route path=path!("/settings") view=SettingsPage />
             </Routes>
