@@ -84,9 +84,18 @@ fn fmt_addr(a: std::net::SocketAddr) -> String {
 pub async fn bind_result(state: &AppState) -> Option<BindResult> {
     let rt = state.runtime.get()?;
     let b = rt.proxy_bind().await?;
-    let (webui, webui_down) = match state.web_server.get() {
-        Some(w) => (Some(fmt_addr(w.addr().await)), w.is_down().await),
-        None => (None, false),
+    let (webui, webui_down, webui_moved_to, webui_error) = match state.web_server.get() {
+        Some(w) => {
+            let addr = w.addr().await;
+            let moved = w.moved_from().await.map(|_| fmt_addr(addr));
+            (
+                Some(fmt_addr(addr)),
+                w.is_down().await,
+                moved,
+                w.startup_error().await,
+            )
+        }
+        None => (None, false, None, None),
     };
     Some(BindResult {
         proxy: Some(fmt_addr(b.proxy)),
@@ -95,7 +104,10 @@ pub async fn bind_result(state: &AppState) -> Option<BindResult> {
         transparent_down: b.transparent_down,
         webui_down,
         webui,
-        webui_moved_to: None,
+        webui_moved_to,
+        webui_error,
+        proxy_error: b.proxy_error,
+        transparent_error: b.transparent_error,
     })
 }
 
@@ -447,7 +459,11 @@ async fn apply_runtime(
         let listeners_changed = old.proxy.host != new.proxy.host
             || old.proxy.port != new.proxy.port
             || old.proxy.transparent_port != new.proxy.transparent_port;
-        if listeners_changed {
+        let down = rt
+            .proxy_bind()
+            .await
+            .is_some_and(|b| b.proxy_down || b.transparent_down);
+        if listeners_changed || down {
             rt.rebind_proxy(&new.proxy.host, new.proxy.port, new.proxy.transparent_port)
                 .await
                 .map_err(&bind_err)?;
@@ -467,7 +483,11 @@ async fn apply_runtime(
     }
     let mut moved_to = None;
     if let Some(web) = state.web_server.get() {
-        if old.webui.host != new.webui.host || old.webui.port != new.webui.port {
+        if old.webui.host != new.webui.host
+            || old.webui.port != new.webui.port
+            || web.is_down().await
+            || web.moved_from().await.is_some()
+        {
             match web.rebind(&new.webui.host, new.webui.port).await {
                 Ok(addr) => {
                     moved_to = Some(addr.to_string());

@@ -15,6 +15,8 @@ struct Fake {
     calls: Mutex<Vec<(String, u16, Option<u16>)>>,
     access: Mutex<Vec<Vec<String>>>,
     fail_with: Mutex<Option<String>>,
+    down: std::sync::atomic::AtomicBool,
+    webui: Mutex<Vec<(String, u16)>>,
 }
 
 #[async_trait::async_trait]
@@ -32,6 +34,8 @@ impl RuntimeControl for Fake {
         Ok(ProxyBind {
             proxy_down: false,
             transparent_down: false,
+            proxy_error: None,
+            transparent_error: None,
             proxy: SocketAddr::from(([127, 0, 0, 1], port)),
             transparent: t.map(|p| SocketAddr::from(([127, 0, 0, 1], p))),
         })
@@ -60,13 +64,17 @@ impl RuntimeControl for Fake {
                 .cloned()
                 .unwrap_or(("".into(), 8080, None));
         Some(ProxyBind {
-            proxy_down: false,
+            proxy_down: self.down.load(std::sync::atomic::Ordering::Relaxed),
             transparent_down: false,
+            proxy_error: None,
+            transparent_error: None,
             proxy: SocketAddr::from(([127, 0, 0, 1], p)),
             transparent: t.map(|p| SocketAddr::from(([127, 0, 0, 1], p))),
         })
     }
-    async fn note_webui(&self, _: &str, _: u16) {}
+    async fn note_webui(&self, h: &str, p: u16) {
+        self.webui.lock().unwrap().push((h.into(), p));
+    }
 }
 
 async fn put(sess: &common::Sess, body: Value) -> axum_test::TestResponse {
@@ -451,4 +459,114 @@ async fn failed_move_and_failed_restore_mark_the_web_listener_down_and_a_retry_r
     let back = web.rebind("127.0.0.1", first.port()).await.unwrap();
     assert!(!web.is_down().await);
     assert_eq!(health(back).await, Some(200));
+}
+
+#[tokio::test]
+async fn busy_web_port_falls_back_and_reports_it_until_a_rebind() {
+    let ctx = TestContext::new().await.unwrap();
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = blocker.local_addr().unwrap().port();
+    let mut cfg = ctx.api_config.clone();
+    cfg.server.host = "127.0.0.1".into();
+    cfg.server.port = busy;
+    let state = ctx.state.clone();
+    tokio::spawn(async move {
+        let _ = web_api::start_server(state, cfg).await;
+    });
+    let web = loop {
+        if let Some(w) = ctx.state.web_server.get() {
+            break w.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let a = web.addr().await;
+    assert_ne!(a.port(), busy);
+    assert_eq!(web.moved_from().await, Some(busy));
+    assert!(web.startup_error().await.is_some());
+    assert_eq!(health(a).await, Some(200));
+    let b = web_api::handlers::proxy::bind_result(&ctx.state).await;
+    if let Some(b) = b {
+        assert_eq!(b.webui_moved_to, Some(a.to_string()));
+        assert!(b.webui_error.is_some());
+    }
+    let n = web.rebind("127.0.0.1", 0).await.unwrap();
+    assert_eq!(web.moved_from().await, None);
+    assert_eq!(web.startup_error().await, None);
+    assert_eq!(health(n).await, Some(200));
+}
+
+#[tokio::test]
+async fn saving_unchanged_settings_retries_a_down_proxy_listener() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let fake = Arc::new(Fake::default());
+    assert!(ctx.state.runtime.set(fake.clone()).is_ok());
+    fake.down.store(true, std::sync::atomic::Ordering::Relaxed);
+    let before = fake.calls.lock().unwrap().len();
+    put(&admin, json!({"request_timeout_secs": 41}))
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        fake.calls.lock().unwrap().len(),
+        before + 1,
+        "rebind retried"
+    );
+    // Healthy again: an unchanged save does not rebind.
+    fake.down.store(false, std::sync::atomic::Ordering::Relaxed);
+    put(&admin, json!({"request_timeout_secs": 42}))
+        .await
+        .assert_status_ok();
+    assert_eq!(fake.calls.lock().unwrap().len(), before + 1);
+}
+
+#[tokio::test]
+async fn saving_after_the_busy_web_port_frees_recovers_and_tracks_the_port() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let fake = Arc::new(Fake::default());
+    assert!(ctx.state.runtime.set(fake.clone()).is_ok());
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = blocker.local_addr().unwrap().port();
+    {
+        let mut c = ctx.state.proxy_state.config.write();
+        c.webui.host = "127.0.0.1".into();
+        c.webui.port = busy;
+    }
+    let mut cfg = ctx.api_config.clone();
+    cfg.server.host = "127.0.0.1".into();
+    cfg.server.port = busy;
+    tokio::spawn(web_api::start_server(ctx.state.clone(), cfg));
+    let web = loop {
+        if let Some(w) = ctx.state.web_server.get() {
+            break w.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let data_dir = ctx.state.proxy_state.config.read().adblock.data_dir.clone();
+    let port_file = data_dir.join(".webui_port");
+    let fallback = web.addr().await.port();
+    assert_ne!(fallback, busy);
+    assert_eq!(
+        std::fs::read_to_string(&port_file).unwrap(),
+        fallback.to_string()
+    );
+    // Loop protection is told the port actually bound, not the configured one.
+    assert_eq!(fake.webui.lock().unwrap().first().unwrap().1, fallback);
+
+    drop(blocker);
+    let r = put(&admin, json!({"request_timeout_secs": 43})).await;
+    r.assert_status_ok();
+    assert_eq!(web.moved_from().await, None);
+    assert_eq!(web.addr().await.port(), busy);
+    assert_eq!(
+        std::fs::read_to_string(&port_file).unwrap(),
+        busy.to_string(),
+        "port file follows a rebind"
+    );
+    let body: Value = r.json();
+    assert!(
+        body["bind"]["webui_moved_to"].is_null()
+            || body["bind"]["webui_moved_to"].as_str() == Some(&format!("127.0.0.1:{busy}")),
+        "{body}"
+    );
 }

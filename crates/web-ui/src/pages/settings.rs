@@ -571,6 +571,15 @@ fn SettingsInner() -> impl IntoView {
         let all = all.clone();
         move |c: &ProxyConfigResponse, only_clean: bool| {
             if let Some(b) = &c.bind {
+                if let (Some(a), Some(f)) = (
+                    &b.webui_moved_to,
+                    all.iter().find(|f| f.def.key == "webui_port"),
+                ) {
+                    f.msg.set(Some((
+                        true,
+                        format!("Web UI is on {a} because the configured port is in use. Change the port here."),
+                    )));
+                }
                 for (down, keys) in [
                     (b.proxy_down, ["explicit_host", "explicit_port"]),
                     (b.transparent_down, ["transparent_on", "transparent_port"]),

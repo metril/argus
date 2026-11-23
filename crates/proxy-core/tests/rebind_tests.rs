@@ -410,3 +410,101 @@ async fn apply_access_changes_nothing_when_any_part_fails() {
     assert!(r.is_err(), "connection was closed: {r:?}");
     let _ = run.shutdown.send(());
 }
+
+/// Start via `ProxyServer::start` with the given ports (which may be occupied).
+async fn start_cfg(
+    port: u16,
+    tport: Option<u16>,
+) -> (Arc<ProxyControl>, tokio::task::JoinHandle<()>) {
+    let mut config = ProxyConfig::default();
+    config.proxy.host = HOST.into();
+    config.proxy.port = port;
+    config.proxy.transparent_port = tport;
+    config.mitm.enabled = false;
+    config.proxy.enable_websockets = false;
+    let ctx = Arc::new(ProxyContext::new(
+        Arc::new(SharedEngine::new()),
+        reqwest::Client::new(),
+        true,
+    ));
+    let server = ProxyServer::new(config, ctx).unwrap();
+    let ctl = server.control();
+    let task = tokio::spawn(async move {
+        let _ = server.start().await;
+    });
+    for _ in 0..200 {
+        if ctl.bind_info().await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (ctl, task)
+}
+
+async fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind((HOST, 0)).unwrap();
+    l.local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn occupied_proxy_port_starts_degraded_then_rebind_recovers() {
+    let held = std::net::TcpListener::bind((HOST, 0)).unwrap();
+    let busy = held.local_addr().unwrap().port();
+    let (ctl, task) = start_cfg(busy, None).await;
+    let info = ctl.bind_info().await.expect("start must succeed degraded");
+    assert!(info.proxy_down && info.proxy_error.is_some());
+    assert!(!task.is_finished());
+
+    // Retrying the same busy port keeps it down with the error.
+    assert!(ctl.rebind(HOST, busy, None).await.is_err());
+    let info = ctl.bind_info().await.unwrap();
+    assert!(info.proxy_down && info.proxy_error.is_some());
+
+    let info = ctl.rebind(HOST, free_port().await, None).await.unwrap();
+    assert!(!info.proxy_down && info.proxy_error.is_none());
+    assert!(accepts(info.proxy).await);
+    task.abort();
+}
+
+#[tokio::test]
+async fn occupied_transparent_port_starts_degraded_then_rebind_recovers() {
+    let held = std::net::TcpListener::bind((HOST, 0)).unwrap();
+    let busy = held.local_addr().unwrap().port();
+    let port = free_port().await;
+    let (ctl, task) = start_cfg(port, Some(busy)).await;
+    let info = ctl.bind_info().await.expect("start must succeed degraded");
+    assert!(!info.proxy_down && info.proxy_error.is_none());
+    assert!(info.transparent_down && info.transparent_error.is_some());
+    assert!(accepts(info.proxy).await);
+
+    let info = ctl
+        .rebind(HOST, port, Some(free_port().await))
+        .await
+        .unwrap();
+    assert!(!info.transparent_down && info.transparent_error.is_none());
+    assert!(accepts(info.transparent.unwrap()).await);
+    task.abort();
+}
+
+#[tokio::test]
+async fn failed_transparent_bind_leaves_the_down_explicit_listener_error_alone() {
+    let held = std::net::TcpListener::bind((HOST, 0)).unwrap();
+    let busy = held.local_addr().unwrap().port();
+    let held2 = std::net::TcpListener::bind((HOST, 0)).unwrap();
+    let busy2 = held2.local_addr().unwrap().port();
+    let (ctl, task) = start_cfg(busy, None).await;
+    let before = ctl.bind_info().await.unwrap().proxy_error.unwrap();
+    // Explicit unchanged (still down on its busy port is retried and fails first), so retarget
+    // only the transparent side with a fresh free explicit port: the transparent bind fails.
+    let free = free_port().await;
+    assert!(ctl.rebind(HOST, free, Some(busy2)).await.is_err());
+    let info = ctl.bind_info().await.unwrap();
+    assert!(info.transparent_error.is_none() || info.transparent_down);
+    assert!(info.proxy_down);
+    assert_eq!(
+        info.proxy_error.as_deref(),
+        Some(before.as_str()),
+        "explicit slot did not fail this time"
+    );
+    task.abort();
+}

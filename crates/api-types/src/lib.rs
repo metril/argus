@@ -312,6 +312,15 @@ pub struct BindResult {
     /// Set when this update moved the web API: open it here. The old address keeps answering
     /// for 30 seconds.
     pub webui_moved_to: Option<String>,
+    /// The web API could not use its configured port at startup (set with `webui_moved_to`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webui_error: Option<String>,
+    /// Why the explicit listener is down, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_error: Option<String>,
+    /// Why the transparent listener is down, when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparent_error: Option<String>,
 }
 
 /// Result of a config update: the new config plus which changes are already live and which

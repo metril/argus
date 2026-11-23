@@ -40,6 +40,9 @@ pub struct BindInfo {
     /// address above is the last one it had. Another `rebind` brings it back.
     pub proxy_down: bool,
     pub transparent_down: bool,
+    /// Why the explicit listener is down (bind failure), cleared once it is bound.
+    pub proxy_error: Option<String>,
+    pub transparent_error: Option<String>,
 }
 
 /// One running accept loop. Stopping it drops the listening socket; connections it already
@@ -52,9 +55,23 @@ struct Listener {
     task: tokio::task::JoinHandle<()>,
     /// Closed and not restored: nothing listens on `addr`.
     down: bool,
+    /// Why it is down.
+    error: Option<String>,
 }
 
 impl Listener {
+    /// A listener that failed to bind: nothing listens on `addr` until a rebind succeeds.
+    fn down(addr: SocketAddr, requested: (String, u16), error: String) -> Self {
+        Self {
+            addr,
+            requested,
+            stop: None,
+            task: tokio::spawn(async {}),
+            down: true,
+            error: Some(error),
+        }
+    }
+
     /// Ask the loop to stop; resolves once the listening socket is closed.
     async fn stop(mut self) {
         self.close().await;
@@ -65,6 +82,19 @@ impl Listener {
             let _ = tx.send(());
         }
         let _ = (&mut self.task).await;
+    }
+}
+
+impl Running {
+    fn info(&self) -> BindInfo {
+        BindInfo {
+            proxy: self.explicit.addr,
+            transparent: self.transparent.as_ref().map(|t| t.addr),
+            proxy_down: self.explicit.down,
+            transparent_down: self.transparent.as_ref().is_some_and(|t| t.down),
+            proxy_error: self.explicit.error.clone(),
+            transparent_error: self.transparent.as_ref().and_then(|t| t.error.clone()),
+        }
     }
 }
 
@@ -157,12 +187,7 @@ fn spec_addr(host: &str, port: u16) -> String {
 impl ProxyControl {
     /// Current bind addresses (`None` before the server runs).
     pub async fn bind_info(&self) -> Option<BindInfo> {
-        self.running.lock().await.as_ref().map(|r| BindInfo {
-            proxy: r.explicit.addr,
-            transparent: r.transparent.as_ref().map(|t| t.addr),
-            proxy_down: r.explicit.down,
-            transparent_down: r.transparent.as_ref().is_some_and(|t| t.down),
-        })
+        self.running.lock().await.as_ref().map(Running::info)
     }
 
     /// Note where the web API listens (own-listener loop protection); call after it rebinds.
@@ -436,12 +461,7 @@ impl ProxyControl {
             _ => false,
         };
         if same_e && same_t {
-            return Ok(BindInfo {
-                proxy: run.explicit.addr,
-                transparent: run.transparent.as_ref().map(|t| t.addr),
-                proxy_down: false,
-                transparent_down: false,
-            });
+            return Ok(run.info());
         }
 
         // Bind the replacements. When the new address collides with the old socket of the same
@@ -451,6 +471,8 @@ impl ProxyControl {
         let mut new_e: Option<TcpListener> = None;
         let mut new_t: Option<TcpListener> = None;
         let mut err: Option<Error> = None;
+        // Slots whose own bind (or later restore) failed: only these carry the error.
+        let mut failed = [false; 2];
 
         if !same_e {
             if port != 0 && !run.explicit.down && run.explicit.addr.port() == port {
@@ -462,7 +484,10 @@ impl ProxyControl {
             let a = spec_addr(host, port);
             match TcpListener::bind(&a).await {
                 Ok(l) => new_e = Some(l),
-                Err(e) => err = Some(Error::Connection(format!("cannot bind proxy to {a}: {e}"))),
+                Err(e) => {
+                    failed[0] = true;
+                    err = Some(Error::Connection(format!("cannot bind proxy to {a}: {e}")))
+                }
             }
         }
         if err.is_none() && !same_t {
@@ -481,6 +506,7 @@ impl ProxyControl {
                 match TcpListener::bind(&a).await {
                     Ok(l) => new_t = Some(l),
                     Err(e) => {
+                        failed[1] = true;
                         err = Some(Error::Connection(format!(
                             "cannot bind transparent listener to {a}: {e}"
                         )))
@@ -491,7 +517,10 @@ impl ProxyControl {
         if err.is_none() && new_t.is_some() && run.entry.is_none() {
             match self.make_entry() {
                 Ok(e) => run.entry = Some(e),
-                Err(e) => err = Some(e),
+                Err(e) => {
+                    failed[1] = true;
+                    err = Some(e)
+                }
             }
         }
 
@@ -538,8 +567,19 @@ impl ProxyControl {
                     }
                     Err(re) => {
                         lost = true;
+                        failed[i] = true;
                         tracing::error!("could not restore listener on {addr}: {re}");
                     }
+                }
+            }
+            // Whatever stays down carries the reason.
+            let why = e.to_string();
+            for (i, l) in std::iter::once(&mut run.explicit)
+                .chain(run.transparent.as_mut())
+                .enumerate()
+            {
+                if l.down && failed[i] {
+                    l.error = Some(why.clone());
                 }
             }
             return Err(if lost {
@@ -581,12 +621,7 @@ impl ProxyControl {
                 .map(|t| format!(", transparent on {}", t.addr))
                 .unwrap_or_default()
         );
-        Ok(BindInfo {
-            proxy: run.explicit.addr,
-            transparent: run.transparent.as_ref().map(|t| t.addr),
-            proxy_down: false,
-            transparent_down: false,
-        })
+        Ok(run.info())
     }
 
     /// Start an accept loop on `listener`.
@@ -614,6 +649,7 @@ impl ProxyControl {
             stop: Some(stop),
             task,
             down: false,
+            error: None,
         }
     }
 
@@ -843,18 +879,18 @@ impl ProxyServer {
 
     /// Start the proxy server with graceful shutdown
     pub async fn start(&self) -> Result<()> {
-        let addr = format!("{}:{}", self.config.proxy.host, self.config.proxy.port);
-        let listener = TcpListener::bind(&addr)
-            .await
-            .map_err(|e| Error::Connection(format!("Failed to bind to {}: {}", addr, e)))?;
-
+        let host = &self.config.proxy.host;
+        let bind = |port: u16, what: &'static str| async move {
+            let a = spec_addr(host, port);
+            TcpListener::bind(&a).await.map_err(|e| {
+                let msg = format!("cannot bind {what} to {a}: {e}");
+                tracing::error!("{msg}; starting without it, fix it in the web UI");
+                msg
+            })
+        };
+        let listener = bind(self.config.proxy.port, "proxy").await;
         let transparent = match self.config.proxy.transparent_port {
-            Some(port) => {
-                let taddr = format!("{}:{}", self.config.proxy.host, port);
-                Some(TcpListener::bind(&taddr).await.map_err(|e| {
-                    Error::Connection(format!("Failed to bind transparent listener {taddr}: {e}"))
-                })?)
-            }
+            Some(port) => Some(bind(port, "transparent listener").await),
             None => None,
         };
 
@@ -867,7 +903,7 @@ impl ProxyServer {
             let _ = shutdown_signal.send(());
         });
 
-        self.serve_all(listener, transparent, shutdown_tx).await
+        self.serve_parts(listener, transparent, shutdown_tx).await
     }
 
     /// Serve on an already-bound listener until `shutdown_tx` fires. Lets callers (and tests)
@@ -888,11 +924,25 @@ impl ProxyServer {
         transparent: Option<TcpListener>,
         shutdown_tx: broadcast::Sender<()>,
     ) -> Result<()> {
-        let addr = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        info!("Proxy server listening on {}", addr);
+        self.serve_parts(Ok(listener), transparent.map(Ok), shutdown_tx)
+            .await
+    }
+
+    /// `serve_all` where a listener may have failed to bind (`Err` = reason): it starts down
+    /// and a rebind can bring it up, so the process stays alive for the web UI.
+    async fn serve_parts(
+        &self,
+        listener: std::result::Result<TcpListener, String>,
+        transparent: Option<std::result::Result<TcpListener, String>>,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> Result<()> {
+        match &listener {
+            Ok(l) => info!(
+                "Proxy server listening on {}",
+                l.local_addr().map(|a| a.to_string()).unwrap_or_default()
+            ),
+            Err(_) => warn!("Proxy server is NOT listening (bind failed)"),
+        }
 
         let cfg_host = self.config.proxy.host.clone();
         for (name, t) in [("explicit", false), ("transparent", true)] {
@@ -948,36 +998,45 @@ impl ProxyServer {
         })));
         let entry = match &transparent {
             Some(t) => {
-                info!(
-                    "Transparent listener on {}",
-                    t.local_addr().map(|a| a.to_string()).unwrap_or_default()
-                );
+                if let Ok(t) = t {
+                    info!(
+                        "Transparent listener on {}",
+                        t.local_addr().map(|a| a.to_string()).unwrap_or_default()
+                    );
+                }
                 Some(ctl.make_entry()?)
             }
             None => None,
         };
-        let t_port = transparent
-            .as_ref()
-            .and_then(|t| t.local_addr().ok())
-            .map_or(0, |a| a.port());
-        let explicit = ctl.spawn_listener(
-            listener,
-            shared.clone(),
-            None,
-            &shutdown_tx,
-            (cfg_host.clone(), self.config.proxy.port),
-        );
+        let down_addr = |port: u16| {
+            spec_addr(&cfg_host, port)
+                .parse::<SocketAddr>()
+                .unwrap_or(SocketAddr::from(([0, 0, 0, 0], port)))
+        };
+        let explicit_req = (cfg_host.clone(), self.config.proxy.port);
+        let explicit = match listener {
+            Ok(l) => ctl.spawn_listener(l, shared.clone(), None, &shutdown_tx, explicit_req),
+            Err(e) => Listener::down(down_addr(explicit_req.1), explicit_req, e),
+        };
         let transparent = transparent.map(|t| {
-            ctl.spawn_listener(
-                t,
-                shared.clone(),
-                entry.clone(),
-                &shutdown_tx,
-                (
-                    cfg_host.clone(),
-                    self.config.proxy.transparent_port.unwrap_or(t_port),
-                ),
-            )
+            let port = self.config.proxy.transparent_port.unwrap_or(0);
+            match t {
+                Ok(t) => {
+                    let port = if port == 0 {
+                        t.local_addr().map_or(0, |a| a.port())
+                    } else {
+                        port
+                    };
+                    ctl.spawn_listener(
+                        t,
+                        shared.clone(),
+                        entry.clone(),
+                        &shutdown_tx,
+                        (cfg_host.clone(), port),
+                    )
+                }
+                Err(e) => Listener::down(down_addr(port), (cfg_host.clone(), port), e),
+            }
         });
         ctl.publish_own(&explicit, transparent.as_ref());
         *ctl.running.lock().await = Some(Running {

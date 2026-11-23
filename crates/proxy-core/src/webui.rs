@@ -90,6 +90,8 @@ fn bind(b: crate::server::BindInfo) -> web_api::ProxyBind {
         transparent: b.transparent,
         proxy_down: b.proxy_down,
         transparent_down: b.transparent_down,
+        proxy_error: b.proxy_error,
+        transparent_error: b.transparent_error,
     }
 }
 

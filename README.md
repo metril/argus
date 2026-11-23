@@ -153,7 +153,7 @@ Failures (upstream timeouts and errors, DNS failures, refused destinations) are 
 
 ### Getting started (end-to-end)
 
-The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API) and **3129** (transparent mode, `proxy.transparent_port`; unset to turn it off). Transparent mode needs `network_mode: host` and an nftables redirect on the gateway: see [docs/TRANSPARENT.md](docs/TRANSPARENT.md). Ports, passthrough hosts and the access lists can be changed in the web UI without a restart; they are saved to `/app/data/settings.toml` (`CONFIG_OVERLAY_PATH`), not to the read-only shipped config.
+The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API) and **3129** (transparent mode, `proxy.transparent_port`; unset to turn it off). Transparent mode needs `network_mode: host` and an nftables redirect on the gateway: see [docs/TRANSPARENT.md](docs/TRANSPARENT.md). Ports, passthrough hosts and the access lists can be changed in the web UI without a restart; they are saved to `/app/data/settings.toml` (`CONFIG_OVERLAY_PATH`), not to the read-only shipped config. A taken port no longer stops startup: the proxy listener shows as down with the error, and the web UI moves to the next free port and logs the URL.
 
 1. **Start it** — `./target/release/argus` (or `docker compose up -d`).
 2. **Create your account** — open `http://localhost:3000` and register. The **first** user

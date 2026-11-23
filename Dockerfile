@@ -136,6 +136,6 @@ ENV WEBUI_DIST_PATH=/app/webui
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD nc -z 127.0.0.1 8080 && nc -z 127.0.0.1 3000 || exit 1
+    CMD wget -q -O /dev/null "http://127.0.0.1:$(cat /app/data/filters/.webui_port 2>/dev/null || echo 3000)/health" || exit 1
 
 ENTRYPOINT ["/app/argus"]
