@@ -26,3 +26,14 @@ impl ApiClient {
         self.update_custom_rules(&rules, &etag).await.map(|_| ())
     }
 }
+
+impl ApiClient {
+    /// Real upstream certificate recorded for a request (`cert_fp` on the log entry).
+    /// `host` selects whose verification verdict is reported (the host the request went to).
+    pub async fn get_cert(&self, fp: &str, host: &str) -> Result<api_types::CertInfo, ApiError> {
+        if host.is_empty() {
+            return self.get(&format!("/certs/{fp}")).await;
+        }
+        self.get(&format!("/certs/{fp}?host={host}")).await
+    }
+}

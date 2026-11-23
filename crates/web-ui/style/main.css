@@ -663,3 +663,10 @@ textarea.form-input{height:auto;padding:8px 10px;font-family:var(--font-mono);fo
 .flist .nm .tag{margin-left:6px;vertical-align:1px}
 @media (max-width:760px){.srow.cat .txt{flex-basis:calc(100% - 50px)}.bpstrip .bpcnt{margin-left:0;white-space:normal}}
 .drawer.sm{width:min(360px,100%)}
+.cert{display:flex;flex-direction:column;gap:var(--s3);align-items:flex-start}
+.cert-body{display:flex;flex-direction:column;gap:var(--s3);width:100%}
+.cert-fp{display:flex;align-items:flex-start;gap:6px;word-break:break-all}
+.cert-chain{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;border:1px solid var(--line);border-radius:var(--r-ctl)}
+.cert-chain li{display:flex;flex-direction:column;gap:2px;padding:var(--s2) var(--s3);font-size:var(--fs-12);overflow-wrap:anywhere}
+.cert-chain li+li{border-top:1px solid var(--line)}
+.cert-chain small{color:var(--text-3)}
