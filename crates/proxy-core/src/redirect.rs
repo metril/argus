@@ -62,6 +62,9 @@ fn reason_text(r: Option<common::certstore::FailReason>) -> &'static str {
         Some(R::UnknownIssuer) => {
             "The certificate was issued by an unknown or untrusted authority."
         }
+        Some(R::Distrusted) => {
+            "The authority that issued the certificate is no longer trusted for certificates like this one."
+        }
         _ => "The server's certificate or TLS handshake could not be verified.",
     }
 }

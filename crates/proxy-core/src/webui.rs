@@ -72,6 +72,9 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
     )
     .await?;
     let _ = state.certs.set(ctx.certs().clone());
+    if let Some(r) = ctx.roots() {
+        let _ = state.roots.set(r.cell.clone());
+    }
     if let Some(p) = ctx.prober() {
         let _ = state.chain_probe.set(p.clone());
     }

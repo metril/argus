@@ -30,6 +30,19 @@ pub struct UpstreamOptions {
     pub pool_max_idle_per_host: Option<usize>,
     /// Where the certificates upstream servers present are recorded (shared with the web API).
     pub certs: Arc<common::certstore::CertStore>,
+    /// The live trusted root set; built from `extra_ca_paths` over the compiled-in floor when
+    /// `None` (a context installs one so every client shares it).
+    pub roots: Option<Arc<crate::roots::RootsHandle>>,
+}
+
+impl UpstreamOptions {
+    /// The root set handle: the shared one, or a fresh floor of the extra CAs.
+    pub fn roots_handle(&self) -> Result<Arc<crate::roots::RootsHandle>> {
+        match &self.roots {
+            Some(r) => Ok(r.clone()),
+            None => crate::roots::RootsHandle::floor(&self.extra_ca_paths),
+        }
+    }
 }
 
 impl UpstreamOptions {
@@ -48,6 +61,7 @@ impl UpstreamOptions {
                 config.performance.request_timeout_secs.max(1),
             )),
             certs: Default::default(),
+            roots: None,
             dns: Some(dns.clone()),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
                 match config.performance.max_connections {
@@ -68,157 +82,25 @@ impl UpstreamOptions {
     }
 }
 
-/// Root store used for every upstream TLS dial: built-in web roots plus `extra_ca_paths` (PEM
-/// files). Shared by the WebSocket path so HTTP and WebSocket trust the same CAs.
+/// Trust anchors of the compiled-in set plus `extra_ca_paths` (PEM files), for callers that
+/// need a plain store. Upstream dials use the live [`RootsHandle`] instead.
 pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertStore> {
-    // No index: the WebSocket path only needs the trust anchors.
-    build_root_set(extra_ca_paths).map(|(r, _)| r)
+    Ok(crate::roots::ActiveRoots::floor(extra_ca_paths)?
+        .store()
+        .clone())
 }
 
-/// Full certificates of the trusted roots, indexed by the (subject, key) a webpki trust anchor
-/// carries: the configured extra CAs and the Mozilla bundle (`webpki-root-certs`, the same
-/// release as `webpki-roots`). Built once at startup; a lookup is one hash probe. A verified
-/// path's anchor is turned back into its genuine certificate here, never from what a server
-/// presented (a look-alike with the same name and key is not that root).
-#[derive(Debug, Default)]
-pub struct RootIndex {
-    /// The Mozilla bundle, indexed once per process and shared.
-    bundle: Arc<std::collections::HashMap<Vec<u8>, &'static [u8]>>,
-    /// Configured extra CAs.
-    extra: std::collections::HashMap<Vec<u8>, Vec<u8>>,
-}
-
-type BundleIndex = std::collections::HashMap<Vec<u8>, &'static [u8]>;
-
-fn bundle_index() -> Arc<BundleIndex> {
-    static BUNDLE: std::sync::OnceLock<Arc<BundleIndex>> = std::sync::OnceLock::new();
-    BUNDLE
-        .get_or_init(|| {
-            let mut m = BundleIndex::new();
-            for c in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-                if let Ok(a) = webpki::anchor_from_trusted_cert(c) {
-                    let key =
-                        RootIndex::key(a.subject.as_ref(), a.subject_public_key_info.as_ref());
-                    // `'static` data of the crate: shared, not copied.
-                    m.insert(key, c.as_ref());
-                }
-            }
-            Arc::new(m)
-        })
-        .clone()
-}
-
-impl RootIndex {
-    fn key(subject: &[u8], spki: &[u8]) -> Vec<u8> {
-        let mut k = Vec::with_capacity(4 + subject.len() + spki.len());
-        k.extend_from_slice(&(subject.len() as u32).to_be_bytes());
-        k.extend_from_slice(subject);
-        k.extend_from_slice(spki);
-        k
-    }
-
-    fn insert_extra(&mut self, der: &[u8]) {
-        let cert = rustls::pki_types::CertificateDer::from(der);
-        if let Ok(a) = webpki::anchor_from_trusted_cert(&cert) {
-            let key = Self::key(a.subject.as_ref(), a.subject_public_key_info.as_ref());
-            self.extra.insert(key, der.to_vec());
-        }
-    }
-
-    /// The certificate of `anchor`, if it is one of the trusted roots. One hash probe.
-    fn get(&self, anchor: &rustls::pki_types::TrustAnchor<'_>) -> Option<&[u8]> {
-        let key = Self::key(
-            anchor.subject.as_ref(),
-            anchor.subject_public_key_info.as_ref(),
-        );
-        self.extra
-            .get(&key)
-            .map(Vec::as_slice)
-            .or_else(|| self.bundle.get(&key).copied())
+/// Verifier of the probe handshake: the same verification as every dial, on the set in force
+/// when the probe started, remembering the chain it saw and the verdict (the handshake is
+/// rejected on a failure, so the verdict is kept here).
+impl std::fmt::Debug for ProbeVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeVerifier").finish_non_exhaustive()
     }
 }
 
-/// [`build_root_store`] plus the [`RootIndex`] of the same roots' full certificates.
-pub fn build_root_set(extra_ca_paths: &[PathBuf]) -> Result<(rustls::RootCertStore, RootIndex)> {
-    let mut index = RootIndex {
-        bundle: bundle_index(),
-        extra: Default::default(),
-    };
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for path in extra_ca_paths {
-        let pem = std::fs::read(path).map_err(|e| {
-            Error::Config(format!(
-                "Failed to read upstream CA {}: {e}",
-                path.display()
-            ))
-        })?;
-        let mut n = 0;
-        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-            let cert = cert.map_err(|e| {
-                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-            })?;
-            index.insert_extra(cert.as_ref());
-            roots.add(cert).map_err(|e| {
-                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-            })?;
-            n += 1;
-        }
-        if n == 0 {
-            return Err(Error::Config(format!(
-                "Upstream CA {} contains no PEM certificates",
-                path.display()
-            )));
-        }
-    }
-    Ok((roots, index))
-}
-
-/// The certificates of the path webpki actually verified for `end_entity`: leaf, intermediates,
-/// and the trust anchor's genuine certificate from `index` when it is a known root. Built with
-/// the same roots, intermediates and time as the verification itself, so a forged or unrelated
-/// certificate that merely shares a name with a real one cannot appear in it. Borrows
-/// everything (no certificate is copied).
-fn verified_path<'a>(
-    roots: &rustls::RootCertStore,
-    index: &'a RootIndex,
-    algs: &rustls::crypto::WebPkiSupportedAlgorithms,
-    end_entity: &'a rustls::pki_types::CertificateDer<'a>,
-    intermediates: &'a [rustls::pki_types::CertificateDer<'a>],
-    now: rustls::pki_types::UnixTime,
-) -> Option<Vec<&'a [u8]>> {
-    let ee = webpki::EndEntityCert::try_from(end_entity).ok()?;
-    let path = ee
-        .verify_for_usage(
-            algs.all,
-            &roots.roots,
-            intermediates,
-            now,
-            webpki::KeyUsage::server_auth(),
-            None,
-            None,
-        )
-        .ok()?;
-    let mut out: Vec<&'a [u8]> = vec![end_entity.as_ref()];
-    for c in path.intermediate_certificates() {
-        // Each is one of `intermediates` (the path only borrows them).
-        let der = c.der();
-        let found = intermediates.iter().find(|i| i.as_ref() == der.as_ref())?;
-        out.push(found.as_ref());
-    }
-    if let Some(root) = index.get(path.anchor()) {
-        out.push(root);
-    }
-    Some(out)
-}
-
-/// Verifier of the probe handshake: standard web-PKI verification, remembering the chain it saw
-/// and the verdict (the handshake is rejected on a failure, so the verdict is kept here).
-#[derive(Debug)]
 struct ProbeVerifier {
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
-    roots: Arc<rustls::RootCertStore>,
-    root_certs: Arc<RootIndex>,
+    active: Arc<crate::roots::ActiveRoots>,
     algs: rustls::crypto::WebPkiSupportedAlgorithms,
     seen: parking_lot::Mutex<Option<ProbeSeen>>,
 }
@@ -228,7 +110,7 @@ type ProbeSeen = (
     std::result::Result<(), (common::certstore::FailReason, String)>,
 );
 
-fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
+pub(crate) fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
     use common::certstore::FailReason as R;
     use rustls::CertificateError as C;
     match e {
@@ -237,6 +119,9 @@ fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
             C::NotValidYet | C::NotValidYetContext { .. } => R::NotYetValid,
             C::NotValidForName | C::NotValidForNameContext { .. } => R::NameMismatch,
             C::UnknownIssuer => R::UnknownIssuer,
+            C::Other(o) if o.0.downcast_ref::<crate::roots::Distrusted>().is_some() => {
+                R::Distrusted
+            }
             _ => R::Other,
         },
         _ => R::Other,
@@ -249,36 +134,22 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         intermediates: &[rustls::pki_types::CertificateDer<'_>],
         server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
+        _ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let res = self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        );
+        let res = self
+            .active
+            .verify(end_entity, intermediates, server_name, now);
         // An accepted chain is stored as the verified path; a rejected one only for its leaf.
-        let chain = match &res {
-            Ok(_) => verified_path(
-                &self.roots,
-                &self.root_certs,
-                &self.algs,
-                end_entity,
-                intermediates,
-                now,
-            )
-            .map(|p| p.into_iter().map(<[u8]>::to_vec).collect())
-            .unwrap_or_else(|| vec![end_entity.as_ref().to_vec()]),
-            Err(_) => vec![end_entity.as_ref().to_vec()],
-        };
-        let verdict = match &res {
-            Ok(_) => Ok(()),
-            Err(e) => Err((fail_reason(e), e.to_string())),
+        let (chain, verdict) = match &res {
+            Ok(path) => (path.iter().map(|d| d.to_vec()).collect(), Ok(())),
+            Err(e) => (
+                vec![end_entity.as_ref().to_vec()],
+                Err((fail_reason(e), e.to_string())),
+            ),
         };
         *self.seen.lock() = Some((chain, verdict));
-        res
+        res.map(|_| rustls::client::danger::ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -287,7 +158,7 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
     fn verify_tls13_signature(
@@ -296,11 +167,11 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.algs.supported_schemes()
     }
 }
 
@@ -314,102 +185,21 @@ impl common::certstore::ChainProbe for CertProber {
     }
 }
 
-/// Standard web-PKI verification that also keeps the chain of every chain it accepts, so the
-/// full path of a certificate is known without any extra connection. It only delegates and
-/// returns the inner result; it writes no verdict, host, port or profile.
-#[derive(Debug)]
-pub struct ChainCapture {
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
-    roots: Arc<rustls::RootCertStore>,
-    root_certs: Arc<RootIndex>,
-    algs: rustls::crypto::WebPkiSupportedAlgorithms,
-    store: Arc<common::certstore::CertStore>,
-}
-
-impl rustls::client::danger::ServerCertVerifier for ChainCapture {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
-        now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let ok = self.inner.verify_server_cert(
-            end_entity,
-            intermediates,
-            server_name,
-            ocsp_response,
-            now,
-        )?;
-        if self
-            .store
-            .wants_chain(end_entity.as_ref(), 1 + intermediates.len())
-        {
-            if let Some(path) = verified_path(
-                &self.roots,
-                &self.root_certs,
-                &self.algs,
-                end_entity,
-                intermediates,
-                now,
-            ) {
-                self.store
-                    .record_chain(&path, &|| crate::ev::is_ev_der(end_entity.as_ref()));
-            }
-        }
-        Ok(ok)
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
-}
-
-/// Web-PKI client config over `roots` (chains captured into `store`), ALPN h2 then http/1.1.
+/// Client TLS config: every handshake is verified against the live root set (chains captured
+/// into `store`), ALPN h2 then http/1.1.
 pub fn client_tls_config(
-    roots: rustls::RootCertStore,
-    root_certs: RootIndex,
+    roots: Arc<crate::roots::RootsHandle>,
     store: Arc<common::certstore::CertStore>,
 ) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots = Arc::new(roots);
-    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        roots.clone(),
-        provider.clone(),
-    )
-    .build()
-    .map_err(|e| Error::Config(format!("Failed to build upstream verifier: {e}")))?;
-    let algs = provider.signature_verification_algorithms;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Config(format!("Failed to build upstream TLS config: {e}")))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ChainCapture {
-            inner,
+        .with_custom_certificate_verifier(Arc::new(crate::roots::LiveVerifier::new(
             roots,
-            root_certs: Arc::new(root_certs),
-            algs,
-            store,
-        }))
+            Some(store),
+        )))
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(cfg)
@@ -432,8 +222,7 @@ struct Busy;
 
 struct ProbeInner {
     store: Arc<common::certstore::CertStore>,
-    roots: Arc<rustls::RootCertStore>,
-    root_certs: Arc<RootIndex>,
+    roots: Arc<crate::roots::RootsHandle>,
     resolver: PolicyResolver,
     connect_timeout_ms: std::sync::atomic::AtomicU64,
     limit: tokio::sync::Semaphore,
@@ -493,11 +282,9 @@ impl CertProber {
         wait: Duration,
         background: usize,
     ) -> Result<Self> {
-        let (roots, root_certs) = build_root_set(&opts.extra_ca_paths)?;
         Ok(Self(Arc::new(ProbeInner {
             store: opts.certs.clone(),
-            roots: Arc::new(roots),
-            root_certs: Arc::new(root_certs),
+            roots: opts.roots_handle()?,
             resolver: PolicyResolver {
                 policy: opts.policy.clone(),
                 override_ip: opts.resolve_all_to,
@@ -644,14 +431,8 @@ impl ProbeInner {
         let name = rustls::pki_types::ServerName::try_from(bare.to_string()).ok()?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = Arc::new(ProbeVerifier {
-            inner: rustls::client::WebPkiServerVerifier::builder_with_provider(
-                self.roots.clone(),
-                provider.clone(),
-            )
-            .build()
-            .ok()?,
-            roots: self.roots.clone(),
-            root_certs: self.root_certs.clone(),
+            // The set in force when the probe starts.
+            active: self.roots.load_full(),
             algs: provider.signature_verification_algorithms,
             seen: Default::default(),
         });
@@ -781,9 +562,8 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
         .http2_adaptive_window(true);
-    let (roots, root_certs) = build_root_set(&opts.extra_ca_paths)?;
     builder =
-        builder.use_preconfigured_tls(client_tls_config(roots, root_certs, opts.certs.clone())?);
+        builder.use_preconfigured_tls(client_tls_config(opts.roots_handle()?, opts.certs.clone())?);
     if let Some(t) = opts.connect_timeout {
         builder = builder.connect_timeout(t);
     }
@@ -1400,239 +1180,5 @@ mod probe_tests {
         let (p, _d) = prober(&pki);
         // Nothing listens on port 1.
         assert_eq!(p.probe("h.test", 1).await, None);
-    }
-}
-
-#[cfg(test)]
-mod capture_tests {
-    use super::*;
-    use common::certstore::{fingerprint, CertStore};
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
-    use rustls::client::danger::ServerCertVerifier;
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-
-    fn ca(cn: &str) -> (CertificateDer<'static>, Issuer<'static, KeyPair>) {
-        let mut p = CertificateParams::new(vec![]).unwrap();
-        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        p.distinguished_name.push(DnType::CommonName, cn);
-        let key = KeyPair::generate().unwrap();
-        let cert = p.self_signed(&key).unwrap();
-        (cert.der().clone(), Issuer::new(p, key))
-    }
-
-    fn leaf(name: &str, issuer: &Issuer<'static, KeyPair>, expired: bool) -> Vec<u8> {
-        let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
-        if expired {
-            p.not_before = rcgen::date_time_ymd(2000, 1, 1);
-            p.not_after = rcgen::date_time_ymd(2001, 1, 1);
-        }
-        let key = KeyPair::generate().unwrap();
-        p.signed_by(&key, issuer).unwrap().der().to_vec()
-    }
-
-    fn capture(root: &CertificateDer<'static>, store: &Arc<CertStore>) -> ChainCapture {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(root.clone()).unwrap();
-        let roots = Arc::new(roots);
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        ChainCapture {
-            inner: rustls::client::WebPkiServerVerifier::builder_with_provider(
-                roots.clone(),
-                provider.clone(),
-            )
-            .build()
-            .unwrap(),
-            roots,
-            root_certs: Arc::new({
-                let mut i = RootIndex::default();
-                i.insert_extra(root);
-                i
-            }),
-            algs: provider.signature_verification_algorithms,
-            store: store.clone(),
-        }
-    }
-
-    fn check(
-        v: &ChainCapture,
-        leaf: &[u8],
-        extra: &[Vec<u8>],
-        host: &str,
-    ) -> std::result::Result<(), rustls::Error> {
-        let inter: Vec<_> = extra
-            .iter()
-            .map(|d| CertificateDer::from(d.clone()))
-            .collect();
-        v.verify_server_cert(
-            &CertificateDer::from(leaf.to_vec()),
-            &inter,
-            &ServerName::try_from(host.to_string()).unwrap(),
-            &[],
-            UnixTime::now(),
-        )
-        .map(|_| ())
-    }
-
-    #[test]
-    fn accepted_chain_is_captured_trimmed_and_nothing_else_is_written() {
-        let (root, root_i) = ca("root");
-        let (stranger, _) = ca("stranger");
-        let store = Arc::new(CertStore::default());
-        let v = capture(&root, &store);
-        let l = leaf("good.test", &root_i, false);
-        check(&v, &l, &[stranger.to_vec(), root.to_vec()], "good.test").unwrap();
-        let info = store.info(&fingerprint(&l), None).unwrap();
-        assert_eq!(info.chain.len(), 2, "stranger dropped, root kept");
-        assert_eq!(info.chain[1].fp, fingerprint(&root));
-        assert!(store.by_host("good.test").is_none());
-        assert!(store.seen_by("good.test").is_empty());
-    }
-
-    #[test]
-    fn failing_verification_stores_nothing_and_a_replay_for_another_name_too() {
-        let (root, root_i) = ca("root");
-        let store = Arc::new(CertStore::default());
-        let v = capture(&root, &store);
-        let expired = leaf("old.test", &root_i, true);
-        assert!(check(&v, &expired, &[root.to_vec()], "old.test").is_err());
-        // A genuine chain replayed for a name it is not valid for is rejected: nothing stored.
-        let genuine = leaf("bank.test", &root_i, false);
-        assert!(check(&v, &genuine, &[root.to_vec()], "evil.test").is_err());
-        assert!(store.is_empty());
-        // Presented for its own name, only that chain is stored, under its own fingerprint.
-        check(&v, &genuine, &[root.to_vec()], "bank.test").unwrap();
-        assert_eq!(store.len(), 1);
-        assert_eq!(
-            store
-                .info(&fingerprint(&genuine), None)
-                .unwrap()
-                .chain
-                .len(),
-            2
-        );
-    }
-
-    fn inter_params() -> CertificateParams {
-        let mut p = CertificateParams::new(vec![]).unwrap();
-        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        p.distinguished_name.push(DnType::CommonName, "inter");
-        p
-    }
-
-    #[test]
-    fn a_forged_same_name_intermediate_never_replaces_the_verified_one() {
-        let (root, root_i) = ca("root");
-        let p = inter_params();
-        let key = KeyPair::generate().unwrap();
-        let real = p.signed_by(&key, &root_i).unwrap();
-        let inter_i = Issuer::new(p, key);
-        // Same subject, another key: webpki rejects it, a name-only walk would pick it.
-        let fp = inter_params()
-            .self_signed(&KeyPair::generate().unwrap())
-            .unwrap();
-        let l = leaf("good.test", &inter_i, false);
-        let store = Arc::new(CertStore::default());
-        let v = capture(&root, &store);
-        let extra = [fp.der().to_vec(), real.der().to_vec(), root.to_vec()];
-        check(&v, &l, &extra, "good.test").unwrap();
-        let info = store.info(&fingerprint(&l), None).unwrap();
-        let fps: Vec<_> = info.chain.iter().map(|c| c.fp.clone()).collect();
-        assert_eq!(
-            fps,
-            vec![fingerprint(&l), fingerprint(real.der()), fingerprint(&root)]
-        );
-        assert!(!fps.contains(&fingerprint(fp.der())));
-    }
-
-    #[test]
-    fn every_public_trust_anchor_maps_to_its_genuine_root_certificate() {
-        // `webpki-roots` (the store) and `webpki-root-certs` (the index) are the same Mozilla
-        // release, so each anchor finds exactly one full certificate with its name and key.
-        let (_, index) = build_root_set(&[]).unwrap();
-        assert!(!webpki_roots::TLS_SERVER_ROOTS.is_empty());
-        for a in webpki_roots::TLS_SERVER_ROOTS {
-            let der = index
-                .get(a)
-                .unwrap_or_else(|| panic!("no certificate for anchor {:?}", a.subject));
-            let (_, x) = x509_parser::parse_x509_certificate(der).unwrap();
-            assert!(x.subject().as_raw().ends_with(a.subject.as_ref()));
-            assert!(x
-                .public_key()
-                .raw
-                .ends_with(a.subject_public_key_info.as_ref()));
-            // A genuine, self-signed root.
-            assert_eq!(x.subject().as_raw(), x.issuer().as_raw());
-        }
-    }
-
-    #[test]
-    fn an_extra_ca_resolves_through_the_same_index() {
-        let mut p = CertificateParams::new(vec![]).unwrap();
-        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        p.distinguished_name
-            .push(DnType::CommonName, "private root");
-        let cert = p.self_signed(&KeyPair::generate().unwrap()).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ca.pem");
-        std::fs::write(&path, cert.pem()).unwrap();
-        let (_, index) = build_root_set(&[path]).unwrap();
-        let anchor = webpki::anchor_from_trusted_cert(cert.der()).unwrap();
-        assert_eq!(index.get(&anchor), Some(cert.der().as_ref()));
-    }
-
-    #[test]
-    fn a_lookalike_root_is_never_stored_as_the_root_entry() {
-        // Same subject and key as the trusted root, but not the same certificate.
-        let mut rp = CertificateParams::new(vec![]).unwrap();
-        rp.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        rp.distinguished_name.push(DnType::CommonName, "root");
-        let key = KeyPair::generate().unwrap();
-        let root = rp.self_signed(&key).unwrap();
-        let lookalike = rp.clone().self_signed(&key).unwrap();
-        assert_ne!(root.der(), lookalike.der(), "serials differ");
-        let issuer = Issuer::new(rp, key);
-        let l = leaf("good.test", &issuer, false);
-        let store = Arc::new(CertStore::default());
-        let v = capture(&root.der().clone(), &store);
-        check(&v, &l, &[lookalike.der().to_vec()], "good.test").unwrap();
-        let info = store.info(&fingerprint(&l), None).unwrap();
-        // The root entry is the genuine configured certificate, never the presented look-alike.
-        assert_eq!(info.chain.len(), 2);
-        assert_eq!(info.chain[1].fp, fingerprint(root.der()));
-        assert_ne!(info.chain[1].fp, fingerprint(lookalike.der()));
-        // Presenting nothing extra gives the same root.
-        let l2 = leaf("good.test", &issuer, false);
-        check(&v, &l2, &[], "good.test").unwrap();
-        let info = store.info(&fingerprint(&l2), None).unwrap();
-        assert_eq!(info.chain[1].fp, fingerprint(root.der()));
-    }
-
-    #[test]
-    fn a_cross_signed_intermediate_follows_the_path_that_verified() {
-        let (root, root_i) = ca("root");
-        let (_r2, r2_i) = ca("other root");
-        let p = inter_params();
-        let key = KeyPair::generate().unwrap();
-        let der = key.serialize_der();
-        let real = p.signed_by(&key, &root_i).unwrap();
-        // The same subject and key, certified by a root nobody here trusts.
-        let cross = inter_params()
-            .signed_by(&KeyPair::try_from(der.as_slice()).unwrap(), &r2_i)
-            .unwrap();
-        let inter_i = Issuer::new(p, key);
-        let l = leaf("good.test", &inter_i, false);
-        let store = Arc::new(CertStore::default());
-        let v = capture(&root, &store);
-        check(
-            &v,
-            &l,
-            &[cross.der().to_vec(), real.der().to_vec()],
-            "good.test",
-        )
-        .unwrap();
-        let info = store.info(&fingerprint(&l), None).unwrap();
-        assert_eq!(info.chain.len(), 3);
-        assert_eq!(info.chain[1].fp, fingerprint(real.der()));
-        assert_eq!(info.chain[2].fp, fingerprint(&root));
     }
 }

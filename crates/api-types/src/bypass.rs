@@ -215,6 +215,27 @@ pub struct ArgusListsStatus {
     #[serde(default)]
     pub skipped_sample: Vec<String>,
     pub categories: Vec<ArgusCategoryDto>,
+    /// The trusted root set (the signed `roots.json` of the same release).
+    #[serde(default)]
+    pub roots: Option<RootsStatusDto>,
+}
+
+/// State of the trusted root set used to verify upstream servers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct RootsStatusDto {
+    /// Serial of the active set; the compiled-in set has its own serial.
+    pub serial: u64,
+    /// Number of trusted roots.
+    pub roots: u32,
+    /// A signed set is active (otherwise the compiled-in set).
+    pub signed: bool,
+    /// RFC 3339: when the active set was installed.
+    pub updated_at: Option<String>,
+    /// RFC 3339: the last check, successful or not.
+    pub last_checked: Option<String>,
+    /// A real failure of the last check (fetch, signature, validation, rollback).
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -178,6 +178,17 @@
               "null"
             ]
           },
+          "roots": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RootsStatusDto",
+                "description": "The trusted root set (the signed `roots.json` of the same release)."
+              }
+            ]
+          },
           "skipped_lines": {
             "description": "Lines skipped across the installed lists (invalid or too broad); not an error.",
             "format": "int32",
@@ -1061,6 +1072,7 @@
           "not_yet_valid",
           "name_mismatch",
           "unknown_issuer",
+          "distrusted",
           "other"
         ],
         "type": "string"
@@ -4556,6 +4568,54 @@
           "bytes_received",
           "bytes_sent",
           "errors"
+        ],
+        "type": "object"
+      },
+      "RootsStatusDto": {
+        "description": "State of the trusted root set used to verify upstream servers.",
+        "properties": {
+          "last_checked": {
+            "description": "RFC 3339: the last check, successful or not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "A real failure of the last check (fetch, signature, validation, rollback).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "roots": {
+            "description": "Number of trusted roots.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "serial": {
+            "description": "Serial of the active set; the compiled-in set has its own serial.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "signed": {
+            "description": "A signed set is active (otherwise the compiled-in set).",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "description": "RFC 3339: when the active set was installed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "serial",
+          "roots",
+          "signed"
         ],
         "type": "object"
       },

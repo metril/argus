@@ -209,15 +209,16 @@ impl ProxyControl {
             .as_ref()
             .filter(|l| l.shared.ws.load().is_none() && config.any_listener(|f| f.websockets))
         {
-            let (paths, policy, resolve) = (
-                config.proxy.extra_upstream_ca_paths.clone(),
+            let (roots, policy, resolve) = (
+                self.ctx
+                    .roots_handle(&config.proxy.extra_upstream_ca_paths)?,
                 self.ctx.policy().clone(),
                 self.ctx.resolve_all_to(),
             );
             let shutdown = l.shutdown_tx.clone();
             new_ws = Some(Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    crate::websocket::WsUpstream::new(&paths, policy, resolve, t.handshake)
+                    crate::websocket::WsUpstream::new(roots, policy, resolve, t.handshake)
                         .map(|w| w.with_lifecycle(t.tunnel_idle, shutdown))
                 })
                 .await
@@ -910,7 +911,8 @@ impl ProxyServer {
             ws: if self.config.any_listener(|f| f.websockets) {
                 ArcSwapOption::new(Some(Arc::new(
                     crate::websocket::WsUpstream::new(
-                        &self.config.proxy.extra_upstream_ca_paths,
+                        self.ctx
+                            .roots_handle(&self.config.proxy.extra_upstream_ca_paths)?,
                         self.ctx.policy().clone(),
                         self.ctx.resolve_all_to(),
                         t0.handshake,

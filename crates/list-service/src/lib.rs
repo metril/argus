@@ -14,7 +14,7 @@ mod sets;
 pub mod site_exceptions;
 mod store;
 
-pub use argus::{ArgusConfig, ArgusLists, RefreshOutcome};
+pub use argus::{verify as verify_minisign, ArgusConfig, ArgusLists, RefreshOutcome};
 pub use error::{Error, Result};
 pub use report::{BuildState, BuildSummary};
 pub use service::{ListService, ListServiceConfig};

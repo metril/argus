@@ -232,6 +232,8 @@ pub struct ProxyContext {
     /// Probe handshakes to learn why an upstream certificate was rejected (when built from
     /// options).
     prober: Option<Arc<crate::upstream::CertProber>>,
+    /// The live trusted root set (when built from options).
+    roots: Option<Arc<crate::roots::RootsHandle>>,
 }
 
 impl ProxyContext {
@@ -262,6 +264,7 @@ impl ProxyContext {
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
             certs: Default::default(),
             prober: None,
+            roots: None,
         }
     }
 
@@ -326,15 +329,38 @@ impl ProxyContext {
         opts: &UpstreamOptions,
         adblock_enabled: bool,
     ) -> Result<Self> {
+        // One root set for every client, the prober and the WebSocket dialer.
+        let mut opts = opts.clone();
+        let roots = opts.roots_handle()?;
+        opts.roots = Some(roots.clone());
+        let opts = &opts;
         let client = build_upstream_client(opts)?;
         let mut ctx = Self::new(engine, client, adblock_enabled);
         ctx.strict_client = ArcSwap::from_pointee(build_strict_upstream_client(opts)?);
+        ctx.roots = Some(roots);
         *ctx.upstream_opts.lock() = Some(opts.clone());
         ctx.policy = opts.policy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
         ctx.certs = opts.certs.clone();
         ctx.prober = Some(Arc::new(crate::upstream::CertProber::new(opts)?));
         Ok(ctx)
+    }
+
+    /// The live trusted root set, or a fresh compiled-in set with `extra_ca_paths` for a context
+    /// built from a ready-made client.
+    pub fn roots_handle(
+        &self,
+        extra_ca_paths: &[std::path::PathBuf],
+    ) -> Result<Arc<crate::roots::RootsHandle>> {
+        match &self.roots {
+            Some(r) => Ok(r.clone()),
+            None => crate::roots::RootsHandle::floor(extra_ca_paths),
+        }
+    }
+
+    /// The live trusted root set, when built from options.
+    pub fn roots(&self) -> Option<&Arc<crate::roots::RootsHandle>> {
+        self.roots.as_ref()
     }
 
     /// The certificate prober, when built from options.

@@ -53,6 +53,9 @@ pub enum FailReason {
     NotYetValid,
     NameMismatch,
     UnknownIssuer,
+    /// The issuing root is no longer trusted for this certificate (issued after its distrust
+    /// date, outside its name constraints, or without a valid Certificate Transparency receipt).
+    Distrusted,
     Other,
 }
 
@@ -135,6 +138,31 @@ struct HostRecord {
     verdict: Verdict,
     reason: Option<FailReason>,
     detail: Option<String>,
+}
+
+/// How the trusted root set stands (the signed argus-lists subscription), for the status API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RootsStatus {
+    /// Serial of the active set; 0 for the compiled-in floor.
+    pub serial: u64,
+    /// Number of trusted roots in the active set.
+    pub roots: usize,
+    /// A signed set is active (otherwise the compiled-in floor).
+    pub signed: bool,
+    /// RFC 3339: when the active set was installed.
+    pub updated_at: Option<String>,
+    /// RFC 3339: the last check, successful or not.
+    pub last_checked: Option<String>,
+    /// A real failure of the last check (fetch, signature, validation, rollback).
+    pub last_error: Option<String>,
+}
+
+/// The roots status, shared between the proxy (writer) and the API (reader), with a way to ask
+/// for an immediate re-check.
+#[derive(Debug, Default)]
+pub struct RootsStatusCell {
+    pub status: parking_lot::RwLock<RootsStatus>,
+    pub wake: tokio::sync::Notify,
 }
 
 /// Fetches a host's certificate chain on demand (a probe handshake) and records it in the

@@ -407,6 +407,9 @@ pub enum CertFailReason {
     NotYetValid,
     NameMismatch,
     UnknownIssuer,
+    /// The issuing root no longer vouches for this certificate (issued after its distrust date,
+    /// outside its name constraints, or without a valid Certificate Transparency receipt).
+    Distrusted,
     Other,
 }
 

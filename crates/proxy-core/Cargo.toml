@@ -149,6 +149,7 @@ criterion = { workspace = true }
 rand = { workspace = true }
 proptest = "1.5"
 ring = "0.17"
+minisign = "0.7"
 
 [[bench]]
 name = "proxy_bench"

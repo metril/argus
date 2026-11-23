@@ -19,7 +19,6 @@ use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use std::net::IpAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -85,18 +84,19 @@ pub struct WsUpstream {
 
 impl WsUpstream {
     pub fn new(
-        extra_ca_paths: &[PathBuf],
+        roots: Arc<crate::roots::RootsHandle>,
         policy: Arc<DestPolicy>,
         resolve_all_to: Option<IpAddr>,
         dial_timeout: Duration,
     ) -> Result<Self> {
-        let roots = crate::upstream::build_root_store(extra_ca_paths)?;
+        // Verified against the live root set on every handshake.
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Tls(format!("Failed to select TLS versions: {e}")))?
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::roots::LiveVerifier::new(roots, None)))
         .with_no_client_auth();
         Ok(Self {
             tls: TlsConnector::from(Arc::new(config)),

@@ -237,6 +237,9 @@ pub struct AppState {
     /// Upstream certificates the proxy has seen (installed by the proxy; empty otherwise).
     pub certs: OnceLock<Arc<common::certstore::CertStore>>,
 
+    /// Status of the trusted root set (installed by the proxy; absent otherwise).
+    pub roots: OnceLock<Arc<common::certstore::RootsStatusCell>>,
+
     /// Fetches full certificate chains on demand (installed by the proxy).
     pub chain_probe: OnceLock<Arc<dyn common::certstore::ChainProbe>>,
 
@@ -810,6 +813,7 @@ pub async fn build_state_full(
         started_at: Instant::now(),
         bypass: OnceLock::new(),
         certs: OnceLock::new(),
+        roots: OnceLock::new(),
         chain_probe: OnceLock::new(),
         argus: OnceLock::new(),
         config_lock: tokio::sync::Mutex::new(()),

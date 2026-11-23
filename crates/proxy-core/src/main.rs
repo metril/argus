@@ -106,6 +106,20 @@ async fn main() -> Result<()> {
     );
     argus.start();
 
+    // Trusted roots: the compiled-in set until a signed one (same release, same key) has been
+    // verified; then swapped in live.
+    if let Some(roots) = ctx.roots() {
+        proxy_core::roots::RootsManager::new(
+            roots.clone(),
+            list_service.clone(),
+            &list_service::ArgusConfig::from_config(
+                &config.bypass,
+                bypass_engine.data_dir().map(|d| d.join("argus-lists")),
+            ),
+        )
+        .start();
+    }
+
     // Userscripts: one manager (one database, one live index) shared by the proxy's injection
     // and GM endpoints and by the management API. The proxy only uses it when enabled.
     #[cfg(feature = "webui")]
