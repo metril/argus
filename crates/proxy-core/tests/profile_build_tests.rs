@@ -36,6 +36,8 @@ fn config(port: u16) -> ProxyConfig {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -58,6 +60,7 @@ fn config(port: u16) -> ProxyConfig {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     }
 }
 

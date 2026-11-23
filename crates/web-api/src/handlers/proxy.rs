@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api_types::{
-    MessageResponse, ProxyConfigResponse, UpdateProxyConfigRequest, UpdateProxyConfigResponse,
+    BindResult, DnsDto, ListenerFlagsView, MessageResponse, ProxyConfigResponse,
+    UpdateProxyConfigRequest, UpdateProxyConfigResponse,
 };
 use axum::{
     extract::State,
@@ -43,11 +44,59 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         block_private_destinations: config.proxy.block_private_destinations,
         allowed_destinations: config.proxy.allowed_destinations.clone(),
         allowed_clients: config.proxy.allowed_clients.clone(),
+        dns: DnsDto {
+            servers: config.dns.servers.clone(),
+            cache_size: config.dns.cache_size,
+            min_ttl_secs: config.dns.min_ttl_secs,
+            max_ttl_secs: config.dns.max_ttl_secs,
+            negative_ttl_secs: config.dns.negative_ttl_secs,
+        },
+        explicit: flags_view(config, false),
+        transparent: flags_view(config, true),
+        webui_host: config.webui.host.clone(),
+        webui_port: config.webui.port,
+        bind: None,
     }
 }
 
+fn flags_view(config: &ProxyConfig, transparent: bool) -> ListenerFlagsView {
+    let f = config.listener_flags(transparent);
+    ListenerFlagsView {
+        enable_mitm: f.mitm,
+        enable_http2: f.http2,
+        enable_websockets: f.websockets,
+        enable_adblock: f.adblock,
+    }
+}
+
+/// The ETag covers the configuration only, not where the sockets happen to be bound.
 fn config_etag(r: &ProxyConfigResponse) -> String {
-    etag_of(&serde_json::to_vec(r).unwrap_or_default())
+    let mut r = r.clone();
+    r.bind = None;
+    etag_of(&serde_json::to_vec(&r).unwrap_or_default())
+}
+
+fn fmt_addr(a: std::net::SocketAddr) -> String {
+    a.to_string()
+}
+
+/// Actual listener addresses (`None` without a running proxy).
+pub async fn bind_result(state: &AppState) -> Option<BindResult> {
+    let rt = state.runtime.get()?;
+    let b = rt.proxy_bind().await?;
+    let (webui, webui_down) = match state.web_server.get() {
+        Some(w) => (Some(fmt_addr(w.addr().await)), w.is_down().await),
+        None => (None, false),
+    };
+    Some(BindResult {
+        proxy: Some(fmt_addr(b.proxy)),
+        transparent: b.transparent.map(fmt_addr),
+        proxy_down: b.proxy_down,
+        transparent_down: b.transparent_down,
+        webui_down,
+        webui,
+        webui_moved_to: None,
+    })
 }
 
 fn valid_cidr(s: &str) -> bool {
@@ -64,6 +113,7 @@ fn valid_cidr(s: &str) -> bool {
 }
 
 fn apply_live(state: &AppState, config: &ProxyConfig) {
+    // Master switch; each listener additionally gates on its own `enable_adblock`.
     state.shared_engine.set_enabled(config.adblock.enabled);
     state.proxy_state.request_timeout_ms.store(
         config.performance.request_timeout_secs.saturating_mul(1000),
@@ -87,13 +137,26 @@ pub async fn get_config(
     [(axum::http::HeaderName, String); 1],
     Json<ProxyConfigResponse>,
 )> {
-    let r = proxy_config_response(&state.proxy_state.config.read());
-    Ok(([(ETAG, config_etag(&r))], Json(r)))
+    let mut r = proxy_config_response(&state.proxy_state.config.read());
+    let etag = config_etag(&r);
+    r.bind = bind_result(&state).await;
+    Ok(([(ETAG, etag)], Json(r)))
 }
 
-/// Apply a partial update: validate, mutate, persist to the config file and apply live settings.
-/// `applied` lists settings in effect now; `restart_required` those needing a restart.
+/// Apply a partial update: validate, move listeners and apply access lists live, persist the
+/// changes to the settings overlay and apply live settings. `applied` lists settings in effect
+/// now; `restart_required` those needing a restart.
 pub async fn apply_update(
+    state: &AppState,
+    req: UpdateProxyConfigRequest,
+    who: &str,
+) -> ApiResult<UpdateProxyConfigResponse> {
+    let _g = state.config_lock.lock().await;
+    apply_update_locked(state, req, who).await
+}
+
+/// [`apply_update`] for a caller that already holds `state.config_lock`.
+async fn apply_update_locked(
     state: &AppState,
     req: UpdateProxyConfigRequest,
     who: &str,
@@ -109,116 +172,329 @@ pub async fn apply_update(
             )));
         }
     }
+    for (name, h) in [("host", &req.host), ("webui_host", &req.webui_host)] {
+        if let Some(h) = h {
+            let h = h.trim().trim_matches(['[', ']']);
+            if h.parse::<std::net::IpAddr>().is_err() && !h.eq_ignore_ascii_case("localhost") {
+                return Err(ApiError::ValidationError(format!(
+                    "{name}: {h:?} is not an IP address"
+                )));
+            }
+        }
+    }
 
     let mut applied: Vec<String> = Vec::new();
     let mut restart_required: Vec<String> = Vec::new();
-    let (config_str, config_path, response, new_config) = {
-        let mut config = state.proxy_state.config.write();
-
-        macro_rules! restart_field {
-            ($name:literal, $slot:expr, $val:expr) => {
-                if let Some(v) = $val {
-                    if $slot != v {
-                        $slot = v;
-                        restart_required.push($name.to_string());
-                    }
-                }
-            };
+    let runtime = state.runtime.get().cloned();
+    let web = state.web_server.get().cloned();
+    // Work on a copy: nothing is committed until every fallible step has succeeded.
+    let old = state.proxy_state.config.read().clone();
+    let mut config = old.clone();
+    // Fields that are live when a running proxy / web server can apply them.
+    let mut live = |name: &str, changed: bool, can: bool, applied: &mut Vec<String>| {
+        if changed {
+            if can {
+                applied.push(name.to_string());
+            } else {
+                restart_required.push(name.to_string());
+            }
         }
-        restart_field!("host", config.proxy.host, req.host);
-        restart_field!("port", config.proxy.port, req.port);
-        restart_field!(
-            "max_connections",
-            config.performance.max_connections,
-            // The UI echoes the effective value back; keep "auto" (0) if it is unchanged.
-            req.max_connections.map(|v| {
-                let v = v as usize;
-                if config.performance.max_connections == 0
-                    && v == common::config::derive_max_connections()
-                {
-                    0
-                } else {
-                    v
-                }
-            })
-        );
-        restart_field!("enable_http2", config.proxy.enable_http2, req.enable_http2);
-        restart_field!(
-            "enable_websockets",
-            config.proxy.enable_websockets,
-            req.enable_websockets
-        );
-        restart_field!("enable_mitm", config.mitm.enabled, req.enable_mitm);
-        restart_field!(
-            "transparent_port",
-            config.proxy.transparent_port,
-            req.transparent_port.map(|p| (p != 0).then_some(p))
-        );
-        restart_field!(
-            "tls_passthrough_hosts",
-            config.proxy.tls_passthrough_hosts,
-            req.tls_passthrough_hosts
-        );
-        restart_field!(
-            "block_private_destinations",
-            config.proxy.block_private_destinations,
-            req.block_private_destinations
-        );
-        restart_field!(
-            "allowed_destinations",
-            config.proxy.allowed_destinations,
-            req.allowed_destinations
-        );
-        restart_field!(
-            "allowed_clients",
-            config.proxy.allowed_clients,
-            req.allowed_clients
-        );
-        restart_field!(
-            "connection_timeout_secs",
-            config.performance.connection_timeout_secs,
-            req.connection_timeout_secs
-        );
-
-        if let Some(v) = req.request_timeout_secs {
-            config.performance.request_timeout_secs = v;
-            applied.push("request_timeout_secs".into());
-        }
-        if let Some(v) = req.enable_adblock {
-            config.adblock.enabled = v;
-            applied.push("enable_adblock".into());
-        }
-        if let Some(v) = req.auto_update {
-            config.adblock.auto_update = v;
-            applied.push("auto_update".into());
-        }
-        if let Some(v) = req.update_interval_hours {
-            config.adblock.update_interval_hours = v;
-            applied.push("update_interval_hours".into());
-        }
-
-        let config_str =
-            toml::to_string_pretty(&*config).map_err(|e| ApiError::Internal(e.to_string()))?;
-        let config_path = state.config_path.read().clone();
-        (
-            config_str,
-            config_path,
-            proxy_config_response(&config),
-            config.clone(),
-        )
     };
+    macro_rules! field {
+        ($name:literal, $slot:expr, $val:expr, $can:expr) => {
+            if let Some(v) = $val {
+                let changed = $slot != v;
+                $slot = v;
+                live($name, changed, $can, &mut applied);
+            }
+        };
+    }
+    let can_proxy = runtime.is_some();
+    let can_web = web.is_some();
+    field!(
+        "host",
+        config.proxy.host,
+        req.host.map(|h| h.trim().to_string()),
+        can_proxy
+    );
+    field!("port", config.proxy.port, req.port, can_proxy);
+    field!(
+        "transparent_port",
+        config.proxy.transparent_port,
+        req.transparent_port.map(|p| (p != 0).then_some(p)),
+        can_proxy
+    );
+    field!(
+        "tls_passthrough_hosts",
+        config.proxy.tls_passthrough_hosts,
+        req.tls_passthrough_hosts,
+        can_proxy
+    );
+    field!(
+        "block_private_destinations",
+        config.proxy.block_private_destinations,
+        req.block_private_destinations,
+        can_proxy
+    );
+    field!(
+        "allowed_destinations",
+        config.proxy.allowed_destinations,
+        req.allowed_destinations,
+        can_proxy
+    );
+    field!(
+        "allowed_clients",
+        config.proxy.allowed_clients,
+        req.allowed_clients,
+        can_proxy
+    );
+    field!(
+        "webui_host",
+        config.webui.host,
+        req.webui_host.map(|h| h.trim().to_string()),
+        can_web
+    );
+    field!("webui_port", config.webui.port, req.webui_port, can_web);
+    field!(
+        "max_connections",
+        config.performance.max_connections,
+        // The UI echoes the effective value back; keep "auto" (0) if it is unchanged.
+        req.max_connections.map(|v| {
+            let v = v as usize;
+            if config.performance.max_connections == 0
+                && v == common::config::derive_max_connections()
+            {
+                0
+            } else {
+                v
+            }
+        }),
+        can_proxy
+    );
+    field!(
+        "enable_http2",
+        config.proxy.enable_http2,
+        req.enable_http2,
+        can_proxy
+    );
+    field!(
+        "enable_websockets",
+        config.proxy.enable_websockets,
+        req.enable_websockets,
+        can_proxy
+    );
+    field!(
+        "enable_mitm",
+        config.mitm.enabled,
+        req.enable_mitm,
+        can_proxy
+    );
+    if let Some(d) = req.dns {
+        let before = config.dns.clone();
+        if let Some(v) = d.servers {
+            config.dns.servers = v.into_iter().map(|s| s.trim().to_string()).collect();
+        }
+        if let Some(v) = d.cache_size {
+            config.dns.cache_size = v;
+        }
+        if let Some(v) = d.min_ttl_secs {
+            config.dns.min_ttl_secs = v;
+        }
+        if let Some(v) = d.max_ttl_secs {
+            config.dns.max_ttl_secs = v;
+        }
+        if let Some(v) = d.negative_ttl_secs {
+            config.dns.negative_ttl_secs = v;
+        }
+        config.dns.validate().map_err(ApiError::ValidationError)?;
+        let changed = format!("{before:?}") != format!("{:?}", config.dns);
+        live("dns", changed, can_proxy, &mut applied);
+    }
+    // Per-listener switches: each writes that listener's own override.
+    for (name, transparent, upd) in [
+        ("explicit", false, req.explicit),
+        ("transparent", true, req.transparent),
+    ] {
+        let Some(u) = upd else { continue };
+        let before = config.listener_flags(transparent);
+        let o = if transparent {
+            &mut config.proxy.transparent
+        } else {
+            &mut config.proxy.explicit
+        };
+        for (key, cur, new, slot) in [
+            (
+                "enable_mitm",
+                before.mitm,
+                u.enable_mitm,
+                &mut o.enable_mitm,
+            ),
+            (
+                "enable_http2",
+                before.http2,
+                u.enable_http2,
+                &mut o.enable_http2,
+            ),
+            (
+                "enable_websockets",
+                before.websockets,
+                u.enable_websockets,
+                &mut o.enable_websockets,
+            ),
+            (
+                "enable_adblock",
+                before.adblock,
+                u.enable_adblock,
+                &mut o.enable_adblock,
+            ),
+        ] {
+            if let Some(v) = new {
+                *slot = Some(v);
+                live(&format!("{name}.{key}"), cur != v, can_proxy, &mut applied);
+            }
+        }
+    }
+    field!(
+        "connection_timeout_secs",
+        config.performance.connection_timeout_secs,
+        req.connection_timeout_secs,
+        can_proxy
+    );
+    if let Some(v) = req.request_timeout_secs {
+        config.performance.request_timeout_secs = v;
+        applied.push("request_timeout_secs".into());
+    }
+    if let Some(v) = req.enable_adblock {
+        config.adblock.enabled = v;
+        applied.push("enable_adblock".into());
+    }
+    if let Some(v) = req.auto_update {
+        config.adblock.auto_update = v;
+        applied.push("auto_update".into());
+    }
+    if let Some(v) = req.update_interval_hours {
+        config.adblock.update_interval_hours = v;
+        applied.push("update_interval_hours".into());
+    }
+
+    let moved_to = apply_runtime(state, &old, &config).await?;
+
+    let overlay_path = state.overlay_path.read().clone();
+    let base_path = state.config_path.read().clone();
+    let c2 = config.clone();
+    let save = tokio::task::spawn_blocking(move || c2.save_overlay(&base_path, &overlay_path))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if let Err(e) = save {
+        // Put the listeners back: the change was not saved. The old web listener is still up
+        // (its stop is only pending), so it is reinstated rather than bound again.
+        if let Some(web) = state.web_server.get() {
+            if (old.webui.host.as_str(), old.webui.port)
+                != (config.webui.host.as_str(), config.webui.port)
+                && web.revert().await.is_none()
+            {
+                let _ = web.rebind(&old.webui.host, old.webui.port).await;
+            }
+        }
+        if let Some(rt) = state.runtime.get() {
+            if (&old.proxy.host, old.proxy.port, old.proxy.transparent_port)
+                != (
+                    &config.proxy.host,
+                    config.proxy.port,
+                    config.proxy.transparent_port,
+                )
+            {
+                let _ = rt
+                    .rebind_proxy(&old.proxy.host, old.proxy.port, old.proxy.transparent_port)
+                    .await;
+            }
+            let _ = rt.apply_access(&old).await;
+        }
+        return Err(ApiError::Internal(format!("Failed to save settings: {e}")));
+    }
 
     info!("Proxy configuration updated by {who}");
-    tokio::fs::write(&config_path, config_str)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to save config: {e}")))?;
-    apply_live(state, &new_config);
+    apply_live(state, &config);
+    let mut response = proxy_config_response(&config);
+    *state.proxy_state.config.write() = config;
+    response.bind = bind_result(state).await;
+    if let (Some(b), Some(m)) = (response.bind.as_mut(), moved_to) {
+        b.webui_moved_to = Some(m);
+    }
 
     Ok(UpdateProxyConfigResponse {
         config: response,
         applied,
         restart_required,
     })
+}
+
+/// Make the running proxy and web server match `new` (relative to `old`): rebind moved
+/// listeners and swap access lists. Returns the web API's new address when it moved. On failure
+/// everything is back as it was and the error names the reason (409).
+async fn apply_runtime(
+    state: &AppState,
+    old: &ProxyConfig,
+    new: &ProxyConfig,
+) -> ApiResult<Option<String>> {
+    let bind_err = |m: String| ApiError::Coded {
+        status: axum::http::StatusCode::CONFLICT,
+        code: "bind_failed",
+        message: m,
+    };
+    let mut proxy_moved = false;
+    if let Some(rt) = state.runtime.get() {
+        let listeners_changed = old.proxy.host != new.proxy.host
+            || old.proxy.port != new.proxy.port
+            || old.proxy.transparent_port != new.proxy.transparent_port;
+        if listeners_changed {
+            rt.rebind_proxy(&new.proxy.host, new.proxy.port, new.proxy.transparent_port)
+                .await
+                .map_err(&bind_err)?;
+            proxy_moved = true;
+        }
+        match rt.apply_access(new).await {
+            Ok(()) => {}
+            Err(e) => {
+                if proxy_moved {
+                    let _ = rt
+                        .rebind_proxy(&old.proxy.host, old.proxy.port, old.proxy.transparent_port)
+                        .await;
+                }
+                return Err(ApiError::ValidationError(e));
+            }
+        }
+    }
+    let mut moved_to = None;
+    if let Some(web) = state.web_server.get() {
+        if old.webui.host != new.webui.host || old.webui.port != new.webui.port {
+            match web.rebind(&new.webui.host, new.webui.port).await {
+                Ok(addr) => {
+                    moved_to = Some(addr.to_string());
+                    if let Some(rt) = state.runtime.get() {
+                        rt.note_webui(&new.webui.host, new.webui.port).await;
+                    }
+                }
+                Err(e) => {
+                    if let Some(rt) = state.runtime.get() {
+                        // Undo the proxy side, then the access lists.
+                        if proxy_moved {
+                            let _ = rt
+                                .rebind_proxy(
+                                    &old.proxy.host,
+                                    old.proxy.port,
+                                    old.proxy.transparent_port,
+                                )
+                                .await;
+                        }
+                        let _ = rt.apply_access(old).await;
+                    }
+                    return Err(bind_err(e));
+                }
+            }
+        }
+    }
+    Ok(moved_to)
 }
 
 /// Update the configuration (partial). Requires `If-Match` (428 if absent, 412 if the
@@ -243,10 +519,24 @@ pub async fn update_config(
     [(axum::http::HeaderName, String); 1],
     Json<UpdateProxyConfigResponse>,
 )> {
+    // One writer at a time from the ETag check through save and commit.
+    let _g = state.config_lock.lock().await;
     let current = config_etag(&proxy_config_response(&state.proxy_state.config.read()));
     check_if_match(&headers, &current)?;
-    let r = apply_update(&state, req, &p.username).await?;
+    let r = apply_update_locked(&state, req, &p.username).await?;
     Ok(([(ETAG, config_etag(&r.config))], Json(r)))
+}
+
+/// The built-in default of every setting, in the shape of `GET /config` (what "reset to
+/// default" in the UI restores). The shipped `config/default.toml` and the settings overlay are
+/// not consulted.
+#[utoipa::path(
+    get, path = "/config/defaults", tag = "config",
+    security(("bearer_auth" = ["config:read"])),
+    responses((status = 200, description = "Built-in defaults", body = ProxyConfigResponse))
+)]
+pub async fn get_config_defaults() -> Json<ProxyConfigResponse> {
+    Json(proxy_config_response(&ProxyConfig::default()))
 }
 
 /// Reload the configuration from its file.
@@ -259,12 +549,16 @@ pub async fn reload_config(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
 ) -> ApiResult<Json<MessageResponse>> {
-    let config_path = state.config_path.read().clone();
-    let config_str = tokio::fs::read_to_string(&config_path)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Failed to read config file: {e}")))?;
-    let new_config: ProxyConfig = toml::from_str(&config_str)
-        .map_err(|e| ApiError::ValidationError(format!("Invalid config file: {e}")))?;
+    let _g = state.config_lock.lock().await;
+    let base = state.config_path.read().clone();
+    let overlay = state.overlay_path.read().clone();
+    let new_config =
+        tokio::task::spawn_blocking(move || ProxyConfig::load_layered(&base, &overlay))
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .map_err(|e| ApiError::ValidationError(format!("Invalid config: {e}")))?;
+    let old = state.proxy_state.config.read().clone();
+    apply_runtime(&state, &old, &new_config).await?;
     apply_live(&state, &new_config);
     *state.proxy_state.config.write() = new_config;
     info!("Proxy configuration reloaded by {}", p.username);

@@ -2,13 +2,11 @@
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
-use web_sys::HtmlInputElement;
 
 use crate::api::ApiClient;
 use crate::components::layout::AuthLayout;
 use crate::state::use_auth_state;
 
-/// Login page component
 #[component]
 pub fn LoginPage() -> impl IntoView {
     let auth_state = use_auth_state();
@@ -21,31 +19,22 @@ pub fn LoginPage() -> impl IntoView {
 
     let on_submit = move |ev: web_sys::SubmitEvent| {
         ev.prevent_default();
-
-        let username_val = username.get();
-        let password_val = password.get();
-
-        if username_val.trim().is_empty() || password_val.is_empty() {
-            error.set(Some("Please fill in all fields".to_string()));
+        let (u, p) = (username.get(), password.get());
+        if u.trim().is_empty() || p.is_empty() {
+            error.set(Some("Enter your username and password.".to_string()));
             return;
         }
-
         loading.set(true);
         error.set(None);
-
-        let auth_state = auth_state.clone();
-        let navigate = navigate.clone();
-
+        let (auth_state, navigate) = (auth_state.clone(), navigate.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let client = ApiClient::new();
-            match client.login(&username_val, &password_val).await {
+            match ApiClient::new().login(&u, &p).await {
                 Ok(response) => {
                     auth_state.user.set(Some(response.user));
+                    auth_state.checked.set(true);
                     navigate("/", Default::default());
                 }
-                Err(e) => {
-                    error.set(Some(e.to_string()));
-                }
+                Err(e) => error.set(Some(e.to_string())),
             }
             loading.set(false);
         });
@@ -53,56 +42,26 @@ pub fn LoginPage() -> impl IntoView {
 
     view! {
         <AuthLayout>
-            <h1 class="auth-title">"Sign In"</h1>
-
-            {move || error.get().map(|e| view! {
-                <div class="auth-error">{e}</div>
-            })}
-
-            <form class="auth-form" on:submit=on_submit>
-                <div class="form-field">
-                    <label class="form-label">"Username"</label>
-                    <input
-                        type="text"
-                        class="form-input"
-                        placeholder="Enter your username"
-                        disabled=move || loading.get()
-                        prop:value=move || username.get()
-                        on:input=move |ev| {
-                            let target = event_target::<HtmlInputElement>(&ev);
-                            username.set(target.value());
-                        }
-                    />
+            <h2>"Sign in"</h2>
+            <form class="reg-card" style="width:auto" on:submit=on_submit novalidate>
+                <div class="field">
+                    <label for="lUser">"Username"</label>
+                    <input class="input" id="lUser" autocomplete="username" disabled=move || loading.get()
+                        aria-invalid=move || if error.get().is_some() { "true" } else { "false" }
+                        prop:value=move || username.get() on:input=move |ev| username.set(event_target_value(&ev)) />
                 </div>
-
-                <div class="form-field">
-                    <label class="form-label">"Password"</label>
-                    <input
-                        type="password"
-                        class="form-input"
-                        placeholder="Enter your password"
-                        disabled=move || loading.get()
-                        prop:value=move || password.get()
-                        on:input=move |ev| {
-                            let target = event_target::<HtmlInputElement>(&ev);
-                            password.set(target.value());
-                        }
-                    />
+                <div class="field">
+                    <label for="lPass">"Password"</label>
+                    <input class="input" id="lPass" type="password" autocomplete="current-password" disabled=move || loading.get()
+                        aria-invalid=move || if error.get().is_some() { "true" } else { "false" }
+                        prop:value=move || password.get() on:input=move |ev| password.set(event_target_value(&ev)) />
+                    {move || error.get().map(|e| view! { <span class="err" role="alert">{e}</span> })}
                 </div>
-
-                <button
-                    type="submit"
-                    class="btn btn-primary auth-submit"
-                    disabled=move || loading.get()
-                >
-                    {move || if loading.get() { "Signing in..." } else { "Sign In" }}
+                <button class="btn primary" type="submit" style="height:36px" disabled=move || loading.get()>
+                    {move || if loading.get() { "Signing in..." } else { "Sign in" }}
                 </button>
+                <p class="hint">"First time here? "<a href="/register" style="color:var(--accent)">"Create the admin account"</a>"."</p>
             </form>
-
-            <p class="auth-footer">
-                "Don't have an account? "
-                <a href="/register" class="auth-link">"Register"</a>
-            </p>
         </AuthLayout>
     }
 }

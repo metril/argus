@@ -58,7 +58,7 @@ pub(crate) fn content_digest<'a>(
 pub(crate) fn engine_key(entries: &mut [KeyEntry<'_>], custom_digest: &str) -> Key {
     entries.sort_by(|a, b| a.id.cmp(b.id));
     let mut h = Sha256::new();
-    h.update(b"adblocker-engine-key\0");
+    h.update(b"argus-engine-key\0");
     h.update(filter_engine::formats::CONVERTER_VERSION.to_le_bytes());
     h.update(filter_engine::ADBLOCK_CRATE_VERSION.as_bytes());
     for e in entries.iter() {

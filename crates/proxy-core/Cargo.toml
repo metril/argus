@@ -7,7 +7,7 @@ authors.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "adblocker"
+name = "argus"
 path = "src/main.rs"
 
 [lib]
@@ -36,6 +36,7 @@ brotli = "8"
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
+x509-parser = "0.18"
 rustls-pemfile = { workspace = true }
 pem = { workspace = true }
 
@@ -128,6 +129,8 @@ libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
 
 [features]
+# Fault-injection hooks for integration tests only; never enabled in release builds.
+test-hooks = []
 # Request filtering is always compiled in; WebSocket proxying is on by default.
 default = ["websockets", "bundled-ubo-resources"]
 # Embed the uBlock Origin resource library (GPL-3.0) as the offline fallback; see docs/LICENSING.md.
@@ -138,6 +141,7 @@ webui = ["dep:web-api"]
 full = ["websockets", "userscripts", "webui", "bundled-ubo-resources"]
 
 [dev-dependencies]
+proxy-core = { path = ".", features = ["test-hooks"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }

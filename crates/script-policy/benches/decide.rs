@@ -22,6 +22,7 @@ fn rules(n: usize) -> RuleSet {
                     Preset::Untrusted
                 },
                 note: None,
+                updated_at: 0,
             },
         );
     }

@@ -117,8 +117,9 @@ pub struct RouteTable {
 }
 
 /// Global (not profile-scoped) reads a profile-restricted token may make.
-const RESTRICTED_GLOBAL_READS: [Scope; 5] = [
+const RESTRICTED_GLOBAL_READS: [Scope; 6] = [
     Scope::ListsRead,
+    Scope::LogsRead,
     Scope::StatsRead,
     Scope::SystemRead,
     Scope::CaRead,

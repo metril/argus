@@ -264,6 +264,8 @@ impl TestProxy {
                 enable_websockets: true,
                 extra_upstream_ca_paths: vec![origin_ca_path],
                 require_device_token: false,
+                explicit: Default::default(),
+                transparent: Default::default(),
             },
             mitm: MitmSettings {
                 enabled: true,
@@ -289,6 +291,7 @@ impl TestProxy {
             script_control: Default::default(),
             webui: WebUiSettings::default(),
             dns: Default::default(),
+            bypass: Default::default(),
         };
 
         tweak(&mut config);

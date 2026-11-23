@@ -78,7 +78,7 @@ pub struct WsUpstream {
     resolve_all_to: Option<IpAddr>,
     dial_timeout: Duration,
     /// Spliced connections close after this long without traffic.
-    idle_timeout: Duration,
+    idle_timeout: std::sync::atomic::AtomicU64,
     /// Spliced connections end when the proxy shuts down.
     shutdown: Option<broadcast::Sender<()>>,
 }
@@ -103,16 +103,29 @@ impl WsUpstream {
             policy,
             resolve_all_to,
             dial_timeout,
-            idle_timeout: Duration::from_secs(300),
+            idle_timeout: std::sync::atomic::AtomicU64::new(300_000),
             shutdown: None,
         })
     }
 
     /// Idle timeout for spliced connections, and the proxy shutdown signal that ends them.
     pub fn with_lifecycle(mut self, idle: Duration, shutdown: broadcast::Sender<()>) -> Self {
-        self.idle_timeout = idle;
+        self.set_idle_timeout(idle);
         self.shutdown = Some(shutdown);
         self
+    }
+
+    /// Change the idle timeout; applies to connections spliced from now on.
+    pub fn set_idle_timeout(&self, idle: Duration) {
+        self.idle_timeout.store(
+            idle.as_millis().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The idle timeout new spliced connections get.
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_timeout.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     async fn dial(&self, host: &str, port: u16, tls: bool) -> Result<Box<dyn WsIo>> {
@@ -257,7 +270,12 @@ pub async fn proxy_upgrade(
         .and_then(|v| v.to_str().ok())
         .unwrap_or(&check_url)
         .to_string();
-    if ctx.should_block_with(rctx, &check_url, &origin, "websocket") {
+    // A host in `full` bypass is forwarded as-is: no filtering, no log event, just the counter.
+    let bypass_full = ctx.bypass().mode_of(&target.host) == Some(common::bypass::BypassMode::Full);
+    if bypass_full {
+        ctx.bypass().note_bypassed();
+    }
+    if !bypass_full && ctx.should_block_with(rctx, &check_url, &origin, "websocket") {
         debug!("Blocked WebSocket to {}", check_url);
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
@@ -349,7 +367,7 @@ pub async fn proxy_upgrade(
     let up_upgrade = hyper::upgrade::on(&mut resp);
     let client_upgrade = hyper::upgrade::on(&mut req);
     let desc = check_url.clone();
-    let idle = ws.idle_timeout;
+    let idle = ws.idle_timeout();
     let shutdown = ws.shutdown.as_ref().map(|tx| tx.subscribe());
     tokio::spawn(async move {
         match tokio::try_join!(client_upgrade, up_upgrade) {

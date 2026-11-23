@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use api_types::{
     AddFilterListRequest, BuildState, BuildSummary, CatalogueEntryResponse, EngineStatusResponse,
-    ExtRuleResponse, FilterListResponse, ListMetaDto, ListReport, ListStatusResponse,
-    MessageResponse, Page, ReportIssueDto, ScheduleResponse, UpdateFilterListRequest,
-    UpdateProxyConfigRequest, UpdateScheduleRequest,
+    ExtRuleResponse, FilterListCounts, FilterListResponse, FilterListsPage, ListMetaDto,
+    ListReport, ListStatusResponse, MessageResponse, Page, ReportIssueDto, ScheduleResponse,
+    UpdateFilterListRequest, UpdateProxyConfigRequest, UpdateScheduleRequest,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use tracing::info;
 use utoipa::IntoParams;
 use validator::Validate;
 
+use super::paging::{desc_key, natural_key, paginate, Keyed};
 use super::proxy::apply_update;
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -22,6 +23,7 @@ use crate::state::{blocking, AppState};
 
 fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> FilterListResponse {
     let status = state.filter_store.get_status(&list.id).unwrap_or_default();
+    let attention = needs_attention(list, status.last_error.is_some());
     FilterListResponse {
         id: list.id.clone(),
         name: list.name.clone(),
@@ -34,7 +36,17 @@ fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> F
         format: list.format.as_str().to_string(),
         allowlist: list.allowlist,
         trusted: list.trusted,
+        attention,
     }
+}
+
+/// A fetch error, or an enabled list that was never fetched / is over 7 days old.
+fn needs_attention(list: &filter_engine::FilterList, has_error: bool) -> bool {
+    has_error
+        || (list.enabled
+            && list
+                .last_updated
+                .is_none_or(|t| chrono::Utc::now() - t > chrono::Duration::days(7)))
 }
 
 fn parse_format(f: &str) -> ApiResult<filter_engine::ListFormat> {
@@ -65,31 +77,118 @@ pub async fn engine_status(state: &AppState) -> EngineStatusResponse {
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListFiltersQuery {
-    /// Only enabled / only disabled lists.
+    /// Only enabled / only disabled lists (same as `status=on|off`).
     pub enabled: Option<bool>,
+    /// Case-insensitive substring of the name or URL.
+    pub q: Option<String>,
+    /// `on` (enabled), `off` (disabled) or `attn` (fetch error or stale).
+    pub status: Option<String>,
+    /// `name` (default), `rules` (most rules first) or `updated` (most recently updated first).
+    pub sort: Option<String>,
+    /// Deprecated: use `cursor`.
     pub page: Option<u32>,
+    /// Page size (1..=200, default 40).
     pub limit: Option<u32>,
+    /// Opaque `next_cursor` of the previous page (stable while lists change).
+    pub cursor: Option<String>,
+    /// With `sort=name`: start at the first name at or after this prefix (natural order).
+    pub from: Option<String>,
 }
 
-/// List filter lists.
+/// List filter lists, filtered by text and status and sorted. `counts` covers every status for
+/// the current `q`, whatever `status` is.
 #[utoipa::path(
     get, path = "/lists", tag = "lists",
     security(("bearer_auth" = ["lists:read"])),
     params(ListFiltersQuery),
-    responses((status = 200, description = "Filter lists", body = Page<FilterListResponse>))
+    responses((status = 200, description = "Filter lists", body = FilterListsPage))
 )]
 pub async fn list_filter_lists(
     State(state): State<Arc<AppState>>,
     ApiQuery(q): ApiQuery<ListFiltersQuery>,
-) -> ApiResult<Json<Page<FilterListResponse>>> {
-    let all = state
+) -> ApiResult<Json<FilterListsPage>> {
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(s @ ("on" | "off" | "attn")) => Some(s),
+        Some(o) => {
+            return Err(ApiError::ValidationError(format!(
+                "unknown status '{o}' (on, off, attn)"
+            )))
+        }
+    };
+    let sort = q.sort.as_deref().unwrap_or("name");
+    if !["name", "rules", "updated"].contains(&sort) {
+        return Err(ApiError::ValidationError(format!(
+            "unknown sort '{sort}' (name, rules, updated)"
+        )));
+    }
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let matching: Vec<(filter_engine::FilterList, FilterListResponse)> = state
         .filter_store
         .get_all()?
         .into_iter()
-        .filter(|l| q.enabled.is_none_or(|e| l.enabled == e))
-        .map(|l| filter_list_response(&state, &l))
+        .filter(|l| {
+            needle.is_empty()
+                || l.name.to_lowercase().contains(&needle)
+                || l.url.to_lowercase().contains(&needle)
+        })
+        .map(|l| {
+            let r = filter_list_response(&state, &l);
+            (l, r)
+        })
         .collect();
-    Ok(Json(Page::from_vec(all, q.page, q.limit)))
+    let mut counts = FilterListCounts {
+        all: matching.len(),
+        on: matching.iter().filter(|(l, _)| l.enabled).count(),
+        off: matching.iter().filter(|(l, _)| !l.enabled).count(),
+        attn: matching.iter().filter(|(_, r)| r.attention).count(),
+        letters: Vec::new(),
+    };
+    if q.from.is_some() && sort != "name" {
+        return Err(ApiError::ValidationError("`from` needs sort=name".into()));
+    }
+    let rows: Vec<Keyed<FilterListResponse>> = matching
+        .into_iter()
+        .filter(|(l, r)| match status {
+            Some("on") => l.enabled,
+            Some("off") => !l.enabled,
+            Some(_) => r.attention,
+            None => q.enabled.is_none_or(|e| l.enabled == e),
+        })
+        .map(|(l, r)| {
+            let name = natural_key(&r.name);
+            let key = match sort {
+                "rules" => format!("{}{name}", desc_key(r.rule_count as u64)),
+                // Lists never updated sort last.
+                "updated" => format!(
+                    "{}{name}",
+                    desc_key(
+                        l.last_updated
+                            .map_or(0, |t| t.timestamp_millis().max(0) as u64)
+                    )
+                ),
+                _ => name,
+            };
+            Keyed {
+                key,
+                id: r.id.clone(),
+                label: r.name.clone(),
+                item: r,
+            }
+        })
+        .collect();
+    let from = q.from.as_deref().map(natural_key);
+    let p = paginate(rows, q.limit, q.cursor.as_deref(), from.as_deref(), q.page)?;
+    counts.letters = p.letters;
+    Ok(Json(FilterListsPage {
+        items: p.items,
+        next_cursor: p.next_cursor,
+        total: p.total,
+        counts,
+        limit: p.limit,
+        has_more: p.has_more,
+        page: p.page,
+    }))
 }
 
 /// Add a filter list and rebuild the engine.

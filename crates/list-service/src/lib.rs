@@ -4,6 +4,7 @@
 //!
 //! Independent of the web UI: the proxy constructs and starts it unconditionally.
 
+mod argus;
 mod error;
 mod persist;
 mod report;
@@ -13,6 +14,7 @@ mod sets;
 pub mod site_exceptions;
 mod store;
 
+pub use argus::{ArgusConfig, ArgusLists, RefreshOutcome};
 pub use error::{Error, Result};
 pub use report::{BuildState, BuildSummary};
 pub use service::{ListService, ListServiceConfig};

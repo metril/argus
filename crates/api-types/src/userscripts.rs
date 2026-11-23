@@ -211,7 +211,9 @@ pub struct ExportedUserscript {
 }
 
 /// Bundle format marker.
-pub const USERSCRIPT_BUNDLE_FORMAT: &str = "adblocker-userscripts-v1";
+pub const USERSCRIPT_BUNDLE_FORMAT: &str = "argus-userscripts-v1";
+/// Pre-rename bundle format, still accepted on import.
+pub const LEGACY_USERSCRIPT_BUNDLE_FORMAT: &str = "adblocker-userscripts-v1";
 
 /// Export / import bundle (JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]

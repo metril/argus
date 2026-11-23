@@ -7,7 +7,7 @@ use leptos::prelude::*;
 use crate::api::filters::FilterList;
 use crate::api::profiles::{CreateProfileRequest, ProfileDto, UpdateProfileRequest};
 use crate::api::{ApiClient, ApiError};
-use crate::components::{Card, Layout, Modal};
+use crate::components::{Card, ChipSelect, Drawer, Layout};
 use crate::state::use_app_state;
 
 /// The built-in default profile (its lists and rules are the global ones).
@@ -159,15 +159,15 @@ pub fn ProfilesPage() -> impl IntoView {
         <Layout>
             <div class="page-header">
                 <h1 class="page-title">"Profiles"</h1>
-                <button class="btn btn-primary" on:click=open_create>"New profile"</button>
+                <button class="btn primary" on:click=open_create>"New profile"</button>
             </div>
-            <p class="modal-help">
+            <p class="hint">
                 "A profile is a set of enabled filter lists plus its own rules. Devices pick a \
                  profile by address or token (see Devices). The default profile uses the global \
                  lists and custom rules and cannot be renamed or deleted."
             </p>
             <Card title="Profiles" class="settings-card">
-                <table class="table">
+                <div class="tbl-wrap"><table class="tbl">
                     <thead>
                         <tr>
                             <th>"Name"</th>
@@ -204,12 +204,12 @@ pub fn ProfilesPage() -> impl IntoView {
                                         }}</td>
                                         <td>
                                             <button
-                                                class="btn btn-secondary"
+                                                class="btn sm"
                                                 disabled=builtin
                                                 on:click=move |_| open_edit(pe.clone())
                                             >"Edit"</button>
                                             <button
-                                                class="btn btn-danger"
+                                                class="btn danger sm"
                                                 disabled=builtin
                                                 on:click=move |_| open_delete(pd.clone())
                                             >"Delete"</button>
@@ -219,30 +219,30 @@ pub fn ProfilesPage() -> impl IntoView {
                             }
                         />
                     </tbody>
-                </table>
+                </table></div>
             </Card>
 
-            <Modal title="Profile" open=show_edit class="source-modal">
-                <div class="form-group">
+            <Drawer title="Profile" open=show_edit>
+                <div class="field">
                     <label>"Name"</label>
-                    <input class="form-input" type="text" maxlength="64"
+                    <input class="input" type="text" maxlength="64"
                         prop:value=move || name.get()
                         on:input=move |ev| name.set(event_target_value(&ev)) />
-                    <p class="form-help">
+                    <p class="hint">
                         "Letters, digits, spaces, '_', '-' and '.' (up to 64 characters)."
                     </p>
                 </div>
-                <div class="form-group">
+                <div class="field">
                     <label>"Description"</label>
-                    <input class="form-input" type="text" maxlength="500"
+                    <input class="input" type="text" maxlength="500"
                         prop:value=move || description.get()
                         on:input=move |ev| description.set(event_target_value(&ev)) />
                 </div>
-                <div class="form-group">
+                <div class="field">
                     <label>"Enabled filter lists"</label>
                     <Show
                         when=move || !lists.get().is_empty()
-                        fallback=|| view! { <p class="form-help">"No filter lists are installed yet."</p> }
+                        fallback=|| view! { <p class="hint">"No filter lists are installed yet."</p> }
                     >
                         <For
                             each=move || lists.get()
@@ -251,51 +251,50 @@ pub fn ProfilesPage() -> impl IntoView {
                                 let id = l.id.clone();
                                 let id2 = l.id.clone();
                                 view! {
-                                    <label class="checkbox-label">
-                                        <input type="checkbox"
-                                            prop:checked=move || enabled.get().contains(&id)
-                                            on:change=move |ev| {
-                                                let on = event_target_checked(&ev);
-                                                let id = id2.clone();
-                                                enabled.update(|v| {
-                                                    v.retain(|x| *x != id);
-                                                    if on { v.push(id); }
-                                                });
-                                            } />
-                                        {format!(" {}", l.name)}
-                                    </label>
+                                    <ChipSelect
+                                        pressed=Signal::derive(move || enabled.get().contains(&id))
+                                        on_toggle=Callback::new(move |on: bool| {
+                                            let id = id2.clone();
+                                            enabled.update(|v| {
+                                                v.retain(|x| *x != id);
+                                                if on { v.push(id); }
+                                            });
+                                        })
+                                    >
+                                        {l.name.clone()}
+                                    </ChipSelect>
                                 }
                             }
                         />
                     </Show>
                 </div>
-                <div class="form-group">
+                <div class="field">
                     <label>"Custom rules (adblock syntax)"</label>
-                    <textarea class="form-input" rows="8" spellcheck="false"
+                    <textarea class="input" rows="8" spellcheck="false"
                         prop:value=move || rules.get()
                         on:input=move |ev| rules.set(event_target_value(&ev))></textarea>
-                    <p class="form-help">
+                    <p class="hint">
                         "Applied on top of this profile's lists, like the global custom rules."
                     </p>
                 </div>
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_edit.set(false)>"Cancel"</button>
-                    <button class="btn btn-primary" disabled=move || busy.get() on:click=save>"Save"</button>
+                <div class="row-gap">
+                    <button class="btn" on:click=move |_| show_edit.set(false)>"Cancel"</button>
+                    <button class="btn primary" disabled=move || busy.get() on:click=save>"Save"</button>
                 </div>
-            </Modal>
+            </Drawer>
 
-            <Modal title="Delete profile" open=show_delete>
+            <Drawer title="Delete profile" open=show_delete>
                 <p>
                     "Delete profile "
                     <strong>{move || delete_target.get().map(|p| p.name).unwrap_or_default()}</strong>
                     "?"
                 </p>
                 {move || delete_error.get().map(|m| view! { <div class="us-warn">{m}</div> })}
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_delete.set(false)>"Cancel"</button>
-                    <button class="btn btn-danger" disabled=move || busy.get() on:click=confirm_delete>"Delete"</button>
+                <div class="row-gap">
+                    <button class="btn" on:click=move |_| show_delete.set(false)>"Cancel"</button>
+                    <button class="btn danger sm" disabled=move || busy.get() on:click=confirm_delete>"Delete"</button>
                 </div>
-            </Modal>
+            </Drawer>
         </Layout>
     }
 }

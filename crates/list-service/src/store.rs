@@ -83,7 +83,7 @@ fn include_key(list_id: &str, path: &str) -> String {
 }
 
 impl ListStore {
-    /// Open (creating if needed) the store in `data_dir`: database `<data_dir>/adblocker.redb`,
+    /// Open (creating if needed) the store in `data_dir`: database `<data_dir>/argus.redb`,
     /// blobs in `<data_dir>/lists`.
     pub fn new(data_dir: impl AsRef<Path>) -> Result<Self> {
         let db = Db::open(data_dir.as_ref())?;

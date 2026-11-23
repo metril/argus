@@ -199,7 +199,7 @@ export function runScript(env, { grants = [], runAt = "document-start", id = "s1
     params.forEach((p, i) => (o[p] = args[i]));
     return fn.call(this, o);
   };
-  runtime({ base: "/__adblock__/gm", top: true, handler: "AdBlocker Userscripts", handlerVersion: "1.0.0", ...cfg }, [{ d, f }], env.W);
+  runtime({ base: "/__adblock__/gm", top: true, handler: "Argus Userscripts", handlerVersion: "1.0.0", ...cfg }, [{ d, f }], env.W);
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

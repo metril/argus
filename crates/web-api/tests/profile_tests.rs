@@ -282,6 +282,11 @@ async fn every_profile_scoped_route_takes_a_profile_and_refuses_other_profiles()
     let any_param = regex::Regex::new(r"\{[^}]+\}").unwrap();
 
     for (m, path, has_param) in &ops {
+        // The device list's `profile` is a filter over what the caller may see (other profiles
+        // are refused, but no profile at all just lists the permitted devices).
+        if m == "GET" && path == "/api/v1/devices" {
+            continue;
+        }
         assert!(
             has_param,
             "{m} {path} is profile-scoped but takes no profile (use ProfileParam)"

@@ -453,6 +453,7 @@ fn validation() {
             scope: Scope::Global,
             preset: Preset::Trusted,
             note: None,
+            updated_at: 0,
         },
     );
     assert!(r.site_rules["x"].validate().is_err());

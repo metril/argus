@@ -375,7 +375,7 @@ pub fn generate(scripts: &[&CompiledScript], opts: &BundleOptions<'_>) -> Bundle
             counts,
         };
     }
-    let cfg = json!({"base": opts.base_path, "top": opts.is_top_frame, "handler": "AdBlocker Userscripts", "handlerVersion": env!("CARGO_PKG_VERSION")});
+    let cfg = json!({"base": opts.base_path, "top": opts.is_top_frame, "handler": "Argus Userscripts", "handlerVersion": env!("CARGO_PKG_VERSION")});
     let entries: Vec<&str> = chunks.iter().map(|c| c.js.as_str()).collect();
     let call = format!(
         "(function(r){{if(r)r({},[{}]);}})(window[Symbol.for(\"{RUNTIME_HOOK}\")]);\n",

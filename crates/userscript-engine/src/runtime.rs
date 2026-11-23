@@ -54,7 +54,7 @@ impl UserscriptRuntime {
             manager,
             storage,
             http_client: Client::builder()
-                .user_agent("AdBlocker-Userscript/1.0")
+                .user_agent("Argus-Userscript/1.0")
                 .build()
                 .unwrap(),
             require_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),

@@ -3,13 +3,16 @@
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
+use super::vlist::*;
 use crate::api::userscripts::{
-    ImportUserscriptsResponse, UpdateDiffDto, Userscript, UserscriptBundle, UserscriptPlanResponse,
-    UserscriptStorageResponse,
+    ImportUserscriptsResponse, UpdateDiffDto, Userscript, UserscriptBundle, UserscriptCounts,
+    UserscriptPlanResponse, UserscriptStorageResponse,
 };
 use crate::api::ApiClient;
-use crate::components::{Card, Layout, Modal, ProfileSelector};
+use crate::components::{Drawer, Icon, Layout, ProfileSelector, Switch};
 use crate::state::use_app_state;
+use gloo_timers::callback::Timeout;
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -65,7 +68,7 @@ pub fn update_status(s: &Userscript) -> &'static str {
 }
 
 /// Offer a text file as a browser download via Blob + anchor.
-fn download_text(filename: &str, text: &str) -> Result<(), String> {
+pub(crate) fn download_text(filename: &str, text: &str) -> Result<(), String> {
     let err = |e: wasm_bindgen::JsValue| format!("{:?}", e);
     let parts = js_sys::Array::new();
     parts.push(&wasm_bindgen::JsValue::from_str(text));
@@ -132,9 +135,43 @@ fn tag_list(items: Vec<String>, sensitive: bool) -> impl IntoView {
 pub fn UserscriptsPage() -> impl IntoView {
     let app = StoredValue::new(use_app_state());
 
-    let scripts = RwSignal::new(Vec::<Userscript>::new());
-    let loading = RwSignal::new(true);
+    let counts = RwSignal::new(Option::<UserscriptCounts>::None);
+    let q = RwSignal::new(query_get("uq").unwrap_or_default()); // debounced
+    let status = RwSignal::new(query_get("um").unwrap_or_default());
+    let sort = RwSignal::new(query_get("us").unwrap_or_else(|| "name".into()));
+    let anchor0 = query_get("ua");
+    let debounce = StoredValue::new_local(None::<Timeout>);
+    let anchor_t = StoredValue::new_local(None::<Timeout>);
+    let dead = RwSignal::new(Vec::<char>::new());
+    let row_h = Signal::derive(move || if is_narrow() { 170.0 } else { 84.0 });
     let reload = RwSignal::new(0u32);
+
+    let fetch: Fetcher<Userscript> = Rc::new(move |cursor, from| {
+        let (qv, st, so) = (
+            q.get_untracked(),
+            status.get_untracked(),
+            sort.get_untracked(),
+        );
+        Box::pin(async move {
+            match ApiClient::new()
+                .list_userscripts_paged(&qv, &st, &so, cursor.as_deref(), from.as_deref(), 40)
+                .await
+            {
+                Ok(r) => {
+                    dead.set(dead_letters(&r.counts.letters));
+                    counts.set(Some(r.counts));
+                    Ok((r.items, r.next_cursor, r.total))
+                }
+                Err(e) => {
+                    app.get_value()
+                        .error(format!("Failed to load userscripts: {}", e));
+                    Err(e)
+                }
+            }
+        })
+    });
+    let feed = Feed::new(fetch);
+    let scripts = feed.items;
     let total_executions = RwSignal::new(0u64);
 
     // Install
@@ -166,22 +203,51 @@ pub fn UserscriptsPage() -> impl IntoView {
     let import_replace = RwSignal::new(false);
     let import_results = RwSignal::new(Option::<ImportUserscriptsResponse>::None);
 
-    // Load list
-    Effect::new(move || {
+    // Load list (restarts on search/filter/sort/profile change)
+    let first = StoredValue::new_local(true);
+    Effect::new(move |_| {
+        reload.track();
+        q.track();
+        status.track();
+        sort.track();
+        let from = if first.get_value() {
+            first.set_value(false);
+            if sort.get_untracked() == "name" {
+                anchor0.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        dead.set(Vec::new());
+        feed.reload(from, false, None);
+    });
+    Effect::new(move |_| {
         reload.track();
         wasm_bindgen_futures::spawn_local(async move {
-            let client = ApiClient::new();
-            match client.list_userscripts(1, 100, None).await {
-                Ok(r) => scripts.set(r.items),
-                Err(e) => app
-                    .get_value()
-                    .error(format!("Failed to load userscripts: {}", e)),
-            }
-            if let Ok(stats) = client.get_userscript_stats().await {
+            if let Ok(stats) = ApiClient::new().get_userscript_stats().await {
                 total_executions.set(stats.total_executions);
             }
-            loading.set(false);
         });
+    });
+    Effect::new(move |_| {
+        let so = sort.get();
+        query_set(&[
+            ("uq", Some(q.get())),
+            ("um", Some(status.get())),
+            ("us", (so != "name").then_some(so)),
+            ("ua", None),
+        ]);
+    });
+    let on_anchor = Callback::new(move |i: usize| {
+        if sort.get_untracked() != "name" {
+            return;
+        }
+        let label = feed
+            .items
+            .with_untracked(|v| v.get(i).map(|r| r.name.clone()));
+        anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("ua", label)]))));
     });
 
     let by_id =
@@ -253,10 +319,35 @@ pub fn UserscriptsPage() -> impl IntoView {
 
     let toggle = move |id: String, enabled: bool| {
         wasm_bindgen_futures::spawn_local(async move {
-            if let Err(e) = ApiClient::new().set_userscript_enabled(&id, enabled).await {
-                app.get_value().error(format!("Failed to update: {}", e));
+            match ApiClient::new().set_userscript_enabled(&id, enabled).await {
+                Ok(updated) => {
+                    counts.update(|c| {
+                        if let Some(c) = c {
+                            if enabled {
+                                c.enabled += 1;
+                                c.disabled = c.disabled.saturating_sub(1);
+                            } else {
+                                c.disabled += 1;
+                                c.enabled = c.enabled.saturating_sub(1);
+                            }
+                        }
+                    });
+                    let st = status.get_untracked();
+                    let gone = (st == "enabled" && !updated.enabled)
+                        || (st == "disabled" && updated.enabled);
+                    if gone {
+                        feed.items.update(|v| v.retain(|x| x.id != id));
+                        feed.total.update(|t| *t = t.saturating_sub(1));
+                    } else {
+                        feed.items.update(|v| {
+                            if let Some(x) = v.iter_mut().find(|x| x.id == id) {
+                                *x = updated;
+                            }
+                        });
+                    }
+                }
+                Err(e) => app.get_value().error(format!("Failed to update: {}", e)),
             }
-            reload.update(|n| *n += 1);
         });
     };
 
@@ -278,7 +369,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                 }
                 Err(e) => app.get_value().error(format!("Update check failed: {}", e)),
             }
-            reload.update(|n| *n += 1);
+            feed.refresh_loaded();
         });
     };
 
@@ -310,7 +401,7 @@ pub fn UserscriptsPage() -> impl IntoView {
             } else {
                 app.get_value().success(msg);
             }
-            reload.update(|n| *n += 1);
+            feed.refresh_loaded();
         });
     };
 
@@ -339,7 +430,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                 }
                 Err(e) => app.get_value().error(format!("Update failed: {}", e)),
             }
-            reload.update(|n| *n += 1);
+            feed.refresh_loaded();
         });
     };
 
@@ -363,7 +454,14 @@ pub fn UserscriptsPage() -> impl IntoView {
                 Ok(_) => {
                     app.get_value().success("Userscript uninstalled");
                     show_detail.set(false);
-                    reload.update(|n| *n += 1);
+                    counts.update(|c| {
+                        if let Some(c) = c {
+                            c.all = c.all.saturating_sub(1);
+                        }
+                    });
+                    feed.items.update(|v| v.retain(|x| x.id != id));
+                    feed.total.update(|t| *t = t.saturating_sub(1));
+                    feed.refresh_loaded();
                 }
                 Err(e) => app.get_value().error(format!("Failed to uninstall: {}", e)),
             }
@@ -383,7 +481,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                     .get_value()
                     .error(format!("Failed to clear storage: {}", e)),
             }
-            reload.update(|n| *n += 1);
+            feed.refresh_loaded();
         });
     };
 
@@ -457,27 +555,23 @@ pub fn UserscriptsPage() -> impl IntoView {
                 <h1 class="page-title">"Userscripts"</h1>
                 <ProfileSelector reload=reload />
                 <div class="userscript-actions">
-                    <button class="btn btn-secondary" on:click=move |_| {
+                    <button class="btn" on:click=move |_| {
                         import_results.set(None);
                         show_import.set(true);
                     }>"Import"</button>
-                    <button class="btn btn-secondary" on:click=do_export>"Export"</button>
-                    <label class="form-checkbox">
-                        <input type="checkbox" class="checkbox-input"
-                            prop:checked=move || export_values.get()
-                            on:change=move |_| export_values.update(|v| *v = !*v) />
-                        <span class="checkbox-label">"include stored values"</span>
-                    </label>
-                    <button class="btn btn-secondary" on:click=check_all>"Check all"</button>
-                    <button class="btn btn-primary" on:click=move |_| show_install.set(true)>
+                    <button class="btn" on:click=do_export>"Export"</button>
+                    <Switch checked=export_values label="Include stored values" text="include stored values"
+                        on_change=Callback::new(move |v: bool| export_values.set(v)) />
+                    <button class="btn" on:click=check_all>"Check all"</button>
+                    <button class="btn primary" on:click=move |_| show_install.set(true)>
                         "+ Install Userscript"
                     </button>
                 </div>
             </div>
 
-            <div class="userscripts-stats">
+            <div class="tiles">
                 <div class="stat-badge">
-                    <span class="stat-value">{move || scripts.get().len()}</span>
+                    <span class="stat-value">{move || counts.get().map(|c| c.all).unwrap_or(0)}</span>
                     <span class="stat-label">"Installed"</span>
                 </div>
                 <div class="stat-badge">
@@ -486,14 +580,63 @@ pub fn UserscriptsPage() -> impl IntoView {
                 </div>
             </div>
 
-            <Card class="userscripts-card">
-                <Show when=move || !loading.get() fallback=|| view! {
-                    <div class="loading">"Loading..."</div>
-                }>
-                    <For
-                        each=move || scripts.get()
-                        key=|s| format!("{}|{}|{}|{}", s.id, s.enabled, s.version.clone().unwrap_or_default(), s.pending_update.is_some())
-                        children=move |script| {
+            <div class="card">
+                <div class="card-h">
+                    <h3>"Installed userscripts"</h3>
+                    <span class="sub">{move || format!("{} scripts", counts.get().map(|c| c.all).unwrap_or(0))}</span>
+                </div>
+                <div class="card-b sitebar">
+                    <div class="toolbar">
+                        <div class="search grow">
+                            <Icon name="search" />
+                            <label class="sr" for="usQ">"Search userscripts"</label>
+                            <input id="usQ" class="input mono" placeholder="Search by name or description" autocomplete="off"
+                                value=q.get_untracked()
+                                on:input=move |ev| {
+                                    let v = event_target_value(&ev);
+                                    debounce.set_value(Some(Timeout::new(150, move || q.set(v))));
+                                } />
+                        </div>
+                        <div class="seg" role="radiogroup" aria-label="Filter by status">
+                            {[("", "All"), ("enabled", "Enabled"), ("disabled", "Disabled"), ("error", "Errors")]
+                                .into_iter()
+                                .map(|(val, name)| view! {
+                                    <button type="button" role="radio"
+                                        aria-checked=move || (status.get() == val).to_string()
+                                        on:click=move |_| status.set(val.to_string())>
+                                        {name}
+                                        {move || counts.get().map(|c| match val {
+                                            "enabled" => c.enabled,
+                                            "disabled" => c.disabled,
+                                            "error" => c.error,
+                                            _ => c.all,
+                                        }).map(|n| view! { <span class="n">{n}</span> })}
+                                    </button>
+                                })
+                                .collect_view()}
+                        </div>
+                        <select class="select" aria-label="Sort" prop:value=move || sort.get()
+                            on:change=move |ev| sort.set(event_target_value(&ev))>
+                            <option value="name">"Name"</option>
+                            <option value="updated">"Recently updated"</option>
+                        </select>
+                    </div>
+                </div>
+                <Show
+                    when=move || !feed.items.with(|v| v.is_empty())
+                    fallback=move || view! {
+                        <div class="empty">
+                            <b>{move || if feed.loading.get() { "Loading..." } else { "No userscripts match" }}</b>
+                        </div>
+                    }
+                >
+                    <div class="vwrap">
+                        <VList
+                            items=feed.items
+                            row_h=row_h
+                            key=|s: &Userscript| format!("{}|{}|{}|{}|{}|{}", s.id, s.enabled, s.version.clone().unwrap_or_default(), s.pending_update.is_some(), s.error, s.updated_at)
+                            render=Callback::new(move |script: Userscript| {
+
                             let id = script.id.clone();
                             let (id_t, id_c, id_d, id_u) = (id.clone(), id.clone(), id.clone(), id.clone());
                             let enabled = script.enabled;
@@ -530,38 +673,59 @@ pub fn UserscriptsPage() -> impl IntoView {
                                         </div>
                                     </div>
                                     <div class="userscript-actions">
-                                        <label class="form-checkbox">
-                                            <input type="checkbox" class="checkbox-input"
-                                                prop:checked=enabled
-                                                on:change=move |ev| toggle(id_t.clone(), event_target_checked(&ev)) />
-                                            <span class="checkbox-label">"Enabled"</span>
-                                        </label>
-                                        <button class="btn btn-ghost" disabled=!has_url
+                                        <Switch checked=enabled label="Enabled" text="Enabled"
+                                            on_change=Callback::new(move |v: bool| toggle(id_t.clone(), v)) />
+                                        <button class="btn ghost" disabled=!has_url
                                             on:click=move |_| check_update(id_c.clone())>
                                             "Check for update"
                                         </button>
-                                        <button class="btn btn-ghost"
+                                        <button class="btn ghost"
                                             on:click=move |_| open_detail(id_d.clone())>
                                             "Details"
                                         </button>
                                     </div>
                                 </div>
-                            }
-                        }
-                    />
-                    <Show when=move || scripts.get().is_empty()>
-                        <div class="empty-state"><p>"No userscripts installed"</p></div>
-                    </Show>
+                            }.into_any()
+                            })
+                            on_end=Callback::new(move |()| feed.more())
+                            on_anchor=on_anchor
+                            reset=feed.tok
+                            label="Userscripts"
+                        />
+                        <nav class="azrail" aria-label="Jump to letter" hidden=move || !(sort.get() == "name" && feed.total.get() > 12)>
+                            {LETTERS.iter().map(|&l| view! {
+                                <button type="button" disabled=move || dead.get().contains(&l)
+                                    on:click=move |_| feed.reload(
+                                        Some(l.to_string()), true,
+                                        Some(Callback::new(move |n: usize| {
+                                            if n == 0 {
+                                                dead.update(|d| d.push(l));
+                                                app.get_value().info(format!("No userscripts starting with {}", l.to_ascii_uppercase()));
+                                            }
+                                        })),
+                                    )>{l.to_ascii_uppercase().to_string()}</button>
+                            }).collect_view()}
+                        </nav>
+                    </div>
                 </Show>
-            </Card>
+                <div class="vfoot" aria-live="polite">
+                    <span>{move || {
+                        let n = feed.total.get();
+                        if !q.get().is_empty() || !status.get().is_empty() { format!("{n} matches") } else { format!("{n} scripts") }
+                    }}</span>
+                    <span>{move || {
+                        let n = feed.items.with(|v| v.len());
+                        if feed.next.get().is_some() { format!("showing 1-{n} \u{b7} scroll for more") } else { "end of list".to_string() }
+                    }}</span>
+                </div>
+            </div>
 
             // Install modal
-            <Modal title="Install Userscript" open=show_install
-                on_close=Callback::new(move |_| show_install.set(false))>
+            <Drawer title="Install Userscript" open=show_install>
                 <div class="us-tabs">
-                    <button class=move || if url_mode.get() { "btn btn-ghost" } else { "btn btn-secondary" }
+                    <button class=move || if url_mode.get() { "btn ghost" } else { "btn" }
                         on:click=move |_| url_mode.set(false)>"Paste source"</button>
-                    <button class=move || if url_mode.get() { "btn btn-secondary" } else { "btn btn-ghost" }
+                    <button class=move || if url_mode.get() { "btn" } else { "btn ghost" }
                         on:click=move |_| url_mode.set(true)>"From URL"</button>
                 </div>
                 <Show when=move || url_mode.get() fallback=move || view! {
@@ -570,22 +734,21 @@ pub fn UserscriptsPage() -> impl IntoView {
                         prop:value=move || install_source.get()
                         on:input=move |ev| install_source.set(event_target_value(&ev))></textarea>
                 }>
-                    <input class="form-input" type="url" placeholder="https://example.com/script.user.js"
+                    <input class="input" type="url" placeholder="https://example.com/script.user.js"
                         prop:value=move || install_url.get()
                         on:input=move |ev| install_url.set(event_target_value(&ev)) />
                 </Show>
-                <p class="modal-help">"Nothing is installed until you approve the plan."</p>
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_install.set(false)>"Cancel"</button>
-                    <button class="btn btn-primary" disabled=move || busy.get() on:click=do_plan>
+                <p class="hint">"Nothing is installed until you approve the plan."</p>
+                <div class="row-gap">
+                    <button class="btn" on:click=move |_| show_install.set(false)>"Cancel"</button>
+                    <button class="btn primary" disabled=move || busy.get() on:click=do_plan>
                         "Review"
                     </button>
                 </div>
-            </Modal>
+            </Drawer>
 
             // Approval dialog
-            <Modal title="Approve installation" open=show_plan class="source-modal"
-                on_close=Callback::new(move |_| show_plan.set(false))>
+            <Drawer title="Approve installation" open=show_plan>
                 {move || plan.get().map(|p| {
                     let sensitive: Vec<(&str, bool)> = vec![
                         ("Network", p.network), ("Cookies", p.cookies), ("Downloads", p.downloads),
@@ -630,12 +793,8 @@ pub fn UserscriptsPage() -> impl IntoView {
                             {p.connect_all.then(|| view! {
                                 <div class="us-danger">
                                     "This script asks to connect to ANY host (@connect *). It can send data anywhere."
-                                    <label class="form-checkbox">
-                                        <input type="checkbox" class="checkbox-input"
-                                            prop:checked=move || allow_all.get()
-                                            on:change=move |_| allow_all.update(|v| *v = !*v) />
-                                        <span class="checkbox-label">"Allow @connect *"</span>
-                                    </label>
+                                    <Switch checked=allow_all label="Allow @connect *" text="Allow @connect *"
+                                        on_change=Callback::new(move |v: bool| allow_all.set(v)) />
                                 </div>
                             })}
                             <div class="userscript-matches">{tag_list(p.connect.clone(), false)}</div>
@@ -672,17 +831,16 @@ pub fn UserscriptsPage() -> impl IntoView {
                         })}
                     }
                 })}
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_plan.set(false)>"Cancel"</button>
-                    <button class="btn btn-primary"
+                <div class="row-gap">
+                    <button class="btn" on:click=move |_| show_plan.set(false)>"Cancel"</button>
+                    <button class="btn primary"
                         disabled=move || busy.get() || plan.get().is_some_and(|p| p.connect_all && !allow_all.get())
                         on:click=do_confirm>"Approve & install"</button>
                 </div>
-            </Modal>
+            </Drawer>
 
             // Pending update dialog
-            <Modal title="Pending update" open=show_update class="source-modal"
-                on_close=Callback::new(move |_| show_update.set(false))>
+            <Drawer title="Pending update" open=show_update>
                 {move || by_id(update_id.get()).and_then(|s| s.pending_update.clone().map(|p| (s, p))).map(|(s, p)| {
                     let d = p.diff.clone();
                     let adds_all = d.added_connect.iter().any(|c| c == "*");
@@ -709,24 +867,19 @@ pub fn UserscriptsPage() -> impl IntoView {
                         {row("Removed grants", d.removed_grants, "")}
                         {row("Other widening", d.widened, "us-hot")}
                         {adds_all.then(|| view! {
-                            <label class="form-checkbox">
-                                <input type="checkbox" class="checkbox-input"
-                                    prop:checked=move || update_allow_all.get()
-                                    on:change=move |_| update_allow_all.update(|v| *v = !*v) />
-                                <span class="checkbox-label">"Allow @connect *"</span>
-                            </label>
+                            <Switch checked=update_allow_all label="Allow @connect *" text="Allow @connect *"
+                                on_change=Callback::new(move |v: bool| update_allow_all.set(v)) />
                         })}
                     }
                 })}
-                <div class="modal-actions">
-                    <button class="btn btn-danger" on:click=move |_| resolve_update(false)>"Discard"</button>
-                    <button class="btn btn-primary" on:click=move |_| resolve_update(true)>"Approve"</button>
+                <div class="row-gap">
+                    <button class="btn danger sm" on:click=move |_| resolve_update(false)>"Discard"</button>
+                    <button class="btn primary" on:click=move |_| resolve_update(true)>"Approve"</button>
                 </div>
-            </Modal>
+            </Drawer>
 
             // Details modal
-            <Modal title="Userscript details" open=show_detail class="source-modal"
-                on_close=Callback::new(move |_| show_detail.set(false))>
+            <Drawer title="Userscript details" open=show_detail>
                 {move || by_id(detail_id.get()).map(|s| {
                     let (id_src, id_un, id_clear) = (s.id.clone(), s.id.clone(), s.id.clone());
                     let sid = s.id.clone();
@@ -769,10 +922,10 @@ pub fn UserscriptsPage() -> impl IntoView {
                             {move || {
                                 let sid = sid.clone();
                                 storage.get().map(|st| if st.values.is_empty() {
-                                    view! { <p class="modal-help">"No stored values"</p> }.into_any()
+                                    view! { <p class="hint">"No stored values"</p> }.into_any()
                                 } else {
                                     view! {
-                                        <div class="table-container"><table class="table">
+                                        <div class="tbl-wrap"><div class="tbl-wrap"><table class="tbl">
                                             <thead><tr><th>"Name"</th><th>"Size"</th><th>"Preview"</th><th></th></tr></thead>
                                             <tbody>
                                                 {st.values.into_iter().map(|v| {
@@ -781,40 +934,35 @@ pub fn UserscriptsPage() -> impl IntoView {
                                                         <td>{v.name.clone()}</td>
                                                         <td>{fmt_bytes(v.size_bytes as u64)}</td>
                                                         <td><code>{v.preview.clone()}</code></td>
-                                                        <td><button class="btn btn-ghost btn-sm"
+                                                        <td><button class="btn ghost sm"
                                                             on:click=move |_| clear_storage(sid.clone(), Some(name.clone()))>"Delete"</button></td>
                                                     </tr> }
                                                 }).collect_view()}
                                             </tbody>
-                                        </table></div>
+                                        </table></div></div>
                                     }.into_any()
                                 })
                             }}
-                            <button class="btn btn-secondary btn-sm"
+                            <button class="btn sm"
                                 on:click=move |_| clear_storage(id_clear.clone(), None)>"Clear all"</button>
                         </div>
-                        <div class="modal-actions">
-                            <button class="btn btn-ghost" on:click=move |_| view_source(id_src.clone())>"View source"</button>
-                            <button class="btn btn-danger" on:click=move |_| uninstall(id_un.clone())>"Uninstall"</button>
+                        <div class="row-gap">
+                            <button class="btn ghost" on:click=move |_| view_source(id_src.clone())>"View source"</button>
+                            <button class="btn danger sm" on:click=move |_| uninstall(id_un.clone())>"Uninstall"</button>
                         </div>
                     }
                 })}
-            </Modal>
+            </Drawer>
 
             // Import modal
-            <Modal title="Import userscripts" open=show_import class="source-modal"
-                on_close=Callback::new(move |_| show_import.set(false))>
-                <p class="modal-help">"Choose an exported bundle file or paste its JSON."</p>
+            <Drawer title="Import userscripts" open=show_import>
+                <p class="hint">"Choose an exported bundle file or paste its JSON."</p>
                 <input type="file" accept=".json,application/json" on:change=on_file />
-                <textarea class="source-input" placeholder="{\"format\": \"adblocker-userscripts-v1\", ...}"
+                <textarea class="source-input" placeholder="{\"format\": \"argus-userscripts-v1\", ...}"
                     prop:value=move || import_text.get()
                     on:input=move |ev| import_text.set(event_target_value(&ev))></textarea>
-                <label class="form-checkbox">
-                    <input type="checkbox" class="checkbox-input"
-                        prop:checked=move || import_replace.get()
-                        on:change=move |_| import_replace.update(|v| *v = !*v) />
-                    <span class="checkbox-label">"Replace existing scripts (default: skip)"</span>
-                </label>
+                <Switch checked=import_replace label="Replace existing scripts" text="Replace existing scripts (default: skip)"
+                    on_change=Callback::new(move |v: bool| import_replace.set(v)) />
                 {move || import_results.get().map(|r| view! {
                     <ul class="us-results">
                         {r.results.into_iter().map(|x| view! {
@@ -825,16 +973,15 @@ pub fn UserscriptsPage() -> impl IntoView {
                         }).collect_view()}
                     </ul>
                 })}
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_import.set(false)>"Close"</button>
-                    <button class="btn btn-primary" disabled=move || busy.get() on:click=do_import>"Import"</button>
+                <div class="row-gap">
+                    <button class="btn" on:click=move |_| show_import.set(false)>"Close"</button>
+                    <button class="btn primary" disabled=move || busy.get() on:click=do_import>"Import"</button>
                 </div>
-            </Modal>
+            </Drawer>
 
-            <Modal title="Userscript Source" open=show_source
-                on_close=Callback::new(move |_| show_source.set(false)) class="source-modal">
+            <Drawer title="Userscript Source" open=show_source>
                 <pre class="source-code">{source_content}</pre>
-            </Modal>
+            </Drawer>
         </Layout>
     }
 }

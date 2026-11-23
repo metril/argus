@@ -1,6 +1,6 @@
 //! The single embedded database (redb) shared by every store in the process.
 //!
-//! One file, `<data_dir>/adblocker.redb`, is opened once per process (see [`Db::open`]); each
+//! One file, `<data_dir>/argus.redb`, is opened once per process (see [`Db::open`]); each
 //! domain (lists, users, sessions, tokens, audit, userscripts) keeps a small typed store on top
 //! of it. All table definitions live in [`tables`].
 //!
@@ -29,7 +29,9 @@ use std::time::Duration;
 use tracing::{error, warn};
 
 /// File name of the database inside the data directory.
-pub const FILE_NAME: &str = "adblocker.redb";
+pub const FILE_NAME: &str = "argus.redb";
+/// Pre-rename database file name; adopted by renaming it on first start.
+pub const LEGACY_FILE_NAME: &str = "adblocker.redb";
 /// On-disk schema version written by this build.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -193,6 +195,7 @@ impl Db {
     fn open_new(dir: &Path) -> Result<Db, DbError> {
         warn_legacy_sled(dir);
         let path = dir.join(FILE_NAME);
+        adopt_legacy_file(dir, &path)?;
         let database = Arc::new(Database::create(&path)?);
         init_schema(&database, &path)?;
         let queue = Arc::new(Queue {
@@ -511,6 +514,40 @@ fn warn_legacy_sled(dir: &Path) {
     }
 }
 
+/// Rename a pre-rename `adblocker.redb` to `argus.redb` when only the old one exists.
+fn adopt_legacy_file(dir: &Path, new: &Path) -> Result<(), DbError> {
+    adopt_legacy_with(dir, new, |from, to| std::fs::rename(from, to))
+}
+
+/// [`adopt_legacy_file`] with the rename injectable. Two processes starting together can both
+/// see the old file; the loser's rename fails with NotFound, which is fine once the new file
+/// exists (the winner already moved it).
+fn adopt_legacy_with(
+    dir: &Path,
+    new: &Path,
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), DbError> {
+    let old = dir.join(LEGACY_FILE_NAME);
+    if !new.exists() && old.exists() {
+        match rename(&old, new) {
+            Ok(()) => tracing::info!(
+                "Adopted existing database {} as {}",
+                old.display(),
+                new.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && new.exists() => {}
+            Err(e) => {
+                return Err(DbError::Storage(format!(
+                    "adopt {} -> {}: {e}",
+                    old.display(),
+                    new.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +570,32 @@ mod tests {
             t.open_table(tables::AUDIT)?.insert(k, b"x".as_slice())?;
             Ok(())
         });
+    }
+
+    #[test]
+    fn legacy_database_file_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            put(&db, 7).unwrap();
+        }
+        std::fs::rename(
+            dir.path().join(FILE_NAME),
+            dir.path().join(LEGACY_FILE_NAME),
+        )
+        .unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(count(&db), 1);
+        assert!(dir.path().join(FILE_NAME).exists());
+        assert!(!dir.path().join(LEGACY_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn fresh_install_uses_new_database_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db = Db::open(dir.path()).unwrap();
+        assert!(dir.path().join(FILE_NAME).exists());
+        assert!(!dir.path().join(LEGACY_FILE_NAME).exists());
     }
 
     #[test]
@@ -723,5 +786,40 @@ mod tests {
         std::fs::write(old.join("conf"), b"x").unwrap();
         std::fs::write(old.join("db"), b"x").unwrap();
         assert!(Db::open(d.path()).is_ok());
+    }
+
+    #[test]
+    fn losing_the_legacy_rename_race_is_fine_once_the_new_file_exists() {
+        let d = tempfile::tempdir().unwrap();
+        let new = d.path().join("argus.redb");
+        std::fs::write(d.path().join(LEGACY_FILE_NAME), b"old").unwrap();
+        // The other process moves the file first: our rename sees NotFound, and the new file is
+        // there.
+        let (old, n2) = (d.path().join(LEGACY_FILE_NAME), new.clone());
+        adopt_legacy_with(d.path(), &new, |_, _| {
+            std::fs::rename(&old, &n2).unwrap();
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap();
+        assert!(new.exists());
+        // NotFound without a new file, and any other error, still fail.
+        let d2 = tempfile::tempdir().unwrap();
+        std::fs::write(d2.path().join(LEGACY_FILE_NAME), b"old").unwrap();
+        let new2 = d2.path().join("argus.redb");
+        assert!(
+            adopt_legacy_with(d2.path(), &new2, |_, _| Err(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            )))
+            .is_err()
+        );
+        assert!(
+            adopt_legacy_with(d2.path(), &new2, |_, _| Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            )))
+            .is_err()
+        );
+        // The plain path still renames.
+        adopt_legacy_file(d2.path(), &new2).unwrap();
+        assert!(new2.exists());
     }
 }

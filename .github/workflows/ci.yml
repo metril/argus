@@ -121,8 +121,8 @@ jobs:
           chrome-version: stable
       - run: cargo nextest run -p e2e-browser --no-fail-fast --no-capture
         env:
-          ADBLOCKER_BROWSER: ${{ steps.chrome.outputs.chrome-path }}
-          ADBLOCKER_REQUIRE_BROWSER: "1"
+          ARGUS_BROWSER: ${{ steps.chrome.outputs.chrome-path }}
+          ARGUS_REQUIRE_BROWSER: "1"
 
   # Real SO_ORIGINAL_DST behind an nftables REDIRECT, inside a throwaway network namespace.
   kernel:
@@ -146,7 +146,7 @@ jobs:
         run: unshare -rn sh -c 'ip link set lo up && nft list ruleset >/dev/null'
       - run: cargo nextest run -p proxy-core --test kernel_original_dst --no-capture
         env:
-          ADBLOCKER_KERNEL_TEST: "1"
+          ARGUS_KERNEL_TEST: "1"
 
   ci-ok:
     if: always()

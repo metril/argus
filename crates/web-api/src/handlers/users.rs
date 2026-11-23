@@ -28,6 +28,29 @@ fn load(state: &AppState, id: &str) -> ApiResult<User> {
         .ok_or_else(|| ApiError::NotFound("User not found".into()))
 }
 
+/// `UserInfo` with the live session count.
+fn info(state: &AppState, user: &User) -> UserInfo {
+    let mut i = UserInfo::from(user);
+    i.session_count = state.session_manager.get_user_sessions(&user.id).len() as u32;
+    i
+}
+
+/// A default profile must be an existing profile id.
+fn check_profile(state: &AppState, id: &str) -> ApiResult<()> {
+    let known = id
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| state.profiles.get(n).ok().flatten())
+        .is_some();
+    if known {
+        Ok(())
+    } else {
+        Err(ApiError::ValidationError(format!(
+            "default_profile: no profile '{id}'"
+        )))
+    }
+}
+
 /// List user accounts.
 #[utoipa::path(
     get, path = "/users", tag = "users",
@@ -42,7 +65,7 @@ pub async fn list_users(
     let st = state.clone();
     let mut users = blocking(move || st.session_store.get_all_users()).await?;
     users.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    let all = users.iter().map(UserInfo::from).collect();
+    let all = users.iter().map(|u| info(&state, u)).collect();
     Ok(Json(Page::from_vec(all, q.page, q.limit)))
 }
 
@@ -73,7 +96,7 @@ pub async fn create_user(
     let (st, u) = (state.clone(), user.clone());
     blocking(move || st.session_store.store_user(&u)).await?;
     info!("User {} created with role {:?}", user.username, user.role);
-    Ok((StatusCode::CREATED, Json(UserInfo::from(&user))))
+    Ok((StatusCode::CREATED, Json(info(&state, &user))))
 }
 
 /// Get one user.
@@ -87,7 +110,7 @@ pub async fn get_user(
     State(state): State<Arc<AppState>>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<UserInfo>> {
-    Ok(Json(UserInfo::from(&load(&state, &id)?)))
+    Ok(Json(info(&state, &load(&state, &id)?)))
 }
 
 /// Change a user's role or enabled flag. The last enabled administrator cannot be demoted or
@@ -104,10 +127,16 @@ pub async fn update_user(
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<UpdateUserRequest>,
 ) -> ApiResult<Json<UserInfo>> {
+    if let Some(p) = req.default_profile.as_deref().filter(|p| !p.is_empty()) {
+        check_profile(&state, p)?;
+    }
     let st = state.clone();
     let user = blocking(move || {
         let _g = st.session_store.admin_lock.lock();
         let mut user = load(&st, &id)?;
+        if let Some(p) = &req.default_profile {
+            user.default_profile = (!p.is_empty()).then(|| p.clone());
+        }
         let was_admin = user.enabled && user.role == UserRole::Admin;
         if let Some(r) = req.role {
             user.role = r;
@@ -128,7 +157,7 @@ pub async fn update_user(
         Ok(user)
     })
     .await?;
-    Ok(Json(UserInfo::from(&user)))
+    Ok(Json(info(&state, &user)))
 }
 
 /// Delete a user, their sessions and their tokens.

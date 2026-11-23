@@ -19,8 +19,14 @@ pub fn AppRouter() -> impl IntoView {
                 // Protected routes
                 <Route path=path!("/") view=DashboardPage />
                 <Route path=path!("/proxy") view=ProxyPage />
+                <Route path=path!("/bypass") view=BypassPage />
                 <Route path=path!("/filters") view=FiltersPage />
+                <Route path=path!("/logs") view=LogsPage />
                 <Route path=path!("/blocked") view=BlockedPage />
+                <Route path=path!("/account") view=AccountPage />
+                <Route path=path!("/users") view=UsersPage />
+                <Route path=path!("/sessions") view=SessionsPage />
+                <Route path=path!("/audit") view=AuditPage />
                 <Route path=path!("/userscripts") view=UserscriptsPage />
                 <Route path=path!("/policy") view=PolicyPage />
                 <Route path=path!("/profiles") view=ProfilesPage />
@@ -36,10 +42,12 @@ pub fn AppRouter() -> impl IntoView {
 #[component]
 fn NotFoundPage() -> impl IntoView {
     view! {
-        <div class="not-found">
-            <h1>"404"</h1>
-            <p>"Page not found"</p>
-            <a href="/" class="btn btn-primary">"Go to Dashboard"</a>
+        <div class="auth-wrap">
+            <div class="not-found">
+                <h1>"404"</h1>
+                <p class="muted">"Page not found"</p>
+                <a href="/" class="btn primary">"Go to Dashboard"</a>
+            </div>
         </div>
     }
 }

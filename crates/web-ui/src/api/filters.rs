@@ -15,6 +15,23 @@ pub type FilterListsResponse = api_types::Page<FilterList>;
 
 /// Filter blocking statistics.
 pub use api_types::FilterStatsResponse as FilterStats;
+pub use api_types::{FilterListCounts, FilterListsPage, TestUrlRequest, TestUrlResponse};
+
+/// Relative time from an RFC 3339 timestamp ("3 h ago"); "never" when absent.
+pub fn ago_rfc3339(ts: Option<&str>) -> String {
+    let Some(ts) = ts else { return "never".into() };
+    let ms = js_sys::Date::parse(ts);
+    if ms.is_nan() {
+        return ts.to_string();
+    }
+    let d = ((js_sys::Date::now() - ms) / 1000.0).max(0.0) as u64;
+    match d {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", d / 60),
+        3600..=86399 => format!("{} h ago", d / 3600),
+        _ => format!("{} d ago", d / 86400),
+    }
+}
 
 impl ApiClient {
     /// List filter lists with pagination
@@ -28,11 +45,65 @@ impl ApiClient {
     }
 
     /// Get a specific filter list
+    /// Cursor-paged lists. `status`: "" | on | off | attn; `sort`: name | rules | updated;
+    /// `from` seeks to a prefix (name only).
+    pub async fn list_filter_lists_paged(
+        &self,
+        q: &str,
+        status: &str,
+        sort: &str,
+        cursor: Option<&str>,
+        from: Option<&str>,
+        limit: u32,
+    ) -> Result<FilterListsPage, ApiError> {
+        let mut path = format!(
+            "/lists?limit={limit}&sort={sort}&q={}",
+            js_sys::encode_uri_component(q.trim())
+        );
+        if !status.is_empty() {
+            path.push_str(&format!("&status={status}"));
+        }
+        if let Some(c) = cursor {
+            path.push_str(&format!("&cursor={}", js_sys::encode_uri_component(c)));
+        }
+        if let Some(f) = from {
+            path.push_str(&format!("&from={}", js_sys::encode_uri_component(f)));
+        }
+        self.get(&path).await
+    }
+
+    /// Refresh one list (rebuilds the engine).
+    pub async fn refresh_list(
+        &self,
+        id: &str,
+    ) -> Result<api_types::EngineStatusResponse, ApiError> {
+        self.post(&format!("/lists/{id}/refresh"), &()).await
+    }
+
+    /// Refresh every enabled list.
+    pub async fn refresh_all_lists(&self) -> Result<api_types::EngineStatusResponse, ApiError> {
+        self.post("/lists/refresh", &()).await
+    }
+
+    /// Which rule decides a URL.
+    pub async fn test_url(&self, url: &str) -> Result<TestUrlResponse, ApiError> {
+        self.post(
+            "/rules/test",
+            &TestUrlRequest {
+                url: url.to_string(),
+                source_url: None,
+                resource_type: None,
+            },
+        )
+        .await
+    }
+
     pub async fn get_filter_list(&self, id: &str) -> Result<FilterList, ApiError> {
         self.get(&format!("/lists/{}", id)).await
     }
 
     /// Add a new filter list
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_filter_list(
         &self,
         id: &str,
@@ -41,6 +112,7 @@ impl ApiClient {
         enabled: bool,
         format: &str,
         allowlist: bool,
+        trusted: bool,
     ) -> Result<FilterList, ApiError> {
         let req = AddFilterListRequest {
             id: id.to_string(),
@@ -49,7 +121,7 @@ impl ApiClient {
             enabled: Some(enabled),
             format: Some(format.to_string()),
             allowlist: Some(allowlist),
-            trusted: None,
+            trusted: Some(trusted),
         };
         self.post("/lists", &req).await
     }

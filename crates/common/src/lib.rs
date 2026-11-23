@@ -1,7 +1,9 @@
 //! Common utilities and types shared across all crates
 
+pub mod bypass;
 pub mod config;
 pub mod db;
+pub mod env;
 pub mod error;
 pub mod faults;
 pub mod net_policy;

@@ -334,3 +334,178 @@ mod tests {
         );
     }
 }
+
+/// Error kind of a failed I/O operation towards the upstream server.
+pub fn classify_io(e: &std::io::Error) -> filter_engine::ErrorKind {
+    use filter_engine::ErrorKind as K;
+    use std::io::ErrorKind as I;
+    if e.get_ref().is_some_and(|i| i.is::<rustls::Error>()) {
+        return K::UpstreamTls;
+    }
+    match e.kind() {
+        I::TimedOut => K::UpstreamTimeout,
+        I::ConnectionReset
+        | I::ConnectionAborted
+        | I::ConnectionRefused
+        | I::BrokenPipe
+        | I::UnexpectedEof => K::UpstreamReset,
+        _ => K::Other,
+    }
+}
+
+/// Error kind of a failed upstream HTTP request: walks the error chain for a timeout, a TLS
+/// (certificate or handshake) failure or a connection reset.
+pub fn classify_reqwest(e: &reqwest::Error) -> filter_engine::ErrorKind {
+    use filter_engine::ErrorKind as K;
+    if e.is_timeout() {
+        return K::UpstreamTimeout;
+    }
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut io_kind = None;
+    while let Some(err) = cur {
+        if err.is::<rustls::Error>() {
+            return K::UpstreamTls;
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            match classify_io(io) {
+                K::Other => {}
+                k @ (K::UpstreamTls | K::UpstreamTimeout) => return k,
+                k => io_kind = io_kind.or(Some(k)),
+            }
+        }
+        cur = err.source();
+    }
+    if let Some(k) = io_kind {
+        return k;
+    }
+    let text = format!("{e:?}").to_ascii_lowercase();
+    if text.contains("certificate")
+        || text.contains("tls handshake")
+        || text.contains("invalidcert")
+    {
+        K::UpstreamTls
+    } else if text.contains("incompletemessage")
+        || text.contains("connection closed")
+        || text.contains("connection reset")
+    {
+        K::UpstreamReset
+    } else {
+        K::Other
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use filter_engine::ErrorKind as K;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn io_errors_map_to_kinds() {
+        let e = |k| std::io::Error::new(k, "x");
+        assert_eq!(
+            classify_io(&e(std::io::ErrorKind::TimedOut)),
+            K::UpstreamTimeout
+        );
+        for k in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(classify_io(&e(k)), K::UpstreamReset, "{k:?}");
+        }
+        assert_eq!(
+            classify_io(&e(std::io::ErrorKind::PermissionDenied)),
+            K::Other
+        );
+        let tls = std::io::Error::other(rustls::Error::General("x".into()));
+        assert_eq!(classify_io(&tls), K::UpstreamTls);
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_is_a_timeout() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .timeout(std::time::Duration::from_millis(150))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify_reqwest(&err), K::UpstreamTimeout);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_hangs_up_is_a_reset() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut b = [0u8; 512];
+                let _ = s.read(&mut b).await;
+                drop(s); // close without answering
+            }
+        });
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify_reqwest(&err), K::UpstreamReset, "{err:?}");
+        // Nothing listening at all: connection refused is a reset-class failure too.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify_reqwest(&err), K::UpstreamReset, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_upstream_certificate_is_a_tls_error() {
+        // A TLS server whose certificate the client does not trust.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = a.accept(s).await;
+                });
+            }
+        });
+        let err = reqwest::Client::new()
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(classify_reqwest(&err), K::UpstreamTls, "{err:?}");
+    }
+}

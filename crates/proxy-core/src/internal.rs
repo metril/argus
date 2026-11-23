@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn boot_defines_runtime_hook() {
-        assert!(BOOT_JS.contains("__adblockerRuntime"));
+        assert!(BOOT_JS.contains("__argusRuntime"));
         assert!(BOOT_JS.contains("unsupported scriptlet "));
     }
 

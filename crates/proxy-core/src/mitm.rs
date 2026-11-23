@@ -17,7 +17,10 @@ use tracing::{debug, info, trace, warn};
 pub struct CertificateData {
     pub cert: CertificateDer<'static>,
     pub key: Arc<PrivateKeyDer<'static>>,
+    /// Offers h2 in ALPN when the handler allows HTTP/2.
     pub server_config: Arc<ServerConfig>,
+    /// HTTP/1.1 only, for listeners with HTTP/2 switched off.
+    pub server_config_h1: Arc<ServerConfig>,
 }
 
 /// MITM handler with certificate caching
@@ -117,12 +120,15 @@ impl MitmHandler {
                         cert.clone(),
                         key.clone_key(),
                         enable_http2,
-                        ticketer,
+                        ticketer.clone(),
                     )?;
+                    let server_config_h1 =
+                        tls::build_server_config(cert.clone(), key.clone_key(), false, ticketer)?;
                     Ok::<_, Error>(Arc::new(CertificateData {
                         cert,
                         key: Arc::new(key),
                         server_config,
+                        server_config_h1,
                     }))
                 })
                 .await

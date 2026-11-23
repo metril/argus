@@ -182,16 +182,31 @@ pub(crate) fn dynamic_selectors(
     out
 }
 
+/// Replacement upstream clients, built but not yet installed.
+pub struct PreparedUpstream {
+    client: reqwest::Client,
+    strict: reqwest::Client,
+    opts: UpstreamOptions,
+}
+
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
 pub struct ProxyContext {
     engine: Arc<SharedEngine>,
-    client: reqwest::Client,
+    /// The pooled upstream client; replaced when its timeouts change (requests in flight keep
+    /// the old one).
+    client: ArcSwap<reqwest::Client>,
+    /// The options the clients were built from, for rebuilding.
+    upstream_opts: parking_lot::Mutex<Option<UpstreamOptions>>,
     /// The default profile's slot (also held by the profile table).
     default_slot: ProfileSlot,
     /// Device-to-profile table; holds only the default profile until something publishes.
     profiles: Profiles,
     /// The profile and device store and the builder that compiles it into `profiles` (set once
     /// at startup; see [`Self::set_profile_service`]).
+    /// Hosts excluded from interception / filtering (see `common::bypass`).
+    bypass: std::sync::OnceLock<Arc<common::bypass::BypassEngine>>,
+    /// Per-host Extended Validation verdicts.
+    ev: crate::ev::EvCache,
     profile_store: std::sync::OnceLock<Arc<common::profile_store::ProfileStore>>,
     profile_builder: std::sync::OnceLock<Arc<crate::profile_build::ProfileBuilder>>,
     /// Refuse explicit-proxy connections without a known device token (`407`).
@@ -204,7 +219,7 @@ pub struct ProxyContext {
     /// Destination policy for every upstream dial.
     policy: Arc<DestPolicy>,
     /// Client for requests aimed at the proxy's own ports (see [`build_strict_upstream_client`]).
-    strict_client: reqwest::Client,
+    strict_client: ArcSwap<reqwest::Client>,
     /// The `/__adblock__/` endpoints and their state.
     internal: Arc<Internal>,
     /// Optional per-response transforms (extended rules), see [`crate::rewrite`].
@@ -224,11 +239,14 @@ impl ProxyContext {
         let default_slot = default_profile_slot(engine.clone());
         Self {
             engine,
-            strict_client: client.clone(),
+            strict_client: ArcSwap::from_pointee(client.clone()),
             policy: Arc::default(),
-            client,
+            upstream_opts: parking_lot::Mutex::new(None),
+            client: ArcSwap::from_pointee(client),
             profiles: Profiles::new(default_slot.clone()),
             default_slot,
+            bypass: std::sync::OnceLock::new(),
+            ev: Default::default(),
             profile_store: std::sync::OnceLock::new(),
             profile_builder: std::sync::OnceLock::new(),
             require_device_token: std::sync::atomic::AtomicBool::new(false),
@@ -303,7 +321,8 @@ impl ProxyContext {
     ) -> Result<Self> {
         let client = build_upstream_client(opts)?;
         let mut ctx = Self::new(engine, client, adblock_enabled);
-        ctx.strict_client = build_strict_upstream_client(opts)?;
+        ctx.strict_client = ArcSwap::from_pointee(build_strict_upstream_client(opts)?);
+        *ctx.upstream_opts.lock() = Some(opts.clone());
         ctx.policy = opts.policy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
         Ok(ctx)
@@ -335,9 +354,108 @@ impl ProxyContext {
         &self.engine
     }
 
+    /// The bypass engine (built-in defaults until [`Self::set_bypass`] installs the persisted one).
+    pub fn bypass(&self) -> &Arc<common::bypass::BypassEngine> {
+        self.bypass.get_or_init(Default::default)
+    }
+
+    /// Whether `host:port` presents an Extended Validation certificate. Probed over the same
+    /// destination policy as any other dial, with its own short timeout, and cached per
+    /// `host:port`: definite answers for a long time, a failed probe only briefly (as
+    /// [`crate::ev::EvVerdict::Unknown`], which callers treat as "do not decrypt"). IP literals
+    /// are never EV.
+    pub async fn ev_verdict(&self, host: &str, port: u16, limit: Duration) -> crate::ev::EvVerdict {
+        use crate::ev::EvVerdict;
+        if host.parse::<IpAddr>().is_ok() {
+            return EvVerdict::NotEv;
+        }
+        self.ev
+            .verdict(host, port, async {
+                let addr = match self.policy.resolve(host, port, self.resolve_all_to).await {
+                    Ok(a) => a,
+                    Err(_) => return EvVerdict::Unknown,
+                };
+                match crate::ev::probe(host, addr, limit).await {
+                    Some(true) => EvVerdict::Ev,
+                    Some(false) => EvVerdict::NotEv,
+                    None => EvVerdict::Unknown,
+                }
+            })
+            .await
+    }
+
+    /// Whether `host` is the reserved in-page panel host (answered by the proxy itself, never
+    /// dialled).
+    pub fn is_panel_host(&self, host: &str) -> bool {
+        self.internal.panel.is_panel_host(host)
+    }
+
+    /// Install the bypass engine (once, at startup).
+    pub fn set_bypass(&self, engine: Arc<common::bypass::BypassEngine>) {
+        let _ = self.bypass.set(engine);
+    }
+
     /// The shared pooled upstream client.
     pub fn client(&self) -> reqwest::Client {
-        self.client.clone()
+        (**self.client.load()).clone()
+    }
+
+    /// Rebuild both upstream clients with new connect / read timeouts and swap them in. Requests
+    /// in flight finish on the old clients. A no-op when the timeouts are unchanged or the
+    /// context was built from a ready-made client.
+    pub fn set_upstream_timeouts(&self, connect: Duration, read: Duration) -> Result<()> {
+        let prepared = self.prepare_upstream_timeouts(connect, read)?;
+        self.commit_upstream(prepared);
+        Ok(())
+    }
+
+    /// Build the replacement clients without installing them (the fallible half of
+    /// [`Self::set_upstream_timeouts`]); `None` when nothing changes.
+    pub fn prepare_upstream_timeouts(
+        &self,
+        connect: Duration,
+        read: Duration,
+    ) -> Result<Option<PreparedUpstream>> {
+        let guard = self.upstream_opts.lock();
+        let Some(opts) = guard.as_ref() else {
+            return Ok(None);
+        };
+        if opts.connect_timeout == Some(connect) && opts.read_timeout == Some(read) {
+            return Ok(None);
+        }
+        let mut next = opts.clone();
+        next.connect_timeout = Some(connect);
+        next.read_timeout = Some(read);
+        Ok(Some(PreparedUpstream {
+            client: build_upstream_client(&next)?,
+            strict: build_strict_upstream_client(&next)?,
+            opts: next,
+        }))
+    }
+
+    /// Install what [`Self::prepare_upstream_timeouts`] built. Cannot fail.
+    pub fn commit_upstream(&self, p: Option<PreparedUpstream>) {
+        if let Some(p) = p {
+            self.client.store(Arc::new(p.client));
+            self.strict_client.store(Arc::new(p.strict));
+            *self.upstream_opts.lock() = Some(p.opts);
+        }
+    }
+
+    /// The caching resolver behind the upstream clients, when built from options.
+    pub fn dns(&self) -> Option<Arc<crate::dns::CachedResolver>> {
+        self.upstream_opts
+            .lock()
+            .as_ref()
+            .and_then(|o| o.dns.clone())
+    }
+
+    /// The connect timeout the upstream client currently uses.
+    pub fn upstream_connect_timeout(&self) -> Option<Duration> {
+        self.upstream_opts
+            .lock()
+            .as_ref()
+            .and_then(|o| o.connect_timeout)
     }
 
     /// Whether ad blocking is currently enabled (live).
@@ -405,7 +523,7 @@ impl ProxyContext {
         resource_type: &str,
     ) -> bool {
         let profile = rctx.profile.load();
-        profile.engine.is_enabled() && {
+        profile.engine.is_enabled() && rctx.adblock_on() && {
             // One adblock request serves the base engine and the overlay.
             let q = filter_engine::Query::new(url, source_url, resource_type);
             let base = profile.engine.check_deferred_q(&q);
@@ -453,6 +571,11 @@ impl ProxyContext {
             .or(named.as_ref().and_then(|(_, p)| *p))
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
         let url_host = authority::url_host(&host);
+        // A host in `full` bypass is forwarded as-is: no filtering, rewriting or log event.
+        let bypass_full = self.bypass().mode_of(&host) == Some(common::bypass::BypassMode::Full);
+        if bypass_full {
+            self.bypass().note_bypassed();
+        }
 
         // The reserved confirmation host is answered by the proxy alone: never filtered, never
         // forwarded, whatever the entry mode.
@@ -470,8 +593,8 @@ impl ProxyContext {
         if uri.path().starts_with(csp::INTERNAL_PREFIX) {
             let origin = origin_of(scheme, &url_host, port);
             let up = crate::gm::Upstream {
-                client: &self.client,
-                strict_client: &self.strict_client,
+                client: &self.client.load(),
+                strict_client: &self.strict_client.load(),
                 policy: &self.policy,
                 resolve_all_to: self.resolve_all_to,
             };
@@ -533,13 +656,20 @@ impl ProxyContext {
         {
             let profile = rctx.profile.load();
             let engine = &profile.engine;
-            if engine.is_enabled() {
+            if engine.is_enabled() && rctx.adblock_on() && !bypass_full {
                 let source = source_url(&headers, &url, rtype);
                 let q = filter_engine::Query::new(&url, source, rtype.as_str());
                 let (verdict, gen_) = engine.check_gen_deferred_q(&q);
                 let verdict = apply_overlay(&profile, verdict, &q);
-                let verdict =
-                    engine.record_verdict(verdict, &url, source, rtype.as_str(), &profile.label);
+                let verdict = engine.record_verdict_meta(
+                    verdict,
+                    &url,
+                    source,
+                    rtype.as_str(),
+                    &profile.label,
+                    method.as_str(),
+                    event_mode(rctx),
+                );
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
@@ -590,14 +720,19 @@ impl ProxyContext {
                             }
                             engine.stats_handle().record_blocked(rtype.as_str(), &host);
                             // Borrowed straight into the ring: no event struct, no clock read here.
-                            engine.block_log_handle().record(
-                                &url,
-                                "",
-                                rtype.as_str(),
-                                &rule,
-                                parsed.map(|r| r.list.as_str()),
-                                Some(profile.label.as_ref()),
-                            );
+                            engine.record_request(&filter_engine::EventRef {
+                                action: filter_engine::EventAction::Blocked,
+                                method: method.as_str(),
+                                url: &url,
+                                source_host: "",
+                                request_type: rtype.as_str(),
+                                rule: &rule,
+                                list_id: parsed.map(|r| r.list.as_str()),
+                                client: Some(profile.label.as_ref()),
+                                status: None,
+                                mode: event_mode(rctx),
+                                error_kind: None,
+                            });
                             let v = filter_engine::MatchResult::blocked(rule);
                             return Ok(block_response(rtype, &v, &url));
                         }
@@ -614,7 +749,11 @@ impl ProxyContext {
                 }
             }
             // Script policy network hints: one atomic load when the master switch is off.
-            if let Some(sc) = profile.script_control.as_ref().filter(|sc| sc.enabled()) {
+            if let Some(sc) = profile
+                .script_control
+                .as_ref()
+                .filter(|sc| sc.enabled() && !bypass_full)
+            {
                 if sc
                     .check_request(
                         &headers,
@@ -643,9 +782,9 @@ impl ProxyContext {
             return Ok(refused_response());
         }
         let client = if self.policy.is_own_port(port) {
-            &self.strict_client
+            self.strict_client.load_full()
         } else {
-            &self.client
+            self.client.load_full()
         };
 
         let listed = connection_listed(&headers);
@@ -698,6 +837,18 @@ impl ProxyContext {
                 Ok(r) => r,
                 Err(_) => {
                     common::faults::note(common::faults::Fault::UpstreamTimeout, &host);
+                    if !bypass_full {
+                        log_request(
+                            rctx,
+                            filter_engine::EventAction::Error,
+                            method.as_str(),
+                            &url,
+                            source_url(&headers, &url, rtype),
+                            rtype,
+                            Some(504),
+                            Some(filter_engine::ErrorKind::UpstreamTimeout),
+                        );
+                    }
                     return Ok(status_response(
                         StatusCode::GATEWAY_TIMEOUT,
                         "Upstream timeout",
@@ -715,11 +866,35 @@ impl ProxyContext {
             Err(e) => {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
                 debug!("Upstream error for {}: {}", url, e);
+                if !bypass_full {
+                    log_request(
+                        rctx,
+                        filter_engine::EventAction::Error,
+                        method.as_str(),
+                        &url,
+                        source_url(&headers, &url, rtype),
+                        rtype,
+                        Some(502),
+                        Some(crate::upstream::classify_reqwest(&e)),
+                    );
+                }
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
             }
         };
 
         let status = resp.status();
+        if !bypass_full {
+            log_request(
+                rctx,
+                filter_engine::EventAction::Allowed,
+                method.as_str(),
+                &url,
+                source_url(&headers, &url, rtype),
+                rtype,
+                Some(status.as_u16()),
+                None,
+            );
+        }
         // Moved out of the response (the body stream does not need them): no header-map copy.
         let mut resp = resp;
         let resp_headers = std::mem::take(resp.headers_mut());
@@ -727,7 +902,7 @@ impl ProxyContext {
         // Script policy applies to every HTML document, `no-transform` or not: it adds headers
         // only, never rewrites a body the origin asked us to leave alone.
         let spol: Option<Arc<crate::scriptctl::DocEntry>> =
-            if kind == BodyKind::Html && !is_head && status.as_u16() >= 200 {
+            if kind == BodyKind::Html && !is_head && status.as_u16() >= 200 && !bypass_full {
                 rctx.profile.load().script_control.as_ref().and_then(|sc| {
                     sc.document(
                         if scheme == "http" { "http" } else { "https" },
@@ -750,6 +925,9 @@ impl ProxyContext {
         {
             kind = BodyKind::None;
         }
+        if bypass_full {
+            kind = BodyKind::None;
+        }
         // HEAD / 1xx / 204 / 205 / 304 never carry a body, whatever the origin's length says.
         let body_allowed = !is_head
             && status.as_u16() >= 200
@@ -760,7 +938,7 @@ impl ProxyContext {
         // Per-response work, decided once from the URL, type and headers.
         let (enabled, cosmetics) = {
             let profile = rctx.profile.load();
-            let enabled = profile.engine.is_enabled();
+            let enabled = profile.engine.is_enabled() && rctx.adblock_on() && !bypass_full;
             let cos = (enabled && !page_off && kind == BodyKind::Html && body_allowed).then(|| {
                 let mut c = profile.engine.cosmetic_for(&url);
                 if let Some(ov) = &profile.overlay {
@@ -1346,4 +1524,40 @@ mod cosmetic_merge_tests {
             vec![".gen"]
         );
     }
+}
+
+fn event_mode(rctx: &RequestCtx) -> filter_engine::EventMode {
+    if rctx.transparent {
+        filter_engine::EventMode::Transparent
+    } else {
+        filter_engine::EventMode::Explicit
+    }
+}
+
+/// Record a non-blocked request in the profile engine's request log (and live broadcast).
+#[allow(clippy::too_many_arguments)]
+fn log_request(
+    rctx: &RequestCtx,
+    action: filter_engine::EventAction,
+    method: &str,
+    url: &str,
+    source: &str,
+    rtype: RequestType,
+    status: Option<u16>,
+    error_kind: Option<filter_engine::ErrorKind>,
+) {
+    let profile = rctx.profile.load();
+    profile.engine.record_request(&filter_engine::EventRef {
+        action,
+        method,
+        url,
+        source_host: filter_engine::RequestMatcher::host_of(source),
+        request_type: rtype.as_str(),
+        rule: "",
+        list_id: None,
+        client: Some(profile.label.as_ref()),
+        status,
+        mode: event_mode(rctx),
+        error_kind,
+    });
 }

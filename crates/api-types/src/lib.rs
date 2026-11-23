@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 pub mod scopes;
 pub use scopes::{scope_table_markdown, Scope};
 
+mod bypass;
 mod more;
+pub use bypass::*;
 pub use more::*;
 
 mod policy;
@@ -125,6 +127,22 @@ pub struct UserInfo {
     /// Effective scopes granted by the role.
     #[serde(default)]
     pub scopes: Vec<Scope>,
+    /// Profile (decimal id) the account starts on in the UI, if one was set.
+    #[serde(default)]
+    pub default_profile: Option<String>,
+    /// Active sessions of this account (filled in by the users endpoints).
+    #[serde(default)]
+    pub session_count: u32,
+}
+
+/// Whether the first-run account can still be registered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct RegistrationStatus {
+    /// `POST /auth/register` will be accepted.
+    pub open: bool,
+    /// No account exists yet: the next registration creates the administrator.
+    pub first_run: bool,
 }
 
 fn default_true() -> bool {
@@ -207,6 +225,93 @@ pub struct ProxyConfigResponse {
     /// CIDRs of clients allowed to use the proxy.
     #[serde(default)]
     pub allowed_clients: Vec<String>,
+    /// Upstream DNS resolution.
+    #[serde(default)]
+    pub dns: DnsDto,
+    /// Effective switches of the explicit-proxy listener.
+    #[serde(default)]
+    pub explicit: ListenerFlagsView,
+    /// Effective switches of the transparent listener.
+    #[serde(default)]
+    pub transparent: ListenerFlagsView,
+    /// Address the web API listens on.
+    #[serde(default)]
+    pub webui_host: String,
+    #[serde(default)]
+    pub webui_port: u16,
+    /// Where the listeners are actually bound right now (absent without a running proxy).
+    #[serde(default)]
+    pub bind: Option<BindResult>,
+}
+
+/// Upstream DNS settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DnsDto {
+    /// `ip` or `ip:port`; empty uses the system resolver.
+    pub servers: Vec<String>,
+    /// Maximum cached names.
+    pub cache_size: u64,
+    /// Lower clamp on cached TTLs, seconds.
+    pub min_ttl_secs: u64,
+    /// Upper clamp on cached TTLs, seconds.
+    pub max_ttl_secs: u64,
+    /// How long failed lookups are cached, seconds.
+    pub negative_ttl_secs: u64,
+}
+
+/// Partial DNS update; omitted fields keep their value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DnsUpdate {
+    pub servers: Option<Vec<String>>,
+    pub cache_size: Option<u64>,
+    pub min_ttl_secs: Option<u64>,
+    pub max_ttl_secs: Option<u64>,
+    pub negative_ttl_secs: Option<u64>,
+}
+
+/// A listener's effective switches (its own setting, else the global one).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListenerFlagsView {
+    pub enable_mitm: bool,
+    pub enable_http2: bool,
+    pub enable_websockets: bool,
+    pub enable_adblock: bool,
+}
+
+/// Partial update of one listener's switches; omitted fields keep their current setting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListenerFlagsUpdate {
+    pub enable_mitm: Option<bool>,
+    pub enable_http2: Option<bool>,
+    pub enable_websockets: Option<bool>,
+    pub enable_adblock: Option<bool>,
+}
+
+/// Actual listener addresses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BindResult {
+    /// Explicit proxy, `ip:port`.
+    pub proxy: Option<String>,
+    /// Transparent listener, `ip:port` (`None` = off).
+    pub transparent: Option<String>,
+    /// Web API, `ip:port`.
+    pub webui: Option<String>,
+    /// The explicit listener is down (a move failed and could not be undone); retry the change.
+    #[serde(default)]
+    pub proxy_down: bool,
+    #[serde(default)]
+    pub transparent_down: bool,
+    /// The web API listener is down (same cause); this response came from an older listener.
+    #[serde(default)]
+    pub webui_down: bool,
+    /// Set when this update moved the web API: open it here. The old address keeps answering
+    /// for 30 seconds.
+    pub webui_moved_to: Option<String>,
 }
 
 /// Result of a config update: the new config plus which changes are already live and which
@@ -253,16 +358,28 @@ pub struct UpdateProxyConfigRequest {
     #[cfg_attr(feature = "server", validate(range(min = 1, max = 8760)))]
     pub update_interval_hours: Option<u64>,
 
-    /// Transparent listener port; `0` turns it off. Needs a restart.
+    /// Transparent listener port; `0` turns it off. Applied live (the listener is rebound).
     pub transparent_port: Option<u16>,
-    /// Replaces the TLS passthrough host list. Needs a restart.
+    /// Replaces the TLS passthrough host list. Applied live.
     pub tls_passthrough_hosts: Option<Vec<String>>,
-    /// Needs a restart.
+    /// Applied live.
     pub block_private_destinations: Option<bool>,
-    /// CIDR list; replaces the current one. Needs a restart.
+    /// CIDR list; replaces the current one. Applied live.
     pub allowed_destinations: Option<Vec<String>>,
-    /// CIDR list; replaces the current one. Needs a restart.
+    /// CIDR list; replaces the current one. Applied live.
     pub allowed_clients: Option<Vec<String>>,
+    /// DNS settings; applied live (the resolver is rebuilt and its cache flushed).
+    pub dns: Option<DnsUpdate>,
+    /// Switches of the explicit-proxy listener only. Applied live.
+    pub explicit: Option<ListenerFlagsUpdate>,
+    /// Switches of the transparent listener only. Applied live.
+    pub transparent: Option<ListenerFlagsUpdate>,
+    /// Web API listen address; the listener is rebound live.
+    #[cfg_attr(feature = "server", validate(length(min = 1, max = 255)))]
+    pub webui_host: Option<String>,
+    /// Web API listen port; the listener is rebound live.
+    #[cfg_attr(feature = "server", validate(range(min = 1, max = 65535)))]
+    pub webui_port: Option<u16>,
 }
 
 /// Connection statistics.
@@ -311,6 +428,44 @@ pub struct ProxyStatsResponse {
     #[serde(default)]
     pub faults: FaultStats,
     pub mitm: Option<MitmStats>,
+    /// Transparent-gateway listener.
+    #[serde(default)]
+    pub transparent: TransparentStatus,
+    /// Live counters of the explicit-proxy listener.
+    #[serde(default)]
+    pub explicit: ListenerCounters,
+    /// Requests and tunnels handled in `full` bypass since the proxy started.
+    #[serde(default)]
+    pub bypassed_total: u64,
+    /// Bypass fail-safe: HTTPS is tunnelled until the first-party lists have loaded.
+    #[serde(default)]
+    pub failsafe: FailsafeDto,
+}
+
+/// Live traffic of one listener.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListenerCounters {
+    pub active_connections: u64,
+    /// Requests served per second over the last few seconds.
+    pub requests_per_sec: f64,
+    /// Distinct client addresses seen in the last 5 minutes.
+    pub clients: u64,
+}
+
+/// State of the transparent-gateway listener.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TransparentStatus {
+    pub enabled: bool,
+    /// Bound address (`ip:port`) while enabled and running; else the configured one.
+    pub address: Option<String>,
+    /// TLS hosts that are tunnelled instead of intercepted (exact or `*.suffix`).
+    pub tls_passthrough_hosts: Vec<String>,
+    /// Live traffic of the transparent listener (`active_connections`, `requests_per_sec`,
+    /// `clients`).
+    #[serde(flatten)]
+    pub counters: ListenerCounters,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +529,43 @@ pub struct FilterListResponse {
     /// `#%#` scripts, snippets, unknown scriptlets); untrusted lists have those dropped.
     #[serde(default)]
     pub trusted: bool,
+    /// Needs a look: the last fetch failed, or an enabled list was never fetched or is more
+    /// than 7 days old.
+    #[serde(default)]
+    pub attention: bool,
+}
+
+/// Filter lists per status, for the current search text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FilterListCounts {
+    pub all: usize,
+    /// Enabled.
+    pub on: usize,
+    /// Disabled.
+    pub off: usize,
+    /// Fetch error or stale.
+    pub attn: usize,
+    /// First characters (`A`-`Z`, `#`) present among the rows matching the current filters.
+    #[serde(default)]
+    pub letters: Vec<String>,
+}
+
+/// A page of filter lists plus per-status counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FilterListsPage {
+    pub items: Vec<FilterListResponse>,
+    /// Pass as `cursor` for the next page; `null` on the last page.
+    pub next_cursor: Option<String>,
+    /// Lists matching `q` and `status`, across all pages.
+    pub total: usize,
+    pub counts: FilterListCounts,
+    pub limit: u32,
+    pub has_more: bool,
+    /// Echoed only when the deprecated `page` parameter was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 /// Add a filter list.
@@ -490,6 +682,40 @@ pub struct UserscriptResponse {
     pub require_count: usize,
     #[serde(default)]
     pub resource_count: usize,
+    /// Last install or update (RFC 3339).
+    #[serde(default)]
+    pub updated_at: String,
+    /// Uses features the proxy cannot run (see `unsupported`).
+    #[serde(default)]
+    pub error: bool,
+}
+
+/// Userscripts per status, for the current search text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UserscriptCounts {
+    pub all: usize,
+    pub enabled: usize,
+    pub disabled: usize,
+    /// Scripts with unsupported features (may also be enabled).
+    pub error: usize,
+    /// First characters (`A`-`Z`, `#`) present among the rows matching the current filters.
+    #[serde(default)]
+    pub letters: Vec<String>,
+}
+
+/// A page of userscripts plus per-status counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UserscriptsPage {
+    pub items: Vec<UserscriptResponse>,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+    pub counts: UserscriptCounts,
+    pub limit: u32,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 /// Install a userscript from source.

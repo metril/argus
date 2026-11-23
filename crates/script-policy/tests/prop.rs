@@ -75,6 +75,7 @@ fn build(sp: &Spec) -> RuleSet {
                 scope,
                 preset: preset_of(*p),
                 note: None,
+                updated_at: 0,
             },
         );
     }

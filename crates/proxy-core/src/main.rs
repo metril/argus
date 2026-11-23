@@ -1,4 +1,4 @@
-//! Main entry point for the adblocker proxy server
+//! Main entry point for the argus proxy server
 
 use std::sync::Arc;
 
@@ -16,11 +16,10 @@ async fn main() -> Result<()> {
     // Initialize logging
     // Held to the end of `main` so buffered log lines are flushed on exit.
     let _log_guard = init_logging();
+    // Emits the one-time deprecation warning now that logging is up.
+    let _ = common::env::var_os("LOG_VERBOSE");
 
-    info!(
-        "Starting adblocker proxy server v{}",
-        env!("CARGO_PKG_VERSION")
-    );
+    info!("Starting argus proxy server v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
     let config_path =
@@ -29,10 +28,21 @@ async fn main() -> Result<()> {
     common::config::raise_nofile_limit();
     info!("Loading configuration from: {}", config_path);
 
-    let config = ProxyConfig::from_file(&config_path).map_err(|e| {
+    // The shipped file is the read-only base; settings saved from the web UI live in an overlay
+    // on the data volume and win over it.
+    let base_path = std::path::PathBuf::from(&config_path);
+    let base = ProxyConfig::from_file(&config_path).map_err(|e| {
         error!("Failed to load configuration: {}", e);
         e
     })?;
+    let overlay_path = common::config::default_overlay_path(&base.adblock.data_dir);
+    let config = ProxyConfig::load_layered(&base_path, &overlay_path).map_err(|e| {
+        error!("Failed to load settings overlay: {}", e);
+        e
+    })?;
+    if overlay_path.exists() {
+        info!("Applied saved settings from {}", overlay_path.display());
+    }
 
     // Shared compiled filter engine. The real adblock engine is !Send, so it lives thread-locally
     // per worker; this handle shares the compiled rules as bytes between the proxy and the web API.
@@ -57,6 +67,16 @@ async fn main() -> Result<()> {
 
     ctx.set_respect_no_transform(config.adblock.respect_no_transform);
 
+    // Hosts excluded from interception / filtering: built-in categories plus the user's own
+    // entries and subscriptions, persisted next to the settings overlay.
+    let bypass_path = overlay_path
+        .parent()
+        .map_or_else(|| "bypass.json".into(), |p| p.join("bypass.json"));
+    let bypass_engine = Arc::new(common::bypass::BypassEngine::load(bypass_path));
+    #[cfg(feature = "webui")]
+    let bypass_for_api = bypass_engine.clone();
+    ctx.set_bypass(bypass_engine.clone());
+
     // Create the proxy server
     let server = ProxyServer::new(config.clone(), ctx.clone()).map_err(|e| {
         error!("Failed to initialize proxy server: {}", e);
@@ -73,6 +93,18 @@ async fn main() -> Result<()> {
     )
     .map_err(|e| Error::Config(format!("Failed to open filter list service: {e}")))?;
     list_service.start();
+
+    // First-party bypass lists: loaded from the verified cache, then fetched right away. Until
+    // every enabled list has loaded once, HTTPS is tunnelled rather than decrypted.
+    let argus = list_service::ArgusLists::new(
+        bypass_engine.clone(),
+        list_service.clone(),
+        list_service::ArgusConfig::from_config(
+            &config.bypass,
+            bypass_engine.data_dir().map(|d| d.join("argus-lists")),
+        ),
+    );
+    argus.start();
 
     // Userscripts: one manager (one database, one live index) shared by the proxy's injection
     // and GM endpoints and by the management API. The proxy only uses it when enabled.
@@ -167,6 +199,9 @@ async fn main() -> Result<()> {
     });
     ctx.set_profile_service(profile_store.clone(), profile_builder.clone());
 
+    #[cfg(feature = "webui")]
+    let control = server.control();
+
     // Start web UI server if enabled
     #[cfg(feature = "webui")]
     let webui_handle = if config.webui.enabled {
@@ -181,6 +216,9 @@ async fn main() -> Result<()> {
                     .clone()
                     .expect("manager exists when the web UI is enabled"),
                 policy_store.clone(),
+                control,
+                bypass_for_api,
+                argus.clone(),
             )
             .await?,
         )
@@ -214,6 +252,7 @@ async fn main() -> Result<()> {
 
 /// Start the Web UI API server
 #[cfg(feature = "webui")]
+#[allow(clippy::too_many_arguments)]
 async fn start_webui_server(
     config: &ProxyConfig,
     config_path: String,
@@ -222,13 +261,16 @@ async fn start_webui_server(
     ctx: &Arc<ProxyContext>,
     userscript_manager: Arc<userscript_engine::UserscriptManager>,
     policy_store: Arc<script_policy::store::PolicyStore>,
+    control: Arc<proxy_core::server::ProxyControl>,
+    bypass: Arc<common::bypass::BypassEngine>,
+    argus: Arc<list_service::ArgusLists>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use web_api::{start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
 
     // One database file per process: users, sessions, tokens, audit and userscripts share
-    // `<adblock.data_dir>/adblocker.redb` with the filter lists.
+    // `<adblock.data_dir>/argus.redb` with the filter lists.
     let data_dir = config.adblock.data_dir.clone();
 
     // Build API configuration from proxy config
@@ -243,8 +285,8 @@ async fn start_webui_server(
             access_token_expiry_seconds: 900,     // 15 minutes
             refresh_token_expiry_seconds: 604800, // 7 days
             bcrypt_cost: 12,
-            issuer: "adblocker-api".to_string(),
-            audience: "adblocker-ui".to_string(),
+            issuer: "argus-api".to_string(),
+            audience: "argus-ui".to_string(),
         },
         rate_limit: web_api::config::RateLimitConfig {
             global_requests_per_minute: config.webui.rate_limit_global_rpm,
@@ -290,6 +332,12 @@ async fn start_webui_server(
     .await
     .map_err(|e| proxy_core::Error::Config(format!("Failed to build web API state: {}", e)))?;
 
+    let _ = state
+        .runtime
+        .set(Arc::new(proxy_core::webui::ProxyRuntime(control)));
+    let _ = state.bypass.set(bypass);
+    let _ = state.argus.set(argus);
+
     info!(
         "Web UI API server starting on {}:{}",
         api_config.server.host, api_config.server.port
@@ -309,10 +357,10 @@ async fn start_webui_server(
 /// slow or blocked stdout never stalls a request task (lines are dropped if the buffer fills).
 /// Warnings and errors use a separate non-lossy writer: they are rare (and rate-limited at
 /// their sources), and must not vanish under exactly the load that causes them.
-/// File, line and thread ids are off by default; set `ADBLOCKER_LOG_VERBOSE=1` to add them.
+/// File, line and thread ids are off by default; set `ARGUS_LOG_VERBOSE=1` to add them.
 fn init_logging() -> Vec<tracing_appender::non_blocking::WorkerGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let verbose = std::env::var_os("ADBLOCKER_LOG_VERBOSE").is_some_and(|v| v != "0");
+    let verbose = common::env::peek_os("LOG_VERBOSE").is_some_and(|v| v != "0");
     let (lossy, g1) = tracing_appender::non_blocking(std::io::stdout());
     let (strict, g2) = tracing_appender::non_blocking::NonBlockingBuilder::default()
         .lossy(false)

@@ -7,8 +7,8 @@ use api_types::{
     BlockedItemDto, CspDirectiveDto, ExplainResponse, HtmlActionsDto, HtmlRuleDto, MessageResponse,
     Page, PolicyExportDto, PolicyImportRequest, PolicyProfileDto, PolicyReportDto,
     PolicySettingsDto, PolicySettingsResponse, PresetDto, PreviewRequest, PreviewResponse,
-    SiteRuleDto, SiteRuleInput, SiteRuleUpdate, SourceRuleDto, SourceRuleInput, SourceRuleUpdate,
-    SuggestedAllowDto, TempGrantDto, TempGrantInput,
+    SiteRuleCounts, SiteRuleDto, SiteRuleInput, SiteRuleUpdate, SiteRulesPage, SourceRuleDto,
+    SourceRuleInput, SourceRuleUpdate, SuggestedAllowDto, TempGrantDto, TempGrantInput,
 };
 use axum::{extract::State, http::StatusCode, Json};
 use script_policy as sp;
@@ -16,6 +16,7 @@ use script_policy::store::StoreError;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
+use super::paging::{desc_key, natural_key, paginate, Keyed};
 use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
@@ -133,6 +134,7 @@ fn site_out(r: &sp::SiteRule) -> SiteRuleDto {
         scope: r.scope.to_string(),
         preset: preset_out(&r.preset),
         note: r.note.clone(),
+        updated_at: r.updated_at,
     }
 }
 
@@ -284,37 +286,110 @@ pub async fn put_settings(
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct SiteRulesQuery {
+    /// Deprecated: use `cursor`.
     pub page: Option<u32>,
+    /// Page size (1..=200, default 40).
     pub limit: Option<u32>,
+    /// Opaque `next_cursor` of the previous page (stable while rules change).
+    pub cursor: Option<String>,
+    /// With `sort=az`: start at the first scope at or after this prefix (natural order).
+    pub from: Option<String>,
     /// Case-insensitive substring of the scope (e.g. a site name).
     pub q: Option<String>,
-    /// `default`, `trusted`, `untrusted` or `custom`.
+    /// `default`, `trusted`, `untrusted` or `custom`. Same as `preset`.
+    pub mode: Option<String>,
+    /// Older spelling of `mode`.
     pub preset: Option<String>,
+    /// `az` (by scope, default) or `recent` (last changed first).
+    pub sort: Option<String>,
 }
 
-/// List site rules, sorted by scope.
+/// List site rules, filtered by host substring (`q`) and mode, sorted by scope (`az`) or by
+/// last change (`recent`). `counts` covers every mode for the current `q`, whatever `mode` is.
 #[utoipa::path(
     get, path = "/policy/site-rules", tag = "policy",
     security(("bearer_auth" = ["policy:read"])),
     params(ProfileQuery, SiteRulesQuery),
-    responses((status = 200, description = "Site rules", body = Page<SiteRuleDto>))
+    responses((status = 200, description = "Site rules", body = SiteRulesPage))
 )]
 pub async fn list_site_rules(
     State(state): State<Arc<AppState>>,
     profile: ProfileParam,
     ApiQuery(q): ApiQuery<SiteRulesQuery>,
-) -> ApiResult<Json<Page<SiteRuleDto>>> {
+) -> ApiResult<Json<SiteRulesPage>> {
+    let mode = q.mode.as_ref().or(q.preset.as_ref());
+    if let Some(m) = mode {
+        if !["default", "trusted", "untrusted", "custom"].contains(&m.as_str()) {
+            return Err(ApiError::ValidationError(format!(
+                "unknown mode '{m}' (default, trusted, untrusted, custom)"
+            )));
+        }
+    }
+    let recent = match q.sort.as_deref() {
+        None | Some("az") => false,
+        Some("recent") => true,
+        Some(o) => {
+            return Err(ApiError::ValidationError(format!(
+                "unknown sort '{o}' (az, recent)"
+            )))
+        }
+    };
     let st = state.policy.clone();
     let rules = blocking(move || st.rules(&profile.name).map_err(store_err)).await?;
-    let mut all: Vec<SiteRuleDto> = rules
+    let matching: Vec<SiteRuleDto> = rules
         .site_rules
         .values()
         .map(site_out)
         .filter(|r| contains_ci(&r.scope, q.q.as_deref().unwrap_or("")))
-        .filter(|r| q.preset.as_ref().is_none_or(|p| &r.preset.kind == p))
         .collect();
-    all.sort_by(|a, b| a.scope.cmp(&b.scope));
-    Ok(Json(Page::from_vec(all, q.page, q.limit)))
+    let mut counts = SiteRuleCounts {
+        all: matching.len(),
+        ..Default::default()
+    };
+    for r in &matching {
+        match r.preset.kind.as_str() {
+            "trusted" => counts.trusted += 1,
+            "untrusted" => counts.untrusted += 1,
+            "custom" => counts.custom += 1,
+            _ => counts.default += 1,
+        }
+    }
+    if q.from.is_some() && recent {
+        return Err(ApiError::ValidationError("`from` needs sort=az".into()));
+    }
+    let rows: Vec<Keyed<SiteRuleDto>> = matching
+        .into_iter()
+        .filter(|r| mode.is_none_or(|m| &r.preset.kind == m))
+        .map(|r| {
+            // Sort by the host, not the `site:` / `host:` prefix.
+            let name = natural_key(r.scope.split_once(':').map_or(r.scope.as_str(), |(_, h)| h));
+            Keyed {
+                key: if recent {
+                    format!("{}{name}", desc_key(r.updated_at))
+                } else {
+                    name
+                },
+                id: r.id.clone(),
+                label: r
+                    .scope
+                    .split_once(':')
+                    .map_or(r.scope.clone(), |(_, h)| h.to_string()),
+                item: r,
+            }
+        })
+        .collect();
+    let from = q.from.as_deref().map(natural_key);
+    let p = paginate(rows, q.limit, q.cursor.as_deref(), from.as_deref(), q.page)?;
+    counts.letters = p.letters;
+    Ok(Json(SiteRulesPage {
+        items: p.items,
+        next_cursor: p.next_cursor,
+        total: p.total,
+        counts,
+        limit: p.limit,
+        has_more: p.has_more,
+        page: p.page,
+    }))
 }
 
 /// Create a site rule (409 if the scope already has one).
@@ -723,6 +798,7 @@ pub async fn preview(
                 scope: scope_in(&i.scope)?,
                 preset: preset_in(&i.preset)?,
                 note: None,
+                updated_at: now,
             };
             r.validate()
                 .map_err(|e| ApiError::ValidationError(e.to_string()))?;

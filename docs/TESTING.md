@@ -21,15 +21,15 @@ instantiates a scenario for both entry modes (explicit proxy and transparent).
 Needs unprivileged user namespaces and `nft`/`ip`; skipped unless enabled:
 
     sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # Ubuntu 24.04+
-    ADBLOCKER_KERNEL_TEST=1 cargo nextest run -p proxy-core --test kernel_original_dst --no-capture
+    ARGUS_KERNEL_TEST=1 cargo nextest run -p proxy-core --test kernel_original_dst --no-capture
 
 ## Browser (headless Chromium over CDP through the proxy)
 
     cargo nextest run -p e2e-browser --no-capture
 
-* Browser discovery: `ADBLOCKER_BROWSER=/path/to/chrome`, else `chromium`/`google-chrome` on
+* Browser discovery: `ARGUS_BROWSER=/path/to/chrome`, else `chromium`/`google-chrome` on
   `PATH`, else Playwright's cache (`~/.cache/ms-playwright`). With none found tests print
-  `SKIPPED` and pass; `ADBLOCKER_REQUIRE_BROWSER=1` (set in CI) turns that into a failure.
+  `SKIPPED` and pass; `ARGUS_REQUIRE_BROWSER=1` (set in CI) turns that into a failure.
 * One browser, throwaway profile, proxy and origin per test. The proxy CA is trusted through
   `--ignore-certificate-errors-spki-list` (CA key plus the proxy-issued leaf of every test
   hostname), never a blanket ignore; the baseline test also checks the served chain via CDP.
@@ -44,7 +44,7 @@ Needs unprivileged user namespaces and `nft`/`ip`; skipped unless enabled:
   bug is fixed (the runner says when an entry starts passing). Rules in these scenarios see
   non-default ports in every URL, so write host rules as `||host^` (a path rule such as
   `||host/p` matches only default-port URLs, as in uBO).
-* Debug a run with `ADBLOCKER_BROWSER_NETLOG=/path/net.json` (Chromium net-log of the session).
+* Debug a run with `ARGUS_BROWSER_NETLOG=/path/net.json` (Chromium net-log of the session).
 
 ## Lint
 

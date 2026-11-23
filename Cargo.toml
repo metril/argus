@@ -16,14 +16,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Real floor: oxc_parser 0.126 (filter-engine) requires Rust 1.92. Toolchain is pinned to
 # stable in rust-toolchain.toml; no nightly features are used.
 rust-version = "1.92"
-authors = ["Adblocker Contributors"]
+authors = ["Argus Contributors"]
 publish = false
-repository = "https://github.com/yourusername/adblocker"
+repository = "https://github.com/metril/argus"
 
 [workspace.dependencies]
 # Async runtime

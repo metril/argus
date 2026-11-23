@@ -60,6 +60,40 @@ pub struct SiteRuleDto {
     pub preset: PresetDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Unix seconds of the last create or change (0: unknown).
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Site rules per mode, for the current search text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SiteRuleCounts {
+    pub all: usize,
+    pub trusted: usize,
+    pub default: usize,
+    pub untrusted: usize,
+    pub custom: usize,
+    /// First characters (`A`-`Z`, `#`) present among the rows matching the current filters.
+    #[serde(default)]
+    pub letters: Vec<String>,
+}
+
+/// A page of site rules plus per-mode counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SiteRulesPage {
+    pub items: Vec<SiteRuleDto>,
+    /// Pass as `cursor` for the next page; `null` on the last page.
+    pub next_cursor: Option<String>,
+    /// Rules matching `q` and `mode`, across all pages.
+    pub total: usize,
+    pub counts: SiteRuleCounts,
+    pub limit: u32,
+    pub has_more: bool,
+    /// Echoed only when the deprecated `page` parameter was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 /// Create a site rule (also the export form).

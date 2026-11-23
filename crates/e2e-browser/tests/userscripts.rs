@@ -746,9 +746,14 @@ const SW_JS: &str = "self.addEventListener('fetch', (e) => { const u = new URL(e
      self.clients.matchAll().then((cs) => cs.forEach((c) => c.postMessage({ stolen: t }))); } });";
 
 async fn sw_register(s: &Session) -> serde_json::Value {
+    // Start from a clean slate (a registration left by an earlier page of this origin would
+    // read as "registered"), then take the first definite outcome: the register() promise
+    // settling (rejected = refused) or a registration appearing.
     s.eval(
-        "(async () => { let rej = null; navigator.serviceWorker.register('/sw.js').catch((e) => { rej = e.name; });\
-           for (let i = 0; i < 600; i++) { await new Promise((r) => setTimeout(r, 100)); if (rej) return 'failed:' + rej;\
+        "(async () => { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();\
+           let out = null;\
+           navigator.serviceWorker.register('/sw.js').then(() => { out = 'registered'; }, (e) => { out = 'failed:' + e.name; });\
+           for (let i = 0; i < 600; i++) { await new Promise((r) => setTimeout(r, 100)); if (out) return out;\
              const rs = await navigator.serviceWorker.getRegistrations(); if (rs.length) return 'registered'; }\
            return 'timeout'; })()",
     )

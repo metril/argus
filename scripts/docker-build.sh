@@ -1,5 +1,5 @@
 #!/bin/bash
-# Multi-arch Docker build script for Adblocker Proxy
+# Multi-arch Docker build script for Argus Proxy
 # Usage: ./scripts/docker-build.sh [OPTIONS]
 #
 # Options:
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-IMAGE_NAME="${REGISTRY}adblocker-proxy:${TAG}"
+IMAGE_NAME="${REGISTRY}argus-proxy:${TAG}"
 
 echo "Building multi-arch Docker image..."
 echo "  Image: ${IMAGE_NAME}"
@@ -74,7 +74,7 @@ if ! docker buildx version &> /dev/null; then
 fi
 
 # Create/use buildx builder for multi-arch
-BUILDER_NAME="adblocker-multiarch"
+BUILDER_NAME="argus-multiarch"
 if ! docker buildx inspect ${BUILDER_NAME} &> /dev/null; then
     echo "Creating buildx builder: ${BUILDER_NAME}"
     docker buildx create --name ${BUILDER_NAME} --driver docker-container --bootstrap

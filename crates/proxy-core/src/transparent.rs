@@ -164,11 +164,19 @@ fn head_err(e: HeadError) -> Error {
 pub struct TransparentEntry {
     original_dst: Arc<dyn OriginalDst>,
     /// Ports the proxy itself listens on (explicit and transparent), for the loop guard.
-    own_ports: Vec<u16>,
+    own_ports: Arc<parking_lot::RwLock<Vec<u16>>>,
 }
 
 impl TransparentEntry {
     pub fn new(original_dst: Arc<dyn OriginalDst>, own_ports: Vec<u16>) -> Self {
+        Self::with_ports(original_dst, Arc::new(parking_lot::RwLock::new(own_ports)))
+    }
+
+    /// Like [`Self::new`], with a port list the owner can update while the entry runs.
+    pub fn with_ports(
+        original_dst: Arc<dyn OriginalDst>,
+        own_ports: Arc<parking_lot::RwLock<Vec<u16>>>,
+    ) -> Self {
         Self {
             original_dst,
             own_ports,
@@ -178,20 +186,21 @@ impl TransparentEntry {
     /// Handle one redirected connection end to end.
     pub async fn handle(&self, h: &ConnectionHandler, mut stream: TcpStream) -> Result<()> {
         let _ = stream.set_nodelay(true);
+        h.mark_transparent();
         let dst = self
             .original_dst
             .original_dst(&stream)
             .await
             .map_err(|e| Error::Connection(format!("original destination unavailable: {e}")))?;
         let local = stream.local_addr()?;
-        if is_self(dst, local, &self.own_ports) {
+        if is_self(dst, local, &self.own_ports.read()) {
             return Err(Error::Connection(format!(
                 "refusing connection from {} whose destination {dst} is the proxy itself",
                 h.client_addr
             )));
         }
 
-        let limit = h.shared.timeouts.handshake;
+        let limit = h.shared.timeouts.load().handshake;
         let mut buf = Vec::with_capacity(2048);
         read_at_least(&mut stream, &mut buf, 1, limit)
             .await
@@ -210,7 +219,7 @@ impl TransparentEntry {
             return match hello {
                 Hello::Sni(host) => {
                     let host = crate::authority::normalize_host(&host).unwrap_or(host);
-                    let passthrough = h.shared.passthrough.matches(&host);
+                    let passthrough = h.shared.ctx.bypass().mode_of(&host).is_some();
                     debug!(
                         "transparent TLS {host}:{} from {} ({})",
                         dst.port(),
@@ -221,7 +230,7 @@ impl TransparentEntry {
                             "intercept"
                         }
                     );
-                    let intercept = h.shared.mitm.is_some() && !passthrough;
+                    let intercept = h.intercepts(&host);
                     h.intercept_and_serve(io, target(host, intercept)).await
                 }
                 // No hostname to dial or to mint a certificate for: opaque tunnel to the original

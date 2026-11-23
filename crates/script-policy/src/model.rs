@@ -50,6 +50,9 @@ pub struct SiteRule {
     pub preset: Preset,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Unix seconds of the last create or change (0: unknown, e.g. imported).
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 /// One cell of the matrix: on pages in `page`, sources in `source` are allowed/denied `caps`.
@@ -333,6 +336,7 @@ impl RuleSet {
                 scope: r.scope.clone(),
                 preset: r.preset,
                 note: None,
+                updated_at: 0,
             }
             .validate()?;
         }
@@ -356,6 +360,7 @@ impl RuleSet {
                     scope: r.scope,
                     preset: r.preset,
                     note: r.note,
+                    updated_at: 0,
                 },
             );
         }

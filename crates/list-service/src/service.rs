@@ -415,7 +415,7 @@ impl ListService {
                 .map_err(|e| Error::Other(e.to_string()))?,
         );
         let client = control_plane_client(guard.clone())
-            .user_agent(concat!("AdBlocker/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Argus/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| Error::Other(format!("build list-download client: {e}")))?;
         Ok(Self::new_guarded(cfg, store, engine, client, Some(guard)))
@@ -1145,6 +1145,12 @@ impl ListService {
     ) -> std::result::Result<String, String> {
         self.fetch_text(url.as_ref(), None, self.cfg.max_list_bytes)
             .await
+    }
+
+    /// Download a small text list (an exclusion list) with the same URL checks, timeout and size
+    /// limit as filter lists.
+    pub async fn fetch_exclusion_list(&self, url: &str) -> std::result::Result<String, String> {
+        self.get_text(url).await
     }
 
     /// Check a URL before connecting: http(s) only and, under a guard, the control-plane policy.

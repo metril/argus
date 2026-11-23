@@ -44,6 +44,7 @@ scopes! {
     RulesWrite => "rules:write", "Replace the custom rules.";
     EngineReload => "engine:reload", "Trigger a rebuild of the blocking engine.";
     StatsRead => "stats:read", "Read blocking, proxy and engine statistics.";
+    LogsRead => "logs:read", "Read the request log, live and recent (full browsing history of every client the token may see).";
     StatsReset => "stats:reset", "Reset blocking statistics.";
     ConfigRead => "config:read", "Read the proxy configuration.";
     ConfigWrite => "config:write", "Change or reload the proxy configuration.";
@@ -78,13 +79,15 @@ impl Scope {
         self.as_str().split(':').nth(1).unwrap_or("")
     }
 
-    /// Viewer bundle: every `*:read` except users and audit, plus `sessions:self`.
+    /// Viewer bundle: every `*:read` except users, audit and the request log, plus `sessions:self`.
     fn in_viewer_bundle(&self) -> bool {
-        (self.action() == "read" && !matches!(self, Scope::UsersRead | Scope::AuditRead))
+        (self.action() == "read"
+            && !matches!(self, Scope::UsersRead | Scope::AuditRead | Scope::LogsRead))
             || matches!(self, Scope::SessionsSelf)
     }
 
-    /// User bundle: viewer plus writes on lists, rules, scripts, policy and own tokens.
+    /// User bundle: viewer plus the request log and writes on lists, rules, scripts, policy and
+    /// own tokens.
     fn in_user_bundle(&self) -> bool {
         self.in_viewer_bundle()
             || matches!(
@@ -94,6 +97,7 @@ impl Scope {
                     | Scope::ScriptsWrite
                     | Scope::PolicyWrite
                     | Scope::TokensSelf
+                    | Scope::LogsRead
             )
     }
 }

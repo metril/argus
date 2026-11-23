@@ -369,7 +369,7 @@ async fn export_import_roundtrip_with_values() {
         .unwrap();
 
     let plain: Value = admin.get("/api/v1/userscripts/export").await.json();
-    assert_eq!(plain["format"], "adblocker-userscripts-v1");
+    assert_eq!(plain["format"], "argus-userscripts-v1");
     assert!(plain["scripts"][0].get("values").is_none());
     let bundle: Value = admin
         .get("/api/v1/userscripts/export?values=true")
@@ -446,7 +446,7 @@ async fn scopes_and_audit() {
         .assert_status_forbidden();
     viewer
         .post("/api/v1/userscripts/import")
-        .json(&json!({"format": "adblocker-userscripts-v1", "scripts": []}))
+        .json(&json!({"format": "argus-userscripts-v1", "scripts": []}))
         .await
         .assert_status_forbidden();
     // A scripts:read token cannot read storage or export values either.
@@ -604,7 +604,7 @@ async fn imported_scripts_arrive_disabled_and_unapproved_unless_confirmed() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;
     let bundle = json!({
-        "format": "adblocker-userscripts-v1",
+        "format": "argus-userscripts-v1",
         "scripts": [{
             "source": src("1.0", "// @grant GM_xmlhttpRequest\n// @connect *"),
             "enabled": true,

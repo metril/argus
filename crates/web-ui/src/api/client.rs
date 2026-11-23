@@ -379,7 +379,7 @@ impl ApiClient {
                 let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Validation(text))
             }
-            412 | 428 => {
+            409 | 412 | 428 => {
                 let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Conflict(text))
             }

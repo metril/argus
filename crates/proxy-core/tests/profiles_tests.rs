@@ -44,6 +44,8 @@ fn config(port: u16, require_token: bool) -> ProxyConfig {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: require_token,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -66,6 +68,7 @@ fn config(port: u16, require_token: bool) -> ProxyConfig {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     }
 }
 
@@ -277,9 +280,7 @@ async fn unknown_token_gets_407_when_required() {
         let mut s = connect(&f).await;
         let r = request(&mut s, &f, "/x", tok).await;
         assert_eq!(r.status, 407);
-        assert!(r
-            .head
-            .contains("proxy-authenticate: basic realm=\"adblocker\""));
+        assert!(r.head.contains("proxy-authenticate: basic realm=\"argus\""));
     }
     let mut s = connect(&f).await;
     assert!(request(&mut s, &f, "/x", Some("tok-a"))

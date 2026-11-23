@@ -19,6 +19,7 @@ pub fn site_rule(r: &mut RuleSet, id: &str, sc: &str, preset: Preset) {
             scope: scope(sc),
             preset,
             note: None,
+            updated_at: 0,
         },
     );
 }

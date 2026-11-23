@@ -115,6 +115,35 @@ pub struct DeviceDto {
     pub created_at: String,
 }
 
+/// Devices per category, for the current search text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DeviceCounts {
+    pub all: usize,
+    pub with_token: usize,
+    /// Connected since the proxy started.
+    pub seen: usize,
+    /// Devices per profile id.
+    pub by_profile: std::collections::BTreeMap<String, usize>,
+    /// First characters (`A`-`Z`, `#`) present among the rows matching the current filters.
+    #[serde(default)]
+    pub letters: Vec<String>,
+}
+
+/// A page of devices plus counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DevicesPage {
+    pub items: Vec<DeviceDto>,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+    pub counts: DeviceCounts,
+    pub limit: u32,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+}
+
 /// Create a device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]

@@ -201,8 +201,8 @@ pub fn install_shared_resolver(resolver: Arc<dyn NameResolver>) -> bool {
 #[derive(Default)]
 pub struct NetPolicy {
     resolver: Option<Arc<dyn NameResolver>>,
-    block_private: bool,
-    allowed: Vec<IpNet>,
+    /// `(block_private, allowed CIDRs)`; replaceable at runtime ([`Self::set_rules`]).
+    rules: RwLock<(bool, Vec<IpNet>)>,
     /// Host names whose private (but never reserved) resolved addresses are accepted.
     allowed_hosts: Vec<String>,
     own: RwLock<Own>,
@@ -211,8 +211,7 @@ pub struct NetPolicy {
 impl fmt::Debug for NetPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NetPolicy")
-            .field("block_private", &self.block_private)
-            .field("allowed", &self.allowed)
+            .field("rules", &*self.rules.read())
             .finish_non_exhaustive()
     }
 }
@@ -254,12 +253,19 @@ impl NetPolicy {
     /// Build from config values; invalid CIDR entries are an error.
     pub fn new(block_private: bool, allowed_destinations: &[String]) -> Result<Self> {
         Ok(Self {
-            block_private,
-            allowed: parse_nets(allowed_destinations)?,
+            rules: RwLock::new((block_private, parse_nets(allowed_destinations)?)),
             allowed_hosts: Vec::new(),
             own: RwLock::default(),
             resolver: None,
         })
+    }
+
+    /// Replace the private-range switch and the allowed CIDRs live. An invalid entry is an
+    /// error and leaves the current rules untouched.
+    pub fn set_rules(&self, block_private: bool, allowed_destinations: &[String]) -> Result<()> {
+        let nets = parse_nets(allowed_destinations)?;
+        *self.rules.write() = (block_private, nets);
+        Ok(())
     }
 
     /// Build from the proxy settings.
@@ -299,16 +305,13 @@ impl NetPolicy {
             return Err(Refusal::OwnListener);
         }
         let c = canonical(ip);
-        if self
-            .allowed
-            .iter()
-            .any(|n| n.contains(&ip) || n.contains(&c))
-        {
+        let (block_private, allowed) = &*self.rules.read();
+        if allowed.iter().any(|n| n.contains(&ip) || n.contains(&c)) {
             return Ok(());
         }
         match classify(ip) {
             Class::Reserved => Err(Refusal::Reserved),
-            Class::Private if self.block_private => Err(Refusal::Private),
+            Class::Private if *block_private => Err(Refusal::Private),
             _ => Ok(()),
         }
     }

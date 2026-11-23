@@ -470,7 +470,7 @@ proptest! {
         let preset = match preset { 0 => Preset::Default, 1 => Preset::Untrusted, _ => Preset::Trusted };
         // Rules are built from user-typed scopes: whatever parses must render safely.
         if let Ok(p) = Scope::parse(&page) {
-            r.site_rules.insert("s".into(), SiteRule { id: "s".into(), scope: p, preset, note: None });
+            r.site_rules.insert("s".into(), SiteRule { id: "s".into(), scope: p, preset, note: None, updated_at: 0 });
             if let Ok(sc) = Scope::parse(&src) {
                 r.source_rules.insert("r".into(), SourceRule {
                     id: "r".into(), page: Scope::parse(&page).unwrap(), source: sc,
@@ -478,7 +478,7 @@ proptest! {
                     effect: if allow { Effect::Allow } else { Effect::Deny }, note: None });
             }
         }
-        r.site_rules.insert("g".into(), SiteRule { id: "g".into(), scope: Scope::Global, preset, note: None });
+        r.site_rules.insert("g".into(), SiteRule { id: "g".into(), scope: Scope::Global, preset, note: None, updated_at: 0 });
         let c = compile(&r);
         for scheme in ["https", "http"] {
             // The page host reaches us from the proxy; it is normalised first (IDN to punycode).

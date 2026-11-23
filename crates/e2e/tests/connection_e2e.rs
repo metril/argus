@@ -94,3 +94,46 @@ e2e_test!(ws_echo_plain_and_tls_via_either_entry, rules = [], |env| {
     let mut wss = connect_wss(&env.proxy, "wss2.test", env.origin.https_port(), "/ws").await;
     echo(&mut wss, "tls").await;
 });
+
+// `ws://` upgrades to a `full`-bypass host skip filtering and logging; without the bypass the
+// same rule blocks them.
+e2e_test!(
+    ws_upgrade_to_a_full_bypass_host_is_unfiltered_and_unlogged,
+    rules = ["||fullws.test^", "||filteredws.test^"],
+    |env| {
+        env.proxy
+            .ctx
+            .bypass()
+            .update(|s| {
+                s.entries.push(common::bypass::Entry {
+                    id: common::bypass::new_id(),
+                    pattern: "fullws.test".into(),
+                    mode: common::bypass::BypassMode::Full,
+                    source: "custom".into(),
+                    note: None,
+                    updated_at: 0,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let before = env.proxy.ctx.bypass().bypassed_total();
+        let mut ws = connect_ws(&env.proxy, "fullws.test", env.origin.http_port(), "/ws").await;
+        echo(&mut ws, "through").await;
+        assert!(env.proxy.ctx.bypass().bypassed_total() > before);
+        assert!(
+            env.proxy
+                .engine
+                .recent_requests(20)
+                .iter()
+                .all(|e| !e.url.contains("fullws.test")),
+            "no log event for a full-bypass host"
+        );
+        // A host that is not bypassed is still blocked by the same kind of rule.
+        let tcp = tokio::net::TcpStream::connect(env.proxy.entry_addr())
+            .await
+            .unwrap();
+        let url = format!("ws://filteredws.test:{}/ws", env.origin.http_port());
+        let err = tokio_tungstenite::client_async(url, tcp).await.unwrap_err();
+        assert!(matches!(err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403));
+    }
+);

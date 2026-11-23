@@ -7,7 +7,7 @@ authors.workspace = true
 publish = false
 
 # Real-browser (headless Chromium over CDP) tests for the proxy. Skipped when no browser is found
-# unless ADBLOCKER_REQUIRE_BROWSER=1. See docs/TESTING.md.
+# unless ARGUS_REQUIRE_BROWSER=1. See docs/TESTING.md.
 [dependencies]
 e2e = { path = "../e2e" }
 proxy-core = { path = "../proxy-core", default-features = false, features = ["websockets"] }

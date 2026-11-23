@@ -1,6 +1,6 @@
-//! Web UI - Leptos SPA for Adblocker Proxy
+//! Web UI - Leptos SPA for Argus Proxy
 //!
-//! A reactive web interface for managing the adblocker proxy,
+//! A reactive web interface for managing the argus proxy,
 //! filter lists, and userscripts.
 
 pub mod api;

@@ -25,6 +25,10 @@ pub enum Error {
     #[error("Destination refused: {0}")]
     DestinationRefused(String),
 
+    /// The client refused the certificate we presented (alert or immediate close).
+    #[error("client rejected the proxy certificate: {0}")]
+    ClientRejectedCert(String),
+
     #[error("Timeout error")]
     Timeout,
 

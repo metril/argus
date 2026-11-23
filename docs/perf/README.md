@@ -147,7 +147,7 @@ with `--mix html=100` is the same at 100 and 500k rules (12.3k req/s). Open-loop
 (2 of 8 direct runs showed 58 ms and 350 ms p99.9), so the earlier list-size dependence was host
 noise, not per-response work.
 
-Allocator (real `adblocker` binary behind `loadgen --proxy-addr`, proxy pinned to 4 logical CPUs,
+Allocator (real `argus` binary behind `loadgen --proxy-addr`, proxy pinned to 4 logical CPUs,
 5 interleaved rounds, 50k rules): mimalloc raised closed-loop throughput 8% (h1 4931 -> 5329 req/s,
 h2 4753 -> 5164) and lowered closed-loop p99 slightly, but peak RSS grew 557 (533..565) -> 693
 (629..708) MiB (+24%) and open-loop p99 was dominated by host stalls in both variants. Not worth

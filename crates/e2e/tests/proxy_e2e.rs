@@ -130,7 +130,9 @@ e2e_test!(sni_host_and_origin_port_reach_origin, rules = [], |env| {
 // client trusting only the proxy CA fails the handshake. Unlisted hosts are still intercepted.
 e2e_test!(
     passthrough_hosts_are_not_intercepted,
-    rules = ["||pinned.test^", "||a.wild.test^"],
+    // No blocking rules for these hosts: passthrough hosts migrate to `no_decrypt` bypass, which
+    // keeps host-level blocking (see bypass_e2e for that).
+    rules = Vec::<&str>::new(),
     passthrough = ["pinned.test", "*.wild.test"],
     |env| {
         env.origin.route("/p", MockResponse::ok("origin-direct"));
@@ -138,7 +140,6 @@ e2e_test!(
         let direct = TestClient::trusting(&env.proxy, HttpVersion::Http1, &[origin_ca]);
         for host in ["pinned.test", "a.wild.test"] {
             let resp = direct.get(&env.origin.https_url(host, "/p")).await;
-            // Blocking rules do not apply to a tunnel.
             assert_eq!(resp.status(), 200, "{host}");
             assert_eq!(resp.text().await.unwrap(), "origin-direct");
         }

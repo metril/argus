@@ -96,8 +96,8 @@ impl CertificateAuthority {
 
         // Set distinguished name
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "Adblocker Proxy CA");
-        dn.push(DnType::OrganizationName, "Adblocker Proxy");
+        dn.push(DnType::CommonName, "Argus Proxy CA");
+        dn.push(DnType::OrganizationName, "Argus Proxy");
         dn.push(DnType::CountryName, "US");
         params.distinguished_name = dn;
 
@@ -240,6 +240,58 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
+
+    fn subject_cn(der: &CertificateDer<'_>) -> String {
+        let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).unwrap();
+        let cn = cert
+            .subject()
+            .iter_common_name()
+            .next()
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        cn
+    }
+
+    /// A CA issued before the rename (CN "Adblocker Proxy CA") must load untouched: same files,
+    /// same certificate, never regenerated.
+    #[test]
+    fn pre_rename_ca_is_kept_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cert_path = tmp.path().join("root-ca.crt");
+        let key_path = tmp.path().join("root-ca.key");
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Adblocker Proxy CA");
+        dn.push(DnType::OrganizationName, "Adblocker Proxy");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let key = KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        fs::write(&cert_path, cert.pem()).unwrap();
+        fs::write(&key_path, key.serialize_pem()).unwrap();
+        let (cert_before, key_before) =
+            (fs::read(&cert_path).unwrap(), fs::read(&key_path).unwrap());
+
+        let ca = CertificateAuthority::load_or_generate(&cert_path, &key_path).unwrap();
+
+        assert_eq!(ca.ca_cert_der().as_ref(), cert.der().as_ref());
+        assert_eq!(subject_cn(ca.ca_cert_der()), "Adblocker Proxy CA");
+        assert_eq!(fs::read(&cert_path).unwrap(), cert_before);
+        assert_eq!(fs::read(&key_path).unwrap(), key_before);
+    }
+
+    #[test]
+    fn fresh_ca_is_named_argus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = CertificateAuthority::load_or_generate(
+            tmp.path().join("root-ca.crt"),
+            tmp.path().join("root-ca.key"),
+        )
+        .unwrap();
+        assert_eq!(subject_cn(ca.ca_cert_der()), "Argus Proxy CA");
+    }
 
     #[test]
     fn test_ca_generation() {

@@ -122,8 +122,8 @@ impl Default for AuthConfig {
             access_token_expiry_seconds: 3600,    // 1 hour
             refresh_token_expiry_seconds: 604800, // 7 days
             bcrypt_cost: 12,
-            issuer: "adblocker-api".to_string(),
-            audience: "adblocker-ui".to_string(),
+            issuer: "argus-api".to_string(),
+            audience: "argus-ui".to_string(),
         }
     }
 }
@@ -185,7 +185,7 @@ impl Default for SecurityConfig {
 /// Session storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Directory holding `adblocker.redb` (the one database file shared by users, sessions,
+    /// Directory holding `argus.redb` (the one database file shared by users, sessions,
     /// tokens, audit and userscripts)
     pub storage_path: PathBuf,
 

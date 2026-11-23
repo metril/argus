@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 publish.workspace = true
-description = "Web UI for adblocker proxy - Leptos SPA"
+description = "Web UI for argus proxy - Leptos SPA"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -53,6 +53,21 @@ web-sys = { version = "0.3", features = [
     "HtmlAnchorElement",
     "File",
     "FileList",
+    "EventSource",
+    "EventSourceInit",
+    "MessageEvent",
+    "Event",
+    "EventTarget",
+    "KeyboardEvent",
+    "MouseEvent",
+    "Clipboard",
+    "Navigator",
+    "MediaQueryList",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "NodeList",
+    "History",
+    "Node",
 ] }
 js-sys = "0.3"
 

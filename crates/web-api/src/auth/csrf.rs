@@ -16,7 +16,7 @@ pub const CSRF_COOKIE: &str = "csrf_token";
 pub const CSRF_HEADER: &str = "x-csrf-token";
 
 fn key(secret: &str) -> [u8; 32] {
-    blake3::derive_key("adblocker api csrf v1", secret.as_bytes())
+    blake3::derive_key("argus api csrf v1", secret.as_bytes())
 }
 
 /// The CSRF token for a session.

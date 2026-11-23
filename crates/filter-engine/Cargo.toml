@@ -34,6 +34,7 @@ url = { workspace = true }
 # Caching
 arc-swap = { workspace = true }
 crossbeam = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 
 # Concurrency
 dashmap = { workspace = true }

@@ -92,16 +92,22 @@ impl Expiry<Arc<str>, Entry> for PerEntry {
 
 /// TTL-respecting, bounded, single-flight DNS cache.
 pub struct CachedResolver {
-    backend: Arc<dyn DnsBackend>,
-    cache: moka::future::Cache<Arc<str>, Entry>,
-    cfg: DnsCacheConfig,
+    /// Backend, cache and limits; replaced as a unit by [`Self::reconfigure`], so everyone
+    /// holding this resolver switches over at once.
+    inner: arc_swap::ArcSwap<Inner>,
     lookups: AtomicU64,
     /// Lookups that went to the backend.
     misses: AtomicU64,
 }
 
-impl CachedResolver {
-    pub fn new(backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) -> Self {
+struct Inner {
+    backend: Arc<dyn DnsBackend>,
+    cache: moka::future::Cache<Arc<str>, Entry>,
+    cfg: DnsCacheConfig,
+}
+
+impl Inner {
+    fn new(backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) -> Self {
         let cache = moka::future::Cache::builder()
             .max_capacity(cfg.capacity)
             .expire_after(PerEntry)
@@ -110,6 +116,14 @@ impl CachedResolver {
             backend,
             cache,
             cfg,
+        }
+    }
+}
+
+impl CachedResolver {
+    pub fn new(backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) -> Self {
+        Self {
+            inner: arc_swap::ArcSwap::from_pointee(Inner::new(backend, cfg)),
             lookups: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -126,6 +140,31 @@ impl CachedResolver {
         )
     }
 
+    /// Switch to new settings. The servers are re-read and the cache starts empty (cached
+    /// answers from the old servers must not outlive them); lookups already in flight finish
+    /// on the old state.
+    pub fn reconfigure(&self, settings: &DnsSettings) {
+        self.reconfigure_with(
+            Arc::new(FallbackBackend {
+                primary: Arc::new(HickoryBackend::new(settings)),
+                secondary: Arc::new(OsBackend),
+            }),
+            DnsCacheConfig::from(settings),
+        );
+    }
+
+    /// [`Self::reconfigure`] with a ready backend.
+    pub fn reconfigure_with(&self, backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) {
+        self.inner.store(Arc::new(Inner::new(backend, cfg)));
+    }
+
+    /// Names currently cached (after pending maintenance).
+    pub async fn cached_names(&self) -> u64 {
+        let inner = self.inner.load_full();
+        inner.cache.run_pending_tasks().await;
+        inner.cache.entry_count()
+    }
+
     /// Cache hits and backend lookups so far.
     pub fn stats(&self) -> (u64, u64) {
         let (l, m) = (
@@ -139,13 +178,14 @@ impl CachedResolver {
     pub async fn resolve(&self, name: &str) -> Result<Arc<[IpAddr]>, String> {
         self.lookups.fetch_add(1, Ordering::Relaxed);
         let key: Arc<str> = name.trim_end_matches('.').to_ascii_lowercase().into();
-        let backend = self.backend.clone();
-        let cfg = self.cfg.clone();
+        let inner = self.inner.load_full();
+        let backend = inner.backend.clone();
+        let cfg = inner.cfg.clone();
         let misses = &self.misses;
         let k2 = key.clone();
         // `try_get_with` stores only `Ok`: transport failures are returned, not cached, and
         // concurrent callers of one lookup share its outcome.
-        let entry = self
+        let entry = inner
             .cache
             .try_get_with(key, async move {
                 misses.fetch_add(1, Ordering::Relaxed);
@@ -653,5 +693,25 @@ mod tests {
         let r = CachedResolver::new(Arc::new(b), DnsCacheConfig::from(&settings(vec![])));
         let a = r.resolve("localhost").await.unwrap();
         assert!(a.iter().any(|ip| ip.is_loopback()), "{a:?}");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_swaps_backend_and_flushes_the_cache() {
+        let cfg = DnsCacheConfig::from(&DnsSettings::default());
+        let old = fake("192.0.2.1", Duration::from_secs(300));
+        let r = CachedResolver::new(old.clone(), cfg.clone());
+        assert_eq!(
+            &*r.resolve("a.test").await.unwrap(),
+            &["192.0.2.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(r.cached_names().await, 1);
+        let new = fake("192.0.2.2", Duration::from_secs(300));
+        r.reconfigure_with(new.clone(), cfg);
+        assert_eq!(r.cached_names().await, 0, "cache flushed");
+        assert_eq!(
+            &*r.resolve("a.test").await.unwrap(),
+            &["192.0.2.2".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(old.calls.load(Ordering::SeqCst), 1);
     }
 }
