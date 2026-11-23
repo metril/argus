@@ -2,10 +2,9 @@ name: Docker Multi-Arch Build
 
 on:
   push:
-    branches: [main, master]
     tags: ['v*']
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
@@ -42,7 +41,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=tag
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
