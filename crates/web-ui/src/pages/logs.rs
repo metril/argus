@@ -112,13 +112,39 @@ struct StreamCtx {
 /// via a re-seed must produce the same key.
 fn entry_key(e: &RequestLogEntry) -> String {
     format!(
-        "{}|{}|{}|{}|{:?}",
+        "{}|{}|{}|{}|{:?}|{:?}|{:?}|{}",
         e.ts,
         e.method,
         e.url,
         action_key(e.action),
-        e.status
+        e.status,
+        e.client,
+        e.source_host,
+        e.request_type
     )
+}
+
+/// The fetched entries not already held. `held` is matched as a multiset: each held key
+/// cancels one fetched entry with that key, so identical requests in the same instant are not
+/// collapsed, and duplicates within the fetched batch are never dropped.
+fn unseen(
+    held: impl IntoIterator<Item = String>,
+    fetched: Vec<RequestLogEntry>,
+) -> Vec<RequestLogEntry> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for k in held {
+        *counts.entry(k).or_default() += 1;
+    }
+    fetched
+        .into_iter()
+        .filter(|e| match counts.get_mut(&entry_key(e)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 /// After a reconnect, fetch what the gap missed (`since` the newest entry held) and merge it,
@@ -152,13 +178,17 @@ fn reseed(ctx: &StreamCtx) {
         };
         match r {
             Ok(r) => {
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                buffer.with_untracked(|b| seen.extend(b.iter().map(|r| entry_key(&r.e))));
-                pending.with_untracked(|b| seen.extend(b.iter().map(|r| entry_key(&r.e))));
-                let fresh: Vec<Row> = r
-                    .entries
+                if r.has_more {
+                    app.warning(format!(
+                        "The stream fell behind; {} requests were skipped.",
+                        r.total.saturating_sub(r.entries.len())
+                    ));
+                }
+                let mut held: Vec<String> = Vec::new();
+                buffer.with_untracked(|b| held.extend(b.iter().map(|r| entry_key(&r.e))));
+                pending.with_untracked(|b| held.extend(b.iter().map(|r| entry_key(&r.e))));
+                let fresh: Vec<Row> = unseen(held, r.entries)
                     .into_iter()
-                    .filter(|e| seen.insert(entry_key(e)))
                     .map(|e| {
                         let id = next_id.get_value();
                         next_id.set_value(id + 1);
@@ -718,5 +748,43 @@ pub fn LogsPage() -> impl IntoView {
                 })}
             </Drawer>
         </Layout>
+    }
+}
+
+#[cfg(test)]
+mod reseed_tests {
+    use super::*;
+
+    fn entry(url: &str, client: &str) -> RequestLogEntry {
+        serde_json::from_value(serde_json::json!({
+            "ts": "2026-01-01T00:00:00+00:00", "action": "allowed", "method": "GET", "url": url,
+            "source_host": null, "client": client, "request_type": "script", "rule": null,
+            "list_id": null, "status": 200, "mode": "explicit"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn held_entries_cancel_one_fetched_each_and_batch_duplicates_survive() {
+        let a = entry("https://a.test/", "1");
+        let b = entry("https://a.test/", "2"); // same instant, other client
+                                               // Two identical requests were fetched; one is already held: one is new.
+        let held = vec![entry_key(&a)];
+        let out = unseen(held, vec![a.clone(), a.clone(), b.clone()]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.client.as_deref() == Some("1"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.client.as_deref() == Some("2"))
+                .count(),
+            1
+        );
+        // Nothing held: the batch is kept whole, duplicates included.
+        assert_eq!(unseen(Vec::new(), vec![a.clone(), a]).len(), 2);
     }
 }

@@ -42,7 +42,18 @@ pub struct AuditQuery {
     pub until: Option<DateTime<Utc>>,
 }
 
-/// Read the audit log, newest first.
+/// Cursor: the entry key to continue below, and the first page's `total`.
+fn encode_cursor(key: u64, total: usize) -> String {
+    format!("{key:016x}.{total}")
+}
+
+fn decode_cursor(c: &str) -> Option<(u64, usize)> {
+    let (k, t) = c.split_once('.')?;
+    Some((AuditStore::entry_key(k)?, t.parse().ok()?))
+}
+
+/// Read the audit log, newest first. `total` on the first page is exact for an unfiltered
+/// query and otherwise a lower bound; later pages (with `cursor`) repeat that first-page value.
 #[utoipa::path(
     get, path = "/audit", tag = "audit",
     security(("bearer_auth" = ["audit:read"])),
@@ -66,21 +77,21 @@ pub async fn list_audit(
         action: q.action.filter(|s| !s.trim().is_empty()),
         q: q.q.filter(|s| !s.trim().is_empty()),
     };
-    if q.cursor.as_deref().is_some_and(|c| !c.is_empty()) {
-        let before = AuditStore::entry_key(q.cursor.as_deref().unwrap_or_default())
-            .ok_or_else(|| ApiError::ValidationError("invalid cursor".into()))?;
+    if let Some(c) = q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        let (before, total) =
+            decode_cursor(c).ok_or_else(|| ApiError::ValidationError("invalid cursor".into()))?;
         let st = state.clone();
-        let (items, more) =
+        let (items, next) =
             blocking(move || Ok(st.audit.query_before(&filter, Some(before), limit as usize)))
                 .await?;
-        let next_cursor = more.then(|| items.last().map(|e| e.id.clone())).flatten();
         return Ok(Json(Page {
-            total: items.len() + usize::from(more),
+            // Echoed from the first page, so it does not change while paging.
+            total,
             items,
             page,
             limit,
-            has_more: more,
-            next_cursor,
+            has_more: next.is_some(),
+            next_cursor: next.map(|k| encode_cursor(k, total)),
         }));
     }
     let offset = (page as usize - 1) * limit as usize;
@@ -90,7 +101,12 @@ pub async fn list_audit(
         blocking(move || Ok(st.audit.query(&filter, offset, limit as usize))).await?;
     let has_more = offset + items.len() < total;
     let next_cursor = has_more
-        .then(|| items.last().map(|e| e.id.clone()))
+        .then(|| {
+            items
+                .last()
+                .and_then(|e| AuditStore::entry_key(&e.id))
+                .map(|k| encode_cursor(k, total))
+        })
         .flatten();
     Ok(Json(Page {
         has_more,

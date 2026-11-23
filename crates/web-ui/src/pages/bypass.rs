@@ -91,9 +91,11 @@ pub fn BypassPage() -> impl IntoView {
     let hosts_title = RwSignal::new(String::new());
     let hosts_id = RwSignal::new(String::new());
     let hosts_q = RwSignal::new(String::new());
+    // The query the loaded pages were fetched with (see the rules drawer).
+    let hosts_q_snap = RwSignal::new(String::new());
     let hosts_t = StoredValue::new_local(None::<Timeout>);
     let hosts_fetch: Fetcher<String> = Rc::new(move |cursor, _| {
-        let (id, q) = (hosts_id.get_untracked(), hosts_q.get_untracked());
+        let (id, q) = (hosts_id.get_untracked(), hosts_q_snap.get_untracked());
         Box::pin(async move {
             match ApiClient::new()
                 .bypass_category_hosts(&id, &q, cursor.as_deref())
@@ -108,7 +110,10 @@ pub fn BypassPage() -> impl IntoView {
         })
     });
     let hosts = Feed::new(hosts_fetch);
-    let load_hosts = move || hosts.reload(None, false, None);
+    let load_hosts = move || {
+        hosts_q_snap.set(hosts_q.get_untracked());
+        hosts.reload(None, false, None);
+    };
 
     // ---- entries (vlist) ----
     let q = RwSignal::new(query_get("bq").unwrap_or_default());

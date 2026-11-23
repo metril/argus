@@ -95,6 +95,14 @@ older offset form of the same list. Cursor-paged lists: users, sessions, tokens,
 `/rules/ext` (`q`, `list`, `kind`), audit (`actor`, `action`, `q`, `since`, `outcome`;
 newest first) and a userscript's storage (`q`, with `total`).
 
+Details: `/rules/ext` cursors name the engine build; after a rebuild the old cursor gets `409`
+`ext_rules_changed` and the client restarts from the first page. Audit `total` is exact for an
+unfiltered query and otherwise a lower bound taken on the first page; pages fetched with a
+cursor repeat that first-page value. An audit page may be short or empty yet still carry
+`next_cursor` when the scan budget ran out; keep following it. Bypass hosts and userscript
+storage accept `limit` up to 1000 (defaults 200 and 1000, so clients that send neither see
+what they always did); other lists cap at 200.
+
 ## Concurrency control
 
 `GET /config` and `GET /rules/custom` return an `ETag`; the matching `PUT` requires it in

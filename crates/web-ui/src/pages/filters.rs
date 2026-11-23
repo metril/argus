@@ -814,10 +814,13 @@ fn FilterDrawer(
 fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> impl IntoView {
     let app = StoredValue::new(use_app_state());
     let q = RwSignal::new(String::new());
+    // The query the loaded pages were fetched with: later pages must not mix in a newer one.
+    let q_snap = RwSignal::new(String::new());
     let t = StoredValue::new_local(None::<Timeout>);
+    let rules_cell = StoredValue::new_local(None::<Feed<api_types::ExtRuleResponse>>);
     let fetch: Fetcher<api_types::ExtRuleResponse> = Rc::new(move |cursor, _| {
         let id = list.get_untracked().map(|l| l.0).unwrap_or_default();
-        let qv = q.get_untracked();
+        let qv = q_snap.get_untracked();
         Box::pin(async move {
             // An empty id would list every list's rules.
             if id.is_empty() {
@@ -829,17 +832,28 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
             {
                 Ok(p) => Ok((p.items, p.next_cursor, p.total)),
                 Err(e) => {
-                    app.get_value().error(format!("Failed to load rules: {e}"));
+                    if matches!(e, crate::api::ApiError::Conflict(_)) {
+                        // The rule set was rebuilt under the cursor: start over.
+                        app.get_value()
+                            .info("Filter lists were rebuilt; reloading the rules");
+                        if let Some(f) = rules_cell.get_value() {
+                            f.reload(None, false, None);
+                        }
+                    } else {
+                        app.get_value().error(format!("Failed to load rules: {e}"));
+                    }
                     Err(e)
                 }
             }
         })
     });
     let rules = Feed::new(fetch);
+    rules_cell.set_value(Some(rules));
     Effect::new(move |_| {
         if open.get() {
             let _ = list.get();
             rules.items.set(Vec::new());
+            q_snap.set(q.get_untracked());
             rules.reload(None, false, None);
         }
     });
@@ -854,7 +868,10 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
                     prop:value=move || q.get()
                     on:input=move |ev| {
                         q.set(event_target_value(&ev));
-                        t.set_value(Some(Timeout::new(250, move || rules.reload(None, false, None))));
+                        t.set_value(Some(Timeout::new(250, move || {
+                            q_snap.set(q.get_untracked());
+                            rules.reload(None, false, None);
+                        })));
                     } />
             </div>
             <span class="hint" aria-live="polite">{move || format!(
@@ -863,7 +880,7 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
             <VList
                 items=rules.items
                 row_h=Signal::derive(|| 52.0)
-                key=|r: &api_types::ExtRuleResponse| format!("{}/{}", r.list, r.raw)
+                key=|r: &api_types::ExtRuleResponse| r.index.to_string()
                 render=Callback::new(|r: api_types::ExtRuleResponse| view! {
                     <div class="hrow rrow" title=r.raw.clone()>
                         <code>{r.raw.clone()}</code>

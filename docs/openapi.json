@@ -2126,6 +2126,11 @@
             },
             "type": "array"
           },
+          "index": {
+            "description": "Position in the engine's handed-off rule list (stable within one build).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "kind": {
             "type": "string"
           },
@@ -3223,6 +3228,11 @@
                     "type": "string"
                   },
                   "type": "array"
+                },
+                "index": {
+                  "description": "Position in the engine's handed-off rule list (stable within one build).",
+                  "minimum": 0,
+                  "type": "integer"
                 },
                 "kind": {
                   "type": "string"
@@ -7296,7 +7306,7 @@
             ]
           }
         ],
-        "summary": "Read the audit log, newest first.",
+        "summary": "Read the audit log, newest first. `total` on the first page is exact for an unfiltered\nquery and otherwise a lower bound; later pages (with `cursor`) repeat that first-page value.",
         "tags": [
           "audit"
         ]
@@ -8258,7 +8268,7 @@
             }
           },
           {
-            "description": "Page size (1..=200, default 200).",
+            "description": "Page size (1..=1000, default 200).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -18591,7 +18601,7 @@
             }
           },
           {
-            "description": "Page size (1..=200, default 50).",
+            "description": "Page size (1..=1000, default 1000).",
             "in": "query",
             "name": "limit",
             "required": false,

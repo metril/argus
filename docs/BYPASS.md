@@ -33,7 +33,8 @@ and the proxy subscribes to them by default (source `argus:<category>`, fetched 
   installed. Fetching starts when the server starts, retries with backoff until it succeeds and
   then checks every few hours; `POST /bypass/argus-lists/refresh` checks now.
 * **Categories** are switches over those subscriptions: `GET /bypass/categories`, `PUT
-  /bypass/categories/{id}` (`enabled`, `mode`), `GET /bypass/categories/{id}/hosts?q=`. Every
+  /bypass/categories/{id}` (`enabled`, `mode`), `GET /bypass/categories/{id}/hosts?q=&limit=&cursor=` (cursor-paged: `limit` up to 1000,
+  default 200; pass `next_cursor` back as `cursor`, absent on the last page). Every
   category defaults to `no_decrypt` (as in AdGuard); any category, entry or subscription can be
   `full`. `GET /bypass/argus-lists` reports `{version, updated_at, last_checked, last_error,
   categories}`. Settings of the former embedded categories migrate into the subscriptions

@@ -22,7 +22,7 @@ use userscript_engine::install::{self, Approvals};
 use userscript_engine::storage::ns;
 use utoipa::IntoParams;
 
-use super::paging::{desc_key, natural_key, paginate, Keyed};
+use super::paging::{desc_key, natural_key, paginate, paginate_max, Keyed};
 use crate::auth::authz::Principal;
 use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -693,7 +693,7 @@ pub async fn discard_update(
 pub struct StorageQuery {
     /// Case-insensitive substring of the value name.
     pub q: Option<String>,
-    /// Page size (1..=200, default 50).
+    /// Page size (1..=1000, default 1000).
     pub limit: Option<u32>,
     /// `next_cursor` of the previous page.
     pub cursor: Option<String>,
@@ -731,12 +731,14 @@ pub async fn get_storage(
             item: (name, size),
         })
         .collect();
-    let p = paginate(
+    // Without a cursor or limit the old behaviour holds: up to 1000 values in one response.
+    let p = paginate_max(
         rows,
-        Some(q.limit.unwrap_or(50)),
+        Some(q.limit.unwrap_or(1000)),
         q.cursor.as_deref(),
         None,
         None,
+        1000,
     )?;
     let values = p
         .items

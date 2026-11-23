@@ -320,6 +320,14 @@ where
         feed.items.track();
         check_end();
     });
+    // The list restarted (new filter, reload): back to the top.
+    Effect::new(move |_| {
+        feed.tok.track();
+        if let Some(el) = node.get() {
+            let el: web_sys::HtmlElement = el.into();
+            el.set_scroll_top(0);
+        }
+    });
     view! {
         {move || feed.error.get().map(|msg| view! {
             <div class="vlist-err" role="alert">

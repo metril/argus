@@ -15,7 +15,7 @@ use tracing::info;
 use utoipa::IntoParams;
 use validator::Validate;
 
-use super::paging::{desc_key, natural_key, page_of, paginate, Keyed};
+use super::paging::{desc_key, natural_key, paginate, Keyed};
 use super::proxy::apply_update;
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -748,39 +748,63 @@ pub async fn list_ext_rules(
     // The rule list and the index are installed together; if a rebuild slipped in between the
     // two reads, say `unknown` instead of mislabelling.
     let index = index.filter(|i| i.stats().total == rules.len());
-    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
-    // Rows are indexes into the rule list (its order is the display order); only the page's
-    // rows are turned into responses.
-    let rows: Vec<Keyed<usize>> = rules
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
-        .filter(|(_, r)| q.list.as_deref().is_none_or(|l| r.list == l))
-        .filter(|(_, r)| {
-            needle.is_empty()
-                || r.raw.to_lowercase().contains(&needle)
-                || r.list.to_lowercase().contains(&needle)
-        })
-        .map(|(i, _)| Keyed {
-            key: format!("{i:012}"),
-            id: String::new(),
-            label: String::new(),
-            item: i,
-        })
-        .collect();
-    let cq = super::CursorQuery {
-        page: q.page,
-        limit: q.limit,
-        cursor: q.cursor,
+    let needle = q.q.as_deref().unwrap_or("").trim().to_ascii_lowercase();
+    let limit = q.limit.unwrap_or(50).clamp(1, 200) as usize;
+    let gen_id = generation.id;
+    // The cursor is the index of the last rule served plus the build it came from; a rebuild
+    // renumbers the rules, so a cursor from another build is refused.
+    let after = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        Some(c) => {
+            let (g, i) = decode_ext_cursor(c)?;
+            if g != gen_id {
+                return Err(ApiError::conflict(
+                    "ext_rules_changed",
+                    "The rule set was rebuilt since this cursor was issued; restart from the first page",
+                ));
+            }
+            Some(i)
+        }
+        None => None,
     };
-    let p = page_of(rows, &cq)?;
-    let items: Vec<ExtRuleResponse> = p
-        .items
+    let mut skip = match (after, q.page) {
+        (None, Some(p)) => (p.max(1) as usize - 1).saturating_mul(limit),
+        _ => 0,
+    };
+    // One pass, no per-row allocation: count every match, collect the page (plus one row to
+    // know whether more follow).
+    let mut total = 0usize;
+    let mut picked: Vec<usize> = Vec::with_capacity(limit + 1);
+    for (i, r) in rules.iter().enumerate() {
+        if q.kind.as_deref().is_some_and(|k| r.kind.as_str() != k)
+            || q.list.as_deref().is_some_and(|l| r.list != l)
+            || !(needle.is_empty()
+                || super::paging::ci_contains(&r.raw, &needle)
+                || super::paging::ci_contains(&r.list, &needle))
+        {
+            continue;
+        }
+        total += 1;
+        if after.is_some_and(|a| i <= a) {
+            continue;
+        }
+        if skip > 0 {
+            skip -= 1;
+        } else if picked.len() <= limit {
+            picked.push(i);
+        }
+    }
+    let has_more = picked.len() > limit;
+    picked.truncate(limit);
+    let next_cursor = has_more
+        .then(|| picked.last().map(|&i| encode_ext_cursor(gen_id, i)))
+        .flatten();
+    let items: Vec<ExtRuleResponse> = picked
         .iter()
         .map(|&i| {
             let r = &rules[i];
             let st = index.and_then(|x| x.state_of(i));
             ExtRuleResponse {
+                index: i,
                 kind: r.kind.as_str().into(),
                 raw: r.raw.clone(),
                 domains: r.domains.clone(),
@@ -792,12 +816,28 @@ pub async fn list_ext_rules(
         .collect();
     Ok(Json(Page {
         items,
-        total: p.total,
-        page: p.page,
-        limit: p.limit,
-        has_more: p.has_more,
-        next_cursor: p.next_cursor,
+        total,
+        page: q.page.filter(|_| after.is_none()).unwrap_or(1).max(1),
+        limit: limit as u32,
+        has_more,
+        next_cursor,
     }))
+}
+
+fn encode_ext_cursor(gen: u64, index: usize) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{gen}:{index}"))
+}
+
+fn decode_ext_cursor(c: &str) -> ApiResult<(u64, usize)> {
+    use base64::Engine;
+    let bad = || ApiError::ValidationError("invalid cursor".into());
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(c)
+        .map_err(|_| bad())?;
+    let s = String::from_utf8(raw).map_err(|_| bad())?;
+    let (g, i) = s.split_once(':').ok_or_else(bad)?;
+    Ok((g.parse().map_err(|_| bad())?, i.parse().map_err(|_| bad())?))
 }
 
 /// Stable error code for a fetch URL that is not an allowed destination.

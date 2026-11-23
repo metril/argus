@@ -714,6 +714,9 @@ pub struct CatalogueEntryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ExtRuleResponse {
+    /// Position in the engine's handed-off rule list (stable within one build).
+    #[serde(default)]
+    pub index: usize,
     pub kind: String,
     pub raw: String,
     pub domains: Vec<String>,

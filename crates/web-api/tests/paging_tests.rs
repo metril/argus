@@ -469,6 +469,110 @@ async fn request_log_seed_is_not_clamped_to_200_and_honours_since() {
 }
 
 #[tokio::test]
+async fn cursor_row_deleted_between_pages_loses_and_repeats_nothing() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    for i in 0..9 {
+        admin
+            .post("/api/v1/policy/site-rules")
+            .json(&json!({"scope": format!("del{i}.com"), "preset": {"kind": "trusted"}}))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+    let base = "/api/v1/policy/site-rules?limit=3";
+    let p1: Value = admin.get(base).await.json();
+    let first: Vec<String> = p1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(field("id"))
+        .collect();
+    // Delete the row the cursor points at.
+    admin
+        .delete(&format!("/api/v1/policy/site-rules/{}", first[2]))
+        .await
+        .assert_status_ok();
+    let cur = p1["next_cursor"].as_str().unwrap();
+    let p2: Value = admin.get(&format!("{base}&cursor={cur}")).await.json();
+    let second: Vec<String> = p2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(field("id"))
+        .collect();
+    let scopes: Vec<String> = p2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(field("scope"))
+        .collect();
+    assert_eq!(second.len(), 3);
+    assert!(second.iter().all(|i| !first.contains(i)), "no repeats");
+    assert_eq!(
+        scopes,
+        ["site:del3.com", "site:del4.com", "site:del5.com"],
+        "no gap"
+    );
+}
+
+#[tokio::test]
+async fn ext_rules_cursor_is_refused_after_a_rebuild() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let mut l = filter_engine::FilterList::new(
+        "ag".into(),
+        "AG".into(),
+        "https://127.0.0.1:1/ag.txt".into(),
+    );
+    l.format = filter_engine::ListFormat::Adguard;
+    ctx.state.filter_store.upsert(&l).unwrap();
+    let body = |n: usize| -> String {
+        (0..n)
+            .map(|i| format!("||x{i}.example^$replace=/a/b/\n"))
+            .collect()
+    };
+    ctx.state.filter_store.put_content("ag", &body(30)).unwrap();
+    ctx.state.list_service.reload_now().await;
+    let p1: Value = admin.get("/api/v1/rules/ext?limit=10").await.json();
+    assert_eq!(p1["items"][0]["index"], 0);
+    let cur = p1["next_cursor"].as_str().unwrap().to_string();
+    let ok = admin
+        .get(&format!("/api/v1/rules/ext?limit=10&cursor={cur}"))
+        .await;
+    ok.assert_status_ok();
+    assert_eq!(ok.json::<Value>()["items"][0]["index"], 10);
+
+    ctx.state.filter_store.put_content("ag", &body(31)).unwrap();
+    ctx.state.list_service.reload_now().await;
+    let r = admin
+        .get(&format!("/api/v1/rules/ext?limit=10&cursor={cur}"))
+        .await;
+    r.assert_status(StatusCode::CONFLICT);
+    assert_eq!(r.json::<Value>()["error"]["code"], "ext_rules_changed");
+    admin
+        .get("/api/v1/rules/ext?limit=10")
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn bypass_hosts_keep_their_old_limits() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let hosts: Vec<String> = (0..N).map(|i| format!("h{i}.example")).collect();
+    ctx.state
+        .bypass()
+        .update_volatile(|s| s.set_hosts("argus:banking_finance", hosts));
+    let base = "/api/v1/bypass/categories/banking_finance/hosts";
+    // Old clients: no limit gives 200; limit=1000 gives everything in one response.
+    let v: Value = admin.get(base).await.json();
+    assert_eq!(v["items"].as_array().unwrap().len(), 200);
+    let v: Value = admin.get(&format!("{base}?limit=1000")).await.json();
+    assert_eq!(v["items"].as_array().unwrap().len(), N);
+    assert_eq!(v["has_more"], false);
+}
+
+#[tokio::test]
 async fn users_filter_and_cursor_combined() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;
@@ -536,6 +640,9 @@ async fn userscript_storage_page_and_search() {
         .collect();
     let base = format!("/api/v1/userscripts/{enc}/storage");
     walk_n(&admin, &base, "values", N, field("name")).await;
+    // Old clients (no limit, no cursor) still get every value in one response.
+    let all: Value = admin.get(&base).await.json();
+    assert_eq!(all["values"].as_array().unwrap().len(), N);
     let v: Value = admin.get(&format!("{base}?limit=10")).await.json();
     assert_eq!(
         (v["total"].as_u64(), v["values"].as_array().map(Vec::len)),

@@ -94,13 +94,25 @@ fn decode(token: &str) -> ApiResult<(String, String)> {
 /// * `from`: start at the first row whose key is >= `from_key` (a name-sorted seek).
 /// * `page`: deprecated 1-based offset paging.
 pub fn paginate<T>(
-    mut rows: Vec<Keyed<T>>,
+    rows: Vec<Keyed<T>>,
     limit: Option<u32>,
     cursor: Option<&str>,
     from_key: Option<&str>,
     page: Option<u32>,
 ) -> ApiResult<CursorPage<T>> {
-    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    paginate_max(rows, limit, cursor, from_key, page, MAX_LIMIT)
+}
+
+/// [`paginate`] with a larger page-size ceiling, for endpoints whose older form allowed it.
+pub fn paginate_max<T>(
+    mut rows: Vec<Keyed<T>>,
+    limit: Option<u32>,
+    cursor: Option<&str>,
+    from_key: Option<&str>,
+    page: Option<u32>,
+    max_limit: u32,
+) -> ApiResult<CursorPage<T>> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, max_limit);
     rows.sort_by(|a, b| (&a.key, &a.id).cmp(&(&b.key, &b.id)));
     let total = rows.len();
     let letters: Vec<String> = rows
@@ -141,6 +153,12 @@ pub fn paginate<T>(
         page: page_echo,
         letters,
     })
+}
+
+/// ASCII case-insensitive substring test without allocating; `needle` must be lower case.
+pub fn ci_contains(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.is_empty() || (n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n)))
 }
 
 /// Sort key for a timestamp, oldest first (RFC 3339 text; unparsable sorts first).
