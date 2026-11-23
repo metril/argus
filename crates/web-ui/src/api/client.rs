@@ -123,8 +123,20 @@ pub fn scope_to_profile(path: &str, profile: &str) -> String {
 
 thread_local! {
     static REFRESH_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
-    static REFRESH_OK: Cell<bool> = const { Cell::new(false) };
+    /// Outcome of the last refresh (`None` = succeeded), shared with waiting callers.
+    static REFRESH_ERR: std::cell::RefCell<Option<ApiError>> = const { std::cell::RefCell::new(None) };
+    /// `Date.now()` of the last failed refresh; a burst of requests that 401 right after
+    /// reuses that verdict instead of each re-POSTing `/auth/refresh`.
+    static REFRESH_FAILED_AT: Cell<f64> = const { Cell::new(0.0) };
 }
+
+/// Forget a failed refresh (after a fresh login the cookies are valid again).
+pub fn reset_refresh_cooldown() {
+    REFRESH_FAILED_AT.with(|c| c.set(0.0));
+}
+
+/// How long a failed refresh is trusted, in ms.
+const REFRESH_FAIL_TTL_MS: f64 = 5000.0;
 
 /// API client for making authenticated requests
 #[derive(Clone)]
@@ -317,18 +329,25 @@ impl ApiClient {
                     break;
                 }
             }
-            return if REFRESH_OK.with(Cell::get) {
-                Ok(())
-            } else {
-                Err(ApiError::Unauthorized)
+            return match REFRESH_ERR.with(|e| e.borrow().clone()) {
+                None => Ok(()),
+                Some(e) => Err(e),
             };
+        }
+
+        if js_sys::Date::now() - REFRESH_FAILED_AT.with(Cell::get) < REFRESH_FAIL_TTL_MS {
+            return Err(ApiError::Unauthorized);
         }
 
         // We own the refresh. No `.await` between the check above and this set,
         // so on the single-threaded WASM executor this is race-free.
         REFRESH_IN_FLIGHT.with(|f| f.set(true));
         let result = self.do_refresh().await;
-        REFRESH_OK.with(|c| c.set(result.is_ok()));
+        REFRESH_ERR.with(|e| *e.borrow_mut() = result.clone().err());
+        // Only a real auth rejection is cached; outages must stay retryable.
+        if matches!(result, Err(ApiError::Unauthorized)) {
+            REFRESH_FAILED_AT.with(|c| c.set(js_sys::Date::now()));
+        }
         REFRESH_IN_FLIGHT.with(|f| f.set(false));
         result
     }
@@ -341,10 +360,10 @@ impl ApiClient {
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
 
-        if (200..300).contains(&response.status()) {
-            Ok(())
-        } else {
-            Err(ApiError::Unauthorized)
+        match response.status() {
+            200..=299 => Ok(()),
+            401 | 403 => Err(ApiError::Unauthorized),
+            s => Err(ApiError::Server(format!("refresh failed with status {s}"))),
         }
     }
 

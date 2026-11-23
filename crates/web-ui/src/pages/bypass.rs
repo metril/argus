@@ -32,17 +32,26 @@ pub fn BypassPage() -> impl IntoView {
     let load_top = move || {
         wasm_bindgen_futures::spawn_local(async move {
             let c = ApiClient::new();
-            if let Ok(a) = c.argus_lists().await {
-                argus.set(Some(a));
+            let mut errs = Vec::<String>::new();
+            match c.argus_lists().await {
+                Ok(a) => argus.set(Some(a)),
+                Err(e) => errs.push(e.to_string()),
             }
-            if let Ok(s) = c.bypass_settings().await {
-                settings.set(Some(s));
+            match c.bypass_settings().await {
+                Ok(s) => settings.set(Some(s)),
+                Err(e) => errs.push(e.to_string()),
             }
-            if let Ok(s) = c.list_bypass_subscriptions().await {
-                subs.set(s);
+            match c.list_bypass_subscriptions().await {
+                Ok(s) => subs.set(s),
+                Err(e) => errs.push(e.to_string()),
             }
-            if let Ok(s) = c.suggested_bypass_subscriptions().await {
-                suggested.set(s);
+            match c.suggested_bypass_subscriptions().await {
+                Ok(s) => suggested.set(s),
+                Err(e) => errs.push(e.to_string()),
+            }
+            if let Some(e) = errs.first() {
+                app.get_value()
+                    .error(format!("Failed to load bypass data: {e}"));
             }
         });
     };
@@ -88,9 +97,12 @@ pub fn BypassPage() -> impl IntoView {
     let load_hosts = move || {
         let (id, q) = (hosts_id.get_untracked(), hosts_q.get_untracked());
         wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(r) = ApiClient::new().bypass_category_hosts(&id, &q).await {
-                hosts_total.set(r.total);
-                hosts.set(r.items);
+            match ApiClient::new().bypass_category_hosts(&id, &q).await {
+                Ok(r) => {
+                    hosts_total.set(r.total);
+                    hosts.set(r.items);
+                }
+                Err(e) => app.get_value().error(format!("Failed to load hosts: {e}")),
             }
         });
     };
@@ -466,6 +478,8 @@ pub fn BypassPage() -> impl IntoView {
                                 }.into_any()
                             })
                             on_end=Callback::new(move |()| feed.more())
+                            error=feed.error
+                            on_retry=Callback::new(move |()| feed.retry())
                             on_anchor=on_anchor
                             reset=feed.tok
                             label="Your bypass entries"

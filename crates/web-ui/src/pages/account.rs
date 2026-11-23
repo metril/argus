@@ -4,7 +4,7 @@ use leptos::prelude::*;
 
 use crate::api::auth::SessionInfo;
 use crate::api::ApiClient;
-use crate::components::{Card, Layout};
+use crate::components::{Card, ConfirmButton, Layout};
 use crate::state::{use_app_state, use_auth_state};
 use crate::utils::api_base_url;
 
@@ -134,12 +134,10 @@ pub fn AccountPage() -> impl IntoView {
                                                 {user_agent}
                                             </div>
                                         </div>
-                                        <button
-                                            class="btn btn-danger"
-                                            on:click=move |_| revoke_id.set(Some(session_id.clone()))
-                                        >
-                                            "Revoke"
-                                        </button>
+                                        <ConfirmButton
+                                            label="Revoke"
+                                            on_confirm=Callback::new(move |()| revoke_id.set(Some(session_id.clone())))
+                                        />
                                     </div>
                                 }
                             }

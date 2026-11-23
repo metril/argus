@@ -9,7 +9,7 @@ use crate::api::userscripts::{
     UserscriptPlanResponse, UserscriptStorageResponse,
 };
 use crate::api::ApiClient;
-use crate::components::{Drawer, Icon, Layout, ProfileSelector, Switch};
+use crate::components::{ConfirmButton, Drawer, Icon, Layout, ProfileSelector, Switch};
 use crate::state::use_app_state;
 use gloo_timers::callback::Timeout;
 use std::rc::Rc;
@@ -688,6 +688,8 @@ pub fn UserscriptsPage() -> impl IntoView {
                             }.into_any()
                             })
                             on_end=Callback::new(move |()| feed.more())
+                            error=feed.error
+                            on_retry=Callback::new(move |()| feed.retry())
                             on_anchor=on_anchor
                             reset=feed.tok
                             label="Userscripts"
@@ -934,8 +936,8 @@ pub fn UserscriptsPage() -> impl IntoView {
                                                         <td>{v.name.clone()}</td>
                                                         <td>{fmt_bytes(v.size_bytes as u64)}</td>
                                                         <td><code>{v.preview.clone()}</code></td>
-                                                        <td><button class="btn ghost sm"
-                                                            on:click=move |_| clear_storage(sid.clone(), Some(name.clone()))>"Delete"</button></td>
+                                                        <td><ConfirmButton label="Delete" confirm_label="Delete?"
+                                                            on_confirm=Callback::new(move |()| clear_storage(sid.clone(), Some(name.clone()))) /></td>
                                                     </tr> }
                                                 }).collect_view()}
                                             </tbody>
@@ -943,12 +945,12 @@ pub fn UserscriptsPage() -> impl IntoView {
                                     }.into_any()
                                 })
                             }}
-                            <button class="btn sm"
-                                on:click=move |_| clear_storage(id_clear.clone(), None)>"Clear all"</button>
+                            <ConfirmButton label="Clear all" confirm_label="Clear all?"
+                                on_confirm=Callback::new(move |()| clear_storage(id_clear.clone(), None)) />
                         </div>
                         <div class="row-gap">
                             <button class="btn ghost" on:click=move |_| view_source(id_src.clone())>"View source"</button>
-                            <button class="btn danger sm" on:click=move |_| uninstall(id_un.clone())>"Uninstall"</button>
+                            <ConfirmButton label="Uninstall" confirm_label="Uninstall?" on_confirm=Callback::new(move |()| uninstall(id_un.clone())) />
                         </div>
                     }
                 })}

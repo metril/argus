@@ -23,7 +23,7 @@ pub use confirm::ConfirmButton;
 pub use drawer::Drawer;
 pub use form::{ChipSelect, Input, Segmented, Switch, TagInput};
 pub use icon::Icon;
-pub use layout::{AuthLayout, Layout, RequireAdmin};
+pub use layout::{AuthLayout, Layout, Protected, RequireAdmin};
 pub use modal::Modal;
 pub use navbar::Navbar;
 pub use palette::CommandPalette;

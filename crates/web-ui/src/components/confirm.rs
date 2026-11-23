@@ -3,22 +3,35 @@
 use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 
+use super::icon::Icon;
+
 #[component]
 pub fn ConfirmButton(
     #[prop(into)] label: String,
     #[prop(into, optional)] confirm_label: Option<String>,
     on_confirm: Callback<()>,
-    #[prop(into, optional)] class: String,
+    /// Extra classes; `danger` is always applied.
+    #[prop(into, optional)]
+    class: String,
+    /// Use the regular (30px) height instead of the compact one.
+    #[prop(optional)]
+    large: bool,
     #[prop(into, optional)] disabled: Signal<bool>,
 ) -> impl IntoView {
     let armed = RwSignal::new(false);
     let timer = StoredValue::new_local(None::<Timeout>);
     let confirm_label = confirm_label.unwrap_or_else(|| "Confirm".to_string());
     let l1 = label.clone();
+    let sr = format!("{label}: press again to confirm");
     view! {
         <button
             type="button"
-            class=move || format!("btn {} {}", if class.is_empty() { "danger sm" } else { &class }, if armed.get() { "armed" } else { "" })
+            class=move || format!(
+                "btn danger{} {} {}",
+                if large { "" } else { " sm" },
+                class,
+                if armed.get() { "armed" } else { "" }
+            )
             disabled=move || disabled.get()
             on:click=move |_| {
                 if armed.get_untracked() {
@@ -32,7 +45,9 @@ pub fn ConfirmButton(
             }
             on:blur=move |_| armed.set(false)
         >
+            <Show when=move || !armed.get()><Icon name="trash" /></Show>
             {move || if armed.get() { confirm_label.clone() } else { l1.clone() }}
         </button>
+        <span class="sr-only" aria-live="polite">{move || if armed.get() { sr.clone() } else { String::new() }}</span>
     }
 }

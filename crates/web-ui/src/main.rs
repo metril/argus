@@ -5,6 +5,7 @@
 use web_ui::App;
 
 fn main() {
+    console_error_panic_hook::set_once();
     // Initialize tracing for WASM
     tracing_subscriber::fmt()
         .with_writer(tracing_web::MakeWebConsoleWriter::new())

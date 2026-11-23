@@ -154,10 +154,14 @@ pub fn FiltersPage() -> impl IntoView {
         anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("fa", label)]))));
     });
     // Custom rules (once)
+    let app_cr = app_state.clone();
     wasm_bindgen_futures::spawn_local(async move {
-        if let Ok((resp, etag)) = ApiClient::new().get_custom_rules().await {
-            custom_rules.set(resp.rules);
-            rules_etag.set(etag);
+        match ApiClient::new().get_custom_rules().await {
+            Ok((resp, etag)) => {
+                custom_rules.set(resp.rules);
+                rules_etag.set(etag);
+            }
+            Err(e) => app_cr.error(format!("Failed to load custom rules: {e}")),
         }
     });
 
@@ -165,17 +169,29 @@ pub fn FiltersPage() -> impl IntoView {
     {
         let alive = Arc::new(AtomicBool::new(true));
         let flag = alive.clone();
+        let app_b = app_state.clone();
         on_cleanup(move || flag.store(false, Ordering::Relaxed));
         wasm_bindgen_futures::spawn_local(async move {
             let client = ApiClient::new();
             let mut was_building = false;
+            let mut failing = false;
             while alive.load(Ordering::Relaxed) {
-                if let Ok(b) = client.get_build_summary().await {
-                    if was_building && !b.building {
-                        feed.refresh_loaded();
+                match client.get_build_summary().await {
+                    Ok(b) => {
+                        failing = false;
+                        if was_building && !b.building {
+                            feed.refresh_loaded();
+                        }
+                        was_building = b.building;
+                        build.set(Some(b));
                     }
-                    was_building = b.building;
-                    build.set(Some(b));
+                    Err(e) => {
+                        // Toast once per outage, not every poll.
+                        if !failing {
+                            app_b.error(format!("Build status unavailable: {e}"));
+                        }
+                        failing = true;
+                    }
                 }
                 gloo_timers::future::TimeoutFuture::new(3000).await;
             }
@@ -321,9 +337,11 @@ pub fn FiltersPage() -> impl IntoView {
                             class="btn sm"
                             on:click=move |_| {
                                 show_catalogue.set(true);
+                                let app_c = app_state.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
-                                    if let Ok(c) = ApiClient::new().get_catalogue().await {
-                                        catalogue.set(c);
+                                    match ApiClient::new().get_catalogue().await {
+                                        Ok(c) => catalogue.set(c),
+                                        Err(e) => app_c.error(format!("Failed to load catalogue: {e}")),
                                     }
                                 });
                             }
@@ -420,6 +438,8 @@ pub fn FiltersPage() -> impl IntoView {
                             key=|f: &FilterList| format!("{}:{}:{}:{}:{}:{}:{:?}:{:?}", f.id, f.enabled, f.allowlist, f.trusted, f.format, f.rule_count, f.last_error, f.last_updated)
                             render=Callback::new(move |f: FilterList| view! { <FilterRow filter=f sel=sel sel_open=sel_open feed=feed /> }.into_any())
                             on_end=Callback::new(move |()| feed.more())
+                            error=feed.error
+                            on_retry=Callback::new(move |()| feed.retry())
                             on_anchor=on_anchor
                             reset=feed.tok
                             label="Filter lists"
@@ -693,13 +713,16 @@ fn FilterDrawer(
 ) -> impl IntoView {
     let app_state = use_app_state();
     let report = RwSignal::new(HashMap::<String, ListReport>::new());
+    let app_rep = app_state.clone();
     Effect::new(move |_| {
         if let Some(id) = sel.get().filter(|_| open.get()) {
+            let app_r = app_rep.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if let Ok(r) = ApiClient::new().get_list_report(&id).await {
-                    report.update(|m| {
+                match ApiClient::new().get_list_report(&id).await {
+                    Ok(r) => report.update(|m| {
                         m.insert(id, r);
-                    });
+                    }),
+                    Err(e) => app_r.error(format!("Failed to load list report: {e}")),
                 }
             });
         }
