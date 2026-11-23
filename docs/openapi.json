@@ -317,6 +317,13 @@
             "description": "The explicit listener is down (a move failed and could not be undone); retry the change.",
             "type": "boolean"
           },
+          "proxy_error": {
+            "description": "Why the explicit listener is down, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "transparent": {
             "description": "Transparent listener, `ip:port` (`None` = off).",
             "type": [
@@ -326,6 +333,13 @@
           },
           "transparent_down": {
             "type": "boolean"
+          },
+          "transparent_error": {
+            "description": "Why the transparent listener is down, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "webui": {
             "description": "Web API, `ip:port`.",
@@ -337,6 +351,13 @@
           "webui_down": {
             "description": "The web API listener is down (same cause); this response came from an older listener.",
             "type": "boolean"
+          },
+          "webui_error": {
+            "description": "The web API could not use its configured port at startup (set with `webui_moved_to`).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "webui_moved_to": {
             "description": "Set when this update moved the web API: open it here. The old address keeps answering\nfor 30 seconds.",

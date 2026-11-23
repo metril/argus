@@ -52,6 +52,8 @@ pub struct ProxyBind {
     /// Not listening (a failed move could not be undone); the address is the last known one.
     pub proxy_down: bool,
     pub transparent_down: bool,
+    pub proxy_error: Option<String>,
+    pub transparent_error: Option<String>,
 }
 
 /// Caps on concurrent live-log streams, in total and per user.

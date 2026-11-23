@@ -195,6 +195,7 @@ pub fn ProxyPage() -> impl IntoView {
 
     view! {
         <Layout>
+            {move || cfg.read().as_ref().and_then(|c| c.bind.as_ref()).and_then(|b| b.webui_moved_to.clone()).map(|a| view! { <div class="card"><div class="card-b"><span class="hint" role="status">{format!("Web UI is on {a} because the configured port is in use. Change the port under ")}<a href="/settings" style="color:var(--accent)">"Settings"</a>"."</span></div></div> })}
             <div class="grid2">
                 <article class="card" aria-labelledby="pxE">
                     <div class="card-h">
@@ -207,6 +208,7 @@ pub fn ProxyPage() -> impl IntoView {
                         </div>
                     </div>
                     <div class="card-b">
+                        {move || cfg.read().as_ref().and_then(|c| c.bind.as_ref()).and_then(|b| b.proxy_error.clone()).map(|e| view! { <span class="hint" role="alert">{e}</span> })}
                         <div class="listen">
                             <span class="addr">{move || cfg.read().as_ref().map(|c| c.bind.as_ref().and_then(|b| b.proxy.clone()).unwrap_or_else(|| format!("{}:{}", c.host, c.port))).unwrap_or_default()}</span>
                             <span class="dim">"clients set this as their HTTP(S) proxy"</span>
@@ -229,6 +231,7 @@ pub fn ProxyPage() -> impl IntoView {
                         </div>
                     </div>
                     <div class="card-b">
+                        {move || cfg.read().as_ref().and_then(|c| c.bind.as_ref()).and_then(|b| b.transparent_error.clone()).map(|e| view! { <span class="hint" role="alert">{e}</span> })}
                         <div class="listen">
                             <span class="addr">{move || t_addr.get().unwrap_or_else(|| "not listening".into())}</span>
                             <span class="dim">"receives traffic redirected by the firewall"</span>

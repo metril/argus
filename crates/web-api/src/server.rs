@@ -155,6 +155,8 @@ const OLD_LISTENER_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// The web API's listener, replaceable at runtime.
 pub struct WebServer {
     router: Router,
+    /// Where the bound port is recorded for tooling (`.webui_port`).
+    port_file: parking_lot::Mutex<Option<std::path::PathBuf>>,
     current: tokio::sync::Mutex<Current>,
     /// Test hook: make restoring the old listener fail.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -176,6 +178,9 @@ struct Current {
     down: bool,
     /// The listener this one replaced, still serving until its grace period ends.
     previous: Option<Previous>,
+    /// Configured port that could not be bound at startup (we fell back to another).
+    moved_from: Option<u16>,
+    startup_error: Option<String>,
 }
 
 /// The replaced listener, kept so a failed save can put it back.
@@ -234,6 +239,7 @@ impl WebServer {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let srv = Arc::new(Self {
             router,
+            port_file: parking_lot::Mutex::new(None),
             current: tokio::sync::Mutex::new(Current {
                 gen: 0,
                 addr: listener
@@ -243,6 +249,8 @@ impl WebServer {
                 stop: None,
                 down: false,
                 previous: None,
+                moved_from: None,
+                startup_error: None,
             }),
             gens: std::sync::atomic::AtomicU64::new(1),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -253,6 +261,13 @@ impl WebServer {
         let stop = srv.spawn_serve(listener, 0);
         srv.current.try_lock().expect("fresh lock").stop = Some(stop);
         srv
+    }
+
+    /// Record the current bound port in the port file (if one is set).
+    fn write_port(&self, addr: SocketAddr) {
+        if let Some(p) = self.port_file.lock().as_ref() {
+            let _ = std::fs::write(p, addr.port().to_string());
+        }
     }
 
     fn next_gen(&self) -> u64 {
@@ -313,6 +328,16 @@ impl WebServer {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The configured port that failed at startup, until a `rebind` succeeds.
+    pub async fn moved_from(&self) -> Option<u16> {
+        self.current.lock().await.moved_from
+    }
+
+    /// Why the configured port failed at startup, until a `rebind` succeeds.
+    pub async fn startup_error(&self) -> Option<String> {
+        self.current.lock().await.startup_error.clone()
+    }
+
     /// Nothing is listening: a move failed and so did restoring the old listener. Another
     /// `rebind` brings it back.
     pub async fn is_down(&self) -> bool {
@@ -323,7 +348,11 @@ impl WebServer {
     /// changes. The old listener keeps serving for 30 seconds (or until [`Self::revert`]).
     pub async fn rebind(self: &Arc<Self>, host: &str, port: u16) -> Result<SocketAddr, String> {
         let mut cur = self.current.lock().await;
-        if port != 0 && !cur.down && cur.requested == (host.to_string(), port) {
+        if port != 0
+            && !cur.down
+            && cur.moved_from.is_none()
+            && cur.requested == (host.to_string(), port)
+        {
             return Ok(cur.addr);
         }
         let a = spec_addr(host, port);
@@ -403,7 +432,10 @@ impl WebServer {
         cur.addr = addr;
         cur.requested = (host.to_string(), port);
         cur.down = false;
+        cur.moved_from = None;
+        cur.startup_error = None;
         tracing::info!("Web API now listening on {addr}; the old listener closes after 30s");
+        self.write_port(addr);
         Ok(addr)
     }
 
@@ -423,6 +455,7 @@ impl WebServer {
         cur.addr = prev.addr;
         cur.requested = prev.requested;
         cur.down = false;
+        self.write_port(cur.addr);
         Some(cur.addr)
     }
 
@@ -442,8 +475,41 @@ impl WebServer {
 /// Start the web server
 pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::error::ApiResult<()> {
     let addr = spec_addr(&config.server.host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("Web API server listening on {}", addr);
+    let (listener, fallback) = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => (l, None),
+        Err(e) => {
+            let configured = config.server.port;
+            let mut found = None;
+            let candidates = (1..=10u16)
+                .filter_map(|i| configured.checked_add(i))
+                .filter(|p| *p != 0)
+                .chain(std::iter::once(0));
+            for p in candidates {
+                if let Ok(l) =
+                    tokio::net::TcpListener::bind(spec_addr(&config.server.host, p)).await
+                {
+                    found = Some(l);
+                    break;
+                }
+            }
+            match found {
+                Some(l) => (l, Some((configured, e.to_string()))),
+                None => return Err(e.into()),
+            }
+        }
+    };
+    let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    match &fallback {
+        None => tracing::info!("Web API server listening on {}", addr),
+        Some((configured, err)) => tracing::warn!(
+            "Web UI could not use configured port {configured} ({err}); it is available at http://{}:{bound_port}/ instead. The saved setting is unchanged; change the port in Settings.",
+            config.server.host.trim_matches(['[', ']'])
+        ),
+    }
+    let data_dir = state.proxy_state.config.read().adblock.data_dir.clone();
+    let _ = std::fs::create_dir_all(&data_dir);
+    let port_file = data_dir.join(".webui_port");
+    let _ = std::fs::write(&port_file, bound_port.to_string());
     warn_if_exposed_without_tls(&config);
 
     let sessions = state.session_manager.clone();
@@ -470,6 +536,16 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         listener,
         (config.server.host.clone(), config.server.port),
     );
+    if let Some((configured, err)) = fallback {
+        let mut cur = server.current.lock().await;
+        cur.moved_from = Some(configured);
+        cur.startup_error = Some(format!("port {configured} unavailable: {err}"));
+    }
+    *server.port_file.lock() = Some(port_file);
+    if let Some(rt) = state.runtime.get() {
+        let host = config.server.host.clone();
+        rt.note_webui(&host, bound_port).await;
+    }
     let _ = state.web_server.set(server.clone());
     server.wait().await
 }

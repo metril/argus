@@ -112,7 +112,9 @@ opt-in kernel test described under Verifying.
   lost and connections are refused (not tested). `cap_drop: ALL` is kept: the redirect runs on the
   gateway's firewall, not in the container. With host networking the explicit proxy, the
   transparent listener and the web UI bind directly on the host (`8080`, `3129`, `3000`); there is
-  no `ports:` mapping.
+  no `ports:` mapping. A port already taken on the host no longer stops startup: that listener
+  shows as down (with the error) on the Proxy page, and the web UI moves to the next free port
+  and logs its URL (also written to `<data_dir>/.webui_port`, which the container health check reads).
 
 ## Changing ports and listeners
 

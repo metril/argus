@@ -45,6 +45,7 @@ impl TestContext {
         // Tests never reach the real first-party lists: a dead address fails at once.
         let mut proxy_config = ProxyConfig::default();
         proxy_config.bypass.lists_base_url = "http://127.0.0.1:1".into();
+        proxy_config.adblock.data_dir = temp_path.join("filters");
         let config_path = temp_path.join("proxy.toml");
         std::fs::write(
             &config_path,
