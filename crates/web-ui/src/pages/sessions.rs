@@ -77,7 +77,10 @@ fn SessionsInner() -> impl IntoView {
                 if n == total {
                     app.success(format!("{n} sessions revoked"));
                 } else {
-                    app.error(format!("{} of {total} sessions failed to revoke", total - n));
+                    app.error(format!(
+                        "{} of {total} sessions failed to revoke",
+                        total - n
+                    ));
                 }
                 reload.update(|n| *n += 1);
             });

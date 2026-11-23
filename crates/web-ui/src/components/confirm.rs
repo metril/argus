@@ -11,9 +11,11 @@ pub fn ConfirmButton(
     #[prop(into, optional)] confirm_label: Option<String>,
     on_confirm: Callback<()>,
     /// Extra classes; `danger` is always applied.
-    #[prop(into, optional)] class: String,
+    #[prop(into, optional)]
+    class: String,
     /// Use the regular (30px) height instead of the compact one.
-    #[prop(optional)] large: bool,
+    #[prop(optional)]
+    large: bool,
     #[prop(into, optional)] disabled: Signal<bool>,
 ) -> impl IntoView {
     let armed = RwSignal::new(false);

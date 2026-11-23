@@ -34,7 +34,10 @@ pub fn Protected(children: Children) -> impl IntoView {
         if here.is_empty() || here == "/" {
             "/login".to_string()
         } else {
-            format!("/login?next={}", String::from(js_sys::encode_uri_component(&here)))
+            format!(
+                "/login?next={}",
+                String::from(js_sys::encode_uri_component(&here))
+            )
         }
     };
     let slot = StoredValue::new_local(Some(children));

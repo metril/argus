@@ -28,8 +28,12 @@ fn trap_tab(ev: &web_sys::KeyboardEvent, dialog: &web_sys::HtmlElement) {
         .and_then(|w| w.document())
         .and_then(|d| d.active_element());
     let on = |el: &web_sys::HtmlElement| active.as_ref().is_some_and(|a| a == el.as_ref());
-    let outside = active.as_ref().is_none_or(|a| !dialog.contains(Some(a.as_ref())));
-    if ev.shift_key() && (on(first) || outside || active.as_ref().is_some_and(|a| a == dialog.as_ref())) {
+    let outside = active
+        .as_ref()
+        .is_none_or(|a| !dialog.contains(Some(a.as_ref())));
+    if ev.shift_key()
+        && (on(first) || outside || active.as_ref().is_some_and(|a| a == dialog.as_ref()))
+    {
         ev.prevent_default();
         let _ = last.focus();
     } else if !ev.shift_key() && (on(last) || outside) {

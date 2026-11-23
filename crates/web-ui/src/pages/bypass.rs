@@ -50,7 +50,8 @@ pub fn BypassPage() -> impl IntoView {
                 Err(e) => errs.push(e.to_string()),
             }
             if let Some(e) = errs.first() {
-                app.get_value().error(format!("Failed to load bypass data: {e}"));
+                app.get_value()
+                    .error(format!("Failed to load bypass data: {e}"));
             }
         });
     };
