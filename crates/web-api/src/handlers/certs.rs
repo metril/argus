@@ -42,6 +42,29 @@ fn visible(state: &AppState, p: &Principal, host: &str) -> bool {
             .any(|id| p.may_access_profile(id))
 }
 
+/// A leaf-only record of `host` is upgraded to the full chain through one (cached, bounded)
+/// probe. Only when the probe saw this very certificate; after a rotation the record is
+/// returned unchanged, never with another certificate's chain. Callers check visibility first.
+async fn with_chain(state: &AppState, host: &str, info: Stored) -> Stored {
+    let Some(probe) = state.chain_probe.get() else {
+        return info;
+    };
+    if !info.is_leaf_only() {
+        return info;
+    }
+    let hp = common::certstore::parse_hostport(host);
+    let Some((h, port)) = hp
+        .rsplit_once(':')
+        .and_then(|(h, p)| Some((h, p.parse().ok()?)))
+    else {
+        return info;
+    };
+    if probe.probe(h, port).await.as_deref() != Some(info.fp.as_str()) {
+        return info;
+    }
+    state.certs().info(&info.fp, Some(host)).unwrap_or(info)
+}
+
 /// A certificate by SHA-256 fingerprint (lowercase hex), as linked from the request log.
 #[utoipa::path(
     get, path = "/certs/{fp}", tag = "certs",
@@ -64,6 +87,10 @@ pub async fn get_cert(
         .certs()
         .info(&fp, q.host.as_deref())
         .ok_or_else(|| ApiError::NotFound("Certificate not found".into()))?;
+    let info = match q.host.as_deref() {
+        Some(h) => with_chain(&state, h, info).await,
+        None => info,
+    };
     Ok(Json(dto(&info)?))
 }
 
@@ -84,5 +111,6 @@ pub async fn get_cert_by_host(
         return Err(unknown());
     }
     let info = state.certs().by_host(&host).ok_or_else(unknown)?;
+    let info = with_chain(&state, &host, info).await;
     Ok(Json(dto(&info)?))
 }

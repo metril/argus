@@ -137,6 +137,24 @@ struct HostRecord {
     detail: Option<String>,
 }
 
+/// Fetches a host's certificate chain on demand (a probe handshake) and records it in the
+/// store; implemented by the proxy so the API need not depend on it.
+pub trait ChainProbe: Send + Sync {
+    /// Fingerprint of the leaf `host:port` presented, once its chain is recorded.
+    fn probe<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
+}
+
+impl CertInfo {
+    /// Only the leaf is known (and it is not self-signed): the full chain could be fetched.
+    pub fn is_leaf_only(&self) -> bool {
+        self.chain.len() <= 1 && self.subject != self.issuer
+    }
+}
+
 /// Upstream certificate store.
 pub struct CertStore {
     parsed: Cache<String, Arc<Parsed>>,

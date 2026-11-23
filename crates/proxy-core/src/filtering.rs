@@ -337,6 +337,11 @@ impl ProxyContext {
         Ok(ctx)
     }
 
+    /// The certificate prober, when built from options.
+    pub fn prober(&self) -> Option<&Arc<crate::upstream::CertProber>> {
+        self.prober.as_ref()
+    }
+
     /// The upstream certificate store.
     pub fn certs(&self) -> &Arc<common::certstore::CertStore> {
         &self.certs

@@ -179,6 +179,16 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
     }
 }
 
+impl common::certstore::ChainProbe for CertProber {
+    fn probe<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(CertProber::probe(self, host, port))
+    }
+}
+
 /// Plain web-PKI client config over `roots`, ALPN h2 then http/1.1.
 pub fn client_tls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());

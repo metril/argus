@@ -237,6 +237,9 @@ pub struct AppState {
     /// Upstream certificates the proxy has seen (installed by the proxy; empty otherwise).
     pub certs: OnceLock<Arc<common::certstore::CertStore>>,
 
+    /// Fetches full certificate chains on demand (installed by the proxy).
+    pub chain_probe: OnceLock<Arc<dyn common::certstore::ChainProbe>>,
+
     /// The first-party list manager (installed by the proxy; created on first use otherwise).
     pub argus: OnceLock<Arc<list_service::ArgusLists>>,
 
@@ -807,6 +810,7 @@ pub async fn build_state_full(
         started_at: Instant::now(),
         bypass: OnceLock::new(),
         certs: OnceLock::new(),
+        chain_probe: OnceLock::new(),
         argus: OnceLock::new(),
         config_lock: tokio::sync::Mutex::new(()),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),

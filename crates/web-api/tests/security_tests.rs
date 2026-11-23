@@ -646,6 +646,107 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
     assert!(h.headers().get("access-control-allow-origin").is_none());
 }
 
+/// Probe stand-in: "sees" a fixed chain per host and records it like the real prober.
+struct FakeProbe {
+    store: std::sync::Arc<::common::certstore::CertStore>,
+    chains: Vec<(&'static str, Vec<Vec<u8>>)>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ::common::certstore::ChainProbe for FakeProbe {
+    fn probe<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let chain = &self.chains.iter().find(|(h, _)| *h == host).unwrap().1;
+        let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+        let fp = self.store.record_probe(
+            &::common::certstore::hostport(host, port),
+            &refs,
+            Ok(()),
+            &|| false,
+        );
+        Box::pin(async move { fp })
+    }
+}
+
+fn chain_for(name: &str) -> Vec<Vec<u8>> {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    let mut ca = CertificateParams::new(vec![]).unwrap();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.distinguished_name
+        .push(rcgen::DnType::CommonName, "chain test CA");
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let mut lp = CertificateParams::new(vec![name.to_string()]).unwrap();
+    lp.distinguished_name.push(rcgen::DnType::CommonName, name);
+    let leaf = lp.signed_by(&key, &issuer).unwrap();
+    vec![leaf.der().to_vec(), ca_cert.der().to_vec()]
+}
+
+#[tokio::test]
+async fn leaf_only_records_are_upgraded_to_the_full_chain_on_lookup() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ctx = TestContext::new().await.unwrap();
+    let store = ctx.state.certs().clone();
+    let full = chain_for("o.test");
+    let rotated = chain_for("o.test");
+    // The proxy knows only the leaf of o.test and of r.test (which has since rotated).
+    let fp = store.record_ok("o.test", &full[0], &|| false).unwrap();
+    let old = store.record_ok("r.test", &rotated[0], &|| false).unwrap();
+    store.note_seen("o.test", "kids");
+    let fake = std::sync::Arc::new(FakeProbe {
+        store: store.clone(),
+        // r.test now serves a different certificate than the one on record.
+        chains: vec![("o.test", full.clone()), ("r.test", chain_for("r.test"))],
+        calls: Default::default(),
+    });
+    ctx.state.chain_probe.set(fake.clone()).ok().unwrap();
+    let admin = ctx.admin().await;
+    let secret = ctx.token(&admin, &["logs:read"]).await;
+
+    // A restricted token for a host it has not seen: 404 and no probe.
+    let r = admin
+        .post("/api/v1/tokens")
+        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
+        .await;
+    let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
+    ctx.bearer("GET", "/api/v1/certs/by-host/r.test", &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    ctx.bearer("GET", &format!("/api/v1/certs/{old}?host=r.test"), &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(fake.calls.load(SeqCst), 0);
+
+    // A rotated site: the probe sees another certificate, so the record is not upgraded.
+    let v: Value = ctx
+        .bearer("GET", &format!("/api/v1/certs/{old}?host=r.test"), &secret)
+        .await
+        .json();
+    assert_eq!(fake.calls.load(SeqCst), 1);
+    assert_eq!(v["fp"], old.as_str());
+    assert_eq!(v["chain"].as_array().unwrap().len(), 1);
+
+    // The probe sees the same certificate: its full chain is stored and returned.
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/certs/by-host/o.test", &kid)
+        .await
+        .json();
+    assert_eq!(v["fp"], fp.as_str());
+    assert_eq!(v["chain"].as_array().unwrap().len(), 2);
+    assert_eq!(fake.calls.load(SeqCst), 2);
+    // Already full: no further probe.
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=o.test"), &secret)
+        .await
+        .assert_status_ok();
+    assert_eq!(fake.calls.load(SeqCst), 2);
+}
+
 // ------------------------------------------------------------------ (f) revocation / expiry
 
 #[tokio::test]
