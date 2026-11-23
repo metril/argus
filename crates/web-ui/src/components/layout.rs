@@ -6,61 +6,59 @@ use leptos_router::components::Redirect;
 use super::{CommandPalette, Navbar, Sidebar, ToastContainer};
 use crate::state::{use_app_state, use_auth_state};
 
+/// Wraps every authenticated route. Checks the session once and builds the page only when
+/// logged in, so a logged-out visit makes no API calls beyond the session check itself
+/// (pages fetch in their own bodies, which only run inside this gate).
+#[component]
+pub fn Protected(children: Children) -> impl IntoView {
+    let auth_state = use_auth_state();
+    let (user, checked) = (auth_state.user, auth_state.checked);
+    if user.get_untracked().is_none() {
+        let auth_state = auth_state.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            auth_state.check_session().await;
+        });
+    }
+    let slot = StoredValue::new_local(Some(children));
+    let authed = Memo::new(move |_| user.with(|u| u.is_some()));
+    view! {
+        {move || authed.get().then(|| slot.try_update_value(Option::take).flatten().map(|c| c()))}
+        <Show when=move || checked.get() && user.get().is_none()>
+            <Redirect path="/login" />
+        </Show>
+    }
+}
+
 /// Main layout wrapper for authenticated pages. `class` is added to the page container
 /// (e.g. `logs-screen`).
 #[component]
 pub fn Layout(#[prop(into, optional)] class: String, children: Children) -> impl IntoView {
     let app_state = use_app_state();
-    let auth_state = use_auth_state();
     let (collapsed, nav_open) = (app_state.collapsed, app_state.nav_open);
-    let (user, checked) = (auth_state.user, auth_state.checked);
-
-    {
-        let auth_state = auth_state.clone();
-        Effect::new(move |_| {
-            let auth_state = auth_state.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                auth_state.check_session().await;
-            });
-        });
-    }
     // A navigation closes the off-canvas menu.
     nav_open.set(false);
 
-    // Nothing authenticated (pages, sidebar, navbar: all of which fetch on creation) is built
-    // until the session check says we are logged in, so a logged-out visit makes no API calls
-    // beyond the session check itself.
-    let slot = StoredValue::new_local(Some(children));
-    let authed = Memo::new(move |_| user.with(|u| u.is_some()));
-    let class = StoredValue::new(class);
+    let children_view = children();
 
     view! {
-        {move || authed.get().then(|| {
-            let children_view = slot.try_update_value(Option::take).flatten().map(|c| c());
-            view! {
-                <div class=move || format!(
-                    "app {} {}",
-                    if collapsed.get() { "collapsed" } else { "" },
-                    if nav_open.get() { "navopen" } else { "" }
-                )>
-                    <Sidebar />
-                    <Navbar />
-                    <main class="main" id="main" tabindex="-1">
-                        <div class=format!("screen {}", class.get_value())>
-                            {children_view}
-                        </div>
-                    </main>
-                    <Show when=move || nav_open.get()>
-                        <div class="navscrim" on:click=move |_| nav_open.set(false)></div>
-                    </Show>
-                    <ToastContainer />
-                    <CommandPalette />
+        <div class=move || format!(
+            "app {} {}",
+            if collapsed.get() { "collapsed" } else { "" },
+            if nav_open.get() { "navopen" } else { "" }
+        )>
+            <Sidebar />
+            <Navbar />
+            <main class="main" id="main" tabindex="-1">
+                <div class=format!("screen {class}")>
+                    {children_view}
                 </div>
-            }
-        })}
-        <Show when=move || checked.get() && user.get().is_none()>
-            <Redirect path="/login" />
-        </Show>
+            </main>
+            <Show when=move || nav_open.get()>
+                <div class="navscrim" on:click=move |_| nav_open.set(false)></div>
+            </Show>
+            <ToastContainer />
+            <CommandPalette />
+        </div>
     }
 }
 

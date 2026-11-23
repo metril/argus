@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
+use crate::components::Protected;
 use crate::pages::*;
 
 /// Main router component
@@ -17,22 +18,22 @@ pub fn AppRouter() -> impl IntoView {
                 <Route path=path!("/register") view=RegisterPage />
 
                 // Protected routes
-                <Route path=path!("/") view=DashboardPage />
-                <Route path=path!("/proxy") view=ProxyPage />
-                <Route path=path!("/bypass") view=BypassPage />
-                <Route path=path!("/filters") view=FiltersPage />
-                <Route path=path!("/logs") view=LogsPage />
-                <Route path=path!("/blocked") view=BlockedPage />
-                <Route path=path!("/account") view=AccountPage />
-                <Route path=path!("/users") view=UsersPage />
-                <Route path=path!("/sessions") view=SessionsPage />
-                <Route path=path!("/audit") view=AuditPage />
-                <Route path=path!("/userscripts") view=UserscriptsPage />
-                <Route path=path!("/policy") view=PolicyPage />
-                <Route path=path!("/profiles") view=ProfilesPage />
-                <Route path=path!("/devices") view=DevicesPage />
-                <Route path=path!("/tokens") view=TokensPage />
-                <Route path=path!("/settings") view=SettingsPage />
+                <Route path=path!("/") view=|| view! { <Protected><DashboardPage /></Protected> } />
+                <Route path=path!("/proxy") view=|| view! { <Protected><ProxyPage /></Protected> } />
+                <Route path=path!("/bypass") view=|| view! { <Protected><BypassPage /></Protected> } />
+                <Route path=path!("/filters") view=|| view! { <Protected><FiltersPage /></Protected> } />
+                <Route path=path!("/logs") view=|| view! { <Protected><LogsPage /></Protected> } />
+                <Route path=path!("/blocked") view=|| view! { <Protected><BlockedPage /></Protected> } />
+                <Route path=path!("/account") view=|| view! { <Protected><AccountPage /></Protected> } />
+                <Route path=path!("/users") view=|| view! { <Protected><UsersPage /></Protected> } />
+                <Route path=path!("/sessions") view=|| view! { <Protected><SessionsPage /></Protected> } />
+                <Route path=path!("/audit") view=|| view! { <Protected><AuditPage /></Protected> } />
+                <Route path=path!("/userscripts") view=|| view! { <Protected><UserscriptsPage /></Protected> } />
+                <Route path=path!("/policy") view=|| view! { <Protected><PolicyPage /></Protected> } />
+                <Route path=path!("/profiles") view=|| view! { <Protected><ProfilesPage /></Protected> } />
+                <Route path=path!("/devices") view=|| view! { <Protected><DevicesPage /></Protected> } />
+                <Route path=path!("/tokens") view=|| view! { <Protected><TokensPage /></Protected> } />
+                <Route path=path!("/settings") view=|| view! { <Protected><SettingsPage /></Protected> } />
             </Routes>
         </Router>
     }
