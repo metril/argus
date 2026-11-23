@@ -205,6 +205,27 @@ pub fn parse_hostport(s: &str) -> String {
     hostport(host, port.unwrap_or(DEFAULT_PORT))
 }
 
+/// Like [`parse_hostport`], but `None` for an empty host or a port that is not a number in
+/// 1..=65535 (`host:abc`, `host:`), for validating request input.
+pub fn try_parse_hostport(s: &str) -> Option<String> {
+    let h = s.trim();
+    let port_text = if let Some(rest) = h.strip_prefix('[') {
+        rest.split_once(']')?
+            .1
+            .strip_prefix(':')
+            .map(str::to_string)
+    } else if h.matches(':').count() == 1 {
+        h.split_once(':').map(|(_, p)| p.to_string())
+    } else {
+        None
+    };
+    if let Some(p) = port_text {
+        p.parse::<u16>().ok().filter(|p| *p != 0)?;
+    }
+    let k = parse_hostport(h);
+    (!k.starts_with(':') && !k.starts_with("[]")).then_some(k)
+}
+
 /// Canonical `host:port` key from a bare host (with or without IPv6 brackets) and a port.
 pub fn hostport(host: &str, port: u16) -> String {
     let h = host.trim().trim_start_matches('[').trim_end_matches(']');
@@ -299,14 +320,14 @@ impl CertStore {
         }
     }
 
-    /// Parse and keep `chain_der` unless its leaf is known with at least as long a chain.
-    fn ensure_parsed(&self, fp: &str, chain_der: &[&[u8]], ev: &dyn Fn() -> bool) -> bool {
-        if let Some(p) = self.parsed.get(fp) {
-            if p.chain.len() >= chain_der.len().min(MAX_CHAIN) {
-                return true;
-            }
+    /// Make sure the leaf is known, WITHOUT a chain: only [`Self::record_chain`] (a verified
+    /// handshake) may attach intermediates to the per-fingerprint data, so no host can plant a
+    /// chain under another site's certificate.
+    fn ensure_leaf(&self, fp: &str, leaf: &[u8], ev: &dyn Fn() -> bool) -> bool {
+        if self.parsed.contains_key(fp) {
+            return true;
         }
-        match Self::parse(fp, chain_der, ev()) {
+        match Self::parse(fp, &[leaf], ev()) {
             Some(p) => {
                 self.parsed.insert(fp.to_string(), Arc::new(p));
                 true
@@ -328,7 +349,7 @@ impl CertStore {
     /// passed, so `hostport` gets an `ok` verdict. Returns the leaf fingerprint.
     pub fn record_ok(&self, hostport: &str, der: &[u8], ev: &dyn Fn() -> bool) -> Option<String> {
         let fp = fingerprint(der);
-        if !self.ensure_parsed(&fp, &[der], ev) {
+        if !self.ensure_leaf(&fp, der, ev) {
             return None;
         }
         self.put(
@@ -343,8 +364,9 @@ impl CertStore {
         Some(fp)
     }
 
-    /// Record what a probe handshake to `hostport` saw: the chain (leaf first) and the result of
-    /// verifying it. Returns the leaf fingerprint.
+    /// Record what a probe handshake to `hostport` saw: the leaf and the result of verifying the
+    /// chain (leaf first). Only a verified (`Ok`) chain is kept as certificate data; the chain of
+    /// a rejected one is dropped. Returns the leaf fingerprint.
     pub fn record_probe(
         &self,
         hostport: &str,
@@ -353,11 +375,15 @@ impl CertStore {
         ev: &dyn Fn() -> bool,
     ) -> Option<String> {
         let fp = fingerprint(chain_der.first()?);
-        if !self.ensure_parsed(&fp, chain_der, ev) {
+        if !self.ensure_leaf(&fp, chain_der[0], ev) {
             return None;
         }
         let (verdict, reason, detail) = match result {
-            Ok(()) => (Verdict::Ok, None, None),
+            Ok(()) => {
+                // A completed, verified handshake: its chain is as trustworthy as a captured one.
+                self.record_chain(chain_der, ev);
+                (Verdict::Ok, None, None)
+            }
             Err((r, d)) => (Verdict::Invalid, Some(r), Some(cap(&d))),
         };
         self.put(
@@ -384,27 +410,39 @@ impl CertStore {
             return;
         }
         let path = trim_chain(chain_der);
-        self.ensure_parsed(&fp, &path, ev);
+        if let Some(p) = Self::parse(&fp, &path, ev()) {
+            self.parsed.insert(fp, Arc::new(p));
+        }
     }
 
     /// Remember that `profile` saw `hostport`.
     pub fn note_seen(&self, hostport: &str, profile: &str) {
         let key = parse_hostport(hostport);
-        if let Some(v) = self.seen.get(&key) {
-            if v.lock().iter().any(|p| p == profile) {
-                return;
-            }
-        }
-        // Re-insert so the weigher sees the grown set.
-        let mut ids = self
+        if self
             .seen
             .get(&key)
-            .map(|v| v.lock().clone())
-            .unwrap_or_default();
-        if ids.len() < MAX_PROFILES && !ids.iter().any(|p| p == profile) {
-            ids.push(profile.to_string());
+            .is_some_and(|v| v.lock().iter().any(|p| p == profile))
+        {
+            return;
         }
-        self.seen.insert(key, Arc::new(Mutex::new(ids)));
+        // Atomic per key, so concurrent profiles cannot lose each other; re-inserting also lets
+        // the weigher see the grown set.
+        self.seen.entry(key).and_upsert_with(|cur| {
+            let mut ids = cur
+                .map(|e| e.into_value().lock().clone())
+                .unwrap_or_default();
+            if ids.len() < MAX_PROFILES && !ids.iter().any(|p| p == profile) {
+                ids.push(profile.to_string());
+            }
+            Arc::new(Mutex::new(ids))
+        });
+    }
+
+    /// Fingerprint of the certificate on record for `hostport`.
+    pub fn host_fp(&self, hostport: &str) -> Option<String> {
+        self.hosts
+            .get(&parse_hostport(hostport))
+            .map(|r| r.fp.clone())
     }
 
     /// Profiles that saw `hostport`.
@@ -641,6 +679,95 @@ mod tests {
         assert!(s.record_ok("a.test", b"nope", NO_EV).is_none());
         assert!(s.record_probe("a.test", &[], Ok(()), NO_EV).is_none());
         assert!(s.by_host("a.test").is_none());
+    }
+}
+
+#[cfg(test)]
+mod poison_tests {
+    use super::*;
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use std::sync::Arc;
+
+    fn ca(cn: &str) -> (Vec<u8>, Issuer<'static, KeyPair>) {
+        let mut p = CertificateParams::new(vec![]).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.distinguished_name.push(DnType::CommonName, cn);
+        let key = KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        (cert.der().to_vec(), Issuer::new(p, key))
+    }
+
+    fn leaf(issuer: &Issuer<'static, KeyPair>) -> Vec<u8> {
+        let mut p = CertificateParams::new(vec!["bank.test".into()]).unwrap();
+        p.distinguished_name.push(DnType::CommonName, "bank.test");
+        let key = KeyPair::generate().unwrap();
+        p.signed_by(&key, issuer).unwrap().der().to_vec()
+    }
+
+    const NO_EV: &dyn Fn() -> bool = &|| false;
+
+    #[test]
+    fn a_rejected_probe_cannot_plant_a_chain_under_anothers_certificate() {
+        let (root, root_i) = ca("root");
+        let (fake, _) = ca("fake");
+        let l = leaf(&root_i);
+        let fp = fingerprint(&l);
+        let evil = [l.as_slice(), fake.as_slice()];
+        // Unknown leaf: only the leaf is kept.
+        let s = CertStore::default();
+        s.record_probe(
+            "evil.test",
+            &evil,
+            Err((FailReason::NameMismatch, "x".into())),
+            NO_EV,
+        );
+        assert_eq!(s.info(&fp, Some("evil.test")).unwrap().chain.len(), 1);
+        // A verified chain on record is never replaced by a probe's.
+        s.record_chain(&[l.as_slice(), root.as_slice()], NO_EV);
+        s.record_probe(
+            "evil.test",
+            &evil,
+            Err((FailReason::NameMismatch, "x".into())),
+            NO_EV,
+        );
+        let c = s.info(&fp, None).unwrap().chain;
+        assert_eq!((c.len(), c[1].fp.clone()), (2, fingerprint(&root)));
+    }
+
+    #[test]
+    fn concurrent_profiles_are_never_lost() {
+        let s = Arc::new(CertStore::default());
+        let hs: Vec<_> = (0..16)
+            .map(|i| {
+                let s = s.clone();
+                std::thread::spawn(move || s.note_seen("race.test", &format!("p{i}")))
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(s.seen_by("race.test").len(), 16);
+    }
+
+    #[test]
+    fn bad_hosts_are_rejected_when_validating_input() {
+        for bad in [
+            "h.test:abc",
+            "h.test:",
+            "h.test:0",
+            "h.test:70000",
+            "",
+            ":443",
+            "[::1]:x",
+        ] {
+            assert_eq!(try_parse_hostport(bad), None, "{bad}");
+        }
+        assert_eq!(
+            try_parse_hostport("H.test:8443").as_deref(),
+            Some("h.test:8443")
+        );
+        assert_eq!(try_parse_hostport("[::1]").as_deref(), Some("[::1]:443"));
+        assert_eq!(try_parse_hostport("::1").as_deref(), Some("[::1]:443"));
     }
 }
 

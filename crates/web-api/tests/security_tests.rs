@@ -630,6 +630,18 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
     ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=o.test"), &kid)
         .await
         .assert_status_ok();
+    // A public fingerprint alone, or with a host that is not on record with it, reveals nothing
+    // to a restricted token.
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}"), &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=evil.test"), &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    // Bad host input is a 400.
+    ctx.bearer("GET", "/api/v1/certs/by-host/o.test:abc", &secret)
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
     ctx.bearer("GET", "/api/v1/certs/by-host/nope.test", &secret)
         .await
         .assert_status(StatusCode::NOT_FOUND);
@@ -721,6 +733,17 @@ async fn leaf_only_records_are_upgraded_to_the_full_chain_on_lookup() {
     ctx.bearer("GET", &format!("/api/v1/certs/{old}?host=r.test"), &kid)
         .await
         .assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(fake.calls.load(SeqCst), 0);
+    // A host that is not on record with this certificate cannot make the server probe.
+    let v: Value = ctx
+        .bearer(
+            "GET",
+            &format!("/api/v1/certs/{fp}?host=elsewhere.test"),
+            &secret,
+        )
+        .await
+        .json();
+    assert_eq!(v["chain"].as_array().unwrap().len(), 1);
     assert_eq!(fake.calls.load(SeqCst), 0);
 
     // A rotated site: the probe sees another certificate, so the record is not upgraded.

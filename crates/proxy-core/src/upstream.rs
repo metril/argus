@@ -271,23 +271,40 @@ pub fn client_tls_config(
 const PROBE_TTL: Duration = Duration::from_secs(300);
 /// Probe handshakes running at once.
 const PROBE_CONCURRENCY: usize = 8;
+/// How long a request waits for a free probe slot before it gives up and probes in the
+/// background instead.
+const PROBE_WAIT: Duration = Duration::from_millis(250);
 
-/// Dedicated handshake to a `host:port` after an upstream TLS failure, to learn the certificate
-/// and why it was rejected. Results are cached per `host:port` (single-flight, bounded
-/// concurrency) so repeated failures cannot multiply outbound connections.
-pub struct CertProber {
+/// No probe slot was free in time (the result is not cached).
+#[derive(Debug)]
+struct Busy;
+
+struct ProbeInner {
     store: Arc<common::certstore::CertStore>,
     roots: Arc<rustls::RootCertStore>,
     resolver: PolicyResolver,
     connect_timeout_ms: std::sync::atomic::AtomicU64,
     limit: tokio::sync::Semaphore,
+    wait: Duration,
     cache: moka::future::Cache<String, Option<String>>,
     handshakes: std::sync::atomic::AtomicUsize,
 }
 
+/// Dedicated handshake to a `host:port` after an upstream TLS failure, to learn the certificate
+/// and why it was rejected. Results are cached per `host:port` (single-flight, bounded
+/// concurrency) so repeated failures cannot multiply outbound connections. A caller never waits
+/// long for a slot: when none is free it gets `None` at once and the probe runs in the
+/// background to fill the store.
+#[derive(Clone)]
+pub struct CertProber(Arc<ProbeInner>);
+
 impl CertProber {
     pub fn new(opts: &UpstreamOptions) -> Result<Self> {
-        Ok(Self {
+        Self::with_limits(opts, PROBE_CONCURRENCY, PROBE_WAIT)
+    }
+
+    fn with_limits(opts: &UpstreamOptions, permits: usize, wait: Duration) -> Result<Self> {
+        Ok(Self(Arc::new(ProbeInner {
             store: opts.certs.clone(),
             roots: Arc::new(build_root_store(&opts.extra_ca_paths)?),
             resolver: PolicyResolver {
@@ -303,66 +320,111 @@ impl CertProber {
                 .map_or(10_000, |t| t.as_millis() as u64)
                 .into(),
             handshakes: Default::default(),
-            limit: tokio::sync::Semaphore::new(PROBE_CONCURRENCY),
+            limit: tokio::sync::Semaphore::new(permits),
+            wait,
             cache: moka::future::Cache::builder()
                 .max_capacity(4096)
                 .time_to_live(PROBE_TTL)
                 .build(),
-        })
+        })))
     }
 
     /// Follow a changed connect timeout.
     pub fn set_connect_timeout(&self, t: Option<Duration>) {
-        self.connect_timeout_ms.store(
+        self.0.connect_timeout_ms.store(
             t.map_or(10_000, |t| t.as_millis() as u64),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
 
+    /// Probe handshakes started so far.
+    pub fn handshakes(&self) -> usize {
+        self.0.handshakes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Fingerprint of the certificate `host:port` presented, recorded in the store with its
-    /// verdict. `None` when the probe learnt nothing (connect or handshake failed before a
-    /// certificate arrived).
+    /// verdict. `None` when the probe learnt nothing (no certificate arrived, the handshake
+    /// failed for another reason) or no slot was free in time (then it continues in the
+    /// background).
     pub async fn probe(&self, host: &str, port: u16) -> Option<String> {
+        match self.0.probe(host, port).await {
+            Ok(fp) => fp,
+            Err(Busy) => {
+                let (inner, host) = (self.0.clone(), host.to_string());
+                tokio::spawn(async move {
+                    let _ = inner.probe_waiting(&host, port).await;
+                });
+                None
+            }
+        }
+    }
+}
+
+impl ProbeInner {
+    async fn probe(&self, host: &str, port: u16) -> std::result::Result<Option<String>, Busy> {
+        self.cached(host, port, Some(self.wait)).await
+    }
+
+    async fn probe_waiting(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<Option<String>, Busy> {
+        self.cached(host, port, None).await
+    }
+
+    async fn cached(
+        &self,
+        host: &str,
+        port: u16,
+        wait: Option<Duration>,
+    ) -> std::result::Result<Option<String>, Busy> {
         let key = common::certstore::hostport(host, port);
         self.cache
-            .get_with(key.clone(), async {
-                let _permit = self.limit.acquire().await.ok()?;
+            .try_get_with(key.clone(), async {
+                let _permit = match wait {
+                    Some(w) => tokio::time::timeout(w, self.limit.acquire())
+                        .await
+                        .map_err(|_| Busy)?
+                        .map_err(|_| Busy)?,
+                    None => self.limit.acquire().await.map_err(|_| Busy)?,
+                };
                 let limit = Duration::from_millis(
                     self.connect_timeout_ms
                         .load(std::sync::atomic::Ordering::Relaxed),
                 );
-                tokio::time::timeout(limit, self.run(&key, host, port))
+                Ok(tokio::time::timeout(limit, self.run(&key, host, port))
                     .await
                     .ok()
-                    .flatten()
+                    .flatten())
             })
             .await
-    }
-
-    /// Probe handshakes started so far.
-    pub fn handshakes(&self) -> usize {
-        self.handshakes.load(std::sync::atomic::Ordering::Relaxed)
+            .map_err(|_: Arc<Busy>| Busy)
     }
 
     async fn run(&self, key: &str, host: &str, port: u16) -> Option<String> {
         self.handshakes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let addrs: Vec<SocketAddr> = match bare.parse::<IpAddr>() {
-            Ok(ip) => match self.resolver.override_ip {
-                Some(o) => vec![SocketAddr::new(o, port)],
-                None => {
-                    self.resolver.policy.check_ip(ip).ok()?;
-                    vec![SocketAddr::new(ip, port)]
-                }
-            },
+        let candidates: Vec<IpAddr> = match bare.parse::<IpAddr>() {
+            Ok(ip) => vec![ip],
             Err(_) => self
                 .resolver
                 .resolve_checked(bare)
                 .await
                 .ok()?
                 .into_iter()
-                .map(|a| SocketAddr::new(a.ip(), port))
+                .map(|a| a.ip())
+                .collect(),
+        };
+        // The same port-aware destination policy as the request path (own listeners, private
+        // ranges), for literals and resolved addresses alike. A code-only override is unfiltered.
+        let addrs: Vec<SocketAddr> = match self.resolver.override_ip {
+            Some(o) => vec![SocketAddr::new(o, port)],
+            None => candidates
+                .into_iter()
+                .filter(|ip| self.resolver.policy.check(*ip, port).is_ok())
+                .map(|ip| SocketAddr::new(ip, port))
                 .collect(),
         };
         let name = rustls::pki_types::ServerName::try_from(bare.to_string()).ok()?;
@@ -383,15 +445,20 @@ impl CertProber {
             .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let mut completed = None;
         for addr in addrs {
             let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
                 continue;
             };
-            // Only the verifier's observation matters; a rejected handshake is the point.
-            let _ = connector.connect(name.clone(), tcp).await;
+            completed = Some(connector.connect(name.clone(), tcp).await.is_ok());
             break;
         }
         let (chain, verdict) = verifier.seen.lock().take()?;
+        // An `ok` needs a completed handshake (the server proved it holds the key); a
+        // certificate rejection is recorded as such. Anything else learnt nothing.
+        if verdict.is_ok() && completed != Some(true) {
+            return None;
+        }
         let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
         self.store.record_probe(key, &refs, verdict, &|| {
             chain.first().is_some_and(|d| crate::ev::is_ev_der(d))
@@ -888,7 +955,7 @@ mod probe_tests {
         let (good, _) = server(&pki, "h.test", false).await;
         let (p, _d) = prober(&pki);
         let fp = p.probe("h.test", bad).await.expect("fingerprint");
-        let info = p.store.by_host(&format!("h.test:{bad}")).unwrap();
+        let info = p.0.store.by_host(&format!("h.test:{bad}")).unwrap();
         assert_eq!(info.fp, fp);
         assert_eq!(
             (info.verdict, info.reason),
@@ -897,7 +964,7 @@ mod probe_tests {
         // The same host on another port is independent.
         let fp2 = p.probe("h.test", good).await.unwrap();
         assert_ne!(fp, fp2);
-        let ok = p.store.by_host(&format!("h.test:{good}")).unwrap();
+        let ok = p.0.store.by_host(&format!("h.test:{good}")).unwrap();
         assert_eq!(ok.verdict, Verdict::Ok);
         // Cached: no new connection, same answer.
         let before = bad_hits.load(Ordering::SeqCst);
@@ -918,6 +985,113 @@ mod probe_tests {
         .await;
         assert!(rs.iter().all(|r| r == &rs[0] && r.is_some()));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_ok_verdict_needs_a_completed_handshake() {
+        // The certificate verifies, but the server cannot sign with its key: the handshake
+        // fails after verification, so nothing may be recorded as ok.
+        use rustls::sign::CertifiedKey;
+        #[derive(Debug)]
+        struct Wrong(Arc<CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Wrong {
+            fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        let pki = pki();
+        let mut p = CertificateParams::new(vec!["h.test".to_string()]).unwrap();
+        p.distinguished_name.push(DnType::CommonName, "h.test");
+        let real = KeyPair::generate().unwrap();
+        let cert = p.signed_by(&real, &pki.issuer).unwrap();
+        let other = KeyPair::generate().unwrap();
+        let signer = rustls::crypto::ring::sign::any_supported_type(
+            &rustls::pki_types::PrivateKeyDer::try_from(other.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let ck = Arc::new(CertifiedKey::new(vec![cert.der().clone()], signer));
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(Wrong(ck)));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = a.accept(s).await;
+                });
+            }
+        });
+        let (pr, _d) = prober(&pki);
+        assert_eq!(pr.probe("h.test", port).await, None);
+        assert!(pr.0.store.by_host(&format!("h.test:{port}")).is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_respects_the_port_aware_destination_policy() {
+        let pki = pki();
+        let (port, hits) = server(&pki, "127.0.0.1", true).await;
+        // No override: the default policy refuses loopback literals.
+        let opts = UpstreamOptions {
+            connect_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let p = CertProber::new(&opts).unwrap();
+        assert_eq!(p.probe("127.0.0.1", port).await, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no connection was made");
+    }
+
+    #[tokio::test]
+    async fn a_busy_prober_answers_at_once_and_finishes_in_the_background() {
+        let pki = pki();
+        // A server that accepts and then says nothing keeps the only slot busy.
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hole_port = hole.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(hole.accept().await.unwrap());
+            }
+        });
+        let (bad, _) = server(&pki, "b.test", true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, &pki.ca_pem).unwrap();
+        let opts = UpstreamOptions {
+            extra_ca_paths: vec![ca],
+            resolve_all_to: Some("127.0.0.1".parse().unwrap()),
+            connect_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(50)).unwrap();
+        let slow = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("a.test", hole_port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let t = std::time::Instant::now();
+        assert_eq!(p.probe("b.test", bad).await, None);
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "did not wait for a slot"
+        );
+        assert_eq!(slow.await.unwrap(), None);
+        // The background probe fills the store once the slot frees up.
+        let key = format!("b.test:{bad}");
+        for _ in 0..50 {
+            if p.0.store.by_host(&key).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(p.0.store.by_host(&key).unwrap().verdict, Verdict::Invalid);
     }
 
     #[tokio::test]

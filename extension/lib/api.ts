@@ -48,7 +48,7 @@ export function hostOf(url?: string): string | null {
   try {
     const u = new URL(url ?? '');
     // `host` keeps an explicit port (the lookup is per host:port) and IPv6 brackets.
-    return u.protocol === 'https:' || u.protocol === 'http:' ? u.host : null;
+    return u.protocol === 'https:' ? u.host : null;
   } catch { return null; }
 }
 

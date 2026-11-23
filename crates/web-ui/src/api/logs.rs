@@ -34,6 +34,7 @@ impl ApiClient {
         if host.is_empty() {
             return self.get(&format!("/certs/{fp}")).await;
         }
-        self.get(&format!("/certs/{fp}?host={host}")).await
+        let enc = String::from(js_sys::encode_uri_component(host));
+        self.get(&format!("/certs/{fp}?host={enc}")).await
     }
 }

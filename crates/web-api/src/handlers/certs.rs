@@ -31,6 +31,12 @@ fn dto(info: &Stored) -> ApiResult<CertInfo> {
         .map_err(|e| ApiError::Internal(format!("certificate info: {e}")))
 }
 
+/// The canonical `host:port` of request input, or 400 for a bad port or empty host.
+fn valid_host(h: &str) -> ApiResult<String> {
+    common::certstore::try_parse_hostport(h)
+        .ok_or_else(|| ApiError::bad_request("Invalid host: expected host or host:port"))
+}
+
 /// Whether the caller may learn about `host`: unrestricted tokens always, a profile-restricted
 /// one only for hosts its profiles have seen (otherwise indistinguishable from unknown).
 fn visible(state: &AppState, p: &Principal, host: &str) -> bool {
@@ -50,6 +56,11 @@ async fn with_chain(state: &AppState, host: &str, info: Stored) -> Stored {
         return info;
     };
     if !info.is_leaf_only() {
+        return info;
+    }
+    // Probe only the host this very certificate is on record for (never from a caller-chosen
+    // fp/host pairing).
+    if state.certs().host_fp(host).as_deref() != Some(info.fp.as_str()) {
         return info;
     }
     let hp = common::certstore::parse_hostport(host);
@@ -78,16 +89,26 @@ pub async fn get_cert(
     ApiPath(fp): ApiPath<String>,
     ApiQuery(q): ApiQuery<CertQuery>,
 ) -> ApiResult<Json<CertInfo>> {
-    if let Some(h) = q.host.as_deref() {
-        if !visible(&state, &p, h) {
-            return Err(ApiError::NotFound("Certificate not found".into()));
+    let host = match q.host.as_deref() {
+        Some(h) => Some(valid_host(h)?),
+        None => None,
+    };
+    let not_found = || ApiError::NotFound("Certificate not found".into());
+    if p.profiles.is_some() {
+        // A public fingerprint must not reveal who visited what: a restricted caller names a
+        // host its profiles saw, and that host must be on record with exactly this certificate.
+        let h = host.as_deref().ok_or_else(not_found)?;
+        if !visible(&state, &p, h)
+            || state.certs().host_fp(h).as_deref() != Some(fp.to_ascii_lowercase().as_str())
+        {
+            return Err(not_found());
         }
     }
     let info = state
         .certs()
-        .info(&fp, q.host.as_deref())
+        .info(&fp, host.as_deref())
         .ok_or_else(|| ApiError::NotFound("Certificate not found".into()))?;
-    let info = match q.host.as_deref() {
+    let info = match host.as_deref() {
         Some(h) => with_chain(&state, h, info).await,
         None => info,
     };
@@ -106,6 +127,7 @@ pub async fn get_cert_by_host(
     Extension(p): Extension<Principal>,
     ApiPath(host): ApiPath<String>,
 ) -> ApiResult<Json<CertInfo>> {
+    let host = valid_host(&host)?;
     let unknown = || ApiError::NotFound("No certificate recorded for this host".into());
     if !visible(&state, &p, &host) {
         return Err(unknown());
