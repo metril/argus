@@ -148,6 +148,7 @@ tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 proptest = "1.5"
+ring = "0.17"
 
 [[bench]]
 name = "proxy_bench"
