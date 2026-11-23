@@ -227,6 +227,13 @@ pub struct ProxyContext {
     /// Leave bodies alone when the origin says `Cache-Control: no-transform` (header-only edits
     /// still apply). Many CDNs set it on everything, hence the switch.
     respect_no_transform: std::sync::atomic::AtomicBool,
+    /// Upstream certificates seen by the upstream clients (shared with the web API).
+    certs: Arc<common::certstore::CertStore>,
+    /// Probe handshakes to learn why an upstream certificate was rejected (when built from
+    /// options).
+    prober: Option<Arc<crate::upstream::CertProber>>,
+    /// The live trusted root set (when built from options).
+    roots: Option<Arc<crate::roots::RootsHandle>>,
 }
 
 impl ProxyContext {
@@ -255,6 +262,9 @@ impl ProxyContext {
             internal: Arc::new(Internal::new()),
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
+            certs: Default::default(),
+            prober: None,
+            roots: None,
         }
     }
 
@@ -319,13 +329,48 @@ impl ProxyContext {
         opts: &UpstreamOptions,
         adblock_enabled: bool,
     ) -> Result<Self> {
+        // One root set for every client, the prober and the WebSocket dialer.
+        let mut opts = opts.clone();
+        let roots = opts.roots_handle()?;
+        opts.roots = Some(roots.clone());
+        let opts = &opts;
         let client = build_upstream_client(opts)?;
         let mut ctx = Self::new(engine, client, adblock_enabled);
         ctx.strict_client = ArcSwap::from_pointee(build_strict_upstream_client(opts)?);
+        ctx.roots = Some(roots);
         *ctx.upstream_opts.lock() = Some(opts.clone());
         ctx.policy = opts.policy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
+        ctx.certs = opts.certs.clone();
+        ctx.prober = Some(Arc::new(crate::upstream::CertProber::new(opts)?));
         Ok(ctx)
+    }
+
+    /// The live trusted root set, or a fresh compiled-in set with `extra_ca_paths` for a context
+    /// built from a ready-made client.
+    pub fn roots_handle(
+        &self,
+        extra_ca_paths: &[std::path::PathBuf],
+    ) -> Result<Arc<crate::roots::RootsHandle>> {
+        match &self.roots {
+            Some(r) => Ok(r.clone()),
+            None => crate::roots::RootsHandle::floor(extra_ca_paths),
+        }
+    }
+
+    /// The live trusted root set, when built from options.
+    pub fn roots(&self) -> Option<&Arc<crate::roots::RootsHandle>> {
+        self.roots.as_ref()
+    }
+
+    /// The certificate prober, when built from options.
+    pub fn prober(&self) -> Option<&Arc<crate::upstream::CertProber>> {
+        self.prober.as_ref()
+    }
+
+    /// The upstream certificate store.
+    pub fn certs(&self) -> &Arc<common::certstore::CertStore> {
+        &self.certs
     }
 
     /// Replace the destination policy (for contexts built from a ready-made client).
@@ -438,6 +483,9 @@ impl ProxyContext {
         if let Some(p) = p {
             self.client.store(Arc::new(p.client));
             self.strict_client.store(Arc::new(p.strict));
+            if let Some(pr) = &self.prober {
+                pr.set_connect_timeout(p.opts.connect_timeout);
+            }
             *self.upstream_opts.lock() = Some(p.opts);
         }
     }
@@ -732,6 +780,7 @@ impl ProxyContext {
                                 status: None,
                                 mode: event_mode(rctx),
                                 error_kind: None,
+                                cert_fp: None,
                             });
                             let v = filter_engine::MatchResult::blocked(rule);
                             return Ok(block_response(rtype, &v, &url));
@@ -839,6 +888,7 @@ impl ProxyContext {
                     common::faults::note(common::faults::Fault::UpstreamTimeout, &host);
                     if !bypass_full {
                         log_request(
+                            None,
                             rctx,
                             filter_engine::EventAction::Error,
                             method.as_str(),
@@ -866,8 +916,22 @@ impl ProxyContext {
             Err(e) => {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
                 debug!("Upstream error for {}: {}", url, e);
+                let kind = crate::upstream::classify_reqwest(&e);
+                let hostport = common::certstore::hostport(&url_host, port);
+                // A certificate failure: one cached, single-flight probe handshake tells which
+                // certificate was presented and why it was rejected.
+                let failed_fp = match (&self.prober, kind, scheme) {
+                    (Some(p), filter_engine::ErrorKind::UpstreamTls, "https") => {
+                        p.probe(&url_host, port).await
+                    }
+                    _ => None,
+                };
+                if kind == filter_engine::ErrorKind::UpstreamTls {
+                    self.certs.note_seen(&hostport, &rctx.profile.load().label);
+                }
                 if !bypass_full {
                     log_request(
+                        failed_fp.as_deref(),
                         rctx,
                         filter_engine::EventAction::Error,
                         method.as_str(),
@@ -875,8 +939,18 @@ impl ProxyContext {
                         source_url(&headers, &url, rtype),
                         rtype,
                         Some(502),
-                        Some(crate::upstream::classify_reqwest(&e)),
+                        Some(kind),
                     );
+                }
+                if kind == filter_engine::ErrorKind::UpstreamTls {
+                    let info = failed_fp
+                        .as_deref()
+                        .and_then(|fp| self.certs.info(fp, Some(&hostport)))
+                        .filter(|i| i.verdict == common::certstore::Verdict::Invalid);
+                    return Ok(crate::redirect::cert_error_response(
+                        &url_host,
+                        info.as_ref(),
+                    ));
                 }
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
             }
@@ -884,7 +958,22 @@ impl ProxyContext {
 
         let status = resp.status();
         if !bypass_full {
+            // The certificate of the connection that served this very response.
+            let cert_fp = resp
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(|t| t.peer_certificate())
+                .and_then(|der| {
+                    // A completed response proves the chain verified for this host and port.
+                    let hostport = common::certstore::hostport(&url_host, port);
+                    let fp = self
+                        .certs
+                        .record_ok(&hostport, der, &|| crate::ev::is_ev_der(der))?;
+                    self.certs.note_seen(&hostport, &rctx.profile.load().label);
+                    Some(fp)
+                });
             log_request(
+                cert_fp.as_deref(),
                 rctx,
                 filter_engine::EventAction::Allowed,
                 method.as_str(),
@@ -1537,6 +1626,7 @@ fn event_mode(rctx: &RequestCtx) -> filter_engine::EventMode {
 /// Record a non-blocked request in the profile engine's request log (and live broadcast).
 #[allow(clippy::too_many_arguments)]
 fn log_request(
+    cert_fp: Option<&str>,
     rctx: &RequestCtx,
     action: filter_engine::EventAction,
     method: &str,
@@ -1559,5 +1649,6 @@ fn log_request(
         status,
         mode: event_mode(rctx),
         error_kind,
+        cert_fp,
     });
 }

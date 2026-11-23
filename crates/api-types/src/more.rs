@@ -383,6 +383,74 @@ pub struct RequestLogEntry {
     /// Set on `error` events.
     #[serde(default)]
     pub error_kind: Option<LogErrorKind>,
+    /// SHA-256 fingerprint (hex) of the upstream server certificate of a decrypted request;
+    /// resolves via `GET /certs/{fp}`.
+    #[serde(default)]
+    pub cert_fp: Option<String>,
+}
+
+/// Verification outcome of an upstream certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CertVerdict {
+    Ok,
+    Invalid,
+}
+
+/// Why an upstream certificate was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CertFailReason {
+    Expired,
+    NotYetValid,
+    NameMismatch,
+    UnknownIssuer,
+    /// The issuing root no longer vouches for this certificate (issued after its distrust date,
+    /// outside its name constraints, or without a valid Certificate Transparency receipt).
+    Distrusted,
+    Other,
+}
+
+/// One certificate of an upstream chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CertChainEntry {
+    pub subject: String,
+    pub issuer: String,
+    /// RFC 3339.
+    pub not_before: String,
+    /// RFC 3339.
+    pub not_after: String,
+    /// SHA-256 of the DER, lowercase hex.
+    pub fp: String,
+}
+
+/// The real certificate an upstream server presented to the proxy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CertInfo {
+    /// SHA-256 of the leaf DER, lowercase hex.
+    pub fp: String,
+    pub subject: String,
+    pub issuer: String,
+    pub serial: String,
+    /// RFC 3339.
+    pub not_before: String,
+    /// RFC 3339.
+    pub not_after: String,
+    /// DNS names and IP addresses of the subjectAltName extension.
+    pub sans: Vec<String>,
+    /// The chain as presented, leaf first.
+    pub chain: Vec<CertChainEntry>,
+    pub verdict: CertVerdict,
+    /// Set when `verdict` is `invalid`.
+    pub reason: Option<CertFailReason>,
+    /// Verifier message when `verdict` is `invalid`.
+    pub detail: Option<String>,
+    /// The leaf carries an Extended Validation policy.
+    pub ev: bool,
 }
 
 /// Snapshot of the request log.

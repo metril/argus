@@ -954,6 +954,17 @@ fn argus_status(state: &AppState) -> ArgusListsStatus {
         last_error: s.argus.last_error.clone(),
         skipped_lines: s.argus.skipped_lines,
         skipped_sample: s.argus.skipped_sample.clone(),
+        roots: state.roots.get().map(|c| {
+            let r = c.status.read();
+            api_types::RootsStatusDto {
+                serial: r.serial,
+                roots: u32::try_from(r.roots).unwrap_or(u32::MAX),
+                signed: r.signed,
+                updated_at: r.updated_at.clone(),
+                last_checked: r.last_checked.clone(),
+                last_error: r.last_error.clone(),
+            }
+        }),
         categories: core::FIRST_PARTY
             .iter()
             .map(|(cat, title)| {
@@ -995,6 +1006,10 @@ pub async fn get_argus_lists(State(state): State<Arc<AppState>>) -> Json<ArgusLi
 pub async fn refresh_argus_lists(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<ArgusListsStatus>> {
+    // The trusted roots follow the same release: check them too (in the background).
+    if let Some(c) = state.roots.get() {
+        c.wake.notify_one();
+    }
     state.argus().refresh().await.map_err(|e| {
         ApiError::coded(
             StatusCode::BAD_GATEWAY,

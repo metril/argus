@@ -144,6 +144,8 @@ pub struct TestOrigin {
 }
 
 struct SniResolver {
+    /// DER of the issuing CA, presented after each leaf like a real server's chain.
+    ca_der: Vec<u8>,
     issuer: Issuer<'static, KeyPair>,
     cache: Mutex<HashMap<String, Arc<CertifiedKey>>>,
 }
@@ -173,6 +175,11 @@ impl SniResolver {
         } else {
             vec![SanType::DnsName(name.try_into().expect("dns name"))]
         };
+        // Hosts named `expired-*` present a certificate that expired long ago.
+        if name.starts_with("expired-") {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
         // Hosts named `ev-*` present a certificate with the CA/B Forum EV policy (2.23.140.1.1).
         if name.starts_with("ev-") {
             // certificatePolicies ::= SEQUENCE { SEQUENCE { OID 2.23.140.1.1 } }
@@ -191,7 +198,10 @@ impl SniResolver {
         let der = PrivateKeyDer::try_from(key.serialize_der()).expect("key der");
         let signing = any_supported_type(&der).expect("signing key");
         Arc::new(CertifiedKey::new(
-            vec![CertificateDer::from(cert.der().to_vec())],
+            vec![
+                CertificateDer::from(cert.der().to_vec()),
+                CertificateDer::from(self.ca_der.clone()),
+            ],
             signing,
         ))
     }
@@ -242,6 +252,11 @@ impl TestOrigin {
         let mut tls = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(SniResolver {
+                ca_der: rustls_pemfile::certs(&mut ca_pem.as_bytes())
+                    .next()
+                    .expect("ca pem has a certificate")
+                    .expect("ca pem parses")
+                    .to_vec(),
                 issuer,
                 cache: Mutex::new(HashMap::new()),
             }));

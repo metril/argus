@@ -113,6 +113,12 @@ pub fn split_url(url: &str) -> (String, String) {
     }
 }
 
+/// `host[:port]` of a URL (userinfo dropped), as the certificate lookup expects it.
+pub fn url_hostport(url: &str) -> String {
+    let a = split_url(url).0;
+    a.rsplit('@').next().unwrap_or(&a).to_string()
+}
+
 /// Host part of a URL (without port-less userinfo handling; good enough for display/rules).
 pub fn url_host(url: &str) -> String {
     let h = split_url(url).0;

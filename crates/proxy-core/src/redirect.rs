@@ -53,6 +53,62 @@ fn block_page(url: &str, rule: &str) -> String {
     )
 }
 
+fn reason_text(r: Option<common::certstore::FailReason>) -> &'static str {
+    use common::certstore::FailReason as R;
+    match r {
+        Some(R::Expired) => "The certificate has expired.",
+        Some(R::NotYetValid) => "The certificate is not valid yet.",
+        Some(R::NameMismatch) => "The certificate is not valid for this host name.",
+        Some(R::UnknownIssuer) => {
+            "The certificate was issued by an unknown or untrusted authority."
+        }
+        Some(R::Distrusted) => {
+            "The authority that issued the certificate is no longer trusted for certificates like this one."
+        }
+        _ => "The server's certificate or TLS handshake could not be verified.",
+    }
+}
+
+fn cert_error_page(host: &str, info: Option<&common::certstore::CertInfo>) -> String {
+    let details = info.map_or_else(String::new, |i| {
+        format!(
+            "<p>Issuer: <code>{}</code></p><p>Subject: <code>{}</code></p>\
+             <p>Valid: <code>{}</code> to <code>{}</code></p>\
+             <p>Fingerprint (SHA-256): <code>{}</code></p>",
+            html_escape(&i.issuer),
+            html_escape(&i.subject),
+            html_escape(&i.not_before),
+            html_escape(&i.not_after),
+            html_escape(&i.fp)
+        )
+    });
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Insecure connection blocked</title>\
+         <style>body{{font:16px system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color:#222}}\
+         code{{background:#eee;padding:.1em .3em;word-break:break-all}}</style></head><body>\
+         <h1>Connection blocked</h1>\
+         <p>Argus did not connect to <code>{}</code> because the server's certificate is not trustworthy.</p>\
+         <p>{}</p>{}\
+         <p>The request was not forwarded. Inspect the certificate in the Argus web UI request log.</p>\
+         </body></html>",
+        html_escape(host),
+        reason_text(info.and_then(|i| i.reason)),
+        details
+    )
+}
+
+/// Page served when the upstream server's TLS certificate failed verification: names the host,
+/// the reason and the issuer. The request stays blocked (`502`, `x-adblock: cert-error`).
+pub fn cert_error_response(
+    host: &str,
+    info: Option<&common::certstore::CertInfo>,
+) -> Response<ProxyBody> {
+    base(StatusCode::BAD_GATEWAY, "cert-error")
+        .header("content-type", "text/html; charset=utf-8")
+        .body(full_body(Bytes::from(cert_error_page(host, info))))
+        .expect("static cert error response")
+}
+
 /// Response for a blocked request, shaped to what the requester expects.
 pub fn block_response(ty: RequestType, verdict: &MatchResult, url: &str) -> Response<ProxyBody> {
     let (status, ctype, body): (StatusCode, Option<&str>, Bytes) = match ty {

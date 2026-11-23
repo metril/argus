@@ -133,9 +133,7 @@ pub fn create_router_with(
     }
 
     // Layers: last added = outermost.
-    if let Some(cors) = build_cors_layer(&config.security.cors_origins) {
-        router = router.layer(cors);
-    }
+    router = router.layer(build_cors_layer(&config.security.cors_origins));
     router
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -547,21 +545,33 @@ fn warn_if_exposed_without_tls(config: &ApiConfig) {
     }
 }
 
+/// Path prefix whose responses browser extensions may read cross-origin.
+const EXTENSION_CORS_PREFIX: &str = "/api/v1/certs/";
+
+/// Whether `origin` is a browser-extension origin.
+fn is_extension_origin(origin: &HeaderValue) -> bool {
+    origin
+        .to_str()
+        .is_ok_and(|o| o.starts_with("chrome-extension://") || o.starts_with("moz-extension://"))
+}
+
 /// CORS: same-origin only unless origins are allowlisted (then credentials are allowed for
-/// exactly those origins).
-fn build_cors_layer(origins: &[String]) -> Option<CorsLayer> {
+/// exactly those origins). Browser extensions (`chrome-extension://*`, `moz-extension://*`) are
+/// additionally allowed, but only on `/api/v1/certs/*`.
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
     use tower_http::cors::AllowOrigin;
 
     let allowed: Vec<HeaderValue> = origins
         .iter()
         .filter_map(|o| o.parse::<HeaderValue>().ok())
         .collect();
-    if allowed.is_empty() {
-        return None;
-    }
-    Some(
+    {
         CorsLayer::new()
-            .allow_origin(AllowOrigin::list(allowed))
+            .allow_origin(AllowOrigin::predicate(move |origin, parts| {
+                allowed.contains(origin)
+                    || (is_extension_origin(origin)
+                        && parts.uri.path().starts_with(EXTENSION_CORS_PREFIX))
+            }))
             .allow_methods([
                 Method::GET,
                 Method::POST,
@@ -583,6 +593,6 @@ fn build_cors_layer(origins: &[String]) -> Option<CorsLayer> {
                 header::HeaderName::from_static("x-request-id"),
             ])
             .allow_credentials(true)
-            .max_age(std::time::Duration::from_secs(3600)),
-    )
+            .max_age(std::time::Duration::from_secs(3600))
+    }
 }

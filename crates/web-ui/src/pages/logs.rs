@@ -7,9 +7,11 @@ use wasm_bindgen::JsCast;
 
 use crate::api::logs::{LogAction, LogMode, RequestLogEntry};
 use crate::api::{client::API_PREFIX, ApiClient, ApiError};
-use crate::components::{ChipSelect, Drawer, Icon, Layout, Pill, Segmented};
+use crate::components::{CertPanel, ChipSelect, Drawer, Icon, Layout, Pill, Segmented};
 use crate::state::{use_app_state, use_auth_state};
-use crate::utils::{api_base_url, copy_text, fmt_datetime, fmt_time, split_url, url_host};
+use crate::utils::{
+    api_base_url, copy_text, fmt_datetime, fmt_time, split_url, url_host, url_hostport,
+};
 
 /// Entries kept in memory.
 const BUFFER_MAX: usize = 2000;
@@ -623,6 +625,7 @@ pub fn LogsPage() -> impl IntoView {
                                 <Icon name="copy" />"Copy URL"
                             </button>
                         </div>
+                        {e.cert_fp.clone().map(|fp| view! { <CertPanel fp=fp host=url_hostport(&e.url) /> })}
                         {bypass_section(e.action, e.error_kind, host, bypass_mode, bypass_site)}
                     }
                 })}

@@ -548,6 +548,228 @@ async fn cors_is_same_origin_unless_allowlisted() {
     assert!(bad.headers().get("access-control-allow-origin").is_none());
 }
 
+#[tokio::test]
+async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_only_there() {
+    let ctx = TestContext::new().await.unwrap();
+    let der = rcgen::generate_simple_self_signed(vec!["o.test".to_string()])
+        .unwrap()
+        .cert
+        .der()
+        .to_vec();
+    let fp = ctx
+        .state
+        .certs()
+        .record_ok("o.test", &der, &|| false)
+        .unwrap();
+    // Another host replaying the chain gets its own verdict; o.test's is untouched.
+    ctx.state.certs().record_probe(
+        "evil.test",
+        &[der.as_slice()],
+        Err((::common::certstore::FailReason::NameMismatch, "bad".into())),
+        &|| false,
+    );
+    ctx.state.certs().note_seen("o.test", "kids");
+    let admin = ctx.admin().await;
+    let secret = ctx.token(&admin, &["logs:read"]).await;
+    let a = ctx
+        .bearer("GET", &format!("/api/v1/certs/{fp}"), &secret)
+        .await;
+    a.assert_status_ok();
+    let b = ctx
+        .bearer("GET", "/api/v1/certs/by-host/o.test", &secret)
+        .add_header("origin", "chrome-extension://abc")
+        .await;
+    b.assert_status_ok();
+    assert_eq!(
+        b.header("access-control-allow-origin"),
+        "chrome-extension://abc"
+    );
+    assert_eq!(a.json::<Value>()["fp"], fp);
+    assert_eq!(a.json::<Value>()["verdict"], "ok");
+    let evil: Value = ctx
+        .bearer(
+            "GET",
+            &format!("/api/v1/certs/{fp}?host=evil.test"),
+            &secret,
+        )
+        .await
+        .json();
+    assert_eq!(evil["reason"], "name_mismatch");
+    let ok: Value = ctx
+        .bearer(
+            "GET",
+            &format!("/api/v1/certs/{fp}?host=O.test:443"),
+            &secret,
+        )
+        .await
+        .json();
+    assert_eq!(ok["verdict"], "ok");
+    // A profile-restricted token sees only hosts its profiles visited; the rest is a plain 404.
+    let r = admin
+        .post("/api/v1/tokens")
+        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
+        .await;
+    let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
+    ctx.bearer("GET", "/api/v1/certs/by-host/o.test", &kid)
+        .await
+        .assert_status_ok();
+    ctx.bearer("GET", "/api/v1/certs/by-host/o.test:443", &kid)
+        .await
+        .assert_status_ok();
+    for path in [
+        "/api/v1/certs/by-host/evil.test".to_string(),
+        "/api/v1/certs/by-host/unknown.test".to_string(),
+        "/api/v1/certs/by-host/o.test:8443".to_string(),
+        format!("/api/v1/certs/{fp}?host=evil.test"),
+        format!("/api/v1/certs/{fp}?host=unknown.test"),
+    ] {
+        ctx.bearer("GET", &path, &kid)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=o.test"), &kid)
+        .await
+        .assert_status_ok();
+    // A public fingerprint alone, or with a host that is not on record with it, reveals nothing
+    // to a restricted token.
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}"), &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=evil.test"), &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    // Bad host input is a 400.
+    ctx.bearer("GET", "/api/v1/certs/by-host/o.test:abc", &secret)
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    ctx.bearer("GET", "/api/v1/certs/by-host/nope.test", &secret)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    ctx.server
+        .get("/api/v1/certs/by-host/o.test")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    // Extension origins get no CORS elsewhere.
+    let h = ctx
+        .server
+        .get("/api/v1/health")
+        .add_header("origin", "moz-extension://abc")
+        .await;
+    assert!(h.headers().get("access-control-allow-origin").is_none());
+}
+
+/// Probe stand-in: "sees" a fixed chain per host and records it like the real prober.
+struct FakeProbe {
+    store: std::sync::Arc<::common::certstore::CertStore>,
+    chains: Vec<(&'static str, Vec<Vec<u8>>)>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ::common::certstore::ChainProbe for FakeProbe {
+    fn probe<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let chain = &self.chains.iter().find(|(h, _)| *h == host).unwrap().1;
+        let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+        let fp = self.store.record_probe(
+            &::common::certstore::hostport(host, port),
+            &refs,
+            Ok(()),
+            &|| false,
+        );
+        Box::pin(async move { fp })
+    }
+}
+
+fn chain_for(name: &str) -> Vec<Vec<u8>> {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    let mut ca = CertificateParams::new(vec![]).unwrap();
+    ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca.distinguished_name
+        .push(rcgen::DnType::CommonName, "chain test CA");
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let mut lp = CertificateParams::new(vec![name.to_string()]).unwrap();
+    lp.distinguished_name.push(rcgen::DnType::CommonName, name);
+    let leaf = lp.signed_by(&key, &issuer).unwrap();
+    vec![leaf.der().to_vec(), ca_cert.der().to_vec()]
+}
+
+#[tokio::test]
+async fn leaf_only_records_are_upgraded_to_the_full_chain_on_lookup() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ctx = TestContext::new().await.unwrap();
+    let store = ctx.state.certs().clone();
+    let full = chain_for("o.test");
+    let rotated = chain_for("o.test");
+    // The proxy knows only the leaf of o.test and of r.test (which has since rotated).
+    let fp = store.record_ok("o.test", &full[0], &|| false).unwrap();
+    let old = store.record_ok("r.test", &rotated[0], &|| false).unwrap();
+    store.note_seen("o.test", "kids");
+    let fake = std::sync::Arc::new(FakeProbe {
+        store: store.clone(),
+        // r.test now serves a different certificate than the one on record.
+        chains: vec![("o.test", full.clone()), ("r.test", chain_for("r.test"))],
+        calls: Default::default(),
+    });
+    ctx.state.chain_probe.set(fake.clone()).ok().unwrap();
+    let admin = ctx.admin().await;
+    let secret = ctx.token(&admin, &["logs:read"]).await;
+
+    // A restricted token for a host it has not seen: 404 and no probe.
+    let r = admin
+        .post("/api/v1/tokens")
+        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
+        .await;
+    let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
+    ctx.bearer("GET", "/api/v1/certs/by-host/r.test", &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    ctx.bearer("GET", &format!("/api/v1/certs/{old}?host=r.test"), &kid)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(fake.calls.load(SeqCst), 0);
+    // A host that is not on record with this certificate cannot make the server probe.
+    let v: Value = ctx
+        .bearer(
+            "GET",
+            &format!("/api/v1/certs/{fp}?host=elsewhere.test"),
+            &secret,
+        )
+        .await
+        .json();
+    assert_eq!(v["chain"].as_array().unwrap().len(), 1);
+    assert_eq!(fake.calls.load(SeqCst), 0);
+
+    // A rotated site: the probe sees another certificate, so the record is not upgraded.
+    let v: Value = ctx
+        .bearer("GET", &format!("/api/v1/certs/{old}?host=r.test"), &secret)
+        .await
+        .json();
+    assert_eq!(fake.calls.load(SeqCst), 1);
+    assert_eq!(v["fp"], old.as_str());
+    assert_eq!(v["chain"].as_array().unwrap().len(), 1);
+
+    // The probe sees the same certificate: its full chain is stored and returned.
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/certs/by-host/o.test", &kid)
+        .await
+        .json();
+    assert_eq!(v["fp"], fp.as_str());
+    assert_eq!(v["chain"].as_array().unwrap().len(), 2);
+    assert_eq!(fake.calls.load(SeqCst), 2);
+    // Already full: no further probe.
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=o.test"), &secret)
+        .await
+        .assert_status_ok();
+    assert_eq!(fake.calls.load(SeqCst), 2);
+}
+
 // ------------------------------------------------------------------ (f) revocation / expiry
 
 #[tokio::test]

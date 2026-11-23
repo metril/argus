@@ -1042,3 +1042,30 @@ async fn a_fetch_that_finishes_after_the_url_changed_does_not_write_its_patterns
         .unwrap();
     assert!(ctx.state.bypass().lookup("fresh.test").is_some());
 }
+
+#[tokio::test]
+async fn argus_lists_status_reports_the_trusted_roots_and_their_last_error() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    // Without a proxy there is no root set to report.
+    let st: Value = admin.get("/api/v1/bypass/argus-lists").await.json();
+    assert_eq!(st["roots"], Value::Null);
+
+    let cell = std::sync::Arc::new(::common::certstore::RootsStatusCell::default());
+    {
+        let mut s = cell.status.write();
+        s.serial = 2026112302;
+        s.roots = 93;
+        s.signed = true;
+        s.last_error = Some("roots.json: signature does not verify".into());
+    }
+    ctx.state.roots.set(cell).ok().unwrap();
+    let st: Value = admin.get("/api/v1/bypass/argus-lists").await.json();
+    assert_eq!(st["roots"]["serial"], 2026112302u64);
+    assert_eq!(st["roots"]["roots"], 93);
+    assert_eq!(st["roots"]["signed"], true);
+    assert_eq!(
+        st["roots"]["last_error"],
+        "roots.json: signature does not verify"
+    );
+}

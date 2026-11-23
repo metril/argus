@@ -28,6 +28,21 @@ pub struct UpstreamOptions {
     pub dns: Option<Arc<CachedResolver>>,
     /// Idle pooled connections kept per origin; `None` keeps the default of 32.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Where the certificates upstream servers present are recorded (shared with the web API).
+    pub certs: Arc<common::certstore::CertStore>,
+    /// The live trusted root set; built from `extra_ca_paths` over the compiled-in floor when
+    /// `None` (a context installs one so every client shares it).
+    pub roots: Option<Arc<crate::roots::RootsHandle>>,
+}
+
+impl UpstreamOptions {
+    /// The root set handle: the shared one, or a fresh floor of the extra CAs.
+    pub fn roots_handle(&self) -> Result<Arc<crate::roots::RootsHandle>> {
+        match &self.roots {
+            Some(r) => Ok(r.clone()),
+            None => crate::roots::RootsHandle::floor(&self.extra_ca_paths),
+        }
+    }
 }
 
 impl UpstreamOptions {
@@ -45,6 +60,8 @@ impl UpstreamOptions {
             read_timeout: Some(Duration::from_secs(
                 config.performance.request_timeout_secs.max(1),
             )),
+            certs: Default::default(),
+            roots: None,
             dns: Some(dns.clone()),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
                 match config.performance.max_connections {
@@ -65,36 +82,386 @@ impl UpstreamOptions {
     }
 }
 
-/// Root store used for every upstream TLS dial: built-in web roots plus `extra_ca_paths` (PEM
-/// files). Shared by the WebSocket path so HTTP and WebSocket trust the same CAs.
+/// Trust anchors of the compiled-in set plus `extra_ca_paths` (PEM files), for callers that
+/// need a plain store. Upstream dials use the live [`RootsHandle`] instead.
 pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertStore> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    for path in extra_ca_paths {
-        let pem = std::fs::read(path).map_err(|e| {
-            Error::Config(format!(
-                "Failed to read upstream CA {}: {e}",
-                path.display()
-            ))
-        })?;
-        let mut n = 0;
-        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-            let cert = cert.map_err(|e| {
-                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-            })?;
-            roots.add(cert).map_err(|e| {
-                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-            })?;
-            n += 1;
-        }
-        if n == 0 {
-            return Err(Error::Config(format!(
-                "Upstream CA {} contains no PEM certificates",
-                path.display()
-            )));
+    Ok(crate::roots::ActiveRoots::floor(extra_ca_paths)?
+        .store()
+        .clone())
+}
+
+/// Verifier of the probe handshake: the same verification as every dial, on the set in force
+/// when the probe started, remembering the chain it saw and the verdict (the handshake is
+/// rejected on a failure, so the verdict is kept here).
+impl std::fmt::Debug for ProbeVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeVerifier").finish_non_exhaustive()
+    }
+}
+
+struct ProbeVerifier {
+    active: Arc<crate::roots::ActiveRoots>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+    seen: parking_lot::Mutex<Option<ProbeSeen>>,
+}
+
+type ProbeSeen = (
+    Vec<Vec<u8>>,
+    std::result::Result<(), (common::certstore::FailReason, String)>,
+);
+
+pub(crate) fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
+    use common::certstore::FailReason as R;
+    use rustls::CertificateError as C;
+    match e {
+        rustls::Error::InvalidCertificate(c) => match c {
+            C::Expired | C::ExpiredContext { .. } => R::Expired,
+            C::NotValidYet | C::NotValidYetContext { .. } => R::NotYetValid,
+            C::NotValidForName | C::NotValidForNameContext { .. } => R::NameMismatch,
+            C::UnknownIssuer => R::UnknownIssuer,
+            C::Other(o) if o.0.downcast_ref::<crate::roots::Distrusted>().is_some() => {
+                R::Distrusted
+            }
+            _ => R::Other,
+        },
+        _ => R::Other,
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let res = self
+            .active
+            .verify(end_entity, intermediates, server_name, now);
+        // An accepted chain is stored as the verified path; a rejected one only for its leaf.
+        let (chain, verdict) = match &res {
+            Ok(path) => (path.iter().map(|d| d.to_vec()).collect(), Ok(())),
+            Err(e) => (
+                vec![end_entity.as_ref().to_vec()],
+                Err((fail_reason(e), e.to_string())),
+            ),
+        };
+        *self.seen.lock() = Some((chain, verdict));
+        res.map(|_| rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+impl common::certstore::ChainProbe for CertProber {
+    fn probe<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        Box::pin(CertProber::probe(self, host, port))
+    }
+}
+
+/// Client TLS config: every handshake is verified against the live root set (chains captured
+/// into `store`), ALPN h2 then http/1.1.
+pub fn client_tls_config(
+    roots: Arc<crate::roots::RootsHandle>,
+    store: Arc<common::certstore::CertStore>,
+) -> Result<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Config(format!("Failed to build upstream TLS config: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(crate::roots::LiveVerifier::new(
+            roots,
+            Some(store),
+        )))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// How long a probe result (ok or invalid) is reused.
+const PROBE_TTL: Duration = Duration::from_secs(300);
+/// Probe handshakes running at once.
+const PROBE_CONCURRENCY: usize = 8;
+/// How long a request waits for a free probe slot before it gives up and probes in the
+/// background instead.
+const PROBE_WAIT: Duration = Duration::from_millis(250);
+
+/// Background probes queued or running at once; further ones are dropped.
+const PROBE_BACKGROUND: usize = 16;
+
+/// No probe slot was free in time (the result is not cached).
+#[derive(Debug)]
+struct Busy;
+
+struct ProbeInner {
+    store: Arc<common::certstore::CertStore>,
+    roots: Arc<crate::roots::RootsHandle>,
+    resolver: PolicyResolver,
+    connect_timeout_ms: std::sync::atomic::AtomicU64,
+    limit: tokio::sync::Semaphore,
+    wait: Duration,
+    cache: moka::future::Cache<String, Option<String>>,
+    handshakes: std::sync::atomic::AtomicUsize,
+    /// Keys with a probe running right now (never started twice).
+    inflight: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Keys with a background probe queued or running.
+    queued: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Room for background probes.
+    background: Arc<tokio::sync::Semaphore>,
+    spawned: std::sync::atomic::AtomicUsize,
+}
+
+/// Removes a key from the queued set when its background probe ends.
+struct Queued(Arc<ProbeInner>, String);
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.0.queued.lock().remove(&self.1);
+    }
+}
+
+/// Removes a key from the in-flight set when the probe ends (or is dropped).
+struct Inflight<'a>(&'a ProbeInner, String);
+
+impl<'a> Inflight<'a> {
+    fn new(p: &'a ProbeInner, key: &str) -> Self {
+        p.inflight.lock().insert(key.to_string());
+        Self(p, key.to_string())
+    }
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.lock().remove(&self.1);
+    }
+}
+
+/// Dedicated handshake to a `host:port` after an upstream TLS failure, to learn the certificate
+/// and why it was rejected. Results are cached per `host:port` (single-flight, bounded
+/// concurrency) so repeated failures cannot multiply outbound connections. A caller never waits
+/// long for a slot: when none is free it gets `None` at once and the probe runs in the
+/// background to fill the store.
+#[derive(Clone)]
+pub struct CertProber(Arc<ProbeInner>);
+
+impl CertProber {
+    pub fn new(opts: &UpstreamOptions) -> Result<Self> {
+        Self::with_limits(opts, PROBE_CONCURRENCY, PROBE_WAIT, PROBE_BACKGROUND)
+    }
+
+    fn with_limits(
+        opts: &UpstreamOptions,
+        permits: usize,
+        wait: Duration,
+        background: usize,
+    ) -> Result<Self> {
+        Ok(Self(Arc::new(ProbeInner {
+            store: opts.certs.clone(),
+            roots: opts.roots_handle()?,
+            resolver: PolicyResolver {
+                policy: opts.policy.clone(),
+                override_ip: opts.resolve_all_to,
+                strict: false,
+                dns: opts.dns.clone().unwrap_or_else(|| {
+                    Arc::new(CachedResolver::from_settings(&Default::default()))
+                }),
+            },
+            connect_timeout_ms: opts
+                .connect_timeout
+                .map_or(10_000, |t| t.as_millis() as u64)
+                .into(),
+            handshakes: Default::default(),
+            inflight: Default::default(),
+            queued: Default::default(),
+            background: Arc::new(tokio::sync::Semaphore::new(background)),
+            spawned: Default::default(),
+            limit: tokio::sync::Semaphore::new(permits),
+            wait,
+            cache: moka::future::Cache::builder()
+                .max_capacity(4096)
+                .time_to_live(PROBE_TTL)
+                .build(),
+        })))
+    }
+
+    /// Follow a changed connect timeout.
+    pub fn set_connect_timeout(&self, t: Option<Duration>) {
+        self.0.connect_timeout_ms.store(
+            t.map_or(10_000, |t| t.as_millis() as u64),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Probe handshakes started so far.
+    pub fn handshakes(&self) -> usize {
+        self.0.handshakes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fingerprint of the certificate `host:port` presented, recorded in the store with its
+    /// verdict. `None` when the probe learnt nothing (no certificate arrived, the handshake
+    /// failed for another reason) or no slot was free in time (then it continues in the
+    /// background).
+    pub async fn probe(&self, host: &str, port: u16) -> Option<String> {
+        // Bounded as a whole: also a caller joining a probe that is already running.
+        match tokio::time::timeout(self.0.wait, self.0.cached(host, port, Some(self.0.wait))).await
+        {
+            Ok(Ok(fp)) => fp,
+            Ok(Err(Busy)) | Err(_) => {
+                self.spawn_background(host, port);
+                None
+            }
         }
     }
-    Ok(roots)
+
+    /// Probe in the background to fill the store: not when one is already running for the key,
+    /// and dropped when too many are queued.
+    fn spawn_background(&self, host: &str, port: u16) {
+        let key = common::certstore::hostport(host, port);
+        if self.0.inflight.lock().contains(&key) {
+            return;
+        }
+        // Claim the key before queueing: a duplicate must not take another slot.
+        if !self.0.queued.lock().insert(key.clone()) {
+            return;
+        }
+        let queued = Queued(self.0.clone(), key);
+        let Ok(permit) = self.0.background.clone().try_acquire_owned() else {
+            return;
+        };
+        self.0
+            .spawned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (inner, host) = (self.0.clone(), host.to_string());
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _queued = queued;
+            let _ = inner.cached(&host, port, None).await;
+        });
+    }
+
+    /// Background probes started so far.
+    pub fn background_started(&self) -> usize {
+        self.0.spawned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl ProbeInner {
+    async fn cached(
+        &self,
+        host: &str,
+        port: u16,
+        wait: Option<Duration>,
+    ) -> std::result::Result<Option<String>, Busy> {
+        let key = common::certstore::hostport(host, port);
+        self.cache
+            .try_get_with(key.clone(), async {
+                let _permit = match wait {
+                    Some(w) => tokio::time::timeout(w, self.limit.acquire())
+                        .await
+                        .map_err(|_| Busy)?
+                        .map_err(|_| Busy)?,
+                    None => self.limit.acquire().await.map_err(|_| Busy)?,
+                };
+                let _running = Inflight::new(self, &key);
+                let limit = Duration::from_millis(
+                    self.connect_timeout_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                Ok(tokio::time::timeout(limit, self.run(&key, host, port))
+                    .await
+                    .ok()
+                    .flatten())
+            })
+            .await
+            .map_err(|_: Arc<Busy>| Busy)
+    }
+
+    async fn run(&self, key: &str, host: &str, port: u16) -> Option<String> {
+        self.handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let candidates: Vec<IpAddr> = match bare.parse::<IpAddr>() {
+            Ok(ip) => vec![ip],
+            Err(_) => self
+                .resolver
+                .resolve_checked(bare)
+                .await
+                .ok()?
+                .into_iter()
+                .map(|a| a.ip())
+                .collect(),
+        };
+        // The same port-aware destination policy as the request path (own listeners, private
+        // ranges), for literals and resolved addresses alike. A code-only override is unfiltered.
+        let addrs: Vec<SocketAddr> = match self.resolver.override_ip {
+            Some(o) => vec![SocketAddr::new(o, port)],
+            None => candidates
+                .into_iter()
+                .filter(|ip| self.resolver.policy.check(*ip, port).is_ok())
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+        };
+        let name = rustls::pki_types::ServerName::try_from(bare.to_string()).ok()?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(ProbeVerifier {
+            // The set in force when the probe starts.
+            active: self.roots.load_full(),
+            algs: provider.signature_verification_algorithms,
+            seen: Default::default(),
+        });
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone())
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let mut completed = None;
+        for addr in addrs {
+            let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
+                continue;
+            };
+            completed = Some(connector.connect(name.clone(), tcp).await.is_ok());
+            break;
+        }
+        let (chain, verdict) = verifier.seen.lock().take()?;
+        // An `ok` needs a completed handshake (the server proved it holds the key); a
+        // certificate rejection is recorded as such. Anything else learnt nothing.
+        if verdict.is_ok() && completed != Some(true) {
+            return None;
+        }
+        let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+        self.store.record_probe(key, &refs, verdict, &|| {
+            chain.first().is_some_and(|d| crate::ev::is_ev_der(d))
+        })
+    }
 }
 
 /// DNS resolver that applies the destination policy to what the name resolves to (reqwest never
@@ -178,6 +545,8 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
     // destination policy.
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        // Each response carries the certificate of the connection that served it.
+        .tls_info(true)
         .redirect(reqwest::redirect::Policy::none())
         // Latency over batching: the proxy relays whole messages, never small interactive writes
         // it could usefully coalesce (also reqwest's default; stated so it cannot regress).
@@ -193,25 +562,8 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
         .http2_adaptive_window(true);
-    for path in &opts.extra_ca_paths {
-        let pem = std::fs::read(path).map_err(|e| {
-            Error::Config(format!(
-                "Failed to read upstream CA {}: {e}",
-                path.display()
-            ))
-        })?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem)
-            .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
-        if certs.is_empty() {
-            return Err(Error::Config(format!(
-                "Upstream CA {} contains no PEM certificates",
-                path.display()
-            )));
-        }
-        for cert in certs {
-            builder = builder.add_root_certificate(cert);
-        }
-    }
+    builder =
+        builder.use_preconfigured_tls(client_tls_config(opts.roots_handle()?, opts.certs.clone())?);
     if let Some(t) = opts.connect_timeout {
         builder = builder.connect_timeout(t);
     }
@@ -507,5 +859,326 @@ mod classify_tests {
             .await
             .unwrap_err();
         assert_eq!(classify_reqwest(&err), K::UpstreamTls, "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use common::certstore::{FailReason, Verdict};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Pki {
+        ca_pem: String,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn pki() -> Pki {
+        let mut p = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "probe test CA");
+        p.distinguished_name = dn;
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let key = KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        Pki {
+            ca_pem: cert.pem(),
+            issuer: Issuer::new(p, key),
+        }
+    }
+
+    /// A TLS server presenting a certificate for `name` (expired when asked); returns its port
+    /// and a counter of accepted connections.
+    async fn server(pki: &Pki, name: &str, expired: bool) -> (u16, Arc<AtomicUsize>) {
+        let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
+        if expired {
+            p.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            p.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
+        let key = KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &pki.issuer).unwrap();
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                c.fetch_add(1, Ordering::SeqCst);
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = a.accept(s).await;
+                });
+            }
+        });
+        (port, count)
+    }
+
+    fn prober(pki: &Pki) -> (CertProber, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, &pki.ca_pem).unwrap();
+        let opts = UpstreamOptions {
+            extra_ca_paths: vec![ca],
+            resolve_all_to: Some("127.0.0.1".parse().unwrap()),
+            connect_timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        (CertProber::new(&opts).unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn probe_records_reason_per_port_and_is_cached() {
+        let pki = pki();
+        let (bad, bad_hits) = server(&pki, "h.test", true).await;
+        let (good, _) = server(&pki, "h.test", false).await;
+        let (p, _d) = prober(&pki);
+        let fp = p.probe("h.test", bad).await.expect("fingerprint");
+        let info = p.0.store.by_host(&format!("h.test:{bad}")).unwrap();
+        assert_eq!(info.fp, fp);
+        assert_eq!(
+            (info.verdict, info.reason),
+            (Verdict::Invalid, Some(FailReason::Expired))
+        );
+        // The same host on another port is independent.
+        let fp2 = p.probe("h.test", good).await.unwrap();
+        assert_ne!(fp, fp2);
+        let ok = p.0.store.by_host(&format!("h.test:{good}")).unwrap();
+        assert_eq!(ok.verdict, Verdict::Ok);
+        // Cached: no new connection, same answer.
+        let before = bad_hits.load(Ordering::SeqCst);
+        assert_eq!(p.probe("h.test", bad).await, Some(fp));
+        assert_eq!(bad_hits.load(Ordering::SeqCst), before);
+    }
+
+    #[tokio::test]
+    async fn concurrent_probes_of_one_host_share_one_handshake() {
+        let pki = pki();
+        let (port, hits) = server(&pki, "h.test", true).await;
+        let (p, _d) = prober(&pki);
+        let p = Arc::new(p);
+        let rs = futures_util::future::join_all((0..8).map(|_| {
+            let p = p.clone();
+            async move { p.probe("h.test", port).await }
+        }))
+        .await;
+        assert!(rs.iter().all(|r| r == &rs[0] && r.is_some()));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_ok_verdict_needs_a_completed_handshake() {
+        // The certificate verifies, but the server cannot sign with its key: the handshake
+        // fails after verification, so nothing may be recorded as ok.
+        use rustls::sign::CertifiedKey;
+        #[derive(Debug)]
+        struct Wrong(Arc<CertifiedKey>);
+        impl rustls::server::ResolvesServerCert for Wrong {
+            fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+                Some(self.0.clone())
+            }
+        }
+        let pki = pki();
+        let mut p = CertificateParams::new(vec!["h.test".to_string()]).unwrap();
+        p.distinguished_name.push(DnType::CommonName, "h.test");
+        let real = KeyPair::generate().unwrap();
+        let cert = p.signed_by(&real, &pki.issuer).unwrap();
+        let other = KeyPair::generate().unwrap();
+        let signer = rustls::crypto::ring::sign::any_supported_type(
+            &rustls::pki_types::PrivateKeyDer::try_from(other.serialize_der()).unwrap(),
+        )
+        .unwrap();
+        let ck = Arc::new(CertifiedKey::new(vec![cert.der().clone()], signer));
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(Wrong(ck)));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = a.accept(s).await;
+                });
+            }
+        });
+        let (pr, _d) = prober(&pki);
+        assert_eq!(pr.probe("h.test", port).await, None);
+        assert!(pr.0.store.by_host(&format!("h.test:{port}")).is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_respects_the_port_aware_destination_policy() {
+        let pki = pki();
+        let (port, hits) = server(&pki, "127.0.0.1", true).await;
+        // No override: the default policy refuses loopback literals.
+        let opts = UpstreamOptions {
+            connect_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let p = CertProber::new(&opts).unwrap();
+        assert_eq!(p.probe("127.0.0.1", port).await, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no connection was made");
+    }
+
+    #[tokio::test]
+    async fn a_busy_prober_answers_at_once_and_finishes_in_the_background() {
+        let pki = pki();
+        // A server that accepts and then says nothing keeps the only slot busy.
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hole_port = hole.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(hole.accept().await.unwrap());
+            }
+        });
+        let (bad, _) = server(&pki, "b.test", true).await;
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, &pki.ca_pem).unwrap();
+        let opts = UpstreamOptions {
+            extra_ca_paths: vec![ca],
+            resolve_all_to: Some("127.0.0.1".parse().unwrap()),
+            connect_timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        };
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(50), 4).unwrap();
+        let slow = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("a.test", hole_port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let t = std::time::Instant::now();
+        assert_eq!(p.probe("b.test", bad).await, None);
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "did not wait for a slot"
+        );
+        assert_eq!(slow.await.unwrap(), None);
+        // The background probe fills the store once the slot frees up.
+        let key = format!("b.test:{bad}");
+        for _ in 0..50 {
+            if p.0.store.by_host(&key).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(p.0.store.by_host(&key).unwrap().verdict, Verdict::Invalid);
+    }
+
+    /// A listener that accepts and never answers, so a probe to it holds its slot.
+    async fn black_hole() -> u16 {
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = hole.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(hole.accept().await.unwrap());
+            }
+        });
+        port
+    }
+
+    fn slow_opts() -> (UpstreamOptions, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = UpstreamOptions {
+            resolve_all_to: Some("127.0.0.1".parse().unwrap()),
+            connect_timeout: Some(Duration::from_secs(3)),
+            ..Default::default()
+        };
+        (opts, dir)
+    }
+
+    #[tokio::test]
+    async fn background_probes_are_capped_and_never_duplicated() {
+        let port = black_hole().await;
+        let (opts, _d) = slow_opts();
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(20), 3).unwrap();
+        let holder = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("held.test", port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Many distinct hosts while the only slot is busy: at most 3 queue, the rest drop.
+        for i in 0..40 {
+            assert_eq!(p.probe(&format!("h{i}.test"), port).await, None);
+        }
+        assert_eq!(p.background_started(), 3);
+        // The same key again: its probe is already queued or running, so none is added.
+        let before = p.background_started();
+        p.probe("h0.test", port).await;
+        assert_eq!(p.background_started(), before);
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_keys_do_not_consume_background_slots() {
+        let port = black_hole().await;
+        let (opts, _d) = slow_opts();
+        // More slots than keys: only duplicates could exhaust them.
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(20), 100).unwrap();
+        let holder = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("held.test", port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..4 {
+            for i in 0..5 {
+                assert_eq!(p.probe(&format!("k{i}.test"), port).await, None);
+            }
+        }
+        // The holder's own call handed its probe over once, then one per distinct key.
+        holder.await.unwrap();
+        assert_eq!(p.background_started(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_caller_joining_a_running_probe_returns_within_the_wait() {
+        let port = black_hole().await;
+        let (opts, _d) = slow_opts();
+        let p = CertProber::with_limits(&opts, 4, Duration::from_millis(100), 4).unwrap();
+        let first = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("j.test", port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let t = std::time::Instant::now();
+        assert_eq!(p.probe("j.test", port).await, None);
+        assert!(t.elapsed() < Duration::from_secs(1));
+        // The first caller handed the slow probe to the background; the joiner adds none.
+        first.await.unwrap();
+        assert_eq!(p.background_started(), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_failure_yields_nothing() {
+        let pki = pki();
+        let (p, _d) = prober(&pki);
+        // Nothing listens on port 1.
+        assert_eq!(p.probe("h.test", 1).await, None);
     }
 }

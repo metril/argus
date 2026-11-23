@@ -234,6 +234,15 @@ pub struct AppState {
     /// persisted default is created on first use otherwise).
     pub bypass: OnceLock<Arc<common::bypass::BypassEngine>>,
 
+    /// Upstream certificates the proxy has seen (installed by the proxy; empty otherwise).
+    pub certs: OnceLock<Arc<common::certstore::CertStore>>,
+
+    /// Status of the trusted root set (installed by the proxy; absent otherwise).
+    pub roots: OnceLock<Arc<common::certstore::RootsStatusCell>>,
+
+    /// Fetches full certificate chains on demand (installed by the proxy).
+    pub chain_probe: OnceLock<Arc<dyn common::certstore::ChainProbe>>,
+
     /// The first-party list manager (installed by the proxy; created on first use otherwise).
     pub argus: OnceLock<Arc<list_service::ArgusLists>>,
 
@@ -803,6 +812,9 @@ pub async fn build_state_full(
         policy,
         started_at: Instant::now(),
         bypass: OnceLock::new(),
+        certs: OnceLock::new(),
+        roots: OnceLock::new(),
+        chain_probe: OnceLock::new(),
         argus: OnceLock::new(),
         config_lock: tokio::sync::Mutex::new(()),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
@@ -863,6 +875,11 @@ impl AppState {
             );
             list_service::ArgusLists::new(bypass, self.list_service.clone(), cfg)
         })
+    }
+
+    /// The upstream certificate store.
+    pub fn certs(&self) -> &Arc<common::certstore::CertStore> {
+        self.certs.get_or_init(Default::default)
     }
 
     /// The bypass engine.

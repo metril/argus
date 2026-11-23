@@ -17,6 +17,7 @@ This guide explains how to install the Argus Proxy CA certificate on different p
 - [Verification](#verification)
 - [Removal](#removal)
 - [Security Considerations](#security-considerations)
+- [Argus browser extension](#argus-browser-extension)
 
 ## Understanding the CA Certificate
 
@@ -308,6 +309,27 @@ docker compose up -d
 ### "NET::ERR_CERT_AUTHORITY_INVALID"
 
 This means the CA isn't installed or trusted. Follow installation instructions for your platform.
+
+## Argus browser extension
+
+The extension shows the real upstream certificate Argus saw for the current site, flags invalid ones with a badge, and marks hosts Argus has not seen as "not filtered". On Firefox it also reports whether the page was "Intercepted by Argus" or "Direct".
+
+### Create a token
+
+In the Argus web UI, open Settings, create an API token with the `logs:read` scope, and copy it.
+
+### Build and load unpacked
+
+```bash
+cd extension
+npm ci
+npx wxt build -b chrome    # or: npx wxt build -b firefox
+```
+
+- **Chrome/Chromium**: open `chrome://extensions`, enable Developer mode, click "Load unpacked", and select `extension/.output/chrome-mv3`.
+- **Firefox**: open `about:debugging#/runtime/this-firefox`, click "Load Temporary Add-on", and select `extension/.output/firefox-mv3/manifest.json`.
+
+Open the extension's options, enter the Argus URL (for example `http://localhost:8080`) and the token, and click "Test connection". Grant the host permission when prompted. CI also uploads zips as the `argus-extension` artifact.
 
 ## Additional Resources
 

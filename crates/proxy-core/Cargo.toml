@@ -35,6 +35,7 @@ brotli = "8"
 # TLS
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
 rcgen = { workspace = true }
 x509-parser = "0.18"
 rustls-pemfile = { workspace = true }
@@ -95,6 +96,7 @@ common = { path = "../common" }
 # WebSocket proxying (optional, feature `websockets`)
 tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = "1.0"
+webpki-root-certs = "=1.0.8"
 
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine", default-features = false }
@@ -146,6 +148,8 @@ tempfile = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 proptest = "1.5"
+ring = "0.17"
+minisign = "0.7"
 
 [[bench]]
 name = "proxy_bench"

@@ -202,6 +202,19 @@ impl ProxyControl {
                     .map_err(|e| Error::Internal(e.to_string()))??,
             );
         }
+        // A live change of the extra CAs takes effect for the next handshake (a broken file
+        // rejects the change before anything is applied).
+        let new_extras = match self.ctx.roots() {
+            Some(roots) => {
+                let (roots, paths) = (roots.clone(), config.proxy.extra_upstream_ca_paths.clone());
+                Some(
+                    tokio::task::spawn_blocking(move || roots.prepare_extras(&paths))
+                        .await
+                        .map_err(|e| Error::Internal(e.to_string()))??,
+                )
+            }
+            None => None,
+        };
         #[cfg(feature = "websockets")]
         let mut new_ws = None;
         #[cfg(feature = "websockets")]
@@ -209,15 +222,16 @@ impl ProxyControl {
             .as_ref()
             .filter(|l| l.shared.ws.load().is_none() && config.any_listener(|f| f.websockets))
         {
-            let (paths, policy, resolve) = (
-                config.proxy.extra_upstream_ca_paths.clone(),
+            let (roots, policy, resolve) = (
+                self.ctx
+                    .roots_handle(&config.proxy.extra_upstream_ca_paths)?,
                 self.ctx.policy().clone(),
                 self.ctx.resolve_all_to(),
             );
             let shutdown = l.shutdown_tx.clone();
             new_ws = Some(Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    crate::websocket::WsUpstream::new(&paths, policy, resolve, t.handshake)
+                    crate::websocket::WsUpstream::new(roots, policy, resolve, t.handshake)
                         .map(|w| w.with_lifecycle(t.tunnel_idle, shutdown))
                 })
                 .await
@@ -278,6 +292,9 @@ impl ProxyControl {
         }
         self.timeouts.store(Arc::new(t));
         self.ctx.commit_upstream(upstream);
+        if let (Some(roots), Some(extras)) = (self.ctx.roots(), new_extras) {
+            roots.commit_extras(extras);
+        }
         self.ctx.set_request_timeout(std::time::Duration::from_secs(
             config.performance.request_timeout_secs,
         ));
@@ -910,7 +927,8 @@ impl ProxyServer {
             ws: if self.config.any_listener(|f| f.websockets) {
                 ArcSwapOption::new(Some(Arc::new(
                     crate::websocket::WsUpstream::new(
-                        &self.config.proxy.extra_upstream_ca_paths,
+                        self.ctx
+                            .roots_handle(&self.config.proxy.extra_upstream_ca_paths)?,
                         self.ctx.policy().clone(),
                         self.ctx.resolve_all_to(),
                         t0.handshake,

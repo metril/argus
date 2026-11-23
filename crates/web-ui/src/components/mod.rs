@@ -2,6 +2,7 @@
 
 pub mod button;
 pub mod card;
+pub mod cert_panel;
 pub mod confirm;
 pub mod drawer;
 pub mod form;
@@ -17,6 +18,7 @@ pub mod toast;
 
 pub use button::Button;
 pub use card::{Card, Tile};
+pub use cert_panel::CertPanel;
 pub use confirm::ConfirmButton;
 pub use drawer::Drawer;
 pub use form::{ChipSelect, Input, Segmented, Switch, TagInput};
