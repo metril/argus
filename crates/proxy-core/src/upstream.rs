@@ -28,6 +28,8 @@ pub struct UpstreamOptions {
     pub dns: Option<Arc<CachedResolver>>,
     /// Idle pooled connections kept per origin; `None` keeps the default of 32.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Where the certificates upstream servers present are recorded (shared with the web API).
+    pub certs: Arc<common::certstore::CertStore>,
 }
 
 impl UpstreamOptions {
@@ -45,6 +47,7 @@ impl UpstreamOptions {
             read_timeout: Some(Duration::from_secs(
                 config.performance.request_timeout_secs.max(1),
             )),
+            certs: Default::default(),
             dns: Some(dns.clone()),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
                 match config.performance.max_connections {
@@ -95,6 +98,114 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
         }
     }
     Ok(roots)
+}
+
+/// Wraps the standard web-PKI verifier: delegates, then records the presented chain and the
+/// verdict (also for rejected chains) so the real server certificate can be inspected. Runs once
+/// per handshake, not per request.
+#[derive(Debug)]
+pub struct RecordingVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    store: Arc<common::certstore::CertStore>,
+}
+
+impl RecordingVerifier {
+    pub fn new(
+        roots: rustls::RootCertStore,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+        store: Arc<common::certstore::CertStore>,
+    ) -> Result<Self> {
+        let inner =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| Error::Config(format!("Failed to build upstream verifier: {e}")))?;
+        Ok(Self { inner, store })
+    }
+}
+
+fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
+    use common::certstore::FailReason as R;
+    use rustls::CertificateError as C;
+    match e {
+        rustls::Error::InvalidCertificate(c) => match c {
+            C::Expired | C::ExpiredContext { .. } => R::Expired,
+            C::NotValidYet | C::NotValidYetContext { .. } => R::NotYetValid,
+            C::NotValidForName | C::NotValidForNameContext { .. } => R::NameMismatch,
+            C::UnknownIssuer => R::UnknownIssuer,
+            _ => R::Other,
+        },
+        _ => R::Other,
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let res = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+        let host = server_name.to_str();
+        let chain: Vec<&[u8]> = std::iter::once(end_entity.as_ref())
+            .chain(intermediates.iter().map(|c| c.as_ref()))
+            .collect();
+        let verdict = match &res {
+            Ok(_) => Ok(()),
+            Err(e) => Err((fail_reason(e), e.to_string())),
+        };
+        self.store.record(&host, &chain, verdict, &|| {
+            crate::ev::is_ev_der(end_entity.as_ref())
+        });
+        res
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Client TLS config: `roots` verified through a [`RecordingVerifier`], ALPN h2 then http/1.1.
+pub fn recording_tls_config(
+    roots: rustls::RootCertStore,
+    store: Arc<common::certstore::CertStore>,
+) -> Result<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = RecordingVerifier::new(roots, provider.clone(), store)?;
+    let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Config(format!("Failed to build upstream TLS config: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(cfg)
 }
 
 /// DNS resolver that applies the destination policy to what the name resolves to (reqwest never
@@ -193,25 +304,10 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
         .http2_adaptive_window(true);
-    for path in &opts.extra_ca_paths {
-        let pem = std::fs::read(path).map_err(|e| {
-            Error::Config(format!(
-                "Failed to read upstream CA {}: {e}",
-                path.display()
-            ))
-        })?;
-        let certs = reqwest::Certificate::from_pem_bundle(&pem)
-            .map_err(|e| Error::Config(format!("Invalid upstream CA {}: {e}", path.display())))?;
-        if certs.is_empty() {
-            return Err(Error::Config(format!(
-                "Upstream CA {} contains no PEM certificates",
-                path.display()
-            )));
-        }
-        for cert in certs {
-            builder = builder.add_root_certificate(cert);
-        }
-    }
+    builder = builder.use_preconfigured_tls(recording_tls_config(
+        build_root_store(&opts.extra_ca_paths)?,
+        opts.certs.clone(),
+    )?);
     if let Some(t) = opts.connect_timeout {
         builder = builder.connect_timeout(t);
     }
@@ -507,5 +603,120 @@ mod classify_tests {
             .await
             .unwrap_err();
         assert_eq!(classify_reqwest(&err), K::UpstreamTls, "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use common::certstore::{CertStore, FailReason, Verdict};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+        KeyUsagePurpose,
+    };
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    struct Pki {
+        ca_der: CertificateDer<'static>,
+        issuer: Issuer<'static, KeyPair>,
+    }
+
+    fn pki() -> Pki {
+        pki_named("test CA")
+    }
+
+    fn pki_named(cn: &str) -> Pki {
+        let mut p = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, cn);
+        p.distinguished_name = dn;
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        let key = KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        Pki {
+            ca_der: cert.der().clone(),
+            issuer: Issuer::new(p, key),
+        }
+    }
+
+    fn leaf(pki: &Pki, name: &str, expired: bool) -> Vec<u8> {
+        let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
+        if expired {
+            p.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            p.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
+        let key = KeyPair::generate().unwrap();
+        p.signed_by(&key, &pki.issuer).unwrap().der().to_vec()
+    }
+
+    fn verifier(trusted: Option<&Pki>, store: &Arc<CertStore>) -> RecordingVerifier {
+        let mut roots = rustls::RootCertStore::empty();
+        if let Some(p) = trusted {
+            roots.add(p.ca_der.clone()).unwrap();
+        }
+        RecordingVerifier::new(
+            roots,
+            Arc::new(rustls::crypto::ring::default_provider()),
+            store.clone(),
+        )
+        .unwrap()
+    }
+
+    fn check(
+        v: &RecordingVerifier,
+        der: &[u8],
+        host: &str,
+    ) -> std::result::Result<(), rustls::Error> {
+        v.verify_server_cert(
+            &CertificateDer::from(der.to_vec()),
+            &[],
+            &ServerName::try_from(host.to_string()).unwrap(),
+            &[],
+            UnixTime::now(),
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn good_chain_is_accepted_and_recorded() {
+        let (store, pki) = (Arc::new(CertStore::default()), pki());
+        let der = leaf(&pki, "good.test", false);
+        check(&verifier(Some(&pki), &store), &der, "good.test").unwrap();
+        let info = store.by_host("good.test").unwrap();
+        assert_eq!(info.verdict, Verdict::Ok);
+        assert_eq!(info.reason, None);
+        assert!(info.subject.contains("good.test") || info.sans == ["good.test"]);
+    }
+
+    #[test]
+    fn bad_chains_are_still_rejected_but_recorded_with_a_reason() {
+        let (store, pki) = (Arc::new(CertStore::default()), pki());
+        let v = verifier(Some(&pki), &store);
+
+        let expired = leaf(&pki, "old.test", true);
+        assert!(check(&v, &expired, "old.test").is_err());
+        let i = store.by_host("old.test").unwrap();
+        assert_eq!(
+            (i.verdict, i.reason),
+            (Verdict::Invalid, Some(FailReason::Expired))
+        );
+
+        let other = leaf(&pki, "other.test", false);
+        assert!(check(&v, &other, "wrong.test").is_err());
+        let i = store.by_host("wrong.test").unwrap();
+        assert_eq!(i.reason, Some(FailReason::NameMismatch));
+
+        let stranger = leaf(&pki, "x.test", false);
+        assert!(check(
+            &verifier(Some(&pki_named("unrelated CA")), &store),
+            &stranger,
+            "x.test"
+        )
+        .is_err());
+        let i = store.by_host("x.test").unwrap();
+        assert_eq!(i.reason, Some(FailReason::UnknownIssuer));
+        assert!(i.detail.is_some());
     }
 }

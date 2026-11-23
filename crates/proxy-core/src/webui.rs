@@ -56,7 +56,7 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
         i.manager.clone(),
         i.manager.storage_arc(),
     ));
-    web_api::build_state_full(
+    let state = web_api::build_state_full(
         i.api_config,
         i.proxy_config,
         i.shared_engine,
@@ -70,7 +70,9 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
         ctx.profile_store().cloned(),
         Some(Arc::new(ProxyProfileRuntime::new(ctx.clone()))),
     )
-    .await
+    .await?;
+    let _ = state.certs.set(ctx.certs().clone());
+    Ok(state)
 }
 
 /// Lets the API move the proxy's listeners and swap its access lists while it runs.

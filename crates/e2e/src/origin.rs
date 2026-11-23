@@ -173,6 +173,11 @@ impl SniResolver {
         } else {
             vec![SanType::DnsName(name.try_into().expect("dns name"))]
         };
+        // Hosts named `expired-*` present a certificate that expired long ago.
+        if name.starts_with("expired-") {
+            params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
         // Hosts named `ev-*` present a certificate with the CA/B Forum EV policy (2.23.140.1.1).
         if name.starts_with("ev-") {
             // certificatePolicies ::= SEQUENCE { SEQUENCE { OID 2.23.140.1.1 } }

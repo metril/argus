@@ -32,6 +32,7 @@ use crate::auth::authz::RouteTable;
         (name = "stats", description = "Statistics"),
         (name = "config", description = "Proxy configuration"),
         (name = "ca", description = "CA certificate"),
+        (name = "certs", description = "Real upstream server certificates seen by the proxy"),
         (name = "userscripts", description = "Userscripts"),
         (name = "policy", description = "Script policy (NoScript-style per-site capabilities)"),
         (name = "profiles", description = "Per-device filtering profiles"),

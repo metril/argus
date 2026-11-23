@@ -427,6 +427,7 @@ impl SharedEngine {
             status: event.status,
             mode: event.mode,
             error_kind: event.error_kind,
+            cert_fp: event.cert_fp.as_deref(),
         });
     }
 
@@ -772,6 +773,7 @@ impl SharedEngine {
                 status: None,
                 mode,
                 error_kind: None,
+                cert_fp: None,
             });
         } else {
             self.stats.record_allowed();

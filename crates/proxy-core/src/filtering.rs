@@ -227,6 +227,8 @@ pub struct ProxyContext {
     /// Leave bodies alone when the origin says `Cache-Control: no-transform` (header-only edits
     /// still apply). Many CDNs set it on everything, hence the switch.
     respect_no_transform: std::sync::atomic::AtomicBool,
+    /// Upstream certificates seen by the upstream clients (shared with the web API).
+    certs: Arc<common::certstore::CertStore>,
 }
 
 impl ProxyContext {
@@ -255,6 +257,7 @@ impl ProxyContext {
             internal: Arc::new(Internal::new()),
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
+            certs: Default::default(),
         }
     }
 
@@ -325,7 +328,13 @@ impl ProxyContext {
         *ctx.upstream_opts.lock() = Some(opts.clone());
         ctx.policy = opts.policy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
+        ctx.certs = opts.certs.clone();
         Ok(ctx)
+    }
+
+    /// The upstream certificate store.
+    pub fn certs(&self) -> &Arc<common::certstore::CertStore> {
+        &self.certs
     }
 
     /// Replace the destination policy (for contexts built from a ready-made client).
@@ -732,6 +741,7 @@ impl ProxyContext {
                                 status: None,
                                 mode: event_mode(rctx),
                                 error_kind: None,
+                                cert_fp: None,
                             });
                             let v = filter_engine::MatchResult::blocked(rule);
                             return Ok(block_response(rtype, &v, &url));
@@ -839,6 +849,7 @@ impl ProxyContext {
                     common::faults::note(common::faults::Fault::UpstreamTimeout, &host);
                     if !bypass_full {
                         log_request(
+                            &self.certs,
                             rctx,
                             filter_engine::EventAction::Error,
                             method.as_str(),
@@ -868,6 +879,7 @@ impl ProxyContext {
                 debug!("Upstream error for {}: {}", url, e);
                 if !bypass_full {
                     log_request(
+                        &self.certs,
                         rctx,
                         filter_engine::EventAction::Error,
                         method.as_str(),
@@ -878,6 +890,16 @@ impl ProxyContext {
                         Some(crate::upstream::classify_reqwest(&e)),
                     );
                 }
+                if crate::upstream::classify_reqwest(&e) == filter_engine::ErrorKind::UpstreamTls {
+                    let info = self
+                        .certs
+                        .by_host(&url_host)
+                        .filter(|i| i.verdict == common::certstore::Verdict::Invalid);
+                    return Ok(crate::redirect::cert_error_response(
+                        &url_host,
+                        info.as_deref(),
+                    ));
+                }
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
             }
         };
@@ -885,6 +907,7 @@ impl ProxyContext {
         let status = resp.status();
         if !bypass_full {
             log_request(
+                &self.certs,
                 rctx,
                 filter_engine::EventAction::Allowed,
                 method.as_str(),
@@ -1537,6 +1560,7 @@ fn event_mode(rctx: &RequestCtx) -> filter_engine::EventMode {
 /// Record a non-blocked request in the profile engine's request log (and live broadcast).
 #[allow(clippy::too_many_arguments)]
 fn log_request(
+    certs: &common::certstore::CertStore,
     rctx: &RequestCtx,
     action: filter_engine::EventAction,
     method: &str,
@@ -1547,6 +1571,10 @@ fn log_request(
     error_kind: Option<filter_engine::ErrorKind>,
 ) {
     let profile = rctx.profile.load();
+    let cert_fp = url
+        .starts_with("https:")
+        .then(|| certs.fp_for_host(filter_engine::RequestMatcher::host_of(url)))
+        .flatten();
     profile.engine.record_request(&filter_engine::EventRef {
         action,
         method,
@@ -1559,5 +1587,6 @@ fn log_request(
         status,
         mode: event_mode(rctx),
         error_kind,
+        cert_fp: cert_fp.as_deref(),
     });
 }

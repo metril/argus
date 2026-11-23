@@ -343,6 +343,7 @@ fn log_entry(e: RequestEvent) -> RequestLogEntry {
             EventMode::Explicit => LogMode::Explicit,
             EventMode::Transparent => LogMode::Transparent,
         },
+        cert_fp: e.cert_fp,
         error_kind: e.error_kind.map(|k| match k {
             filter_engine::ErrorKind::ClientRejectedCert => {
                 api_types::LogErrorKind::ClientRejectedCert

@@ -25,6 +25,7 @@ fn ev<'a>(action: EventAction, url: &'a str, client: &'a str, mode: EventMode) -
         status: (action == EventAction::Allowed).then_some(200),
         mode,
         error_kind: None,
+        cert_fp: None,
     }
 }
 

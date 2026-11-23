@@ -8,6 +8,7 @@ pub mod audit;
 pub mod auth;
 pub mod bypass;
 pub mod certificate;
+pub mod certs;
 pub mod devices;
 pub mod health;
 pub mod lists;

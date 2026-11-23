@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use crate::TestProxy;
 
 const PASSWORD: &str = "SecurePassword123!";
-const SCOPES: [&str; 10] = [
+const SCOPES: [&str; 11] = [
+    "logs:read",
     "profiles:read",
     "profiles:write",
     "devices:read",

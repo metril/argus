@@ -228,6 +228,7 @@ impl ConnectionHandler {
             client: Some(profile.label.as_ref()),
             status: None,
             error_kind,
+            cert_fp: None,
             mode: if rctx.transparent {
                 filter_engine::EventMode::Transparent
             } else {

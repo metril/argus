@@ -116,6 +116,9 @@ pub struct RequestEvent {
     /// Set on `Error` events.
     #[serde(default)]
     pub error_kind: Option<ErrorKind>,
+    /// SHA-256 fingerprint (hex) of the upstream server certificate, for decrypted requests.
+    #[serde(default)]
+    pub cert_fp: Option<String>,
 }
 
 /// An event as broadcast to live subscribers: the decoded event plus its lowercased searchable
@@ -155,17 +158,19 @@ pub struct EventRef<'a> {
     pub status: Option<u16>,
     pub mode: EventMode,
     pub error_kind: Option<ErrorKind>,
+    pub cert_fp: Option<&'a str>,
 }
 
-const FIELDS: usize = 7;
+const FIELDS: usize = 8;
 
 struct Raw {
     ts_ms: i64,
     text: Box<str>,
-    /// End offset in `text` of each field: url, source, type, rule, list, client, method.
+    /// End offset in `text` of each field: url, source, type, rule, list, client, method, cert fp.
     ends: [u32; FIELDS],
     has_list: bool,
     has_client: bool,
+    has_cert_fp: bool,
     action: u8,
     /// 0 = none.
     status: u16,
@@ -201,6 +206,7 @@ impl Raw {
                 EventMode::Explicit
             },
             error_kind: ErrorKind::from_code(self.error_kind),
+            cert_fp: self.has_cert_fp.then(|| field(7)),
         }
     }
 }
@@ -326,6 +332,7 @@ impl RequestLog {
             status: None,
             mode: EventMode::Explicit,
             error_kind: None,
+            cert_fp: None,
         });
     }
 
@@ -354,6 +361,7 @@ impl RequestLog {
                 e.list_id.unwrap_or(""),
                 e.client.unwrap_or(""),
                 truncate(e.method, 16),
+                truncate(e.cert_fp.unwrap_or(""), 64),
             ];
             for (i, p) in parts.iter().enumerate() {
                 b.push_str(p);
@@ -365,6 +373,7 @@ impl RequestLog {
                 ends,
                 has_list: e.list_id.is_some(),
                 has_client: e.client.is_some(),
+                has_cert_fp: e.cert_fp.is_some(),
                 action: e.action.code(),
                 status: e.status.unwrap_or(0),
                 transparent: e.mode == EventMode::Transparent,
@@ -474,6 +483,7 @@ mod tests {
             status: Some(200),
             mode: EventMode::Transparent,
             error_kind: None,
+            cert_fp: None,
         }
     }
 

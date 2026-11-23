@@ -950,13 +950,16 @@ dependencies = [
  "chrono",
  "ipnet",
  "libc",
+ "moka",
  "parking_lot",
  "psl",
  "rand 0.8.6",
+ "rcgen",
  "redb",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -964,6 +967,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x509-parser",
 ]
 
 [[package]]

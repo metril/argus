@@ -1,6 +1,7 @@
 //! Common utilities and types shared across all crates
 
 pub mod bypass;
+pub mod certstore;
 pub mod config;
 pub mod db;
 pub mod env;

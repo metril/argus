@@ -1023,6 +1023,134 @@
         ],
         "type": "object"
       },
+      "CertChainEntry": {
+        "description": "One certificate of an upstream chain.",
+        "properties": {
+          "fp": {
+            "description": "SHA-256 of the DER, lowercase hex.",
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "not_after": {
+            "description": "RFC 3339.",
+            "type": "string"
+          },
+          "not_before": {
+            "description": "RFC 3339.",
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "issuer",
+          "not_before",
+          "not_after",
+          "fp"
+        ],
+        "type": "object"
+      },
+      "CertFailReason": {
+        "description": "Why an upstream certificate was rejected.",
+        "enum": [
+          "expired",
+          "not_yet_valid",
+          "name_mismatch",
+          "unknown_issuer",
+          "other"
+        ],
+        "type": "string"
+      },
+      "CertInfo": {
+        "description": "The real certificate an upstream server presented to the proxy.",
+        "properties": {
+          "chain": {
+            "description": "The chain as presented, leaf first.",
+            "items": {
+              "$ref": "#/components/schemas/CertChainEntry"
+            },
+            "type": "array"
+          },
+          "detail": {
+            "description": "Verifier message when `verdict` is `invalid`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ev": {
+            "description": "The leaf carries an Extended Validation policy.",
+            "type": "boolean"
+          },
+          "fp": {
+            "description": "SHA-256 of the leaf DER, lowercase hex.",
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "not_after": {
+            "description": "RFC 3339.",
+            "type": "string"
+          },
+          "not_before": {
+            "description": "RFC 3339.",
+            "type": "string"
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CertFailReason",
+                "description": "Set when `verdict` is `invalid`."
+              }
+            ]
+          },
+          "sans": {
+            "description": "DNS names and IP addresses of the subjectAltName extension.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "serial": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/CertVerdict"
+          }
+        },
+        "required": [
+          "fp",
+          "subject",
+          "issuer",
+          "serial",
+          "not_before",
+          "not_after",
+          "sans",
+          "chain",
+          "verdict",
+          "ev"
+        ],
+        "type": "object"
+      },
+      "CertVerdict": {
+        "description": "Verification outcome of an upstream certificate.",
+        "enum": [
+          "ok",
+          "invalid"
+        ],
+        "type": "string"
+      },
       "ChangePasswordRequest": {
         "properties": {
           "current_password": {
@@ -4274,6 +4402,13 @@
         "properties": {
           "action": {
             "$ref": "#/components/schemas/LogAction"
+          },
+          "cert_fp": {
+            "description": "SHA-256 fingerprint (hex) of the upstream server certificate of a decrypted request;\nresolves via `GET /certs/{fp}`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "client": {
             "description": "Id of the profile that handled it (decimal).",
@@ -9282,6 +9417,174 @@
         "summary": "Download the CA certificate (DER), as Android and Windows expect.",
         "tags": [
           "ca"
+        ]
+      }
+    },
+    "/api/v1/certs/by-host/{host}": {
+      "get": {
+        "operationId": "get_cert_by_host",
+        "parameters": [
+          {
+            "description": "Host name as dialed",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CertInfo"
+                }
+              }
+            },
+            "description": "Latest upstream certificate"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "logs:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "logs:read"
+            ]
+          }
+        ],
+        "summary": "The latest certificate a host presented to the proxy.",
+        "tags": [
+          "certs"
+        ]
+      }
+    },
+    "/api/v1/certs/{fp}": {
+      "get": {
+        "operationId": "get_cert",
+        "parameters": [
+          {
+            "description": "SHA-256 fingerprint of the leaf, hex",
+            "in": "path",
+            "name": "fp",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CertInfo"
+                }
+              }
+            },
+            "description": "Upstream certificate"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "logs:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "logs:read"
+            ]
+          }
+        ],
+        "summary": "A certificate by SHA-256 fingerprint (lowercase hex), as linked from the request log.",
+        "tags": [
+          "certs"
         ]
       }
     },
@@ -18275,6 +18578,10 @@
     {
       "description": "CA certificate",
       "name": "ca"
+    },
+    {
+      "description": "Real upstream server certificates seen by the proxy",
+      "name": "certs"
     },
     {
       "description": "Userscripts",

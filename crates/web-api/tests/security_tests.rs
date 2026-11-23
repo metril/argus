@@ -548,6 +548,52 @@ async fn cors_is_same_origin_unless_allowlisted() {
     assert!(bad.headers().get("access-control-allow-origin").is_none());
 }
 
+#[tokio::test]
+async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_only_there() {
+    let ctx = TestContext::new().await.unwrap();
+    let der = rcgen::generate_simple_self_signed(vec!["o.test".to_string()])
+        .unwrap()
+        .cert
+        .der()
+        .to_vec();
+    let fp = ctx
+        .state
+        .certs()
+        .record("o.test", &[der.as_slice()], Ok(()), &|| false)
+        .unwrap();
+    let admin = ctx.admin().await;
+    let secret = ctx.token(&admin, &["logs:read"]).await;
+    let a = ctx
+        .bearer("GET", &format!("/api/v1/certs/{fp}"), &secret)
+        .await;
+    a.assert_status_ok();
+    let b = ctx
+        .bearer("GET", "/api/v1/certs/by-host/o.test", &secret)
+        .add_header("origin", "chrome-extension://abc")
+        .await;
+    b.assert_status_ok();
+    assert_eq!(
+        b.header("access-control-allow-origin"),
+        "chrome-extension://abc"
+    );
+    assert_eq!(a.json::<Value>()["fp"], fp);
+    assert_eq!(a.json::<Value>()["verdict"], "ok");
+    ctx.bearer("GET", "/api/v1/certs/by-host/nope.test", &secret)
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+    ctx.server
+        .get("/api/v1/certs/by-host/o.test")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    // Extension origins get no CORS elsewhere.
+    let h = ctx
+        .server
+        .get("/api/v1/health")
+        .add_header("origin", "moz-extension://abc")
+        .await;
+    assert!(h.headers().get("access-control-allow-origin").is_none());
+}
+
 // ------------------------------------------------------------------ (f) revocation / expiry
 
 #[tokio::test]
