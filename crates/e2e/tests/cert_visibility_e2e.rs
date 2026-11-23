@@ -23,7 +23,7 @@ e2e_test!(
         let fp = ev.cert_fp.clone().expect("cert_fp on a decrypted request");
 
         let api = env.proxy.api().await;
-        let r = api.get(&format!("/certs/{fp}")).await;
+        let r = api.get(&format!("/certs/{fp}?host=good.test")).await;
         r.assert_status_ok();
         let info: serde_json::Value = r.json();
         assert_eq!(info["fp"], fp.as_str());
@@ -74,8 +74,68 @@ e2e_test!(
         assert_eq!(ev.error_kind, Some(ErrorKind::UpstreamTls));
         let fp = ev.cert_fp.clone().expect("cert_fp on the failed request");
         let api = env.proxy.api().await;
-        let info: serde_json::Value = api.get(&format!("/certs/{fp}")).await.json();
+        let info: serde_json::Value = api
+            .get(&format!("/certs/{fp}?host=expired-a.test"))
+            .await
+            .json();
         assert_eq!(info["verdict"], "invalid");
         assert_eq!(info["reason"], "expired");
     }
 );
+
+e2e_test!(
+    each_response_carries_its_own_connections_certificate,
+    rules = Vec::<&str>::new(),
+    |env| {
+        env.origin.route("/ok", MockResponse::ok("fine"));
+        // Two hosts, two certificates, interleaved: every event links to its own host's cert.
+        for _ in 0..2 {
+            for h in ["one.test", "two.test"] {
+                env.client().get(&env.origin.https_url(h, "/ok")).await;
+            }
+        }
+        let api = env.proxy.api().await;
+        let all = env.proxy.engine.recent_requests(10);
+        assert_eq!(all.len(), 4);
+        for e in &all {
+            let host = if e.url.contains("one.test") {
+                "one.test"
+            } else {
+                "two.test"
+            };
+            let fp = e.cert_fp.clone().expect("cert_fp");
+            let info: serde_json::Value = api.get(&format!("/certs/{fp}?host={host}")).await.json();
+            assert!(info["subject"].as_str().unwrap().contains(host), "{info}");
+        }
+    }
+);
+
+#[tokio::test]
+async fn tls_info_is_present_on_every_response_even_when_sessions_resume() {
+    let origin = e2e::TestOrigin::start().await;
+    origin.route("/ok", MockResponse::ok("fine"));
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, origin.ca_pem()).unwrap();
+    let opts = proxy_core::upstream::UpstreamOptions {
+        extra_ca_paths: vec![ca],
+        resolve_all_to: Some(origin.ip()),
+        // No pooling: every request is a new connection that may resume the previous session.
+        pool_max_idle_per_host: Some(0),
+        ..Default::default()
+    };
+    let client = proxy_core::upstream::build_upstream_client(&opts).unwrap();
+    let url = origin.https_url("resume.test", "/ok");
+    let mut fps = Vec::new();
+    for _ in 0..3 {
+        let r = client.get(&url).send().await.unwrap();
+        let der = r
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(|t| t.peer_certificate())
+            .expect("peer certificate on every response")
+            .to_vec();
+        fps.push(common::certstore::fingerprint(&der));
+    }
+    assert!(fps.windows(2).all(|w| w[0] == w[1]));
+}

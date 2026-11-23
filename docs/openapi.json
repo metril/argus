@@ -9456,14 +9456,7 @@
             "description": "Missing, invalid, expired or revoked credentials"
           },
           "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing scope, or CSRF check failed"
+            "description": "Profile-restricted token"
           },
           "429": {
             "content": {
@@ -9513,6 +9506,15 @@
             "in": "path",
             "name": "fp",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Host (optionally `host:port`) the certificate was presented to. Without it the verdict\nreflects the validity period only.",
+            "in": "query",
+            "name": "host",
+            "required": false,
             "schema": {
               "type": "string"
             }

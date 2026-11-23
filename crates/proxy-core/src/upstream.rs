@@ -154,6 +154,7 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
             ocsp_response,
             now,
         );
+        // Key is the host the client dialed (IPv6 without brackets, see `host_key`).
         let host = server_name.to_str();
         let chain: Vec<&[u8]> = std::iter::once(end_entity.as_ref())
             .chain(intermediates.iter().map(|c| c.as_ref()))
@@ -174,7 +175,11 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        let ok = self.inner.verify_tls12_signature(message, cert, dss)?;
+        // The server proved it holds the key: the recorded verdict is now trustworthy.
+        self.store
+            .confirm(&common::certstore::fingerprint(cert.as_ref()));
+        Ok(ok)
     }
 
     fn verify_tls13_signature(
@@ -183,7 +188,11 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        let ok = self.inner.verify_tls13_signature(message, cert, dss)?;
+        // The server proved it holds the key: the recorded verdict is now trustworthy.
+        self.store
+            .confirm(&common::certstore::fingerprint(cert.as_ref()));
+        Ok(ok)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -289,6 +298,8 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
     // destination policy.
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        // Each response carries the certificate of the connection that served it.
+        .tls_info(true)
         .redirect(reqwest::redirect::Policy::none())
         // Latency over batching: the proxy relays whole messages, never small interactive writes
         // it could usefully coalesce (also reqwest's default; stated so it cannot regress).
@@ -683,7 +694,11 @@ mod recording_tests {
     fn good_chain_is_accepted_and_recorded() {
         let (store, pki) = (Arc::new(CertStore::default()), pki());
         let der = leaf(&pki, "good.test", false);
-        check(&verifier(Some(&pki), &store), &der, "good.test").unwrap();
+        let v = verifier(Some(&pki), &store);
+        check(&v, &der, "good.test").unwrap();
+        // Until the server proves the key (signature check) nothing is served.
+        assert!(store.by_host("good.test").is_none());
+        store.confirm(&common::certstore::fingerprint(&der));
         let info = store.by_host("good.test").unwrap();
         assert_eq!(info.verdict, Verdict::Ok);
         assert_eq!(info.reason, None);

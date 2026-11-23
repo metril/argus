@@ -839,6 +839,8 @@ impl ProxyContext {
             rb = rb.body(reqwest::Body::wrap_stream(stream));
         }
 
+        // Start of this attempt: only a rejection recorded after it can belong to this request.
+        let attempt_start = std::time::Instant::now();
         let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);
         let sent = if timeout_ms == 0 {
             rb.send().await
@@ -849,7 +851,7 @@ impl ProxyContext {
                     common::faults::note(common::faults::Fault::UpstreamTimeout, &host);
                     if !bypass_full {
                         log_request(
-                            &self.certs,
+                            None,
                             rctx,
                             filter_engine::EventAction::Error,
                             method.as_str(),
@@ -877,9 +879,11 @@ impl ProxyContext {
             Err(e) => {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
                 debug!("Upstream error for {}: {}", url, e);
+                // A failure with no response: the host's rejection recorded during this attempt.
+                let failed_fp = self.certs.invalid_since(&url_host, attempt_start);
                 if !bypass_full {
                     log_request(
-                        &self.certs,
+                        failed_fp.as_deref(),
                         rctx,
                         filter_engine::EventAction::Error,
                         method.as_str(),
@@ -891,13 +895,12 @@ impl ProxyContext {
                     );
                 }
                 if crate::upstream::classify_reqwest(&e) == filter_engine::ErrorKind::UpstreamTls {
-                    let info = self
-                        .certs
-                        .by_host(&url_host)
-                        .filter(|i| i.verdict == common::certstore::Verdict::Invalid);
+                    let info = failed_fp
+                        .as_deref()
+                        .and_then(|fp| self.certs.info(fp, Some(&url_host)));
                     return Ok(crate::redirect::cert_error_response(
                         &url_host,
-                        info.as_deref(),
+                        info.as_ref(),
                     ));
                 }
                 return Ok(bad_gateway(&format!("Upstream error: {e}")));
@@ -906,8 +909,14 @@ impl ProxyContext {
 
         let status = resp.status();
         if !bypass_full {
+            // The certificate of the connection that served this very response.
+            let cert_fp = resp
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(|t| t.peer_certificate())
+                .and_then(|der| self.certs.note_peer(der));
             log_request(
-                &self.certs,
+                cert_fp.as_deref(),
                 rctx,
                 filter_engine::EventAction::Allowed,
                 method.as_str(),
@@ -1560,7 +1569,7 @@ fn event_mode(rctx: &RequestCtx) -> filter_engine::EventMode {
 /// Record a non-blocked request in the profile engine's request log (and live broadcast).
 #[allow(clippy::too_many_arguments)]
 fn log_request(
-    certs: &common::certstore::CertStore,
+    cert_fp: Option<&str>,
     rctx: &RequestCtx,
     action: filter_engine::EventAction,
     method: &str,
@@ -1571,10 +1580,6 @@ fn log_request(
     error_kind: Option<filter_engine::ErrorKind>,
 ) {
     let profile = rctx.profile.load();
-    let cert_fp = url
-        .starts_with("https:")
-        .then(|| certs.fp_for_host(filter_engine::RequestMatcher::host_of(url)))
-        .flatten();
     profile.engine.record_request(&filter_engine::EventRef {
         action,
         method,
@@ -1587,6 +1592,6 @@ fn log_request(
         status,
         mode: event_mode(rctx),
         error_kind,
-        cert_fp: cert_fp.as_deref(),
+        cert_fp,
     });
 }

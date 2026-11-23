@@ -561,6 +561,14 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
         .certs()
         .record("o.test", &[der.as_slice()], Ok(()), &|| false)
         .unwrap();
+    ctx.state.certs().confirm(&fp);
+    // Another host replaying the chain gets its own verdict; o.test's is untouched.
+    ctx.state.certs().record(
+        "evil.test",
+        &[der.as_slice()],
+        Err((::common::certstore::FailReason::NameMismatch, "bad".into())),
+        &|| false,
+    );
     let admin = ctx.admin().await;
     let secret = ctx.token(&admin, &["logs:read"]).await;
     let a = ctx
@@ -578,6 +586,36 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
     );
     assert_eq!(a.json::<Value>()["fp"], fp);
     assert_eq!(a.json::<Value>()["verdict"], "ok");
+    let evil: Value = ctx
+        .bearer(
+            "GET",
+            &format!("/api/v1/certs/{fp}?host=evil.test"),
+            &secret,
+        )
+        .await
+        .json();
+    assert_eq!(evil["reason"], "name_mismatch");
+    let ok: Value = ctx
+        .bearer(
+            "GET",
+            &format!("/api/v1/certs/{fp}?host=O.test:443"),
+            &secret,
+        )
+        .await
+        .json();
+    assert_eq!(ok["verdict"], "ok");
+    // A profile-restricted token cannot probe hosts, but can read a cert it holds the fp of.
+    let r = admin
+        .post("/api/v1/tokens")
+        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
+        .await;
+    let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
+    ctx.bearer("GET", "/api/v1/certs/by-host/o.test", &kid)
+        .await
+        .assert_status_forbidden();
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}"), &kid)
+        .await
+        .assert_status_ok();
     ctx.bearer("GET", "/api/v1/certs/by-host/nope.test", &secret)
         .await
         .assert_status(StatusCode::NOT_FOUND);
