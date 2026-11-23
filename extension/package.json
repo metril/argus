@@ -1,0 +1,20 @@
+{
+  "name": "argus-extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "gen:api": "openapi-typescript ../docs/openapi.json -o lib/api-schema.d.ts",
+    "typecheck": "npm run gen:api && wxt prepare && tsc --noEmit",
+    "build": "npm run gen:api && wxt build",
+    "build:firefox": "npm run gen:api && wxt build -b firefox",
+    "zip": "npm run gen:api && wxt zip",
+    "zip:firefox": "npm run gen:api && wxt zip -b firefox"
+  },
+  "devDependencies": {
+    "@types/chrome": "0.3.7",
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3",
+    "wxt": "0.21.5"
+  }
+}

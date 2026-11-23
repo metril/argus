@@ -31,3 +31,9 @@ Thumbs.db
 
 # Trunk build output
 crates/web-ui/dist/
+
+# Browser extension
+extension/node_modules
+extension/.output
+extension/.wxt
+extension/lib/api-schema.d.ts
