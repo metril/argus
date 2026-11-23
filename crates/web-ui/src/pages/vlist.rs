@@ -22,6 +22,8 @@ pub struct Feed<T: Send + Sync + 'static> {
     pub next: RwSignal<Option<String>>,
     pub total: RwSignal<usize>,
     pub loading: RwSignal<bool>,
+    /// Message of the last failed fetch (cleared by the next success or retry).
+    pub error: RwSignal<Option<String>>,
     /// Bumped when the list restarts so the scroller jumps to the top.
     pub tok: RwSignal<u32>,
     gen: RwSignal<u64>,
@@ -41,6 +43,7 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
             next: RwSignal::new(None),
             total: RwSignal::new(0),
             loading: RwSignal::new(false),
+            error: RwSignal::new(None),
             tok: RwSignal::new(0),
             gen: RwSignal::new(0),
             fetch: StoredValue::new_local(fetch),
@@ -66,7 +69,11 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
                 return;
             }
             me.loading.set(false);
+            if let Err(e) = &r {
+                me.error.set(Some(e.to_string()));
+            }
             if let Ok((items, next, total)) = r {
+                me.error.set(None);
                 let n = items.len();
                 if n == 0 && keep_if_empty {
                     if let Some(cb) = on_done {
@@ -85,13 +92,25 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
         });
     }
 
+    /// Retry after a failed fetch: restart when nothing is loaded, else fetch the next page.
+    pub fn retry(&self) {
+        let had_items = self.items.with_untracked(|v| !v.is_empty());
+        self.error.set(None);
+        if had_items {
+            self.more();
+        } else {
+            self.reload(None, false, None);
+        }
+    }
+
     /// Fetch the next page, if any.
     pub fn more(&self) {
         let me = *self;
         let Some(cursor) = me.next.get_untracked() else {
             return;
         };
-        if me.loading.get_untracked() {
+        // After a failure, paging resumes only through `retry` (no hot loop on a dead endpoint).
+        if me.loading.get_untracked() || me.error.get_untracked().is_some() {
             return;
         }
         let g = me.gen.get_untracked();
@@ -103,7 +122,11 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
                 return;
             }
             me.loading.set(false);
+            if let Err(e) = &r {
+                me.error.set(Some(e.to_string()));
+            }
             if let Ok((items, next, total)) = r {
+                me.error.set(None);
                 me.items.update(|v| v.extend(items));
                 me.next.set(next);
                 me.total.set(total);
@@ -159,6 +182,10 @@ pub fn VList<T>(
     /// Render rows inside `<ul class="flist">` (for `<li>` rows) instead of a `<div>`.
     #[prop(optional)]
     as_list: bool,
+    /// Feed error to show with a Retry button.
+    #[prop(optional)]
+    error: Option<RwSignal<Option<String>>>,
+    #[prop(optional)] on_retry: Option<Callback<()>>,
 ) -> impl IntoView
 where
     T: Clone + Send + Sync + 'static,
@@ -231,7 +258,21 @@ where
         }
     };
 
+    let banner = move || {
+        error.and_then(|e| e.get()).map(|msg| {
+            view! {
+                <div class="vlist-err" role="alert">
+                    <span>{format!("Failed to load: {msg}")}</span>
+                    <button type="button" class="btn sm" on:click=move |_| {
+                        if let Some(cb) = on_retry { cb.run(()); }
+                    }>"Retry"</button>
+                </div>
+            }
+        })
+    };
+
     view! {
+        {banner}
         <div
             class="vlist"
             node_ref=node

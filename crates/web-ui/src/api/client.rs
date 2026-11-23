@@ -124,7 +124,18 @@ pub fn scope_to_profile(path: &str, profile: &str) -> String {
 thread_local! {
     static REFRESH_IN_FLIGHT: Cell<bool> = const { Cell::new(false) };
     static REFRESH_OK: Cell<bool> = const { Cell::new(false) };
+    /// `Date.now()` of the last failed refresh; a burst of requests that 401 right after
+    /// reuses that verdict instead of each re-POSTing `/auth/refresh`.
+    static REFRESH_FAILED_AT: Cell<f64> = const { Cell::new(0.0) };
 }
+
+/// Forget a failed refresh (after a fresh login the cookies are valid again).
+pub fn reset_refresh_cooldown() {
+    REFRESH_FAILED_AT.with(|c| c.set(0.0));
+}
+
+/// How long a failed refresh is trusted, in ms.
+const REFRESH_FAIL_TTL_MS: f64 = 5000.0;
 
 /// API client for making authenticated requests
 #[derive(Clone)]
@@ -324,11 +335,18 @@ impl ApiClient {
             };
         }
 
+        if js_sys::Date::now() - REFRESH_FAILED_AT.with(Cell::get) < REFRESH_FAIL_TTL_MS {
+            return Err(ApiError::Unauthorized);
+        }
+
         // We own the refresh. No `.await` between the check above and this set,
         // so on the single-threaded WASM executor this is race-free.
         REFRESH_IN_FLIGHT.with(|f| f.set(true));
         let result = self.do_refresh().await;
         REFRESH_OK.with(|c| c.set(result.is_ok()));
+        if result.is_err() {
+            REFRESH_FAILED_AT.with(|c| c.set(js_sys::Date::now()));
+        }
         REFRESH_IN_FLIGHT.with(|f| f.set(false));
         result
     }

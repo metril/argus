@@ -68,13 +68,17 @@ fn SessionsInner() -> impl IntoView {
             let app = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let c = ApiClient::new();
-                let mut n = 0;
+                let (mut n, total) = (0, ids.len());
                 for id in ids {
                     if c.admin_revoke_session(&id).await.is_ok() {
                         n += 1;
                     }
                 }
-                app.success(format!("{n} sessions revoked"));
+                if n == total {
+                    app.success(format!("{n} sessions revoked"));
+                } else {
+                    app.error(format!("{} of {total} sessions failed to revoke", total - n));
+                }
                 reload.update(|n| *n += 1);
             });
         })

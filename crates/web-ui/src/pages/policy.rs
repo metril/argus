@@ -709,6 +709,8 @@ fn SitesCard(reload: RwSignal<u32>) -> impl IntoView {
                         key=|r: &SiteRuleDto| format!("{}:{}", r.id, r.preset.kind)
                         render=render
                         on_end=Callback::new(move |()| feed.more())
+                        error=feed.error
+                        on_retry=Callback::new(move |()| feed.retry())
                         on_anchor=on_anchor
                         reset=feed.tok
                         label="Site rules"
@@ -927,19 +929,18 @@ fn SourceMatrix(page_scope: String) -> impl IntoView {
                                                     }
                                                 }).collect_view()}
                                                 <td>
-                                                    <button
-                                                        class="btn danger sm"
-                                                        on:click=move |_| {
+                                                    <ConfirmButton
+                                                        label="Remove"
+                                                        confirm_label="Remove?"
+                                                        on_confirm=Callback::new(move |()| {
                                                             let rid = rid_del.clone();
                                                             run(&app_del, async move {
                                                                 ApiClient::new().delete_source_rule(&rid).await?;
                                                                 reload.update(|n| *n += 1);
                                                                 Ok(String::new())
                                                             });
-                                                        }
-                                                    >
-                                                        "Remove"
-                                                    </button>
+                                                        })
+                                                    />
                                                 </td>
                                             </tr>
                                         }

@@ -371,6 +371,8 @@ pub fn DevicesPage() -> impl IntoView {
                                 }.into_any()
                             })
                             on_end=Callback::new(move |()| feed.more())
+                            error=feed.error
+                            on_retry=Callback::new(move |()| feed.retry())
                             on_anchor=on_anchor
                             reset=feed.tok
                             label="Devices"

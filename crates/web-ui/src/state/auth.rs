@@ -56,18 +56,8 @@ impl AuthState {
                 self.user.set(Some(user));
             }
             Err(ApiError::Unauthorized) => {
-                // Try to refresh the token
-                match client.refresh().await {
-                    Ok(_) => {
-                        // Retry getting user info
-                        if let Ok(user) = client.me().await {
-                            self.user.set(Some(user));
-                        }
-                    }
-                    Err(_) => {
-                        self.user.set(None);
-                    }
-                }
+                // `me()` already tried a (single-flight) refresh before giving up.
+                self.user.set(None);
             }
             Err(ApiError::Forbidden(_)) => {
                 // Access denied - logout

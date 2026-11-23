@@ -20,7 +20,11 @@ impl ApiClient {
             password: password.to_string(),
             password_confirm: password.to_string(),
         };
-        self.post("/auth/register", &req).await
+        let r = self.post("/auth/register", &req).await;
+        if r.is_ok() {
+            super::client::reset_refresh_cooldown();
+        }
+        r
     }
 
     /// Login with username and password
@@ -29,7 +33,11 @@ impl ApiClient {
             username: username.to_string(),
             password: password.to_string(),
         };
-        self.post("/auth/login", &req).await
+        let r = self.post("/auth/login", &req).await;
+        if r.is_ok() {
+            super::client::reset_refresh_cooldown();
+        }
+        r
     }
 
     /// Logout the current user

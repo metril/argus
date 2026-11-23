@@ -58,6 +58,9 @@ fn paths(name: &str) -> &'static str {
         }
         "moon" => r#"<path d="M13 9.5A5.5 5.5 0 0 1 6.5 3 5.5 5.5 0 1 0 13 9.5z"/>"#,
         "out" => r#"<path d="M6 2.5H3v11h3M10 5l3 3-3 3M13 8H6"/>"#,
+        "trash" => {
+            r#"<path d="M2.5 4h11M6 4V2.5h4V4M4 4l.6 9.5h6.8L12 4M6.8 6.5v4.5M9.2 6.5v4.5"/>"#
+        }
         "bypass" => {
             r#"<rect x="3" y="7" width="10" height="7" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2M8 10v1.5"/>"#
         }

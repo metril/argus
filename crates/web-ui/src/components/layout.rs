@@ -27,30 +27,40 @@ pub fn Layout(#[prop(into, optional)] class: String, children: Children) -> impl
     // A navigation closes the off-canvas menu.
     nav_open.set(false);
 
-    let children_view = children();
+    // Nothing authenticated (pages, sidebar, navbar: all of which fetch on creation) is built
+    // until the session check says we are logged in, so a logged-out visit makes no API calls
+    // beyond the session check itself.
+    let slot = StoredValue::new_local(Some(children));
+    let authed = Memo::new(move |_| user.with(|u| u.is_some()));
+    let class = StoredValue::new(class);
 
     view! {
-        <div class=move || format!(
-            "app {} {}",
-            if collapsed.get() { "collapsed" } else { "" },
-            if nav_open.get() { "navopen" } else { "" }
-        )>
-            <Sidebar />
-            <Navbar />
-            <main class="main" id="main" tabindex="-1">
-                <div class=format!("screen {class}")>
-                    {children_view}
+        {move || authed.get().then(|| {
+            let children_view = slot.try_update_value(Option::take).flatten().map(|c| c());
+            view! {
+                <div class=move || format!(
+                    "app {} {}",
+                    if collapsed.get() { "collapsed" } else { "" },
+                    if nav_open.get() { "navopen" } else { "" }
+                )>
+                    <Sidebar />
+                    <Navbar />
+                    <main class="main" id="main" tabindex="-1">
+                        <div class=format!("screen {}", class.get_value())>
+                            {children_view}
+                        </div>
+                    </main>
+                    <Show when=move || nav_open.get()>
+                        <div class="navscrim" on:click=move |_| nav_open.set(false)></div>
+                    </Show>
+                    <ToastContainer />
+                    <CommandPalette />
                 </div>
-            </main>
-            <Show when=move || nav_open.get()>
-                <div class="navscrim" on:click=move |_| nav_open.set(false)></div>
-            </Show>
-            <ToastContainer />
-            <CommandPalette />
-            <Show when=move || checked.get() && user.get().is_none()>
-                <Redirect path="/login" />
-            </Show>
-        </div>
+            }
+        })}
+        <Show when=move || checked.get() && user.get().is_none()>
+            <Redirect path="/login" />
+        </Show>
     }
 }
 

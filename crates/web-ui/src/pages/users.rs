@@ -64,8 +64,9 @@ fn UsersInner() -> impl IntoView {
                     Ok(p) => users.set(p.items),
                     Err(e) => app.error(format!("Failed to load users: {e}")),
                 }
-                if let Ok(p) = c.list_profiles().await {
-                    profiles.set(p.into_iter().map(|p| (p.id, p.name)).collect());
+                match c.list_profiles().await {
+                    Ok(p) => profiles.set(p.into_iter().map(|p| (p.id, p.name)).collect()),
+                    Err(e) => app.error(format!("Failed to load profiles: {e}")),
                 }
             });
         });
