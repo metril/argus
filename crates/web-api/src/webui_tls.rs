@@ -25,26 +25,52 @@ pub const RENEW_BEFORE_DAYS: i64 = 30;
 pub const ISSUED_DAYS: i64 = 397;
 
 /// The TLS configuration the listener reads for every new connection. Swapping it takes effect
-/// for the next connection without rebinding.
-#[derive(Default)]
+/// for the next connection without rebinding; open connections are asked to finish when TLS is
+/// switched on or off (or the redirect changes), so nothing keeps the old protocol.
 pub struct TlsShared {
     cfg: ArcSwapOption<ServerConfig>,
     redirect: AtomicBool,
+    /// Proxies whose `X-Forwarded-Proto: https` means the client already used HTTPS.
+    trusted: Vec<IpAddr>,
+    epoch: tokio::sync::watch::Sender<u64>,
+    header_timeout_ms: std::sync::atomic::AtomicU64,
 }
 
 impl TlsShared {
-    pub fn new(cfg: Option<Arc<ServerConfig>>, redirect: bool) -> Self {
+    pub fn new(cfg: Option<Arc<ServerConfig>>, redirect: bool, trusted: Vec<IpAddr>) -> Self {
         Self {
             cfg: ArcSwapOption::new(cfg),
             redirect: AtomicBool::new(redirect),
+            trusted,
+            epoch: tokio::sync::watch::channel(0).0,
+            header_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
         }
     }
     pub fn set(&self, cfg: Option<Arc<ServerConfig>>, redirect: bool) {
+        let (old, old_redirect) = self.snapshot();
+        let changed = old.is_some() != cfg.is_some() || old_redirect != redirect;
         self.cfg.store(cfg);
         self.redirect.store(redirect, Ordering::Relaxed);
+        if changed {
+            self.epoch.send_modify(|e| *e += 1);
+        }
     }
     pub fn snapshot(&self) -> (Option<Arc<ServerConfig>>, bool) {
         (self.cfg.load_full(), self.redirect.load(Ordering::Relaxed))
+    }
+    pub fn trusted(&self) -> &[IpAddr] {
+        &self.trusted
+    }
+    /// Receiver that changes when connections should wind down (subscribe before `snapshot`).
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.epoch.subscribe()
+    }
+    pub fn header_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.header_timeout_ms.load(Ordering::Relaxed))
+    }
+    pub fn set_header_timeout(&self, d: std::time::Duration) {
+        self.header_timeout_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
     }
 }
 
@@ -190,6 +216,25 @@ fn fresh_for(f: &CertFacts, sans: &[String], now: i64) -> bool {
         && sans.iter().all(|s| f.info.sans.iter().any(|c| c == s))
 }
 
+/// Whether `cert_pem` was signed by the CA certificate currently on disk (a regenerated or
+/// replaced CA invalidates certificates issued by the old one).
+fn signed_by_current_ca(state: &AppState, cert_pem: &str) -> bool {
+    let ca_path = state.proxy_state.config.read().mitm.ca_cert_path.clone();
+    let Ok(ca_pem) = std::fs::read_to_string(ca_path) else {
+        return false;
+    };
+    let (Ok(ca_der), Ok(leaf_der)) = (first_cert(&ca_pem), first_cert(cert_pem)) else {
+        return false;
+    };
+    let (Ok((_, ca)), Ok((_, leaf))) = (
+        x509_parser::parse_x509_certificate(&ca_der),
+        x509_parser::parse_x509_certificate(&leaf_der),
+    ) else {
+        return false;
+    };
+    leaf.verify_signature(Some(ca.public_key())).is_ok()
+}
+
 pub fn tls_dir(state: &AppState) -> PathBuf {
     state
         .proxy_state
@@ -212,16 +257,23 @@ fn files_of(dir: &Path, mode: WebUiTlsMode) -> Option<(PathBuf, PathBuf)> {
     Some((dir.join(c), dir.join(k)))
 }
 
-/// Write `data` readable by the owner only, atomically.
+/// Write `data` readable by the owner only, atomically: the directory is 0700, the temporary
+/// file has a random name and is created exclusively (never through a symlink), and the rename
+/// is made durable by syncing the directory.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    let tmp = path.with_extension("tmp");
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("f");
+    let tmp = dir.join(format!(".{name}.{:016x}.tmp", rand::random::<u64>()));
+    let written = (|| {
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -230,13 +282,13 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let mut f = opts.open(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return written;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Previous contents of files a change overwrites, to put back when saving fails.
@@ -277,7 +329,9 @@ async fn argus_material(state: &AppState, sans: &[String]) -> Result<Material, S
     let (cp, kp) = files_of(&dir, WebUiTlsMode::ArgusCa).expect("mode has files");
     if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
         if let Ok(f) = inspect(&c) {
-            if fresh_for(&f, sans, chrono::Utc::now().timestamp()) && server_config(&c, &k).is_ok()
+            if fresh_for(&f, sans, chrono::Utc::now().timestamp())
+                && signed_by_current_ca(state, &c)
+                && server_config(&c, &k).is_ok()
             {
                 return Ok(Material {
                     cert_pem: c,
@@ -352,27 +406,46 @@ pub async fn initial(state: &AppState) -> Option<Arc<ServerConfig>> {
     }
 }
 
-/// Renew an Argus-issued certificate that is close to expiry (or no longer covers its names)
-/// and swap it in live. Called from the periodic tick.
+/// Bring the listener in line with the saved setting: serve TLS if it is configured but not
+/// active (startup fallback, either mode), and renew an Argus-issued certificate that is close
+/// to expiry, no longer covers its names or was issued by a replaced CA. Holds the config lock
+/// so it cannot interleave with a settings change.
 pub async fn renew_if_due(state: &AppState) {
+    let _g = state.config_lock.lock().await;
     let tls = state.proxy_state.config.read().webui.tls.clone();
-    if tls.mode != WebUiTlsMode::ArgusCa {
+    if tls.mode == WebUiTlsMode::Off {
         return;
     }
     let Some(web) = state.web_server.get() else {
         return;
     };
     match material(state, &tls).await {
-        Ok(Some(m)) if m.issued => match server_config(&m.cert_pem, &m.key_pem) {
-            Ok(cfg) => {
-                web.set_tls(Some(cfg), tls.redirect_http);
-                tracing::info!("Web UI HTTPS certificate renewed");
+        Ok(Some(m)) if m.issued || web.tls_snapshot().0.is_none() => {
+            match server_config(&m.cert_pem, &m.key_pem) {
+                Ok(cfg) => {
+                    web.set_tls(Some(cfg), tls.redirect_http);
+                    tracing::info!("Web UI HTTPS certificate loaded");
+                }
+                Err(e) => tracing::warn!("web UI certificate is unusable: {e}"),
             }
-            Err(e) => tracing::warn!("renewed web UI certificate is unusable: {e}"),
-        },
+        }
         Ok(_) => {}
-        Err(e) => tracing::warn!("web UI certificate renewal failed: {e}"),
+        Err(e) => tracing::warn!("web UI HTTPS unavailable: {e}"),
     }
+}
+
+/// Why HTTPS is configured but not served, if so.
+pub fn not_served(state: &AppState) -> Option<String> {
+    let mode = state.proxy_state.config.read().webui.tls.mode;
+    let active = state
+        .web_server
+        .get()
+        .is_some_and(|w| w.tls_snapshot().0.is_some());
+    (mode != WebUiTlsMode::Off && !active).then(|| {
+        "HTTPS is configured for the web UI but is not being served; it is plain HTTP right now. \
+         Check the certificate under Settings > HTTPS."
+            .to_string()
+    })
 }
 
 /// The saved setting, the certificate it uses and whether TLS is being served.

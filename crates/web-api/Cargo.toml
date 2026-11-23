@@ -85,7 +85,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 arc-swap = { workspace = true }
 # CA certificate details
-x509-parser = "0.18"
+x509-parser = { version = "0.18", features = ["verify"] }
 sha2 = "0.10"
 
 [features]

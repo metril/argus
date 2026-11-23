@@ -34,20 +34,61 @@ fn current_hostname() -> String {
         .to_string()
 }
 
-/// Send the browser to the same page on the other protocol after a short pause.
-fn move_to(https: bool) {
+/// Whether this page was loaded over HTTPS (directly or through a TLS proxy).
+fn page_is_https() -> bool {
+    web_sys::window()
+        .and_then(|w| w.location().protocol().ok())
+        .is_some_and(|p| p == "https:")
+}
+
+/// Whether applying `target_https` should send the browser to the other protocol: switching
+/// built-in HTTPS on from an http page, or off from an https page that the built-in TLS was
+/// serving. A page behind a TLS proxy (https, built-in off) stays where it is.
+fn must_navigate(target_https: bool, was_active: bool) -> bool {
+    if target_https {
+        !page_is_https()
+    } else {
+        was_active && page_is_https()
+    }
+}
+
+/// Move the browser to the same page on the other protocol once the target answers (up to ~10 s
+/// for HTTPS; the browser blocks probing http from an https page, so that waits a moment
+/// instead). Returns false when the target never became reachable.
+async fn move_to(https: bool) -> bool {
     let Some(loc) = web_sys::window().map(|w| w.location()) else {
-        return;
+        return false;
     };
-    let host = loc.host().unwrap_or_default();
-    let url = format!(
-        "{}//{host}/settings",
-        if https { "https:" } else { "http:" }
+    let origin = format!(
+        "{}//{}",
+        if https { "https:" } else { "http:" },
+        loc.host().unwrap_or_default()
     );
-    gloo_timers::callback::Timeout::new(2000, move || {
-        let _ = web_sys::window().map(|w| w.location().set_href(&url));
-    })
-    .forget();
+    if https {
+        let probe = format!("{origin}/api/v1/health");
+        let mut ok = false;
+        for _ in 0..10 {
+            // A no-cors request resolves once a TLS connection is established and fails on a
+            // certificate or connection error, which is all that is needed here.
+            if gloo_net::http::Request::get(&probe)
+                .mode(web_sys::RequestMode::NoCors)
+                .send()
+                .await
+                .is_ok()
+            {
+                ok = true;
+                break;
+            }
+            gloo_timers::future::TimeoutFuture::new(1000).await;
+        }
+        if !ok {
+            return false;
+        }
+    } else {
+        gloo_timers::future::TimeoutFuture::new(1500).await;
+    }
+    let _ = loc.set_href(&format!("{origin}/settings"));
+    true
 }
 
 #[component]
@@ -93,13 +134,19 @@ pub fn HttpsCard() -> impl IntoView {
                 load(s);
                 key_pem.set(String::new());
                 cert_pem.set(String::new());
-                if now != was {
+                if must_navigate(now, was) {
                     app.get_value().success(if now {
                         "HTTPS is on. Moving this page to https://..."
                     } else {
                         "HTTPS is off. Moving this page to http://..."
                     });
-                    move_to(now);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if !move_to(now).await {
+                            app.get_value().error(
+                                "https:// is not reachable from this browser yet. Install and trust the Argus CA, then open the https:// address yourself.",
+                            );
+                        }
+                    });
                 } else {
                     app.get_value().success("HTTPS settings applied");
                 }
@@ -136,7 +183,12 @@ pub fn HttpsCard() -> impl IntoView {
     // Switching HTTPS on or off moves this page to another address: ask first.
     let moves = move || {
         let on = parse_mode(&mode.get()) != WebUiTlsMode::Off;
-        status.get().is_some_and(|s| s.active != on)
+        status.get().is_some_and(|s| must_navigate(on, s.active))
+    };
+    // Going from https to http drops the session: its cookies are Secure.
+    let logs_out = move || {
+        parse_mode(&mode.get()) == WebUiTlsMode::Off
+            && status.get().is_some_and(|s| must_navigate(false, s.active))
     };
     let ca_url = format!("{}/api/v1/ca.crt", api_base_url());
 
@@ -219,6 +271,11 @@ pub fn HttpsCard() -> impl IntoView {
                         ", install it, then apply. The CA stays downloadable over http:// on this port."
                     </p>
                 </Show>
+                <Show when=move || logs_out()>
+                    <p class="fmsg bad" role="note" style="margin-bottom:var(--s2)">
+                        "Turning HTTPS off moves this page to http:// and signs you out: session cookies are marked Secure and are not sent over http. Log in again afterwards."
+                    </p>
+                </Show>
                 <div>
                     <Show when=move || moves() fallback=move || view! {
                         <button class="btn primary" type="button" disabled=move || busy.get() on:click=move |_| apply()>"Apply HTTPS settings"</button>
@@ -226,7 +283,7 @@ pub fn HttpsCard() -> impl IntoView {
                         <ConfirmButton
                             label="Apply and move this page"
                             confirm_label="Confirm: move this page"
-                            class="primary"
+                            large=true
                             disabled=Signal::derive(move || busy.get())
                             on_confirm=Callback::new(move |_| apply())
                         />

@@ -47,7 +47,8 @@ impl TestCa {
     }
 }
 
-struct Fake(Arc<TestCa>);
+/// The CA the fake runtime currently signs with (swappable to simulate a replaced CA).
+struct Fake(Arc<std::sync::Mutex<Arc<TestCa>>>);
 
 #[async_trait::async_trait]
 impl RuntimeControl for Fake {
@@ -77,32 +78,52 @@ impl RuntimeControl for Fake {
     }
     async fn note_webui(&self, _: &str, _: u16) {}
     async fn issue_webui_cert(&self, sans: &[String]) -> Result<(String, String), String> {
-        Ok(self.0.leaf(sans))
+        Ok(self.0.lock().unwrap().leaf(sans))
     }
 }
 
 struct Env {
     ctx: TestContext,
     ca: Arc<TestCa>,
+    slot: Arc<std::sync::Mutex<Arc<TestCa>>>,
     addr: SocketAddr,
 }
 
 async fn start() -> Env {
-    let ctx = TestContext::new().await.unwrap();
+    start_with(|_| {}).await
+}
+
+async fn start_with(tweak: impl FnOnce(&mut web_api::config::ApiConfig)) -> Env {
+    let ctx = TestContext::with_config(tweak).await.unwrap();
     let ca = Arc::new(TestCa::new());
-    assert!(ctx.state.runtime.set(Arc::new(Fake(ca.clone()))).is_ok());
+    let slot = Arc::new(std::sync::Mutex::new(ca.clone()));
+    assert!(ctx.state.runtime.set(Arc::new(Fake(slot.clone()))).is_ok());
+    // The CA certificate the issued certificates must chain to.
+    let ca_path = ctx.temp_dir.path().join("ca.crt");
+    std::fs::write(&ca_path, &ca.pem).unwrap();
+    ctx.state.proxy_state.config.write().mitm.ca_cert_path = ca_path;
     let mut cfg = ctx.api_config.clone();
     cfg.server.host = "127.0.0.1".into();
     cfg.server.port = 0;
-    tokio::spawn(web_api::start_server(ctx.state.clone(), cfg));
-    let web = loop {
-        if let Some(w) = ctx.state.web_server.get() {
-            break w.clone();
+    let task = tokio::spawn(web_api::start_server(ctx.state.clone(), cfg));
+    let web = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(w) = ctx.state.web_server.get() {
+                return w.clone();
+            }
+            assert!(!task.is_finished(), "start_server ended: {:?}", task.await);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
+    })
+    .await
+    .expect("web server did not start within 5s");
     let addr = web.addr().await;
-    Env { ctx, ca, addr }
+    Env {
+        ctx,
+        ca,
+        slot,
+        addr,
+    }
 }
 
 fn client_config(ca_pem: &str) -> Arc<rustls::ClientConfig> {
@@ -152,9 +173,14 @@ async fn https_get(
 }
 
 async fn plain_get(addr: SocketAddr, host: &str, path: &str) -> String {
+    plain_get_with(addr, host, path, "").await
+}
+
+async fn plain_get_with(addr: SocketAddr, host: &str, path: &str, extra: &str) -> String {
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     s.write_all(
-        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n")
+            .as_bytes(),
     )
     .await
     .unwrap();
@@ -222,17 +248,31 @@ async fn tls_handshake_redirect_live_swap_and_bad_upload() {
         .await
         .is_err());
 
-    // Plain HTTP is redirected (308), keeping host, port and path; the CA download is not.
+    // Plain HTTP is redirected (307), keeping host, port and path; the CA download is not.
     let resp = plain_get(env.addr, &format!("localhost:{port}"), "/settings?a=1")
         .await
         .to_lowercase();
-    assert!(resp.starts_with("http/1.1 308"), "{resp}");
+    assert!(resp.starts_with("http/1.1 307"), "{resp}");
     assert!(
         resp.contains(&format!("location: https://localhost:{port}/settings?a=1")),
         "{resp}"
     );
+    assert!(resp.contains("cache-control: no-store"), "{resp}");
+    // The port comes from the Host header (container port mappings), not the socket.
+    let mapped = plain_get(env.addr, "argus.lan:8443", "/x")
+        .await
+        .to_lowercase();
+    assert!(
+        mapped.contains("location: https://argus.lan:8443/x"),
+        "{mapped}"
+    );
+    // Health probes (the container healthcheck) are never redirected.
+    for p in ["/api/v1/health", "/health"] {
+        let r = plain_get(env.addr, "127.0.0.1", p).await;
+        assert!(!r.to_lowercase().starts_with("http/1.1 307"), "{p}: {r}");
+    }
     let ca = plain_get(env.addr, "localhost", "/api/v1/ca.crt").await;
-    assert!(!ca.starts_with("HTTP/1.1 308"), "{ca}");
+    assert!(!ca.starts_with("HTTP/1.1 307"), "{ca}");
     // Redirect off: plain HTTP is served again.
     put_tls(
         &env,
@@ -430,4 +470,73 @@ async fn only_admins_may_change_https() {
         .json(&json!({"mode": "off"}))
         .await;
     assert_eq!(r.status_code(), 403);
+}
+
+#[tokio::test]
+async fn trusted_proxy_that_terminated_tls_is_not_redirected() {
+    let env = start_with(|c| c.network.trusted_proxies = vec!["127.0.0.1".parse().unwrap()]).await;
+    let admin = env.ctx.admin().await;
+    put_tls(
+        &env,
+        &admin,
+        json!({"mode": "argus_ca", "sans": ["localhost"], "redirect_http": true}),
+    )
+    .await
+    .assert_status_ok();
+    let plain = plain_get(env.addr, "localhost", "/api/v1/auth/me")
+        .await
+        .to_lowercase();
+    assert!(plain.starts_with("http/1.1 307"), "{plain}");
+    let proxied = plain_get_with(
+        env.addr,
+        "localhost",
+        "/api/v1/auth/me",
+        "X-Forwarded-Proto: https\r\n",
+    )
+    .await;
+    assert!(proxied.starts_with("HTTP/1.1 401"), "{proxied}");
+}
+
+#[tokio::test]
+async fn certificate_from_a_replaced_ca_is_reissued() {
+    let env = start().await;
+    let admin = env.ctx.admin().await;
+    let body = json!({"mode": "argus_ca", "sans": ["localhost"], "redirect_http": false});
+    put_tls(&env, &admin, body.clone()).await.assert_status_ok();
+    let (_, fp1) = https_get(env.addr, &env.ca.pem, "localhost", "/")
+        .await
+        .unwrap();
+    // Same names, same CA: reused.
+    put_tls(&env, &admin, body.clone()).await.assert_status_ok();
+    let (_, same) = https_get(env.addr, &env.ca.pem, "localhost", "/")
+        .await
+        .unwrap();
+    assert_eq!(fp1, same);
+    // The CA is replaced: the stored certificate no longer chains to it and is reissued.
+    let ca2 = Arc::new(TestCa::new());
+    std::fs::write(env.ctx.temp_dir.path().join("ca.crt"), &ca2.pem).unwrap();
+    *env.slot.lock().unwrap() = ca2.clone();
+    put_tls(&env, &admin, body).await.assert_status_ok();
+    let (_, fp2) = https_get(env.addr, &ca2.pem, "localhost", "/")
+        .await
+        .unwrap();
+    assert_ne!(fp1, fp2);
+}
+
+#[tokio::test]
+async fn slow_header_connections_are_closed() {
+    let env = start().await;
+    env.ctx
+        .state
+        .web_server
+        .get()
+        .unwrap()
+        .__set_header_timeout(std::time::Duration::from_millis(300));
+    let mut s = tokio::net::TcpStream::connect(env.addr).await.unwrap();
+    s.write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    assert!(r.is_ok(), "connection stayed open past the header timeout");
 }

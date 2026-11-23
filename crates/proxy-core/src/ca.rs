@@ -2,8 +2,8 @@
 
 use crate::{Error, Result};
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
-    KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
@@ -163,7 +163,7 @@ impl CertificateAuthority {
         domain: &str,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
         debug!("Generating certificate for host: {}", domain);
-        let (cert, key_pair) = self.issue(domain, subject_alt_names(domain)?, 30)?;
+        let (cert, key_pair) = self.issue(domain, subject_alt_names(domain)?, 30, false)?;
         let cert_der = CertificateDer::from(cert.der().to_vec());
         let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
             .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
@@ -193,7 +193,7 @@ impl CertificateAuthority {
             .ok_or_else(|| Error::Certificate("At least one name is required".into()))?
             .trim()
             .to_string();
-        let (cert, key) = self.issue(&cn, names, days)?;
+        let (cert, key) = self.issue(&cn, names, days, true)?;
         Ok((cert.pem(), key.serialize_pem()))
     }
 
@@ -202,6 +202,7 @@ impl CertificateAuthority {
         cn: &str,
         sans: Vec<SanType>,
         days: i64,
+        server_auth: bool,
     ) -> Result<(rcgen::Certificate, KeyPair)> {
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
@@ -214,6 +215,9 @@ impl CertificateAuthority {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
+        if server_auth {
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        }
         let key_pair = KeyPair::generate()
             .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
         let cert = params
@@ -452,6 +456,8 @@ mod tests {
         let v = cert.validity();
         let days = (v.not_after.timestamp() - v.not_before.timestamp()) / 86400;
         assert!((396..=398).contains(&days), "{days}");
+        let eku = cert.extended_key_usage().unwrap().unwrap().value;
+        assert!(eku.server_auth);
         assert!(ca.generate_server_cert_pem(&[], 397).is_err());
     }
 

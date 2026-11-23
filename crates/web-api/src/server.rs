@@ -311,6 +311,12 @@ impl WebServer {
         self.tls.set(cfg, redirect);
     }
 
+    /// Header-read timeout for new connections (default 30 s). Test hook.
+    #[doc(hidden)]
+    pub fn __set_header_timeout(&self, d: std::time::Duration) {
+        self.tls.set_header_timeout(d);
+    }
+
     /// The TLS configuration and redirect flag in effect.
     pub fn tls_snapshot(&self) -> (Option<Arc<rustls::ServerConfig>>, bool) {
         self.tls.snapshot()
@@ -528,7 +534,11 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         warn_if_exposed_without_tls(&config);
     }
     let redirect = state.proxy_state.config.read().webui.tls.redirect_http;
-    let tls = Arc::new(TlsShared::new(tls_cfg, redirect));
+    let tls = Arc::new(TlsShared::new(
+        tls_cfg,
+        redirect,
+        config.network.trusted_proxies.clone(),
+    ));
 
     let sessions = state.session_manager.clone();
     let renew_state = state.clone();
@@ -568,6 +578,18 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         rt.note_webui(&host, bound_port).await;
     }
     let _ = state.web_server.set(server.clone());
+    // HTTPS configured but not served at startup (certificate not ready, runtime late): retry
+    // soon instead of waiting for the hourly tick.
+    let retry = state.clone();
+    tokio::spawn(async move {
+        for secs in [2u64, 5, 10, 30, 60, 120, 300] {
+            if crate::webui_tls::not_served(&retry).is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            crate::webui_tls::renew_if_due(&retry).await;
+        }
+    });
     server.wait().await
 }
 
@@ -647,12 +669,22 @@ fn warn_if_exposed_without_tls(config: &ApiConfig) {
 /// How long a new connection may take to send its first byte and finish the TLS handshake.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Public CA downloads stay reachable over plain HTTP so a browser can fetch the CA it must
-/// trust before it can open the HTTPS page.
-const PLAIN_PATHS: [&str; 2] = ["/api/v1/ca.crt", "/api/v1/ca.der"];
+/// Most simultaneous connections on the web listener; further ones are closed at accept.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// Paths served over plain HTTP even when everything else is redirected: the public CA downloads
+/// (a browser needs the CA before it can open the HTTPS page) and health probes (the container
+/// healthcheck uses plain HTTP).
+const PLAIN_PATHS: [&str; 4] = [
+    "/api/v1/ca.crt",
+    "/api/v1/ca.der",
+    "/api/v1/health",
+    "/health",
+];
 
 /// Accept connections until `shutdown` resolves, then stop accepting (the socket is released at
-/// once) and let in-flight connections finish.
+/// once) and let in-flight connections finish. Connection tasks live in a `JoinSet`, so dropping
+/// this future (the caller's grace period ended) aborts whatever is left.
 ///
 /// The first byte of each connection decides: a TLS ClientHello (0x16) goes to the TLS acceptor
 /// built from the current [`TlsShared`] configuration; anything else is plain HTTP, redirected to
@@ -664,20 +696,27 @@ async fn serve_loop(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
     let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut conns = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            // Reap finished connection tasks.
+            Some(_) = conns.join_next(), if !conns.is_empty() => {}
             accepted = listener.accept() => match accepted {
                 Ok((stream, peer)) => {
-                    tokio::spawn(handle_conn(
+                    let Ok(permit) = permits.clone().try_acquire_owned() else {
+                        tracing::warn!("web listener at its connection limit; dropping {peer}");
+                        continue;
+                    };
+                    conns.spawn(handle_conn(
                         stream,
                         peer,
                         router.clone(),
                         tls.clone(),
                         sd_rx.clone(),
-                        live_tx.clone(),
+                        permit,
                     ));
                 }
                 Err(e) => {
@@ -690,9 +729,7 @@ async fn serve_loop(
     }
     drop(listener);
     let _ = sd_tx.send(true);
-    drop(live_tx);
-    // Resolves once every connection task has dropped its sender.
-    let _ = live_rx.recv().await;
+    while conns.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -702,14 +739,21 @@ async fn handle_conn(
     router: Router,
     tls: Arc<TlsShared>,
     sd: tokio::sync::watch::Receiver<bool>,
-    _alive: tokio::sync::mpsc::Sender<()>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    let mut epoch = tls.subscribe();
+    epoch.mark_unchanged();
     let mut first = [0u8; 1];
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
         Ok(Ok(1)) => {}
         _ => return,
     }
     let (cfg, redirect) = tls.snapshot();
+    let ctl = Ctl {
+        sd,
+        epoch,
+        header_timeout: tls.header_timeout(),
+    };
     if first[0] == 0x16 {
         let Some(cfg) = cfg else { return };
         let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
@@ -718,12 +762,17 @@ async fn handle_conn(
                 Ok(Ok(s)) => s,
                 _ => return,
             };
-        serve_io(tls_stream, app_service(router, peer, true), sd).await;
+        serve_io(tls_stream, app_service(router, peer, true), ctl).await;
     } else if cfg.is_some() && redirect {
-        let port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
-        serve_io(stream, redirect_service(router, peer, port), sd).await;
+        let local = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+        serve_io(
+            stream,
+            redirect_service(router, peer, local, tls.trusted().to_vec()),
+            ctl,
+        )
+        .await;
     } else {
-        serve_io(stream, app_service(router, peer, false), sd).await;
+        serve_io(stream, app_service(router, peer, false), ctl).await;
     }
 }
 
@@ -753,12 +802,13 @@ fn app_service(
     })
 }
 
-/// Plain-HTTP requests answered with a 308 to the same path over HTTPS on this port (the CA
-/// downloads are served as usual).
+/// Plain-HTTP requests answered with a redirect to the same path over HTTPS. Left alone: the CA
+/// downloads and health probes, and requests a trusted reverse proxy says arrived over HTTPS.
 fn redirect_service(
     router: Router,
     peer: SocketAddr,
-    port: u16,
+    local_port: u16,
+    trusted: Vec<std::net::IpAddr>,
 ) -> impl hyper::service::Service<
     hyper::Request<hyper::body::Incoming>,
     Response = Resp,
@@ -769,55 +819,85 @@ fn redirect_service(
     hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
         use tower::ServiceExt;
         let router = router.clone();
+        let trusted = trusted.clone();
         async move {
-            if PLAIN_PATHS.contains(&req.uri().path()) {
+            let proxied_https = crate::middleware::request_id::request_is_https(
+                req.headers(),
+                Some(peer.ip()),
+                &trusted,
+            );
+            if proxied_https || PLAIN_PATHS.contains(&req.uri().path()) {
                 req.extensions_mut()
                     .insert(axum::extract::ConnectInfo(peer));
                 return router.oneshot(req.map(axum::body::Body::new)).await;
             }
-            Ok(redirect_response(&req, port))
+            Ok(redirect_response(&req, local_port))
         }
     })
 }
 
-fn redirect_response<B>(req: &hyper::Request<B>, port: u16) -> Resp {
-    let host = req
+/// 307 to `https://<host>[:port]<path>`. The port is the one the client used (the `Host`
+/// header, which survives container port mappings), else the local one. Never cached: the
+/// redirect must not outlive turning HTTPS off.
+fn redirect_response<B>(req: &hyper::Request<B>, local_port: u16) -> Resp {
+    let hdr = req
         .headers()
         .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|h| {
-            if h.starts_with('[') {
-                h.split_inclusive(']').next().unwrap_or(h)
-            } else {
-                h.rsplit_once(':').map_or(h, |(n, _)| n)
-            }
-        })
-        .filter(|h| {
-            !h.is_empty()
-                && h.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_:[]".contains(&b))
-        });
-    let Some(host) = host else {
-        return StatusCode::BAD_REQUEST.into_response();
+        .and_then(|h| h.to_str().ok());
+    let (host, host_port) = match hdr {
+        Some(h) if h.starts_with('[') => {
+            let end = h.find(']').map_or(h.len(), |i| i + 1);
+            (
+                &h[..end],
+                h[end..]
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok()),
+            )
+        }
+        Some(h) => match h.rsplit_once(':') {
+            Some((n, p)) => (n, p.parse::<u16>().ok()),
+            None => (h, None),
+        },
+        None => ("", None),
     };
-    let pq = req
-        .uri()
-        .path_and_query()
-        .map_or("/", |p| p.as_str())
-        .to_string();
-    let port = if port == 443 {
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_:[]".contains(&b))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let port = host_port.unwrap_or(local_port);
+    let port = if port == 443 || port == 0 {
         String::new()
     } else {
         format!(":{port}")
     };
+    let pq = req.uri().path_and_query().map_or("/", |p| p.as_str());
     match HeaderValue::try_from(format!("https://{host}{port}{pq}")) {
-        Ok(loc) => (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, loc)]).into_response(),
+        Ok(loc) => (
+            StatusCode::TEMPORARY_REDIRECT,
+            [
+                (header::LOCATION, loc),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+        )
+            .into_response(),
         Err(_) => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 
-/// Run one HTTP/1 or HTTP/2 connection until it ends, or finish it gracefully on shutdown.
-async fn serve_io<I, S>(io: I, svc: S, mut sd: tokio::sync::watch::Receiver<bool>)
+/// What ends a connection early.
+struct Ctl {
+    sd: tokio::sync::watch::Receiver<bool>,
+    epoch: tokio::sync::watch::Receiver<u64>,
+    header_timeout: std::time::Duration,
+}
+
+/// Run one HTTP/1 or HTTP/2 connection until it ends. On listener shutdown or a TLS/redirect
+/// change it is finished gracefully (idle keep-alives close at once) and cut after the grace
+/// period.
+async fn serve_io<I, S>(io: I, svc: S, mut ctl: Ctl)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: hyper::service::Service<
@@ -828,9 +908,20 @@ where
         + 'static,
     S::Future: Send + 'static,
 {
-    let builder =
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    let conn = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), svc);
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+    let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(ctl.header_timeout)
+        .keep_alive(true);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(std::time::Duration::from_secs(30))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .max_concurrent_streams(128);
+    let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), svc);
     tokio::pin!(conn);
     tokio::select! {
         r = conn.as_mut() => {
@@ -839,10 +930,11 @@ where
             }
             return;
         }
-        _ = sd.wait_for(|v| *v) => {}
+        _ = ctl.sd.wait_for(|v| *v) => {}
+        _ = ctl.epoch.changed() => {}
     }
     conn.as_mut().graceful_shutdown();
-    let _ = conn.await;
+    let _ = tokio::time::timeout(OLD_LISTENER_GRACE, conn).await;
 }
 
 /// Path prefix whose responses browser extensions may read cross-origin.

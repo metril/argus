@@ -18,6 +18,11 @@ The proxy must forward the `Host` header unchanged and send `X-Forwarded-Proto` 
 `X-Forwarded-For`). The live log stream uses Server-Sent Events, so response buffering must be off
 for `/api/v1/`.
 
+If you do turn on Argus's own HTTPS with the HTTP redirect as well, a request from a trusted proxy
+that carries `X-Forwarded-Proto: https` is never redirected (it already used HTTPS), so the two
+setups can coexist. Health probes (`/health`, `/api/v1/health`) and the CA downloads are never
+redirected either.
+
 ## Caddy
 
 ```caddyfile

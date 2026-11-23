@@ -5163,6 +5163,13 @@
           "mitm_enabled": {
             "type": "boolean"
           },
+          "tls_error": {
+            "description": "HTTPS is configured for the web UI but not being served (the page is plain HTTP).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "uptime_secs": {
             "format": "int64",
             "minimum": 0,
