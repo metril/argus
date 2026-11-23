@@ -1723,7 +1723,7 @@ docs/
 adblocker/
 ├── Cargo.toml                      # Workspace (11 crates)
 ├── Dockerfile                      # Multi-stage Debian build
-├── docker-compose.yml
+├── compose.yaml
 ├── README.md
 ├── LICENSE
 ├── CHANGELOG.md

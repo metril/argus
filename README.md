@@ -110,12 +110,13 @@ cargo build --release --features full
 ### Docker Deployment
 
 ```bash
-# Build the image
-docker build -t adblocker .
-
-# Run with docker-compose
-docker-compose up -d
+# Run the published image (set ADBLOCKER_VERSION to pin a release, e.g. 0.1.0)
+docker compose -f compose.yaml up -d
 ```
+
+To build the image locally instead, run `docker build -t adblocker .` and start it with
+`ADBLOCKER_VERSION=local docker compose -f compose.yaml up -d` after tagging it
+`docker tag adblocker ghcr.io/metril/adblocker:local`.
 
 ### Security defaults
 
@@ -144,7 +145,7 @@ Failures (upstream timeouts and errors, DNS failures, refused destinations) are 
 
 The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API), and optionally the transparent-mode port (`proxy.transparent_port`, off by default).
 
-1. **Start it** — `./target/release/adblocker` (or `docker-compose up -d`).
+1. **Start it** — `./target/release/adblocker` (or `docker compose up -d`).
 2. **Create your account** — open `http://localhost:3000` and register. The **first** user
    registered automatically becomes the admin.
 3. **Install the root CA** — in the Web UI go to **Settings → CA Certificate → Download CA

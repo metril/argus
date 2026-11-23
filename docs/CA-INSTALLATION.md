@@ -56,7 +56,7 @@ If the file doesn't exist, start the proxy once to generate it:
 ```bash
 ./target/release/adblocker
 # or
-docker-compose up -d
+docker compose up -d
 ```
 
 ## Installation Instructions
@@ -277,14 +277,14 @@ If your CA is compromised or you want a fresh start:
 
 ```bash
 # Stop the proxy
-docker-compose down
+docker compose down
 # or kill the process
 
 # Delete old certificates
 rm certs/root-ca.*
 
 # Start proxy (will generate new CA)
-docker-compose up -d
+docker compose up -d
 
 # Reinstall the NEW CA certificate on all devices
 ```
@@ -318,7 +318,7 @@ This means the CA isn't installed or trusted. Follow installation instructions f
 ## Support
 
 If you encounter issues:
-1. Check proxy logs: `docker-compose logs -f`
+1. Check proxy logs: `docker compose logs -f`
 2. Verify certificate: `openssl x509 -in certs/root-ca.crt -text -noout`
 3. Create an issue on GitHub with:
    - Platform and browser

@@ -1,11 +1,6 @@
-version: '3.8'
-
 services:
   adblocker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: adblocker-proxy:latest
+    image: ghcr.io/metril/adblocker:${ADBLOCKER_VERSION:-latest}
     container_name: adblocker-proxy
     restart: unless-stopped
     ports:
@@ -24,8 +19,9 @@ services:
       - data:/app/data
       # Persist logs
       - logs:/app/logs
-      # Custom configuration (read-only host bind mount; no writes/ownership concern)
-      - ./config:/app/config:ro
+      # Optional custom configuration: copy config/default.toml from the repository next to this
+      # file, edit it, then uncomment. (The image ships a default; an empty mount would hide it.)
+      # - ./config:/app/config:ro
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
