@@ -252,36 +252,6 @@ pub fn hostport(host: &str, port: u16) -> String {
     }
 }
 
-/// The part of a presented chain that actually links: from the leaf, repeatedly the certificate
-/// whose subject is the current one's issuer. Unrelated extras are dropped; the walk stops at a
-/// self-signed certificate or a missing issuer.
-pub fn trim_chain<'a>(chain: &[&'a [u8]]) -> Vec<&'a [u8]> {
-    let parsed: Vec<_> = chain
-        .iter()
-        .take(MAX_CHAIN * 2)
-        .map(|d| x509_parser::parse_x509_certificate(d).ok().map(|(_, c)| c))
-        .collect();
-    let Some(Some(first)) = parsed.first() else {
-        return chain.iter().take(1).copied().collect();
-    };
-    let mut out = vec![chain[0]];
-    let mut used = vec![false; parsed.len()];
-    used[0] = true;
-    let mut cur = first;
-    while out.len() < MAX_CHAIN && cur.subject().as_raw() != cur.issuer().as_raw() {
-        let next = parsed.iter().enumerate().find(|(i, c)| {
-            !used[*i]
-                && c.as_ref()
-                    .is_some_and(|c| c.subject().as_raw() == cur.issuer().as_raw())
-        });
-        let Some((i, Some(c))) = next else { break };
-        used[i] = true;
-        out.push(chain[i]);
-        cur = c;
-    }
-    out
-}
-
 fn cap(s: &str) -> String {
     if s.len() <= MAX_STR {
         return s.to_string();
@@ -423,10 +393,9 @@ impl CertStore {
         }
     }
 
-    /// Keep the chain a handshake presented, as host-independent data of the leaf. The caller
-    /// passes only a path the TLS stack actually verified (never raw presented certificates),
-    /// and only after verification succeeded; it is still linked by name here and cut at a
-    /// self-signed certificate. Writes no verdict, host or profile. A no-op when the leaf
+    /// Keep the chain of a handshake as host-independent data of the leaf. The caller passes
+    /// exactly the path the TLS stack verified (never raw presented certificates), and only
+    /// after verification succeeded; it is stored as given. Writes no verdict, host or profile. A no-op when the leaf
     /// already has a full chain, or when only the leaf is presented and the leaf is known.
     pub fn record_chain(&self, chain_der: &[&[u8]], ev: &dyn Fn() -> bool) {
         let Some(leaf) = chain_der.first() else {
@@ -436,8 +405,7 @@ impl CertStore {
             return;
         }
         let fp = fingerprint(leaf);
-        let path = trim_chain(chain_der);
-        if let Some(p) = Self::parse(&fp, &path, ev()) {
+        if let Some(p) = Self::parse(&fp, chain_der, ev()) {
             self.parsed.insert(fp, Arc::new(p));
         }
     }
@@ -803,57 +771,24 @@ mod chain_tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 
-    fn ca(
-        cn: &str,
-        parent: Option<&Issuer<'static, KeyPair>>,
-    ) -> (Vec<u8>, Issuer<'static, KeyPair>) {
+    fn pki() -> (Vec<u8>, Vec<u8>) {
         let mut p = CertificateParams::new(vec![]).unwrap();
         p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        p.distinguished_name.push(DnType::CommonName, cn);
+        p.distinguished_name.push(DnType::CommonName, "root");
         let key = KeyPair::generate().unwrap();
-        let cert = match parent {
-            Some(i) => p.signed_by(&key, i).unwrap(),
-            None => p.self_signed(&key).unwrap(),
-        };
-        (cert.der().to_vec(), Issuer::new(p, key))
-    }
-
-    fn leaf(name: &str, issuer: &Issuer<'static, KeyPair>) -> Vec<u8> {
-        let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
-        p.distinguished_name.push(DnType::CommonName, name);
-        let key = KeyPair::generate().unwrap();
-        p.signed_by(&key, issuer).unwrap().der().to_vec()
+        let root = p.self_signed(&key).unwrap().der().to_vec();
+        let issuer = Issuer::new(p, key);
+        let mut lp = CertificateParams::new(vec!["a.test".to_string()]).unwrap();
+        lp.distinguished_name.push(DnType::CommonName, "a.test");
+        let lk = KeyPair::generate().unwrap();
+        (lp.signed_by(&lk, &issuer).unwrap().der().to_vec(), root)
     }
 
     #[test]
-    fn unrelated_extras_are_trimmed_and_the_walk_stops_at_the_root() {
-        let (root, root_i) = ca("root", None);
-        let (mid, mid_i) = ca("mid", Some(&root_i));
-        let (other, _) = ca("unrelated", None);
-        let l = leaf("a.test", &mid_i);
-        // Presented out of order, with a stranger in the middle and the root's issuer absent.
-        let chain = [
-            l.as_slice(),
-            other.as_slice(),
-            root.as_slice(),
-            mid.as_slice(),
-        ];
-        let t = trim_chain(&chain);
-        assert_eq!(t, vec![l.as_slice(), mid.as_slice(), root.as_slice()]);
-        // A missing issuer stops the walk.
-        let t = trim_chain(&[l.as_slice(), other.as_slice(), root.as_slice()]);
-        assert_eq!(t, vec![l.as_slice()]);
-    }
-
-    #[test]
-    fn record_chain_stores_the_path_by_leaf_and_nothing_else() {
-        let (root, root_i) = ca("root", None);
-        let (other, _) = ca("unrelated", None);
-        let l = leaf("a.test", &root_i);
+    fn record_chain_stores_the_given_path_by_leaf_and_nothing_else() {
+        let (l, root) = pki();
         let s = CertStore::default();
-        s.record_chain(&[l.as_slice(), other.as_slice(), root.as_slice()], &|| {
-            false
-        });
+        s.record_chain(&[l.as_slice(), root.as_slice()], &|| false);
         let info = s.info(&fingerprint(&l), None).unwrap();
         assert_eq!(info.chain.len(), 2);
         assert_eq!(info.chain[1].fp, fingerprint(&root));
@@ -863,5 +798,6 @@ mod chain_tests {
         // A leaf that already has a full chain is left alone.
         s.record_chain(&[l.as_slice()], &|| false);
         assert_eq!(s.info(&fingerprint(&l), None).unwrap().chain.len(), 2);
+        assert!(!s.wants_chain(&l, 5));
     }
 }

@@ -71,6 +71,13 @@ impl UpstreamOptions {
 /// Root store used for every upstream TLS dial: built-in web roots plus `extra_ca_paths` (PEM
 /// files). Shared by the WebSocket path so HTTP and WebSocket trust the same CAs.
 pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertStore> {
+    build_root_set(extra_ca_paths).map(|(r, _)| r)
+}
+
+/// [`build_root_store`] plus the DER of every configured extra CA (the built-in web roots are
+/// trust anchors only and have no certificate to keep).
+pub fn build_root_set(extra_ca_paths: &[PathBuf]) -> Result<(rustls::RootCertStore, Vec<Vec<u8>>)> {
+    let mut ders = Vec::new();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     for path in extra_ca_paths {
@@ -85,6 +92,7 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
             let cert = cert.map_err(|e| {
                 Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
             })?;
+            ders.push(cert.as_ref().to_vec());
             roots.add(cert).map_err(|e| {
                 Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
             })?;
@@ -97,7 +105,7 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
             )));
         }
     }
-    Ok(roots)
+    Ok((roots, ders))
 }
 
 /// The certificates of the path webpki actually verified for `end_entity` (leaf, intermediates,
@@ -106,6 +114,7 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
 /// certificate that merely shares a name with a real one cannot appear in it.
 fn verified_path(
     roots: &rustls::RootCertStore,
+    root_ders: &[Vec<u8>],
     algs: &rustls::crypto::WebPkiSupportedAlgorithms,
     end_entity: &rustls::pki_types::CertificateDer<'_>,
     intermediates: &[rustls::pki_types::CertificateDer<'_>],
@@ -128,16 +137,18 @@ fn verified_path(
         path.intermediate_certificates()
             .map(|c| c.der().as_ref().to_vec()),
     );
-    // The anchor is only a subject and key; its certificate is included when presented.
+    // The anchor is only a subject and key; its certificate is included only when the server
+    // presented a certificate byte-identical to a configured root's.
     let anchor = path.anchor();
     let presented = intermediates.iter().find(|c| {
-        x509_parser::parse_x509_certificate(c).is_ok_and(|(_, x)| {
-            // The anchor holds the name and key contents without their outer SEQUENCE header.
-            x.subject().as_raw().ends_with(anchor.subject.as_ref())
-                && x.public_key()
-                    .raw
-                    .ends_with(anchor.subject_public_key_info.as_ref())
-        })
+        root_ders.iter().any(|r| r.as_slice() == c.as_ref())
+            && x509_parser::parse_x509_certificate(c).is_ok_and(|(_, x)| {
+                // The anchor holds the name and key contents without their outer SEQUENCE header.
+                x.subject().as_raw().ends_with(anchor.subject.as_ref())
+                    && x.public_key()
+                        .raw
+                        .ends_with(anchor.subject_public_key_info.as_ref())
+            })
     });
     if let Some(c) = presented {
         out.push(c.as_ref().to_vec());
@@ -151,6 +162,7 @@ fn verified_path(
 struct ProbeVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
     roots: Arc<rustls::RootCertStore>,
+    root_ders: Arc<Vec<Vec<u8>>>,
     algs: rustls::crypto::WebPkiSupportedAlgorithms,
     seen: parking_lot::Mutex<Option<ProbeSeen>>,
 }
@@ -193,8 +205,15 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
         );
         // An accepted chain is stored as the verified path; a rejected one only for its leaf.
         let chain = match &res {
-            Ok(_) => verified_path(&self.roots, &self.algs, end_entity, intermediates, now)
-                .unwrap_or_else(|| vec![end_entity.as_ref().to_vec()]),
+            Ok(_) => verified_path(
+                &self.roots,
+                &self.root_ders,
+                &self.algs,
+                end_entity,
+                intermediates,
+                now,
+            )
+            .unwrap_or_else(|| vec![end_entity.as_ref().to_vec()]),
             Err(_) => vec![end_entity.as_ref().to_vec()],
         };
         let verdict = match &res {
@@ -245,6 +264,7 @@ impl common::certstore::ChainProbe for CertProber {
 pub struct ChainCapture {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
     roots: Arc<rustls::RootCertStore>,
+    root_ders: Arc<Vec<Vec<u8>>>,
     algs: rustls::crypto::WebPkiSupportedAlgorithms,
     store: Arc<common::certstore::CertStore>,
 }
@@ -269,9 +289,14 @@ impl rustls::client::danger::ServerCertVerifier for ChainCapture {
             .store
             .wants_chain(end_entity.as_ref(), 1 + intermediates.len())
         {
-            if let Some(path) =
-                verified_path(&self.roots, &self.algs, end_entity, intermediates, now)
-            {
+            if let Some(path) = verified_path(
+                &self.roots,
+                &self.root_ders,
+                &self.algs,
+                end_entity,
+                intermediates,
+                now,
+            ) {
                 let refs: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
                 self.store
                     .record_chain(&refs, &|| crate::ev::is_ev_der(end_entity.as_ref()));
@@ -306,6 +331,7 @@ impl rustls::client::danger::ServerCertVerifier for ChainCapture {
 /// Web-PKI client config over `roots` (chains captured into `store`), ALPN h2 then http/1.1.
 pub fn client_tls_config(
     roots: rustls::RootCertStore,
+    root_ders: Vec<Vec<u8>>,
     store: Arc<common::certstore::CertStore>,
 ) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -324,6 +350,7 @@ pub fn client_tls_config(
         .with_custom_certificate_verifier(Arc::new(ChainCapture {
             inner,
             roots,
+            root_ders: Arc::new(root_ders),
             algs,
             store,
         }))
@@ -350,6 +377,7 @@ struct Busy;
 struct ProbeInner {
     store: Arc<common::certstore::CertStore>,
     roots: Arc<rustls::RootCertStore>,
+    root_ders: Arc<Vec<Vec<u8>>>,
     resolver: PolicyResolver,
     connect_timeout_ms: std::sync::atomic::AtomicU64,
     limit: tokio::sync::Semaphore,
@@ -358,9 +386,20 @@ struct ProbeInner {
     handshakes: std::sync::atomic::AtomicUsize,
     /// Keys with a probe running right now (never started twice).
     inflight: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Keys with a background probe queued or running.
+    queued: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// Room for background probes.
     background: Arc<tokio::sync::Semaphore>,
     spawned: std::sync::atomic::AtomicUsize,
+}
+
+/// Removes a key from the queued set when its background probe ends.
+struct Queued(Arc<ProbeInner>, String);
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.0.queued.lock().remove(&self.1);
+    }
 }
 
 /// Removes a key from the in-flight set when the probe ends (or is dropped).
@@ -398,9 +437,11 @@ impl CertProber {
         wait: Duration,
         background: usize,
     ) -> Result<Self> {
+        let (roots, root_ders) = build_root_set(&opts.extra_ca_paths)?;
         Ok(Self(Arc::new(ProbeInner {
             store: opts.certs.clone(),
-            roots: Arc::new(build_root_store(&opts.extra_ca_paths)?),
+            roots: Arc::new(roots),
+            root_ders: Arc::new(root_ders),
             resolver: PolicyResolver {
                 policy: opts.policy.clone(),
                 override_ip: opts.resolve_all_to,
@@ -415,6 +456,7 @@ impl CertProber {
                 .into(),
             handshakes: Default::default(),
             inflight: Default::default(),
+            queued: Default::default(),
             background: Arc::new(tokio::sync::Semaphore::new(background)),
             spawned: Default::default(),
             limit: tokio::sync::Semaphore::new(permits),
@@ -462,6 +504,11 @@ impl CertProber {
         if self.0.inflight.lock().contains(&key) {
             return;
         }
+        // Claim the key before queueing: a duplicate must not take another slot.
+        if !self.0.queued.lock().insert(key.clone()) {
+            return;
+        }
+        let queued = Queued(self.0.clone(), key);
         let Ok(permit) = self.0.background.clone().try_acquire_owned() else {
             return;
         };
@@ -471,6 +518,7 @@ impl CertProber {
         let (inner, host) = (self.0.clone(), host.to_string());
         tokio::spawn(async move {
             let _permit = permit;
+            let _queued = queued;
             let _ = inner.cached(&host, port, None).await;
         });
     }
@@ -547,6 +595,7 @@ impl ProbeInner {
             .build()
             .ok()?,
             roots: self.roots.clone(),
+            root_ders: self.root_ders.clone(),
             algs: provider.signature_verification_algorithms,
             seen: Default::default(),
         });
@@ -676,10 +725,9 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
         .http2_adaptive_window(true);
-    builder = builder.use_preconfigured_tls(client_tls_config(
-        build_root_store(&opts.extra_ca_paths)?,
-        opts.certs.clone(),
-    )?);
+    let (roots, root_ders) = build_root_set(&opts.extra_ca_paths)?;
+    builder =
+        builder.use_preconfigured_tls(client_tls_config(roots, root_ders, opts.certs.clone())?);
     if let Some(t) = opts.connect_timeout {
         builder = builder.connect_timeout(t);
     }
@@ -1252,6 +1300,27 @@ mod probe_tests {
     }
 
     #[tokio::test]
+    async fn repeated_keys_do_not_consume_background_slots() {
+        let port = black_hole().await;
+        let (opts, _d) = slow_opts();
+        // More slots than keys: only duplicates could exhaust them.
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(20), 100).unwrap();
+        let holder = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("held.test", port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..4 {
+            for i in 0..5 {
+                assert_eq!(p.probe(&format!("k{i}.test"), port).await, None);
+            }
+        }
+        // The holder's own call handed its probe over once, then one per distinct key.
+        holder.await.unwrap();
+        assert_eq!(p.background_started(), 6);
+    }
+
+    #[tokio::test]
     async fn a_caller_joining_a_running_probe_returns_within_the_wait() {
         let port = black_hole().await;
         let (opts, _d) = slow_opts();
@@ -1318,6 +1387,7 @@ mod capture_tests {
             .build()
             .unwrap(),
             roots,
+            root_ders: Arc::new(vec![root.to_vec()]),
             algs: provider.signature_verification_algorithms,
             store: store.clone(),
         }
@@ -1412,6 +1482,30 @@ mod capture_tests {
             vec![fingerprint(&l), fingerprint(real.der()), fingerprint(&root)]
         );
         assert!(!fps.contains(&fingerprint(fp.der())));
+    }
+
+    #[test]
+    fn a_lookalike_root_is_never_stored_as_the_root_entry() {
+        // Same subject and key as the trusted root, but not the same certificate.
+        let mut rp = CertificateParams::new(vec![]).unwrap();
+        rp.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        rp.distinguished_name.push(DnType::CommonName, "root");
+        let key = KeyPair::generate().unwrap();
+        let root = rp.self_signed(&key).unwrap();
+        let lookalike = rp.clone().self_signed(&key).unwrap();
+        assert_ne!(root.der(), lookalike.der(), "serials differ");
+        let issuer = Issuer::new(rp, key);
+        let l = leaf("good.test", &issuer, false);
+        let store = Arc::new(CertStore::default());
+        let v = capture(&root.der().clone(), &store);
+        check(&v, &l, &[lookalike.der().to_vec()], "good.test").unwrap();
+        let info = store.info(&fingerprint(&l), None).unwrap();
+        assert_eq!(info.chain.len(), 1, "the lookalike is not stored");
+        // The configured root itself, presented, is.
+        let l2 = leaf("good.test", &issuer, false);
+        check(&v, &l2, &[root.der().to_vec()], "good.test").unwrap();
+        let info = store.info(&fingerprint(&l2), None).unwrap();
+        assert_eq!(info.chain[1].fp, fingerprint(root.der()));
     }
 
     #[test]
