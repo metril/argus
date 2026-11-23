@@ -36,7 +36,9 @@ e2e_test!(
             .unwrap()
             .iter()
             .any(|s| s == "good.test"));
-        assert_eq!(info["chain"].as_array().unwrap().len(), 1);
+        // The full chain came from the proxied request itself: no probe handshake was needed.
+        assert!(info["chain"].as_array().unwrap().len() > 1, "{info}");
+        assert_eq!(env.proxy.ctx.prober().unwrap().handshakes(), 0);
 
         let by_host: serde_json::Value = api
             .get(&format!("/certs/by-host/good.test:{port}"))

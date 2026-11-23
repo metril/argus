@@ -189,13 +189,79 @@ impl common::certstore::ChainProbe for CertProber {
     }
 }
 
-/// Plain web-PKI client config over `roots`, ALPN h2 then http/1.1.
-pub fn client_tls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig> {
+/// Standard web-PKI verification that also keeps the chain of every chain it accepts, so the
+/// full path of a certificate is known without any extra connection. It only delegates and
+/// returns the inner result; it writes no verdict, host, port or profile.
+#[derive(Debug)]
+pub struct ChainCapture {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    store: Arc<common::certstore::CertStore>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for ChainCapture {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let ok = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
+        let chain: Vec<&[u8]> = std::iter::once(end_entity.as_ref())
+            .chain(intermediates.iter().map(|c| c.as_ref()))
+            .collect();
+        self.store
+            .record_chain(&chain, &|| crate::ev::is_ev_der(end_entity.as_ref()));
+        Ok(ok)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Web-PKI client config over `roots` (chains captured into `store`), ALPN h2 then http/1.1.
+pub fn client_tls_config(
+    roots: rustls::RootCertStore,
+    store: Arc<common::certstore::CertStore>,
+) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| Error::Config(format!("Failed to build upstream verifier: {e}")))?;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Config(format!("Failed to build upstream TLS config: {e}")))?
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ChainCapture { inner, store }))
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(cfg)
@@ -216,6 +282,7 @@ pub struct CertProber {
     connect_timeout_ms: std::sync::atomic::AtomicU64,
     limit: tokio::sync::Semaphore,
     cache: moka::future::Cache<String, Option<String>>,
+    handshakes: std::sync::atomic::AtomicUsize,
 }
 
 impl CertProber {
@@ -235,6 +302,7 @@ impl CertProber {
                 .connect_timeout
                 .map_or(10_000, |t| t.as_millis() as u64)
                 .into(),
+            handshakes: Default::default(),
             limit: tokio::sync::Semaphore::new(PROBE_CONCURRENCY),
             cache: moka::future::Cache::builder()
                 .max_capacity(4096)
@@ -271,7 +339,14 @@ impl CertProber {
             .await
     }
 
+    /// Probe handshakes started so far.
+    pub fn handshakes(&self) -> usize {
+        self.handshakes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn run(&self, key: &str, host: &str, port: u16) -> Option<String> {
+        self.handshakes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         let addrs: Vec<SocketAddr> = match bare.parse::<IpAddr>() {
             Ok(ip) => match self.resolver.override_ip {
@@ -422,8 +497,10 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
         .http2_adaptive_window(true);
-    builder =
-        builder.use_preconfigured_tls(client_tls_config(build_root_store(&opts.extra_ca_paths)?)?);
+    builder = builder.use_preconfigured_tls(client_tls_config(
+        build_root_store(&opts.extra_ca_paths)?,
+        opts.certs.clone(),
+    )?);
     if let Some(t) = opts.connect_timeout {
         builder = builder.connect_timeout(t);
     }
@@ -849,5 +926,106 @@ mod probe_tests {
         let (p, _d) = prober(&pki);
         // Nothing listens on port 1.
         assert_eq!(p.probe("h.test", 1).await, None);
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use common::certstore::{fingerprint, CertStore};
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    fn ca(cn: &str) -> (CertificateDer<'static>, Issuer<'static, KeyPair>) {
+        let mut p = CertificateParams::new(vec![]).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.distinguished_name.push(DnType::CommonName, cn);
+        let key = KeyPair::generate().unwrap();
+        let cert = p.self_signed(&key).unwrap();
+        (cert.der().clone(), Issuer::new(p, key))
+    }
+
+    fn leaf(name: &str, issuer: &Issuer<'static, KeyPair>, expired: bool) -> Vec<u8> {
+        let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
+        if expired {
+            p.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            p.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
+        let key = KeyPair::generate().unwrap();
+        p.signed_by(&key, issuer).unwrap().der().to_vec()
+    }
+
+    fn capture(root: &CertificateDer<'static>, store: &Arc<CertStore>) -> ChainCapture {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root.clone()).unwrap();
+        ChainCapture {
+            inner: rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .unwrap(),
+            store: store.clone(),
+        }
+    }
+
+    fn check(
+        v: &ChainCapture,
+        leaf: &[u8],
+        extra: &[Vec<u8>],
+        host: &str,
+    ) -> std::result::Result<(), rustls::Error> {
+        let inter: Vec<_> = extra
+            .iter()
+            .map(|d| CertificateDer::from(d.clone()))
+            .collect();
+        v.verify_server_cert(
+            &CertificateDer::from(leaf.to_vec()),
+            &inter,
+            &ServerName::try_from(host.to_string()).unwrap(),
+            &[],
+            UnixTime::now(),
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn accepted_chain_is_captured_trimmed_and_nothing_else_is_written() {
+        let (root, root_i) = ca("root");
+        let (stranger, _) = ca("stranger");
+        let store = Arc::new(CertStore::default());
+        let v = capture(&root, &store);
+        let l = leaf("good.test", &root_i, false);
+        check(&v, &l, &[stranger.to_vec(), root.to_vec()], "good.test").unwrap();
+        let info = store.info(&fingerprint(&l), None).unwrap();
+        assert_eq!(info.chain.len(), 2, "stranger dropped, root kept");
+        assert_eq!(info.chain[1].fp, fingerprint(&root));
+        assert!(store.by_host("good.test").is_none());
+        assert!(store.seen_by("good.test").is_empty());
+    }
+
+    #[test]
+    fn failing_verification_stores_nothing_and_a_replay_for_another_name_too() {
+        let (root, root_i) = ca("root");
+        let store = Arc::new(CertStore::default());
+        let v = capture(&root, &store);
+        let expired = leaf("old.test", &root_i, true);
+        assert!(check(&v, &expired, &[root.to_vec()], "old.test").is_err());
+        // A genuine chain replayed for a name it is not valid for is rejected: nothing stored.
+        let genuine = leaf("bank.test", &root_i, false);
+        assert!(check(&v, &genuine, &[root.to_vec()], "evil.test").is_err());
+        assert!(store.is_empty());
+        // Presented for its own name, only that chain is stored, under its own fingerprint.
+        check(&v, &genuine, &[root.to_vec()], "bank.test").unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store
+                .info(&fingerprint(&genuine), None)
+                .unwrap()
+                .chain
+                .len(),
+            2
+        );
     }
 }
