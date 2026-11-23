@@ -100,28 +100,18 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
     Ok(roots)
 }
 
-/// Wraps the standard web-PKI verifier: delegates, then records the presented chain and the
-/// verdict (also for rejected chains) so the real server certificate can be inspected. Runs once
-/// per handshake, not per request.
+/// Verifier of the probe handshake: standard web-PKI verification, remembering the chain it saw
+/// and the verdict (the handshake is rejected on a failure, so the verdict is kept here).
 #[derive(Debug)]
-pub struct RecordingVerifier {
+struct ProbeVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
-    store: Arc<common::certstore::CertStore>,
+    seen: parking_lot::Mutex<Option<ProbeSeen>>,
 }
 
-impl RecordingVerifier {
-    pub fn new(
-        roots: rustls::RootCertStore,
-        provider: Arc<rustls::crypto::CryptoProvider>,
-        store: Arc<common::certstore::CertStore>,
-    ) -> Result<Self> {
-        let inner =
-            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
-                .build()
-                .map_err(|e| Error::Config(format!("Failed to build upstream verifier: {e}")))?;
-        Ok(Self { inner, store })
-    }
-}
+type ProbeSeen = (
+    Vec<Vec<u8>>,
+    std::result::Result<(), (common::certstore::FailReason, String)>,
+);
 
 fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
     use common::certstore::FailReason as R;
@@ -138,7 +128,7 @@ fn fail_reason(e: &rustls::Error) -> common::certstore::FailReason {
     }
 }
 
-impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
+impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
@@ -154,18 +144,15 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
             ocsp_response,
             now,
         );
-        // Key is the host the client dialed (IPv6 without brackets, see `host_key`).
-        let host = server_name.to_str();
-        let chain: Vec<&[u8]> = std::iter::once(end_entity.as_ref())
+        let chain = std::iter::once(end_entity.as_ref())
             .chain(intermediates.iter().map(|c| c.as_ref()))
+            .map(<[u8]>::to_vec)
             .collect();
         let verdict = match &res {
             Ok(_) => Ok(()),
             Err(e) => Err((fail_reason(e), e.to_string())),
         };
-        self.store.record(&host, &chain, verdict, &|| {
-            crate::ev::is_ev_der(end_entity.as_ref())
-        });
+        *self.seen.lock() = Some((chain, verdict));
         res
     }
 
@@ -175,11 +162,7 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        let ok = self.inner.verify_tls12_signature(message, cert, dss)?;
-        // The server proved it holds the key: the recorded verdict is now trustworthy.
-        self.store
-            .confirm(&common::certstore::fingerprint(cert.as_ref()));
-        Ok(ok)
+        self.inner.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -188,11 +171,7 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        let ok = self.inner.verify_tls13_signature(message, cert, dss)?;
-        // The server proved it holds the key: the recorded verdict is now trustworthy.
-        self.store
-            .confirm(&common::certstore::fingerprint(cert.as_ref()));
-        Ok(ok)
+        self.inner.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -200,21 +179,139 @@ impl rustls::client::danger::ServerCertVerifier for RecordingVerifier {
     }
 }
 
-/// Client TLS config: `roots` verified through a [`RecordingVerifier`], ALPN h2 then http/1.1.
-pub fn recording_tls_config(
-    roots: rustls::RootCertStore,
-    store: Arc<common::certstore::CertStore>,
-) -> Result<rustls::ClientConfig> {
+/// Plain web-PKI client config over `roots`, ALPN h2 then http/1.1.
+pub fn client_tls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = RecordingVerifier::new(roots, provider.clone(), store)?;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Config(format!("Failed to build upstream TLS config: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_root_certificates(roots)
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(cfg)
+}
+
+/// How long a probe result (ok or invalid) is reused.
+const PROBE_TTL: Duration = Duration::from_secs(300);
+/// Probe handshakes running at once.
+const PROBE_CONCURRENCY: usize = 8;
+
+/// Dedicated handshake to a `host:port` after an upstream TLS failure, to learn the certificate
+/// and why it was rejected. Results are cached per `host:port` (single-flight, bounded
+/// concurrency) so repeated failures cannot multiply outbound connections.
+pub struct CertProber {
+    store: Arc<common::certstore::CertStore>,
+    roots: Arc<rustls::RootCertStore>,
+    resolver: PolicyResolver,
+    connect_timeout_ms: std::sync::atomic::AtomicU64,
+    limit: tokio::sync::Semaphore,
+    cache: moka::future::Cache<String, Option<String>>,
+}
+
+impl CertProber {
+    pub fn new(opts: &UpstreamOptions) -> Result<Self> {
+        Ok(Self {
+            store: opts.certs.clone(),
+            roots: Arc::new(build_root_store(&opts.extra_ca_paths)?),
+            resolver: PolicyResolver {
+                policy: opts.policy.clone(),
+                override_ip: opts.resolve_all_to,
+                strict: false,
+                dns: opts.dns.clone().unwrap_or_else(|| {
+                    Arc::new(CachedResolver::from_settings(&Default::default()))
+                }),
+            },
+            connect_timeout_ms: opts
+                .connect_timeout
+                .map_or(10_000, |t| t.as_millis() as u64)
+                .into(),
+            limit: tokio::sync::Semaphore::new(PROBE_CONCURRENCY),
+            cache: moka::future::Cache::builder()
+                .max_capacity(4096)
+                .time_to_live(PROBE_TTL)
+                .build(),
+        })
+    }
+
+    /// Follow a changed connect timeout.
+    pub fn set_connect_timeout(&self, t: Option<Duration>) {
+        self.connect_timeout_ms.store(
+            t.map_or(10_000, |t| t.as_millis() as u64),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Fingerprint of the certificate `host:port` presented, recorded in the store with its
+    /// verdict. `None` when the probe learnt nothing (connect or handshake failed before a
+    /// certificate arrived).
+    pub async fn probe(&self, host: &str, port: u16) -> Option<String> {
+        let key = common::certstore::hostport(host, port);
+        self.cache
+            .get_with(key.clone(), async {
+                let _permit = self.limit.acquire().await.ok()?;
+                let limit = Duration::from_millis(
+                    self.connect_timeout_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                tokio::time::timeout(limit, self.run(&key, host, port))
+                    .await
+                    .ok()
+                    .flatten()
+            })
+            .await
+    }
+
+    async fn run(&self, key: &str, host: &str, port: u16) -> Option<String> {
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let addrs: Vec<SocketAddr> = match bare.parse::<IpAddr>() {
+            Ok(ip) => match self.resolver.override_ip {
+                Some(o) => vec![SocketAddr::new(o, port)],
+                None => {
+                    self.resolver.policy.check_ip(ip).ok()?;
+                    vec![SocketAddr::new(ip, port)]
+                }
+            },
+            Err(_) => self
+                .resolver
+                .resolve_checked(bare)
+                .await
+                .ok()?
+                .into_iter()
+                .map(|a| SocketAddr::new(a.ip(), port))
+                .collect(),
+        };
+        let name = rustls::pki_types::ServerName::try_from(bare.to_string()).ok()?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(ProbeVerifier {
+            inner: rustls::client::WebPkiServerVerifier::builder_with_provider(
+                self.roots.clone(),
+                provider.clone(),
+            )
+            .build()
+            .ok()?,
+            seen: Default::default(),
+        });
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone())
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        for addr in addrs {
+            let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
+                continue;
+            };
+            // Only the verifier's observation matters; a rejected handshake is the point.
+            let _ = connector.connect(name.clone(), tcp).await;
+            break;
+        }
+        let (chain, verdict) = verifier.seen.lock().take()?;
+        let refs: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+        self.store.record_probe(key, &refs, verdict, &|| {
+            chain.first().is_some_and(|d| crate::ev::is_ev_der(d))
+        })
+    }
 }
 
 /// DNS resolver that applies the destination policy to what the name resolves to (reqwest never
@@ -315,10 +412,8 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
         .http2_adaptive_window(true);
-    builder = builder.use_preconfigured_tls(recording_tls_config(
-        build_root_store(&opts.extra_ca_paths)?,
-        opts.certs.clone(),
-    )?);
+    builder =
+        builder.use_preconfigured_tls(client_tls_config(build_root_store(&opts.extra_ca_paths)?)?);
     if let Some(t) = opts.connect_timeout {
         builder = builder.connect_timeout(t);
     }
@@ -618,120 +713,131 @@ mod classify_tests {
 }
 
 #[cfg(test)]
-mod recording_tests {
+mod probe_tests {
     use super::*;
-    use common::certstore::{CertStore, FailReason, Verdict};
+    use common::certstore::{FailReason, Verdict};
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
         KeyUsagePurpose,
     };
-    use rustls::client::danger::ServerCertVerifier;
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Pki {
-        ca_der: CertificateDer<'static>,
+        ca_pem: String,
         issuer: Issuer<'static, KeyPair>,
     }
 
     fn pki() -> Pki {
-        pki_named("test CA")
-    }
-
-    fn pki_named(cn: &str) -> Pki {
         let mut p = CertificateParams::default();
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, cn);
+        dn.push(DnType::CommonName, "probe test CA");
         p.distinguished_name = dn;
         p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         p.key_usages = vec![KeyUsagePurpose::KeyCertSign];
         let key = KeyPair::generate().unwrap();
         let cert = p.self_signed(&key).unwrap();
         Pki {
-            ca_der: cert.der().clone(),
+            ca_pem: cert.pem(),
             issuer: Issuer::new(p, key),
         }
     }
 
-    fn leaf(pki: &Pki, name: &str, expired: bool) -> Vec<u8> {
+    /// A TLS server presenting a certificate for `name` (expired when asked); returns its port
+    /// and a counter of accepted connections.
+    async fn server(pki: &Pki, name: &str, expired: bool) -> (u16, Arc<AtomicUsize>) {
         let mut p = CertificateParams::new(vec![name.to_string()]).unwrap();
         if expired {
             p.not_before = rcgen::date_time_ymd(2000, 1, 1);
             p.not_after = rcgen::date_time_ymd(2001, 1, 1);
         }
         let key = KeyPair::generate().unwrap();
-        p.signed_by(&key, &pki.issuer).unwrap().der().to_vec()
-    }
-
-    fn verifier(trusted: Option<&Pki>, store: &Arc<CertStore>) -> RecordingVerifier {
-        let mut roots = rustls::RootCertStore::empty();
-        if let Some(p) = trusted {
-            roots.add(p.ca_der.clone()).unwrap();
-        }
-        RecordingVerifier::new(
-            roots,
-            Arc::new(rustls::crypto::ring::default_provider()),
-            store.clone(),
-        )
+        let cert = p.signed_by(&key, &pki.issuer).unwrap();
+        let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
         .unwrap()
-    }
-
-    fn check(
-        v: &RecordingVerifier,
-        der: &[u8],
-        host: &str,
-    ) -> std::result::Result<(), rustls::Error> {
-        v.verify_server_cert(
-            &CertificateDer::from(der.to_vec()),
-            &[],
-            &ServerName::try_from(host.to_string()).unwrap(),
-            &[],
-            UnixTime::now(),
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
         )
-        .map(|_| ())
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                c.fetch_add(1, Ordering::SeqCst);
+                let a = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = a.accept(s).await;
+                });
+            }
+        });
+        (port, count)
     }
 
-    #[test]
-    fn good_chain_is_accepted_and_recorded() {
-        let (store, pki) = (Arc::new(CertStore::default()), pki());
-        let der = leaf(&pki, "good.test", false);
-        let v = verifier(Some(&pki), &store);
-        check(&v, &der, "good.test").unwrap();
-        // Until the server proves the key (signature check) nothing is served.
-        assert!(store.by_host("good.test").is_none());
-        store.confirm(&common::certstore::fingerprint(&der));
-        let info = store.by_host("good.test").unwrap();
-        assert_eq!(info.verdict, Verdict::Ok);
-        assert_eq!(info.reason, None);
-        assert!(info.subject.contains("good.test") || info.sans == ["good.test"]);
+    fn prober(pki: &Pki) -> (CertProber, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, &pki.ca_pem).unwrap();
+        let opts = UpstreamOptions {
+            extra_ca_paths: vec![ca],
+            resolve_all_to: Some("127.0.0.1".parse().unwrap()),
+            connect_timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        (CertProber::new(&opts).unwrap(), dir)
     }
 
-    #[test]
-    fn bad_chains_are_still_rejected_but_recorded_with_a_reason() {
-        let (store, pki) = (Arc::new(CertStore::default()), pki());
-        let v = verifier(Some(&pki), &store);
-
-        let expired = leaf(&pki, "old.test", true);
-        assert!(check(&v, &expired, "old.test").is_err());
-        let i = store.by_host("old.test").unwrap();
+    #[tokio::test]
+    async fn probe_records_reason_per_port_and_is_cached() {
+        let pki = pki();
+        let (bad, bad_hits) = server(&pki, "h.test", true).await;
+        let (good, _) = server(&pki, "h.test", false).await;
+        let (p, _d) = prober(&pki);
+        let fp = p.probe("h.test", bad).await.expect("fingerprint");
+        let info = p.store.by_host(&format!("h.test:{bad}")).unwrap();
+        assert_eq!(info.fp, fp);
         assert_eq!(
-            (i.verdict, i.reason),
+            (info.verdict, info.reason),
             (Verdict::Invalid, Some(FailReason::Expired))
         );
+        // The same host on another port is independent.
+        let fp2 = p.probe("h.test", good).await.unwrap();
+        assert_ne!(fp, fp2);
+        let ok = p.store.by_host(&format!("h.test:{good}")).unwrap();
+        assert_eq!(ok.verdict, Verdict::Ok);
+        // Cached: no new connection, same answer.
+        let before = bad_hits.load(Ordering::SeqCst);
+        assert_eq!(p.probe("h.test", bad).await, Some(fp));
+        assert_eq!(bad_hits.load(Ordering::SeqCst), before);
+    }
 
-        let other = leaf(&pki, "other.test", false);
-        assert!(check(&v, &other, "wrong.test").is_err());
-        let i = store.by_host("wrong.test").unwrap();
-        assert_eq!(i.reason, Some(FailReason::NameMismatch));
+    #[tokio::test]
+    async fn concurrent_probes_of_one_host_share_one_handshake() {
+        let pki = pki();
+        let (port, hits) = server(&pki, "h.test", true).await;
+        let (p, _d) = prober(&pki);
+        let p = Arc::new(p);
+        let rs = futures_util::future::join_all((0..8).map(|_| {
+            let p = p.clone();
+            async move { p.probe("h.test", port).await }
+        }))
+        .await;
+        assert!(rs.iter().all(|r| r == &rs[0] && r.is_some()));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
 
-        let stranger = leaf(&pki, "x.test", false);
-        assert!(check(
-            &verifier(Some(&pki_named("unrelated CA")), &store),
-            &stranger,
-            "x.test"
-        )
-        .is_err());
-        let i = store.by_host("x.test").unwrap();
-        assert_eq!(i.reason, Some(FailReason::UnknownIssuer));
-        assert!(i.detail.is_some());
+    #[tokio::test]
+    async fn probe_failure_yields_nothing() {
+        let pki = pki();
+        let (p, _d) = prober(&pki);
+        // Nothing listens on port 1.
+        assert_eq!(p.probe("h.test", 1).await, None);
     }
 }

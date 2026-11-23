@@ -2,16 +2,16 @@
 //! certificate (the certificate a client sees is Argus's minted leaf).
 //!
 //! Parsed certificate data is keyed by SHA-256 fingerprint of the leaf and is host-independent.
-//! Verdicts are keyed by host (the TLS verifier sees no port), so one host presenting another
-//! site's public chain can never change that site's verdict. An `ok` verdict counts only after
-//! the handshake signature check proved the server holds the key ([`CertStore::confirm`]); an
-//! `invalid` one is recorded at once (the handshake is rejected anyway) against the host that
-//! was attempted. The parsed cache is capped in bytes. A chain is parsed only when its
+//! Verdicts are keyed by `host:port` (port defaulted to 443), so one site presenting another's
+//! public chain can never change that site's verdict, and two ports of one host stay apart.
+//! The proxy records an `ok` verdict from a response that completed (full verification) and an
+//! `invalid` one from a dedicated probe handshake after an upstream TLS failure. The store also
+//! remembers which profiles saw each `host:port`, so profile-restricted callers only get hosts
+//! their profiles visited. Everything is capped in bytes. A chain is parsed only when its
 //! fingerprint is new.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use moka::sync::Cache;
 use parking_lot::Mutex;
@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_CAPACITY: u64 = 4096;
 /// Default byte budget of the parsed-certificate cache.
 pub const DEFAULT_BYTES: u64 = 32 * 1024 * 1024;
+/// Byte budget of the per-host profile memory.
+pub const SEEN_BYTES: u64 = 2 * 1024 * 1024;
 /// Most SANs kept per certificate.
 const MAX_SANS: usize = 100;
 /// Longest stored subject, issuer, SAN or detail string, in bytes.
@@ -29,8 +31,10 @@ const MAX_STR: usize = 256;
 /// Most chain entries parsed per handshake.
 const MAX_CHAIN: usize = 10;
 /// Entries not touched for this long are dropped.
-/// Waiting `ok` verdicts kept before the table is reset.
-const MAX_PENDING: usize = 1024;
+/// Most profiles remembered per host.
+const MAX_PROFILES: usize = 32;
+/// Default port when none is given.
+pub const DEFAULT_PORT: u16 = 443;
 const TTL_IDLE: Duration = Duration::from_secs(24 * 3600);
 
 /// Outcome of verifying the upstream chain.
@@ -125,22 +129,20 @@ impl Parsed {
     }
 }
 
-/// A host's verification result for one fingerprint.
+/// A `host:port`'s verification result for one fingerprint.
 struct HostRecord {
-    host: String,
     fp: String,
     verdict: Verdict,
     reason: Option<FailReason>,
     detail: Option<String>,
-    at: Instant,
 }
 
 /// Upstream certificate store.
 pub struct CertStore {
     parsed: Cache<String, Arc<Parsed>>,
     hosts: Cache<String, Arc<HostRecord>>,
-    /// `ok` verdicts waiting for the signature check, by leaf fingerprint.
-    pending: Mutex<HashMap<String, Vec<Arc<HostRecord>>>>,
+    /// Profile ids that saw each `host:port`.
+    seen: Cache<String, Arc<Mutex<Vec<String>>>>,
 }
 
 impl std::fmt::Debug for CertStore {
@@ -168,18 +170,32 @@ pub fn fingerprint(der: &[u8]) -> String {
     hex(&Sha256::digest(der))
 }
 
-/// Canonical key of a host: lowercase, IPv6 without brackets, no trailing dot, no port. The TLS
-/// verifier and URL hosts spell the same host differently; both go through this.
-pub fn host_key(host: &str) -> String {
-    let h = host.trim();
-    let h = if let Some(rest) = h.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
+/// Canonical `host:port` key. Accepts `host`, `host:port`, `[v6]`, `[v6]:port` and a bare IPv6
+/// literal; lowercase, no trailing dot, port defaulted to [`DEFAULT_PORT`]. IPv6 keeps its
+/// brackets.
+pub fn parse_hostport(s: &str) -> String {
+    let h = s.trim();
+    let (host, port) = if let Some(rest) = h.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']').unwrap_or((rest, ""));
+        (inner, after.strip_prefix(':').and_then(|p| p.parse().ok()))
     } else if h.matches(':').count() == 1 {
-        h.split(':').next().unwrap_or(h)
+        let (a, p) = h.split_once(':').unwrap_or((h, ""));
+        (a, p.parse().ok())
     } else {
-        h
+        (h, None)
     };
-    h.trim_end_matches('.').to_ascii_lowercase()
+    hostport(host, port.unwrap_or(DEFAULT_PORT))
+}
+
+/// Canonical `host:port` key from a bare host (with or without IPv6 brackets) and a port.
+pub fn hostport(host: &str, port: u16) -> String {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let h = h.trim_end_matches('.').to_ascii_lowercase();
+    if h.contains(':') {
+        format!("[{h}]:{port}")
+    } else {
+        format!("{h}:{port}")
+    }
 }
 
 fn cap(s: &str) -> String {
@@ -224,13 +240,23 @@ impl CertStore {
                 .max_capacity(max_hosts)
                 .time_to_idle(TTL_IDLE)
                 .build(),
-            pending: Mutex::new(HashMap::new()),
+            seen: Cache::builder()
+                .max_capacity(SEEN_BYTES)
+                .weigher(|k: &String, v: &Arc<Mutex<Vec<String>>>| {
+                    let n: usize = v.lock().iter().map(|p| p.len() + 32).sum();
+                    u32::try_from(k.len() + n + 64).unwrap_or(u32::MAX)
+                })
+                .time_to_idle(TTL_IDLE)
+                .build(),
         }
     }
 
+    /// Parse and keep `chain_der` unless its leaf is known with at least as long a chain.
     fn ensure_parsed(&self, fp: &str, chain_der: &[&[u8]], ev: &dyn Fn() -> bool) -> bool {
-        if self.parsed.contains_key(fp) {
-            return true;
+        if let Some(p) = self.parsed.get(fp) {
+            if p.chain.len() >= chain_der.len().min(MAX_CHAIN) {
+                return true;
+            }
         }
         match Self::parse(fp, chain_der, ev()) {
             Some(p) => {
@@ -241,18 +267,44 @@ impl CertStore {
         }
     }
 
-    /// Record the chain `host` presented (leaf first) and the verification result; returns the
-    /// leaf fingerprint. A failure is recorded against `host` at once. A success is held until
-    /// [`Self::confirm`] sees the handshake signature verify for that fingerprint.
-    pub fn record(
+    fn put(&self, key: &str, rec: HostRecord) {
+        if let Some(old) = self.hosts.get(key) {
+            if old.fp == rec.fp && old.verdict == rec.verdict && old.reason == rec.reason {
+                return;
+            }
+        }
+        self.hosts.insert(key.to_string(), Arc::new(rec));
+    }
+
+    /// A response completed over a connection that presented the leaf `der`: full verification
+    /// passed, so `hostport` gets an `ok` verdict. Returns the leaf fingerprint.
+    pub fn record_ok(&self, hostport: &str, der: &[u8], ev: &dyn Fn() -> bool) -> Option<String> {
+        let fp = fingerprint(der);
+        if !self.ensure_parsed(&fp, &[der], ev) {
+            return None;
+        }
+        self.put(
+            &parse_hostport(hostport),
+            HostRecord {
+                fp: fp.clone(),
+                verdict: Verdict::Ok,
+                reason: None,
+                detail: None,
+            },
+        );
+        Some(fp)
+    }
+
+    /// Record what a probe handshake to `hostport` saw: the chain (leaf first) and the result of
+    /// verifying it. Returns the leaf fingerprint.
+    pub fn record_probe(
         &self,
-        host: &str,
+        hostport: &str,
         chain_der: &[&[u8]],
         result: Result<(), (FailReason, String)>,
         ev: &dyn Fn() -> bool,
     ) -> Option<String> {
-        let leaf = chain_der.first()?;
-        let fp = fingerprint(leaf);
+        let fp = fingerprint(chain_der.first()?);
         if !self.ensure_parsed(&fp, chain_der, ev) {
             return None;
         }
@@ -260,39 +312,44 @@ impl CertStore {
             Ok(()) => (Verdict::Ok, None, None),
             Err((r, d)) => (Verdict::Invalid, Some(r), Some(cap(&d))),
         };
-        let rec = Arc::new(HostRecord {
-            host: host_key(host),
-            fp: fp.clone(),
-            verdict,
-            reason,
-            detail,
-            at: Instant::now(),
-        });
-        if verdict == Verdict::Invalid {
-            self.hosts.insert(rec.host.clone(), rec);
-        } else {
-            let mut p = self.pending.lock();
-            if p.len() >= MAX_PENDING {
-                p.clear();
-            }
-            p.entry(fp.clone()).or_default().push(rec);
-        }
+        self.put(
+            &parse_hostport(hostport),
+            HostRecord {
+                fp: fp.clone(),
+                verdict,
+                reason,
+                detail,
+            },
+        );
         Some(fp)
     }
 
-    /// The handshake signature verified for the certificate `fp`: its waiting `ok` verdicts count.
-    pub fn confirm(&self, fp: &str) {
-        let recs = self.pending.lock().remove(fp);
-        for r in recs.into_iter().flatten() {
-            self.hosts.insert(r.host.clone(), r);
+    /// Remember that `profile` saw `hostport`.
+    pub fn note_seen(&self, hostport: &str, profile: &str) {
+        let key = parse_hostport(hostport);
+        if let Some(v) = self.seen.get(&key) {
+            if v.lock().iter().any(|p| p == profile) {
+                return;
+            }
         }
+        // Re-insert so the weigher sees the grown set.
+        let mut ids = self
+            .seen
+            .get(&key)
+            .map(|v| v.lock().clone())
+            .unwrap_or_default();
+        if ids.len() < MAX_PROFILES && !ids.iter().any(|p| p == profile) {
+            ids.push(profile.to_string());
+        }
+        self.seen.insert(key, Arc::new(Mutex::new(ids)));
     }
 
-    /// Make sure the leaf `der` a connection presented is known (a resumed session skips the
-    /// verifier); returns its fingerprint.
-    pub fn note_peer(&self, der: &[u8]) -> Option<String> {
-        let fp = fingerprint(der);
-        self.ensure_parsed(&fp, &[der], &|| false).then_some(fp)
+    /// Profiles that saw `hostport`.
+    pub fn seen_by(&self, hostport: &str) -> Vec<String> {
+        self.seen
+            .get(&parse_hostport(hostport))
+            .map(|v| v.lock().clone())
+            .unwrap_or_default()
     }
 
     fn parse(fp: &str, chain_der: &[&[u8]], ev: bool) -> Option<Parsed> {
@@ -344,14 +401,14 @@ impl CertStore {
         })
     }
 
-    /// The certificate `fp`. With `host`, the verdict that host last got for exactly this
+    /// The certificate `fp`. With `host` (`host` or `host:port`), the verdict that host last got for exactly this
     /// certificate; otherwise (or when that host presented another one) a host-independent
     /// verdict from the validity period alone, which says nothing about trust or name.
     pub fn info(&self, fp: &str, host: Option<&str>) -> Option<CertInfo> {
         let fp = fp.to_ascii_lowercase();
         let p = self.parsed.get(&fp)?;
         let rec = host
-            .and_then(|h| self.hosts.get(&host_key(h)))
+            .and_then(|h| self.hosts.get(&parse_hostport(h)))
             .filter(|r| r.fp == fp);
         let (verdict, reason, detail) = match rec {
             Some(r) => (r.verdict, r.reason, r.detail.clone()),
@@ -386,19 +443,10 @@ impl CertStore {
         })
     }
 
-    /// The latest certificate `host` presented, with its verdict.
+    /// The latest certificate `host` (`host` or `host:port`) presented, with its verdict.
     pub fn by_host(&self, host: &str) -> Option<CertInfo> {
-        let r = self.hosts.get(&host_key(host))?;
+        let r = self.hosts.get(&parse_hostport(host))?;
         self.info(&r.fp, Some(host))
-    }
-
-    /// Fingerprint of a certificate `host` was rejected for at or after `since` (the start of
-    /// the failed attempt).
-    pub fn invalid_since(&self, host: &str, since: Instant) -> Option<String> {
-        self.hosts
-            .get(&host_key(host))
-            .filter(|r| r.verdict == Verdict::Invalid && r.at >= since)
-            .map(|r| r.fp.clone())
     }
 
     /// Number of distinct certificates held (after pending maintenance).
@@ -430,34 +478,44 @@ mod tests {
     fn dedupes_by_fingerprint_and_links_hosts() {
         let s = CertStore::default();
         let d = cert("a.test");
-        let fp1 = s.record("A.test", &[d.as_slice()], Ok(()), NO_EV).unwrap();
-        let fp2 = s.record("b.test", &[d.as_slice()], Ok(()), NO_EV).unwrap();
+        let fp1 = s.record_ok("A.test", &d, NO_EV).unwrap();
+        let fp2 = s.record_ok("b.test:443", &d, NO_EV).unwrap();
         assert_eq!(fp1, fp2);
         assert_eq!(fp1, fingerprint(&d));
         assert_eq!(s.len(), 1);
-        assert!(
-            s.by_host("a.test").is_none(),
-            "unconfirmed ok is not served"
-        );
-        s.confirm(&fp1);
         let info = s.by_host("a.test").unwrap();
         assert_eq!(info.sans, vec!["a.test".to_string()]);
         assert_eq!(info.verdict, Verdict::Ok);
-        assert_eq!(info.chain.len(), 1);
         assert_eq!(s.by_host("b.test").unwrap().fp, fp1);
         assert!(s.info(&fp1.to_uppercase(), None).is_some());
+    }
+
+    #[test]
+    fn ports_of_one_host_are_independent() {
+        let s = CertStore::default();
+        let (a, b) = (cert("h.test"), cert("h.test"));
+        let fa = s.record_ok("h.test:443", &a, NO_EV).unwrap();
+        let fb = s
+            .record_probe(
+                "h.test:8443",
+                &[b.as_slice()],
+                Err((FailReason::Expired, "old".into())),
+                NO_EV,
+            )
+            .unwrap();
+        assert_ne!(fa, fb);
+        assert_eq!(s.by_host("h.test").unwrap().fp, fa);
+        assert_eq!(s.by_host("h.test:8443").unwrap().fp, fb);
+        assert_eq!(s.by_host("h.test:8443").unwrap().verdict, Verdict::Invalid);
+        assert_eq!(s.by_host("h.test").unwrap().verdict, Verdict::Ok);
     }
 
     #[test]
     fn another_hosts_failure_never_changes_a_verdict() {
         let s = CertStore::default();
         let d = cert("bank.test");
-        let fp = s
-            .record("bank.test", &[d.as_slice()], Ok(()), NO_EV)
-            .unwrap();
-        s.confirm(&fp);
-        // evil.test replays bank.test's public chain and is rejected.
-        s.record(
+        let fp = s.record_ok("bank.test", &d, NO_EV).unwrap();
+        s.record_probe(
             "evil.test",
             &[d.as_slice()],
             Err((FailReason::NameMismatch, "bad name".into())),
@@ -466,45 +524,31 @@ mod tests {
         assert_eq!(s.info(&fp, Some("bank.test")).unwrap().verdict, Verdict::Ok);
         let evil = s.info(&fp, Some("evil.test")).unwrap();
         assert_eq!(evil.reason, Some(FailReason::NameMismatch));
-        // Without a host, only the validity period speaks.
         assert_eq!(s.info(&fp, None).unwrap().verdict, Verdict::Ok);
     }
 
     #[test]
-    fn replayed_chain_without_a_valid_signature_is_never_confirmed() {
-        let s = CertStore::default();
-        let d = cert("bank.test");
-        s.record("bank.test", &[d.as_slice()], Ok(()), NO_EV)
-            .unwrap();
-        // The signature check never succeeds: nothing is served.
-        assert!(s.by_host("bank.test").is_none());
-    }
-
-    #[test]
-    fn invalid_since_needs_a_fresh_invalid_record() {
-        let s = CertStore::default();
-        let d = cert("a.test");
-        let before = Instant::now();
-        s.record(
-            "[::1]",
-            &[d.as_slice()],
-            Err((FailReason::Expired, "x".into())),
-            NO_EV,
-        );
-        assert!(
-            s.invalid_since("::1", before).is_some(),
-            "IPv6 spellings meet"
-        );
-        assert!(s.invalid_since("::1", Instant::now()).is_none(), "stale");
-        assert!(s.invalid_since("other.test", before).is_none());
-    }
-
-    #[test]
     fn host_keys_are_canonical() {
-        assert_eq!(host_key("Example.COM."), "example.com");
-        assert_eq!(host_key("example.com:8443"), "example.com");
-        assert_eq!(host_key("[2001:db8::1]:443"), "2001:db8::1");
-        assert_eq!(host_key("2001:db8::1"), "2001:db8::1");
+        assert_eq!(parse_hostport("Example.COM."), "example.com:443");
+        assert_eq!(parse_hostport("example.com:8443"), "example.com:8443");
+        assert_eq!(parse_hostport("[2001:db8::1]:444"), "[2001:db8::1]:444");
+        assert_eq!(parse_hostport("2001:db8::1"), "[2001:db8::1]:443");
+        assert_eq!(hostport("[::1]", 443), "[::1]:443");
+        assert_eq!(hostport("::1", 443), parse_hostport("[::1]"));
+    }
+
+    #[test]
+    fn profiles_are_remembered_per_host_and_bounded() {
+        let s = CertStore::default();
+        s.note_seen("a.test", "1");
+        s.note_seen("a.test:443", "1");
+        s.note_seen("a.test", "2");
+        assert_eq!(s.seen_by("a.test"), vec!["1".to_string(), "2".to_string()]);
+        assert!(s.seen_by("b.test").is_empty());
+        for i in 0..100 {
+            s.note_seen("c.test", &i.to_string());
+        }
+        assert_eq!(s.seen_by("c.test").len(), MAX_PROFILES);
     }
 
     #[test]
@@ -517,33 +561,22 @@ mod tests {
             .cert
             .der()
             .to_vec();
-        let s = CertStore::new(1024, 16);
-        s.record("big.test", &[d.as_slice()], Ok(()), NO_EV)
-            .unwrap();
-        s.confirm(&fingerprint(&d));
-        let info = s.by_host("big.test");
-        if let Some(i) = info {
-            assert!(i.sans.len() <= MAX_SANS);
-            assert!(i.sans.iter().all(|x| x.len() <= MAX_STR));
-        }
+        let tiny = CertStore::new(1024, 16);
+        tiny.record_ok("big.test", &d, NO_EV).unwrap();
         // The entry outweighs the whole budget, so it is evicted instead of held.
-        assert!(s.len() <= 1);
+        assert!(tiny.len() <= 1);
         let roomy = CertStore::default();
-        roomy
-            .record("big.test", &[d.as_slice()], Ok(()), NO_EV)
-            .unwrap();
-        roomy.confirm(&fingerprint(&d));
+        roomy.record_ok("big.test", &d, NO_EV).unwrap();
         let i = roomy.by_host("big.test").unwrap();
         assert_eq!(i.sans.len(), MAX_SANS);
+        assert!(i.sans.iter().all(|x| x.len() <= MAX_STR));
     }
 
     #[test]
     fn garbage_is_not_stored() {
         let s = CertStore::default();
-        assert!(s
-            .record("a.test", &[b"nope".as_slice()], Ok(()), NO_EV)
-            .is_none());
-        assert!(s.record("a.test", &[], Ok(()), NO_EV).is_none());
+        assert!(s.record_ok("a.test", b"nope", NO_EV).is_none());
+        assert!(s.record_probe("a.test", &[], Ok(()), NO_EV).is_none());
         assert!(s.by_host("a.test").is_none());
     }
 }

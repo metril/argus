@@ -559,16 +559,16 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
     let fp = ctx
         .state
         .certs()
-        .record("o.test", &[der.as_slice()], Ok(()), &|| false)
+        .record_ok("o.test", &der, &|| false)
         .unwrap();
-    ctx.state.certs().confirm(&fp);
     // Another host replaying the chain gets its own verdict; o.test's is untouched.
-    ctx.state.certs().record(
+    ctx.state.certs().record_probe(
         "evil.test",
         &[der.as_slice()],
         Err((::common::certstore::FailReason::NameMismatch, "bad".into())),
         &|| false,
     );
+    ctx.state.certs().note_seen("o.test", "kids");
     let admin = ctx.admin().await;
     let secret = ctx.token(&admin, &["logs:read"]).await;
     let a = ctx
@@ -604,7 +604,7 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
         .await
         .json();
     assert_eq!(ok["verdict"], "ok");
-    // A profile-restricted token cannot probe hosts, but can read a cert it holds the fp of.
+    // A profile-restricted token sees only hosts its profiles visited; the rest is a plain 404.
     let r = admin
         .post("/api/v1/tokens")
         .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
@@ -612,8 +612,22 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
     let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
     ctx.bearer("GET", "/api/v1/certs/by-host/o.test", &kid)
         .await
-        .assert_status_forbidden();
-    ctx.bearer("GET", &format!("/api/v1/certs/{fp}"), &kid)
+        .assert_status_ok();
+    ctx.bearer("GET", "/api/v1/certs/by-host/o.test:443", &kid)
+        .await
+        .assert_status_ok();
+    for path in [
+        "/api/v1/certs/by-host/evil.test".to_string(),
+        "/api/v1/certs/by-host/unknown.test".to_string(),
+        "/api/v1/certs/by-host/o.test:8443".to_string(),
+        format!("/api/v1/certs/{fp}?host=evil.test"),
+        format!("/api/v1/certs/{fp}?host=unknown.test"),
+    ] {
+        ctx.bearer("GET", &path, &kid)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+    ctx.bearer("GET", &format!("/api/v1/certs/{fp}?host=o.test"), &kid)
         .await
         .assert_status_ok();
     ctx.bearer("GET", "/api/v1/certs/by-host/nope.test", &secret)

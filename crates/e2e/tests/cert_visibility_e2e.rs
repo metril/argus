@@ -23,7 +23,8 @@ e2e_test!(
         let fp = ev.cert_fp.clone().expect("cert_fp on a decrypted request");
 
         let api = env.proxy.api().await;
-        let r = api.get(&format!("/certs/{fp}?host=good.test")).await;
+        let port = env.origin.https_port();
+        let r = api.get(&format!("/certs/{fp}?host=good.test:{port}")).await;
         r.assert_status_ok();
         let info: serde_json::Value = r.json();
         assert_eq!(info["fp"], fp.as_str());
@@ -37,7 +38,10 @@ e2e_test!(
             .any(|s| s == "good.test"));
         assert_eq!(info["chain"].as_array().unwrap().len(), 1);
 
-        let by_host: serde_json::Value = api.get("/certs/by-host/good.test").await.json();
+        let by_host: serde_json::Value = api
+            .get(&format!("/certs/by-host/good.test:{port}"))
+            .await
+            .json();
         assert_eq!(by_host["fp"], fp.as_str());
         api.get("/certs/by-host/unseen.test")
             .await
@@ -104,7 +108,13 @@ e2e_test!(
                 "two.test"
             };
             let fp = e.cert_fp.clone().expect("cert_fp");
-            let info: serde_json::Value = api.get(&format!("/certs/{fp}?host={host}")).await.json();
+            let info: serde_json::Value = api
+                .get(&format!(
+                    "/certs/{fp}?host={host}:{}",
+                    env.origin.https_port()
+                ))
+                .await
+                .json();
             assert!(info["subject"].as_str().unwrap().contains(host), "{info}");
         }
     }

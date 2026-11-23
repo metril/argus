@@ -9425,7 +9425,7 @@
         "operationId": "get_cert_by_host",
         "parameters": [
           {
-            "description": "Host name as dialed",
+            "description": "`host` or `host:port` as dialed (default port 443)",
             "in": "path",
             "name": "host",
             "required": true,
@@ -9456,7 +9456,14 @@
             "description": "Missing, invalid, expired or revoked credentials"
           },
           "403": {
-            "description": "Profile-restricted token"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
           },
           "429": {
             "content": {
@@ -9511,7 +9518,7 @@
             }
           },
           {
-            "description": "Host (optionally `host:port`) the certificate was presented to. Without it the verdict\nreflects the validity period only.",
+            "description": "`host` or `host:port` (default port 443) the certificate was presented to. Without it the\nverdict reflects the validity period only. A profile-restricted token gets 404 for hosts\nits profiles have not visited.",
             "in": "query",
             "name": "host",
             "required": false,

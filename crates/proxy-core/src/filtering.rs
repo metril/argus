@@ -229,6 +229,9 @@ pub struct ProxyContext {
     respect_no_transform: std::sync::atomic::AtomicBool,
     /// Upstream certificates seen by the upstream clients (shared with the web API).
     certs: Arc<common::certstore::CertStore>,
+    /// Probe handshakes to learn why an upstream certificate was rejected (when built from
+    /// options).
+    prober: Option<Arc<crate::upstream::CertProber>>,
 }
 
 impl ProxyContext {
@@ -258,6 +261,7 @@ impl ProxyContext {
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
             certs: Default::default(),
+            prober: None,
         }
     }
 
@@ -329,6 +333,7 @@ impl ProxyContext {
         ctx.policy = opts.policy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
         ctx.certs = opts.certs.clone();
+        ctx.prober = Some(Arc::new(crate::upstream::CertProber::new(opts)?));
         Ok(ctx)
     }
 
@@ -447,6 +452,9 @@ impl ProxyContext {
         if let Some(p) = p {
             self.client.store(Arc::new(p.client));
             self.strict_client.store(Arc::new(p.strict));
+            if let Some(pr) = &self.prober {
+                pr.set_connect_timeout(p.opts.connect_timeout);
+            }
             *self.upstream_opts.lock() = Some(p.opts);
         }
     }
@@ -839,8 +847,6 @@ impl ProxyContext {
             rb = rb.body(reqwest::Body::wrap_stream(stream));
         }
 
-        // Start of this attempt: only a rejection recorded after it can belong to this request.
-        let attempt_start = std::time::Instant::now();
         let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);
         let sent = if timeout_ms == 0 {
             rb.send().await
@@ -879,8 +885,19 @@ impl ProxyContext {
             Err(e) => {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
                 debug!("Upstream error for {}: {}", url, e);
-                // A failure with no response: the host's rejection recorded during this attempt.
-                let failed_fp = self.certs.invalid_since(&url_host, attempt_start);
+                let kind = crate::upstream::classify_reqwest(&e);
+                let hostport = common::certstore::hostport(&url_host, port);
+                // A certificate failure: one cached, single-flight probe handshake tells which
+                // certificate was presented and why it was rejected.
+                let failed_fp = match (&self.prober, kind, scheme) {
+                    (Some(p), filter_engine::ErrorKind::UpstreamTls, "https") => {
+                        p.probe(&url_host, port).await
+                    }
+                    _ => None,
+                };
+                if failed_fp.is_some() {
+                    self.certs.note_seen(&hostport, &rctx.profile.load().label);
+                }
                 if !bypass_full {
                     log_request(
                         failed_fp.as_deref(),
@@ -891,13 +908,14 @@ impl ProxyContext {
                         source_url(&headers, &url, rtype),
                         rtype,
                         Some(502),
-                        Some(crate::upstream::classify_reqwest(&e)),
+                        Some(kind),
                     );
                 }
-                if crate::upstream::classify_reqwest(&e) == filter_engine::ErrorKind::UpstreamTls {
+                if kind == filter_engine::ErrorKind::UpstreamTls {
                     let info = failed_fp
                         .as_deref()
-                        .and_then(|fp| self.certs.info(fp, Some(&url_host)));
+                        .and_then(|fp| self.certs.info(fp, Some(&hostport)))
+                        .filter(|i| i.verdict == common::certstore::Verdict::Invalid);
                     return Ok(crate::redirect::cert_error_response(
                         &url_host,
                         info.as_ref(),
@@ -914,7 +932,15 @@ impl ProxyContext {
                 .extensions()
                 .get::<reqwest::tls::TlsInfo>()
                 .and_then(|t| t.peer_certificate())
-                .and_then(|der| self.certs.note_peer(der));
+                .and_then(|der| {
+                    // A completed response proves the chain verified for this host and port.
+                    let hostport = common::certstore::hostport(&url_host, port);
+                    let fp = self
+                        .certs
+                        .record_ok(&hostport, der, &|| crate::ev::is_ev_der(der))?;
+                    self.certs.note_seen(&hostport, &rctx.profile.load().label);
+                    Some(fp)
+                });
             log_request(
                 cert_fp.as_deref(),
                 rctx,
