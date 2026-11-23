@@ -32,7 +32,7 @@ function openOptions(label = 'Open settings') {
   if (r.kind === 'unseen') { status('Not seen by Argus: this site is not filtered.', 'mut'); }
   if (r.kind === 'ok') {
     const c = r.cert;
-    if (c.verdict === 'invalid') status(`Invalid upstream certificate: ${c.reason ?? 'other'}${c.detail ? ` (${c.detail})` : ''}`, 'bad');
+    if (c.verdict === 'invalid') status(`Invalid upstream certificate: ${c.reason === 'distrusted' ? 'issuer no longer trusted for it' : (c.reason ?? 'other')}${c.detail ? ` (${c.detail})` : ''}`, 'bad');
     else status(`Upstream certificate valid${c.ev ? ' (EV)' : ''}`, 'ok');
     const dl = el('dl');
     const row = (k: string, v: string) => dl.append(el('dt', k), el('dd', v));

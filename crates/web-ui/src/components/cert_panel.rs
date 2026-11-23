@@ -14,6 +14,7 @@ fn reason_text(r: Option<CertFailReason>) -> &'static str {
         Some(CertFailReason::NotYetValid) => "Certificate is not valid yet",
         Some(CertFailReason::NameMismatch) => "Certificate does not match the host name",
         Some(CertFailReason::UnknownIssuer) => "Issuer is not trusted",
+        Some(CertFailReason::Distrusted) => "Issuing root no longer trusted for this certificate",
         Some(CertFailReason::Other) | None => "Verification failed",
     }
 }

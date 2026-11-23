@@ -291,6 +291,10 @@ pub fn BypassPage() -> impl IntoView {
                         <span class="dim" title=a.skipped_sample.join("\n")>{format!("{} lines skipped (too broad or invalid)", a.skipped_lines)}</span>
                     })}
                     {move || argus.read().as_ref().and_then(|a| a.last_error.clone()).map(|e| view! { <span class="err" role="alert">{format!("Last update failed: {e}")}</span> })}
+                    {move || argus.read().as_ref().and_then(|a| a.roots.clone()).map(|r| view! {
+                        <span class="dim">{format!("Trusted roots: {} ({} roots{})", if r.signed { format!("signed set {}", r.serial) } else { "built-in set".to_string() }, r.roots, r.last_checked.as_deref().map(|t| format!(", checked {}", crate::utils::fmt_datetime(t))).unwrap_or_default())}</span>
+                        {r.last_error.clone().map(|e| view! { <span class="err" role="alert">{format!("Trusted roots update failed: {e}")}</span> })}
+                    })}
                     <div class="srow cat">
                         <Switch
                             checked=Signal::derive(move || settings.read().as_ref().map(|s| s.ev_no_decrypt).unwrap_or(false))
