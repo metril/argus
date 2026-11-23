@@ -96,6 +96,7 @@ common = { path = "../common" }
 # WebSocket proxying (optional, feature `websockets`)
 tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = "1.0"
+webpki-root-certs = "=1.0.8"
 
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine", default-features = false }
