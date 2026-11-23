@@ -18,12 +18,10 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
-      AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Assert tag matches the Cargo version
         id: ver
@@ -60,11 +58,14 @@ jobs:
           mkdir dist
           cp "extension/.output/argus-extension-${VERSION}-chrome.zip" "extension/.output/argus-extension-${VERSION}-firefox.zip" dist/
 
-      # Only when the AMO secrets exist. A version can be signed once, so a re-run reuses the
-      # xpi already attached to the release.
+      # Only when the AMO secrets exist. A version can be signed once, so the xpi is uploaded to
+      # the release right away and a re-run reuses it.
       - name: Sign Firefox build (unlisted)
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: |
           if [ -z "$AMO_JWT_ISSUER" ] || [ -z "$AMO_JWT_SECRET" ]; then
             echo "AMO secrets not set; skipping Firefox signing"
@@ -81,12 +82,18 @@ jobs:
             --channel unlisted \
             --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET"
           cp signed/*.xpi "dist/$xpi"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" "dist/$xpi" --clobber
 
       - name: Checksums
         working-directory: dist
         run: sha256sum * > SHA256SUMS
 
       - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
