@@ -32,3 +32,11 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.claude/
+certs/
+crates/web-ui/dist/
+benches/
+docs/
+scripts/
+compose.yaml
+Dockerfile

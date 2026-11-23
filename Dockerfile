@@ -47,12 +47,12 @@ FROM chef AS builder
 # `full` compiles in the Web UI, ad blocking, userscripts, WebSocket, and HTTP/3 support so they
 # are present in the shipped binary (HTTP/3 still only starts when enabled in config).
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --features full
+RUN cargo chef cook --release --recipe-path recipe.json -p proxy-core --features full
 
 # Now copy source and build (only our code compiles; deps are cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN RUSTFLAGS="-C link-arg=-s" cargo build --release --bin adblocker --features full
+RUN RUSTFLAGS="-C link-arg=-s" cargo build --release -p proxy-core --bin adblocker --features full
 
 # Copy binary to a known location and verify
 RUN cp /build/target/release/adblocker /build/adblocker && \
@@ -90,6 +90,10 @@ FROM alpine:3.21
 # Pull the latest security patches for base packages, then add runtime deps.
 RUN apk upgrade --no-cache && apk add --no-cache ca-certificates libgcc
 
+LABEL org.opencontainers.image.source="https://github.com/metril/adblocker" \
+      org.opencontainers.image.title="adblocker" \
+      org.opencontainers.image.description="Adblocking MITM proxy with Web UI"
+
 # Create non-root user
 RUN adduser -D -u 1000 -h /app adblocker
 
@@ -119,6 +123,6 @@ ENV WEBUI_DIST_PATH=/app/webui
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD nc -z localhost 8080 && nc -z localhost 3000 || exit 1
+    CMD nc -z 127.0.0.1 8080 && nc -z 127.0.0.1 3000 || exit 1
 
 ENTRYPOINT ["/app/adblocker"]
