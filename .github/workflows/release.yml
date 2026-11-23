@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extension:
+    name: Browser extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+      AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert tag matches the Cargo version
+        id: ver
+        run: |
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version '${cargo_version}'"
+            exit 1
+          fi
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - name: Build and zip
+        working-directory: extension
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          npm ci
+          npm run gen:api
+          npx wxt zip -b chrome
+          npx wxt zip -b firefox
+
+      - name: Collect assets
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir dist
+          cp "extension/.output/argus-extension-${VERSION}-chrome.zip" "extension/.output/argus-extension-${VERSION}-firefox.zip" dist/
+
+      # Only when the AMO secrets exist. A version can be signed once, so a re-run reuses the
+      # xpi already attached to the release.
+      - name: Sign Firefox build (unlisted)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if [ -z "$AMO_JWT_ISSUER" ] || [ -z "$AMO_JWT_SECRET" ]; then
+            echo "AMO secrets not set; skipping Firefox signing"
+            exit 0
+          fi
+          xpi="argus-extension-${VERSION}-firefox.xpi"
+          if gh release download "$GITHUB_REF_NAME" --pattern "$xpi" --dir dist 2>/dev/null; then
+            echo "xpi already on the release; reusing"
+            exit 0
+          fi
+          npx --yes web-ext@8.9.0 sign \
+            --source-dir extension/.output/firefox-mv3 \
+            --artifacts-dir signed \
+            --channel unlisted \
+            --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET"
+          cp signed/*.xpi "dist/$xpi"
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create or update the GitHub release
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

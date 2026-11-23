@@ -329,7 +329,7 @@ npx wxt build -b chrome    # or: npx wxt build -b firefox
 - **Chrome/Chromium**: open `chrome://extensions`, enable Developer mode, click "Load unpacked", and select `extension/.output/chrome-mv3`.
 - **Firefox**: open `about:debugging#/runtime/this-firefox`, click "Load Temporary Add-on", and select `extension/.output/firefox-mv3/manifest.json`.
 
-Open the extension's options, enter the Argus URL (for example `http://localhost:8080`) and the token, and click "Test connection". Grant the host permission when prompted. CI also uploads zips as the `argus-extension` artifact.
+Open the extension's options, enter the Argus URL (for example `http://localhost:3000`) and the token, and click "Test connection". Grant the host permission when prompted. Prebuilt zips are attached to each [release](https://github.com/metril/argus/releases).
 
 ## Additional Resources
 
