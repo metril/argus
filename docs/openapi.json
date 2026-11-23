@@ -6589,6 +6589,143 @@
           "lines"
         ],
         "type": "object"
+      },
+      "WebUiCertInfo": {
+        "description": "Public details of a web UI certificate. The private key is never exposed.",
+        "properties": {
+          "fingerprint_sha256": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "not_after": {
+            "type": "string"
+          },
+          "not_before": {
+            "type": "string"
+          },
+          "sans": {
+            "description": "DNS names and IP addresses the certificate is valid for.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "issuer",
+          "sans",
+          "not_before",
+          "not_after",
+          "fingerprint_sha256"
+        ],
+        "type": "object"
+      },
+      "WebUiTlsMode": {
+        "description": "Where the web UI's HTTPS certificate comes from.",
+        "enum": [
+          "off",
+          "argus_ca",
+          "uploaded"
+        ],
+        "type": "string"
+      },
+      "WebUiTlsRequest": {
+        "description": "Set the web UI's HTTPS mode.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/WebUiTlsMode"
+          },
+          "redirect_http": {
+            "type": "boolean"
+          },
+          "sans": {
+            "description": "Names for the Argus CA certificate (required for `argus_ca`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "WebUiTlsStatus": {
+        "description": "Built-in HTTPS for the web UI: the saved setting, the certificate it uses and whether the\nlistener is serving TLS right now.",
+        "properties": {
+          "active": {
+            "description": "The listener is serving TLS now.",
+            "type": "boolean"
+          },
+          "cert": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/WebUiCertInfo",
+                "description": "The certificate for the current mode (`None` when off or none is stored yet)."
+              }
+            ]
+          },
+          "error": {
+            "description": "Why the stored setting is not in effect (e.g. certificate could not be loaded).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/WebUiTlsMode"
+          },
+          "redirect_http": {
+            "type": "boolean"
+          },
+          "sans": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "uploaded": {
+            "description": "An uploaded certificate is stored (usable by switching to `uploaded`).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mode",
+          "sans",
+          "redirect_http",
+          "active",
+          "uploaded"
+        ],
+        "type": "object"
+      },
+      "WebUiTlsUpload": {
+        "description": "Upload a certificate chain and its private key (PEM). Switches the mode to `uploaded`.",
+        "properties": {
+          "cert_pem": {
+            "type": "string"
+          },
+          "key_pem": {
+            "type": "string"
+          },
+          "redirect_http": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cert_pem",
+          "key_pem"
+        ],
+        "type": "object"
       }
     },
     "securitySchemes": {
@@ -15665,6 +15802,252 @@
         "summary": "Dry-run through the real conversion pipeline for `format`: per-line translated / handed off /\nskipped / rejected. Nothing is stored or installed.",
         "tags": [
           "rules"
+        ]
+      }
+    },
+    "/api/v1/settings/webui/tls": {
+      "get": {
+        "operationId": "get_tls",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebUiTlsStatus"
+                }
+              }
+            },
+            "description": "HTTPS status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "config:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:read"
+            ]
+          }
+        ],
+        "summary": "Current HTTPS setting of the web UI and its certificate.",
+        "tags": [
+          "config"
+        ]
+      },
+      "put": {
+        "operationId": "put_tls",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebUiTlsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebUiTlsStatus"
+                }
+              }
+            },
+            "description": "Applied"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "409": {
+            "description": "No certificate could be issued"
+          },
+          "422": {
+            "description": "Invalid names or certificate"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Set the HTTPS mode, certificate names and HTTP redirect. Applied live: the next connection\nuses the new certificate. 422 keeps the old setting when the certificate cannot be used.",
+        "tags": [
+          "config"
+        ]
+      }
+    },
+    "/api/v1/settings/webui/tls/upload": {
+      "post": {
+        "operationId": "upload_tls",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebUiTlsUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebUiTlsStatus"
+                }
+              }
+            },
+            "description": "Uploaded and applied"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "422": {
+            "description": "Not a valid certificate/key pair"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Upload a certificate chain and private key (PEM) and switch to it. The key must match the\ncertificate; otherwise 422 and the old certificate keeps being served.",
+        "tags": [
+          "config"
         ]
       }
     },

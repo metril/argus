@@ -163,41 +163,63 @@ impl CertificateAuthority {
         domain: &str,
     ) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
         debug!("Generating certificate for host: {}", domain);
+        let (cert, key_pair) = self.issue(domain, subject_alt_names(domain)?, 30)?;
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
+            .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
+        Ok((cert_der, key_der))
+    }
 
-        // Create certificate parameters
+    /// Issue a server certificate valid for `days` covering every entry of `sans` (DNS names and
+    /// IP literals, taken as given: no wildcard is added). Returns `(certificate PEM, key PEM)`.
+    pub fn generate_server_cert_pem(&self, sans: &[String], days: i64) -> Result<(String, String)> {
+        let mut names = Vec::new();
+        for s in sans {
+            let s = s.trim();
+            let bare = s
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(s);
+            if let Ok(ip) = bare.parse::<IpAddr>() {
+                names.push(SanType::IpAddress(ip));
+            } else {
+                names.push(SanType::DnsName(s.try_into().map_err(|e| {
+                    Error::Certificate(format!("Invalid name {s:?}: {e:?}"))
+                })?));
+            }
+        }
+        let cn = sans
+            .first()
+            .ok_or_else(|| Error::Certificate("At least one name is required".into()))?
+            .trim()
+            .to_string();
+        let (cert, key) = self.issue(&cn, names, days)?;
+        Ok((cert.pem(), key.serialize_pem()))
+    }
+
+    fn issue(
+        &self,
+        cn: &str,
+        sans: Vec<SanType>,
+        days: i64,
+    ) -> Result<(rcgen::Certificate, KeyPair)> {
         let mut params = CertificateParams::default();
-
-        // Set distinguished name
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, domain);
+        dn.push(DnType::CommonName, cn);
         params.distinguished_name = dn;
-
-        params.subject_alt_names = subject_alt_names(domain)?;
-
-        // Set validity period (30 days)
+        params.subject_alt_names = sans;
         params.not_before = OffsetDateTime::now_utc();
-        params.not_after = OffsetDateTime::now_utc() + Duration::days(30);
-
-        // Set key usages for server certificate
+        params.not_after = OffsetDateTime::now_utc() + Duration::days(days);
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-
-        // Generate key pair for the server certificate
         let key_pair = KeyPair::generate()
             .map_err(|e| Error::Certificate(format!("Failed to generate key pair: {}", e)))?;
-
         let cert = params
             .signed_by(&key_pair, &self.issuer)
             .map_err(|e| Error::Certificate(format!("Failed to sign certificate: {}", e)))?;
-
-        // Convert to DER format for rustls
-        let cert_der = CertificateDer::from(cert.der().to_vec());
-        let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
-            .map_err(|_| Error::Certificate("Failed to convert key to DER".to_string()))?;
-
-        Ok((cert_der, key_der))
+        Ok((cert, key_pair))
     }
 
     /// Get the CA certificate in DER format
@@ -390,6 +412,47 @@ mod tests {
         for host in ["10.1.2.3", "::1", "localhost", "a.example"] {
             assert!(ca.generate_cert(host).is_ok(), "{host}");
         }
+    }
+
+    #[test]
+    fn multi_san_server_cert_has_dns_and_ip_and_397_days() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ca = CertificateAuthority::load_or_generate(
+            tmp.path().join("ca.crt"),
+            tmp.path().join("ca.key"),
+        )
+        .unwrap();
+        let sans = [
+            "argus.lan".to_string(),
+            "192.168.1.5".into(),
+            "[::1]".into(),
+        ];
+        let (cert_pem, key_pem) = ca.generate_server_cert_pem(&sans, 397).unwrap();
+        assert!(key_pem.contains("PRIVATE KEY"));
+        let der = pem::parse(&cert_pem).unwrap().into_contents();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        let mut dns = Vec::new();
+        let mut ips = Vec::new();
+        for ext in cert.extensions() {
+            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+                ext.parsed_extension()
+            {
+                for n in &san.general_names {
+                    match n {
+                        x509_parser::extensions::GeneralName::DNSName(d) => dns.push(d.to_string()),
+                        x509_parser::extensions::GeneralName::IPAddress(b) => ips.push(b.to_vec()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(dns, vec!["argus.lan"]);
+        assert_eq!(ips.len(), 2);
+        assert!(ips.contains(&vec![192, 168, 1, 5]));
+        let v = cert.validity();
+        let days = (v.not_after.timestamp() - v.not_before.timestamp()) / 86400;
+        assert!((396..=398).contains(&days), "{days}");
+        assert!(ca.generate_server_cert_pem(&[], 397).is_err());
     }
 
     /// Verify `leaf` for `host` against only the on-disk CA certificate, with a real verifier.

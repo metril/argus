@@ -750,3 +750,77 @@ pub struct UserscriptStatsResponse {
     pub disabled_scripts: usize,
     pub total_executions: u64,
 }
+
+/// Where the web UI's HTTPS certificate comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WebUiTlsMode {
+    /// Plain HTTP (or a reverse proxy terminates TLS).
+    #[default]
+    Off,
+    /// A certificate issued by the Argus CA, renewed automatically.
+    ArgusCa,
+    /// A certificate and key the admin uploaded.
+    Uploaded,
+}
+
+/// Public details of a web UI certificate. The private key is never exposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WebUiCertInfo {
+    pub subject: String,
+    pub issuer: String,
+    /// DNS names and IP addresses the certificate is valid for.
+    pub sans: Vec<String>,
+    pub not_before: String,
+    pub not_after: String,
+    pub fingerprint_sha256: String,
+}
+
+/// Built-in HTTPS for the web UI: the saved setting, the certificate it uses and whether the
+/// listener is serving TLS right now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WebUiTlsStatus {
+    pub mode: WebUiTlsMode,
+    pub sans: Vec<String>,
+    pub redirect_http: bool,
+    /// The listener is serving TLS now.
+    pub active: bool,
+    /// The certificate for the current mode (`None` when off or none is stored yet).
+    pub cert: Option<WebUiCertInfo>,
+    /// An uploaded certificate is stored (usable by switching to `uploaded`).
+    pub uploaded: bool,
+    /// Why the stored setting is not in effect (e.g. certificate could not be loaded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Set the web UI's HTTPS mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WebUiTlsRequest {
+    pub mode: WebUiTlsMode,
+    /// Names for the Argus CA certificate (required for `argus_ca`).
+    #[serde(default)]
+    pub sans: Vec<String>,
+    #[serde(default)]
+    pub redirect_http: bool,
+}
+
+/// Upload a certificate chain and its private key (PEM). Switches the mode to `uploaded`.
+#[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WebUiTlsUpload {
+    pub cert_pem: String,
+    pub key_pem: String,
+    #[serde(default)]
+    pub redirect_http: bool,
+}
+
+impl std::fmt::Debug for WebUiTlsUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebUiTlsUpload").finish_non_exhaustive()
+    }
+}

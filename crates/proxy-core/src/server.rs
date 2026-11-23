@@ -190,6 +190,21 @@ impl ProxyControl {
         self.running.lock().await.as_ref().map(Running::info)
     }
 
+    /// Issue the web UI's HTTPS certificate from the Argus CA (397 days, one entry per name in
+    /// `sans`). Returns `(certificate PEM, key PEM)`.
+    pub async fn issue_webui_cert(&self, sans: Vec<String>) -> Result<(String, String)> {
+        let (cert, key) = {
+            let l = self.lazy_cfg.lock();
+            (l.mitm.ca_cert_path.clone(), l.mitm.ca_key_path.clone())
+        };
+        tokio::task::spawn_blocking(move || {
+            CertificateAuthority::load_or_generate(&cert, &key)?
+                .generate_server_cert_pem(&sans, 397)
+        })
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?
+    }
+
     /// Note where the web API listens (own-listener loop protection); call after it rebinds.
     pub async fn set_webui_listener(&self, host: &str, port: u16) {
         *self.webui_own.lock() = Some((port, host.parse().ok()));

@@ -22,6 +22,7 @@ use crate::middleware::{audit_middleware, rate_limit_middleware, request_id_midd
 use crate::openapi::{finalize, ApiDoc};
 use crate::routes::{api_router, API_PREFIX};
 use crate::state::AppState;
+use crate::webui_tls::TlsShared;
 
 /// Build the OpenAPI document and route table for an assembled router. Exposed so tests can
 /// exercise registration of arbitrary routers.
@@ -155,6 +156,8 @@ const OLD_LISTENER_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// The web API's listener, replaceable at runtime.
 pub struct WebServer {
     router: Router,
+    /// TLS configuration read by every new connection (swappable without rebinding).
+    tls: Arc<TlsShared>,
     /// Where the bound port is recorded for tooling (`.webui_port`).
     port_file: parking_lot::Mutex<Option<std::path::PathBuf>>,
     current: tokio::sync::Mutex<Current>,
@@ -235,10 +238,12 @@ impl WebServer {
         router: Router,
         listener: tokio::net::TcpListener,
         requested: (String, u16),
+        tls: Arc<TlsShared>,
     ) -> Arc<Self> {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let srv = Arc::new(Self {
             router,
+            tls,
             port_file: parking_lot::Mutex::new(None),
             current: tokio::sync::Mutex::new(Current {
                 gen: 0,
@@ -282,25 +287,33 @@ impl WebServer {
         gen: u64,
     ) -> tokio::sync::oneshot::Sender<()> {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let app = self
-            .router
-            .clone()
-            .into_make_service_with_connect_info::<SocketAddr>();
+        let (router, tls) = (self.router.clone(), self.tls.clone());
         let done = self.done_tx.clone();
         tokio::spawn(async move {
             let (grace_tx, grace_rx) = tokio::sync::oneshot::channel::<()>();
-            let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let serve = serve_loop(listener, router, tls, async move {
                 let _ = stop_rx.await;
                 let _ = grace_tx.send(());
             });
             let result = tokio::select! {
-                r = serve => r.map_err(|e| e.to_string()),
+                r = serve => r,
                 // After a stop request, give the old listener its grace period, then drop it.
                 _ = async { let _ = grace_rx.await; tokio::time::sleep(OLD_LISTENER_GRACE).await } => Ok(()),
             };
             let _ = done.send((gen, result));
         });
         stop_tx
+    }
+
+    /// Serve TLS with `cfg` from the next connection on (`None` = plain HTTP only). With
+    /// `redirect`, plain-HTTP requests are answered with a redirect to HTTPS.
+    pub fn set_tls(&self, cfg: Option<Arc<rustls::ServerConfig>>, redirect: bool) {
+        self.tls.set(cfg, redirect);
+    }
+
+    /// The TLS configuration and redirect flag in effect.
+    pub fn tls_snapshot(&self) -> (Option<Arc<rustls::ServerConfig>>, bool) {
+        self.tls.snapshot()
     }
 
     /// Current listening address (the last one, while [`Self::is_down`]).
@@ -510,13 +523,20 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
     let _ = std::fs::create_dir_all(&data_dir);
     let port_file = data_dir.join(".webui_port");
     let _ = std::fs::write(&port_file, bound_port.to_string());
-    warn_if_exposed_without_tls(&config);
+    let tls_cfg = crate::webui_tls::initial(&state).await;
+    if tls_cfg.is_none() {
+        warn_if_exposed_without_tls(&config);
+    }
+    let redirect = state.proxy_state.config.read().webui.tls.redirect_http;
+    let tls = Arc::new(TlsShared::new(tls_cfg, redirect));
 
     let sessions = state.session_manager.clone();
+    let renew_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
+            crate::webui_tls::renew_if_due(&renew_state).await;
             let s = sessions.clone();
             match tokio::task::spawn_blocking(move || s.purge_expired()).await {
                 Ok(Ok(_)) => {}
@@ -535,6 +555,7 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         router,
         listener,
         (config.server.host.clone(), config.server.port),
+        tls,
     );
     if let Some((configured, err)) = fallback {
         let mut cur = server.current.lock().await;
@@ -605,7 +626,8 @@ fn spawn_userscript_update_checks(state: Arc<AppState>) {
 }
 
 /// The server speaks plain HTTP. Bound beyond loopback, logins and session cookies cross the
-/// network in clear unless a TLS-terminating reverse proxy sits in front. Logged once at startup.
+/// network in clear unless HTTPS is on or a TLS-terminating reverse proxy sits in front. Logged
+/// once at startup (not when built-in HTTPS is active).
 fn warn_if_exposed_without_tls(config: &ApiConfig) {
     let host = config.server.host.trim_matches(['[', ']']);
     let loopback = host.eq_ignore_ascii_case("localhost")
@@ -615,10 +637,212 @@ fn warn_if_exposed_without_tls(config: &ApiConfig) {
     if !loopback {
         tracing::warn!(
             "Web UI is bound to {host} without TLS: passwords and session cookies are sent in \
-             clear text. Put a TLS-terminating reverse proxy in front (and list it under \
-             network.trusted_proxies so cookies get the Secure flag) or bind to 127.0.0.1."
+             clear text. Turn on HTTPS under Settings > HTTPS, put a TLS-terminating reverse \
+             proxy in front (and list it under trusted proxies so cookies get the Secure flag), \
+             or bind to 127.0.0.1."
         );
     }
+}
+
+/// How long a new connection may take to send its first byte and finish the TLS handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Public CA downloads stay reachable over plain HTTP so a browser can fetch the CA it must
+/// trust before it can open the HTTPS page.
+const PLAIN_PATHS: [&str; 2] = ["/api/v1/ca.crt", "/api/v1/ca.der"];
+
+/// Accept connections until `shutdown` resolves, then stop accepting (the socket is released at
+/// once) and let in-flight connections finish.
+///
+/// The first byte of each connection decides: a TLS ClientHello (0x16) goes to the TLS acceptor
+/// built from the current [`TlsShared`] configuration; anything else is plain HTTP, redirected to
+/// HTTPS when that is configured.
+async fn serve_loop(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    tls: Arc<TlsShared>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => {
+                    tokio::spawn(handle_conn(
+                        stream,
+                        peer,
+                        router.clone(),
+                        tls.clone(),
+                        sd_rx.clone(),
+                        live_tx.clone(),
+                    ));
+                }
+                Err(e) => {
+                    // Out of descriptors and the like: back off instead of spinning.
+                    tracing::warn!("web listener accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            },
+        }
+    }
+    drop(listener);
+    let _ = sd_tx.send(true);
+    drop(live_tx);
+    // Resolves once every connection task has dropped its sender.
+    let _ = live_rx.recv().await;
+    Ok(())
+}
+
+async fn handle_conn(
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    router: Router,
+    tls: Arc<TlsShared>,
+    sd: tokio::sync::watch::Receiver<bool>,
+    _alive: tokio::sync::mpsc::Sender<()>,
+) {
+    let mut first = [0u8; 1];
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
+        Ok(Ok(1)) => {}
+        _ => return,
+    }
+    let (cfg, redirect) = tls.snapshot();
+    if first[0] == 0x16 {
+        let Some(cfg) = cfg else { return };
+        let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+        let tls_stream =
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(s)) => s,
+                _ => return,
+            };
+        serve_io(tls_stream, app_service(router, peer, true), sd).await;
+    } else if cfg.is_some() && redirect {
+        let port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+        serve_io(stream, redirect_service(router, peer, port), sd).await;
+    } else {
+        serve_io(stream, app_service(router, peer, false), sd).await;
+    }
+}
+
+type Resp = axum::response::Response;
+
+/// The router as a hyper service, with the peer address and (for native TLS) the secure marker.
+fn app_service(
+    router: Router,
+    peer: SocketAddr,
+    secure: bool,
+) -> impl hyper::service::Service<
+    hyper::Request<hyper::body::Incoming>,
+    Response = Resp,
+    Error = std::convert::Infallible,
+    Future = impl Send + 'static,
+> + Send
+       + 'static {
+    hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+        use tower::ServiceExt;
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        if secure {
+            req.extensions_mut()
+                .insert(crate::middleware::request_id::NativeTls);
+        }
+        router.clone().oneshot(req.map(axum::body::Body::new))
+    })
+}
+
+/// Plain-HTTP requests answered with a 308 to the same path over HTTPS on this port (the CA
+/// downloads are served as usual).
+fn redirect_service(
+    router: Router,
+    peer: SocketAddr,
+    port: u16,
+) -> impl hyper::service::Service<
+    hyper::Request<hyper::body::Incoming>,
+    Response = Resp,
+    Error = std::convert::Infallible,
+    Future = impl Send + 'static,
+> + Send
+       + 'static {
+    hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+        use tower::ServiceExt;
+        let router = router.clone();
+        async move {
+            if PLAIN_PATHS.contains(&req.uri().path()) {
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+                return router.oneshot(req.map(axum::body::Body::new)).await;
+            }
+            Ok(redirect_response(&req, port))
+        }
+    })
+}
+
+fn redirect_response<B>(req: &hyper::Request<B>, port: u16) -> Resp {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| {
+            if h.starts_with('[') {
+                h.split_inclusive(']').next().unwrap_or(h)
+            } else {
+                h.rsplit_once(':').map_or(h, |(n, _)| n)
+            }
+        })
+        .filter(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-_:[]".contains(&b))
+        });
+    let Some(host) = host else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map_or("/", |p| p.as_str())
+        .to_string();
+    let port = if port == 443 {
+        String::new()
+    } else {
+        format!(":{port}")
+    };
+    match HeaderValue::try_from(format!("https://{host}{port}{pq}")) {
+        Ok(loc) => (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, loc)]).into_response(),
+        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
+/// Run one HTTP/1 or HTTP/2 connection until it ends, or finish it gracefully on shutdown.
+async fn serve_io<I, S>(io: I, svc: S, mut sd: tokio::sync::watch::Receiver<bool>)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = Resp,
+            Error = std::convert::Infallible,
+        > + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    let conn = builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(io), svc);
+    tokio::pin!(conn);
+    tokio::select! {
+        r = conn.as_mut() => {
+            if let Err(e) = r {
+                tracing::debug!("web connection ended: {e}");
+            }
+            return;
+        }
+        _ = sd.wait_for(|v| *v) => {}
+    }
+    conn.as_mut().graceful_shutdown();
+    let _ = conn.await;
 }
 
 /// Path prefix whose responses browser extensions may read cross-origin.

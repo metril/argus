@@ -15,6 +15,7 @@ pub mod proxy;
 pub mod register;
 pub mod sessions;
 pub mod settings;
+pub mod settings_https;
 pub mod tokens;
 pub mod users;
 pub mod userscripts;

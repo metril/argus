@@ -11,7 +11,7 @@ use utoipa_axum::{
 
 use crate::handlers::{
     audit, auth, bypass, certificate, certs, devices, downloads, health, lists, policy, profiles,
-    proxy, rules, stats, tokens, users, userscripts,
+    proxy, rules, stats, tokens, users, userscripts, webui_tls,
 };
 use crate::state::AppState;
 
@@ -123,6 +123,9 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(bypass::check_host))
         .routes(routes!(proxy::reload_config))
+        // web UI HTTPS
+        .routes(routes!(webui_tls::get_tls, webui_tls::put_tls))
+        .routes(routes!(webui_tls::upload_tls))
         // userscripts
         .routes(routes!(
             userscripts::list_userscripts,

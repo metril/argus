@@ -9,7 +9,22 @@ pub use api_types::{
     UpdateProxyConfigRequest,
 };
 
+pub use api_types::{WebUiTlsMode, WebUiTlsRequest, WebUiTlsStatus, WebUiTlsUpload};
+
 impl ApiClient {
+    /// HTTPS setting of the web UI and its certificate.
+    pub async fn get_webui_tls(&self) -> Result<WebUiTlsStatus, ApiError> {
+        self.get("/settings/webui/tls").await
+    }
+
+    pub async fn put_webui_tls(&self, r: &WebUiTlsRequest) -> Result<WebUiTlsStatus, ApiError> {
+        self.put("/settings/webui/tls", r).await
+    }
+
+    pub async fn upload_webui_tls(&self, r: &WebUiTlsUpload) -> Result<WebUiTlsStatus, ApiError> {
+        self.post("/settings/webui/tls/upload", r).await
+    }
+
     /// Get proxy configuration
     pub async fn get_proxy_config(&self) -> Result<ProxyConfigResponse, ApiError> {
         self.get("/config").await

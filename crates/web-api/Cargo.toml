@@ -77,6 +77,13 @@ utoipa-axum = "0.2"
 
 # Token digests, CSRF tags, ETags
 blake3 = "1.5"
+# Built-in HTTPS for the web UI
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+arc-swap = { workspace = true }
 # CA certificate details
 x509-parser = "0.18"
 sha2 = "0.10"
