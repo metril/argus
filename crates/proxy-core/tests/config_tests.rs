@@ -63,6 +63,8 @@ fn test_custom_config() {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -85,6 +87,7 @@ fn test_custom_config() {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     };
 
     assert_eq!(config.proxy.host, "127.0.0.1");

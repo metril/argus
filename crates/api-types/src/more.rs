@@ -75,6 +75,8 @@ pub struct CreateUserRequest {
 pub struct UpdateUserRequest {
     pub role: Option<UserRole>,
     pub enabled: Option<bool>,
+    /// Profile id to start on; an empty string clears it.
+    pub default_profile: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +299,104 @@ pub struct RecentBlockedResponse {
     pub has_more: bool,
     /// Newest first.
     pub entries: Vec<BlockedEntry>,
+}
+
+/// One time-series bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TimeseriesPoint {
+    /// Start of the bucket, Unix seconds.
+    pub ts: i64,
+    pub requests: u64,
+    pub blocked: u64,
+}
+
+/// Requests and blocks over time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TimeseriesResponse {
+    /// `6h`, `24h` or `7d`.
+    pub range: String,
+    /// Bucket length in seconds (1800, or 21600 for `7d`).
+    pub bucket_secs: i64,
+    /// Oldest first, ending with the current bucket.
+    pub points: Vec<TimeseriesPoint>,
+}
+
+/// What happened to a logged request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LogAction {
+    Allowed,
+    Blocked,
+    /// An opaque tunnel the proxy did not look inside.
+    Passthrough,
+    Error,
+}
+
+/// Why an `error` event happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogErrorKind {
+    /// The client refused the proxy's certificate (a bad_certificate, unknown_ca,
+    /// certificate_unknown or decrypt_error alert, or an immediate close): typical of
+    /// certificate-pinned apps, which are candidates for a bypass.
+    ClientRejectedCert,
+    UpstreamTimeout,
+    UpstreamReset,
+    /// TLS to the upstream server failed.
+    UpstreamTls,
+    Other,
+}
+
+/// How the connection reached the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum LogMode {
+    Explicit,
+    Transparent,
+}
+
+/// One request in the live log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct RequestLogEntry {
+    /// RFC 3339 time.
+    pub ts: String,
+    pub action: LogAction,
+    /// HTTP method (`CONNECT` for tunnels).
+    pub method: String,
+    pub url: String,
+    /// Host of the initiating page, when known.
+    pub source_host: Option<String>,
+    /// Id of the profile that handled it (decimal).
+    pub client: Option<String>,
+    pub request_type: String,
+    pub rule: Option<String>,
+    pub list_id: Option<String>,
+    /// Upstream status, when there was one.
+    pub status: Option<u16>,
+    pub mode: LogMode,
+    /// Set on `error` events.
+    #[serde(default)]
+    pub error_kind: Option<LogErrorKind>,
+}
+
+/// Snapshot of the request log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct RequestLogResponse {
+    /// Ring capacity (older events are overwritten).
+    pub capacity: usize,
+    pub total: usize,
+    pub page: u32,
+    pub limit: u32,
+    pub has_more: bool,
+    /// Newest first.
+    pub entries: Vec<RequestLogEntry>,
 }
 
 // ---------------------------------------------------------------------------

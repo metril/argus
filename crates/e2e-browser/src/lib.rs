@@ -1,8 +1,8 @@
 //! Real-browser test harness: headless Chromium driven over CDP through the production proxy.
 //!
-//! * Browser discovery: `ADBLOCKER_BROWSER` (path), then `chromium`/`google-chrome`/... on `PATH`,
+//! * Browser discovery: `ARGUS_BROWSER` (path), then `chromium`/`google-chrome`/... on `PATH`,
 //!   then Playwright's cache (`~/.cache/ms-playwright`). With none found, tests skip with a message,
-//!   unless `ADBLOCKER_REQUIRE_BROWSER=1` (CI), which turns the skip into a failure.
+//!   unless `ARGUS_REQUIRE_BROWSER=1` (CI), which turns the skip into a failure.
 //! * Every [`Session`] owns its origin, proxy (fresh CA), throwaway Chromium profile and CDP port.
 //! * The proxy CA is trusted with `--ignore-certificate-errors-spki-list=<hash of the CA key>`, not
 //!   a blanket error override; the baseline test additionally checks the served chain via CDP.
@@ -92,7 +92,7 @@ fn playwright_cache() -> Option<PathBuf> {
 
 /// The browser binary to use, if any.
 pub fn find_browser() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("ADBLOCKER_BROWSER") {
+    if let Some(p) = common::env::var_os("BROWSER") {
         return Some(PathBuf::from(p));
     }
     BROWSER_NAMES
@@ -258,7 +258,7 @@ fn resources_json(which: Resources) -> String {
 
 impl Session {
     /// Start in explicit-proxy mode with `rules`. `None` (after printing why) when there is no
-    /// browser, unless `ADBLOCKER_REQUIRE_BROWSER=1`, which panics instead.
+    /// browser, unless `ARGUS_REQUIRE_BROWSER=1`, which panics instead.
     pub async fn start(rules: &[&str]) -> Option<Session> {
         Self::start_mode(EntryMode::Explicit, rules).await
     }
@@ -273,9 +273,9 @@ impl Session {
         resources: Resources,
     ) -> Option<Session> {
         let Some(bin) = find_browser() else {
-            let msg = "no Chromium found (set ADBLOCKER_BROWSER=/path/to/chrome)";
-            if std::env::var("ADBLOCKER_REQUIRE_BROWSER").is_ok_and(|v| v == "1") {
-                panic!("ADBLOCKER_REQUIRE_BROWSER=1 but {msg}");
+            let msg = "no Chromium found (set ARGUS_BROWSER=/path/to/chrome)";
+            if common::env::var("REQUIRE_BROWSER").is_some_and(|v| v == "1") {
+                panic!("ARGUS_REQUIRE_BROWSER=1 but {msg}");
             }
             eprintln!("SKIPPED: {msg}");
             return None;
@@ -316,7 +316,7 @@ impl Session {
         .map(|s| s.to_string())
         .collect();
         args.push(format!("--ignore-certificate-errors-spki-list={spki}"));
-        if let Ok(p) = std::env::var("ADBLOCKER_BROWSER_NETLOG") {
+        if let Some(p) = common::env::var("BROWSER_NETLOG") {
             args.push(format!("--log-net-log={p}"));
         }
         match mode {

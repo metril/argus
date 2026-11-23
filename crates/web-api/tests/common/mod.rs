@@ -42,7 +42,9 @@ impl TestContext {
         api_config.auth.bcrypt_cost = 4;
         tweak(&mut api_config);
 
-        let proxy_config = ProxyConfig::default();
+        // Tests never reach the real first-party lists: a dead address fails at once.
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.bypass.lists_base_url = "http://127.0.0.1:1".into();
         let config_path = temp_path.join("proxy.toml");
         std::fs::write(
             &config_path,

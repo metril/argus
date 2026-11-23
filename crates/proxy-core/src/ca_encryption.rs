@@ -30,7 +30,16 @@ use tracing::info;
 pub const MIN_PASSPHRASE_LENGTH: usize = 16;
 
 /// Magic bytes to identify encrypted CA key files
-const ENCRYPTED_KEY_MAGIC: &[u8] = b"ADBLOCKER_CA_KEY_V1\n";
+const ENCRYPTED_KEY_MAGIC: &[u8] = b"ARGUS_CA_KEY_V1\n";
+/// Pre-rename magic; files written before the rename are still readable.
+const LEGACY_ENCRYPTED_KEY_MAGIC: &[u8] = b"ADBLOCKER_CA_KEY_V1\n";
+
+/// The magic prefix of `data`, if it is an encrypted key file.
+fn magic_of(data: &[u8]) -> Option<&'static [u8]> {
+    [ENCRYPTED_KEY_MAGIC, LEGACY_ENCRYPTED_KEY_MAGIC]
+        .into_iter()
+        .find(|m| data.starts_with(m))
+}
 
 /// Configuration for CA key encryption
 #[derive(Debug, Clone)]
@@ -138,14 +147,14 @@ pub fn decrypt_ca_key_with_config(
     _config: &CaEncryptionConfig,
 ) -> Result<String> {
     // Check magic bytes
-    if !encrypted_data.starts_with(ENCRYPTED_KEY_MAGIC) {
+    let Some(magic) = magic_of(encrypted_data) else {
         return Err(Error::Certificate(
             "Invalid encrypted key format (missing magic bytes)".to_string(),
         ));
-    }
+    };
 
     // Get the encrypted portion
-    let encrypted = &encrypted_data[ENCRYPTED_KEY_MAGIC.len()..];
+    let encrypted = &encrypted_data[magic.len()..];
 
     // Create identity for decryption
     let identity = age::scrypt::Identity::new(SecretString::from(passphrase.to_string()));
@@ -179,7 +188,7 @@ pub fn decrypt_ca_key_with_config(
 
 /// Check if a file contains an encrypted CA key
 pub fn is_encrypted_key(data: &[u8]) -> bool {
-    data.starts_with(ENCRYPTED_KEY_MAGIC)
+    magic_of(data).is_some()
 }
 
 /// Read and decrypt a CA key from a file

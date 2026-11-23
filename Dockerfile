@@ -1,7 +1,7 @@
-# Multi-stage Dockerfile for Adblocker MITM Proxy
+# Multi-stage Dockerfile for Argus MITM Proxy
 # Multi-arch: linux/amd64, linux/arm64
-# Build:  docker build -t adblocker .
-#         docker buildx build --platform linux/amd64,linux/arm64 -t adblocker .
+# Build:  docker build -t argus .
+#         docker buildx build --platform linux/amd64,linux/arm64 -t argus .
 #
 # Uses cargo-chef for dependency caching - incremental builds are ~10x faster.
 # Pure-rustls (no OpenSSL): the build is fully static musl with no system TLS libs.
@@ -54,11 +54,11 @@ RUN cargo chef cook --release --recipe-path recipe.json -p proxy-core --features
 # Now copy source and build (only our code compiles; deps are cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN RUSTFLAGS="-C link-arg=-s" cargo build --release -p proxy-core --bin adblocker --features full
+RUN RUSTFLAGS="-C link-arg=-s" cargo build --release -p proxy-core --bin argus --features full
 
 # Copy binary to a known location and verify
-RUN cp /build/target/release/adblocker /build/adblocker && \
-    ls -lh /build/adblocker
+RUN cp /build/target/release/argus /build/argus && \
+    ls -lh /build/argus
 
 # Stage 4: WebUI build (WASM is architecture-independent -> always built on the
 # build host's platform via $BUILDPLATFORM for speed)
@@ -101,17 +101,17 @@ FROM alpine:3.21
 # Pull the latest security patches for base packages, then add runtime deps.
 RUN apk upgrade --no-cache && apk add --no-cache ca-certificates libgcc
 
-LABEL org.opencontainers.image.source="https://github.com/metril/adblocker" \
-      org.opencontainers.image.title="adblocker" \
+LABEL org.opencontainers.image.source="https://github.com/metril/argus" \
+      org.opencontainers.image.title="argus" \
       org.opencontainers.image.description="Adblocking MITM proxy with Web UI"
 
 # Create non-root user
-RUN adduser -D -u 1000 -h /app adblocker
+RUN adduser -D -u 1000 -h /app argus
 
 WORKDIR /app
 
 # Copy binary and WebUI dist
-COPY --from=builder /build/adblocker /app/adblocker
+COPY --from=builder /build/argus /app/argus
 COPY --from=webui-builder /build/crates/web-ui/dist /app/webui
 
 # Copy default configuration
@@ -119,9 +119,9 @@ COPY config/default.toml /app/config/default.toml
 
 # Create necessary directories with proper permissions
 RUN mkdir -p /app/certs /app/data /app/logs && \
-    chown -R adblocker:adblocker /app
+    chown -R argus:argus /app
 
-USER adblocker
+USER argus
 
 # Expose ports: 8080 (explicit proxy), 3000 (Web API + WebUI), 3129 (optional transparent
 # listener: only active when proxy.transparent_port = 3129; needs host networking, see
@@ -130,10 +130,12 @@ EXPOSE 8080 3000 3129
 
 ENV RUST_LOG=info
 ENV CONFIG_PATH=/app/config/default.toml
+# Settings saved from the web UI (the shipped config is read-only); on the data volume.
+ENV CONFIG_OVERLAY_PATH=/app/data/settings.toml
 ENV WEBUI_DIST_PATH=/app/webui
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD nc -z 127.0.0.1 8080 && nc -z 127.0.0.1 3000 || exit 1
 
-ENTRYPOINT ["/app/adblocker"]
+ENTRYPOINT ["/app/argus"]

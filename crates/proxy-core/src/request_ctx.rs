@@ -135,6 +135,10 @@ pub struct RequestCtx {
     /// Profile-table epoch this context was resolved at. It lives inside the swapped value, so
     /// the context and its epoch can never be paired up wrongly by concurrent re-resolutions.
     pub epoch: u64,
+    /// The connection arrived on the transparent listener (for the request log).
+    pub transparent: bool,
+    /// Switches of the listener that accepted the connection (`None`: defaults).
+    pub listener: Option<Arc<crate::listener_flags::ListenerFlags>>,
 }
 
 impl RequestCtx {
@@ -144,7 +148,25 @@ impl RequestCtx {
             client_addr,
             auth_user,
             epoch: 0,
+            transparent: false,
+            listener: None,
         }
+    }
+
+    fn with_listener(
+        mut self,
+        transparent: bool,
+        listener: Option<Arc<crate::listener_flags::ListenerFlags>>,
+    ) -> Self {
+        self.transparent = transparent;
+        self.listener = listener;
+        self
+    }
+
+    /// Whether ad blocking applies to this connection's listener.
+    #[inline]
+    pub fn adblock_on(&self) -> bool {
+        self.listener.as_ref().is_none_or(|l| l.adblock())
     }
 
     fn at_epoch(mut self, epoch: u64) -> Self {
@@ -172,6 +194,10 @@ pub struct ConnCtx {
     awaiting_token: AtomicBool,
     /// The token was revoked while the connection was open and tokens are required.
     revoked: AtomicBool,
+    /// Arrived on the transparent listener.
+    transparent: AtomicBool,
+    /// Switches of the accepting listener.
+    listener: arc_swap::ArcSwapOption<crate::listener_flags::ListenerFlags>,
 }
 
 impl ConnCtx {
@@ -185,7 +211,38 @@ impl ConnCtx {
             cur: ArcSwap::from_pointee(RequestCtx::new(slot, client_addr, None).at_epoch(epoch)),
             awaiting_token: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
+            transparent: AtomicBool::new(false),
+            listener: arc_swap::ArcSwapOption::empty(),
         }
+    }
+
+    /// Record which listener accepted the connection (call before the first request).
+    pub fn set_listener(
+        &self,
+        flags: Option<Arc<crate::listener_flags::ListenerFlags>>,
+        transparent: bool,
+    ) {
+        self.transparent.store(transparent, Ordering::Relaxed);
+        self.listener.store(flags.clone());
+        let mut ctx = (**self.cur.load()).clone();
+        ctx.transparent = transparent;
+        ctx.listener = flags;
+        self.cur.store(Arc::new(ctx));
+    }
+
+    /// Whether MITM is on for this connection's listener (default on).
+    /// The accepting listener's switches.
+    pub fn listener_flags(&self) -> Option<Arc<crate::listener_flags::ListenerFlags>> {
+        self.listener.load_full()
+    }
+
+    pub fn mitm_on(&self) -> bool {
+        self.listener.load().as_ref().is_none_or(|l| l.mitm())
+    }
+
+    /// Whether HTTP/2 is on for this connection's listener (default on).
+    pub fn http2_on(&self) -> bool {
+        self.listener.load().as_ref().is_none_or(|l| l.http2())
     }
 
     pub fn client_addr(&self) -> SocketAddr {
@@ -226,7 +283,12 @@ impl ConnCtx {
             self.revoked.store(true, Ordering::Relaxed);
         }
         self.cur.store(Arc::new(
-            RequestCtx::new(slot, self.client_addr, None).at_epoch(epoch),
+            RequestCtx::new(slot, self.client_addr, None)
+                .at_epoch(epoch)
+                .with_listener(
+                    self.transparent.load(Ordering::Relaxed),
+                    self.listener.load_full(),
+                ),
         ));
     }
 

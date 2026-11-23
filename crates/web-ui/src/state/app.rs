@@ -3,30 +3,53 @@
 use gloo_storage::{LocalStorage, Storage};
 use leptos::prelude::*;
 
-/// Application theme
+/// Application theme. `System` follows `prefers-color-scheme` (dark when unknown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
     #[default]
+    System,
     Light,
     Dark,
 }
 
 impl Theme {
-    /// Get the CSS class for this theme
-    pub fn class(&self) -> &'static str {
+    /// Value for the `data-theme` attribute (`None` leaves the system preference in charge).
+    pub fn attr(&self) -> Option<&'static str> {
         match self {
-            Theme::Light => "light",
-            Theme::Dark => "dark",
+            Theme::System => None,
+            Theme::Light => Some("light"),
+            Theme::Dark => Some("dark"),
         }
     }
 
-    /// Toggle the theme
-    pub fn toggle(&self) -> Self {
+    /// Whether this theme renders dark, given the system preference.
+    pub fn is_dark(&self, system_dark: bool) -> bool {
         match self {
-            Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::Light,
+            Theme::System => system_dark,
+            Theme::Light => false,
+            Theme::Dark => true,
         }
     }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            _ => None,
+        }
+    }
+}
+
+/// True when the OS asks for a light color scheme.
+fn system_prefers_light() -> bool {
+    web_sys::window()
+        .and_then(|w| {
+            w.match_media("(prefers-color-scheme: light)")
+                .ok()
+                .flatten()
+        })
+        .map(|m| m.matches())
+        .unwrap_or(false)
 }
 
 /// Toast notification type
@@ -42,10 +65,9 @@ impl ToastType {
     /// Get the CSS class for this toast type
     pub fn class(&self) -> &'static str {
         match self {
-            ToastType::Success => "toast-success",
-            ToastType::Error => "toast-error",
-            ToastType::Warning => "toast-warning",
-            ToastType::Info => "toast-info",
+            ToastType::Success | ToastType::Info => "",
+            ToastType::Error => "bad",
+            ToastType::Warning => "warn",
         }
     }
 }
@@ -103,8 +125,14 @@ impl Toast {
 pub struct AppState {
     /// Current theme
     pub theme: RwSignal<Theme>,
-    /// Sidebar open state
-    pub sidebar_open: RwSignal<bool>,
+    /// Sidebar collapsed to the icon rail (desktop)
+    pub collapsed: RwSignal<bool>,
+    /// Off-canvas navigation open (under 760px)
+    pub nav_open: RwSignal<bool>,
+    /// Command palette open
+    pub palette_open: RwSignal<bool>,
+    /// Bumped when the navbar profile selector changes, so profile-scoped pages reload
+    pub profile_reload: RwSignal<u32>,
     /// Toast notification queue
     pub toasts: RwSignal<Vec<Toast>>,
 }
@@ -118,35 +146,35 @@ impl Default for AppState {
 impl AppState {
     /// Create new app state
     pub fn new() -> Self {
-        // Load theme from localStorage
         let saved_theme = LocalStorage::get::<String>("theme")
             .ok()
-            .and_then(|t| match t.as_str() {
-                "dark" => Some(Theme::Dark),
-                "light" => Some(Theme::Light),
-                _ => None,
-            })
+            .and_then(|t| Theme::parse(&t))
             .unwrap_or_default();
+        let collapsed = LocalStorage::get::<bool>("sidebar_collapsed").unwrap_or(false);
 
         Self {
             theme: RwSignal::new(saved_theme),
-            sidebar_open: RwSignal::new(true),
+            collapsed: RwSignal::new(collapsed),
+            nav_open: RwSignal::new(false),
+            palette_open: RwSignal::new(false),
+            profile_reload: RwSignal::new(0),
             toasts: RwSignal::new(Vec::new()),
         }
     }
 
-    /// Toggle the theme
+    /// Flip between light and dark (from whatever is currently displayed) and remember it.
     pub fn toggle_theme(&self) {
-        let new_theme = self.theme.get().toggle();
-        self.theme.set(new_theme);
-
-        // Save to localStorage
-        let _ = LocalStorage::set("theme", new_theme.class());
+        let dark = self.theme.get_untracked().is_dark(!system_prefers_light());
+        let next = if dark { Theme::Light } else { Theme::Dark };
+        self.theme.set(next);
+        let _ = LocalStorage::set("theme", next.attr().unwrap_or("dark"));
     }
 
-    /// Toggle sidebar
-    pub fn toggle_sidebar(&self) {
-        self.sidebar_open.update(|open| *open = !*open);
+    /// Collapse or expand the desktop sidebar.
+    pub fn toggle_collapsed(&self) {
+        let v = !self.collapsed.get_untracked();
+        self.collapsed.set(v);
+        let _ = LocalStorage::set("sidebar_collapsed", v);
     }
 
     /// Show a toast notification
@@ -183,6 +211,19 @@ impl AppState {
 /// Provide app state context
 pub fn provide_app_state() -> AppState {
     let state = AppState::new();
+    let theme = state.theme;
+    Effect::new(move || {
+        let t = theme.get();
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+        {
+            let _ = match t.attr() {
+                Some(v) => el.set_attribute("data-theme", v),
+                None => el.remove_attribute("data-theme"),
+            };
+        }
+    });
     provide_context(state.clone());
     state
 }

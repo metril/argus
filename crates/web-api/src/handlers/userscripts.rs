@@ -7,11 +7,12 @@ use std::collections::BTreeMap;
 use api_types::{
     ApproveUpdateRequest, CheckUpdateRequest, CheckUpdateResponse, ConfirmPlanRequest,
     ExportedAssets, ExportedRequire, ExportedResource, ExportedUserscript, ImportResultDto,
-    ImportUserscriptsResponse, InstallUserscriptRequest, MessageResponse, Page, PendingUpdateDto,
+    ImportUserscriptsResponse, InstallUserscriptRequest, MessageResponse, PendingUpdateDto,
     PlanRequireDto, PlanResourceDto, PlanUpdateDto, PlanUserscriptRequest, Scope,
-    SetEnabledRequest, StorageValueDto, UpdateDiffDto, UserscriptBundle, UserscriptPlanResponse,
-    UserscriptResponse, UserscriptSourceResponse, UserscriptStatsResponse,
-    UserscriptStorageResponse, USERSCRIPT_BUNDLE_FORMAT,
+    SetEnabledRequest, StorageValueDto, UpdateDiffDto, UserscriptBundle, UserscriptCounts,
+    UserscriptPlanResponse, UserscriptResponse, UserscriptSourceResponse, UserscriptStatsResponse,
+    UserscriptStorageResponse, UserscriptsPage, LEGACY_USERSCRIPT_BUNDLE_FORMAT,
+    USERSCRIPT_BUNDLE_FORMAT,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Deserialize;
@@ -21,6 +22,7 @@ use userscript_engine::install::{self, Approvals};
 use userscript_engine::storage::ns;
 use utoipa::IntoParams;
 
+use super::paging::{desc_key, natural_key, paginate, Keyed};
 use crate::auth::authz::Principal;
 use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -89,6 +91,8 @@ fn userscript_response(
         execution_count: script.execution_count,
         last_executed: script.last_executed.map(|dt| dt.to_rfc3339()),
         match_patterns: script.metadata.matches.clone(),
+        updated_at: script.updated_at.to_rfc3339(),
+        error: !m.unsupported().is_empty(),
     }
 }
 
@@ -123,10 +127,22 @@ fn require_source(source: &str) -> ApiResult<()> {
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct ListUserscriptsQuery {
-    /// Only enabled / only disabled scripts.
+    /// Only enabled / only disabled scripts (same as `status=enabled|disabled`).
     pub enabled: Option<bool>,
+    /// Case-insensitive substring of the name, namespace or description.
+    pub q: Option<String>,
+    /// `enabled`, `disabled` or `error` (unsupported features).
+    pub status: Option<String>,
+    /// `name` (natural order, default) or `updated` (most recent first).
+    pub sort: Option<String>,
+    /// Deprecated: use `cursor`.
     pub page: Option<u32>,
+    /// Page size (1..=200, default 40).
     pub limit: Option<u32>,
+    /// Opaque `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+    /// With `sort=name`: start at the first name at or after this prefix.
+    pub from: Option<String>,
 }
 
 /// List userscripts.
@@ -134,29 +150,102 @@ pub struct ListUserscriptsQuery {
     get, path = "/userscripts", tag = "userscripts",
     security(("bearer_auth" = ["scripts:read"])),
     params(ProfileQuery, ListUserscriptsQuery),
-    responses((status = 200, description = "Userscripts", body = Page<UserscriptResponse>))
+    responses((status = 200, description = "Userscripts", body = UserscriptsPage))
 )]
 pub async fn list_userscripts(
     State(state): State<Arc<AppState>>,
     profile: ProfileParam,
     ApiQuery(q): ApiQuery<ListUserscriptsQuery>,
-) -> ApiResult<Json<Page<UserscriptResponse>>> {
+) -> ApiResult<Json<UserscriptsPage>> {
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(s @ ("enabled" | "disabled" | "error")) => Some(s),
+        Some(o) => {
+            return Err(ApiError::ValidationError(format!(
+                "unknown status '{o}' (enabled, disabled, error)"
+            )))
+        }
+    };
+    let sort = q.sort.as_deref().unwrap_or("name");
+    if !["name", "updated"].contains(&sort) {
+        return Err(ApiError::ValidationError(format!(
+            "unknown sort '{sort}' (name, updated)"
+        )));
+    }
+    if q.from.is_some() && sort != "name" {
+        return Err(ApiError::ValidationError("`from` needs sort=name".into()));
+    }
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
     let usage = state
         .userscript_manager
         .storage()
         .profile_usage(&profile.name)
         .unwrap_or_default();
-    let all = state
+    let matching: Vec<UserscriptResponse> = state
         .userscript_manager
         .get_all_in(&profile.name)
         .iter()
+        .filter(|s| {
+            needle.is_empty()
+                || s.metadata.name.to_lowercase().contains(&needle)
+                || s.metadata
+                    .namespace
+                    .as_deref()
+                    .is_some_and(|n| n.to_lowercase().contains(&needle))
+                || s.metadata
+                    .description
+                    .as_deref()
+                    .is_some_and(|d| d.to_lowercase().contains(&needle))
+        })
         .map(|s| {
             let used = usage.get(&ns(&s.profile, &s.id)).copied().unwrap_or(0);
             userscript_response(s, used as u64)
         })
-        .filter(|s| q.enabled.is_none_or(|e| s.enabled == e))
         .collect();
-    Ok(Json(Page::from_vec(all, q.page, q.limit)))
+    let mut counts = UserscriptCounts {
+        all: matching.len(),
+        enabled: matching.iter().filter(|s| s.enabled).count(),
+        disabled: matching.iter().filter(|s| !s.enabled).count(),
+        error: matching.iter().filter(|s| s.error).count(),
+        letters: Vec::new(),
+    };
+    let rows: Vec<Keyed<UserscriptResponse>> = matching
+        .into_iter()
+        .filter(|s| match status {
+            Some("enabled") => s.enabled,
+            Some("disabled") => !s.enabled,
+            Some(_) => s.error,
+            None => q.enabled.is_none_or(|e| s.enabled == e),
+        })
+        .map(|s| {
+            let name = natural_key(&s.name);
+            let key = if sort == "updated" {
+                let ts = chrono::DateTime::parse_from_rfc3339(&s.updated_at)
+                    .map_or(0, |t| t.timestamp_millis().max(0) as u64);
+                format!("{}{name}", desc_key(ts))
+            } else {
+                name
+            };
+            Keyed {
+                key,
+                id: s.id.clone(),
+                label: s.name.clone(),
+                item: s,
+            }
+        })
+        .collect();
+    let from = q.from.as_deref().map(natural_key);
+    let p = paginate(rows, q.limit, q.cursor.as_deref(), from.as_deref(), q.page)?;
+    counts.letters = p.letters;
+    Ok(Json(UserscriptsPage {
+        items: p.items,
+        next_cursor: p.next_cursor,
+        total: p.total,
+        counts,
+        limit: p.limit,
+        has_more: p.has_more,
+        page: p.page,
+    }))
 }
 
 /// Install a userscript from its source.
@@ -815,7 +904,8 @@ pub async fn import_userscripts(
     Extension(p): Extension<Principal>,
     ApiJson(bundle): ApiJson<UserscriptBundle>,
 ) -> ApiResult<Json<ImportUserscriptsResponse>> {
-    if bundle.format != USERSCRIPT_BUNDLE_FORMAT {
+    if bundle.format != USERSCRIPT_BUNDLE_FORMAT && bundle.format != LEGACY_USERSCRIPT_BUNDLE_FORMAT
+    {
         return Err(ApiError::ValidationError(format!(
             "Unsupported bundle format '{}'",
             bundle.format

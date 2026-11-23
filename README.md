@@ -13,6 +13,7 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 
 ### Advanced Protocols (Phase 2 - v0.2.0) ✅
 - WebSocket proxying with bidirectional frame forwarding (feature `websockets`, on by default), filtered like other requests
+- Bypass for confidential sites (banking, health, government, pinned apps, ...): never intercepted, with first-party signed lists (fail-safe until they load), custom entries and subscriptions; see [docs/BYPASS.md](docs/BYPASS.md)
 - Transparent-gateway mode (Linux): redirect TCP 80/443 to a second listener, no client proxy settings; see [docs/TRANSPARENT.md](docs/TRANSPARENT.md)
 - TLS passthrough list (`proxy.tls_passthrough_hosts`) for certificate-pinned apps, in both entry modes
 - HTTP/3 and QUIC are **not** intercepted: `Alt-Svc` is stripped so browsers stay on TCP (reject UDP/443 in transparent mode)
@@ -91,8 +92,8 @@ A high-performance, production-ready MITM proxy written in Rust with comprehensi
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/adblocker.git
-cd adblocker
+git clone https://github.com/metril/argus.git
+cd argus
 
 # Build release binary (HTTP/1.1, HTTP/2, and WebSockets)
 cargo build --release --features websockets
@@ -104,19 +105,28 @@ cargo build --release --features "websockets,adblock"
 cargo build --release --features full
 
 # Run the proxy (the prebuilt binary / Docker image enables the full feature set)
-./target/release/adblocker
+./target/release/argus
 ```
 
 ### Docker Deployment
 
 ```bash
-# Run the published image (set ADBLOCKER_VERSION to pin a release, e.g. 0.1.0)
+# Run the published image (set ARGUS_VERSION to pin a release, e.g. 0.1.0)
 docker compose -f compose.yaml up -d
 ```
 
-To build the image locally instead, run `docker build -t adblocker .` and start it with
-`ADBLOCKER_VERSION=local docker compose -f compose.yaml up -d` after tagging it
-`docker tag adblocker ghcr.io/metril/adblocker:local`.
+To build the image locally instead, run `docker build -t argus .` and start it with
+`ARGUS_VERSION=local docker compose -f compose.yaml up -d` after tagging it
+`docker tag argus ghcr.io/metril/argus:local`.
+
+### Upgrading from "adblocker"
+
+The product was renamed to Argus. Existing installs keep working: the old `adblocker.redb`
+database in the data directory is renamed to `argus.redb` on first start, the existing CA
+certificate and key are reused as-is (never regenerated, so trusted devices stay trusted), and
+legacy `ADBLOCKER_*` environment variables are still accepted (with a one-time deprecation
+warning) when the `ARGUS_*` one is unset. Browser sessions are signed out once, and the metrics
+are now named `argus_*`. The image moves to `ghcr.io/metril/argus`.
 
 ### Security defaults
 
@@ -143,9 +153,9 @@ Failures (upstream timeouts and errors, DNS failures, refused destinations) are 
 
 ### Getting started (end-to-end)
 
-The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API), and optionally the transparent-mode port (`proxy.transparent_port`, off by default).
+The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web UI + API) and **3129** (transparent mode, `proxy.transparent_port`; unset to turn it off). Transparent mode needs `network_mode: host` and an nftables redirect on the gateway: see [docs/TRANSPARENT.md](docs/TRANSPARENT.md). Ports, passthrough hosts and the access lists can be changed in the web UI without a restart; they are saved to `/app/data/settings.toml` (`CONFIG_OVERLAY_PATH`), not to the read-only shipped config.
 
-1. **Start it** — `./target/release/adblocker` (or `docker compose up -d`).
+1. **Start it** — `./target/release/argus` (or `docker compose up -d`).
 2. **Create your account** — open `http://localhost:3000` and register. The **first** user
    registered automatically becomes the admin.
 3. **Install the root CA** — in the Web UI go to **Settings → CA Certificate → Download CA
@@ -156,7 +166,7 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
      double-click it → expand **Trust** → set **When using this certificate: Always Trust**.
    - **Chrome/Edge**: Settings > Privacy and security > Security > Manage certificates
    - **Firefox**: Settings > Privacy & Security > Certificates > View Certificates > Authorities > Import
-   - **Linux**: `sudo cp adblocker-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`
+   - **Linux**: `sudo cp argus-ca.crt /usr/local/share/ca-certificates/ && sudo update-ca-certificates`
 
    Full per-OS/browser instructions: [docs/CA-INSTALLATION.md](docs/CA-INSTALLATION.md).
 4. **Point your device/browser at the proxy** — set **both** the HTTP and HTTPS proxy to the
@@ -302,7 +312,7 @@ not worked around by sharding: reduce the number of path-style rules, or prefer 
 
 Everything lives under `adblock.data_dir` (default `data/filters`):
 
-- `adblocker.redb`: one database for list metadata, build reports, users, sessions, tokens, audit
+- `argus.redb`: one database for list metadata, build reports, users, sessions, tokens, audit
   log and userscripts.
 - `lists/`: raw list contents as content-addressed files (`lists/<sha256>`), garbage-collected when
   unreferenced.
@@ -1286,7 +1296,7 @@ These will be addressed in future phases:
 ## Project Structure
 
 ```
-adblocker/
+argus/
 ├── Cargo.toml                      # Workspace manifest
 ├── crates/
 │   ├── proxy-core/                 # Core proxy server

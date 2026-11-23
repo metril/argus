@@ -29,6 +29,9 @@ pub fn Modal(
         >
             <div
                 class=class_value
+                role="dialog"
+                aria-modal="true"
+                on:keydown=move |ev: web_sys::KeyboardEvent| if ev.key() == "Escape" { open.set(false); }
                 on:click=move |ev: web_sys::MouseEvent| ev.stop_propagation()
             >
                 <div class="modal-header">

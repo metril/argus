@@ -35,6 +35,31 @@ impl ApiClient {
         Ok(page.items)
     }
 
+    /// Cursor-paged devices. `profile` empty = all; `sort`: name | last_seen; `from` seeks to a
+    /// name prefix (name sort only).
+    pub async fn list_devices_paged(
+        &self,
+        q: &str,
+        profile: &str,
+        sort: &str,
+        cursor: Option<&str>,
+        from: Option<&str>,
+        limit: u32,
+    ) -> Result<api_types::DevicesPage, ApiError> {
+        let enc = |s: &str| String::from(js_sys::encode_uri_component(s));
+        let mut url = format!("/devices?limit={limit}&sort={sort}&q={}", enc(q.trim()));
+        if !profile.is_empty() {
+            url.push_str(&format!("&profile={}", enc(profile)));
+        }
+        if let Some(c) = cursor {
+            url.push_str(&format!("&cursor={}", enc(c)));
+        }
+        if let Some(f) = from {
+            url.push_str(&format!("&from={}", enc(f)));
+        }
+        self.get(&url).await
+    }
+
     pub async fn create_device(&self, r: &CreateDeviceRequest) -> Result<DeviceDto, ApiError> {
         self.post("/devices", r).await
     }

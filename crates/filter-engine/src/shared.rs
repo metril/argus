@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::compile::compile_lists;
 use crate::domainset::{DomainHit, DomainSet, Scheme};
-use crate::events::{BlockEvent, BlockLog, DEFAULT_CAPACITY};
+use crate::events::{BlockLog, EventAction, EventMode, EventRef, RequestEvent, DEFAULT_CAPACITY};
 use crate::formats::{ExtRule, IpRange, IpSet};
 use crate::matcher::{MatchResult, RequestMatcher};
 use crate::precheck;
@@ -398,7 +398,7 @@ impl SharedEngine {
 
     /// The most recent blocked requests, newest first (at most `limit`, at most the ring
     /// capacity).
-    pub fn recent_blocked(&self, limit: usize) -> Vec<BlockEvent> {
+    pub fn recent_blocked(&self, limit: usize) -> Vec<RequestEvent> {
         self.block_log.recent(limit)
     }
 
@@ -414,15 +414,37 @@ impl SharedEngine {
 
     /// Record a block that happened outside [`Self::check`] (for example a request the proxy
     /// refused for another reason) in the recent-blocked ring.
-    pub fn record_block(&self, event: &BlockEvent) {
-        self.block_log.record(
-            &event.url,
-            &event.source_host,
-            &event.request_type,
-            &event.rule,
-            event.list_id.as_deref(),
-            event.client.as_deref(),
-        );
+    pub fn record_block(&self, event: &RequestEvent) {
+        self.block_log.record_event(&EventRef {
+            action: EventAction::Blocked,
+            method: &event.method,
+            url: &event.url,
+            source_host: &event.source_host,
+            request_type: &event.request_type,
+            rule: event.rule.as_deref().unwrap_or(""),
+            list_id: event.list_id.as_deref(),
+            client: event.client.as_deref(),
+            status: event.status,
+            mode: event.mode,
+            error_kind: event.error_kind,
+        });
+    }
+
+    /// Recent events of every action (newest first, at most `limit`).
+    pub fn recent_requests(&self, limit: usize) -> Vec<RequestEvent> {
+        self.block_log.recent_all(limit)
+    }
+
+    /// Live request events from now on.
+    pub fn subscribe_requests(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<std::sync::Arc<crate::events::LiveEvent>> {
+        self.block_log.subscribe()
+    }
+
+    /// Record a request event (allowed, errored, ...) in the request log and live broadcast.
+    pub fn record_request(&self, event: &EventRef<'_>) {
+        self.block_log.record_event(event);
     }
 
     /// Extended rules (`$replace`, HTML filters, ...) found in the installed lists.
@@ -628,7 +650,39 @@ impl SharedEngine {
         resource_type: &str,
         client: &str,
     ) -> MatchResult {
-        self.record(r, url, source_url, resource_type, Some(client))
+        self.record(
+            r,
+            url,
+            source_url,
+            resource_type,
+            Some(client),
+            "",
+            EventMode::Explicit,
+        )
+    }
+
+    /// [`Self::record_verdict`] that also stamps the request method and entry mode on the
+    /// recorded block event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_verdict_meta(
+        &self,
+        r: MatchResult,
+        url: &str,
+        source_url: &str,
+        resource_type: &str,
+        client: &str,
+        method: &str,
+        mode: EventMode,
+    ) -> MatchResult {
+        self.record(
+            r,
+            url,
+            source_url,
+            resource_type,
+            Some(client),
+            method,
+            mode,
+        )
     }
 
     /// [`Self::check_for`] that also returns the [`Generation`] the verdict was computed
@@ -653,7 +707,15 @@ impl SharedEngine {
             // may be from the newer build, so redo it (ids only ever grow: no ABA).
             if self.engine.load().id == generation.id {
                 return (
-                    self.record(r, url, source_url, resource_type, Some(client)),
+                    self.record(
+                        r,
+                        url,
+                        source_url,
+                        resource_type,
+                        Some(client),
+                        "",
+                        EventMode::Explicit,
+                    ),
                     arc_swap::Guard::into_inner(guard),
                 );
             }
@@ -672,10 +734,19 @@ impl SharedEngine {
         } else {
             MatchResult::allowed()
         };
-        self.record(r, url, source_url, resource_type, client)
+        self.record(
+            r,
+            url,
+            source_url,
+            resource_type,
+            client,
+            "",
+            EventMode::Explicit,
+        )
     }
 
     /// Statistics and block-log bookkeeping for a finished verdict.
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         r: MatchResult,
@@ -683,18 +754,25 @@ impl SharedEngine {
         source_url: &str,
         resource_type: &str,
         client: Option<&str>,
+        method: &str,
+        mode: EventMode,
     ) -> MatchResult {
         if r.blocked {
             self.stats
                 .record_blocked(resource_type, RequestMatcher::host_of(url));
-            self.block_log.record(
+            self.block_log.record_event(&EventRef {
+                action: EventAction::Blocked,
+                method,
                 url,
-                RequestMatcher::host_of(source_url),
-                resource_type,
-                r.matched_rule.as_deref().unwrap_or(""),
-                r.list_id.as_deref(),
+                source_host: RequestMatcher::host_of(source_url),
+                request_type: resource_type,
+                rule: r.matched_rule.as_deref().unwrap_or(""),
+                list_id: r.list_id.as_deref(),
                 client,
-            );
+                status: None,
+                mode,
+                error_kind: None,
+            });
         } else {
             self.stats.record_allowed();
         }

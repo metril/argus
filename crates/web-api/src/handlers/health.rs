@@ -92,80 +92,80 @@ pub async fn metrics_prometheus(State(state): State<Arc<AppState>>) -> impl Into
         );
     };
     metric(
-        "adblocker_proxy_connections_total",
+        "argus_proxy_connections_total",
         "counter",
         "Connections accepted.",
         p.connections.total,
     );
     metric(
-        "adblocker_proxy_connections_active",
+        "argus_proxy_connections_active",
         "gauge",
         "Open connections.",
         p.connections.active,
     );
     metric(
-        "adblocker_proxy_requests_total",
+        "argus_proxy_requests_total",
         "counter",
         "Requests processed.",
         p.requests.total,
     );
     metric(
-        "adblocker_proxy_received_bytes_total",
+        "argus_proxy_received_bytes_total",
         "counter",
         "Bytes received.",
         p.requests.bytes_received,
     );
     metric(
-        "adblocker_proxy_sent_bytes_total",
+        "argus_proxy_sent_bytes_total",
         "counter",
         "Bytes sent.",
         p.requests.bytes_sent,
     );
     metric(
-        "adblocker_proxy_errors_total",
+        "argus_proxy_errors_total",
         "counter",
         "Proxy errors.",
         p.requests.errors,
     );
     metric(
-        "adblocker_filter_requests_total",
+        "argus_filter_requests_total",
         "counter",
         "Requests checked by the filter.",
         f.total_requests,
     );
     metric(
-        "adblocker_filter_blocked_total",
+        "argus_filter_blocked_total",
         "counter",
         "Requests blocked.",
         f.blocked_requests,
     );
     metric(
-        "adblocker_filter_allowed_total",
+        "argus_filter_allowed_total",
         "counter",
         "Requests allowed.",
         f.allowed_requests,
     );
     let st = storage_metrics(&state);
     metric(
-        "adblocker_db_deferred_dropped_total",
+        "argus_db_deferred_dropped_total",
         "counter",
         "Telemetry database writes dropped because the queue was full.",
         st.deferred_dropped,
     );
     metric(
-        "adblocker_db_deferred_failed_total",
+        "argus_db_deferred_failed_total",
         "counter",
         "Deferred database writes that failed or panicked.",
         st.deferred_failed,
     );
     metric(
-        "adblocker_db_deferred_queued",
+        "argus_db_deferred_queued",
         "gauge",
         "Deferred database writes waiting to be committed.",
         st.deferred_queued,
     );
     metric(
-        "adblocker_uptime_seconds",
+        "argus_uptime_seconds",
         "gauge",
         "Seconds since API start.",
         state.started_at.elapsed().as_secs(),

@@ -72,3 +72,53 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
     )
     .await
 }
+
+/// Lets the API move the proxy's listeners and swap its access lists while it runs.
+pub struct ProxyRuntime(pub Arc<crate::server::ProxyControl>);
+
+fn bind(b: crate::server::BindInfo) -> web_api::ProxyBind {
+    web_api::ProxyBind {
+        proxy: b.proxy,
+        transparent: b.transparent,
+        proxy_down: b.proxy_down,
+        transparent_down: b.transparent_down,
+    }
+}
+
+#[async_trait::async_trait]
+impl web_api::RuntimeControl for ProxyRuntime {
+    async fn rebind_proxy(
+        &self,
+        host: &str,
+        port: u16,
+        transparent_port: Option<u16>,
+    ) -> Result<web_api::ProxyBind, String> {
+        self.0
+            .rebind(host, port, transparent_port)
+            .await
+            .map(bind)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn apply_access(&self, config: &crate::config::ProxyConfig) -> Result<(), String> {
+        self.0.apply_access(config).await.map_err(|e| e.to_string())
+    }
+
+    fn listener_counters(&self) -> (web_api::ListenerCounters, web_api::ListenerCounters) {
+        let (e, t) = self.0.listener_counters();
+        let c = |x: crate::listener_flags::ListenerCounters| web_api::ListenerCounters {
+            active_connections: x.active_connections,
+            requests_per_sec: x.requests_per_sec,
+            clients: x.clients,
+        };
+        (c(e), c(t))
+    }
+
+    async fn proxy_bind(&self) -> Option<web_api::ProxyBind> {
+        self.0.bind_info().await.map(bind)
+    }
+
+    async fn note_webui(&self, host: &str, port: u16) {
+        self.0.set_webui_listener(host, port).await;
+    }
+}

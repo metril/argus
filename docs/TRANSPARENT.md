@@ -47,35 +47,59 @@ tls_passthrough_hosts = [        # never intercepted, in BOTH modes
 
 ## nftables example
 
-Untested as a whole; adapt interface names. `LAN` is the client-facing interface.
+`LAN` is the client-facing interface; adapt it. `1000` is the UID the proxy runs as (the
+container's `argus` user; check with `id argus` or `docker top`).
 
 ```nft
 define LAN  = "eth1"
 define PORT = 3129
 
-table inet adblocker {
-    chain redirect {
+table inet argus {
+    # Traffic from LAN clients, before routing. One rule per family (the proxy listens on "::",
+    # so both land on the same dual-stack socket).
+    chain nat_prerouting {
         type nat hook prerouting priority dstnat; policy accept;
-        iifname $LAN tcp dport { 80, 443 } redirect to :$PORT
+        iifname != $LAN return
+        # Loop guard: traffic addressed to the gateway itself (including the proxy's own ports
+        # and the web UI) is never redirected.
+        fib daddr type local return
+        meta nfproto ipv4 tcp dport { 80, 443 } redirect to :$PORT
+        meta nfproto ipv6 tcp dport { 80, 443 } redirect to :$PORT
     }
-    chain quic {
+
+    # Optional: also filter the gateway's own traffic. Without the UID exclusion the proxy's
+    # upstream connections would be redirected back into itself.
+    chain nat_output {
+        type nat hook output priority dstnat; policy accept;
+        meta skuid 1000 return
+        fib daddr type local return
+        tcp dport { 80, 443 } redirect to :$PORT
+    }
+
+    # The proxy cannot intercept QUIC; make clients fall back to TCP.
+    chain block_quic {
         type filter hook forward priority filter; policy accept;
         iifname $LAN udp dport 443 reject
     }
 }
 ```
 
-* `prerouting` only sees traffic arriving from the LAN, so the proxy's own upstream connections
-  (locally generated, `output` hook) are not redirected and cannot loop.
-* To also filter the gateway's **own** traffic, add an `output` chain hooked at `dstnat`
-  (`type nat hook output priority -100`) and exclude the proxy's own connections, otherwise its
-  upstream dials are redirected back to itself:
-  `meta skuid != "adblocker" tcp dport { 80, 443 } redirect to :$PORT` (or match a
-  `meta mark` set by the proxy's service/cgroup). Redirecting from the `output` hook with
-  `redirect to :PORT` is exactly what the opt-in kernel test exercises, for IPv4 and IPv6.
-* IPv6: the `inet` table above covers both families, but the proxy must listen on `::` and
-  `net.ipv6.conf.all.forwarding` must be on. Clients with global IPv6 addresses bypass an IPv4-only
-  setup, so redirect (or block) IPv6 as well.
+Apply with `nft -f argus.nft` (as root); remove with `nft delete table inet argus`.
+
+* `redirect` is a keyword in nft: do not use it as a chain name.
+* The `nat_prerouting` chain only sees traffic arriving from the LAN, so the proxy's own upstream
+  connections (locally generated, `output` hook) cannot loop. If you drop the `nat_output` chain
+  the UID exclusion is not needed.
+* The loop guard in the proxy itself (see above) is a second line of defence, not a substitute
+  for the exclusions: a looped connection is refused, not served.
+* IPv6: the proxy must listen on `::` and `net.ipv6.conf.all.forwarding` must be on. Clients
+  with global IPv6 addresses bypass an IPv4-only setup, so redirect (or block) IPv6 as well.
+
+**How this was validated.** The ruleset above was loaded with `nft -f` inside a throwaway
+network namespace (`unshare -rn`, with a dummy `eth1`) and read back with `nft list ruleset`, so
+the syntax and the kernel's acceptance of every rule are checked. It has **not** been run on a real
+gateway with live client traffic. The original-destination lookup itself is covered by the
+opt-in kernel test described under Verifying.
 
 ## Host requirements
 
@@ -83,15 +107,34 @@ table inet adblocker {
 * Loading nftables rules needs root / `CAP_NET_ADMIN`. The proxy itself binds an unprivileged port;
   reading the original destination is a plain `getsockopt` and is not expected to need a
   capability (not verified unprivileged).
-* **Docker:** use `network_mode: host`. In a bridge network the container only sees addresses
-  rewritten by Docker's own NAT, so the original destination is lost and connections are refused
-  (not tested). Published ports (`3129`) are only useful for explicit-style testing.
+* **Docker:** use `network_mode: host` (the shipped `compose.yaml` does). In a bridge network the
+  container only sees addresses rewritten by Docker's own NAT, so the original destination is
+  lost and connections are refused (not tested). `cap_drop: ALL` is kept: the redirect runs on the
+  gateway's firewall, not in the container. With host networking the explicit proxy, the
+  transparent listener and the web UI bind directly on the host (`8080`, `3129`, `3000`); there is
+  no `ports:` mapping.
+
+## Changing ports and listeners
+
+Everything above can be changed from the web UI (Proxy page) or `PUT /api/v1/config` without
+restarting: the proxy host, explicit port, transparent port (`0` turns it off), TLS passthrough
+hosts, allowed clients, allowed destinations and the web UI's own host and port. New sockets are
+bound first; if a bind fails the old listener stays up and the call returns `409 bind_failed`
+with the reason. Connections already accepted keep running on the old socket; the web UI's old
+address keeps answering for 30 seconds so the page can redirect.
+
+UI changes are saved to a settings overlay, not to the shipped `config/default.toml`, which is
+read-only in the container. The overlay lives at `CONFIG_OVERLAY_PATH` (the image sets
+`/app/data/settings.toml`, on the data volume; elsewhere it defaults to `<adblock.data_dir>/settings.toml`).
+It holds only the keys that differ from the base file, `transparent_port = 0` means off, and
+`POST /api/v1/config/reload` re-reads both files. Delete the overlay to return to the shipped
+defaults.
 
 ## Verifying
 
 * `cargo nextest run -p e2e` runs every scenario through both entry modes with an injected
   original-destination source.
-* `ADBLOCKER_KERNEL_TEST=1 cargo nextest run -p proxy-core --test kernel_original_dst` creates a
+* `ARGUS_KERNEL_TEST=1 cargo nextest run -p proxy-core --test kernel_original_dst` creates a
   throwaway network namespace (`unshare -rn`, or `unshare -n` as root), loads an nftables
   `REDIRECT` there and checks the real `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` results. It
   skips with a message when the tools or privileges are missing and never touches host rules.

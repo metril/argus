@@ -173,6 +173,19 @@ impl SniResolver {
         } else {
             vec![SanType::DnsName(name.try_into().expect("dns name"))]
         };
+        // Hosts named `ev-*` present a certificate with the CA/B Forum EV policy (2.23.140.1.1).
+        if name.starts_with("ev-") {
+            // certificatePolicies ::= SEQUENCE { SEQUENCE { OID 2.23.140.1.1 } }
+            let der = vec![
+                0x30, 0x09, 0x30, 0x07, 0x06, 0x05, 0x67, 0x81, 0x0c, 0x01, 0x01,
+            ];
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 32],
+                    der,
+                ));
+        }
         let key = KeyPair::generate().expect("leaf key");
         let cert = params.signed_by(&key, &self.issuer).expect("sign leaf");
         let der = PrivateKeyDer::try_from(key.serialize_der()).expect("key der");

@@ -1,6 +1,6 @@
 # Certificate Authority Installation Guide
 
-This guide explains how to install the Adblocker Proxy CA certificate on different platforms to avoid SSL/TLS warnings when using MITM mode.
+This guide explains how to install the Argus Proxy CA certificate on different platforms to avoid SSL/TLS warnings when using MITM mode.
 
 ## Table of Contents
 
@@ -20,11 +20,11 @@ This guide explains how to install the Adblocker Proxy CA certificate on differe
 
 ## Understanding the CA Certificate
 
-The Adblocker Proxy uses a self-signed Certificate Authority (CA) to generate certificates on-the-fly for intercepted HTTPS connections. When you install this CA certificate in your system's trust store, your browser will trust certificates signed by this CA.
+The Argus Proxy uses a self-signed Certificate Authority (CA) to generate certificates on-the-fly for intercepted HTTPS connections. When you install this CA certificate in your system's trust store, your browser will trust certificates signed by this CA.
 
 **Certificate Details:**
-- Common Name: `Adblocker Proxy CA`
-- Organization: `Adblocker Proxy`
+- Common Name: `Argus Proxy CA`
+- Organization: `Argus Proxy`
 - Validity: 10 years
 - Location: `certs/root-ca.crt`
 
@@ -37,7 +37,7 @@ The easiest way to get the certificate onto a device is to **download it from th
   ```
   http://<server>:3000/api/v1/ca.crt
   ```
-  e.g. `curl -O http://192.168.1.50:3000/api/v1/ca.crt` (saved as `adblocker-ca.crt`).
+  e.g. `curl -O http://192.168.1.50:3000/api/v1/ca.crt` (saved as `argus-ca.crt`).
 
 Alternatively, the CA certificate is automatically generated on first run and stored on the server
 file system at:
@@ -54,7 +54,7 @@ file system at:
 
 If the file doesn't exist, start the proxy once to generate it:
 ```bash
-./target/release/adblocker
+./target/release/argus
 # or
 docker compose up -d
 ```
@@ -87,7 +87,7 @@ certutil -addstore "Root" certs\root-ca.crt
 
 1. Double-click `certs/root-ca.crt` to open Keychain Access
 2. Select "System" keychain
-3. Find "Adblocker Proxy CA" in the list
+3. Find "Argus Proxy CA" in the list
 4. Double-click the certificate
 5. Expand "Trust" section
 6. Set "When using this certificate" to "Always Trust"
@@ -106,7 +106,7 @@ sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keyc
 
 ```bash
 # Copy certificate to system directory
-sudo cp certs/root-ca.crt /usr/local/share/ca-certificates/adblocker-proxy-ca.crt
+sudo cp certs/root-ca.crt /usr/local/share/ca-certificates/argus-proxy-ca.crt
 
 # Update certificate store
 sudo update-ca-certificates
@@ -118,7 +118,7 @@ sudo update-ca-certificates
 
 ```bash
 # Copy certificate
-sudo cp certs/root-ca.crt /etc/pki/ca-trust/source/anchors/adblocker-proxy-ca.crt
+sudo cp certs/root-ca.crt /etc/pki/ca-trust/source/anchors/argus-proxy-ca.crt
 
 # Update trust
 sudo update-ca-trust
@@ -130,7 +130,7 @@ sudo update-ca-trust
 
 ```bash
 # Copy certificate
-sudo cp certs/root-ca.crt /etc/ca-certificates/trust-source/anchors/adblocker-proxy-ca.crt
+sudo cp certs/root-ca.crt /etc/ca-certificates/trust-source/anchors/argus-proxy-ca.crt
 
 # Update trust
 sudo trust extract-compat
@@ -178,9 +178,9 @@ Chrome typically uses the system certificate store, but can be configured manual
 1. Transfer `root-ca.crt` to your iOS device (email, AirDrop, etc.)
 2. Open the file → Install Profile
 3. Settings → General → VPN & Device Management
-4. Select "Adblocker Proxy CA" profile → Install
+4. Select "Argus Proxy CA" profile → Install
 5. Settings → General → About → Certificate Trust Settings
-6. Enable "Adblocker Proxy CA"
+6. Enable "Argus Proxy CA"
 
 ## Verification
 
@@ -189,24 +189,24 @@ Chrome typically uses the system certificate store, but can be configured manual
 1. Configure browser to use proxy (localhost:8080)
 2. Visit `https://example.com`
 3. Click padlock icon in address bar
-4. View certificate → Should show "Adblocker Proxy CA" as issuer
+4. View certificate → Should show "Argus Proxy CA" as issuer
 
 ### Command Line Method
 
 **Linux/macOS**:
 ```bash
 # System store
-security find-certificate -a -c "Adblocker Proxy CA"  # macOS
-trust list | grep -i adblocker  # Linux
+security find-certificate -a -c "Argus Proxy CA"  # macOS
+trust list | grep -i argus  # Linux
 
 # Test with curl
 curl -v --proxy localhost:8080 https://example.com 2>&1 | grep -i "issuer"
-# Should show: issuer: C=US; O=Adblocker Proxy; CN=Adblocker Proxy CA
+# Should show: issuer: C=US; O=Argus Proxy; CN=Argus Proxy CA
 ```
 
 **Windows**:
 ```powershell
-certutil -store "Root" | findstr "Adblocker"
+certutil -store "Root" | findstr "Argus"
 ```
 
 ## Removal
@@ -215,7 +215,7 @@ certutil -store "Root" | findstr "Adblocker"
 
 ```powershell
 # As Administrator
-certutil -delstore "Root" "Adblocker Proxy CA"
+certutil -delstore "Root" "Argus Proxy CA"
 ```
 
 Or use MMC as described in installation, but select Delete instead.
@@ -223,7 +223,7 @@ Or use MMC as described in installation, but select Delete instead.
 ### macOS
 
 ```bash
-sudo security delete-certificate -c "Adblocker Proxy CA" -t /Library/Keychains/System.keychain
+sudo security delete-certificate -c "Argus Proxy CA" -t /Library/Keychains/System.keychain
 ```
 
 Or use Keychain Access and delete the certificate manually.
@@ -232,23 +232,23 @@ Or use Keychain Access and delete the certificate manually.
 
 #### Ubuntu/Debian
 ```bash
-sudo rm /usr/local/share/ca-certificates/adblocker-proxy-ca.crt
+sudo rm /usr/local/share/ca-certificates/argus-proxy-ca.crt
 sudo update-ca-certificates --fresh
 ```
 
 #### Fedora/RHEL/CentOS
 ```bash
-sudo rm /etc/pki/ca-trust/source/anchors/adblocker-proxy-ca.crt
+sudo rm /etc/pki/ca-trust/source/anchors/argus-proxy-ca.crt
 sudo update-ca-trust
 ```
 
 ### Firefox
 
-Settings → Privacy & Security → View Certificates → Authorities → Find "Adblocker Proxy CA" → Delete
+Settings → Privacy & Security → View Certificates → Authorities → Find "Argus Proxy CA" → Delete
 
 ### Chrome
 
-Settings → Privacy and security → Manage certificates → Authorities → Find "Adblocker Proxy CA" → Delete
+Settings → Privacy and security → Manage certificates → Authorities → Find "Argus Proxy CA" → Delete
 
 ### Android/iOS
 

@@ -1,44 +1,41 @@
-//! Card component
+//! Card and stat tile.
 
 use leptos::prelude::*;
 
-/// Card component
+/// Card with an optional titled header.
 #[component]
 pub fn Card(
     #[prop(into, optional)] title: String,
+    #[prop(into, optional)] sub: String,
     #[prop(into, optional)] class: String,
     children: Children,
 ) -> impl IntoView {
     view! {
-        <div class={format!("card {}", class)}>
+        <div class=format!("card {class}")>
             {(!title.is_empty()).then(|| view! {
-                <div class="card-header">
-                    <h3 class="card-title">{title.clone()}</h3>
+                <div class="card-h">
+                    <h3>{title.clone()}</h3>
+                    {(!sub.is_empty()).then(|| view! { <span class="sub">{sub.clone()}</span> })}
                 </div>
             })}
-            <div class="card-body">
-                {children()}
-            </div>
+            <div class="card-b">{children()}</div>
         </div>
     }
 }
 
-/// Stat card for dashboard
+/// Dashboard tile: label, big mono value, small detail line.
 #[component]
-pub fn StatCard(
-    #[prop(into)] title: String,
-    #[prop(into)] value: String,
-    #[prop(into, optional)] icon: String,
+pub fn Tile(
+    #[prop(into)] label: String,
+    #[prop(into)] value: Signal<String>,
+    #[prop(into, optional)] detail: Signal<String>,
+    #[prop(into, optional)] color: String,
 ) -> impl IntoView {
     view! {
-        <div class="stat-card">
-            <div class="stat-card-header">
-                {(!icon.is_empty()).then(|| view! {
-                    <span class="stat-icon">{icon.clone()}</span>
-                })}
-                <span class="stat-title">{title}</span>
-            </div>
-            <div class="stat-value">{value}</div>
+        <div class="tile">
+            <span class="k">{label}</span>
+            <span class="v" style=color>{move || value.get()}</span>
+            <span class="d">{move || detail.get()}</span>
         </div>
     }
 }

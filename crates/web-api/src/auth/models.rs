@@ -30,6 +30,9 @@ pub struct User {
     pub last_login: Option<DateTime<Utc>>,
     /// Whether account is enabled
     pub enabled: bool,
+    /// Profile (decimal id) the account starts on in the UI.
+    #[serde(default)]
+    pub default_profile: Option<String>,
 }
 
 impl User {
@@ -43,6 +46,7 @@ impl User {
             created_at: Utc::now(),
             last_login: None,
             enabled: true,
+            default_profile: None,
         }
     }
 }
@@ -88,6 +92,8 @@ impl From<&User> for UserInfo {
             last_login: user.last_login.map(|t| t.to_rfc3339()),
             enabled: user.enabled,
             scopes: user.role.scopes(),
+            default_profile: user.default_profile.clone(),
+            session_count: 0,
         }
     }
 }

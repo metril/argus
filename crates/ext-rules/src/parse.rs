@@ -242,13 +242,13 @@ fn js_str(s: &str) -> String {
 
 impl Injection {
     /// JavaScript to put in a `<script>` for script-like injections. Scriptlets and snippets call
-    /// the in-page runtime hook `self.__adblockerRuntime.run(kind, name, args)`; when the hook is
+    /// the in-page runtime hook `self.__argusRuntime.run(kind, name, args)`; when the hook is
     /// absent they are no-ops. `ProceduralCss` returns `None` (use the selector data).
     pub fn script_body(&self) -> Option<String> {
         let call = |kind: &str, name: &str, args: &[String]| {
             let a: Vec<String> = args.iter().map(|x| js_str(x)).collect();
             format!(
-                "try{{var r=self.__adblockerRuntime;r&&r.run({},{},[{}])}}catch(e){{}}",
+                "try{{var r=self.__argusRuntime;r&&r.run({},{},[{}])}}catch(e){{}}",
                 js_str(kind),
                 js_str(name),
                 a.join(",")

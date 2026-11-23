@@ -63,17 +63,23 @@ e2e_test!(
         let events = env.proxy.engine.recent_blocked(10);
         let rules: Vec<(&str, Option<&str>)> = events
             .iter()
-            .map(|e| (e.rule.as_str(), e.list_id.as_deref()))
+            .map(|e| (e.rule.as_deref().unwrap_or(""), e.list_id.as_deref()))
             .collect();
         // Newest first: imp.test (the engine's $important rule), engine-ad.test, subdomain, host.
         assert_eq!(events.len(), 4, "{rules:?}");
-        assert_eq!(events[0].rule, "||imp.test^$important");
+        assert_eq!(events[0].rule.as_deref(), Some("||imp.test^$important"));
         assert_eq!(
-            (events[1].rule.as_str(), events[1].list_id.as_deref()),
+            (
+                events[1].rule.as_deref().unwrap_or(""),
+                events[1].list_id.as_deref()
+            ),
             ("||engine-ad.test^", Some("abp"))
         );
         assert_eq!(
-            (events[2].rule.as_str(), events[2].list_id.as_deref()),
+            (
+                events[2].rule.as_deref().unwrap_or(""),
+                events[2].list_id.as_deref()
+            ),
             ("||set-ad.test^", Some("hosts"))
         );
         assert!(events[3].url.contains("set-ad.test") && !events[3].request_type.is_empty());

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use api_types::{
     ChangePasswordRequest, LoginRequest, LoginResponse, MessageResponse, Page, RegisterRequest,
-    SessionInfo, UserInfo, UserRole,
+    RegistrationStatus, SessionInfo, UserInfo, UserRole,
 };
 use axum::{
     extract::State,
@@ -164,6 +164,24 @@ fn msg(m: &str) -> axum::Json<MessageResponse> {
 }
 
 type Authed = (Extension<AuditActor>, HeaderMap, axum::Json<LoginResponse>);
+
+/// Whether first-run registration is still open. Public: the login page uses it to offer
+/// "create admin account" or "registration closed".
+#[utoipa::path(
+    get, path = "/auth/registration", tag = "auth",
+    security(()),
+    responses((status = 200, description = "Registration status", body = RegistrationStatus))
+)]
+pub async fn registration_status(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<axum::Json<RegistrationStatus>> {
+    let st = state.clone();
+    let none = blocking(move || Ok(st.session_store.get_all_users()?.is_empty())).await?;
+    Ok(axum::Json(RegistrationStatus {
+        open: none,
+        first_run: none,
+    }))
+}
 
 /// Register the first account (it becomes the administrator). Closed once any user exists;
 /// further accounts are created by an administrator via `POST /users`.

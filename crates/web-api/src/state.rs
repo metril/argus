@@ -44,6 +44,125 @@ pub trait ProfileRuntime: Send + Sync {
     fn device_last_seen(&self, device_id: u64) -> Option<chrono::DateTime<chrono::Utc>>;
 }
 
+/// Where the proxy's listeners are bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyBind {
+    pub proxy: std::net::SocketAddr,
+    pub transparent: Option<std::net::SocketAddr>,
+    /// Not listening (a failed move could not be undone); the address is the last known one.
+    pub proxy_down: bool,
+    pub transparent_down: bool,
+}
+
+/// Caps on concurrent live-log streams, in total and per user.
+pub struct LogStreamLimits {
+    max_total: std::sync::atomic::AtomicUsize,
+    max_per_user: std::sync::atomic::AtomicUsize,
+    /// How often a stream re-checks its caller, milliseconds.
+    recheck_ms: std::sync::atomic::AtomicU64,
+    open: parking_lot::Mutex<(usize, std::collections::HashMap<Uuid, usize>)>,
+}
+
+/// Releases a stream slot when dropped.
+pub struct LogStreamGuard {
+    limits: Arc<LogStreamLimits>,
+    user: Uuid,
+}
+
+impl LogStreamLimits {
+    pub fn new(max_total: usize, max_per_user: usize) -> Self {
+        Self {
+            max_total: max_total.into(),
+            max_per_user: max_per_user.into(),
+            recheck_ms: 15_000.into(),
+            open: Default::default(),
+        }
+    }
+
+    /// How often a stream re-checks that its caller may still watch.
+    pub fn recheck_every(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.recheck_ms.load(Ordering::Relaxed))
+    }
+
+    /// Change the re-check period (tests).
+    pub fn set_recheck_every(&self, d: std::time::Duration) {
+        self.recheck_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Change the caps (tests).
+    pub fn set(&self, max_total: usize, max_per_user: usize) {
+        self.max_total.store(max_total, Ordering::Relaxed);
+        self.max_per_user.store(max_per_user, Ordering::Relaxed);
+    }
+
+    /// Take a slot for `user`, or say why not (429).
+    pub fn acquire(self: &Arc<Self>, user: Uuid) -> ApiResult<LogStreamGuard> {
+        let mut g = self.open.lock();
+        let mine = g.1.get(&user).copied().unwrap_or(0);
+        if g.0 >= self.max_total.load(Ordering::Relaxed) {
+            return Err(ApiError::RateLimitExceeded(
+                "too many live log streams open on the server".into(),
+            ));
+        }
+        if mine >= self.max_per_user.load(Ordering::Relaxed) {
+            return Err(ApiError::RateLimitExceeded(
+                "too many live log streams open for this account".into(),
+            ));
+        }
+        g.0 += 1;
+        g.1.insert(user, mine + 1);
+        Ok(LogStreamGuard {
+            limits: self.clone(),
+            user,
+        })
+    }
+}
+
+impl Drop for LogStreamGuard {
+    fn drop(&mut self) {
+        let mut g = self.limits.open.lock();
+        g.0 = g.0.saturating_sub(1);
+        if let Some(n) = g.1.get_mut(&self.user) {
+            *n -= 1;
+            if *n == 0 {
+                g.1.remove(&self.user);
+            }
+        }
+    }
+}
+
+/// Live traffic of one listener.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListenerCounters {
+    pub active_connections: u64,
+    pub requests_per_sec: f64,
+    pub clients: u64,
+}
+
+/// Live changes to the running proxy. Implemented by the proxy and attached at startup
+/// ([`AppState::runtime`]), so this crate does not depend on it. Without one (tests, no proxy)
+/// listener and access changes are saved and reported as `restart_required`.
+#[async_trait::async_trait]
+pub trait RuntimeControl: Send + Sync {
+    /// Move the proxy listeners; on failure nothing changed and the message says why.
+    async fn rebind_proxy(
+        &self,
+        host: &str,
+        port: u16,
+        transparent_port: Option<u16>,
+    ) -> Result<ProxyBind, String>;
+    /// Apply the client ACL, TLS passthrough hosts, destination rules, DNS, limits and
+    /// per-listener switches, all or nothing.
+    async fn apply_access(&self, config: &ProxyConfig) -> Result<(), String>;
+    /// Counters of the explicit and transparent listeners.
+    fn listener_counters(&self) -> (ListenerCounters, ListenerCounters);
+    /// Current bind addresses.
+    async fn proxy_bind(&self) -> Option<ProxyBind>;
+    /// Tell the proxy where the web API listens (loop protection).
+    async fn note_webui(&self, host: &str, port: u16);
+}
+
 pub struct AppState {
     /// Proxy state wrapper
     pub proxy_state: Arc<ProxyState>,
@@ -110,6 +229,31 @@ pub struct AppState {
 
     /// Process start, for uptime.
     pub started_at: Instant,
+
+    /// Bypass entries, categories and subscriptions (installed by the proxy at startup; a
+    /// persisted default is created on first use otherwise).
+    pub bypass: OnceLock<Arc<common::bypass::BypassEngine>>,
+
+    /// The first-party list manager (installed by the proxy; created on first use otherwise).
+    pub argus: OnceLock<Arc<list_service::ArgusLists>>,
+
+    /// Serialises config updates and reloads (ETag check through save and commit).
+    pub config_lock: tokio::sync::Mutex<()>,
+
+    /// Caps on concurrent live-log streams (5 per user, 64 in all).
+    pub log_streams: Arc<LogStreamLimits>,
+
+    /// Request / block counts over time (fed by a sampler started with the server).
+    pub timeseries: crate::timeseries::Timeseries,
+
+    /// Live control of the proxy listeners and access lists (`None` without a proxy).
+    pub runtime: OnceLock<Arc<dyn RuntimeControl>>,
+
+    /// The running web API server, for rebinding its own listener (set by `start_server`).
+    pub web_server: OnceLock<Arc<crate::server::WebServer>>,
+
+    /// Settings overlay written by config updates (the base file may be read-only).
+    pub overlay_path: Arc<RwLock<PathBuf>>,
 
     /// Serialised OpenAPI document; set once by `create_router`.
     pub spec_json: OnceLock<String>,
@@ -564,6 +708,7 @@ pub async fn build_state_full(
     profiles: Option<Arc<common::profile_store::ProfileStore>>,
     profile_runtime: Option<Arc<dyn ProfileRuntime>>,
 ) -> ApiResult<Arc<AppState>> {
+    let overlay_dir = api_config.session.storage_path.clone();
     crate::auth::password::validate_bcrypt_cost(api_config.auth.bcrypt_cost)?;
     if api_config.auth.bcrypt_cost < crate::auth::password::RECOMMENDED_MIN_BCRYPT_COST {
         tracing::warn!(
@@ -657,6 +802,16 @@ pub async fn build_state_full(
         profile_runtime,
         policy,
         started_at: Instant::now(),
+        bypass: OnceLock::new(),
+        argus: OnceLock::new(),
+        config_lock: tokio::sync::Mutex::new(()),
+        log_streams: Arc::new(LogStreamLimits::new(64, 5)),
+        timeseries: Default::default(),
+        runtime: OnceLock::new(),
+        web_server: OnceLock::new(),
+        overlay_path: Arc::new(RwLock::new(common::config::default_overlay_path(
+            &overlay_dir,
+        ))),
         spec_json: OnceLock::new(),
         route_auth: OnceLock::new(),
     }))
@@ -695,6 +850,32 @@ async fn load_or_generate_jwt_secret(path: &PathBuf) -> ApiResult<String> {
     tracing::info!("Generated new JWT secret at {:?}", path);
 
     Ok(secret_base64)
+}
+
+impl AppState {
+    /// The first-party list manager.
+    pub fn argus(&self) -> &Arc<list_service::ArgusLists> {
+        self.argus.get_or_init(|| {
+            let bypass = self.bypass().clone();
+            let cfg = list_service::ArgusConfig::from_config(
+                &self.proxy_state.config.read().bypass,
+                bypass.data_dir().map(|d| d.join("argus-lists")),
+            );
+            list_service::ArgusLists::new(bypass, self.list_service.clone(), cfg)
+        })
+    }
+
+    /// The bypass engine.
+    pub fn bypass(&self) -> &Arc<common::bypass::BypassEngine> {
+        self.bypass.get_or_init(|| {
+            let path = self
+                .overlay_path
+                .read()
+                .parent()
+                .map_or_else(|| "bypass.json".into(), |p| p.join("bypass.json"));
+            Arc::new(common::bypass::BypassEngine::load(path))
+        })
+    }
 }
 
 #[cfg(test)]

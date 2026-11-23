@@ -251,7 +251,13 @@ async fn send(ctx: &TestContext, method: &str, path: &str, secret: Option<&str>)
     } else {
         req
     };
-    req.await.status_code()
+    // An authorized event stream never finishes; a request still open after a moment passed
+    // authorization and is streaming.
+    match tokio::time::timeout(std::time::Duration::from_secs(3), req).await {
+        Ok(r) => r.status_code(),
+        Err(_) if path.ends_with("/logs/stream") => StatusCode::OK,
+        Err(_) => panic!("{method} {path} timed out"),
+    }
 }
 
 #[tokio::test]

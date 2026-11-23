@@ -56,8 +56,8 @@ async fn metrics_require_system_read() {
     assert_eq!(m["storage"]["deferred_failed"], 0);
     let p = admin.get("/api/v1/system/metrics/prometheus").await;
     p.assert_status_ok();
-    assert!(p.text().contains("adblocker_filter_blocked_total"));
-    assert!(p.text().contains("adblocker_db_deferred_dropped_total"));
+    assert!(p.text().contains("argus_filter_blocked_total"));
+    assert!(p.text().contains("argus_db_deferred_dropped_total"));
     admin.get("/api/v1/system/status").await.assert_status_ok();
 }
 
@@ -494,8 +494,13 @@ async fn max_connections_auto_reports_derived_value_and_is_not_pinned_by_saving(
             .max_connections,
         0
     );
-    let saved = std::fs::read_to_string(ctx.temp_dir.path().join("proxy.toml")).unwrap();
-    assert!(saved.contains("max_connections = 0"), "{saved}");
+    // Saved to the overlay (only what differs from the base file); the base is untouched.
+    let overlay = ctx.state.overlay_path.read().clone();
+    let saved = std::fs::read_to_string(&overlay).unwrap();
+    assert!(saved.contains("request_timeout_secs = 45"), "{saved}");
+    assert!(!saved.contains("max_connections"), "{saved}");
+    let base = std::fs::read_to_string(ctx.temp_dir.path().join("proxy.toml")).unwrap();
+    assert!(!base.contains("request_timeout_secs = 45"), "{base}");
 
     let r = put_config(&admin, json!({"max_connections": derived - 1})).await;
     r.assert_status_ok();

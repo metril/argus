@@ -1,70 +1,92 @@
-//! Layout component
+//! App shell: sidebar, top bar, work area, toasts, command palette.
 
 use leptos::prelude::*;
+use leptos_router::components::Redirect;
 
-use super::{Navbar, Sidebar, ToastContainer};
+use super::{CommandPalette, Navbar, Sidebar, ToastContainer};
 use crate::state::{use_app_state, use_auth_state};
 
-/// Main layout wrapper for authenticated pages
+/// Main layout wrapper for authenticated pages. `class` is added to the page container
+/// (e.g. `logs-screen`).
 #[component]
-pub fn Layout(children: Children) -> impl IntoView {
+pub fn Layout(#[prop(into, optional)] class: String, children: Children) -> impl IntoView {
     let app_state = use_app_state();
     let auth_state = use_auth_state();
+    let (collapsed, nav_open) = (app_state.collapsed, app_state.nav_open);
+    let (user, checked) = (auth_state.user, auth_state.checked);
 
-    let theme = app_state.theme;
-    let sidebar_open = app_state.sidebar_open;
-    let user = auth_state.user;
-
-    // Check session on mount
-    Effect::new(move || {
+    {
         let auth_state = auth_state.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            auth_state.check_session().await;
+        Effect::new(move |_| {
+            let auth_state = auth_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                auth_state.check_session().await;
+            });
         });
-    });
+    }
+    // A navigation closes the off-canvas menu.
+    nav_open.set(false);
 
-    // Store children view immediately since Children is FnOnce
     let children_view = children();
 
     view! {
-        <div class=move || format!("app-container {}", theme.get().class())>
+        <div class=move || format!(
+            "app {} {}",
+            if collapsed.get() { "collapsed" } else { "" },
+            if nav_open.get() { "navopen" } else { "" }
+        )>
+            <Sidebar />
             <Navbar />
-            <div class="app-body">
-                <Sidebar />
-                <main class=move || format!(
-                    "main-content {}",
-                    if sidebar_open.get() { "sidebar-open" } else { "sidebar-closed" }
-                )>
+            <main class="main" id="main" tabindex="-1">
+                <div class=format!("screen {class}")>
                     {children_view}
-                </main>
-            </div>
+                </div>
+            </main>
+            <Show when=move || nav_open.get()>
+                <div class="navscrim" on:click=move |_| nav_open.set(false)></div>
+            </Show>
             <ToastContainer />
-            <Show when=move || user.get().is_none()>
-                <leptos_router::components::Redirect path="/login" />
+            <CommandPalette />
+            <Show when=move || checked.get() && user.get().is_none()>
+                <Redirect path="/login" />
             </Show>
         </div>
     }
 }
 
-/// Auth layout for login/register pages
+/// Centered card for login/register.
 #[component]
 pub fn AuthLayout(children: Children) -> impl IntoView {
-    let app_state = use_app_state();
-    let theme = app_state.theme;
-
-    // Store children view immediately since Children is FnOnce
     let children_view = children();
-
     view! {
-        <div class=move || format!("auth-container {}", theme.get().class())>
-            <div class="auth-card">
-                <div class="auth-logo">
-                    <span class="logo-icon">"AD"</span>
-                    <span class="logo-text">"Adblocker Proxy"</span>
+        <div class="auth-wrap">
+            <div class="reg-card">
+                <div class="brand">
+                    <span class="brand-mark"><super::icon::Icon name="adblock" /></span>
+                    <span><b>"argus"</b></span>
                 </div>
                 {children_view}
             </div>
             <ToastContainer />
         </div>
+    }
+}
+
+/// Renders its children only for Admin users; everyone else gets an explanation.
+#[component]
+pub fn RequireAdmin(children: ChildrenFn) -> impl IntoView {
+    let user = use_auth_state().user;
+    view! {
+        <Show
+            when=move || user.get().map(|u| u.role.is_admin()).unwrap_or(false)
+            fallback=move || view! {
+                <div class="card"><div class="empty">
+                    <b>"Admins only"</b>
+                    "Your role does not include access to this page."
+                </div></div>
+            }
+        >
+            {children()}
+        </Show>
     }
 }

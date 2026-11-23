@@ -1,12 +1,12 @@
 # Default configuration for Rust MITM Proxy
 
 [proxy]
-host = "0.0.0.0"
+host = "::"                      # dual-stack: IPv4 and IPv6
 port = 8080
 enable_http2 = true
 enable_websockets = true
 # Transparent-gateway listener (Linux); see docs/TRANSPARENT.md. Off when unset.
-# transparent_port = 3129
+transparent_port = 3129
 # TLS hosts never intercepted, in both entry modes (exact or "*.suffix").
 tls_passthrough_hosts = []
 # Clients allowed to use the proxy (CIDRs); others are closed at accept. Empty = nobody.

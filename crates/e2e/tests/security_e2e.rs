@@ -509,3 +509,83 @@ e2e_test!(bracketed_ipv6_host_is_parsed, rules = [], |env| {
     let got = env.origin.requests_for("/v6");
     assert_eq!(got[0].host, format!("[2001:db8::1]:{port}"));
 });
+
+fn bypass_entry(env: &e2e::TestEnv, pattern: &str) {
+    env.proxy
+        .ctx
+        .bypass()
+        .update(|s| {
+            s.entries.push(common::bypass::Entry {
+                id: common::bypass::new_id(),
+                pattern: pattern.into(),
+                mode: common::bypass::BypassMode::NoDecrypt,
+                source: "custom".into(),
+                note: None,
+                updated_at: 0,
+            });
+            Ok(())
+        })
+        .unwrap();
+}
+
+// A bypassed host can never ride a decrypted connection, even where the connection's certificate
+// covers it (the certificate for a.test covers www.a.test): 421, so the client opens its own.
+e2e_test!(
+    bypassed_hosts_get_421_on_a_decrypted_connection_h1,
+    rules = [],
+    |env| {
+        env.origin.route("/x", MockResponse::ok("x"));
+        let mut s = h1_over_tls(&env, "a.test").await;
+        let req = |host: &str| {
+            Request::get("/x")
+                .header("host", host)
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let resp = s.send_request(req("www.a.test")).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "covered subdomain is normally served"
+        );
+        bypass_entry(&env, "www.a.test");
+        let resp = s.send_request(req("www.a.test")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        // The connection's own host and other covered names are unaffected.
+        for host in ["a.test", "sub.a.test"] {
+            let resp = s.send_request(req(host)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{host}");
+        }
+    }
+);
+
+e2e_test!(
+    bypassed_hosts_get_421_on_a_coalesced_h2_connection,
+    rules = [],
+    |env| {
+        env.origin.route("/y", MockResponse::ok("y"));
+        let mut s = h2_over_tls(&env, "a.test").await;
+        let port = env.origin.https_port();
+        let get = |authority: String| {
+            Request::get(format!("https://{authority}/y"))
+                .body(Empty::<Bytes>::new())
+                .unwrap()
+        };
+        let ok = s
+            .send_request(get(format!("sub.a.test:{port}")))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        bypass_entry(&env, "*.a.test");
+        let resp = s
+            .send_request(get(format!("sub.a.test:{port}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(
+            env.origin.requests_for("/y").len(),
+            1,
+            "never reached the origin"
+        );
+    }
+);

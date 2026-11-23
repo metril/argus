@@ -248,6 +248,10 @@ pub fn route_domain_rules(lists: &[&str], list_ids: Vec<String>) -> DomainRouted
         let mut rest = *text;
         while !rest.is_empty() {
             let mut cut = target.min(rest.len());
+            // Never split a multibyte character.
+            while !rest.is_char_boundary(cut) {
+                cut += 1;
+            }
             if cut < rest.len() {
                 cut = rest[cut..].find('\n').map_or(rest.len(), |i| cut + i + 1);
             }
@@ -352,5 +356,14 @@ mod tests {
         );
         assert_eq!(c.per_list[1].network, 1);
         assert!(!c.blob.is_empty());
+    }
+
+    #[test]
+    fn routing_chunks_never_split_a_multibyte_character() {
+        // The first chunk boundary (256 KiB) falls inside a two-byte character.
+        let text = "\u{e9}\n".repeat(100_000);
+        assert!(!text.is_char_boundary(256 * 1024));
+        let routed = route_domain_rules(&[&text], vec!["l".into()]);
+        let _ = routed;
     }
 }

@@ -17,7 +17,34 @@ pub use api_types::{
     UserscriptBundle, UserscriptPlanResponse, UserscriptStorageResponse,
 };
 
+pub use api_types::{UserscriptCounts, UserscriptsPage};
+
 impl ApiClient {
+    /// Cursor-paged list. `status`: "" | enabled | disabled | error; `sort`: name | updated;
+    /// `from` seeks to a name prefix (name sort only).
+    pub async fn list_userscripts_paged(
+        &self,
+        q: &str,
+        status: &str,
+        sort: &str,
+        cursor: Option<&str>,
+        from: Option<&str>,
+        limit: u32,
+    ) -> Result<UserscriptsPage, ApiError> {
+        let enc = |s: &str| String::from(js_sys::encode_uri_component(s));
+        let mut url = format!("/userscripts?limit={limit}&sort={sort}&q={}", enc(q.trim()));
+        if !status.is_empty() {
+            url.push_str(&format!("&status={status}"));
+        }
+        if let Some(c) = cursor {
+            url.push_str(&format!("&cursor={}", enc(c)));
+        }
+        if let Some(f) = from {
+            url.push_str(&format!("&from={}", enc(f)));
+        }
+        self.get(&url).await
+    }
+
     /// List userscripts with pagination
     pub async fn list_userscripts(
         &self,

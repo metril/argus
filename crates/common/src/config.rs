@@ -18,6 +18,23 @@ pub struct ProxyConfig {
     pub webui: WebUiSettings,
     #[serde(default)]
     pub dns: DnsSettings,
+    /// Where the first-party bypass lists come from.
+    #[serde(default)]
+    pub bypass: BypassConfig,
+}
+
+/// First-party bypass lists (see `bypass`): normally left at the defaults. The overrides exist
+/// for testing and for mirroring the lists internally.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BypassConfig {
+    /// Base URL the `<id>.txt`, `<id>.txt.minisig`, `meta.json` and `meta.json.minisig` files are
+    /// fetched from. Empty = the argus-lists GitHub release.
+    #[serde(default)]
+    pub lists_base_url: String,
+    /// Minisign public key (base64 line) the lists must be signed with. Empty = the key
+    /// compiled into the binary.
+    #[serde(default)]
+    pub lists_public_key: String,
 }
 
 /// Upstream DNS resolution and caching.
@@ -54,6 +71,34 @@ fn default_dns_negative_ttl() -> u64 {
     10
 }
 
+impl DnsSettings {
+    /// Check the values a user can set: servers are `ip` or `ip:port`, the cache holds at least
+    /// one name, and `min_ttl_secs <= max_ttl_secs`.
+    pub fn validate(&self) -> Result<(), String> {
+        for s in &self.servers {
+            let ok =
+                s.parse::<std::net::SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok();
+            if !ok {
+                return Err(format!(
+                    "dns.servers: {s:?} is not an IP address or ip:port"
+                ));
+            }
+        }
+        if self.cache_size == 0 || self.cache_size > 10_000_000 {
+            return Err("dns.cache_size must be between 1 and 10000000".into());
+        }
+        if self.min_ttl_secs > self.max_ttl_secs {
+            return Err("dns.min_ttl_secs must not exceed dns.max_ttl_secs".into());
+        }
+        if self.max_ttl_secs > 7 * 86_400 || self.negative_ttl_secs > 86_400 {
+            return Err(
+                "dns: max_ttl_secs is limited to 7 days and negative_ttl_secs to 1 day".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for DnsSettings {
     fn default() -> Self {
         Self {
@@ -66,6 +111,28 @@ impl Default for DnsSettings {
     }
 }
 
+/// Per-listener switches; `None` inherits the global setting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_mitm: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_http2: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_websockets: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_adblock: Option<bool>,
+}
+
+/// A listener's effective switches (override, else the global value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListenerFlagValues {
+    pub mitm: bool,
+    pub http2: bool,
+    pub websockets: bool,
+    pub adblock: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxySettings {
     pub host: String,
@@ -75,6 +142,14 @@ pub struct ProxySettings {
     /// proxy configuration on the client). Off when unset. Linux only.
     #[serde(default)]
     pub transparent_port: Option<u16>,
+    /// Settings of the explicit-proxy listener (`[proxy.explicit]`). A key left out falls back
+    /// to the global setting (`mitm.enabled`, `proxy.enable_http2`, `proxy.enable_websockets`,
+    /// `adblock.enabled`).
+    #[serde(default)]
+    pub explicit: ListenerOverrides,
+    /// Settings of the transparent listener (`[proxy.transparent]`); same fallbacks.
+    #[serde(default)]
+    pub transparent: ListenerOverrides,
     /// TLS hosts never intercepted (tunnelled opaquely) in both entry modes: exact names or
     /// `*.suffix` entries (the latter match subdomains only, not the apex).
     #[serde(default)]
@@ -398,6 +473,8 @@ impl Default for ProxyConfig {
                 port: 8080,
                 enable_http2: true,
                 transparent_port: None,
+                explicit: ListenerOverrides::default(),
+                transparent: ListenerOverrides::default(),
                 tls_passthrough_hosts: Vec::new(),
                 block_private_destinations: false,
                 allowed_destinations: Vec::new(),
@@ -427,17 +504,92 @@ impl Default for ProxyConfig {
             script_control: ScriptControlSettings::default(),
             webui: WebUiSettings::default(),
             dns: DnsSettings::default(),
+            bypass: BypassConfig::default(),
         }
     }
 }
 
 impl ProxyConfig {
+    /// Effective switches of the transparent (`true`) or explicit (`false`) listener.
+    pub fn listener_flags(&self, transparent: bool) -> ListenerFlagValues {
+        let o = if transparent {
+            &self.proxy.transparent
+        } else {
+            &self.proxy.explicit
+        };
+        ListenerFlagValues {
+            mitm: o.enable_mitm.unwrap_or(self.mitm.enabled),
+            http2: o.enable_http2.unwrap_or(self.proxy.enable_http2),
+            websockets: o.enable_websockets.unwrap_or(self.proxy.enable_websockets),
+            // `adblock.enabled` stays the engine's master switch; a listener is on unless it opts out.
+            adblock: o.enable_adblock.unwrap_or(true),
+        }
+    }
+
+    /// Whether any listener wants this feature (what must be set up at startup).
+    pub fn any_listener(&self, f: impl Fn(ListenerFlagValues) -> bool) -> bool {
+        f(self.listener_flags(false)) || f(self.listener_flags(true))
+    }
+
     /// Load configuration from a TOML file
     pub fn from_file(path: &str) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(format!("Failed to read config file: {}", e)))?;
 
         Self::from_toml(&content)
+    }
+
+    /// Load the base file (read-only in containers), then lay the settings overlay on top. A
+    /// missing overlay is fine; a broken one is an error naming it.
+    pub fn load_layered(
+        base: &std::path::Path,
+        overlay: &std::path::Path,
+    ) -> Result<Self, ConfigError> {
+        let mut table = read_table(base)?.ok_or_else(|| {
+            ConfigError::Io(format!(
+                "Failed to read config file: {} not found",
+                base.display()
+            ))
+        })?;
+        if let Some(over) = read_table(overlay)? {
+            merge_tables(&mut table, over);
+        }
+        Self::from_toml(&table.to_string())
+    }
+
+    /// Persist the settings that differ from the base file to `overlay`, atomically (temp file
+    /// in the same directory, then rename). The base file is never written.
+    pub fn save_overlay(
+        &self,
+        base: &std::path::Path,
+        overlay: &std::path::Path,
+    ) -> Result<(), ConfigError> {
+        let new = toml::Table::try_from(self)
+            .map_err(|e| ConfigError::Serialize(format!("Failed to serialize config: {e}")))?;
+        // The base *as the proxy reads it* (file values plus the built-in defaults of keys the
+        // file leaves out), so unchanged settings are not written just because the file omits
+        // them.
+        let base_effective = std::fs::read_to_string(base)
+            .ok()
+            .and_then(|t| Self::from_toml(&t).ok())
+            .unwrap_or_default();
+        let base_cfg = toml::Table::try_from(&base_effective)
+            .map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        let mut diff = diff_tables(&base_cfg, &new);
+        // An unset option has no TOML spelling: `0` is how the overlay switches it off.
+        let had = base_effective.proxy.transparent_port.is_some();
+        if had && self.proxy.transparent_port.is_none() {
+            diff.entry("proxy")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .expect("table")
+                .insert("transparent_port".into(), toml::Value::Integer(0));
+        }
+        let text = format!(
+            "# Settings saved from the web UI; they override the base config file.\n{}",
+            toml::to_string_pretty(&diff).map_err(|e| ConfigError::Serialize(e.to_string()))?
+        );
+        write_atomic(overlay, text.as_bytes())
     }
 
     /// Parse configuration from TOML text. Settings that no longer exist are an error, not
@@ -452,7 +604,12 @@ impl ProxyConfig {
                 )));
             }
         }
-        toml::from_str(content).map_err(parse)
+        let mut cfg: Self = toml::from_str(content).map_err(parse)?;
+        // `0` means off (the overlay's spelling of "unset").
+        if cfg.proxy.transparent_port == Some(0) {
+            cfg.proxy.transparent_port = None;
+        }
+        Ok(cfg)
     }
 
     /// Save configuration to a TOML file
@@ -467,17 +624,105 @@ impl ProxyConfig {
     }
 }
 
+/// Where UI-saved settings live: `CONFIG_OVERLAY_PATH`, else `<data_dir>/settings.toml`.
+pub fn default_overlay_path(data_dir: &std::path::Path) -> PathBuf {
+    match std::env::var_os("CONFIG_OVERLAY_PATH") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => data_dir.join("settings.toml"),
+    }
+}
+
+fn read_table(path: &std::path::Path) -> Result<Option<toml::Table>, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => t
+            .parse::<toml::Table>()
+            .map(Some)
+            .map_err(|e| ConfigError::Parse(format!("Failed to parse {}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ConfigError::Io(format!(
+            "Failed to read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// `over` wins; tables merge key by key, everything else is replaced.
+fn merge_tables(base: &mut toml::Table, over: toml::Table) {
+    for (k, v) in over {
+        match (base.get_mut(&k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge_tables(b, o),
+            (_, v) => {
+                base.insert(k, v);
+            }
+        }
+    }
+}
+
+/// The entries of `new` that differ from `base`.
+fn diff_tables(base: &toml::Table, new: &toml::Table) -> toml::Table {
+    let mut out = toml::Table::new();
+    for (k, v) in new {
+        match (base.get(k), v) {
+            (Some(toml::Value::Table(b)), toml::Value::Table(n)) => {
+                let d = diff_tables(b, n);
+                if !d.is_empty() {
+                    out.insert(k.clone(), toml::Value::Table(d));
+                }
+            }
+            (Some(b), v) if b == v => {}
+            (_, v) => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Write `bytes` to `path` via a temp file in the same directory and a rename.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    use std::io::Write;
+    let io = |what: &str, e: std::io::Error| {
+        ConfigError::Io(format!("Failed to {what} {}: {e}", path.display()))
+    };
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| io("create the directory of", e))?;
+    // Unique per call: the pid alone is 1 in every container, so two writers would share it.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = path.with_extension(format!(
+        "tmp{}-{}-{nanos}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(io("write", e));
+    }
+    Ok(())
+}
+
 /// Settings that used to exist: `(section, key, what replaced them)`.
 const REMOVED_SETTINGS: &[(&str, &str, &str)] = &[
     (
         "userscripts",
         "data_dir",
-        "userscripts are stored in `<adblock.data_dir>/adblocker.redb`",
+        "userscripts are stored in `<adblock.data_dir>/argus.redb`",
     ),
     (
         "webui",
         "session_storage_path",
-        "sessions are stored in `<adblock.data_dir>/adblocker.redb`",
+        "sessions are stored in `<adblock.data_dir>/argus.redb`",
     ),
 ];
 
@@ -561,6 +806,168 @@ pub fn derive_max_connections() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_config_without_listener_tables_loads_and_falls_back_to_globals() {
+        let mut c = ProxyConfig::default();
+        c.proxy.enable_http2 = false;
+        c.adblock.enabled = true;
+        // The legacy shape has no `[proxy.explicit]` / `[proxy.transparent]` tables at all.
+        let text = toml::to_string_pretty(&c)
+            .unwrap()
+            .replace("[proxy.explicit]\n", "")
+            .replace("[proxy.transparent]\n", "");
+        assert!(!text.contains("[proxy.explicit]") && !text.contains("[proxy.transparent]"));
+        let back = ProxyConfig::from_toml(&text).unwrap();
+        for t in [false, true] {
+            let f = back.listener_flags(t);
+            assert_eq!(
+                (f.mitm, f.http2, f.websockets, f.adblock),
+                (true, false, true, true),
+                "transparent={t}"
+            );
+        }
+    }
+
+    #[test]
+    fn listener_tables_override_the_globals_per_listener() {
+        let mut c = ProxyConfig::default();
+        c.adblock.enabled = true;
+        c.proxy.transparent.enable_adblock = Some(false);
+        c.proxy.explicit.enable_http2 = Some(false);
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back = ProxyConfig::from_toml(&text).unwrap();
+        let (e, t) = (back.listener_flags(false), back.listener_flags(true));
+        assert!(e.adblock && !t.adblock, "adblock off on transparent only");
+        assert!(!e.http2 && t.http2, "http2 off on explicit only");
+        assert!(back.any_listener(|f| f.adblock));
+        assert!(back.proxy.explicit.enable_mitm.is_none());
+    }
+
+    fn base_text() -> String {
+        let mut c = ProxyConfig::default();
+        c.proxy.transparent_port = Some(3129);
+        toml::to_string_pretty(&c).unwrap()
+    }
+
+    fn layer_dir() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let (b, o) = (
+            d.path().join("default.toml"),
+            d.path().join("data/settings.toml"),
+        );
+        std::fs::write(&b, base_text()).unwrap();
+        (d, b, o)
+    }
+
+    #[test]
+    fn overlay_merges_over_base_and_missing_overlay_is_fine() {
+        let (_d, b, o) = layer_dir();
+        assert_eq!(ProxyConfig::load_layered(&b, &o).unwrap().proxy.port, 8080);
+        std::fs::create_dir_all(o.parent().unwrap()).unwrap();
+        std::fs::write(&o, "[proxy]\nport = 9090\n").unwrap();
+        let c = ProxyConfig::load_layered(&b, &o).unwrap();
+        assert_eq!(
+            (c.proxy.port, c.proxy.transparent_port, c.proxy.enable_http2),
+            (9090, Some(3129), true)
+        );
+        std::fs::write(&o, "[proxy\nport").unwrap();
+        let e = ProxyConfig::load_layered(&b, &o).unwrap_err().to_string();
+        assert!(e.contains("settings.toml"), "{e}");
+    }
+
+    #[test]
+    fn save_overlay_writes_only_differences_atomically_and_round_trips() {
+        let (_d, b, o) = layer_dir();
+        let mut c = ProxyConfig::load_layered(&b, &o).unwrap();
+        c.proxy.port = 9191;
+        c.proxy.transparent_port = None;
+        c.proxy.tls_passthrough_hosts = vec!["bank.test".into()];
+        c.save_overlay(&b, &o).unwrap();
+        let text = std::fs::read_to_string(&o).unwrap();
+        assert!(
+            text.contains("port = 9191") && !text.contains("enable_http2"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            base_text(),
+            "base is never written"
+        );
+        // No temp files left behind.
+        let left: Vec<_> = std::fs::read_dir(o.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["settings.toml"]);
+        let back = ProxyConfig::load_layered(&b, &o).unwrap();
+        assert_eq!(back.proxy.port, 9191);
+        assert_eq!(
+            back.proxy.transparent_port, None,
+            "0 in the overlay means off"
+        );
+        assert_eq!(back.proxy.tls_passthrough_hosts, ["bank.test"]);
+    }
+
+    #[test]
+    fn overlay_holds_only_values_that_differ_even_when_the_base_file_omits_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let (b, o) = (
+            d.path().join("default.toml"),
+            d.path().join("settings.toml"),
+        );
+        // A sparse base: most keys are left to the built-in defaults.
+        std::fs::write(
+            &b,
+            toml::to_string_pretty(&ProxyConfig::default())
+                .unwrap()
+                .lines()
+                .filter(|l| !l.starts_with("list_fetch") && !l.starts_with("max_list_bytes"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut c = ProxyConfig::load_layered(&b, &o).unwrap();
+        c.performance.request_timeout_secs = 77;
+        c.save_overlay(&b, &o).unwrap();
+        let text = std::fs::read_to_string(&o).unwrap();
+        assert!(text.contains("request_timeout_secs = 77"), "{text}");
+        for unchanged in [
+            "list_fetch",
+            "max_list_bytes",
+            "[dns]",
+            "[userscripts]",
+            "extra_upstream_ca_paths",
+            "require_device_token",
+        ] {
+            assert!(
+                !text.contains(unchanged),
+                "{unchanged} written though unchanged:\n{text}"
+            );
+        }
+        // Setting a value back to the default drops it from the overlay again.
+        c.performance.request_timeout_secs =
+            ProxyConfig::load_layered(&b, std::path::Path::new("/nonexistent"))
+                .unwrap()
+                .performance
+                .request_timeout_secs;
+        c.save_overlay(&b, &o).unwrap();
+        assert!(!std::fs::read_to_string(&o)
+            .unwrap()
+            .contains("request_timeout_secs"));
+    }
+
+    #[test]
+    fn save_overlay_failure_leaves_the_old_overlay_intact() {
+        let (_d, b, o) = layer_dir();
+        let c = ProxyConfig::load_layered(&b, &o).unwrap();
+        c.save_overlay(&b, &o).unwrap();
+        // A directory where the file should go makes the rename fail.
+        let blocked = o.parent().unwrap().join("dir.toml");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(c.save_overlay(&b, &blocked).is_err());
+        assert!(o.exists());
+    }
 
     #[test]
     fn descriptor_budget_for_soft_limits() {

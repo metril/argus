@@ -28,7 +28,7 @@ test("GM objects are frozen; GM_info is populated", async () => {
   const api = await run(env, { grants: ["gm_info"], name: "Évil </script>", meta: { version: "2.0", namespace: "ns" } }, (a) => a);
   assert.equal(api.GM_info.script.name, "Évil </script>");
   assert.equal(api.GM.info, api.GM_info);
-  assert.equal(api.GM_info.scriptHandler, "AdBlocker Userscripts");
+  assert.equal(api.GM_info.scriptHandler, "Argus Userscripts");
   assert.equal(api.GM_info.version, "1.0.0");
   assert.match(api.GM_info.scriptMetaStr, /==UserScript==/);
   assert.throws(() => { api.GM.info = 1; }, TypeError);

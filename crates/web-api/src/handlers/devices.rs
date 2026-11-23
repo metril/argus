@@ -7,7 +7,8 @@
 use std::sync::Arc;
 
 use api_types::{
-    CreateDeviceRequest, DeviceDto, DeviceTokenCreated, MessageResponse, Page, UpdateDeviceRequest,
+    CreateDeviceRequest, DeviceCounts, DeviceDto, DeviceTokenCreated, DevicesPage, MessageResponse,
+    UpdateDeviceRequest,
 };
 use axum::{
     extract::State,
@@ -21,7 +22,7 @@ use ipnet::IpNet;
 use tracing::info;
 use validator::Validate;
 
-use super::PageQuery;
+use super::paging::{desc_key, natural_key, paginate, Keyed};
 use crate::auth::authz::Principal;
 use crate::auth::profile::{forbidden_profile, parse_profile_id};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -102,26 +103,110 @@ async fn load(state: &Arc<AppState>, p: &Principal, raw: &str) -> ApiResult<Devi
     Ok(d)
 }
 
-/// List the devices the caller may see.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ListDevicesQuery {
+    /// Case-insensitive substring of the name or an address.
+    pub q: Option<String>,
+    /// Only devices on this profile (decimal id).
+    pub profile: Option<String>,
+    /// `name` (natural order, default) or `last_seen` (most recent first, never-seen last).
+    pub sort: Option<String>,
+    /// Deprecated: use `cursor`.
+    pub page: Option<u32>,
+    /// Page size (1..=200, default 40).
+    pub limit: Option<u32>,
+    /// Opaque `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+    /// With `sort=name`: start at the first name at or after this prefix.
+    pub from: Option<String>,
+}
+
+/// List the devices the caller may see, with search, a profile filter, sorting and counts
+/// (`counts` ignores `profile` so a profile picker can show every profile's size).
 #[utoipa::path(
     get, path = "/devices", tag = "devices",
     security(("bearer_auth" = ["devices:read"])),
-    params(PageQuery),
-    responses((status = 200, description = "Devices", body = Page<DeviceDto>))
+    params(ListDevicesQuery),
+    responses((status = 200, description = "Devices", body = DevicesPage))
 )]
 pub async fn list_devices(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
-    ApiQuery(q): ApiQuery<PageQuery>,
-) -> ApiResult<Json<Page<DeviceDto>>> {
+    ApiQuery(q): ApiQuery<ListDevicesQuery>,
+) -> ApiResult<Json<DevicesPage>> {
+    let sort = q.sort.as_deref().unwrap_or("name");
+    if !["name", "last_seen"].contains(&sort) {
+        return Err(ApiError::ValidationError(format!(
+            "unknown sort '{sort}' (name, last_seen)"
+        )));
+    }
+    if q.from.is_some() && sort != "name" {
+        return Err(ApiError::ValidationError("`from` needs sort=name".into()));
+    }
+    if let Some(pid) = q.profile.as_deref() {
+        let id = parse_profile_id(pid)?;
+        if !p.may_access_profile(&id.to_string()) {
+            return Err(forbidden_profile(id));
+        }
+    }
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
     let st = state.clone();
     let all = blocking(move || Ok(st.profiles.devices()?)).await?;
-    let items = all
+    let matching: Vec<DeviceDto> = all
         .iter()
         .filter(|d| p.may_access_profile(&d.profile_id.to_string()))
         .map(|d| device_dto(&state, d))
+        .filter(|d| {
+            needle.is_empty()
+                || d.name.to_lowercase().contains(&needle)
+                || d.ips.iter().any(|ip| ip.to_lowercase().contains(&needle))
+        })
         .collect();
-    Ok(Json(Page::from_vec(items, q.page, q.limit)))
+    let mut counts = DeviceCounts {
+        all: matching.len(),
+        with_token: matching.iter().filter(|d| d.has_token).count(),
+        seen: matching.iter().filter(|d| d.last_seen.is_some()).count(),
+        ..Default::default()
+    };
+    for d in &matching {
+        *counts.by_profile.entry(d.profile_id.clone()).or_default() += 1;
+    }
+    let rows: Vec<Keyed<DeviceDto>> = matching
+        .into_iter()
+        .filter(|d| q.profile.as_ref().is_none_or(|p| &d.profile_id == p))
+        .map(|d| {
+            let name = natural_key(&d.name);
+            let key = if sort == "last_seen" {
+                let ts = d
+                    .last_seen
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map_or(0, |t| t.timestamp().max(0) as u64);
+                format!("{}{name}", desc_key(ts))
+            } else {
+                name
+            };
+            Keyed {
+                key,
+                id: format!("{:020}", d.id.parse::<u64>().unwrap_or(0)),
+                label: d.name.clone(),
+                item: d,
+            }
+        })
+        .collect();
+    let from = q.from.as_deref().map(natural_key);
+    let pg = paginate(rows, q.limit, q.cursor.as_deref(), from.as_deref(), q.page)?;
+    counts.letters = pg.letters;
+    Ok(Json(DevicesPage {
+        items: pg.items,
+        next_cursor: pg.next_cursor,
+        total: pg.total,
+        counts,
+        limit: pg.limit,
+        has_more: pg.has_more,
+        page: pg.page,
+    }))
 }
 
 /// Create a device (no token yet; issue one with `POST /devices/{device_id}/token`).

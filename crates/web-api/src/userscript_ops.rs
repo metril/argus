@@ -189,7 +189,7 @@ pub async fn fetch_limited(
     }
     let client = control_plane_client(policy)
         .timeout(FETCH_TIMEOUT)
-        .user_agent(concat!("AdBlocker/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Argus/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let mut resp = client

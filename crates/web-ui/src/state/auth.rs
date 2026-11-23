@@ -10,6 +10,8 @@ use crate::api::{ApiClient, ApiError};
 pub struct AuthState {
     /// Current user (None if not authenticated)
     pub user: RwSignal<Option<UserInfo>>,
+    /// True once the first session check has finished (successfully or not)
+    pub checked: RwSignal<bool>,
     /// Loading state
     pub is_loading: RwSignal<bool>,
     /// Error message
@@ -27,6 +29,7 @@ impl AuthState {
     pub fn new() -> Self {
         Self {
             user: RwSignal::new(None),
+            checked: RwSignal::new(false),
             is_loading: RwSignal::new(false),
             error: RwSignal::new(None),
         }
@@ -78,6 +81,7 @@ impl AuthState {
         }
 
         self.is_loading.set(false);
+        self.checked.set(true);
     }
 
     /// Login with username and password

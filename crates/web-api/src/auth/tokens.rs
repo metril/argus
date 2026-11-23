@@ -178,6 +178,14 @@ impl TokenStore {
         Ok((info, full))
     }
 
+    /// Whether token `id` still exists and is neither revoked nor expired (for long-lived
+    /// streams that must stop when their token is revoked).
+    pub fn is_live(&self, id: &str) -> bool {
+        self.cache.get(id).is_some_and(|e| {
+            e.stored.revoked_at.is_none() && e.stored.expires_at.is_none_or(|t| t > Utc::now())
+        })
+    }
+
     /// Check a presented `abk_<id>_<secret>` string.
     pub fn verify(&self, presented: &str) -> Result<Arc<CachedToken>, TokenReject> {
         let mut parts = presented.splitn(3, '_');

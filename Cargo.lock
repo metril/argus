@@ -166,7 +166,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "api-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -940,9 +940,10 @@ dependencies = [
 
 [[package]]
 name = "common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "base64 0.22.1",
  "blake3",
  "bytes",
@@ -950,6 +951,7 @@ dependencies = [
  "ipnet",
  "libc",
  "parking_lot",
+ "psl",
  "rand 0.8.6",
  "redb",
  "reqwest 0.12.28",
@@ -960,6 +962,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
@@ -1326,6 +1329,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ct-codecs"
+version = "1.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8fd9f3db6f2cfef61c10613071955154ffdc9e515daebff26de4b54e35038fdd"
+
+[[package]]
 name = "curve25519-dalek"
 version = "4.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1571,7 +1580,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -1610,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "e2e-browser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-compression",
  "axum-test",
@@ -1749,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "ext-rules"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adblock",
  "criterion",
@@ -1773,7 +1782,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filter-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adblock",
  "arc-swap",
@@ -1794,6 +1803,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "url",
 ]
@@ -3110,16 +3120,19 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "list-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-compression",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "common",
  "ext-rules",
  "filter-engine",
  "futures-util",
  "libc",
+ "minisign",
+ "minisign-verify",
  "parking_lot",
  "rayon",
  "reqwest 0.12.28",
@@ -3270,6 +3283,24 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minisign"
+version = "0.7.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26541387415a1e829df5d532aad019fb11bc723e2b5bc99edefa4cf5bfad0de7"
+dependencies = [
+ "ct-codecs",
+ "getrandom 0.2.17",
+ "rpassword",
+ "scrypt",
+]
+
+[[package]]
+name = "minisign-verify"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "871285dc19d8d0ebe0eef3d0e99a205f2a71363b122632cbbfa4a6c370a960ce"
 
 [[package]]
 name = "miniz_oxide"
@@ -4141,7 +4172,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adblock",
  "age",
@@ -4175,6 +4206,7 @@ dependencies = [
  "parking_lot",
  "pem",
  "proptest",
+ "proxy-core",
  "rand 0.8.6",
  "rcgen",
  "regex",
@@ -4204,6 +4236,7 @@ dependencies = [
  "userscript-engine",
  "web-api",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4679,6 +4712,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "7.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa2c5d9304b618df61ff17f3d3485c6e1854a3d94902a49abbb8d43dfbe0464"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rstml"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4691,6 +4735,16 @@ dependencies = [
  "syn 2.0.118",
  "syn_derive",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4882,7 +4936,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "script-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "common",
@@ -6158,7 +6212,7 @@ dependencies = [
 
 [[package]]
 name = "userscript-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -6469,10 +6523,11 @@ dependencies = [
 
 [[package]]
 name = "web-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "api-types",
+ "async-trait",
  "axum",
  "axum-test",
  "base64 0.22.1",
@@ -6489,6 +6544,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "list-service",
+ "minisign",
  "parking_lot",
  "rand 0.8.6",
  "rcgen",
@@ -6513,6 +6569,7 @@ dependencies = [
  "utoipa-swagger-ui",
  "uuid",
  "validator",
+ "web-api",
  "x509-parser",
 ]
 
@@ -6538,7 +6595,7 @@ dependencies = [
 
 [[package]]
 name = "web-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "api-types",
  "gloo-net",

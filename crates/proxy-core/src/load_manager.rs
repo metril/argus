@@ -97,6 +97,8 @@ impl Default for LoadManagerStats {
 /// Unified load manager for production hardening
 pub struct LoadManager {
     config: LoadManagerConfig,
+    /// Live cap on concurrent connections (0 = unlimited); starts at `config.max_connections`.
+    max_connections: std::sync::atomic::AtomicUsize,
     circuit_breaker: CircuitBreaker,
     memory_monitor: Arc<MemoryMonitor>,
     stats: LoadManagerStats,
@@ -172,6 +174,7 @@ impl LoadManager {
         let config_rate = config.connection_rate_limit;
 
         Self {
+            max_connections: std::sync::atomic::AtomicUsize::new(config.max_connections),
             config,
             circuit_breaker,
             memory_monitor,
@@ -180,6 +183,17 @@ impl LoadManager {
             epoch: Instant::now(),
             last_summary_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Change the connection cap while running (0 = unlimited). Connections already admitted
+    /// are never cut; new ones are refused while at or over the new cap.
+    pub fn set_max_connections(&self, max: usize) {
+        self.max_connections.store(max, Ordering::Relaxed);
+    }
+
+    /// The current connection cap.
+    pub fn max_connections(&self) -> usize {
+        self.max_connections.load(Ordering::Relaxed)
     }
 
     /// Create a load manager with default configuration
@@ -207,7 +221,7 @@ impl LoadManager {
         }
 
         // 2. Check max connections
-        if self.config.max_connections > 0 {
+        if self.max_connections() > 0 {
             let active = self.stats.active_connections.load(Ordering::Relaxed) as usize;
             let effective_max = self.effective_max_connections();
             if active >= effective_max {
@@ -283,15 +297,16 @@ impl LoadManager {
 
     /// Effective max connections based on memory pressure
     fn effective_max_connections(&self) -> usize {
+        let max = self.max_connections();
         if !self.config.adaptive_concurrency {
-            return self.config.max_connections;
+            return max;
         }
 
         let pressure = self.memory_monitor.current_pressure();
         match pressure {
-            MemoryPressure::Normal => self.config.max_connections,
-            MemoryPressure::Warning => self.config.max_connections * 75 / 100, // 75%
-            MemoryPressure::Critical => self.config.max_connections * 50 / 100, // 50%
+            MemoryPressure::Normal => max,
+            MemoryPressure::Warning => max * 75 / 100, // 75%
+            MemoryPressure::Critical => max * 50 / 100, // 50%
         }
     }
 

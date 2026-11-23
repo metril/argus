@@ -1,17 +1,16 @@
 services:
-  adblocker:
-    image: ghcr.io/metril/adblocker:${ADBLOCKER_VERSION:-latest}
-    container_name: adblocker-proxy
+  argus:
+    image: ghcr.io/metril/argus:${ARGUS_VERSION:-${ADBLOCKER_VERSION:-latest}}
+    container_name: argus-proxy
     restart: unless-stopped
-    ports:
-      - "8080:8080"   # Explicit proxy (HTTP + HTTPS via CONNECT)
-      # Optional transparent listener (set proxy.transparent_port = 3129). Redirected traffic only
-      # reveals its original destination with host networking; see docs/TRANSPARENT.md.
-      # - "3129:3129"
-      - "3000:3000"   # Web API + WebUI
+    # Host networking: transparent mode needs the kernel's original destination, which a bridge
+    # network's NAT destroys. The proxy (8080), transparent listener (3129) and web UI (3000) bind
+    # directly on the host; change them in the web UI. See docs/TRANSPARENT.md for the gateway's
+    # nftables redirect.
+    network_mode: host
     volumes:
       # Named volumes (not host bind mounts) so Docker initializes them with the
-      # image's adblocker:adblocker (UID 1000) ownership — required for the
+      # image's argus:argus (UID 1000) ownership — required for the
       # non-root, read-only-rootfs container to write. The CA certificate is
       # downloadable from the Web UI, so host access to ./certs isn't needed.
       - certs:/app/certs
@@ -19,15 +18,14 @@ services:
       - data:/app/data
       # Persist logs
       - logs:/app/logs
-      # Optional custom configuration: copy config/default.toml from the repository next to this
+      # Settings saved from the web UI go to /app/data/settings.toml (this volume); the shipped
+      # config is read-only. Optional custom configuration: copy config/default.toml from the repository next to this
       # file, edit it, then uncomment. (The image ships a default; an empty mount would hide it.)
       # - ./config:/app/config:ro
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
       - WEBUI_DIST_PATH=/app/webui
-    networks:
-      - adblocker-net
     # Security hardening: drop all capabilities, forbid privilege escalation,
     # and run with a read-only root filesystem (writes go to the mounted
     # volumes below; transient scratch goes to a tmpfs).
@@ -47,10 +45,6 @@ services:
         reservations:
           cpus: '2'
           memory: 1G
-
-networks:
-  adblocker-net:
-    driver: bridge
 
 volumes:
   certs:

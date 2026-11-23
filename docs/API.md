@@ -43,6 +43,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `rules:write` | - | yes | yes | Replace the custom rules. |
 | `engine:reload` | - | - | yes | Trigger a rebuild of the blocking engine. |
 | `stats:read` | yes | yes | yes | Read blocking, proxy and engine statistics. |
+| `logs:read` | - | yes | yes | Read the request log, live and recent (full browsing history of every client the token may see). |
 | `stats:reset` | - | - | yes | Reset blocking statistics. |
 | `config:read` | yes | yes | yes | Read the proxy configuration. |
 | `config:write` | - | - | yes | Change or reload the proxy configuration. |
@@ -156,7 +157,7 @@ Routes take `?profile=<id>` (default `0`). Writes are audited.
 | `DELETE /userscripts/{id}/update` | `scripts:write` | Discard the pending update. |
 | `GET /userscripts/{id}/storage` | `scripts:write` | Stored GM values: `used_bytes`, `quota_bytes`, per value name, size and 200-char preview. |
 | `DELETE /userscripts/{id}/storage`, `/storage/{name}` | `scripts:write` | Clear all values or one. |
-| `GET /userscripts/export?values=` | `scripts:read` | JSON bundle `adblocker-userscripts-v1` (sources, enabled, `@connect *` approval, fetched dependencies). `values=true` adds stored values, which may hold secrets, and needs `scripts:write`. JSON only (no zip). |
+| `GET /userscripts/export?values=` | `scripts:read` | JSON bundle `argus-userscripts-v1` (sources, enabled, `@connect *` approval, fetched dependencies). `values=true` adds stored values, which may hold secrets, and needs `scripts:write`. JSON only (no zip). |
 | `POST /userscripts/import` | `scripts:write` | Import a bundle (max 16 MiB), `on_conflict` `skip` (default) or `replace`; per-script results `{id,name,status,error?}`. |
 
 Config (`[userscripts]`): `update_check_interval_hours` (0 = off, default) schedules checks of every

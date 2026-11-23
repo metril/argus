@@ -1,6 +1,6 @@
 //! Real-kernel check of `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` behind an nftables REDIRECT.
 //!
-//! Opt-in: set `ADBLOCKER_KERNEL_TEST=1`. The test re-executes itself inside a throwaway
+//! Opt-in: set `ARGUS_KERNEL_TEST=1`. The test re-executes itself inside a throwaway
 //! network namespace (`unshare -rn`, or `unshare -n` as root), brings up `lo`, loads a `nat`
 //! ruleset there and asserts what the accepted socket reports. Nothing outside that namespace is
 //! touched. Without the env var, without Linux, or without `unshare`/`ip`/`nft` (or the right to
@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::process::Command;
 
 const TEST_NAME: &str = "kernel_original_dst_with_nftables_redirect";
-const CHILD_ENV: &str = "ADBLOCKER_KERNEL_CHILD";
+const CHILD_ENV: &str = "ARGUS_KERNEL_CHILD";
 
 fn skip(why: &str) {
     eprintln!("SKIPPED {TEST_NAME}: {why}");
@@ -41,8 +41,8 @@ fn kernel_original_dst_with_nftables_redirect() {
     if std::env::var_os(CHILD_ENV).is_some() {
         return child();
     }
-    if std::env::var_os("ADBLOCKER_KERNEL_TEST").is_none() {
-        return skip("opt-in; set ADBLOCKER_KERNEL_TEST=1");
+    if common::env::var_os("KERNEL_TEST").is_none() {
+        return skip("opt-in; set ARGUS_KERNEL_TEST=1");
     }
     for tool in [["unshare", "--version"], ["ip", "-V"], ["nft", "--version"]] {
         if !works(&tool) {

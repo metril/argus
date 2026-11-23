@@ -12,7 +12,7 @@ fn main() {
         .without_time()
         .init();
 
-    tracing::info!("Starting Adblocker WebUI");
+    tracing::info!("Starting Argus WebUI");
 
     // Mount the app
     leptos::mount::mount_to_body(App);

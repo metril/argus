@@ -1,8 +1,8 @@
 (function(){
 if(window.__abBoot)return;window.__abBoot=1;
 var cfg={};try{cfg=JSON.parse(document.getElementById('__ab_cfg').textContent)||{};}catch(e){}
-/* Runtime for scriptlets/snippets that have no uBO equivalent: self.__adblockerRuntime.run(kind,name,args).
-   Calls made before this script ran may be queued by the page injection in __adblockerRuntime.q=[[kind,name,args],...]. */
+/* Runtime for scriptlets/snippets that have no uBO equivalent: self.__argusRuntime.run(kind,name,args).
+   Calls made before this script ran may be queued by the page injection in __argusRuntime.q=[[kind,name,args],...]. */
 (function(){
 var NATIVE={
 'log':function(a){try{console.log.apply(console,a);}catch(e){}},
@@ -12,9 +12,9 @@ var reported={},pend=[],tm=null;
 function report(name){if(reported[name])return;reported[name]=1;pend.push('unsupported scriptlet '+name);if(!tm)tm=setTimeout(flush,0);}
 function flush(){tm=null;var u=pend;pend=[];
 try{fetch('/__adblock__/cc',{method:'POST',headers:{'Content-Type':'application/json','X-Adblock-Token':cfg.t||''},body:JSON.stringify({url:location.href,unsupported:u}),credentials:'omit',cache:'no-store'}).catch(function(){});}catch(e){}}
-var rt=self.__adblockerRuntime||{};var q=rt.q||[];
+var rt=self.__argusRuntime||{};var q=rt.q||[];
 rt.run=function(kind,name,args){var f=Object.prototype.hasOwnProperty.call(NATIVE,name)?NATIVE[name]:null;if(!f){report(String(name).slice(0,64));return;}try{f(args||[]);}catch(e){}};
-rt.q=[];self.__adblockerRuntime=rt;
+rt.q=[];self.__argusRuntime=rt;
 for(var i=0;i<q.length;i++){try{rt.run(q[i][0],q[i][1],q[i][2]);}catch(e){}}
 })();
 /* Sites with a privileged userscript: drop any service worker already registered for this origin (a worker can read the page's bundles and GM traffic). New registrations are refused by the proxy. */

@@ -32,6 +32,8 @@ async fn test_server_with_mitm_enabled() {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: true,
@@ -54,6 +56,7 @@ async fn test_server_with_mitm_enabled() {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -91,6 +94,8 @@ async fn test_server_with_mitm_disabled() {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -113,6 +118,7 @@ async fn test_server_with_mitm_disabled() {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     };
 
     // Create server with MITM disabled
@@ -142,6 +148,8 @@ async fn test_certificate_generation() {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: true,
@@ -164,6 +172,7 @@ async fn test_certificate_generation() {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -224,6 +233,8 @@ async fn test_load_manager_integration() {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            explicit: Default::default(),
+            transparent: Default::default(),
         },
         mitm: MitmSettings {
             enabled: false,
@@ -246,6 +257,7 @@ async fn test_load_manager_integration() {
         script_control: Default::default(),
         webui: WebUiSettings::default(),
         dns: Default::default(),
+        bypass: Default::default(),
     };
 
     // Create server

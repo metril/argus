@@ -6,10 +6,12 @@ use utoipa::IntoParams;
 
 pub mod audit;
 pub mod auth;
+pub mod bypass;
 pub mod certificate;
 pub mod devices;
 pub mod health;
 pub mod lists;
+pub mod paging;
 pub mod policy;
 pub mod profiles;
 pub mod proxy;

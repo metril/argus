@@ -53,7 +53,7 @@ pub async fn download_ca(State(state): State<Arc<AppState>>) -> ApiResult<Respon
     let pem = read_pem(&state).await?;
     Ok(attachment(
         "application/x-pem-file",
-        "attachment; filename=\"adblocker-ca.crt\"",
+        "attachment; filename=\"argus-ca.crt\"",
         pem,
     ))
 }
@@ -68,7 +68,7 @@ pub async fn download_ca_der(State(state): State<Arc<AppState>>) -> ApiResult<Re
     let der = der_of(&read_pem(&state).await?)?;
     Ok(attachment(
         "application/x-x509-ca-cert",
-        "attachment; filename=\"adblocker-ca.der\"",
+        "attachment; filename=\"argus-ca.der\"",
         der,
     ))
 }

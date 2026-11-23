@@ -24,6 +24,7 @@ ext-rules = { path = "../ext-rules" }
 common = { path = "../common" }
 async-compression = { workspace = true, features = ["zstd"] }
 tokio-util = { workspace = true }
+minisign-verify = "0.3"
 
 [features]
 default = ["bundled-ubo-resources"]
@@ -33,4 +34,6 @@ bundled-ubo-resources = ["filter-engine/bundled-ubo-resources"]
 [dev-dependencies]
 tempfile = { workspace = true }
 axum = { workspace = true }
+minisign = "0.7"
+base64 = "0.22"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

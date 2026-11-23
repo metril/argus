@@ -492,12 +492,13 @@ impl PolicyStore {
         preset: Preset,
         note: Option<String>,
     ) -> Result<SiteRule, StoreError> {
-        self.mutate(profile, |r, _| {
+        self.mutate(profile, |r, now| {
             let rule = SiteRule {
                 id: new_id(),
                 scope,
                 preset,
                 note,
+                updated_at: now,
             };
             rule.validate()?;
             if r.site_rule_for_scope(&rule.scope).is_some() {
@@ -518,13 +519,14 @@ impl PolicyStore {
         preset: Preset,
         note: Option<String>,
     ) -> Result<SiteRule, StoreError> {
-        self.mutate(profile, |r, _| {
+        self.mutate(profile, |r, now| {
             let rule = r
                 .site_rules
                 .get_mut(id)
                 .ok_or_else(|| StoreError::NotFound(format!("site rule {id} not found")))?;
             rule.preset = preset;
             rule.note = note;
+            rule.updated_at = now;
             Ok(rule.clone())
         })
     }

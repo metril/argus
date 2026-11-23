@@ -1,554 +1,26 @@
-//! Filter lists management page
+//! Filter lists page: searchable/paged list (server side), add list, explain URL, custom rules,
+//! catalogue and build state.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 use uuid::Uuid;
-use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 
+use super::vlist::*;
 use crate::api::filters::{
-    BuildState, BuildSummary, CatalogueEntryResponse, FilterList, ListReport,
+    ago_rfc3339, BuildState, BuildSummary, CatalogueEntryResponse, FilterList, FilterListCounts,
+    ListReport, TestUrlResponse,
 };
 use crate::api::ApiClient;
-use crate::components::{Card, Layout, Modal};
+use crate::components::{ConfirmButton, Drawer, Icon, Layout, Modal, Pill, Switch};
 use crate::state::use_app_state;
+use crate::utils::format_number;
+use std::rc::Rc;
 
-/// Filters page component
-#[component]
-pub fn FiltersPage() -> impl IntoView {
-    let app_state = use_app_state();
-
-    let filters = RwSignal::new(Vec::<FilterList>::new());
-    let loading = RwSignal::new(true);
-
-    // Modal state
-    let show_modal = RwSignal::new(false);
-    let add_name = RwSignal::new(String::new());
-    let add_url = RwSignal::new(String::new());
-    let add_format = RwSignal::new("auto".to_string());
-    let add_allowlist = RwSignal::new(false);
-    let trust_change: RwSignal<Option<(String, bool)>> = RwSignal::new(None);
-
-    // Build state (polled), per-list reports, catalogue
-    let build = RwSignal::new(Option::<BuildSummary>::None);
-    let reports = RwSignal::new(HashMap::<String, ListReport>::new());
-    let show_catalogue = RwSignal::new(false);
-    let catalogue = RwSignal::new(Vec::<CatalogueEntryResponse>::new());
-    let flag_change = RwSignal::new(Option::<(String, Option<bool>, Option<bool>)>::None);
-    let catalogue_add = RwSignal::new(Option::<String>::None);
-    let reload_lists = RwSignal::new(0u32);
-
-    // Stats
-    let total_requests = RwSignal::new(0u64);
-    let requests_blocked = RwSignal::new(0u64);
-
-    // Custom rules editor
-    let custom_rules = RwSignal::new(String::new());
-    // ETag of the rules as last read; sent as If-Match so concurrent edits are not overwritten.
-    let rules_etag = RwSignal::new(Option::<String>::None);
-    let saving_rules = RwSignal::new(false);
-    let do_save_rules = RwSignal::new(false);
-
-    // Action signals
-    let do_add = RwSignal::new(false);
-    let delete_id = RwSignal::new(Option::<String>::None);
-
-    // Load filters
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            let _ = reload_lists.get();
-            let app_state = app_state.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let client = ApiClient::new();
-
-                match client.list_filter_lists(1, 100).await {
-                    Ok(response) => {
-                        for l in &response.items {
-                            if let Ok(r) = client.get_list_report(&l.id).await {
-                                reports.update(|m| {
-                                    m.insert(l.id.clone(), r);
-                                });
-                            }
-                        }
-                        filters.set(response.items);
-                    }
-                    Err(e) => {
-                        app_state.error(format!("Failed to load filters: {}", e));
-                    }
-                }
-
-                if let Ok(stats) = client.get_filter_stats().await {
-                    total_requests.set(stats.total_requests);
-                    requests_blocked.set(stats.blocked_requests);
-                }
-
-                if let Ok((resp, etag)) = client.get_custom_rules().await {
-                    custom_rules.set(resp.rules);
-                    rules_etag.set(etag);
-                }
-
-                loading.set(false);
-            });
-        });
-    }
-
-    // Poll the build state while the page is open; reload lists when a build finishes.
-    {
-        let alive = Arc::new(AtomicBool::new(true));
-        let flag = alive.clone();
-        on_cleanup(move || flag.store(false, Ordering::Relaxed));
-        wasm_bindgen_futures::spawn_local(async move {
-            let client = ApiClient::new();
-            let mut was_building = false;
-            while alive.load(Ordering::Relaxed) {
-                if let Ok(b) = client.get_build_summary().await {
-                    if was_building && !b.building {
-                        reload_lists.update(|n| *n += 1);
-                    }
-                    was_building = b.building;
-                    build.set(Some(b));
-                }
-                gloo_timers::future::TimeoutFuture::new(3000).await;
-            }
-        });
-    }
-
-    // Toggle enabled / allowlist
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if let Some((id, enabled, allowlist)) = flag_change.get() {
-                let app_state = app_state.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    match ApiClient::new()
-                        .set_list_flags(&id, enabled, allowlist)
-                        .await
-                    {
-                        Ok(updated) => filters.update(|f| {
-                            if let Some(x) = f.iter_mut().find(|x| x.id == id) {
-                                *x = updated;
-                            }
-                        }),
-                        Err(e) => app_state.error(format!("Failed to update list: {}", e)),
-                    }
-                    flag_change.set(None);
-                });
-            }
-        });
-    }
-
-    // Trust / distrust a list
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if let Some((id, trusted)) = trust_change.get() {
-                let app_state = app_state.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    match ApiClient::new().set_list_trusted(&id, trusted).await {
-                        Ok(updated) => filters.update(|f| {
-                            if let Some(x) = f.iter_mut().find(|x| x.id == id) {
-                                *x = updated;
-                            }
-                        }),
-                        Err(e) => app_state.error(format!("Failed to change trust: {}", e)),
-                    }
-                    trust_change.set(None);
-                });
-            }
-        });
-    }
-
-    // Add from the catalogue
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if let Some(id) = catalogue_add.get() {
-                let app_state = app_state.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-                    match client.add_from_catalogue(&id).await {
-                        Ok(list) => {
-                            catalogue.update(|c| {
-                                if let Some(e) = c.iter_mut().find(|e| e.id == id) {
-                                    e.added = true;
-                                }
-                            });
-                            filters.update(|f| f.push(list));
-                            app_state.success("List added from the catalogue");
-                        }
-                        Err(e) => app_state.error(format!("Failed to add list: {}", e)),
-                    }
-                    catalogue_add.set(None);
-                });
-            }
-        });
-    }
-
-    // Add filter effect
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if do_add.get() {
-                let name = add_name.get();
-                let url = add_url.get();
-                let app_state = app_state.clone();
-
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-                    let filter_id = Uuid::new_v4().to_string();
-
-                    let format = add_format.get_untracked();
-                    let allow = add_allowlist.get_untracked();
-                    match client
-                        .add_filter_list(&filter_id, &name, &url, true, &format, allow)
-                        .await
-                    {
-                        Ok(filter) => {
-                            filters.update(|f| f.push(filter));
-                            app_state.success("Filter list added");
-                            show_modal.set(false);
-                            add_name.set(String::new());
-                            add_url.set(String::new());
-                        }
-                        Err(e) => {
-                            app_state.error(format!("Failed to add filter: {}", e));
-                        }
-                    }
-                    do_add.set(false);
-                });
-            }
-        });
-    }
-
-    // Save custom rules effect
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if do_save_rules.get() {
-                saving_rules.set(true);
-                let app_state = app_state.clone();
-                let rules = custom_rules.get();
-                let etag = rules_etag.get_untracked().unwrap_or_default();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-                    match client.update_custom_rules(&rules, &etag).await {
-                        Ok((_, new_etag)) => {
-                            rules_etag.set(new_etag);
-                            app_state.success("Custom rules saved")
-                        }
-                        Err(e) => app_state.error(format!("Failed to save rules: {}", e)),
-                    }
-                    saving_rules.set(false);
-                    do_save_rules.set(false);
-                });
-            }
-        });
-    }
-
-    // Delete filter effect
-    {
-        let app_state = app_state.clone();
-        Effect::new(move || {
-            if let Some(id) = delete_id.get() {
-                let app_state = app_state.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let client = ApiClient::new();
-
-                    match client.delete_filter_list(&id).await {
-                        Ok(_) => {
-                            filters.update(|f| f.retain(|filter| filter.id != id));
-                            app_state.success("Filter list deleted");
-                        }
-                        Err(e) => {
-                            app_state.error(format!("Failed to delete filter: {}", e));
-                        }
-                    }
-                    delete_id.set(None);
-                });
-            }
-        });
-    }
-
-    view! {
-        <Layout>
-            <div class="page-header">
-                <h1 class="page-title">"Filter Lists"</h1>
-                <div>
-                    <button
-                        class="btn btn-secondary"
-                        on:click=move |_| {
-                            show_catalogue.set(true);
-                            wasm_bindgen_futures::spawn_local(async move {
-                                if let Ok(c) = ApiClient::new().get_catalogue().await {
-                                    catalogue.set(c);
-                                }
-                            });
-                        }
-                    >
-                        "Catalogue"
-                    </button>
-                    " "
-                    <button class="btn btn-primary" on:click=move |_| show_modal.set(true)>
-                        "+ Add Filter List"
-                    </button>
-                </div>
-            </div>
-
-            <BuildIndicator summary=build />
-
-            <div class="filters-stats">
-                <div class="stat-badge">
-                    <span class="stat-value">{total_requests}</span>
-                    <span class="stat-label">"Requests Checked"</span>
-                </div>
-                <div class="stat-badge">
-                    <span class="stat-value">{requests_blocked}</span>
-                    <span class="stat-label">"Requests Blocked"</span>
-                </div>
-            </div>
-
-            <Card class="filters-card">
-                <Show when=move || !loading.get() fallback=|| view! {
-                    <div class="loading">"Loading..."</div>
-                }>
-                    <For
-                        each=move || filters.get()
-                        key=|f| (f.id.clone(), f.enabled, f.allowlist, f.trusted, f.format.clone(), f.rule_count, f.last_error.clone())
-                        children=move |filter| {
-                            let id_for_delete = filter.id.clone();
-                            let id_report = filter.id.clone();
-                            let id_allow = filter.id.clone();
-                            let id_enable = filter.id.clone();
-                            let id_trust = filter.id.clone();
-                            let trusted = filter.trusted;
-                            let (allowlist, enabled) = (filter.allowlist, filter.enabled);
-                            let format = filter.format.clone();
-                            let last_error = filter.last_error.clone();
-                            view! {
-                                <div class={format!(
-                                    "filter-item {}",
-                                    if filter.enabled { "" } else { "disabled" }
-                                )}>
-                                    <div class="filter-info">
-                                        <h3 class="filter-name">{filter.name.clone()}</h3>
-                                        <p class="filter-url">{filter.url.clone()}</p>
-                                        <div class="filter-meta">
-                                            <span class="filter-rules">{filter.rule_count}" rules"</span>
-                                            " | format: "
-                                            {move || {
-                                                let used = reports
-                                                    .get()
-                                                    .get(&id_report)
-                                                    .map(|r| r.format.clone());
-                                                match used {
-                                                    Some(u) if format == "auto" => format!("auto ({u})"),
-                                                    _ => format.clone(),
-                                                }
-                                            }}
-                                        </div>
-                                        <ReportSummary id=filter.id.clone() reports=reports />
-                                        {last_error.map(|e| view! {
-                                            <p class="form-error">"Last error: "{e}</p>
-                                        })}
-                                    </div>
-                                    <div class="filter-actions">
-                                        <label class="form-label">
-                                            <input
-                                                type="checkbox"
-                                                prop:checked=enabled
-                                                on:change=move |ev| {
-                                                    let on = event_target::<HtmlInputElement>(&ev).checked();
-                                                    flag_change.set(Some((id_enable.clone(), Some(on), None)));
-                                                }
-                                            />
-                                            " Enabled"
-                                        </label>
-                                        <label class="form-label">
-                                            <input
-                                                type="checkbox"
-                                                prop:checked=allowlist
-                                                on:change=move |ev| {
-                                                    let on = event_target::<HtmlInputElement>(&ev).checked();
-                                                    flag_change.set(Some((id_allow.clone(), None, Some(on))));
-                                                }
-                                            />
-                                            " Allowlist"
-                                        </label>
-                                        <label
-                                            class="form-label"
-                                            title="Trusting a list lets its rules run JavaScript in the pages you visit (#%# scripts, scriptlets, snippets) and rewrite responses and URLs ($replace, $urltransform). Only trust lists you would let run code in every page."
-                                        >
-                                            <input
-                                                type="checkbox"
-                                                prop:checked=trusted
-                                                on:change=move |ev| {
-                                                    let on = event_target::<HtmlInputElement>(&ev).checked();
-                                                    trust_change.set(Some((id_trust.clone(), on)));
-                                                }
-                                            />
-                                            " Trusted"
-                                        </label>
-                                        <p class="form-help">
-                                            "Trusted lists may run scripts in pages and rewrite responses and URLs; untrusted lists' such rules are dropped."
-                                        </p>
-                                        <button
-                                            class="btn btn-danger"
-                                            on:click=move |_| delete_id.set(Some(id_for_delete.clone()))
-                                        >
-                                            "Delete"
-                                        </button>
-                                    </div>
-                                </div>
-                            }
-                        }
-                    />
-
-                    <Show when=move || filters.get().is_empty()>
-                        <div class="empty-state">
-                            <p>"No filter lists configured"</p>
-                        </div>
-                    </Show>
-                </Show>
-            </Card>
-
-            <Card title="Custom Rules" class="filters-card">
-                <p class="form-help">
-                    "One rule per line in Adblock Plus / uBlock syntax. Use "
-                    <code>"||ads.example^"</code>" to block, "<code>"@@||good.example^"</code>
-                    " to allow (exceptions win over blocklists), or "<code>"example.com##.banner"</code>
-                    " to hide elements. Changes apply after saving."
-                </p>
-                <textarea
-                    class="form-input"
-                    rows="8"
-                    style="font-family: monospace; width: 100%;"
-                    placeholder="||ads.example^&#10;@@||good.example^&#10;example.com##.sponsored"
-                    prop:value=move || custom_rules.get()
-                    on:input=move |ev| {
-                        let target = event_target::<HtmlTextAreaElement>(&ev);
-                        custom_rules.set(target.value());
-                    }
-                ></textarea>
-                <div class="modal-actions">
-                    <button
-                        class="btn btn-primary"
-                        disabled=move || saving_rules.get()
-                        on:click=move |_| do_save_rules.set(true)
-                    >
-                        {move || if saving_rules.get() { "Saving..." } else { "Save Rules" }}
-                    </button>
-                </div>
-            </Card>
-
-            <Modal
-                title="Add Filter List"
-                open=show_modal
-                on_close=Callback::new(move |_| show_modal.set(false))
-            >
-                <div class="form-field">
-                    <label class="form-label">"Name"</label>
-                    <input
-                        type="text"
-                        class="form-input"
-                        placeholder="e.g., EasyList"
-                        prop:value=move || add_name.get()
-                        on:input=move |ev| {
-                            let target = event_target::<HtmlInputElement>(&ev);
-                            add_name.set(target.value());
-                        }
-                    />
-                </div>
-                <div class="form-field">
-                    <label class="form-label">"URL"</label>
-                    <input
-                        type="text"
-                        class="form-input"
-                        placeholder="https://example.com/filters.txt"
-                        prop:value=move || add_url.get()
-                        on:input=move |ev| {
-                            let target = event_target::<HtmlInputElement>(&ev);
-                            add_url.set(target.value());
-                        }
-                    />
-                </div>
-                <div class="form-field">
-                    <label class="form-label">"Format"</label>
-                    <select
-                        class="form-input"
-                        on:change=move |ev| add_format.set(event_target_value(&ev))
-                    >
-                        {FORMATS.iter().map(|f| view! {
-                            <option value=*f selected=move || add_format.get() == *f>{*f}</option>
-                        }).collect_view()}
-                    </select>
-                    <p class="form-help">"auto detects the format from the content."</p>
-                </div>
-                <div class="form-field">
-                    <label class="form-label">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || add_allowlist.get()
-                            on:change=move |ev| add_allowlist.set(event_target::<HtmlInputElement>(&ev).checked())
-                        />
-                        " Allowlist (every rule becomes an exception)"
-                    </label>
-                </div>
-                <div class="modal-actions">
-                    <button class="btn btn-secondary" on:click=move |_| show_modal.set(false)>
-                        "Cancel"
-                    </button>
-                    <button class="btn btn-primary" on:click=move |_| do_add.set(true)>
-                        "Add"
-                    </button>
-                </div>
-            </Modal>
-
-            <Modal
-                title="List Catalogue"
-                open=show_catalogue
-                on_close=Callback::new(move |_| show_catalogue.set(false))
-            >
-                <p class="form-help">
-                    "Well-known hosts, domain and IP lists. Check each list's licence before use."
-                </p>
-                <For
-                    each=move || catalogue.get()
-                    key=|e| (e.id.clone(), e.added)
-                    children=move |e| {
-                        let id = e.id.clone();
-                        view! {
-                            <div class="filter-item">
-                                <div class="filter-info">
-                                    <h3 class="filter-name">{e.name.clone()}</h3>
-                                    <div class="filter-meta">
-                                        {e.format.clone()}" | "{e.category.clone()}" | "{e.licence.clone()}
-                                    </div>
-                                </div>
-                                <div class="filter-actions">
-                                    {if e.added {
-                                        view! { <span class="filter-rules">"Added"</span> }.into_any()
-                                    } else {
-                                        view! {
-                                            <button
-                                                class="btn btn-primary"
-                                                on:click=move |_| catalogue_add.set(Some(id.clone()))
-                                            >
-                                                "Add"
-                                            </button>
-                                        }.into_any()
-                                    }}
-                                </div>
-                            </div>
-                        }
-                    }
-                />
-            </Modal>
-        </Layout>
-    }
-}
+const PAGE_SIZE: u32 = 40;
 
 /// Formats offered when adding a list.
 const FORMATS: &[&str] = &[
@@ -569,13 +41,753 @@ const FORMATS: &[&str] = &[
     "ip-list",
 ];
 
+/// Filters page component
+#[component]
+pub fn FiltersPage() -> impl IntoView {
+    let app_state = use_app_state();
+
+    let counts = RwSignal::new(Option::<FilterListCounts>::None);
+    let q = RwSignal::new(query_get("fq").unwrap_or_default()); // debounced
+    let mode = RwSignal::new(query_get("fm").unwrap_or_default());
+    let sort = RwSignal::new(query_get("fs").unwrap_or_else(|| "name".into()));
+    let anchor0 = query_get("fa");
+    let reload = RwSignal::new(0u32);
+    let debounce = StoredValue::new_local(None::<Timeout>);
+    let anchor_t = StoredValue::new_local(None::<Timeout>);
+    let dead = RwSignal::new(Vec::<char>::new());
+    let sel = RwSignal::new(Option::<String>::None);
+    let sel_open = RwSignal::new(false);
+    let row_h = Signal::derive(move || if is_narrow() { 104.0 } else { 62.0 });
+
+    let build = RwSignal::new(Option::<BuildSummary>::None);
+    let show_catalogue = RwSignal::new(false);
+    let catalogue = RwSignal::new(Vec::<CatalogueEntryResponse>::new());
+    let catalogue_add = RwSignal::new(Option::<String>::None);
+
+    // Add-list form
+    let add_name = RwSignal::new(String::new());
+    let add_url = RwSignal::new(String::new());
+    let add_format = RwSignal::new("auto".to_string());
+    let add_allowlist = RwSignal::new(false);
+    let add_trusted = RwSignal::new(false);
+
+    // Explain
+    let ex_url = RwSignal::new(String::new());
+    let ex_out = RwSignal::new(Option::<TestUrlResponse>::None);
+
+    // Custom rules
+    let custom_rules = RwSignal::new(String::new());
+    let rules_etag = RwSignal::new(Option::<String>::None);
+    let saving_rules = RwSignal::new(false);
+
+    // Cursor-paged feed of lists
+    let fetch: Fetcher<FilterList> = {
+        let app_state = app_state.clone();
+        Rc::new(move |cursor, from| {
+            let (qv, m, s) = (
+                q.get_untracked(),
+                mode.get_untracked(),
+                sort.get_untracked(),
+            );
+            let app_state = app_state.clone();
+            Box::pin(async move {
+                match ApiClient::new()
+                    .list_filter_lists_paged(
+                        &qv,
+                        &m,
+                        &s,
+                        cursor.as_deref(),
+                        from.as_deref(),
+                        PAGE_SIZE,
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        dead.set(dead_letters(&r.counts.letters));
+                        counts.set(Some(r.counts));
+                        Ok((r.items, r.next_cursor, r.total))
+                    }
+                    Err(e) => {
+                        app_state.error(format!("Failed to load filters: {e}"));
+                        Err(e)
+                    }
+                }
+            })
+        })
+    };
+    let feed = Feed::new(fetch);
+    let first = StoredValue::new_local(true);
+    Effect::new(move |_| {
+        reload.track();
+        q.track();
+        mode.track();
+        sort.track();
+        let from = if first.get_value() {
+            first.set_value(false);
+            if sort.get_untracked() == "name" {
+                anchor0.clone()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        dead.set(Vec::new());
+        feed.reload(from, false, None);
+    });
+    Effect::new(move |_| {
+        let s = sort.get();
+        query_set(&[
+            ("fq", Some(q.get())),
+            ("fm", Some(mode.get())),
+            ("fs", (s != "name").then_some(s)),
+            ("fa", None),
+        ]);
+    });
+    let on_anchor = Callback::new(move |i: usize| {
+        if sort.get_untracked() != "name" {
+            return;
+        }
+        let label = feed
+            .items
+            .with_untracked(|v| v.get(i).map(|r| r.name.clone()));
+        anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("fa", label)]))));
+    });
+    // Custom rules (once)
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok((resp, etag)) = ApiClient::new().get_custom_rules().await {
+            custom_rules.set(resp.rules);
+            rules_etag.set(etag);
+        }
+    });
+
+    // Poll the build state while the page is open; reload lists when a build finishes.
+    {
+        let alive = Arc::new(AtomicBool::new(true));
+        let flag = alive.clone();
+        on_cleanup(move || flag.store(false, Ordering::Relaxed));
+        wasm_bindgen_futures::spawn_local(async move {
+            let client = ApiClient::new();
+            let mut was_building = false;
+            while alive.load(Ordering::Relaxed) {
+                if let Ok(b) = client.get_build_summary().await {
+                    if was_building && !b.building {
+                        feed.refresh_loaded();
+                    }
+                    was_building = b.building;
+                    build.set(Some(b));
+                }
+                gloo_timers::future::TimeoutFuture::new(3000).await;
+            }
+        });
+    }
+
+    // Add from the catalogue
+    {
+        let app_state = app_state.clone();
+        Effect::new(move || {
+            if let Some(id) = catalogue_add.get() {
+                let app_state = app_state.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match ApiClient::new().add_from_catalogue(&id).await {
+                        Ok(_) => {
+                            catalogue.update(|c| {
+                                if let Some(e) = c.iter_mut().find(|e| e.id == id) {
+                                    e.added = true;
+                                }
+                            });
+                            reload.update(|n| *n += 1);
+                            app_state.success("List added from the catalogue");
+                        }
+                        Err(e) => app_state.error(format!("Failed to add list: {e}")),
+                    }
+                    catalogue_add.set(None);
+                });
+            }
+        });
+    }
+
+    let add_list = {
+        let app_state = app_state.clone();
+        move |_| {
+            let (name, url) = (add_name.get_untracked(), add_url.get_untracked());
+            if name.trim().is_empty() || url.trim().is_empty() {
+                app_state.error("Give the list a name and a URL");
+                return;
+            }
+            let (format, allow, trusted) = (
+                add_format.get_untracked(),
+                add_allowlist.get_untracked(),
+                add_trusted.get_untracked(),
+            );
+            let app_state = app_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let id = Uuid::new_v4().to_string();
+                match ApiClient::new()
+                    .add_filter_list(&id, &name, &url, true, &format, allow, trusted)
+                    .await
+                {
+                    Ok(_) => {
+                        app_state.success("Filter list added");
+                        add_name.set(String::new());
+                        add_url.set(String::new());
+                        add_trusted.set(false);
+                        add_allowlist.set(false);
+                        reload.update(|n| *n += 1);
+                    }
+                    Err(e) => app_state.error(format!("Failed to add filter: {e}")),
+                }
+            });
+        }
+    };
+
+    let update_all = {
+        let app_state = app_state.clone();
+        move |_| {
+            let app_state = app_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().refresh_all_lists().await {
+                    Ok(_) => app_state.success("Updating enabled lists"),
+                    Err(e) => app_state.error(format!("Update failed: {e}")),
+                }
+            });
+        }
+    };
+
+    let explain = {
+        let app_state = app_state.clone();
+        move || {
+            let u = ex_url.get_untracked();
+            let app_state = app_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().test_url(&u).await {
+                    Ok(r) => ex_out.set(Some(r)),
+                    Err(e) => {
+                        ex_out.set(None);
+                        app_state.error(e.to_string());
+                    }
+                }
+            });
+        }
+    };
+    let explain2 = explain.clone();
+
+    let save_rules = {
+        let app_state = app_state.clone();
+        move |_| {
+            saving_rules.set(true);
+            let app_state = app_state.clone();
+            let rules = custom_rules.get_untracked();
+            let etag = rules_etag.get_untracked().unwrap_or_default();
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().update_custom_rules(&rules, &etag).await {
+                    Ok((_, new_etag)) => {
+                        rules_etag.set(new_etag);
+                        app_state.success("Custom rules saved, engine recompiling");
+                    }
+                    Err(e) => app_state.error(format!("Failed to save rules: {e}")),
+                }
+                saving_rules.set(false);
+            });
+        }
+    };
+
+    let app_state_rail = app_state.clone();
+    let rule_count = move || {
+        custom_rules
+            .get()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    };
+    let pin_custom = move || sort.get() == "name" && q.get().is_empty() && mode.get().is_empty();
+
+    view! {
+        <Layout>
+            <div class="page-header">
+                <h1 class="page-title">"Filter Lists"</h1>
+            </div>
+
+            <BuildIndicator summary=build />
+
+            <div class="card">
+                <div class="card-h">
+                    <h3>"Filter lists"</h3>
+                    <span class="sub">{move || format!("{} lists", format_number(counts.get().map(|c| c.all).unwrap_or(0) as u64))}</span>
+                    <div class="r">
+                        <button type="button" class="btn sm" on:click=update_all>"Update all"</button>
+                        <button
+                            type="button"
+                            class="btn sm"
+                            on:click=move |_| {
+                                show_catalogue.set(true);
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Ok(c) = ApiClient::new().get_catalogue().await {
+                                        catalogue.set(c);
+                                    }
+                                });
+                            }
+                        >
+                            "Browse catalogue"
+                        </button>
+                    </div>
+                </div>
+                <div class="card-b sitebar">
+                    <div class="toolbar">
+                        <div class="search grow">
+                            <Icon name="search" />
+                            <label class="sr" for="flQ">"Search lists"</label>
+                            <input
+                                id="flQ"
+                                class="input mono"
+                                placeholder="Search lists by name or URL"
+                                autocomplete="off"
+                                value=q.get_untracked()
+                                on:input=move |ev| {
+                                    let v = event_target_value(&ev);
+                                    debounce.set_value(Some(Timeout::new(150, move || q.set(v))));
+                                }
+                            />
+                        </div>
+                        <div class="seg" role="radiogroup" aria-label="Filter by status">
+                            {[("", "All"), ("on", "Enabled"), ("off", "Disabled"), ("attn", "Needs attention")]
+                                .into_iter()
+                                .map(|(val, name)| view! {
+                                    <button
+                                        type="button"
+                                        role="radio"
+                                        aria-checked=move || (mode.get() == val).to_string()
+                                        on:click=move |_| mode.set(val.to_string())
+                                    >
+                                        {name}
+                                        {move || counts.get().map(|c| match val {
+                                            "on" => c.on,
+                                            "off" => c.off,
+                                            "attn" => c.attn,
+                                            _ => c.all,
+                                        }).map(|n| view! { <span class="n">{format_number(n as u64)}</span> })}
+                                    </button>
+                                })
+                                .collect_view()}
+                        </div>
+                        <select
+                            class="select"
+                            aria-label="Sort"
+                            prop:value=move || sort.get()
+                            on:change=move |ev| sort.set(event_target_value(&ev))
+                        >
+                            <option value="name">"Name"</option>
+                            <option value="rules">"Most rules"</option>
+                            <option value="updated">"Last updated"</option>
+                        </select>
+                    </div>
+                </div>
+                <Show when=pin_custom>
+                    <ul class="flist">
+                        <li style=move || format!("height:{}px;box-sizing:border-box", row_h.get())>
+                            <span class="dim" aria-hidden="true"><Icon name="audit" /></span>
+                            <div style="min-width:0">
+                                <div class="nm">"Custom rules"</div>
+                                <div class="url">"Your own rules, edited below"</div>
+                            </div>
+                            <div class="meta">
+                                <Pill kind="ok" text="local" />
+                                <span class="cnt num">{move || format!("{} rules", rule_count())}</span>
+                                <span class="tm"></span>
+                            </div>
+                            <div class="meta">
+                                <button type="button" class="btn sm ghost act" on:click=move |_| scroll_to("custom-rules")>"Edit"</button>
+                            </div>
+                        </li>
+                    </ul>
+                </Show>
+                <Show
+                    when=move || !feed.items.with(|v| v.is_empty())
+                    fallback=move || view! {
+                        <div class="empty">
+                            <b>{move || if feed.loading.get() { "Loading..." } else { "No lists match" }}</b>
+                            <button type="button" class="btn sm" style="margin-top:8px" on:click=move |_| {
+                                q.set(String::new());
+                                mode.set(String::new());
+                            }>"Clear filters"</button>
+                        </div>
+                    }
+                >
+                    <div class="vwrap">
+                        <VList
+                            items=feed.items
+                            row_h=row_h
+                            key=|f: &FilterList| format!("{}:{}:{}:{}:{}:{}:{:?}:{:?}", f.id, f.enabled, f.allowlist, f.trusted, f.format, f.rule_count, f.last_error, f.last_updated)
+                            render=Callback::new(move |f: FilterList| view! { <FilterRow filter=f sel=sel sel_open=sel_open feed=feed /> }.into_any())
+                            on_end=Callback::new(move |()| feed.more())
+                            on_anchor=on_anchor
+                            reset=feed.tok
+                            label="Filter lists"
+                            as_list=true
+                        />
+                        <nav class="azrail" aria-label="Jump to letter" hidden=move || !(sort.get() == "name" && feed.total.get() > 12)>
+                            {LETTERS.iter().map(|&l| {
+                                let app_state = app_state_rail.clone();
+                                view! {
+                                    <button type="button" disabled=move || dead.get().contains(&l)
+                                        on:click=move |_| {
+                                            let app_state = app_state.clone();
+                                            feed.reload(
+                                                Some(l.to_string()),
+                                                true,
+                                                Some(Callback::new(move |n: usize| {
+                                                    if n == 0 {
+                                                        dead.update(|d| d.push(l));
+                                                        app_state.info(format!("No lists starting with {}", l.to_ascii_uppercase()));
+                                                    }
+                                                })),
+                                            );
+                                        }>{l.to_ascii_uppercase().to_string()}</button>
+                                }
+                            }).collect_view()}
+                        </nav>
+                    </div>
+                </Show>
+                <div class="vfoot" aria-live="polite">
+                    <span>{move || {
+                        let n = format_number(feed.total.get() as u64);
+                        if !q.get().is_empty() || !mode.get().is_empty() { format!("{n} matches") } else { format!("{n} lists") }
+                    }}</span>
+                    <span>{move || {
+                        let n = feed.items.with(|v| v.len());
+                        if feed.next.get().is_some() { format!("showing 1-{n} \u{b7} scroll for more") } else { "end of list".to_string() }
+                    }}</span>
+                </div>
+                <FilterDrawer sel=sel open=sel_open feed=feed counts=counts />
+            </div>
+
+            <div class="grid2">
+                <div class="card">
+                    <div class="card-h"><h3>"Add filter list"</h3></div>
+                    <div class="card-b">
+                        <div class="field">
+                            <label for="flUrl">"URL"</label>
+                            <input id="flUrl" class="input mono" placeholder="https://example.com/filters.txt"
+                                prop:value=move || add_url.get() on:input=move |ev| add_url.set(event_target_value(&ev)) />
+                        </div>
+                        <div class="field">
+                            <label for="flName">"Name"</label>
+                            <input id="flName" class="input" placeholder="e.g., EasyList"
+                                prop:value=move || add_name.get() on:input=move |ev| add_name.set(event_target_value(&ev)) />
+                        </div>
+                        <div class="field">
+                            <label for="flFmt">"Format"</label>
+                            <select id="flFmt" class="select" on:change=move |ev| add_format.set(event_target_value(&ev))>
+                                {FORMATS.iter().map(|f| view! { <option value=*f>{*f}</option> }).collect_view()}
+                            </select>
+                            <span class="hint">"auto detects the format from the content."</span>
+                        </div>
+                        <div class="srow" style="border-top:0;padding:0">
+                            <div class="txt"><b>"Allowlist"</b><small>"Every rule becomes an exception"</small></div>
+                            <Switch checked=add_allowlist label="Allowlist" on_change=Callback::new(move |v: bool| add_allowlist.set(v)) />
+                        </div>
+                        <div class="srow" style="border-top:0;padding:0">
+                            <div class="txt"><b>"Trusted list"</b><small>"Lets its rules inject scriptlets (#%#) into pages you visit"</small></div>
+                            <Switch checked=add_trusted label="Trusted list" on_change=Callback::new(move |v: bool| add_trusted.set(v)) />
+                        </div>
+                        <div>
+                            <button type="button" class="btn primary" on:click=add_list><Icon name="plus" />"Add list"</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-h"><h3>"Explain this URL"</h3><span class="sub">"Shows which rule decides a request"</span></div>
+                    <div class="card-b">
+                        <div class="field">
+                            <label for="exUrl">"URL"</label>
+                            <input id="exUrl" class="input mono" placeholder="https://example.com/ads.js"
+                                prop:value=move || ex_url.get()
+                                on:input=move |ev| ex_url.set(event_target_value(&ev))
+                                on:keydown=move |ev: web_sys::KeyboardEvent| if ev.key() == "Enter" { explain2() } />
+                        </div>
+                        <div><button type="button" class="btn" on:click=move |_| explain()>"Explain"</button></div>
+                        <div class="explain-out" aria-live="polite">
+                            {move || match ex_out.get() {
+                                None => view! { <span class="dim">"Enter a URL and press Explain."</span> }.into_any(),
+                                Some(r) => view! {
+                                    <div><Pill kind=if r.blocked { "blocked" } else { "allowed" } /></div>
+                                    {r.matched_rule.clone().map(|m| view! { <div class="mono">{m}</div> })}
+                                    {r.exception_rule.clone().map(|m| view! { <div class="dim">"Exception: "<span class="mono">{m}</span></div> })}
+                                    {r.important.then(|| view! { <div class="dim">"Important rule"</div> })}
+                                    {r.redirected.then(|| view! { <div class="dim">"Redirected to a neutered resource"</div> })}
+                                    {r.rewritten_url.clone().map(|m| view! { <div class="dim">"Rewritten to "<span class="mono">{m}</span></div> })}
+                                }.into_any(),
+                            }}
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card" id="custom-rules">
+                <div class="card-h">
+                    <h3>"Custom rules"</h3>
+                    <span class="sub">"uBO / ABP syntax, one per line"</span>
+                    <div class="r">
+                        <span class="dim num">{move || format!("{} rules", rule_count())}</span>
+                        <button type="button" class="btn sm primary" disabled=move || saving_rules.get() on:click=save_rules>
+                            {move || if saving_rules.get() { "Saving..." } else { "Save rules" }}
+                        </button>
+                    </div>
+                </div>
+                <div class="card-b">
+                    <label class="sr" for="crText">"Custom rules"</label>
+                    <textarea
+                        id="crText"
+                        class="input"
+                        rows="8"
+                        spellcheck="false"
+                        placeholder="||ads.example^\n@@||good.example^\nexample.com##.sponsored"
+                        prop:value=move || custom_rules.get()
+                        on:input=move |ev| custom_rules.set(event_target_value(&ev))
+                    ></textarea>
+                </div>
+            </div>
+
+            <Modal
+                title="List Catalogue"
+                open=show_catalogue
+                on_close=Callback::new(move |_| show_catalogue.set(false))
+            >
+                <p class="hint">"Well-known hosts, domain and IP lists. Check each list's licence before use."</p>
+                <ul class="flist">
+                    <For
+                        each=move || catalogue.get()
+                        key=|e| (e.id.clone(), e.added)
+                        children=move |e| {
+                            let id = e.id.clone();
+                            view! {
+                                <li style="grid-template-columns:minmax(0,1fr) auto">
+                                    <div style="min-width:0">
+                                        <div class="nm">{e.name.clone()}</div>
+                                        <div class="url">{e.format.clone()}" | "{e.category.clone()}" | "{e.licence.clone()}</div>
+                                    </div>
+                                    {if e.added {
+                                        view! { <Pill kind="ok" text="added" /> }.into_any()
+                                    } else {
+                                        view! {
+                                            <button type="button" class="btn sm primary" on:click=move |_| catalogue_add.set(Some(id.clone()))>"Add"</button>
+                                        }.into_any()
+                                    }}
+                                </li>
+                            }
+                        }
+                    />
+                </ul>
+            </Modal>
+        </Layout>
+    }
+}
+
+fn scroll_to(id: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    {
+        el.scroll_into_view();
+    }
+}
+
+/// One filter list row (fixed height; options live in the drawer).
+#[component]
+fn FilterRow(
+    filter: FilterList,
+    sel: RwSignal<Option<String>>,
+    sel_open: RwSignal<bool>,
+    feed: Feed<FilterList>,
+) -> impl IntoView {
+    let app_state = use_app_state();
+    let id = filter.id.clone();
+    let on_flag = {
+        let (app_state, id) = (app_state.clone(), id.clone());
+        Callback::new(move |v: bool| {
+            let (app_state, id) = (app_state.clone(), id.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().set_list_flags(&id, Some(v), None).await {
+                    Ok(updated) => apply_update(feed, updated),
+                    Err(e) => app_state.error(format!("Failed to update list: {e}")),
+                }
+            });
+        })
+    };
+    let update = {
+        let (app_state, id, name) = (app_state.clone(), id.clone(), filter.name.clone());
+        move |_| {
+            let (app_state, id, name) = (app_state.clone(), id.clone(), name.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().refresh_list(&id).await {
+                    Ok(_) => app_state.success(format!("Fetching {name}")),
+                    Err(e) => app_state.error(format!("Update failed: {e}")),
+                }
+            });
+        }
+    };
+    let (pill_kind, pill_text) = if filter.last_error.is_some() {
+        ("error", "error")
+    } else if !filter.enabled {
+        ("neutral", "disabled")
+    } else {
+        ("ok", "ok")
+    };
+    let count = if filter.rule_count > 0 {
+        format!("{} rules", format_number(filter.rule_count as u64))
+    } else {
+        "-".to_string()
+    };
+    let open_id = id.clone();
+
+    view! {
+        <li>
+            <Switch checked=filter.enabled label=format!("Enable {}", filter.name) on_change=on_flag />
+            <div style="min-width:0">
+                <div class="nm">
+                    <button type="button" class="nmbtn" title="Options" on:click=move |_| {
+                        sel.set(Some(open_id.clone()));
+                        sel_open.set(true);
+                    }>{filter.name.clone()}</button>
+                    " "
+                    {filter.trusted.then(|| view! { <span class="badge" title="Rules may inject scriptlets">"trusted"</span> })}
+                    {filter.allowlist.then(|| view! { <span class="badge">"allowlist"</span> })}
+                </div>
+                <div class="url" title=filter.last_error.clone().unwrap_or_default()>{filter.url.clone()}</div>
+            </div>
+            <div class="meta">
+                <Pill kind=pill_kind text=pill_text />
+                <span class="cnt num">{count}</span>
+                <span class="tm">{ago_rfc3339(filter.last_updated.as_deref())}</span>
+            </div>
+            <div class="meta">
+                <button type="button" class="btn sm ghost act" on:click=update>"Update"</button>
+            </div>
+        </li>
+    }
+}
+
+/// Replace one row in place after an edit; drop it only if it no longer matches the status filter.
+fn apply_update(feed: Feed<FilterList>, updated: FilterList) {
+    let mode = query_get("fm").unwrap_or_default();
+    let gone = (mode == "on" && !updated.enabled) || (mode == "off" && updated.enabled);
+    if gone {
+        feed.items.update(|v| v.retain(|x| x.id != updated.id));
+        feed.total.update(|t| *t = t.saturating_sub(1));
+    } else {
+        feed.items.update(|v| {
+            if let Some(x) = v.iter_mut().find(|x| x.id == updated.id) {
+                *x = updated;
+            }
+        });
+    }
+}
+
+/// Options for the selected list: trusted, allowlist, build report, delete.
+#[component]
+fn FilterDrawer(
+    sel: RwSignal<Option<String>>,
+    open: RwSignal<bool>,
+    feed: Feed<FilterList>,
+    counts: RwSignal<Option<FilterListCounts>>,
+) -> impl IntoView {
+    let app_state = use_app_state();
+    let report = RwSignal::new(HashMap::<String, ListReport>::new());
+    Effect::new(move |_| {
+        if let Some(id) = sel.get().filter(|_| open.get()) {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(r) = ApiClient::new().get_list_report(&id).await {
+                    report.update(|m| {
+                        m.insert(id, r);
+                    });
+                }
+            });
+        }
+    });
+    let current = move || {
+        let id = sel.get()?;
+        feed.items.with(|v| v.iter().find(|f| f.id == id).cloned())
+    };
+    let title = Signal::derive(move || current().map(|f| f.name).unwrap_or_else(|| "List".into()));
+    let set_flag = {
+        let app_state = app_state.clone();
+        Callback::new(move |(trust, v): (bool, bool)| {
+            let Some(f) = current() else { return };
+            let app_state = app_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let r = if trust {
+                    ApiClient::new().set_list_trusted(&f.id, v).await
+                } else {
+                    ApiClient::new().set_list_flags(&f.id, None, Some(v)).await
+                };
+                match r {
+                    Ok(updated) => apply_update(feed, updated),
+                    Err(e) => app_state.error(format!("Failed to update list: {e}")),
+                }
+            });
+        })
+    };
+    let delete = {
+        let app_state = app_state.clone();
+        Callback::new(move |()| {
+            let Some(f) = current() else { return };
+            let app_state = app_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().delete_filter_list(&f.id).await {
+                    Ok(_) => {
+                        app_state.success("Filter list deleted");
+                        counts.update(|c| {
+                            if let Some(c) = c {
+                                c.all = c.all.saturating_sub(1);
+                                if f.enabled {
+                                    c.on = c.on.saturating_sub(1)
+                                } else {
+                                    c.off = c.off.saturating_sub(1)
+                                }
+                            }
+                        });
+                        feed.items.update(|v| v.retain(|x| x.id != f.id));
+                        feed.total.update(|t| *t = t.saturating_sub(1));
+                        open.set(false);
+                    }
+                    Err(e) => app_state.error(format!("Failed to delete filter: {e}")),
+                }
+            });
+        })
+    };
+    view! {
+        <Drawer open=open title=title>
+            {move || current().map(|f| {
+                let rid = f.id.clone();
+                view! {
+                    <div class="stack">
+                        <div class="mono" style="overflow-wrap:anywhere">{f.url.clone()}</div>
+                        {f.last_error.clone().map(|e| view! { <span class="err">"Last error: "{e}</span> })}
+                        <div class="srow" style="border-top:0">
+                            <div class="txt"><b>"Trusted"</b><small>"May run scripts in pages and rewrite responses and URLs; an untrusted list's such rules are dropped."</small></div>
+                            <Switch checked=f.trusted label="Trusted" on_change=Callback::new(move |v: bool| set_flag.run((true, v))) />
+                        </div>
+                        <div class="srow">
+                            <div class="txt"><b>"Allowlist"</b><small>"Every rule in this list becomes an exception"</small></div>
+                            <Switch checked=f.allowlist label="Allowlist" on_change=Callback::new(move |v: bool| set_flag.run((false, v))) />
+                        </div>
+                        <div class="hint">{format!("format: {}", f.format)}</div>
+                        <ReportSummary id=rid reports=report />
+                        <div><ConfirmButton label="Delete list" confirm_label="Delete?" on_confirm=delete /></div>
+                    </div>
+                }
+            })}
+        </Drawer>
+    }
+}
+
 /// One-line build state: idle totals, download progress, compiling or the last failure.
 #[component]
 fn BuildIndicator(summary: RwSignal<Option<BuildSummary>>) -> impl IntoView {
     view! {
-        <div class="filters-stats">
+        <div class="explain-out" role="status">
             {move || match summary.get() {
-                None => view! { <div class="stat-badge"><span class="stat-label">"Build state unknown"</span></div> }.into_any(),
+                None => view! { <span class="dim">"Build state unknown"</span> }.into_any(),
                 Some(b) => {
                     let state = match &b.state {
                         BuildState::Idle => "Idle".to_string(),
@@ -589,13 +801,9 @@ fn BuildIndicator(summary: RwSignal<Option<BuildSummary>>) -> impl IntoView {
                         b.network, b.cosmetic, b.domain_set, b.ext, b.compile_ms
                     );
                     view! {
-                        <div class="stat-badge">
-                            <span class="stat-value">{state}</span>
-                            <span class="stat-label">
-                                {if b.building { "Building... ".to_string() } else { String::new() }}
-                                {totals}
-                            </span>
-                            {failed.then(|| view! { <span class="form-error">"See the server log for details"</span> })}
+                        <div>
+                            <Pill kind=if failed { "error" } else if b.building { "passthrough" } else { "ok" } text=state />
+                            " "<span class="dim">{if b.building { "Building... ".to_string() } else { String::new() }}{totals}</span>
                         </div>
                     }.into_any()
                 }
@@ -616,7 +824,7 @@ fn ReportSummary(id: String, reports: RwSignal<HashMap<String, ListReport>>) -> 
             let issues = r.issues.clone();
             let n = r.error_count;
             view! {
-                <div class="filter-meta">{counts}</div>
+                <div class="hint">{counts}</div>
                 {(n > 0).then(|| view! {
                     <details>
                         <summary>{format!("{n} parse issue(s)")}</summary>

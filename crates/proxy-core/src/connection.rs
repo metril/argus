@@ -59,16 +59,16 @@ impl Timeouts {
 
 /// Everything a connection needs that is shared by all connections.
 pub struct ConnectionShared {
-    pub mitm: Option<Arc<MitmHandler>>,
+    /// The CA-backed handler; set lazily when MITM is first enabled.
+    pub mitm: arc_swap::ArcSwapOption<MitmHandler>,
     pub enable_http2: bool,
     pub enable_websockets: bool,
     /// Shared filtering + upstream-forwarding context (engine handle + pooled HTTP client).
     pub ctx: Arc<ProxyContext>,
-    pub timeouts: Timeouts,
-    /// Hosts whose TLS is tunnelled instead of intercepted (both entry modes).
-    pub passthrough: crate::passthrough::PassthroughList,
+    /// Live-swappable time limits (`performance.*`).
+    pub timeouts: Arc<arc_swap::ArcSwap<Timeouts>>,
     #[cfg(feature = "websockets")]
-    pub ws: Option<Arc<crate::websocket::WsUpstream>>,
+    pub ws: arc_swap::ArcSwapOption<crate::websocket::WsUpstream>,
 }
 
 /// What the client asked for, independent of how the connection arrived.
@@ -127,6 +127,115 @@ impl ConnectionHandler {
         }
     }
 
+    /// A handler for a connection accepted by the listener owning `flags`.
+    pub fn with_listener(
+        client_addr: SocketAddr,
+        shared: Arc<ConnectionShared>,
+        flags: Arc<crate::listener_flags::ListenerFlags>,
+        transparent: bool,
+    ) -> Self {
+        let h = Self::new(client_addr, shared);
+        h.conn.set_listener(Some(flags), transparent);
+        h
+    }
+
+    /// Mark this connection as arriving on the transparent listener (request log mode).
+    pub(crate) fn mark_transparent(&self) {
+        self.conn.set_listener(self.conn.listener_flags(), true);
+    }
+
+    /// Whether TLS to a host should be intercepted: MITM is available and on for this
+    /// listener, the host is not bypassed and the bypass fail-safe is not holding decryption
+    /// back (an enabled first-party list has not loaded yet).
+    pub(crate) fn intercepts(&self, host: &str) -> bool {
+        let bypass = self.shared.ctx.bypass();
+        self.shared.mitm.load().is_some()
+            && self.conn.mitm_on()
+            && !bypass.failsafe_active()
+            && bypass.mode_of(host).is_none()
+    }
+
+    /// Whether a host-level rule of the connection's profile blocks `target` (recorded as a
+    /// blocked event). Used for `no_decrypt` bypass, where only the host is visible.
+    fn host_blocked(&self, target: &ConnectionTarget) -> bool {
+        let rctx = self.conn.current(
+            self.shared.ctx.profiles(),
+            self.shared.ctx.require_device_token(),
+        );
+        let profile = rctx.profile.load();
+        if !profile.engine.is_enabled() || !rctx.adblock_on() {
+            return false;
+        }
+        let url = format!("https://{}/", target.host);
+        let verdict = profile
+            .engine
+            .check_deferred_q(&filter_engine::Query::new(&url, "", "other"));
+        if !verdict.blocked {
+            return false;
+        }
+        profile.engine.record_verdict_meta(
+            verdict,
+            &url,
+            "",
+            "other",
+            &profile.label,
+            "CONNECT",
+            if rctx.transparent {
+                filter_engine::EventMode::Transparent
+            } else {
+                filter_engine::EventMode::Explicit
+            },
+        );
+        true
+    }
+
+    /// Record a CONNECT-level event (opaque tunnel, failed handshake) in the request log.
+    fn log_connection(
+        &self,
+        action: filter_engine::EventAction,
+        target: &ConnectionTarget,
+        source: Option<&str>,
+        error_kind: Option<filter_engine::ErrorKind>,
+    ) {
+        // `full` bypass leaves no trace in the request log.
+        if self.shared.ctx.bypass().mode_of(&target.host) == Some(common::bypass::BypassMode::Full)
+        {
+            return;
+        }
+        let rctx = self.conn.current(
+            self.shared.ctx.profiles(),
+            self.shared.ctx.require_device_token(),
+        );
+        let profile = rctx.profile.load();
+        let bypass = self.shared.ctx.bypass();
+        let source = source
+            .map(str::to_string)
+            .or_else(|| bypass.lookup(&target.host).map(|h| h.source))
+            .or_else(|| bypass.failsafe_active().then(|| "failsafe".to_string()));
+        let url = if target.port == 443 {
+            format!("https://{}", target.host)
+        } else {
+            format!("{}:{}", target.host, target.port)
+        };
+        profile.engine.record_request(&filter_engine::EventRef {
+            action,
+            method: "CONNECT",
+            url: &url,
+            source_host: "",
+            request_type: "tunnel",
+            rule: source.as_deref().unwrap_or(""),
+            list_id: None,
+            client: Some(profile.label.as_ref()),
+            status: None,
+            error_kind,
+            mode: if rctx.transparent {
+                filter_engine::EventMode::Transparent
+            } else {
+                filter_engine::EventMode::Explicit
+            },
+        });
+    }
+
     /// Handle an incoming connection
     pub async fn handle(&self, stream: TcpStream) -> Result<()> {
         trace!("Handling connection from {}", self.client_addr);
@@ -141,7 +250,7 @@ impl ConnectionHandler {
     /// parse the CONNECT head (across any number of TCP segments, bounded in size and time) and
     /// acknowledge it. Bytes past the head are preserved in the returned stream.
     pub async fn resolve_entry(&self, mut stream: TcpStream) -> Result<Entry<Prefixed<TcpStream>>> {
-        let limit = self.shared.timeouts.handshake;
+        let limit = self.shared.timeouts.load().handshake;
         let mut buf = Vec::with_capacity(1024);
 
         match read_at_least(&mut stream, &mut buf, 8, limit).await {
@@ -189,7 +298,7 @@ impl ConnectionHandler {
         let leftover = buf.split_off(head_len);
 
         debug!("CONNECT {}:{} from {}", host, port, self.client_addr);
-        let intercept_tls = self.shared.mitm.is_some() && !self.shared.passthrough.matches(&host);
+        let intercept_tls = self.intercepts(&host);
 
         // Destination policy, answered with a 403 before the tunnel is established. Intercepted
         // connections only need the literal check here (every request is checked again when it
@@ -255,23 +364,58 @@ impl ConnectionHandler {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let mitm = match (&self.shared.mitm, target.intercept_tls) {
+        let mitm = match (self.shared.mitm.load_full(), target.intercept_tls) {
             (Some(m), true) => m,
             _ => return self.tunnel(io, &target).await,
         };
-
+        // Extended Validation sites are tunnelled: an intercepting certificate would replace the
+        // assurance the site paid for. The verdict is cached per host.
+        let ctx = &self.shared.ctx;
+        // (The reserved panel host is answered by the proxy itself and cannot be probed.)
+        if ctx.bypass().ev_no_decrypt() && !ctx.is_panel_host(&target.host) {
+            use crate::ev::EvVerdict;
+            match ctx
+                .ev_verdict(
+                    &target.host,
+                    target.port,
+                    self.shared.timeouts.load().handshake,
+                )
+                .await
+            {
+                EvVerdict::Ev => return self.tunnel_with(io, &target, Some("ev")).await,
+                // The probe could not tell: tunnel rather than risk decrypting an EV site.
+                EvVerdict::Unknown => {
+                    return self.tunnel_with(io, &target, Some("ev_unknown")).await
+                }
+                EvVerdict::NotEv => {}
+            }
+        }
         let cert = mitm.handle_connect(&target.host, target.port).await?;
-        let acceptor = TlsAcceptor::from(cert.server_config.clone());
-        let tls_stream = tls::accept_tls(&acceptor, io, self.shared.timeouts.handshake)
+        // A listener with HTTP/2 off must not offer h2 in ALPN: it gets the h1-only config.
+        let acceptor = TlsAcceptor::from(if self.conn.http2_on() {
+            cert.server_config.clone()
+        } else {
+            cert.server_config_h1.clone()
+        });
+        let tls_stream = tls::accept_tls(&acceptor, io, self.shared.timeouts.load().handshake)
             .await
-            .inspect_err(|e| debug!("TLS handshake failed for {}: {}", target.host, e))?;
+            .inspect_err(|e| {
+                debug!("TLS handshake failed for {}: {}", target.host, e);
+                let kind = if matches!(e, Error::ClientRejectedCert(_)) {
+                    filter_engine::ErrorKind::ClientRejectedCert
+                } else {
+                    filter_engine::ErrorKind::Other
+                };
+                self.log_connection(filter_engine::EventAction::Error, &target, None, Some(kind));
+            })?;
         trace!("TLS handshake complete for {}", target.host);
 
-        let use_http2 = tls_stream
-            .get_ref()
-            .1
-            .alpn_protocol()
-            .is_some_and(crate::http2::is_http2_protocol);
+        let use_http2 = self.conn.http2_on()
+            && tls_stream
+                .get_ref()
+                .1
+                .alpn_protocol()
+                .is_some_and(crate::http2::is_http2_protocol);
         let origin = Origin {
             scheme: "https",
             authority: Some((target.host.clone(), target.port)),
@@ -310,7 +454,7 @@ impl ConnectionHandler {
 
         http1::Builder::new()
             .timer(TokioTimer::new())
-            .header_read_timeout(self.shared.timeouts.header_read)
+            .header_read_timeout(self.shared.timeouts.load().header_read)
             .serve_connection(TokioIo::new(io), service)
             .with_upgrades()
             .await
@@ -325,7 +469,39 @@ impl ConnectionHandler {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let t = &self.shared.timeouts;
+        self.tunnel_with(client, target, None).await
+    }
+
+    /// [`Self::tunnel`], with `source` (why it is a tunnel, e.g. `ev`) recorded on its events.
+    async fn tunnel_with<IO>(
+        &self,
+        client: IO,
+        target: &ConnectionTarget,
+        source: Option<&str>,
+    ) -> Result<()>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let t = **self.shared.timeouts.load();
+        let bypass = self.shared.ctx.bypass();
+        match bypass.mode_of(&target.host) {
+            Some(common::bypass::BypassMode::Full) => bypass.note_bypassed(),
+            // No interception, but a host the engine blocks stays blocked.
+            Some(common::bypass::BypassMode::NoDecrypt) if self.host_blocked(target) => {
+                return Err(Error::Connection(format!(
+                    "{} is blocked (host-level rule)",
+                    target.host
+                )));
+            }
+            // Fail-safe: everything is tunnelled, so hostname (SNI) blocking is all that is left.
+            None if bypass.failsafe_active() && self.host_blocked(target) => {
+                return Err(Error::Connection(format!(
+                    "{} is blocked (host-level rule)",
+                    target.host
+                )));
+            }
+            _ => {}
+        }
         // Resolve once, check the policy on the resolved address and connect to exactly that
         // address (DNS rebinding cannot swap it afterwards).
         let ctx = &self.shared.ctx;
@@ -340,18 +516,43 @@ impl ConnectionHandler {
             Ok(Ok(s)) => s,
             Ok(Err(e @ Error::DestinationRefused(_))) => {
                 common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
+                self.log_connection(filter_engine::EventAction::Blocked, target, source, None);
                 debug!("Refused tunnel to {}:{}: {e}", target.host, target.port);
                 return Err(e);
             }
             Ok(Err(e)) => {
+                let kind = match &e {
+                    Error::Io(io) => crate::upstream::classify_io(io),
+                    _ => filter_engine::ErrorKind::Other,
+                };
+                self.log_connection(
+                    filter_engine::EventAction::Error,
+                    target,
+                    source,
+                    Some(kind),
+                );
                 return Err(Error::Connection(format!(
                     "Failed to connect to {}:{}: {}",
                     target.host, target.port, e
-                )))
+                )));
             }
-            Err(_) => return Err(Error::Timeout),
+            Err(_) => {
+                self.log_connection(
+                    filter_engine::EventAction::Error,
+                    target,
+                    source,
+                    Some(filter_engine::ErrorKind::UpstreamTimeout),
+                );
+                return Err(Error::Timeout);
+            }
         };
         let _ = server.set_nodelay(true);
+        self.log_connection(
+            filter_engine::EventAction::Passthrough,
+            target,
+            source,
+            None,
+        );
         let mut client = IdleIo::new(client, t.tunnel_idle);
         match tokio::io::copy_bidirectional(&mut client, &mut server).await {
             Ok((up, down)) => {
@@ -366,12 +567,12 @@ impl ConnectionHandler {
     }
 }
 
-const PROXY_AUTH_REQUIRED_RAW: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"adblocker\"\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+const PROXY_AUTH_REQUIRED_RAW: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"argus\"\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
 
 fn proxy_auth_required() -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-        .header("proxy-authenticate", "Basic realm=\"adblocker\"")
+        .header("proxy-authenticate", "Basic realm=\"argus\"")
         .header("connection", "close")
         .body(full_body(Bytes::new()))
         .expect("static response")
@@ -423,6 +624,9 @@ async fn handle_request(
     // Never forwarded upstream.
     req.headers_mut().remove(hyper::header::PROXY_AUTHORIZATION);
     let rctx = conn.current(profiles, require);
+    if let Some(l) = &rctx.listener {
+        l.note_request();
+    }
     if conn.is_revoked() {
         return Ok(proxy_auth_required());
     }
@@ -438,10 +642,17 @@ async fn handle_request(
     // browsers coalesce onto one h2 connection); anything else must use a fresh connection.
     if origin.strict_host {
         if let Some((cert_host, _)) = &origin.authority {
-            let covered = authority::named_hosts(req.uri(), req.headers())
+            let names = authority::named_hosts(req.uri(), req.headers());
+            let covered = names
                 .iter()
                 .all(|h| authority::covered_by_cert(cert_host, h));
-            if !covered {
+            // A bypassed host must never be served over this decrypted connection, even when
+            // the certificate happens to cover it: the browser has to open its own (tunnelled)
+            // connection for it.
+            let bypassed_other = names.iter().any(|h| {
+                !h.eq_ignore_ascii_case(cert_host) && shared.ctx.bypass().mode_of(h).is_some()
+            });
+            if !covered || bypassed_other {
                 debug!(
                     "421 for {:?} on connection to {cert_host} from {}",
                     req.uri().authority(),
@@ -456,10 +667,15 @@ async fn handle_request(
     }
 
     #[cfg(feature = "websockets")]
-    if shared.enable_websockets && crate::websocket::is_websocket_upgrade(req.headers()) {
-        if let Some(ws) = &shared.ws {
+    if rctx
+        .listener
+        .as_ref()
+        .map_or(shared.enable_websockets, |l| l.websockets())
+        && crate::websocket::is_websocket_upgrade(req.headers())
+    {
+        if let Some(ws) = shared.ws.load_full() {
             return crate::websocket::proxy_upgrade(
-                ws,
+                &ws,
                 &shared.ctx,
                 &rctx,
                 req,
@@ -872,14 +1088,15 @@ mod tests {
         let engine = Arc::new(filter_engine::SharedEngine::new());
         let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
         let shared = Arc::new(ConnectionShared {
-            mitm: None,
+            mitm: Default::default(),
             enable_http2: false,
             enable_websockets: false,
             ctx: ctx.clone(),
-            timeouts: Timeouts::from_config(&crate::config::ProxyConfig::default().performance),
-            passthrough: Default::default(),
+            timeouts: Arc::new(arc_swap::ArcSwap::from_pointee(Timeouts::from_config(
+                &crate::config::ProxyConfig::default().performance,
+            ))),
             #[cfg(feature = "websockets")]
-            ws: None,
+            ws: Default::default(),
         });
         let addr: SocketAddr = "203.0.113.7:4242".parse().unwrap();
         let h = ConnectionHandler::new(addr, shared);
@@ -908,14 +1125,15 @@ mod tests {
                 .build(),
         );
         let shared = Arc::new(ConnectionShared {
-            mitm: None,
+            mitm: Default::default(),
             enable_http2: false,
             enable_websockets: false,
             ctx,
-            timeouts: Timeouts::from_config(&crate::config::ProxyConfig::default().performance),
-            passthrough: Default::default(),
+            timeouts: Arc::new(arc_swap::ArcSwap::from_pointee(Timeouts::from_config(
+                &crate::config::ProxyConfig::default().performance,
+            ))),
             #[cfg(feature = "websockets")]
-            ws: None,
+            ws: Default::default(),
         });
         let h = ConnectionHandler::new("203.0.113.7:4242".parse().unwrap(), shared);
         let (mut client, server) = tokio::io::duplex(8192);

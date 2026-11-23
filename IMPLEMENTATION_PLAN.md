@@ -5,7 +5,7 @@
 Building a production-ready Rust MITM proxy with feature parity to AdGuard and uBlock Origin, supporting comprehensive adblocking, userscript execution, HTTP/2, HTTP/3, WebSocket, WebUI, and Docker deployment.
 
 **Project Status**: Greenfield (empty directory)
-**Location**: `/path/to/adblocker`
+**Location**: `/path/to/argus`
 
 **Revision Notes - 2026-01-04 (v2)**: Plan updated based on comprehensive expert reviews (Rust expert, Architecture expert, Project lead, Security expert). **CRITICAL CHANGES**:
 
@@ -361,7 +361,7 @@ tower = "0.5"       # Middleware pattern
    # ... (build steps)
 
    FROM debian:bookworm-slim
-   RUN useradd -m -u 64535 -U adblocker  # High UID to avoid collision
+   RUN useradd -m -u 64535 -U argus  # High UID to avoid collision
 
    # Drop all capabilities
    USER 64535:64535
@@ -374,7 +374,7 @@ tower = "0.5"       # Middleware pattern
    ```yaml
    # docker-compose.yml
    services:
-     adblocker:
+     argus:
        cap_drop:
          - ALL
        cap_add:
@@ -1166,7 +1166,7 @@ enabled_for = ["text/html", "application/xhtml+xml"]
        {
            use secret_service::SecretService;
            let keyring = SecretService::new()?;
-           keyring.store("adblocker", "jwt_secret", secret)?;
+           keyring.store("argus", "jwt_secret", secret)?;
        }
 
        Ok(())
@@ -1481,14 +1481,14 @@ enable_http3 = false  # Disabled by default
 
 2. Memory leak detection:
    ```bash
-   valgrind --leak-check=full --show-leak-kinds=all ./target/release/adblocker
+   valgrind --leak-check=full --show-leak-kinds=all ./target/release/argus
    # OR
-   heaptrack ./target/release/adblocker
+   heaptrack ./target/release/argus
    ```
 
 3. **CPU profiling**:
    ```bash
-   perf record -F 999 -g ./target/release/adblocker
+   perf record -F 999 -g ./target/release/argus
    perf report
    ```
 
@@ -1659,7 +1659,7 @@ docs/
 **Week 68**: Docker Multi-Arch & Release Prep
 11. Multi-arch Docker builds (amd64, arm64):
     ```bash
-    docker buildx build --platform linux/amd64,linux/arm64 -t adblocker:1.0.0 .
+    docker buildx build --platform linux/amd64,linux/arm64 -t argus:1.0.0 .
     ```
 
 12. Release notes and changelog
@@ -1720,7 +1720,7 @@ docs/
 ## Updated Project Structure
 
 ```
-adblocker/
+argus/
 ├── Cargo.toml                      # Workspace (11 crates)
 ├── Dockerfile                      # Multi-stage Debian build
 ├── compose.yaml

@@ -10,8 +10,8 @@ use utoipa_axum::{
 };
 
 use crate::handlers::{
-    audit, auth, certificate, devices, health, lists, policy, profiles, proxy, rules, stats,
-    tokens, users, userscripts,
+    audit, auth, bypass, certificate, devices, health, lists, policy, profiles, proxy, rules,
+    stats, tokens, users, userscripts,
 };
 use crate::state::AppState;
 
@@ -33,6 +33,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(certificate::ca_info))
         // auth + sessions
         .routes(routes!(auth::register))
+        .routes(routes!(auth::registration_status))
         .routes(routes!(auth::login))
         .routes(routes!(auth::refresh))
         .routes(routes!(auth::logout))
@@ -88,8 +89,35 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(stats::reset_filter_stats))
         .routes(routes!(stats::get_proxy_stats))
         .routes(routes!(stats::get_recent_blocked))
+        .routes(routes!(stats::get_timeseries))
+        .routes(routes!(stats::get_request_log))
+        .routes(routes!(stats::stream_request_log))
         // config
         .routes(routes!(proxy::get_config, proxy::update_config))
+        .routes(routes!(proxy::get_config_defaults))
+        // bypass
+        .routes(routes!(bypass::list_categories))
+        .routes(routes!(bypass::update_category))
+        .routes(routes!(bypass::category_hosts))
+        .routes(routes!(bypass::list_entries, bypass::create_entry))
+        .routes(routes!(bypass::update_entry, bypass::delete_entry))
+        .routes(routes!(
+            bypass::list_subscriptions,
+            bypass::create_subscription
+        ))
+        .routes(routes!(
+            bypass::update_subscription,
+            bypass::delete_subscription
+        ))
+        .routes(routes!(bypass::refresh_subscription_now))
+        .routes(routes!(bypass::suggested))
+        .routes(routes!(bypass::get_argus_lists))
+        .routes(routes!(bypass::refresh_argus_lists))
+        .routes(routes!(
+            bypass::get_bypass_settings,
+            bypass::update_bypass_settings
+        ))
+        .routes(routes!(bypass::check_host))
         .routes(routes!(proxy::reload_config))
         // userscripts
         .routes(routes!(

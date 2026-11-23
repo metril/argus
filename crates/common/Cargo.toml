@@ -26,6 +26,8 @@ chrono = { workspace = true }
 # Embedded database
 redb = { workspace = true }
 parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+psl = "2"
 tracing = { workspace = true }
 
 # Destination policy: CIDRs, interface addresses, guarded DNS resolver for reqwest
@@ -39,3 +41,4 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

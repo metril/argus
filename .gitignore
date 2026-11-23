@@ -1,9 +1,13 @@
 # Rust
 /target
 
-# Runtime directories
-/certs/*.key
-/certs/*.crt
+# Runtime directories (any certs/ dir created by a local run, incl. crates/*/certs)
+**/certs/*.key
+**/certs/*.crt
+
+# Local browser-test artifacts
+.playwright-mcp/
+/*.png
 /data
 /logs
 
