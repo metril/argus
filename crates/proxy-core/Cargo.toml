@@ -35,6 +35,7 @@ brotli = "8"
 # TLS
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
 rcgen = { workspace = true }
 x509-parser = "0.18"
 rustls-pemfile = { workspace = true }

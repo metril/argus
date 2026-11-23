@@ -100,11 +100,58 @@ pub fn build_root_store(extra_ca_paths: &[PathBuf]) -> Result<rustls::RootCertSt
     Ok(roots)
 }
 
+/// The certificates of the path webpki actually verified for `end_entity` (leaf, intermediates,
+/// and the trust anchor's certificate when the server presented it), as DER. Built with the same
+/// roots, intermediates and time as the verification itself, so a forged or unrelated
+/// certificate that merely shares a name with a real one cannot appear in it.
+fn verified_path(
+    roots: &rustls::RootCertStore,
+    algs: &rustls::crypto::WebPkiSupportedAlgorithms,
+    end_entity: &rustls::pki_types::CertificateDer<'_>,
+    intermediates: &[rustls::pki_types::CertificateDer<'_>],
+    now: rustls::pki_types::UnixTime,
+) -> Option<Vec<Vec<u8>>> {
+    let ee = webpki::EndEntityCert::try_from(end_entity).ok()?;
+    let path = ee
+        .verify_for_usage(
+            algs.all,
+            &roots.roots,
+            intermediates,
+            now,
+            webpki::KeyUsage::server_auth(),
+            None,
+            None,
+        )
+        .ok()?;
+    let mut out = vec![end_entity.as_ref().to_vec()];
+    out.extend(
+        path.intermediate_certificates()
+            .map(|c| c.der().as_ref().to_vec()),
+    );
+    // The anchor is only a subject and key; its certificate is included when presented.
+    let anchor = path.anchor();
+    let presented = intermediates.iter().find(|c| {
+        x509_parser::parse_x509_certificate(c).is_ok_and(|(_, x)| {
+            // The anchor holds the name and key contents without their outer SEQUENCE header.
+            x.subject().as_raw().ends_with(anchor.subject.as_ref())
+                && x.public_key()
+                    .raw
+                    .ends_with(anchor.subject_public_key_info.as_ref())
+        })
+    });
+    if let Some(c) = presented {
+        out.push(c.as_ref().to_vec());
+    }
+    Some(out)
+}
+
 /// Verifier of the probe handshake: standard web-PKI verification, remembering the chain it saw
 /// and the verdict (the handshake is rejected on a failure, so the verdict is kept here).
 #[derive(Debug)]
 struct ProbeVerifier {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
+    roots: Arc<rustls::RootCertStore>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
     seen: parking_lot::Mutex<Option<ProbeSeen>>,
 }
 
@@ -144,10 +191,12 @@ impl rustls::client::danger::ServerCertVerifier for ProbeVerifier {
             ocsp_response,
             now,
         );
-        let chain = std::iter::once(end_entity.as_ref())
-            .chain(intermediates.iter().map(|c| c.as_ref()))
-            .map(<[u8]>::to_vec)
-            .collect();
+        // An accepted chain is stored as the verified path; a rejected one only for its leaf.
+        let chain = match &res {
+            Ok(_) => verified_path(&self.roots, &self.algs, end_entity, intermediates, now)
+                .unwrap_or_else(|| vec![end_entity.as_ref().to_vec()]),
+            Err(_) => vec![end_entity.as_ref().to_vec()],
+        };
         let verdict = match &res {
             Ok(_) => Ok(()),
             Err(e) => Err((fail_reason(e), e.to_string())),
@@ -195,6 +244,8 @@ impl common::certstore::ChainProbe for CertProber {
 #[derive(Debug)]
 pub struct ChainCapture {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
+    roots: Arc<rustls::RootCertStore>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
     store: Arc<common::certstore::CertStore>,
 }
 
@@ -214,11 +265,18 @@ impl rustls::client::danger::ServerCertVerifier for ChainCapture {
             ocsp_response,
             now,
         )?;
-        let chain: Vec<&[u8]> = std::iter::once(end_entity.as_ref())
-            .chain(intermediates.iter().map(|c| c.as_ref()))
-            .collect();
-        self.store
-            .record_chain(&chain, &|| crate::ev::is_ev_der(end_entity.as_ref()));
+        if self
+            .store
+            .wants_chain(end_entity.as_ref(), 1 + intermediates.len())
+        {
+            if let Some(path) =
+                verified_path(&self.roots, &self.algs, end_entity, intermediates, now)
+            {
+                let refs: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
+                self.store
+                    .record_chain(&refs, &|| crate::ev::is_ev_der(end_entity.as_ref()));
+            }
+        }
         Ok(ok)
     }
 
@@ -251,17 +309,24 @@ pub fn client_tls_config(
     store: Arc<common::certstore::CertStore>,
 ) -> Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let roots = Arc::new(roots);
     let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
+        roots.clone(),
         provider.clone(),
     )
     .build()
     .map_err(|e| Error::Config(format!("Failed to build upstream verifier: {e}")))?;
+    let algs = provider.signature_verification_algorithms;
     let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Config(format!("Failed to build upstream TLS config: {e}")))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ChainCapture { inner, store }))
+        .with_custom_certificate_verifier(Arc::new(ChainCapture {
+            inner,
+            roots,
+            algs,
+            store,
+        }))
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(cfg)
@@ -274,6 +339,9 @@ const PROBE_CONCURRENCY: usize = 8;
 /// How long a request waits for a free probe slot before it gives up and probes in the
 /// background instead.
 const PROBE_WAIT: Duration = Duration::from_millis(250);
+
+/// Background probes queued or running at once; further ones are dropped.
+const PROBE_BACKGROUND: usize = 16;
 
 /// No probe slot was free in time (the result is not cached).
 #[derive(Debug)]
@@ -288,6 +356,27 @@ struct ProbeInner {
     wait: Duration,
     cache: moka::future::Cache<String, Option<String>>,
     handshakes: std::sync::atomic::AtomicUsize,
+    /// Keys with a probe running right now (never started twice).
+    inflight: parking_lot::Mutex<std::collections::HashSet<String>>,
+    /// Room for background probes.
+    background: Arc<tokio::sync::Semaphore>,
+    spawned: std::sync::atomic::AtomicUsize,
+}
+
+/// Removes a key from the in-flight set when the probe ends (or is dropped).
+struct Inflight<'a>(&'a ProbeInner, String);
+
+impl<'a> Inflight<'a> {
+    fn new(p: &'a ProbeInner, key: &str) -> Self {
+        p.inflight.lock().insert(key.to_string());
+        Self(p, key.to_string())
+    }
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        self.0.inflight.lock().remove(&self.1);
+    }
 }
 
 /// Dedicated handshake to a `host:port` after an upstream TLS failure, to learn the certificate
@@ -300,10 +389,15 @@ pub struct CertProber(Arc<ProbeInner>);
 
 impl CertProber {
     pub fn new(opts: &UpstreamOptions) -> Result<Self> {
-        Self::with_limits(opts, PROBE_CONCURRENCY, PROBE_WAIT)
+        Self::with_limits(opts, PROBE_CONCURRENCY, PROBE_WAIT, PROBE_BACKGROUND)
     }
 
-    fn with_limits(opts: &UpstreamOptions, permits: usize, wait: Duration) -> Result<Self> {
+    fn with_limits(
+        opts: &UpstreamOptions,
+        permits: usize,
+        wait: Duration,
+        background: usize,
+    ) -> Result<Self> {
         Ok(Self(Arc::new(ProbeInner {
             store: opts.certs.clone(),
             roots: Arc::new(build_root_store(&opts.extra_ca_paths)?),
@@ -320,6 +414,9 @@ impl CertProber {
                 .map_or(10_000, |t| t.as_millis() as u64)
                 .into(),
             handshakes: Default::default(),
+            inflight: Default::default(),
+            background: Arc::new(tokio::sync::Semaphore::new(background)),
+            spawned: Default::default(),
             limit: tokio::sync::Semaphore::new(permits),
             wait,
             cache: moka::future::Cache::builder()
@@ -347,32 +444,44 @@ impl CertProber {
     /// failed for another reason) or no slot was free in time (then it continues in the
     /// background).
     pub async fn probe(&self, host: &str, port: u16) -> Option<String> {
-        match self.0.probe(host, port).await {
-            Ok(fp) => fp,
-            Err(Busy) => {
-                let (inner, host) = (self.0.clone(), host.to_string());
-                tokio::spawn(async move {
-                    let _ = inner.probe_waiting(&host, port).await;
-                });
+        // Bounded as a whole: also a caller joining a probe that is already running.
+        match tokio::time::timeout(self.0.wait, self.0.cached(host, port, Some(self.0.wait))).await
+        {
+            Ok(Ok(fp)) => fp,
+            Ok(Err(Busy)) | Err(_) => {
+                self.spawn_background(host, port);
                 None
             }
         }
     }
+
+    /// Probe in the background to fill the store: not when one is already running for the key,
+    /// and dropped when too many are queued.
+    fn spawn_background(&self, host: &str, port: u16) {
+        let key = common::certstore::hostport(host, port);
+        if self.0.inflight.lock().contains(&key) {
+            return;
+        }
+        let Ok(permit) = self.0.background.clone().try_acquire_owned() else {
+            return;
+        };
+        self.0
+            .spawned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (inner, host) = (self.0.clone(), host.to_string());
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = inner.cached(&host, port, None).await;
+        });
+    }
+
+    /// Background probes started so far.
+    pub fn background_started(&self) -> usize {
+        self.0.spawned.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl ProbeInner {
-    async fn probe(&self, host: &str, port: u16) -> std::result::Result<Option<String>, Busy> {
-        self.cached(host, port, Some(self.wait)).await
-    }
-
-    async fn probe_waiting(
-        &self,
-        host: &str,
-        port: u16,
-    ) -> std::result::Result<Option<String>, Busy> {
-        self.cached(host, port, None).await
-    }
-
     async fn cached(
         &self,
         host: &str,
@@ -389,6 +498,7 @@ impl ProbeInner {
                         .map_err(|_| Busy)?,
                     None => self.limit.acquire().await.map_err(|_| Busy)?,
                 };
+                let _running = Inflight::new(self, &key);
                 let limit = Duration::from_millis(
                     self.connect_timeout_ms
                         .load(std::sync::atomic::Ordering::Relaxed),
@@ -436,6 +546,8 @@ impl ProbeInner {
             )
             .build()
             .ok()?,
+            roots: self.roots.clone(),
+            algs: provider.signature_verification_algorithms,
             seen: Default::default(),
         });
         let cfg = rustls::ClientConfig::builder_with_provider(provider)
@@ -1070,7 +1182,7 @@ mod probe_tests {
             connect_timeout: Some(Duration::from_secs(2)),
             ..Default::default()
         };
-        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(50)).unwrap();
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(50), 4).unwrap();
         let slow = {
             let p = p.clone();
             tokio::spawn(async move { p.probe("a.test", hole_port).await })
@@ -1092,6 +1204,69 @@ mod probe_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(p.0.store.by_host(&key).unwrap().verdict, Verdict::Invalid);
+    }
+
+    /// A listener that accepts and never answers, so a probe to it holds its slot.
+    async fn black_hole() -> u16 {
+        let hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = hole.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                held.push(hole.accept().await.unwrap());
+            }
+        });
+        port
+    }
+
+    fn slow_opts() -> (UpstreamOptions, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = UpstreamOptions {
+            resolve_all_to: Some("127.0.0.1".parse().unwrap()),
+            connect_timeout: Some(Duration::from_secs(3)),
+            ..Default::default()
+        };
+        (opts, dir)
+    }
+
+    #[tokio::test]
+    async fn background_probes_are_capped_and_never_duplicated() {
+        let port = black_hole().await;
+        let (opts, _d) = slow_opts();
+        let p = CertProber::with_limits(&opts, 1, Duration::from_millis(20), 3).unwrap();
+        let holder = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("held.test", port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Many distinct hosts while the only slot is busy: at most 3 queue, the rest drop.
+        for i in 0..40 {
+            assert_eq!(p.probe(&format!("h{i}.test"), port).await, None);
+        }
+        assert_eq!(p.background_started(), 3);
+        // The same key again: its probe is already queued or running, so none is added.
+        let before = p.background_started();
+        p.probe("h0.test", port).await;
+        assert_eq!(p.background_started(), before);
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn a_caller_joining_a_running_probe_returns_within_the_wait() {
+        let port = black_hole().await;
+        let (opts, _d) = slow_opts();
+        let p = CertProber::with_limits(&opts, 4, Duration::from_millis(100), 4).unwrap();
+        let first = {
+            let p = p.clone();
+            tokio::spawn(async move { p.probe("j.test", port).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let t = std::time::Instant::now();
+        assert_eq!(p.probe("j.test", port).await, None);
+        assert!(t.elapsed() < Duration::from_secs(1));
+        // The first caller handed the slow probe to the background; the joiner adds none.
+        first.await.unwrap();
+        assert_eq!(p.background_started(), 1);
     }
 
     #[tokio::test]
@@ -1133,13 +1308,17 @@ mod capture_tests {
     fn capture(root: &CertificateDer<'static>, store: &Arc<CertStore>) -> ChainCapture {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(root.clone()).unwrap();
+        let roots = Arc::new(roots);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         ChainCapture {
             inner: rustls::client::WebPkiServerVerifier::builder_with_provider(
-                Arc::new(roots),
-                Arc::new(rustls::crypto::ring::default_provider()),
+                roots.clone(),
+                provider.clone(),
             )
             .build()
             .unwrap(),
+            roots,
+            algs: provider.signature_verification_algorithms,
             store: store.clone(),
         }
     }
@@ -1201,5 +1380,65 @@ mod capture_tests {
                 .len(),
             2
         );
+    }
+
+    fn inter_params() -> CertificateParams {
+        let mut p = CertificateParams::new(vec![]).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        p.distinguished_name.push(DnType::CommonName, "inter");
+        p
+    }
+
+    #[test]
+    fn a_forged_same_name_intermediate_never_replaces_the_verified_one() {
+        let (root, root_i) = ca("root");
+        let p = inter_params();
+        let key = KeyPair::generate().unwrap();
+        let real = p.signed_by(&key, &root_i).unwrap();
+        let inter_i = Issuer::new(p, key);
+        // Same subject, another key: webpki rejects it, a name-only walk would pick it.
+        let fp = inter_params()
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap();
+        let l = leaf("good.test", &inter_i, false);
+        let store = Arc::new(CertStore::default());
+        let v = capture(&root, &store);
+        let extra = [fp.der().to_vec(), real.der().to_vec(), root.to_vec()];
+        check(&v, &l, &extra, "good.test").unwrap();
+        let info = store.info(&fingerprint(&l), None).unwrap();
+        let fps: Vec<_> = info.chain.iter().map(|c| c.fp.clone()).collect();
+        assert_eq!(
+            fps,
+            vec![fingerprint(&l), fingerprint(real.der()), fingerprint(&root)]
+        );
+        assert!(!fps.contains(&fingerprint(fp.der())));
+    }
+
+    #[test]
+    fn a_cross_signed_intermediate_follows_the_path_that_verified() {
+        let (root, root_i) = ca("root");
+        let (_r2, r2_i) = ca("other root");
+        let p = inter_params();
+        let key = KeyPair::generate().unwrap();
+        let der = key.serialize_der();
+        let real = p.signed_by(&key, &root_i).unwrap();
+        // The same subject and key, certified by a root nobody here trusts.
+        let cross = inter_params()
+            .signed_by(&KeyPair::try_from(der.as_slice()).unwrap(), &r2_i)
+            .unwrap();
+        let inter_i = Issuer::new(p, key);
+        let l = leaf("good.test", &inter_i, false);
+        let store = Arc::new(CertStore::default());
+        let v = capture(&root, &store);
+        check(
+            &v,
+            &l,
+            &[cross.der().to_vec(), real.der().to_vec()],
+            "good.test",
+        )
+        .unwrap();
+        let info = store.info(&fingerprint(&l), None).unwrap();
+        assert_eq!(info.chain.len(), 2);
+        assert_eq!(info.chain[1].fp, fingerprint(real.der()));
     }
 }

@@ -900,7 +900,7 @@ impl ProxyContext {
                     }
                     _ => None,
                 };
-                if failed_fp.is_some() {
+                if kind == filter_engine::ErrorKind::UpstreamTls {
                     self.certs.note_seen(&hostport, &rctx.profile.load().label);
                 }
                 if !bypass_full {

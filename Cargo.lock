@@ -4220,6 +4220,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "script-policy",
  "secrecy",
  "serde",

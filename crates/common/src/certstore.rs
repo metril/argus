@@ -209,21 +209,36 @@ pub fn parse_hostport(s: &str) -> String {
 /// 1..=65535 (`host:abc`, `host:`), for validating request input.
 pub fn try_parse_hostport(s: &str) -> Option<String> {
     let h = s.trim();
-    let port_text = if let Some(rest) = h.strip_prefix('[') {
-        rest.split_once(']')?
-            .1
-            .strip_prefix(':')
-            .map(str::to_string)
-    } else if h.matches(':').count() == 1 {
-        h.split_once(':').map(|(_, p)| p.to_string())
+    let (host, port_text) = if let Some(rest) = h.strip_prefix('[') {
+        let (inner, after) = rest.split_once(']')?;
+        let port = match after {
+            "" => None,
+            a => Some(a.strip_prefix(':')?),
+        };
+        inner.parse::<std::net::Ipv6Addr>().ok()?;
+        (inner, port)
     } else {
-        None
+        match h.matches(':').count() {
+            0 => (h, None),
+            1 => {
+                let (a, p) = h.split_once(':')?;
+                (a, Some(p))
+            }
+            _ => {
+                // Several colons: only a bare IPv6 literal.
+                h.parse::<std::net::Ipv6Addr>().ok()?;
+                (h, None)
+            }
+        }
     };
-    if let Some(p) = port_text {
-        p.parse::<u16>().ok().filter(|p| *p != 0)?;
+    if host.is_empty() {
+        return None;
     }
-    let k = parse_hostport(h);
-    (!k.starts_with(':') && !k.starts_with("[]")).then_some(k)
+    let port = match port_text {
+        Some(p) => p.parse::<u16>().ok().filter(|p| *p != 0)?,
+        None => DEFAULT_PORT,
+    };
+    Some(hostport(host, port))
 }
 
 /// Canonical `host:port` key from a bare host (with or without IPv6 brackets) and a port.
@@ -398,17 +413,29 @@ impl CertStore {
         Some(fp)
     }
 
-    /// Keep the verified chain a handshake presented, as host-independent data of the leaf:
-    /// trimmed to the path that links (see [`trim_chain`]). Writes no verdict, host or profile.
-    /// Call only after verification succeeded. A no-op when the leaf already has a full chain.
+    /// Whether a handshake presenting `presented_len` certificates led by `leaf` could add to
+    /// what is known: the leaf is new, or it is leaf-only and more than the leaf was presented.
+    pub fn wants_chain(&self, leaf: &[u8], presented_len: usize) -> bool {
+        match self.parsed.get(&fingerprint(leaf)) {
+            None => true,
+            Some(p) if p.chain.len() > 1 => false,
+            Some(_) => presented_len > 1,
+        }
+    }
+
+    /// Keep the chain a handshake presented, as host-independent data of the leaf. The caller
+    /// passes only a path the TLS stack actually verified (never raw presented certificates),
+    /// and only after verification succeeded; it is still linked by name here and cut at a
+    /// self-signed certificate. Writes no verdict, host or profile. A no-op when the leaf
+    /// already has a full chain, or when only the leaf is presented and the leaf is known.
     pub fn record_chain(&self, chain_der: &[&[u8]], ev: &dyn Fn() -> bool) {
         let Some(leaf) = chain_der.first() else {
             return;
         };
-        let fp = fingerprint(leaf);
-        if self.parsed.get(&fp).is_some_and(|p| p.chain.len() > 1) {
+        if !self.wants_chain(leaf, chain_der.len()) {
             return;
         }
+        let fp = fingerprint(leaf);
         let path = trim_chain(chain_der);
         if let Some(p) = Self::parse(&fp, &path, ev()) {
             self.parsed.insert(fp, Arc::new(p));
