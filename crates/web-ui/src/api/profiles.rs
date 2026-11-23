@@ -9,9 +9,32 @@ pub use api_types::{
 };
 
 impl ApiClient {
+    /// Every profile (for pickers), following the cursor.
     pub async fn list_profiles(&self) -> Result<Vec<ProfileDto>, ApiError> {
-        let page: Page<ProfileDto> = self.get("/profiles?limit=200").await?;
-        Ok(page.items)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self.list_profiles_page("", cursor.as_deref()).await?;
+            all.extend(page.items);
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => return Ok(all),
+            }
+        }
+    }
+
+    /// One page of profiles, A-Z, optionally filtered by name.
+    pub async fn list_profiles_page(
+        &self,
+        q: &str,
+        cursor: Option<&str>,
+    ) -> Result<Page<ProfileDto>, ApiError> {
+        self.get(&format!(
+            "/profiles?limit=100&q={}{}",
+            js_sys::encode_uri_component(q.trim()),
+            super::admin::cur(cursor)
+        ))
+        .await
     }
 
     pub async fn create_profile(&self, r: &CreateProfileRequest) -> Result<ProfileDto, ApiError> {

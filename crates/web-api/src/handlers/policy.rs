@@ -16,7 +16,7 @@ use script_policy::store::StoreError;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-use super::paging::{desc_key, natural_key, paginate, Keyed};
+use super::paging::{desc_key, natural_key, page_of, paginate, Keyed};
 use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
@@ -468,6 +468,7 @@ pub async fn delete_site_rule(
 pub struct SourceRulesQuery {
     pub page: Option<u32>,
     pub limit: Option<u32>,
+    pub cursor: Option<String>,
     /// Case-insensitive substring of the page scope or the source scope.
     pub site: Option<String>,
     /// Exact page scope (e.g. `site:example.com`).
@@ -500,7 +501,21 @@ pub async fn list_source_rules(
         .filter(|r| q.effect.as_ref().is_none_or(|e| &r.effect == e))
         .collect();
     all.sort_by(|a, b| (&a.page, &a.source, &a.effect).cmp(&(&b.page, &b.source, &b.effect)));
-    Ok(Json(Page::from_vec(all, q.page, q.limit)))
+    let rows = all
+        .into_iter()
+        .map(|r| Keyed {
+            key: format!("{}\u{1}{}\u{1}{}", r.page, r.source, r.effect),
+            id: r.id.clone(),
+            label: r.page.clone(),
+            item: r,
+        })
+        .collect();
+    let cq = super::CursorQuery {
+        page: q.page,
+        limit: q.limit,
+        cursor: q.cursor,
+    };
+    Ok(Json(page_of(rows, &cq)?))
 }
 
 /// Create a source rule (409 if page + source + effect already has one).

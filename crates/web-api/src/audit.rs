@@ -25,6 +25,14 @@ pub struct AuditFilter {
     pub target: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Case-insensitive substring of `"METHOD route"`.
+    pub action: Option<String>,
+    /// Case-insensitive substring of actor, route, target or address.
+    pub q: Option<String>,
+}
+
+fn has_ci(hay: &str, needle: &str) -> bool {
+    hay.to_lowercase().contains(needle)
 }
 
 impl AuditFilter {
@@ -36,6 +44,8 @@ impl AuditFilter {
             && self.target.is_none()
             && self.since.is_none()
             && self.until.is_none()
+            && self.action.is_none()
+            && self.q.is_none()
     }
 
     fn matches(&self, e: &AuditEntry) -> bool {
@@ -59,6 +69,26 @@ impl AuditFilter {
             && self
                 .until
                 .is_none_or(|u| at.as_ref().is_ok_and(|a| *a <= u))
+            && self.action.as_ref().is_none_or(|a| {
+                has_ci(
+                    &format!("{} {}", e.method, e.route),
+                    &a.trim().to_lowercase(),
+                )
+            })
+            && self.q.as_ref().is_none_or(|q| {
+                let q = q.trim().to_lowercase();
+                [
+                    e.actor_name.as_deref(),
+                    e.actor_id.as_deref(),
+                    Some(e.route.as_str()),
+                    Some(e.method.as_str()),
+                    e.target.as_deref(),
+                    e.ip.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|f| has_ci(f, &q))
+            })
     }
 }
 
@@ -205,6 +235,58 @@ impl AuditStore {
         }
         let total = if unfiltered { self.len() } else { seen };
         (items, total, scanned)
+    }
+
+    /// Keyset form of [`Self::query`]: up to `limit` matching entries older than `before` (an
+    /// entry id from [`Self::entry_key`]; `None` starts at the newest), plus whether more
+    /// follow. Stable while entries are appended or pruned.
+    pub fn query_before(
+        &self,
+        f: &AuditFilter,
+        before: Option<u64>,
+        limit: usize,
+    ) -> (Vec<AuditEntry>, bool) {
+        const MAX_SCAN: usize = 100_000;
+        self.db.flush_deferred();
+        let mut items = Vec::new();
+        let mut more = false;
+        let mut scanned = 0usize;
+        let res = self.db.read::<_, DbError>(|r| {
+            let t = r.open_table(tables::AUDIT)?;
+            for item in t.range(0..before.unwrap_or(u64::MAX))?.rev() {
+                let (_, v) = item?;
+                scanned += 1;
+                if scanned > MAX_SCAN {
+                    break;
+                }
+                let Ok(e) = serde_json::from_slice::<AuditEntry>(v.value()) else {
+                    continue;
+                };
+                if let (Some(since), Ok(at)) = (f.since, DateTime::parse_from_rfc3339(&e.at)) {
+                    if at.with_timezone(&Utc) < since {
+                        break;
+                    }
+                }
+                if !f.matches(&e) {
+                    continue;
+                }
+                if items.len() == limit {
+                    more = true;
+                    break;
+                }
+                items.push(e);
+            }
+            Ok(())
+        });
+        if let Err(e) = res {
+            tracing::error!("audit query failed: {e}");
+        }
+        (items, more)
+    }
+
+    /// The numeric key of an entry id (`{:016x}`).
+    pub fn entry_key(id: &str) -> Option<u64> {
+        u64::from_str_radix(id, 16).ok()
     }
 
     pub fn len(&self) -> usize {

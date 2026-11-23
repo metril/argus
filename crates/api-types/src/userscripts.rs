@@ -162,7 +162,16 @@ pub struct StorageValueDto {
 pub struct UserscriptStorageResponse {
     pub used_bytes: u64,
     pub quota_bytes: u64,
+    /// One page of values, sorted by name.
     pub values: Vec<StorageValueDto>,
+    /// Stored values matching `q`, across all pages.
+    #[serde(default)]
+    pub total: usize,
+    /// Pass back as `cursor` for the next page (absent on the last page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 /// Exported `@require`.

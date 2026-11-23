@@ -1,6 +1,10 @@
 //! Admin: all sessions and all API tokens.
 
+use std::rc::Rc;
+
 use leptos::prelude::*;
+
+use super::vlist::{Feed, Fetcher, Scroller};
 
 use crate::api::admin::ApiTokenInfo;
 use crate::api::auth::SessionInfo;
@@ -18,28 +22,48 @@ pub fn SessionsPage() -> impl IntoView {
 #[component]
 fn SessionsInner() -> impl IntoView {
     let app = use_app_state();
-    let sessions = RwSignal::new(Vec::<SessionInfo>::new());
-    let tokens = RwSignal::new(Vec::<ApiTokenInfo>::new());
     let reload = RwSignal::new(0u32);
 
-    {
+    let sessions_fetch: Fetcher<SessionInfo> = {
         let app = app.clone();
-        Effect::new(move |_| {
-            reload.get();
+        Rc::new(move |cursor, _| {
             let app = app.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let c = ApiClient::new();
-                match c.admin_list_sessions().await {
-                    Ok(p) => sessions.set(p.items),
-                    Err(e) => app.error(format!("Failed to load sessions: {e}")),
+            Box::pin(async move {
+                match ApiClient::new()
+                    .admin_list_sessions(cursor.as_deref())
+                    .await
+                {
+                    Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                    Err(e) => {
+                        app.error(format!("Failed to load sessions: {e}"));
+                        Err(e)
+                    }
                 }
-                match c.admin_list_tokens().await {
-                    Ok(p) => tokens.set(p.items),
-                    Err(e) => app.error(format!("Failed to load tokens: {e}")),
+            })
+        })
+    };
+    let tokens_fetch: Fetcher<ApiTokenInfo> = {
+        let app = app.clone();
+        Rc::new(move |cursor, _| {
+            let app = app.clone();
+            Box::pin(async move {
+                match ApiClient::new().admin_list_tokens(cursor.as_deref()).await {
+                    Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                    Err(e) => {
+                        app.error(format!("Failed to load tokens: {e}"));
+                        Err(e)
+                    }
                 }
-            });
-        });
-    }
+            })
+        })
+    };
+    let sessions = Feed::new(sessions_fetch);
+    let tokens = Feed::new(tokens_fetch);
+    Effect::new(move |_| {
+        reload.track();
+        sessions.reload(None, false, None);
+        tokens.reload(None, false, None);
+    });
 
     let revoke_session = {
         let app = app.clone();
@@ -59,15 +83,23 @@ fn SessionsInner() -> impl IntoView {
     let revoke_others = {
         let app = app.clone();
         Callback::new(move |_| {
-            let ids: Vec<String> = sessions
-                .get_untracked()
-                .into_iter()
-                .filter(|s| !s.current)
-                .map(|s| s.id)
-                .collect();
             let app = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let c = ApiClient::new();
+                // Every session, not just the ones scrolled into view.
+                let mut ids: Vec<String> = Vec::new();
+                let mut cursor: Option<String> = None;
+                loop {
+                    let Ok(p) = c.admin_list_sessions(cursor.as_deref()).await else {
+                        app.error("Failed to list sessions");
+                        return;
+                    };
+                    ids.extend(p.items.into_iter().filter(|s| !s.current).map(|s| s.id));
+                    match p.next_cursor {
+                        Some(n) => cursor = Some(n),
+                        None => break,
+                    }
+                }
                 let (mut n, total) = (0, ids.len());
                 for id in ids {
                     if c.admin_revoke_session(&id).await.is_ok() {
@@ -108,11 +140,11 @@ fn SessionsInner() -> impl IntoView {
                 <h3>"Active sessions"</h3><span class="sub">"All users"</span>
                 <div class="r"><ConfirmButton label="Revoke all except mine" confirm_label="Sign out others?" on_confirm=revoke_others /></div>
             </div>
-            <div class="tbl-wrap">
+            <Scroller feed=sessions class="tbl-wrap">
                 <table class="tbl">
                     <thead><tr><th>"User"</th><th>"Device"</th><th>"IP"</th><th>"Signed in"</th><th>"Last active"</th><th></th></tr></thead>
                     <tbody>
-                        <For each=move || sessions.get() key=|s| s.id.clone() children={
+                        <For each=move || sessions.items.get() key=|s| s.id.clone() children={
                             let revoke = revoke_session.clone();
                             move |s| {
                                 let id = s.id.clone();
@@ -135,16 +167,16 @@ fn SessionsInner() -> impl IntoView {
                         } />
                     </tbody>
                 </table>
-                <Show when=move || sessions.read().is_empty()><div class="empty"><b>"No sessions"</b></div></Show>
-            </div>
+                <Show when=move || sessions.items.with(|v| v.is_empty())><div class="empty"><b>"No sessions"</b></div></Show>
+            </Scroller>
         </div>
         <div class="card">
             <div class="card-h"><h3>"API tokens"</h3><span class="sub">"All users"</span></div>
-            <div class="tbl-wrap">
+            <Scroller feed=tokens class="tbl-wrap">
                 <table class="tbl">
                     <thead><tr><th>"Name"</th><th>"Owner"</th><th>"Scopes"</th><th>"Last used"</th><th>"Expires"</th><th></th></tr></thead>
                     <tbody>
-                        <For each=move || tokens.get() key=|t| format!("{}{}", t.id, t.revoked) children={
+                        <For each=move || tokens.items.get() key=|t| format!("{}{}", t.id, t.revoked) children={
                             let revoke = revoke_token.clone();
                             move |t| {
                                 let id = t.id.clone();
@@ -167,8 +199,8 @@ fn SessionsInner() -> impl IntoView {
                         } />
                     </tbody>
                 </table>
-                <Show when=move || tokens.read().is_empty()><div class="empty"><b>"No tokens"</b></div></Show>
-            </div>
+                <Show when=move || tokens.items.with(|v| v.is_empty())><div class="empty"><b>"No tokens"</b></div></Show>
+            </Scroller>
         </div>
     }
 }

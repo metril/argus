@@ -1,7 +1,10 @@
 //! Admin: users table with create/edit drawer.
 
+use std::rc::Rc;
+
 use leptos::prelude::*;
 
+use super::vlist::{Feed, Fetcher, Scroller};
 use crate::api::users::{UserInfo, UserRole};
 use crate::api::ApiClient;
 use crate::components::{
@@ -37,11 +40,12 @@ pub fn UsersPage() -> impl IntoView {
 fn UsersInner() -> impl IntoView {
     let app = use_app_state();
     let me = use_auth_state().user;
-    let users = RwSignal::new(Vec::<UserInfo>::new());
     let profiles = RwSignal::new(Vec::<(String, String)>::new());
     let f_profile = RwSignal::new(String::new());
     let reload = RwSignal::new(0u32);
     let search = RwSignal::new(String::new());
+    let q = RwSignal::new(String::new()); // debounced `search`
+    let debounce = StoredValue::new_local(None::<gloo_timers::callback::Timeout>);
     let roles = RwSignal::new(ROLES.to_vec());
 
     // Drawer state
@@ -53,6 +57,40 @@ fn UsersInner() -> impl IntoView {
     let f_enabled = RwSignal::new(true);
     let f_err = RwSignal::new(Option::<String>::None);
 
+    let fetch: Fetcher<UserInfo> = {
+        let app = app.clone();
+        Rc::new(move |cursor, _| {
+            let app = app.clone();
+            let (qv, rv) = (
+                q.get_untracked(),
+                roles
+                    .get_untracked()
+                    .into_iter()
+                    .map(role_key)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            Box::pin(async move {
+                match ApiClient::new()
+                    .list_users(&qv, &rv, cursor.as_deref())
+                    .await
+                {
+                    Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                    Err(e) => {
+                        app.error(format!("Failed to load users: {e}"));
+                        Err(e)
+                    }
+                }
+            })
+        })
+    };
+    let users = Feed::new(fetch);
+    Effect::new(move |_| {
+        reload.track();
+        q.track();
+        roles.track();
+        users.reload(None, false, None);
+    });
     {
         let app = app.clone();
         Effect::new(move |_| {
@@ -60,10 +98,6 @@ fn UsersInner() -> impl IntoView {
             let app = app.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let c = ApiClient::new();
-                match c.list_users().await {
-                    Ok(p) => users.set(p.items),
-                    Err(e) => app.error(format!("Failed to load users: {e}")),
-                }
                 match c.list_profiles().await {
                     Ok(p) => profiles.set(p.into_iter().map(|p| (p.id, p.name)).collect()),
                     Err(e) => app.error(format!("Failed to load profiles: {e}")),
@@ -71,18 +105,6 @@ fn UsersInner() -> impl IntoView {
             });
         });
     }
-
-    let visible = move || {
-        let q = search.get().to_lowercase();
-        let r = roles.get();
-        users
-            .get()
-            .into_iter()
-            .filter(|u| {
-                r.contains(&u.role) && (q.is_empty() || u.username.to_lowercase().contains(&q))
-            })
-            .collect::<Vec<_>>()
-    };
 
     let open_new = move |_| {
         editing.set(None);
@@ -198,7 +220,11 @@ fn UsersInner() -> impl IntoView {
             <div class="search grow">
                 <Icon name="search" />
                 <label class="sr" for="userQ">"Search users"</label>
-                <input class="input" id="userQ" placeholder="Search users" prop:value=move || search.get() on:input=move |ev| search.set(event_target_value(&ev)) />
+                <input class="input" id="userQ" placeholder="Search users" prop:value=move || search.get() on:input=move |ev| {
+                    let v = event_target_value(&ev);
+                    search.set(v.clone());
+                    debounce.set_value(Some(gloo_timers::callback::Timeout::new(250, move || q.set(v))));
+                } />
             </div>
             <div class="chips" role="group" aria-label="Role filter">
                 {ROLES.into_iter().map(|r| view! {
@@ -211,12 +237,12 @@ fn UsersInner() -> impl IntoView {
             <button class="btn primary" type="button" on:click=open_new><Icon name="plus" />"New user"</button>
         </div>
         <div class="card">
-            <div class="tbl-wrap">
+            <Scroller feed=users class="tbl-wrap">
                 <table class="tbl">
                     <thead><tr><th>"User"</th><th>"Role"</th><th>"Enabled"</th><th>"Profile"</th><th class="r">"Sessions"</th><th>"Last seen"</th><th></th></tr></thead>
                     <tbody>
                         <For
-                            each=visible
+                            each=move || users.items.get()
                             key=|u| format!("{}{}{}{}", u.id, role_key(u.role), u.enabled, u.last_login.clone().unwrap_or_default())
                             children={
                                 let toggle_enabled = toggle_enabled.clone();
@@ -265,10 +291,10 @@ fn UsersInner() -> impl IntoView {
                         />
                     </tbody>
                 </table>
-                <Show when=move || visible().is_empty()>
+                <Show when=move || users.items.with(|v| v.is_empty()) && !users.loading.get()>
                     <div class="empty"><b>"No users match"</b>"Clear a filter to see more."</div>
                 </Show>
-            </div>
+            </Scroller>
         </div>
         <Drawer
             open=open

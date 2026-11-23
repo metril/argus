@@ -157,8 +157,10 @@ pub async fn update_category(
 pub struct HostsQuery {
     /// Case-insensitive substring.
     pub q: Option<String>,
-    /// Most domains returned (default 200, max 1000).
+    /// Page size (1..=200, default 200).
     pub limit: Option<u32>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
 }
 
 /// The domains of a category, optionally filtered.
@@ -185,10 +187,30 @@ pub async fn category_hosts(
             .cloned()
             .collect()
     });
-    all.sort_by_key(|d| natural_key(d.trim_start_matches("*.")));
-    let total = all.len();
-    all.truncate(q.limit.unwrap_or(200).clamp(1, 1000) as usize);
-    Ok(Json(BypassHostsResponse { items: all, total }))
+    all.sort();
+    all.dedup();
+    let rows = all
+        .into_iter()
+        .map(|d| Keyed {
+            key: natural_key(d.trim_start_matches("*.")),
+            id: d.clone(),
+            label: d.clone(),
+            item: d,
+        })
+        .collect();
+    let p = paginate(
+        rows,
+        Some(q.limit.unwrap_or(200)),
+        q.cursor.as_deref(),
+        None,
+        None,
+    )?;
+    Ok(Json(BypassHostsResponse {
+        items: p.items,
+        total: p.total,
+        next_cursor: p.next_cursor,
+        has_more: p.has_more,
+    }))
 }
 
 // ---- custom entries ----

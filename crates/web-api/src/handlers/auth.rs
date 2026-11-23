@@ -17,7 +17,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use validator::Validate;
 
-use super::{parse_uuid, PageQuery};
+use super::paging::{page_of, ts_key_desc, Keyed};
+use super::{parse_uuid, CursorQuery};
 use crate::auth::authz::{refresh_cookie, AuditActor, Principal};
 use crate::auth::csrf::{token_for, CSRF_COOKIE};
 use crate::auth::jwt::{generate_token_pair, validate_refresh_token};
@@ -429,17 +430,29 @@ fn session_info(id: &Uuid, s: &SessionData, current: Option<Uuid>) -> SessionInf
     }
 }
 
+/// Sessions as paging rows, newest first.
+fn session_rows(all: Vec<SessionInfo>) -> Vec<Keyed<SessionInfo>> {
+    all.into_iter()
+        .map(|s| Keyed {
+            key: ts_key_desc(&s.created_at),
+            id: s.id.clone(),
+            label: s.username.clone(),
+            item: s,
+        })
+        .collect()
+}
+
 /// List your own sessions.
 #[utoipa::path(
     get, path = "/auth/sessions", tag = "sessions",
     security(("bearer_auth" = ["sessions:self"])),
-    params(PageQuery),
+    params(CursorQuery),
     responses((status = 200, description = "Your sessions", body = Page<SessionInfo>))
 )]
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
-    ApiQuery(q): ApiQuery<PageQuery>,
+    ApiQuery(q): ApiQuery<CursorQuery>,
 ) -> ApiResult<axum::Json<Page<SessionInfo>>> {
     let cur = p.session_id();
     let all = state
@@ -448,7 +461,7 @@ pub async fn list_sessions(
         .iter()
         .map(|(id, s)| session_info(id, s, cur))
         .collect();
-    Ok(axum::Json(Page::from_vec(all, q.page, q.limit)))
+    Ok(axum::Json(page_of(session_rows(all), &q)?))
 }
 
 /// Revoke one of your own sessions.
@@ -479,6 +492,7 @@ pub async fn revoke_session(
 pub struct AdminSessionsQuery {
     pub page: Option<u32>,
     pub limit: Option<u32>,
+    pub cursor: Option<String>,
     /// Only this user's sessions.
     pub user_id: Option<String>,
 }
@@ -504,7 +518,12 @@ pub async fn admin_list_sessions(
         .filter(|(_, s)| only.is_none_or(|u| s.user_id == u))
         .map(|(id, s)| session_info(id, s, cur))
         .collect();
-    Ok(axum::Json(Page::from_vec(all, q.page, q.limit)))
+    let cq = CursorQuery {
+        page: q.page,
+        limit: q.limit,
+        cursor: q.cursor,
+    };
+    Ok(axum::Json(page_of(session_rows(all), &cq)?))
 }
 
 /// Revoke any session.

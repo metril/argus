@@ -6,7 +6,7 @@ use wasm_bindgen::JsCast;
 use super::vlist::*;
 use crate::api::userscripts::{
     ImportUserscriptsResponse, UpdateDiffDto, Userscript, UserscriptBundle, UserscriptCounts,
-    UserscriptPlanResponse, UserscriptStorageResponse,
+    UserscriptPlanResponse,
 };
 use crate::api::ApiClient;
 use crate::components::{ConfirmButton, Drawer, Icon, Layout, ProfileSelector, Switch};
@@ -187,7 +187,31 @@ pub fn UserscriptsPage() -> impl IntoView {
     // Details / source / storage
     let show_detail = RwSignal::new(false);
     let detail_id = RwSignal::new(Option::<String>::None);
-    let storage = RwSignal::new(Option::<UserscriptStorageResponse>::None);
+    // (used, quota) bytes of the open script's storage; its values are paged and searchable.
+    let storage = RwSignal::new(Option::<(u64, u64)>::None);
+    let storage_q = RwSignal::new(String::new());
+    let storage_t = StoredValue::new_local(None::<Timeout>);
+    let storage_fetch: Fetcher<api_types::StorageValueDto> = Rc::new(move |cursor, _| {
+        let id = detail_id.get_untracked().unwrap_or_default();
+        let q = storage_q.get_untracked();
+        Box::pin(async move {
+            match ApiClient::new()
+                .get_userscript_storage(&id, &q, cursor.as_deref())
+                .await
+            {
+                Ok(s) => {
+                    storage.set(Some((s.used_bytes, s.quota_bytes)));
+                    Ok((s.values, s.next_cursor, s.total))
+                }
+                Err(e) => {
+                    app.get_value()
+                        .error(format!("Failed to load storage: {}", e));
+                    Err(e)
+                }
+            }
+        })
+    });
+    let sfeed = Feed::new(storage_fetch);
     let show_source = RwSignal::new(false);
     let source_content = RwSignal::new(String::new());
 
@@ -253,19 +277,12 @@ pub fn UserscriptsPage() -> impl IntoView {
     let by_id =
         move |id: Option<String>| id.and_then(|id| scripts.get().into_iter().find(|s| s.id == id));
 
-    let load_storage = move |id: String| {
-        wasm_bindgen_futures::spawn_local(async move {
-            match ApiClient::new().get_userscript_storage(&id).await {
-                Ok(s) => storage.set(Some(s)),
-                Err(e) => app
-                    .get_value()
-                    .error(format!("Failed to load storage: {}", e)),
-            }
-        });
-    };
+    let load_storage = move |_id: String| sfeed.reload(None, false, None);
 
     let open_detail = move |id: String| {
         storage.set(None);
+        sfeed.items.set(Vec::new());
+        storage_q.set(String::new());
         detail_id.set(Some(id.clone()));
         show_detail.set(true);
         load_storage(id);
@@ -916,35 +933,40 @@ pub fn UserscriptsPage() -> impl IntoView {
                         })}
                         <div class="us-section">
                             <h4>"Stored values"
-                                {move || storage.get().map(|st| view! {
+                                {move || storage.get().map(|(used, quota)| view! {
                                     <span class="userscript-version">
-                                        {fmt_bytes(st.used_bytes)}" / "{fmt_bytes(st.quota_bytes)}</span>
+                                        {fmt_bytes(used)}" / "{fmt_bytes(quota)}</span>
                                 })}
                             </h4>
-                            {move || {
-                                let sid = sid.clone();
-                                storage.get().map(|st| if st.values.is_empty() {
-                                    view! { <p class="hint">"No stored values"</p> }.into_any()
-                                } else {
-                                    view! {
-                                        <div class="tbl-wrap"><div class="tbl-wrap"><table class="tbl">
-                                            <thead><tr><th>"Name"</th><th>"Size"</th><th>"Preview"</th><th></th></tr></thead>
-                                            <tbody>
-                                                {st.values.into_iter().map(|v| {
-                                                    let (sid, name) = (sid.clone(), v.name.clone());
-                                                    view! { <tr>
-                                                        <td>{v.name.clone()}</td>
-                                                        <td>{fmt_bytes(v.size_bytes as u64)}</td>
-                                                        <td><code>{v.preview.clone()}</code></td>
-                                                        <td><ConfirmButton label="Delete" confirm_label="Delete?"
-                                                            on_confirm=Callback::new(move |()| clear_storage(sid.clone(), Some(name.clone()))) /></td>
-                                                    </tr> }
-                                                }).collect_view()}
-                                            </tbody>
-                                        </table></div></div>
-                                    }.into_any()
-                                })
-                            }}
+                            <input class="input mono" placeholder="Search values" aria-label="Search stored values"
+                                prop:value=move || storage_q.get()
+                                on:input=move |ev| {
+                                    storage_q.set(event_target_value(&ev));
+                                    storage_t.set_value(Some(Timeout::new(250, move || sfeed.reload(None, false, None))));
+                                } />
+                            <Show when=move || sfeed.items.with(|v| v.is_empty()) fallback=|| ()>
+                                <p class="hint">{move || if sfeed.loading.get() { "Loading..." } else { "No stored values" }}</p>
+                            </Show>
+                            <Scroller feed=sfeed>
+                                <table class="tbl">
+                                    <thead><tr><th>"Name"</th><th>"Size"</th><th>"Preview"</th><th></th></tr></thead>
+                                    <tbody>
+                                        <For each=move || sfeed.items.get() key=|v| format!("{}/{}", v.name, v.size_bytes) children={
+                                            let sid = sid.clone();
+                                            move |v| {
+                                                let (sid, name) = (sid.clone(), v.name.clone());
+                                                view! { <tr>
+                                                    <td>{v.name.clone()}</td>
+                                                    <td>{fmt_bytes(v.size_bytes as u64)}</td>
+                                                    <td><code>{v.preview.clone()}</code></td>
+                                                    <td><ConfirmButton label="Delete" confirm_label="Delete?"
+                                                        on_confirm=Callback::new(move |()| clear_storage(sid.clone(), Some(name.clone()))) /></td>
+                                                </tr> }
+                                            }
+                                        } />
+                                    </tbody>
+                                </table>
+                            </Scroller>
                             <ConfirmButton label="Clear all" confirm_label="Clear all?"
                                 on_confirm=Callback::new(move |()| clear_storage(id_clear.clone(), None)) />
                         </div>

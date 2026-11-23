@@ -7,7 +7,8 @@ use axum::{extract::State, http::StatusCode, Extension, Json};
 use tracing::info;
 use validator::Validate;
 
-use super::{parse_uuid, PageQuery};
+use super::paging::{page_of, ts_key, Keyed};
+use super::{parse_uuid, CursorQuery};
 use crate::auth::authz::Principal;
 use crate::auth::models::User;
 use crate::auth::password::{hash_password, validate_password_strength};
@@ -51,22 +52,66 @@ fn check_profile(state: &AppState, id: &str) -> ApiResult<()> {
     }
 }
 
-/// List user accounts.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UsersQuery {
+    /// Deprecated: use `cursor`.
+    pub page: Option<u32>,
+    /// Items per page, 1..=200 (default 50).
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    /// Case-insensitive substring of the username.
+    pub q: Option<String>,
+    /// Comma-separated roles to keep (`admin`, `user`, `viewer`).
+    pub roles: Option<String>,
+}
+
+/// List user accounts, oldest first.
 #[utoipa::path(
     get, path = "/users", tag = "users",
     security(("bearer_auth" = ["users:read"])),
-    params(PageQuery),
+    params(UsersQuery),
     responses((status = 200, description = "Users", body = Page<UserInfo>))
 )]
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
-    ApiQuery(q): ApiQuery<PageQuery>,
+    ApiQuery(q): ApiQuery<UsersQuery>,
 ) -> ApiResult<Json<Page<UserInfo>>> {
     let st = state.clone();
     let mut users = blocking(move || st.session_store.get_all_users()).await?;
     users.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    let all = users.iter().map(|u| info(&state, u)).collect();
-    Ok(Json(Page::from_vec(all, q.page, q.limit)))
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let roles: Option<Vec<String>> = q.roles.as_deref().map(|r| {
+        r.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let rows = users
+        .iter()
+        .filter(|u| needle.is_empty() || u.username.to_lowercase().contains(&needle))
+        .map(|u| info(&state, u))
+        .filter(|i| {
+            roles.as_ref().is_none_or(|r| {
+                serde_json::to_value(i.role)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_lowercase))
+                    .is_some_and(|s| r.contains(&s))
+            })
+        })
+        .map(|i| Keyed {
+            key: ts_key(&i.created_at),
+            id: i.id.clone(),
+            label: i.username.clone(),
+            item: i,
+        })
+        .collect();
+    let cq = CursorQuery {
+        page: q.page,
+        limit: q.limit,
+        cursor: q.cursor,
+    };
+    Ok(Json(page_of(rows, &cq)?))
 }
 
 /// Create a user account.

@@ -492,6 +492,10 @@ pub struct Page<T> {
     pub page: u32,
     pub limit: u32,
     pub has_more: bool,
+    /// Pass back as `cursor` for the next page (absent on the last page). Cursor paging is
+    /// stable under inserts and deletes; `page` is the older offset form of the same list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 impl<T> Page<T> {
@@ -508,6 +512,7 @@ impl<T> Page<T> {
             total,
             page,
             limit,
+            next_cursor: None,
         }
     }
 }

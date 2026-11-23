@@ -34,6 +34,24 @@ pub fn ago_rfc3339(ts: Option<&str>) -> String {
 }
 
 impl ApiClient {
+    /// A page of the rules the network engine handed off (cosmetic, scriptlet, replace, ...),
+    /// optionally of one list and filtered by text.
+    pub async fn list_ext_rules(
+        &self,
+        list: &str,
+        q: &str,
+        cursor: Option<&str>,
+    ) -> Result<api_types::Page<api_types::ExtRuleResponse>, ApiError> {
+        let enc = |s: &str| String::from(js_sys::encode_uri_component(s));
+        self.get(&format!(
+            "/rules/ext?limit=100&list={}&q={}{}",
+            enc(list),
+            enc(q.trim()),
+            super::admin::cur(cursor)
+        ))
+        .await
+    }
+
     /// List filter lists with pagination
     pub async fn list_filter_lists(
         &self,

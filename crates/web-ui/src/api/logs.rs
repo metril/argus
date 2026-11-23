@@ -10,6 +10,20 @@ impl ApiClient {
         self.get(&format!("/logs/requests?limit={limit}")).await
     }
 
+    /// Entries at or after `since` (RFC 3339), newest first, to fill the gap after the stream
+    /// reconnected.
+    pub async fn get_request_log_since(
+        &self,
+        since: &str,
+        limit: u32,
+    ) -> Result<RequestLogResponse, ApiError> {
+        self.get(&format!(
+            "/logs/requests?limit={limit}&since={}",
+            js_sys::encode_uri_component(since)
+        ))
+        .await
+    }
+
     /// Append a line to the custom rules (used by the log drawer's allow/block actions).
     pub async fn append_custom_rule(&self, rule: &str) -> Result<(), ApiError> {
         let (cur, etag) = self.get_custom_rules().await?;

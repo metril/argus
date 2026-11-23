@@ -295,6 +295,48 @@ where
     }
 }
 
+/// Scroll box for tables and chip lists whose rows have no fixed height: asks the feed for the
+/// next page near the bottom and shows its error and a loaded-of-total line.
+#[component]
+pub fn Scroller<T>(
+    feed: Feed<T>,
+    #[prop(optional)] class: &'static str,
+    children: ChildrenFn,
+) -> impl IntoView
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let node: NodeRef<leptos::html::Div> = NodeRef::new();
+    let check_end = move || {
+        if let Some(el) = node.get_untracked() {
+            let el: web_sys::HtmlElement = el.into();
+            if (el.scroll_top() + el.client_height()) as f64 >= el.scroll_height() as f64 - 160.0 {
+                feed.more();
+            }
+        }
+    };
+    // A short first page may not fill the box: keep asking until it does or the list ends.
+    Effect::new(move |_| {
+        feed.items.track();
+        check_end();
+    });
+    view! {
+        {move || feed.error.get().map(|msg| view! {
+            <div class="vlist-err" role="alert">
+                <span>{format!("Failed to load: {msg}")}</span>
+                <button type="button" class="btn sm" on:click=move |_| feed.retry()>"Retry"</button>
+            </div>
+        })}
+        <div class=format!("scrollbox {class}") node_ref=node tabindex="0" on:scroll=move |_| check_end()>
+            {children()}
+        </div>
+        <div class="vfoot" aria-live="polite">
+            <span>{move || if feed.loading.get() { "Loading...".to_string() } else { format!("{} loaded", feed.items.with(|v| v.len())) }}</span>
+            <span>{move || if feed.next.get().is_some() { "scroll for more" } else { "end of list" }}</span>
+        </div>
+    }
+}
+
 /// True under the 760px breakpoint.
 pub fn is_narrow() -> bool {
     web_sys::window()

@@ -15,7 +15,7 @@ use tracing::info;
 use utoipa::IntoParams;
 use validator::Validate;
 
-use super::paging::{desc_key, natural_key, paginate, Keyed};
+use super::paging::{desc_key, natural_key, page_of, paginate, Keyed};
 use super::proxy::apply_update;
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -718,8 +718,16 @@ pub async fn add_from_catalogue(
 pub struct ExtRulesQuery {
     /// Only this kind (`replace`, `cookie`, `html-filter`, ...).
     pub kind: Option<String>,
+    /// Case-insensitive substring of the rule text or its list.
+    pub q: Option<String>,
+    /// Only rules of this filter list id.
+    pub list: Option<String>,
+    /// Deprecated: use `cursor`.
     pub page: Option<u32>,
+    /// Page size (1..=200, default 50).
     pub limit: Option<u32>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
 }
 
 /// Rules the network engine cannot run (handed off) and what the extended-rule index did with
@@ -733,26 +741,44 @@ pub struct ExtRulesQuery {
 pub async fn list_ext_rules(
     State(state): State<Arc<AppState>>,
     ApiQuery(q): ApiQuery<ExtRulesQuery>,
-) -> Json<Page<ExtRuleResponse>> {
+) -> ApiResult<Json<Page<ExtRuleResponse>>> {
     let generation = state.shared_engine.generation();
     let index = generation.aux::<ext_rules::ExtIndex>();
     let rules = state.shared_engine.ext_rules();
     // The rule list and the index are installed together; if a rebuild slipped in between the
     // two reads, say `unknown` instead of mislabelling.
     let index = index.filter(|i| i.stats().total == rules.len());
-    let total_matching = rules
-        .iter()
-        .filter(|r| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
-        .count();
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
-    let page = q.page.unwrap_or(1).max(1);
-    let items: Vec<ExtRuleResponse> = rules
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+    // Rows are indexes into the rule list (its order is the display order); only the page's
+    // rows are turned into responses.
+    let rows: Vec<Keyed<usize>> = rules
         .iter()
         .enumerate()
         .filter(|(_, r)| q.kind.as_deref().is_none_or(|k| r.kind.as_str() == k))
-        .skip((page as usize - 1).saturating_mul(limit as usize))
-        .take(limit as usize)
-        .map(|(i, r)| {
+        .filter(|(_, r)| q.list.as_deref().is_none_or(|l| r.list == l))
+        .filter(|(_, r)| {
+            needle.is_empty()
+                || r.raw.to_lowercase().contains(&needle)
+                || r.list.to_lowercase().contains(&needle)
+        })
+        .map(|(i, _)| Keyed {
+            key: format!("{i:012}"),
+            id: String::new(),
+            label: String::new(),
+            item: i,
+        })
+        .collect();
+    let cq = super::CursorQuery {
+        page: q.page,
+        limit: q.limit,
+        cursor: q.cursor,
+    };
+    let p = page_of(rows, &cq)?;
+    let items: Vec<ExtRuleResponse> = p
+        .items
+        .iter()
+        .map(|&i| {
+            let r = &rules[i];
             let st = index.and_then(|x| x.state_of(i));
             ExtRuleResponse {
                 kind: r.kind.as_str().into(),
@@ -764,13 +790,14 @@ pub async fn list_ext_rules(
             }
         })
         .collect();
-    Json(Page {
-        has_more: (page as usize - 1) * limit as usize + items.len() < total_matching,
+    Ok(Json(Page {
         items,
-        total: total_matching,
-        page,
-        limit,
-    })
+        total: p.total,
+        page: p.page,
+        limit: p.limit,
+        has_more: p.has_more,
+        next_cursor: p.next_cursor,
+    }))
 }
 
 /// Stable error code for a fetch URL that is not an allowed destination.

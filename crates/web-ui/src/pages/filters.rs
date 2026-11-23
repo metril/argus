@@ -727,6 +727,7 @@ fn FilterDrawer(
             });
         }
     });
+    let rules_open = RwSignal::new(false);
     let current = move || {
         let id = sel.get()?;
         feed.items.with(|v| v.iter().find(|f| f.id == id).cloned())
@@ -796,10 +797,86 @@ fn FilterDrawer(
                         </div>
                         <div class="hint">{format!("format: {}", f.format)}</div>
                         <ReportSummary id=rid reports=report />
+                        <div><button class="btn" type="button" on:click=move |_| rules_open.set(true)>"View rules"</button></div>
                         <div><ConfirmButton label="Delete list" confirm_label="Delete?" on_confirm=delete /></div>
                     </div>
                 }
             })}
+        </Drawer>
+        <RulesDrawer list=Signal::derive(move || current().map(|f| (f.id, f.name))) open=rules_open />
+    }
+}
+
+/// The extended rules (cosmetic, scriptlet, replace, ...) a list contributes: search plus
+/// infinite scroll over `/rules/ext`. Plain network rules are compiled into the engine and are
+/// not listed there.
+#[component]
+fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> impl IntoView {
+    let app = StoredValue::new(use_app_state());
+    let q = RwSignal::new(String::new());
+    let t = StoredValue::new_local(None::<Timeout>);
+    let fetch: Fetcher<api_types::ExtRuleResponse> = Rc::new(move |cursor, _| {
+        let id = list.get_untracked().map(|l| l.0).unwrap_or_default();
+        let qv = q.get_untracked();
+        Box::pin(async move {
+            // An empty id would list every list's rules.
+            if id.is_empty() {
+                return Ok((Vec::new(), None, 0));
+            }
+            match ApiClient::new()
+                .list_ext_rules(&id, &qv, cursor.as_deref())
+                .await
+            {
+                Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                Err(e) => {
+                    app.get_value().error(format!("Failed to load rules: {e}"));
+                    Err(e)
+                }
+            }
+        })
+    });
+    let rules = Feed::new(fetch);
+    Effect::new(move |_| {
+        if open.get() {
+            let _ = list.get();
+            rules.items.set(Vec::new());
+            rules.reload(None, false, None);
+        }
+    });
+    let title =
+        Signal::derive(move || format!("Rules in {}", list.get().map(|l| l.1).unwrap_or_default()));
+    view! {
+        <Drawer fill=true open=open title=title>
+            <div class="search">
+                <Icon name="search" />
+                <label class="sr" for="ruleQ">"Search rules"</label>
+                <input class="input mono" id="ruleQ" placeholder="Search rules" autocomplete="off"
+                    prop:value=move || q.get()
+                    on:input=move |ev| {
+                        q.set(event_target_value(&ev));
+                        t.set_value(Some(Timeout::new(250, move || rules.reload(None, false, None))));
+                    } />
+            </div>
+            <span class="hint" aria-live="polite">{move || format!(
+                "Showing {} of {} cosmetic, scriptlet and other extended rules",
+                rules.items.with(|v| v.len()), format_number(rules.total.get() as u64))}</span>
+            <VList
+                items=rules.items
+                row_h=Signal::derive(|| 52.0)
+                key=|r: &api_types::ExtRuleResponse| format!("{}/{}", r.list, r.raw)
+                render=Callback::new(|r: api_types::ExtRuleResponse| view! {
+                    <div class="hrow rrow" title=r.raw.clone()>
+                        <code>{r.raw.clone()}</code>
+                        <small>{r.kind.clone()}" \u{b7} "{r.state.clone()}{r.reason.clone().map(|x| format!(" ({x})"))}</small>
+                    </div>
+                }.into_any())
+                on_end=Callback::new(move |()| rules.more())
+                error=rules.error
+                on_retry=Callback::new(move |()| rules.retry())
+                on_anchor=Callback::new(|_| ())
+                reset=rules.tok
+                label="Rules"
+            />
         </Drawer>
     }
 }

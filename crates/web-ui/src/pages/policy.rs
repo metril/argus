@@ -828,25 +828,34 @@ fn SiteRow(
 #[component]
 fn SourceMatrix(page_scope: String) -> impl IntoView {
     let app = use_app_state();
-    let rules = RwSignal::new(Vec::<SourceRuleDto>::new());
     let reload = RwSignal::new(0u32);
     let new_source = RwSignal::new(String::new());
     let new_effect = RwSignal::new("allow".to_string());
     let new_cap = RwSignal::new("script".to_string());
 
-    {
+    let fetch: Fetcher<SourceRuleDto> = {
         let (app, scope) = (app.clone(), page_scope.clone());
-        Effect::new(move || {
-            reload.track();
+        std::rc::Rc::new(move |cursor, _| {
             let (app, scope) = (app.clone(), scope.clone());
-            wasm_bindgen_futures::spawn_local(async move {
-                match ApiClient::new().list_source_rules(&scope).await {
-                    Ok(p) => rules.set(p.items),
-                    Err(e) => app.error(format!("Failed to load source rules: {e}")),
+            Box::pin(async move {
+                match ApiClient::new()
+                    .list_source_rules(&scope, cursor.as_deref())
+                    .await
+                {
+                    Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                    Err(e) => {
+                        app.error(format!("Failed to load source rules: {e}"));
+                        Err(e)
+                    }
                 }
-            });
-        });
-    }
+            })
+        })
+    };
+    let rules = Feed::new(fetch);
+    Effect::new(move || {
+        reload.track();
+        rules.reload(None, false, None);
+    });
 
     let add = {
         let (app, scope) = (app.clone(), page_scope.clone());
@@ -876,7 +885,7 @@ fn SourceMatrix(page_scope: String) -> impl IntoView {
 
     view! {
             <div class="policy-matrix">
-                <div class="table-container">
+                <Scroller feed=rules class="table-container">
                     <table class="table">
                         <thead>
                             <tr>
@@ -888,7 +897,7 @@ fn SourceMatrix(page_scope: String) -> impl IntoView {
                         </thead>
                         <tbody>
                             <For
-                                each=move || rules.get()
+                                each=move || rules.items.get()
                                 key=|r| (r.id.clone(), r.caps.clone())
                                 children={
                                     let app = app.clone();
@@ -949,10 +958,10 @@ fn SourceMatrix(page_scope: String) -> impl IntoView {
                             />
                         </tbody>
                     </table>
-                    <Show when=move || rules.get().is_empty()>
+                    <Show when=move || rules.items.with(|v| v.is_empty()) && !rules.loading.get()>
                         <div class="empty"><p>"No third-party rules for this scope"</p></div>
                     </Show>
-                </div>
+                </Scroller>
                 <div class="policy-add">
                     <input
                         class="input"

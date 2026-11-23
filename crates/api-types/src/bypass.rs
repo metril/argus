@@ -45,8 +45,13 @@ pub struct UpdateBypassCategory {
 pub struct BypassHostsResponse {
     /// Matching domains (a bare domain covers its subdomains too; `*.x` only subdomains).
     pub items: Vec<String>,
-    /// Matching domains before `limit`.
+    /// Matching domains across all pages.
     pub total: usize,
+    /// Pass back as `cursor` for the next page (absent on the last page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 /// A custom entry.

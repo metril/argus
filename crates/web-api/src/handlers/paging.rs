@@ -143,6 +143,42 @@ pub fn paginate<T>(
     })
 }
 
+/// Sort key for a timestamp, oldest first (RFC 3339 text; unparsable sorts first).
+pub fn ts_key(rfc3339: &str) -> String {
+    format!("{:020}", ts_millis(rfc3339))
+}
+
+/// Sort key for a timestamp, newest first.
+pub fn ts_key_desc(rfc3339: &str) -> String {
+    desc_key(ts_millis(rfc3339))
+}
+
+fn ts_millis(rfc3339: &str) -> u64 {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.timestamp_millis().max(0) as u64)
+        .unwrap_or(0)
+}
+
+/// Serve a [`api_types::Page`] (default page size 50) from keyed rows, honouring `cursor` and
+/// the deprecated `page`.
+pub fn page_of<T>(rows: Vec<Keyed<T>>, q: &super::CursorQuery) -> ApiResult<api_types::Page<T>> {
+    let p = paginate(
+        rows,
+        Some(q.limit.unwrap_or(50)),
+        q.cursor.as_deref(),
+        None,
+        q.page,
+    )?;
+    Ok(api_types::Page {
+        items: p.items,
+        total: p.total,
+        page: p.page.unwrap_or(1),
+        limit: p.limit,
+        has_more: p.has_more,
+        next_cursor: p.next_cursor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

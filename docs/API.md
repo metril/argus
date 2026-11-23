@@ -88,6 +88,12 @@ loopback or link-local destination, see the README's fetch policy),
 
 Every list endpoint takes `?page=1&limit=50` (limit 1..=200) and returns
 `{ "items": [...], "total": n, "page": 1, "limit": 50, "has_more": false }`.
+Prefer cursor paging: pass the response's `next_cursor` back as `?cursor=` (absent on the last
+page). A cursor stays correct while rows are added or removed between requests; `page` is the
+older offset form of the same list. Cursor-paged lists: users, sessions, tokens, profiles
+(`q`), devices, site and source rules, bypass entries and category hosts, filter lists,
+`/rules/ext` (`q`, `list`, `kind`), audit (`actor`, `action`, `q`, `since`, `outcome`;
+newest first) and a userscript's storage (`q`, with `total`).
 
 ## Concurrency control
 
