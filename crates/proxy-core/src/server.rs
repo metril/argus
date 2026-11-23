@@ -204,9 +204,17 @@ impl ProxyControl {
         }
         // A live change of the extra CAs takes effect for the next handshake (a broken file
         // rejects the change before anything is applied).
-        if let Some(roots) = self.ctx.roots() {
-            roots.set_extras(&config.proxy.extra_upstream_ca_paths)?;
-        }
+        let new_extras = match self.ctx.roots() {
+            Some(roots) => {
+                let (roots, paths) = (roots.clone(), config.proxy.extra_upstream_ca_paths.clone());
+                Some(
+                    tokio::task::spawn_blocking(move || roots.prepare_extras(&paths))
+                        .await
+                        .map_err(|e| Error::Internal(e.to_string()))??,
+                )
+            }
+            None => None,
+        };
         #[cfg(feature = "websockets")]
         let mut new_ws = None;
         #[cfg(feature = "websockets")]
@@ -284,6 +292,9 @@ impl ProxyControl {
         }
         self.timeouts.store(Arc::new(t));
         self.ctx.commit_upstream(upstream);
+        if let (Some(roots), Some(extras)) = (self.ctx.roots(), new_extras) {
+            roots.commit_extras(extras);
+        }
         self.ctx.set_request_timeout(std::time::Duration::from_secs(
             config.performance.request_timeout_secs,
         ));

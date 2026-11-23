@@ -536,38 +536,35 @@ impl ActiveRoots {
         }
         if !root.permitted_dns.is_empty() {
             use x509_parser::extensions::GeneralName;
-            let names: Vec<String> = leaf
-                .subject_alternative_name()
-                .ok()
-                .flatten()
-                .map(|e| {
-                    e.value
-                        .general_names
-                        .iter()
-                        .filter_map(|g| match g {
-                            GeneralName::DNSName(d) => Some(d.to_ascii_lowercase()),
-                            // An address is outside any DNS constraint: refuse it.
-                            GeneralName::IPAddress(_) => Some(String::new()),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            for n in &names {
-                let n = n.trim_start_matches("*.").trim_end_matches('.');
-                if n.is_empty() {
-                    return Err(distrusted(
-                        "the issuing root may not issue for IP addresses (name constraint)",
-                    ));
-                }
-                let allowed = root
-                    .permitted_dns
-                    .iter()
-                    .any(|p| n == p || n.ends_with(&format!(".{p}")));
-                if !allowed {
-                    return Err(distrusted(format!(
-                        "the issuing root may not issue for {n} (name constraint)"
-                    )));
+            let sans = leaf.subject_alternative_name().ok().flatten();
+            for g in sans.iter().flat_map(|e| e.value.general_names.iter()) {
+                match g {
+                    GeneralName::DNSName(d) => {
+                        let n = d
+                            .to_ascii_lowercase()
+                            .trim_start_matches("*.")
+                            .trim_end_matches('.')
+                            .to_string();
+                        if n.is_empty() {
+                            return Err(distrusted("the certificate has an empty DNS name"));
+                        }
+                        let allowed = root
+                            .permitted_dns
+                            .iter()
+                            .any(|p| n == *p || n.ends_with(&format!(".{p}")));
+                        if !allowed {
+                            return Err(distrusted(format!(
+                                "the issuing root may not issue for {n} (name constraint)"
+                            )));
+                        }
+                    }
+                    // An address is outside any DNS constraint: refuse it.
+                    GeneralName::IPAddress(_) => {
+                        return Err(distrusted(
+                            "the issuing root may not issue for IP addresses (name constraint)",
+                        ))
+                    }
+                    _ => {}
                 }
             }
         }
@@ -674,20 +671,38 @@ impl RootsHandle {
         Ok(())
     }
 
-    /// Use these extra CA files from now on (a live config change): the active set is rebuilt
-    /// from the current data and swapped. Unreadable files change nothing.
-    pub fn set_extras(&self, extra_ca_paths: &[PathBuf]) -> Result<()> {
-        let extras = load_extras(extra_ca_paths)?;
+    /// First half of a live change of the extra CA files: read and check them. No side effects;
+    /// the result is applied with [`Self::commit_extras`].
+    pub fn prepare_extras(&self, extra_ca_paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+        let ders = load_extras(extra_ca_paths)?;
+        // Make sure every certificate is usable, so the commit cannot fail.
+        ActiveRoots::floor_with(&ders)?;
+        Ok(ders)
+    }
+
+    /// Second half: rebuild the active set from the current data with these extra CAs and swap
+    /// it in.
+    pub fn commit_extras(&self, extras: Vec<Vec<u8>>) {
         let mut st = self.state.lock();
         if st.extras == extras {
-            return Ok(());
+            return;
         }
         let next = match &st.data {
-            Some(d) => ActiveRoots::from_data(d, &extras)?,
-            None => ActiveRoots::floor_with(&extras)?,
+            Some(d) => ActiveRoots::from_data(d, &extras),
+            None => ActiveRoots::floor_with(&extras),
         };
-        self.active.store(Arc::new(next));
-        st.extras = extras;
+        match next {
+            Ok(n) => {
+                self.active.store(Arc::new(n));
+                st.extras = extras;
+            }
+            Err(e) => tracing::warn!("trusted roots: extra CAs not applied: {e}"),
+        }
+    }
+
+    /// Prepare and commit in one step (tests, and callers with nothing to roll back).
+    pub fn set_extras(&self, extra_ca_paths: &[PathBuf]) -> Result<()> {
+        self.commit_extras(self.prepare_extras(extra_ca_paths)?);
         Ok(())
     }
 }
@@ -844,6 +859,10 @@ impl RootsManager {
         let min = self.min_serial.load(std::sync::atomic::Ordering::Relaxed);
         match self.check(&bytes, &sig).and_then(|d| {
             if d.serial < min {
+                tracing::warn!(
+                    "trusted roots: the cached set (serial {}) is older than the highest ever accepted ({min}); running on the built-in set until the next fetch",
+                    d.serial
+                );
                 return Err(format!(
                     "serial {} is older than {min}, the highest accepted",
                     d.serial
@@ -1882,5 +1901,26 @@ mod tests {
         let leaf = leaf_with_scts(&root, "a.test", &[]);
         let e = handshake(&r.handle, None, &leaf, &[], "a.test").unwrap_err();
         assert_eq!(reason(&e), FailReason::Distrusted);
+    }
+
+    #[test]
+    fn prepared_extras_change_nothing_until_committed() {
+        let private = ca("extra root");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extra.pem");
+        std::fs::write(&path, pem(&private.der)).unwrap();
+        let leaf = leaf_with_scts(&private, "a.test", &[]);
+        let h = RootsHandle::floor(&[]).unwrap();
+        // The extras load (a later prepare step may still fail): the old set stays in force.
+        let prepared = h.prepare_extras(&[path]).unwrap();
+        assert!(handshake(&h, None, &leaf, &[], "a.test").is_err());
+        drop(prepared);
+        assert!(handshake(&h, None, &leaf, &[], "a.test").is_err());
+        // A broken file fails the prepare itself.
+        assert!(h.prepare_extras(&[dir.path().join("missing.pem")]).is_err());
+        // Committing applies them.
+        let ders = h.prepare_extras(&[dir.path().join("extra.pem")]).unwrap();
+        h.commit_extras(ders);
+        handshake(&h, None, &leaf, &[], "a.test").unwrap();
     }
 }
