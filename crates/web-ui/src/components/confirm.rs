@@ -20,6 +20,7 @@ pub fn ConfirmButton(
     let timer = StoredValue::new_local(None::<Timeout>);
     let confirm_label = confirm_label.unwrap_or_else(|| "Confirm".to_string());
     let l1 = label.clone();
+    let sr = format!("{label}: press again to confirm");
     view! {
         <button
             type="button"
@@ -29,7 +30,6 @@ pub fn ConfirmButton(
                 class,
                 if armed.get() { "armed" } else { "" }
             )
-            aria-live="polite"
             disabled=move || disabled.get()
             on:click=move |_| {
                 if armed.get_untracked() {
@@ -46,5 +46,6 @@ pub fn ConfirmButton(
             <Show when=move || !armed.get()><Icon name="trash" /></Show>
             {move || if armed.get() { confirm_label.clone() } else { l1.clone() }}
         </button>
+        <span class="sr-only" aria-live="polite">{move || if armed.get() { sr.clone() } else { String::new() }}</span>
     }
 }

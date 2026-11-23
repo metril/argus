@@ -32,7 +32,10 @@ pub fn LoginPage() -> impl IntoView {
                 Ok(response) => {
                     auth_state.user.set(Some(response.user));
                     auth_state.checked.set(true);
-                    navigate("/", Default::default());
+                    let next = crate::pages::vlist::query_get("next")
+                        .filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains('\\'))
+                        .unwrap_or_else(|| "/".to_string());
+                    navigate(&next, Default::default());
                 }
                 Err(e) => error.set(Some(e.to_string())),
             }

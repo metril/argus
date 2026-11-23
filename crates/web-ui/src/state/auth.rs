@@ -55,18 +55,14 @@ impl AuthState {
             Ok(user) => {
                 self.user.set(Some(user));
             }
-            Err(ApiError::Unauthorized) => {
-                // `me()` already tried a (single-flight) refresh before giving up.
-                self.user.set(None);
-            }
-            Err(ApiError::Forbidden(_)) => {
-                // Access denied - logout
+            // `me()` already tried a (single-flight) refresh before giving up.
+            Err(ApiError::Unauthorized | ApiError::Forbidden(_)) => {
                 self.user.set(None);
             }
             Err(e) => {
-                // Network/server/validation errors should NOT cause logout
-                // Keep user logged in, just log the warning
+                // Network/server errors are not an auth failure: keep the user, surface it.
                 tracing::warn!("Session check failed (transient): {}", e);
+                self.error.set(Some(e.to_string()));
             }
         }
 

@@ -96,6 +96,8 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
     pub fn retry(&self) {
         let had_items = self.items.with_untracked(|v| !v.is_empty());
         self.error.set(None);
+        // A superseded in-flight fetch must not leave `loading` stuck and block the retry.
+        self.loading.set(false);
         if had_items {
             self.more();
         } else {
@@ -163,6 +165,8 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
             me.items.set(all);
             me.next.set(cursor);
             me.total.set(total.unwrap_or(0));
+            me.error.set(None);
+            me.loading.set(false);
         });
     }
 }

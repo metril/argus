@@ -12,19 +12,49 @@ use crate::state::{use_app_state, use_auth_state};
 #[component]
 pub fn Protected(children: Children) -> impl IntoView {
     let auth_state = use_auth_state();
-    let (user, checked) = (auth_state.user, auth_state.checked);
-    if user.get_untracked().is_none() {
+    let (user, checked, error) = (auth_state.user, auth_state.checked, auth_state.error);
+    let check = {
         let auth_state = auth_state.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            auth_state.check_session().await;
-        });
+        move || {
+            let auth_state = auth_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                auth_state.check_session().await;
+            });
+        }
+    };
+    if user.get_untracked().is_none() {
+        check();
     }
+    // Back to the page we were on after signing in.
+    let login_path = {
+        let loc = web_sys::window().map(|w| w.location());
+        let here = loc
+            .and_then(|l| Some(format!("{}{}", l.pathname().ok()?, l.search().ok()?)))
+            .unwrap_or_default();
+        if here.is_empty() || here == "/" {
+            "/login".to_string()
+        } else {
+            format!("/login?next={}", String::from(js_sys::encode_uri_component(&here)))
+        }
+    };
     let slot = StoredValue::new_local(Some(children));
     let authed = Memo::new(move |_| user.with(|u| u.is_some()));
     view! {
         {move || authed.get().then(|| slot.try_update_value(Option::take).flatten().map(|c| c()))}
-        <Show when=move || checked.get() && user.get().is_none()>
-            <Redirect path="/login" />
+        <Show when=move || checked.get() && user.get().is_none() && error.get().is_none()>
+            <Redirect path=login_path.clone() />
+        </Show>
+        <Show when=move || checked.get() && user.get().is_none() && error.get().is_some()>
+            <div class="auth-wrap">
+                <div class="reg-card">
+                    <h2>"Can't reach the server"</h2>
+                    <span class="err" role="alert">{move || error.get().unwrap_or_default()}</span>
+                    <button class="btn primary" type="button" on:click={
+                        let check = check.clone();
+                        move |_| check()
+                    }>"Retry"</button>
+                </div>
+            </div>
         </Show>
     }
 }

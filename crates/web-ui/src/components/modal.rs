@@ -5,12 +5,20 @@ use wasm_bindgen::JsCast;
 
 const FOCUSABLE: &str = "a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex=\"-1\"])";
 
+/// Visible, enabled focusable descendants of `dialog`.
+fn focusables(dialog: &web_sys::HtmlElement) -> Vec<web_sys::HtmlElement> {
+    let Ok(list) = dialog.query_selector_all(FOCUSABLE) else {
+        return Vec::new();
+    };
+    (0..list.length())
+        .filter_map(|i| list.item(i)?.dyn_into::<web_sys::HtmlElement>().ok())
+        .filter(|e| e.offset_parent().is_some() && !e.has_attribute("disabled"))
+        .collect()
+}
+
 /// Keep Tab / Shift+Tab inside `dialog`.
 fn trap_tab(ev: &web_sys::KeyboardEvent, dialog: &web_sys::HtmlElement) {
-    let Ok(list) = dialog.query_selector_all(FOCUSABLE) else { return };
-    let items: Vec<web_sys::HtmlElement> = (0..list.length())
-        .filter_map(|i| list.item(i)?.dyn_into::<web_sys::HtmlElement>().ok())
-        .collect();
+    let items = focusables(dialog);
     let (Some(first), Some(last)) = (items.first(), items.last()) else {
         ev.prevent_default();
         let _ = dialog.focus();
@@ -55,16 +63,19 @@ pub fn Modal(
                 .and_then(|d| d.active_element())
                 .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
             opener.set_value(active);
-            if let Some(d) = dialog_ref.get() {
-                let el: web_sys::HtmlElement = d.into();
-                let target = el
-                    .query_selector(".modal-body input,.modal-body select,.modal-body textarea,.modal-body button")
-                    .ok()
-                    .flatten()
-                    .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-                    .unwrap_or(el);
-                let _ = target.focus();
-            }
+            // Next tick: the overlay is still `display:none` until this update is applied.
+            gloo_timers::callback::Timeout::new(0, move || {
+                if let Some(d) = dialog_ref.get_untracked() {
+                    let el: web_sys::HtmlElement = d.into();
+                    let target = focusables(&el)
+                        .into_iter()
+                        .find(|e| !e.class_name().contains("modal-close"))
+                        .or_else(|| focusables(&el).into_iter().next())
+                        .unwrap_or(el);
+                    let _ = target.focus();
+                }
+            })
+            .forget();
         } else if !now && was_open.unwrap_or(false) {
             if let Some(el) = opener.get_value() {
                 let _ = el.focus();
