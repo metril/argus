@@ -10,6 +10,8 @@
 ARG RUST_VERSION=1.92
 ARG CARGO_CHEF_VERSION=0.1.77
 ARG TRUNK_VERSION=0.21.14
+# Must match the wasm-bindgen crate version in Cargo.lock (checked in the webui-builder stage)
+ARG WASM_BINDGEN_VERSION=0.2.125
 
 # Stage 1: Chef base - stable Rust on musl + cargo-chef
 FROM rust:${RUST_VERSION}-alpine3.21 AS chef
@@ -63,6 +65,7 @@ RUN cp /build/target/release/adblocker /build/adblocker && \
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-alpine3.21 AS webui-builder
 
 ARG TRUNK_VERSION
+ARG WASM_BINDGEN_VERSION
 ARG BUILDARCH
 RUN apk add --no-cache musl-dev gcc curl && \
     case "$BUILDARCH" in \
@@ -72,6 +75,9 @@ RUN apk add --no-cache musl-dev gcc curl && \
     esac && \
     curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-${TRUNK_ARCH}-unknown-linux-musl.tar.gz" \
       | tar -xzf - -C /usr/local/bin && \
+    curl -fsSL "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-${TRUNK_ARCH}-unknown-linux-musl.tar.gz" \
+      | tar -xzf - -C /usr/local/bin --strip-components=1 \
+        "wasm-bindgen-${WASM_BINDGEN_VERSION}-${TRUNK_ARCH}-unknown-linux-musl/wasm-bindgen" && \
     rustup target add wasm32-unknown-unknown
 
 WORKDIR /build
@@ -79,6 +85,11 @@ WORKDIR /build
 # Copy workspace files (full workspace needed for cargo metadata)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+
+# trunk would download a glibc wasm-bindgen on arm64 (cannot run on musl), so a musl build is
+# installed above and trunk uses it from PATH; fail early if it drifts from Cargo.lock.
+RUN grep -A1 '^name = "wasm-bindgen"$' /build/Cargo.lock | grep -q "version = \"${WASM_BINDGEN_VERSION}\"" \
+    && wasm-bindgen --version
 
 # Build WebUI (wasm-opt disabled via index.html data-wasm-opt="0")
 WORKDIR /build/crates/web-ui
