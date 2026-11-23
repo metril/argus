@@ -10627,6 +10627,101 @@
         ]
       }
     },
+    "/api/v1/downloads/extension/{browser}": {
+      "get": {
+        "operationId": "download_extension",
+        "parameters": [
+          {
+            "description": "`chrome` or `firefox`",
+            "in": "path",
+            "name": "browser",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "items": {
+                    "format": "int32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Extension package (zip, or signed xpi for Firefox)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "404": {
+            "description": "Unknown browser or no release asset for this version"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
+          "502": {
+            "description": "Release server unreachable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "system:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "system:read"
+            ]
+          }
+        ],
+        "summary": "Download the browser extension build matching this Argus version.",
+        "tags": [
+          "ca"
+        ]
+      }
+    },
     "/api/v1/engine/build": {
       "get": {
         "operationId": "get_build_summary",

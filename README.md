@@ -844,7 +844,7 @@ match engine.trigger_update().await {
 
 ## Userscripts
 
-Tampermonkey/Violentmonkey-style userscripts run in the page, injected by the proxy. There is no
+Tampermonkey/Violentmonkey-style userscripts run in the page, injected by the proxy. They need no
 browser extension: the proxy rewrites HTML responses and answers a small backend itself.
 
 ### How it works
@@ -939,6 +939,14 @@ service_worker_policy = "block_when_privileged"  # allow | block_when_privileged
 
 Stored scripts from before the rewrite (`resources` map format) cannot be read; they are dropped
 with a log line when the database is loaded.
+
+## Browser extension
+
+An optional extension shows the real upstream certificate Argus saw for the current site and flags invalid ones. It needs an Argus API token with the `logs:read` scope (Settings, API tokens) and the Argus URL, entered in the extension's options.
+
+- Download `argus-extension-<version>-chrome.zip` or `-firefox` from the [Releases](https://github.com/metril/argus/releases) page (checksums in `SHA256SUMS`).
+- **Chrome/Chromium**: unzip, open `chrome://extensions`, enable Developer mode, "Load unpacked", select the folder.
+- **Firefox**: install the signed `.xpi` if the release has one (Firefox 140 or newer). Otherwise load the zip temporarily from `about:debugging#/runtime/this-firefox` ("Load Temporary Add-on"); it is removed on restart.
 
 ## Per-device profiles
 

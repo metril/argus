@@ -10,8 +10,8 @@ use utoipa_axum::{
 };
 
 use crate::handlers::{
-    audit, auth, bypass, certificate, certs, devices, health, lists, policy, profiles, proxy,
-    rules, stats, tokens, users, userscripts,
+    audit, auth, bypass, certificate, certs, devices, downloads, health, lists, policy, profiles,
+    proxy, rules, stats, tokens, users, userscripts,
 };
 use crate::state::AppState;
 
@@ -31,6 +31,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(certificate::download_ca))
         .routes(routes!(certificate::download_ca_der))
         .routes(routes!(certificate::ca_info))
+        .routes(routes!(downloads::download_extension))
         // upstream certificates
         .routes(routes!(certs::get_cert))
         .routes(routes!(certs::get_cert_by_host))

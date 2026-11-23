@@ -127,7 +127,7 @@ fn fetch_err(msg: impl Into<String>) -> ApiError {
     ApiError::coded(StatusCode::BAD_GATEWAY, "fetch_failed", msg)
 }
 
-fn policy(state: &AppState) -> ApiResult<Arc<NetPolicy>> {
+pub(crate) fn policy(state: &AppState) -> ApiResult<Arc<NetPolicy>> {
     match state.list_service.fetch_policy() {
         Some(p) => Ok(p.clone()),
         None => NetPolicy::control_plane(&[])

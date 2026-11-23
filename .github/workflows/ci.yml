@@ -161,6 +161,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: extension/package-lock.json
+      - name: Extension version matches the Cargo workspace version
+        run: |
+          cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' ../Cargo.toml | head -n1)
+          ext_version=$(node -p "require('./package.json').version")
+          [ "$cargo_version" = "$ext_version" ] || { echo "::error::extension $ext_version != Cargo $cargo_version"; exit 1; }
       - run: npm ci
       - run: npm run typecheck
       - run: npx wxt build -b chrome && npx wxt zip -b chrome

@@ -10,6 +10,7 @@ pub mod bypass;
 pub mod certificate;
 pub mod certs;
 pub mod devices;
+pub mod downloads;
 pub mod health;
 pub mod lists;
 pub mod paging;
