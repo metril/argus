@@ -202,6 +202,11 @@ impl ProxyControl {
                     .map_err(|e| Error::Internal(e.to_string()))??,
             );
         }
+        // A live change of the extra CAs takes effect for the next handshake (a broken file
+        // rejects the change before anything is applied).
+        if let Some(roots) = self.ctx.roots() {
+            roots.set_extras(&config.proxy.extra_upstream_ca_paths)?;
+        }
         #[cfg(feature = "websockets")]
         let mut new_ws = None;
         #[cfg(feature = "websockets")]

@@ -199,7 +199,8 @@ impl RootsData {
                 "qualified" => LogState::Qualified,
                 "readonly" => LogState::ReadOnly,
                 "retired" => LogState::Retired,
-                other => return Err(format!("ct log: unknown state {other:?}")),
+                // pending, rejected or a state added later: not a log whose receipts count.
+                _ => continue,
             };
             ct_logs.push(CtLog {
                 id: want,
@@ -296,11 +297,9 @@ pub struct ActiveRoots {
     sct_cache: moka::sync::Cache<String, Option<u64>>,
 }
 
-fn read_extras(
-    extra_ca_paths: &[PathBuf],
-    store: &mut rustls::RootCertStore,
-    extra: &mut Index,
-) -> Result<()> {
+/// The DER certificates of PEM files of extra CAs, read once.
+pub fn load_extras(extra_ca_paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
     for path in extra_ca_paths {
         let pem = std::fs::read(path).map_err(|e| {
             Error::Config(format!(
@@ -313,10 +312,7 @@ fn read_extras(
             let cert = cert.map_err(|e| {
                 Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
             })?;
-            index_insert(extra, RootEntry::bundled_owned(cert.as_ref().to_vec()));
-            store.add(cert).map_err(|e| {
-                Error::Config(format!("Invalid upstream CA {}: {e}", path.display()))
-            })?;
+            out.push(cert.as_ref().to_vec());
             n += 1;
         }
         if n == 0 {
@@ -325,6 +321,20 @@ fn read_extras(
                 path.display()
             )));
         }
+    }
+    Ok(out)
+}
+
+fn add_extras(
+    ders: &[Vec<u8>],
+    store: &mut rustls::RootCertStore,
+    extra: &mut Index,
+) -> Result<()> {
+    for der in ders {
+        store
+            .add(CertificateDer::from(der.clone()))
+            .map_err(|e| Error::Config(format!("Invalid upstream CA: {e}")))?;
+        index_insert(extra, RootEntry::bundled_owned(der.clone()));
     }
     Ok(())
 }
@@ -365,16 +375,21 @@ impl ActiveRoots {
 
     /// The compiled-in set plus the extra CAs.
     pub fn floor(extra_ca_paths: &[PathBuf]) -> Result<Self> {
+        Self::floor_with(&load_extras(extra_ca_paths)?)
+    }
+
+    /// The compiled-in set plus already-read extra CAs.
+    pub fn floor_with(extras: &[Vec<u8>]) -> Result<Self> {
         let mut store = rustls::RootCertStore::empty();
         store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut extra = Index::new();
-        read_extras(extra_ca_paths, &mut store, &mut extra)?;
+        add_extras(extras, &mut store, &mut extra)?;
         let n = webpki_roots::TLS_SERVER_ROOTS.len();
         Ok(Self::new(store, floor_index(), extra, None, n))
     }
 
     /// A signed set plus the extra CAs.
-    pub fn from_data(data: &RootsData, extra_ca_paths: &[PathBuf]) -> Result<Self> {
+    pub fn from_data(data: &RootsData, extras: &[Vec<u8>]) -> Result<Self> {
         let mut store = rustls::RootCertStore::empty();
         let mut base = Index::new();
         for r in &data.roots {
@@ -385,7 +400,7 @@ impl ActiveRoots {
             index_insert(&mut base, r.clone());
         }
         let mut extra = Index::new();
-        read_extras(extra_ca_paths, &mut store, &mut extra)?;
+        add_extras(extras, &mut store, &mut extra)?;
         Ok(Self::new(
             store,
             Arc::new(base),
@@ -405,7 +420,9 @@ impl ActiveRoots {
             anchor.subject.as_ref(),
             anchor.subject_public_key_info.as_ref(),
         );
-        self.extra.get(&k).or_else(|| self.base.get(&k))
+        // The set's own entry first: an extra CA identical to a public root must not drop that
+        // root's rules.
+        self.base.get(&k).or_else(|| self.extra.get(&k))
     }
 
     /// The genuine certificate of the root `anchor`, if it is in this set. One hash probe.
@@ -447,17 +464,39 @@ impl ActiveRoots {
             }
         };
         let ee = webpki::EndEntityCert::try_from(end_entity).map_err(|_| standard())?;
-        let path = ee
-            .verify_for_usage(
-                self.algs.all,
-                &self.store.roots,
-                intermediates,
-                now,
-                webpki::KeyUsage::server_auth(),
-                None,
-                None,
-            )
-            .map_err(|_| standard())?;
+        // The anchor's rules run inside the path search: a path that breaks them is rejected
+        // and webpki keeps looking (another intermediate, another anchor).
+        let rule_err: std::cell::RefCell<Option<rustls::Error>> = Default::default();
+        let rules = |p: &webpki::VerifiedPath<'_>| -> std::result::Result<(), webpki::Error> {
+            let Some(entry) = self.entry(p.anchor()) else {
+                return Ok(());
+            };
+            if !entry.has_rules() {
+                return Ok(());
+            }
+            let first = p.intermediate_certificates().next().map(|c| c.der());
+            let issuer = first.as_ref().map_or(entry.der.as_ref(), |d| d.as_ref());
+            match self.enforce(entry, end_entity.as_ref(), issuer, now) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    *rule_err.borrow_mut() = Some(e);
+                    Err(webpki::Error::UnknownIssuer)
+                }
+            }
+        };
+        let path = match ee.verify_for_usage(
+            self.algs.all,
+            &self.store.roots,
+            intermediates,
+            now,
+            webpki::KeyUsage::server_auth(),
+            None,
+            Some(&rules),
+        ) {
+            Ok(p) => p,
+            // Every path failed: name a rule that rejected one, else the standard reason.
+            Err(_) => return Err(rule_err.take().unwrap_or_else(standard)),
+        };
         ee.verify_is_valid_for_subject_name(server_name)
             .map_err(|_| standard())?;
 
@@ -473,16 +512,19 @@ impl ActiveRoots {
         }
         if let Some(entry) = self.entry(path.anchor()) {
             out.push(entry.der.as_ref());
-            if entry.has_rules() {
-                self.enforce(entry, &out)?;
-            }
         }
         Ok(out)
     }
 
-    /// The anchor's rules for the verified `path` (leaf first, anchor last).
-    fn enforce(&self, root: &RootEntry, path: &[&[u8]]) -> std::result::Result<(), rustls::Error> {
-        let leaf_der = path[0];
+    /// The anchor's rules for a candidate path: the leaf and its issuer (the first intermediate
+    /// or the root itself).
+    fn enforce(
+        &self,
+        root: &RootEntry,
+        leaf_der: &[u8],
+        issuer: &[u8],
+        now: UnixTime,
+    ) -> std::result::Result<(), rustls::Error> {
         let (_, leaf) = x509_parser::parse_x509_certificate(leaf_der)
             .map_err(|_| distrusted("leaf certificate cannot be read"))?;
         if let Some(limit) = root.distrust_after {
@@ -504,6 +546,8 @@ impl ActiveRoots {
                         .iter()
                         .filter_map(|g| match g {
                             GeneralName::DNSName(d) => Some(d.to_ascii_lowercase()),
+                            // An address is outside any DNS constraint: refuse it.
+                            GeneralName::IPAddress(_) => Some(String::new()),
                             _ => None,
                         })
                         .collect()
@@ -511,6 +555,11 @@ impl ActiveRoots {
                 .unwrap_or_default();
             for n in &names {
                 let n = n.trim_start_matches("*.").trim_end_matches('.');
+                if n.is_empty() {
+                    return Err(distrusted(
+                        "the issuing root may not issue for IP addresses (name constraint)",
+                    ));
+                }
                 let allowed = root
                     .permitted_dns
                     .iter()
@@ -522,11 +571,11 @@ impl ActiveRoots {
                 }
             }
         }
-        if let Some(limit) = root.sct_not_after {
-            // The issuer is the next certificate of the path (an intermediate or the root).
-            let issuer = path
-                .get(1)
-                .ok_or_else(|| distrusted("no issuer for the receipt check"))?;
+        // Until the date has passed, the receipt rule is not in force yet.
+        if let Some(limit) = root
+            .sct_not_after
+            .filter(|l| i64::try_from(now.as_secs()).is_ok_and(|n| n > *l))
+        {
             let fp = common::certstore::fingerprint(leaf_der);
             let earliest = self.sct_cache.get_with(fp, || {
                 let spki = x509_parser::parse_x509_certificate(issuer)
@@ -554,17 +603,24 @@ impl ActiveRoots {
 
 // ---------------------------------------------------------------- live handle
 
+/// What the active set is built from: the signed data (if any) and the extra CAs, read once.
+struct HandleState {
+    data: Option<Arc<RootsData>>,
+    extras: Vec<Vec<u8>>,
+}
+
 /// The active root set, swappable at any time, with its status.
 pub struct RootsHandle {
     active: ArcSwap<ActiveRoots>,
-    extras: Vec<PathBuf>,
+    state: parking_lot::Mutex<HandleState>,
     pub cell: Arc<RootsStatusCell>,
 }
 
 impl RootsHandle {
     /// Start on the compiled-in floor plus the extra CAs.
     pub fn floor(extra_ca_paths: &[PathBuf]) -> Result<Arc<Self>> {
-        let a = ActiveRoots::floor(extra_ca_paths)?;
+        let extras = load_extras(extra_ca_paths)?;
+        let a = ActiveRoots::floor_with(&extras)?;
         let cell = Arc::new(RootsStatusCell::default());
         *cell.status.write() = RootsStatus {
             serial: a.serial,
@@ -574,7 +630,7 @@ impl RootsHandle {
         };
         Ok(Arc::new(Self {
             active: ArcSwap::from_pointee(a),
-            extras: extra_ca_paths.to_vec(),
+            state: parking_lot::Mutex::new(HandleState { data: None, extras }),
             cell,
         }))
     }
@@ -596,7 +652,8 @@ impl RootsHandle {
 
     /// Replace the set with a validated one. Fails (changing nothing) unless its serial is
     /// greater than the one in force and the floor.
-    pub fn install(&self, data: &RootsData) -> std::result::Result<(), String> {
+    pub fn install(&self, data: Arc<RootsData>) -> std::result::Result<(), String> {
+        let mut st = self.state.lock();
         let cur = self.serial();
         if data.serial <= cur || data.serial <= FLOOR_SERIAL {
             return Err(format!(
@@ -604,15 +661,33 @@ impl RootsHandle {
                 data.serial, cur
             ));
         }
-        let next = ActiveRoots::from_data(data, &self.extras).map_err(|e| e.to_string())?;
+        let next = ActiveRoots::from_data(&data, &st.extras).map_err(|e| e.to_string())?;
         let (serial, roots) = (next.serial, next.root_count);
         self.active.store(Arc::new(next));
+        st.data = Some(data);
         let mut s = self.cell.status.write();
         s.serial = serial;
         s.roots = roots;
         s.signed = true;
         s.updated_at = Some(chrono::Utc::now().to_rfc3339());
         s.last_error = None;
+        Ok(())
+    }
+
+    /// Use these extra CA files from now on (a live config change): the active set is rebuilt
+    /// from the current data and swapped. Unreadable files change nothing.
+    pub fn set_extras(&self, extra_ca_paths: &[PathBuf]) -> Result<()> {
+        let extras = load_extras(extra_ca_paths)?;
+        let mut st = self.state.lock();
+        if st.extras == extras {
+            return Ok(());
+        }
+        let next = match &st.data {
+            Some(d) => ActiveRoots::from_data(d, &extras)?,
+            None => ActiveRoots::floor_with(&extras)?,
+        };
+        self.active.store(Arc::new(next));
+        st.extras = extras;
         Ok(())
     }
 }
@@ -702,6 +777,8 @@ pub struct RootsManager {
     base_url: String,
     public_key: String,
     cache_dir: Option<PathBuf>,
+    /// Highest serial ever accepted, kept apart from the cache so it outlives it.
+    min_serial: std::sync::atomic::AtomicU64,
     /// One check at a time.
     busy: tokio::sync::Mutex<()>,
 }
@@ -729,6 +806,7 @@ impl RootsManager {
             base_url: cfg.base_url.clone(),
             public_key: cfg.public_key.clone(),
             cache_dir: cfg.cache_dir.clone(),
+            min_serial: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
     }
@@ -749,16 +827,30 @@ impl RootsManager {
         let Some(dir) = &self.cache_dir else {
             return;
         };
+        // The highest serial ever accepted: enforced even when the cache itself is gone.
+        if let Some(n) = std::fs::read_to_string(dir.join("roots.serial"))
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+        {
+            self.min_serial
+                .fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+        }
         let (Ok(bytes), Ok(sig)) = (
             std::fs::read(dir.join("roots.json")),
             std::fs::read_to_string(dir.join("roots.json.minisig")),
         ) else {
             return;
         };
-        match self
-            .check(&bytes, &sig)
-            .and_then(|d| self.handle.install(&d))
-        {
+        let min = self.min_serial.load(std::sync::atomic::Ordering::Relaxed);
+        match self.check(&bytes, &sig).and_then(|d| {
+            if d.serial < min {
+                return Err(format!(
+                    "serial {} is older than {min}, the highest accepted",
+                    d.serial
+                ));
+            }
+            self.handle.install(Arc::new(d))
+        }) {
             Ok(()) => tracing::info!(
                 "trusted roots: serial {} from the cache",
                 self.handle.serial()
@@ -792,8 +884,10 @@ impl RootsManager {
     fn finish<T>(&self, r: std::result::Result<T, String>) -> std::result::Result<T, String> {
         let mut s = self.handle.cell.status.write();
         s.last_checked = Some(chrono::Utc::now().to_rfc3339());
-        if let Err(e) = &r {
-            s.last_error = Some(e.clone());
+        match &r {
+            Err(e) => s.last_error = Some(e.clone()),
+            // A good check ends the earlier failure.
+            Ok(_) => s.last_error = None,
         }
         r
     }
@@ -821,21 +915,37 @@ impl RootsManager {
         if data.serial == cur && cur > FLOOR_SERIAL {
             return Ok(RootsOutcome::Current { serial: cur });
         }
-        // Rollback protection and the build both live in `install`.
-        self.handle.install(&data)?;
+        // Never go below the highest serial ever accepted (it outlives the cache).
+        let min = self.min_serial.load(std::sync::atomic::Ordering::Relaxed);
+        if data.serial < min {
+            return Err(format!(
+                "serial {} is older than {min}, the highest ever accepted; not installing it",
+                data.serial
+            ));
+        }
+        let serial = data.serial;
+        // The rest of the rollback protection and the build live in `install`.
+        self.handle.install(Arc::new(data))?;
+        self.min_serial
+            .fetch_max(serial, std::sync::atomic::Ordering::Relaxed);
         if let Some(dir) = self.cache_dir.clone() {
             let (t, s) = (text.into_bytes(), sig.into_bytes());
-            tokio::task::spawn_blocking(move || {
-                // The signature last: a half-written cache fails verification, never lies.
+            let written = tokio::task::spawn_blocking(move || {
+                // The serial first, then the data, the signature last: a half-written cache
+                // fails verification, never lies.
+                atomic_write(&dir.join("roots.serial"), serial.to_string().as_bytes())?;
                 atomic_write(&dir.join("roots.json"), &t)?;
                 atomic_write(&dir.join("roots.json.minisig"), &s)
             })
             .await
-            .map_err(|e| e.to_string())??;
+            .map_err(|e| e.to_string())
+            .and_then(|r| r);
+            // The set is already in force: a cache that cannot be written is only a warning.
+            if let Err(e) = written {
+                tracing::warn!("trusted roots: could not cache serial {serial}: {e}");
+            }
         }
-        Ok(RootsOutcome::Installed {
-            serial: data.serial,
-        })
+        Ok(RootsOutcome::Installed { serial })
     }
 
     /// Load the cache now, then keep the set current: retry with backoff until the first
@@ -1003,6 +1113,7 @@ mod tests {
             base_url: "http://unused.test".into(),
             public_key: key.to_string(),
             cache_dir: Some(cache.to_path_buf()),
+            min_serial: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
     }
@@ -1152,7 +1263,7 @@ mod tests {
         // Rollback: validly signed, lower serial.
         let older = roots_json(FLOOR_SERIAL + 3, &[], &[], MIN_ROOTS);
         let e = r.push(&older).await.unwrap_err();
-        assert!(e.contains("not newer"), "{e}");
+        assert!(e.contains("older than") || e.contains("not newer"), "{e}");
         keep(&r);
         // Fewer roots than allowed.
         let few = roots_json(FLOOR_SERIAL + 30, &[], &[], MIN_ROOTS - 1);
@@ -1539,5 +1650,237 @@ mod tests {
         // at t_s - 50, so a receipt at T (later) is ignored.
         assert!(run(T, &other, false, "e.test").is_err());
         run(T - 100_000, &other, false, "f.test").unwrap();
+    }
+
+    fn pem(der: &[u8]) -> String {
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            b64(der)
+        )
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_rejects_one_path_lets_webpki_find_another() {
+        let (constrained, open) = (ca("constrained root"), ca("open root"));
+        let r = rig();
+        r.push(&roots_json(
+            FLOOR_SERIAL + 1,
+            &[
+                // Receipts required since 2000: a leaf without one fails under this root.
+                Root {
+                    sct_not_after: Some("2000-01-01T00:00:00Z"),
+                    ..Root::plain(&constrained.der)
+                },
+                Root::plain(&open.der),
+            ],
+            &[],
+            MIN_ROOTS,
+        ))
+        .await
+        .unwrap();
+        let p = inter_params();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let der = key.serialize_der();
+        let via_constrained = p.signed_by(&key, &constrained.issuer).unwrap();
+        let via_open = inter_params()
+            .signed_by(
+                &rcgen::KeyPair::try_from(der.as_slice()).unwrap(),
+                &open.issuer,
+            )
+            .unwrap();
+        let inter = rcgen::Issuer::new(p, key);
+        let leaf = leaf_under(&inter, "good.test");
+
+        // Both cross-signs presented: the unconstrained path is found and is what is stored.
+        let store = Arc::new(CertStore::default());
+        let both = [via_constrained.der().to_vec(), via_open.der().to_vec()];
+        handshake(&r.handle, Some(&store), &leaf, &both, "good.test").unwrap();
+        let chain = store.info(&fingerprint(&leaf), None).unwrap().chain;
+        assert_eq!(chain[1].fp, fingerprint(via_open.der()));
+        assert_eq!(chain[2].fp, fingerprint(&open.der));
+
+        // Only the constrained one: nothing else to try, so the rule's reason is named.
+        let only = [via_constrained.der().to_vec()];
+        let e = handshake(&r.handle, None, &leaf, &only, "good.test").unwrap_err();
+        assert_eq!(reason(&e), FailReason::Distrusted);
+    }
+
+    #[tokio::test]
+    async fn a_receipt_rule_with_a_future_date_is_not_in_force_yet() {
+        let root = ca("future root");
+        let r = rig();
+        r.push(&roots_json(
+            FLOOR_SERIAL + 1,
+            &[Root {
+                sct_not_after: Some(FAR),
+                ..Root::plain(&root.der)
+            }],
+            &[],
+            MIN_ROOTS,
+        ))
+        .await
+        .unwrap();
+        // No receipt at all, yet fine: the date has not passed.
+        handshake(
+            &r.handle,
+            None,
+            &leaf_with_scts(&root, "a.test", &[]),
+            &[],
+            "a.test",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn logs_in_an_unknown_state_are_skipped_not_fatal() {
+        let r = rig();
+        let (known, odd) = (TestLog::new(), TestLog::new());
+        let body = roots_json(
+            FLOOR_SERIAL + 1,
+            &[],
+            &[
+                (&known, "usable", 0),
+                (&odd, "pending", 0),
+                (&odd, "rejected", 0),
+                (&odd, "from-the-future", 0),
+            ],
+            MIN_ROOTS,
+        );
+        r.push(&body).await.expect("the file still installs");
+        let d = RootsData::parse(body.as_bytes()).unwrap();
+        assert_eq!(d.ct_logs.len(), 1, "only the usable log is kept");
+    }
+
+    #[tokio::test]
+    async fn extra_cas_can_change_live_and_a_broken_file_blocks_nothing() {
+        let private = ca("extra root");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extra.pem");
+        std::fs::write(&path, pem(&private.der)).unwrap();
+        let leaf = leaf_with_scts(&private, "a.test", &[]);
+        let h = RootsHandle::floor(&[]).unwrap();
+        assert!(handshake(&h, None, &leaf, &[], "a.test").is_err());
+        h.set_extras(std::slice::from_ref(&path)).unwrap();
+        handshake(&h, None, &leaf, &[], "a.test").unwrap();
+
+        // The files are read once: removing one blocks neither a signed install nor the CA.
+        std::fs::remove_file(&path).unwrap();
+        let (pk, sk) = keypair();
+        let m = manager_for(&h, &pk_b64(&pk), dir.path());
+        let body = roots_json(FLOOR_SERIAL + 1, &[], &[], MIN_ROOTS);
+        let sig = sign(&sk, &pk, body.as_bytes());
+        m.refresh_from(body, sig).await.unwrap();
+        handshake(&h, None, &leaf, &[], "a.test").unwrap();
+        // A broken file is refused and changes nothing.
+        assert!(h.set_extras(&[path]).is_err());
+        handshake(&h, None, &leaf, &[], "a.test").unwrap();
+        // Dropping the extras removes the trust again.
+        h.set_extras(&[]).unwrap();
+        assert!(handshake(&h, None, &leaf, &[], "a.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_highest_serial_survives_a_lost_cache() {
+        let r = rig();
+        r.push(&roots_json(FLOOR_SERIAL + 9, &[], &[], MIN_ROOTS))
+            .await
+            .unwrap();
+        std::fs::remove_file(r.dir.path().join("roots.json")).unwrap();
+        std::fs::remove_file(r.dir.path().join("roots.json.minisig")).unwrap();
+        assert!(r.dir.path().join("roots.serial").exists());
+
+        let fresh = RootsHandle::floor(&[]).unwrap();
+        let m = manager_for(&fresh, &pk_b64(&r.pk), r.dir.path());
+        m.init_cache();
+        assert_eq!(fresh.serial(), FLOOR_SERIAL, "nothing cached to load");
+        let older = roots_json(FLOOR_SERIAL + 4, &[], &[], MIN_ROOTS);
+        let sig = sign(&r.sk, &r.pk, older.as_bytes());
+        let e = m.refresh_from(older, sig).await.unwrap_err();
+        assert!(e.contains("highest ever accepted"), "{e}");
+        let newer = roots_json(FLOOR_SERIAL + 10, &[], &[], MIN_ROOTS);
+        let sig = sign(&r.sk, &r.pk, newer.as_bytes());
+        m.refresh_from(newer, sig).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_good_check_clears_the_error_and_a_cache_failure_is_only_a_warning() {
+        let r = rig();
+        assert!(r.push("not json").await.is_err());
+        assert!(r.handle.cell.status.read().last_error.is_some());
+        r.push(&roots_json(FLOOR_SERIAL + 1, &[], &[], MIN_ROOTS))
+            .await
+            .unwrap();
+        assert!(r.handle.cell.status.read().last_error.is_none());
+        // A Current outcome ends an earlier failure too.
+        assert!(r.push("still not json").await.is_err());
+        let same = roots_json(FLOOR_SERIAL + 1, &[], &[], MIN_ROOTS);
+        assert_eq!(
+            r.push(&same).await.unwrap(),
+            RootsOutcome::Current {
+                serial: FLOOR_SERIAL + 1
+            }
+        );
+        assert!(r.handle.cell.status.read().last_error.is_none());
+
+        // The cache directory is a file: nothing can be written, yet the set installs.
+        let blocker = tempfile::NamedTempFile::new().unwrap();
+        let h = RootsHandle::floor(&[]).unwrap();
+        let (pk, sk) = keypair();
+        let m = manager_for(&h, &pk_b64(&pk), blocker.path());
+        let body = roots_json(FLOOR_SERIAL + 2, &[], &[], MIN_ROOTS);
+        let sig = sign(&sk, &pk, body.as_bytes());
+        m.refresh_from(body, sig).await.unwrap();
+        assert_eq!(h.serial(), FLOOR_SERIAL + 2);
+        assert!(h.cell.status.read().last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn ip_addresses_are_refused_under_a_dns_constrained_root() {
+        let root = ca("constrained root");
+        let r = rig();
+        r.push(&roots_json(
+            FLOOR_SERIAL + 1,
+            &[Root {
+                permitted: vec!["example.test"],
+                ..Root::plain(&root.der)
+            }],
+            &[],
+            MIN_ROOTS,
+        ))
+        .await
+        .unwrap();
+        let mut p = rcgen::CertificateParams::new(vec!["a.example.test".to_string()]).unwrap();
+        p.subject_alt_names
+            .push(rcgen::SanType::IpAddress("192.0.2.7".parse().unwrap()));
+        p.distinguished_name
+            .push(rcgen::DnType::CommonName, "a.example.test");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = p.signed_by(&key, &root.issuer).unwrap().der().to_vec();
+        let e = handshake(&r.handle, None, &leaf, &[], "a.example.test").unwrap_err();
+        assert_eq!(reason(&e), FailReason::Distrusted);
+    }
+
+    #[tokio::test]
+    async fn an_extra_ca_equal_to_a_public_root_keeps_that_roots_rules() {
+        let root = ca("ruled root");
+        let r = rig();
+        r.push(&roots_json(
+            FLOOR_SERIAL + 1,
+            &[Root {
+                distrust_after: Some("1970-01-01T00:00:00Z"),
+                ..Root::plain(&root.der)
+            }],
+            &[],
+            MIN_ROOTS,
+        ))
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same.pem");
+        std::fs::write(&path, pem(&root.der)).unwrap();
+        r.handle.set_extras(&[path]).unwrap();
+        let leaf = leaf_with_scts(&root, "a.test", &[]);
+        let e = handshake(&r.handle, None, &leaf, &[], "a.test").unwrap_err();
+        assert_eq!(reason(&e), FailReason::Distrusted);
     }
 }
