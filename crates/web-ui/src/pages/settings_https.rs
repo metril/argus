@@ -196,7 +196,7 @@ pub fn HttpsCard() -> impl IntoView {
         <div class="card" id="set-https">
             <div class="card-h"><h3>"HTTPS"</h3><span class="sub">"Serve the web UI over TLS on the same port. Applied live; no restart."</span></div>
             <div class="card-b">
-                <fieldset class="https-modes" style="border:0;padding:0;margin:0 0 var(--s3)">
+                <fieldset style="border:0;padding:0;margin:0 0 var(--s3)">
                     <legend class="lname">"Certificate"</legend>
                     {[("off", "Off", "Plain HTTP. Use this behind a reverse proxy that terminates TLS."),
                       ("argus_ca", "Issued by the Argus CA", "Valid for 397 days and renewed automatically. Browsers must trust the Argus CA."),
