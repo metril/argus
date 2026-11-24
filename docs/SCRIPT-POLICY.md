@@ -300,8 +300,22 @@ visibility), re-asserted before each click; the badge and the open menu are rend
 host's and the root's computed style (opacity, transform, filter, visibility, display, clip-path,
 pointer-events) and the badge's size and anchor, and ignores the click if anything is off; menu items
 ignore clicks in the first 400 ms after the menu opens (a page cannot swap the menu under a click);
-and only trusted clicks count. A page can still cover the badge with its own later top-layer element
-(a dialog); a click then lands on the page's element, not on ours.
+and only trusted clicks count. Before acting, ours is re-raised to the top of the top layer (hide,
+then show) and a hit test (`elementsFromPoint` at the clicked element's centre) must return our host
+first; the anchor check uses `documentElement.clientWidth/Height`, so a classic scrollbar does not
+trip it; the ancestor (`html`) opacity/filter/transform check runs only without popover support.
+**Built-ins are captured at document start.** The UI is built lazily, after page scripts may have
+run, so every built-in it uses (`addEventListener`, `createElement`, `attachShadow`,
+`getBoundingClientRect`, `getComputedStyle`, `CSSStyleDeclaration` methods, `showPopover`,
+`MutationObserver`, `setTimeout`, `Date.now`, the property getters) is saved when the runtime
+installs and called only through `Reflect.apply`. A page that hooks `addEventListener` afterwards
+captures no handler, one that hooks `attachShadow` never sees the shadow root, and one that replaces
+`getComputedStyle` cannot fake the checks. `isTrusted` is read through the getter saved from a real
+event, so a fake `{isTrusted: true}` object is refused. The code reads no property of an object
+literal and no array method, so `Object.prototype`/`Array.prototype` pollution is inert. After the
+20-per-second re-attach cap a retry is scheduled for the end of the window. A page can still cover
+the badge with its own later top-layer element (a dialog); a click then lands on the page's
+element, not on ours.
 
 ### Authority: why the panel cannot change anything
 

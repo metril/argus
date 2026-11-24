@@ -2,15 +2,60 @@
    command registry is never reachable from page code: `reg` is a closure variable handed to this
    function once. It shows a small corner badge listing the GM_registerMenuCommand entries of the
    page's scripts, grouped by script, in a closed shadow root (no innerHTML, no inline handlers, no
-   eval, no network). Defences against a hostile page (clickjacking): inline !important styles on
-   the host, top-layer rendering, a computed-style/geometry check before every click, trusted
-   clicks only, and items ignored for 400 ms after the menu opens. See docs/SCRIPT-POLICY.md. */
+   eval, no network).
+   Hostile-page defences: every built-in used is captured here, at document start, and only ever
+   called through Reflect.apply (the page cannot hook addEventListener/attachShadow/
+   getComputedStyle to capture handlers or fake the checks); no property of an object literal or
+   array method is read that Object.prototype/Array.prototype pollution could change; clicks count
+   only when a saved Event isTrusted getter says so; the host has inline !important styles; the
+   badge and open menu are re-raised in the top layer before each click; a computed-style, geometry
+   and hit-test check runs before each click; items ignore clicks for 400 ms after the menu opens.
+   See docs/SCRIPT-POLICY.md. */
 function (W, reg, mode, nonce) {
   "use strict";
-  var D = W.document;
   if (mode !== "always" && mode !== "on_demand") { return; }
   if (mode === "always") { try { if (W !== W.top) { mode = "on_demand"; } } catch (e) { mode = "on_demand"; } }
-  var always = mode === "always", now = Date.now.bind(Date);
+  var apply = Reflect.apply, gopd = Object.getOwnPropertyDescriptor, Str = String, pf = parseFloat, abs = Math.abs, dnow = Date.now, DateC = Date;
+  var D = W.document, always = mode === "always";
+  function pr(c) { try { return c && c.prototype; } catch (e) { return null; } }
+  function fn(p, n) { var f; try { f = p && p[n]; } catch (e) { f = null; } return typeof f === "function" ? f : null; }
+  function getter(p, n) {
+    var d = null, g;
+    try { d = p ? gopd(p, n) : null; } catch (e) { d = null; }
+    g = d && d.get;
+    return function (o) { return g ? apply(g, o, []) : o[n]; };
+  }
+  function setter(p, n) {
+    var d = null, s;
+    try { d = p ? gopd(p, n) : null; } catch (e) { d = null; }
+    s = d && d.set;
+    return function (o, v) { if (s) { apply(s, o, [v]); } else { o[n] = v; } };
+  }
+  var ETp = pr(W.EventTarget), NDp = pr(W.Node), ELp = pr(W.Element), HEp = pr(W.HTMLElement) || ELp, DOp = pr(W.Document), CSp = pr(W.CSSStyleDeclaration), MOp = pr(W.MutationObserver), RCp = pr(W.DOMRectReadOnly);
+  var fAdd = fn(ETp, "addEventListener"), fCreate = fn(DOp, "createElement"), fAttach = fn(ELp, "attachShadow"), fRect = fn(ELp, "getBoundingClientRect"),
+      fSetAttr = fn(ELp, "setAttribute"), fAppend = fn(NDp, "appendChild"), fInsB = fn(NDp, "insertBefore"), fRemove = fn(NDp, "removeChild"),
+      fShow = fn(HEp, "showPopover"), fHide = fn(HEp, "hidePopover"), fFromPts = fn(DOp, "elementsFromPoint"),
+      fSetProp = fn(CSp, "setProperty"), fGetProp = fn(CSp, "getPropertyValue"), fObs = fn(MOp, "observe"),
+      gcs = W.getComputedStyle, setT = W.setTimeout, MO = W.MutationObserver, Sheet = W.CSSStyleSheet;
+  var gStyle = getter(HEp, "style"), gParent = getter(NDp, "parentNode"), gDocEl = getter(DOp, "documentElement"),
+      gCW = getter(ELp, "clientWidth"), gCH = getter(ELp, "clientHeight"), sText = setter(NDp, "textContent"), gText = getter(NDp, "textContent"),
+      rW = getter(RCp, "width"), rH = getter(RCp, "height"), rL = getter(RCp, "left"), rT = getter(RCp, "top"), rR = getter(RCp, "right"), rB = getter(RCp, "bottom");
+  // isTrusted lives on the instance (unforgeable) in browsers: save its getter from a fresh event.
+  var getTrusted = null;
+  try {
+    var e0 = new W.Event("x"), d0 = gopd(e0, "isTrusted") || gopd(pr(W.Event), "isTrusted");
+    getTrusted = d0 && d0.get;
+  } catch (e) { getTrusted = null; }
+  if (!fAdd || !fCreate || !fAttach || !fAppend || !fRemove || !fInsB || !fSetAttr || !getTrusted) { return; }
+  function trusted(e) { try { return apply(getTrusted, e, []) === true; } catch (x) { return false; } }
+  function now() { return apply(dnow, DateC, []); }
+  function add(o, t, f) { apply(fAdd, o, [t, f]); }
+  function setA(o, k, v) { apply(fSetAttr, o, [k, v]); }
+  function append(p, c) { return apply(fAppend, p, [c]); }
+  function remove(p, c) { return apply(fRemove, p, [c]); }
+  function sp(o, k, v) { var s = gStyle(o); if (s && fSetProp) { try { apply(fSetProp, s, [k, v, "important"]); } catch (e) { /* ignore */ } } }
+  function gp(cs, k) { return fGetProp ? Str(apply(fGetProp, cs, [k])) : Str(cs[k]); }
+
   var CSS = ":host{all:initial}*{box-sizing:border-box}" +
     ".w{all:initial;position:fixed;right:12px;bottom:12px;width:28px;height:28px;font:13px/1.4 system-ui,sans-serif;color:var(--fg);" +
     "--bg:#fff;--fg:#1c1b1f;--mut:#5c5b61;--bd:#d0d0d6;--ac:#0b57d0}" +
@@ -21,118 +66,139 @@ function (W, reg, mode, nonce) {
     ".t{margin:4px 6px 2px;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em;overflow-wrap:anywhere}" +
     ".c{display:block;width:100%;text-align:left;font:inherit;color:var(--fg);background:none;border:0;border-radius:5px;padding:5px 8px;cursor:pointer}.c:hover{background:rgba(127,127,127,.18)}" +
     ".n{margin:4px 8px;color:var(--mut)}";
-  var HOST_STYLE = [["all", "initial"], ["display", "block"], ["position", "fixed"], ["right", "0"], ["bottom", "0"], ["width", "0"], ["height", "0"],
-    ["overflow", "visible"], ["z-index", "2147483647"], ["opacity", "1"], ["visibility", "visible"], ["pointer-events", "auto"], ["transform", "none"],
-    ["filter", "none"], ["clip-path", "none"], ["mask", "none"], ["mix-blend-mode", "normal"], ["contain", "none"]];
-  var host = null, root = null, wrap = null, badge = null, menuEl = null, open = false, vis = false, openedAt = 0;
-  var attachN = 0, attachWin = 0, mo = null, moRoot = null;
+  var HOST_STYLE = ["all", "initial", "display", "block", "position", "fixed", "right", "0", "bottom", "0", "width", "0", "height", "0",
+    "overflow", "visible", "z-index", "2147483647", "opacity", "1", "visibility", "visible", "pointer-events", "auto", "transform", "none",
+    "filter", "none", "clip-path", "none", "mask", "none", "mix-blend-mode", "normal", "contain", "none"];
+  var host = null, wrap = null, badge = null, menuEl = null, open = false, vis = false, openedAt = 0;
+  var attachN = 0, attachWin = 0, retry = false, mo = null, moRoot = null;
 
-  function h(tag, props, kids) {
-    var e = D.createElement(tag);
-    for (var k in props || {}) {
-      if (k === "text") { e.textContent = props[k]; }
-      else if (k === "on") { for (var ev in props.on) { e.addEventListener(ev, props.on[ev]); } }
-      else { e.setAttribute(k, props[k]); }
-    }
-    (kids || []).forEach(function (c) { if (c) { e.appendChild(c); } });
+  // Positional builder: no object-literal property is read, so Object.prototype pollution is inert.
+  function h(tag, attrs, text, evs, kids) {
+    var e = apply(fCreate, D, [tag]), i;
+    for (i = 0; i < attrs.length; i += 2) { setA(e, attrs[i], attrs[i + 1]); }
+    if (text !== null) { sText(e, text); }
+    for (i = 0; i < evs.length; i += 2) { add(e, evs[i], evs[i + 1]); }
+    for (i = 0; i < kids.length; i++) { append(e, kids[i]); }
     return e;
   }
-  function cmds() { try { var l = reg.commands(); return Array.isArray(l) ? l : []; } catch (e) { return []; } }
-  function pin() {
-    if (!host || !host.style || !host.style.setProperty) { return; }
-    for (var i = 0; i < HOST_STYLE.length; i++) { try { host.style.setProperty(HOST_STYLE[i][0], HOST_STYLE[i][1], "important"); } catch (e) { /* ignore */ } }
-  }
-  function top(el) {
-    if (typeof el.showPopover === "function") {
-      try { if (!el.matches || !el.matches(":popover-open")) { el.showPopover(); } } catch (e) { /* ignore */ }
-    }
+  function pin() { for (var i = 0; i < HOST_STYLE.length; i += 2) { sp(host, HOST_STYLE[i], HOST_STYLE[i + 1]); } }
+  function raise() {
+    if (!fShow) { return; }
+    if (fHide) { try { apply(fHide, wrap, []); } catch (e) { /* not open */ } }
+    try { apply(fShow, wrap, []); } catch (e) { /* ignore */ }
+    if (menuEl) { try { apply(fShow, menuEl, []); } catch (e) { /* ignore */ } }
   }
   // False when the page hides, fades, moves or covers the badge (or an ancestor) with styles.
-  function intact() {
-    pin();
-    if (typeof W.getComputedStyle !== "function") { return true; }
+  function intact(el, isBadge) {
+    pin(); raise();
     try {
-      var cs = W.getComputedStyle(host), de = D.documentElement && W.getComputedStyle(D.documentElement);
-      var bad = function (s) { return !s || parseFloat(s.opacity) < 1 || (s.transform && s.transform !== "none") || (s.filter && s.filter !== "none") ||
-        s.visibility === "hidden" || s.display === "none" || (s.clipPath && s.clipPath !== "none") || (s.pointerEvents && s.pointerEvents === "none"); };
-      if (bad(cs) || (de && (parseFloat(de.opacity) < 1 || (de.filter && de.filter !== "none") || (de.transform && de.transform !== "none")))) { return false; }
-      if (badge.getBoundingClientRect) {
-        var r = badge.getBoundingClientRect(), iw = W.innerWidth, ih = W.innerHeight;
-        if (iw && ih && (Math.abs(r.width - 28) > 2 || Math.abs(r.height - 28) > 2 || Math.abs(iw - r.right - 12) > 20 || Math.abs(ih - r.bottom - 12) > 20)) { return false; }
+      if (typeof gcs === "function") {
+        var cs = apply(gcs, W, [host]);
+        if (!(pf(gp(cs, "opacity")) >= 1) || gp(cs, "transform") !== "none" || gp(cs, "filter") !== "none" || gp(cs, "clip-path") !== "none" ||
+            gp(cs, "visibility") !== "visible" || gp(cs, "display") === "none" || gp(cs, "pointer-events") === "none") { return false; }
+        if (!fShow) {
+          var de = apply(gcs, W, [gDocEl(D)]);
+          if (!(pf(gp(de, "opacity")) >= 1) || gp(de, "filter") !== "none" || gp(de, "transform") !== "none") { return false; }
+        }
+      }
+      if (fRect) {
+        var r = apply(fRect, el, []), rt = gDocEl(D);
+        if (isBadge) {
+          var cw = gCW(rt), ch = gCH(rt);
+          if (abs(rW(r) - 28) > 2 || abs(rH(r) - 28) > 2 || abs(cw - rR(r) - 12) > 4 || abs(ch - rB(r) - 12) > 4) { return false; }
+        }
+        if (fFromPts) {
+          var hits = apply(fFromPts, D, [(rL(r) + rR(r)) / 2, (rT(r) + rB(r)) / 2]);
+          if (!hits || hits[0] !== host) { return false; }
+        }
       }
     } catch (e) { return false; }
     return true;
   }
   function build() {
-    host = D.createElement("div");
-    root = host.attachShadow({ mode: "closed" });
-    try { var sh = new W.CSSStyleSheet(); sh.replaceSync(CSS); root.adoptedStyleSheets = [sh]; }
-    catch (e) { var s = D.createElement("style"); if (nonce) { s.setAttribute("nonce", nonce); } s.textContent = CSS; root.appendChild(s); }
-    badge = h("button", { type: "button", class: "b", "data-k": "badge", "aria-haspopup": "true", "aria-expanded": "false", on: { click: function (e) {
-      if (e.isTrusted && intact()) { setOpen(!open); }
-    } } }, []);
-    badge.textContent = "A";
-    wrap = h("div", { class: "w" }, [badge]);
-    if (typeof wrap.showPopover === "function") { wrap.setAttribute("popover", "manual"); }
-    root.appendChild(wrap);
-    root.addEventListener("keydown", function (e) { if (e.key === "Escape" && open) { setOpen(false); try { badge.focus(); } catch (x) { /* ignore */ } } });
+    host = apply(fCreate, D, ["div"]);
+    var root = apply(fAttach, host, [{ mode: "closed" }]);
+    try { var sh = new Sheet(); sh.replaceSync(CSS); root.adoptedStyleSheets = [sh]; }
+    catch (e) { var s = h("style", nonce ? ["nonce", nonce] : [], CSS, [], []); append(root, s); }
+    badge = h("button", ["type", "button", "class", "b", "data-k", "badge", "aria-haspopup", "true", "aria-expanded", "false"], "A", ["click", function (e) {
+      if (trusted(e) && intact(badge, true)) { setOpen(!open); }
+    }], []);
+    wrap = h("div", fShow ? ["class", "w", "popover", "manual"] : ["class", "w"], null, [], [badge]);
+    append(root, wrap);
+    add(root, "keydown", function (e) { if (trusted(e) && e.key === "Escape" && open) { setOpen(false); try { badge.focus(); } catch (x) { /* ignore */ } } });
     pin();
   }
   function setOpen(v) { open = v; openedAt = v ? now() : 0; render(); }
-  // Re-attach after the page drops the host; at most about 20 times a second so a page that keeps
-  // removing it cannot make us spin.
+  // Re-attach after the page drops the host, at most 20 times a second; past the cap a retry is
+  // scheduled for when the window ends, so a page that removes it in a burst cannot leave it gone.
   function ensure() {
-    var r = D.documentElement;
-    if (!host || !r || host.parentNode === r) { return; }
+    var r = gDocEl(D);
+    if (!host || !r || gParent(host) === r) { return; }
     var t = now();
     if (t - attachWin >= 1000) { attachWin = t; attachN = 0; }
-    if (++attachN > 20) { return; }
-    r.appendChild(host);
-    pin(); top(wrap); if (menuEl) { top(menuEl); }
+    if (++attachN > 20) {
+      if (!retry && typeof setT === "function") {
+        retry = true;
+        apply(setT, W, [function () { retry = false; if (vis) { ensure(); } }, 1000 - (t - attachWin) + 5]);
+      }
+      return;
+    }
+    append(r, host);
+    pin(); raise();
   }
   function render() {
-    var list = cmds(), show = always || list.length > 0;
+    var list = [], show, i, j, g;
+    try { list = reg.commands(); } catch (e) { list = []; }
+    show = always || list.length > 0;
     if (!show) {
-      if (host && host.parentNode) { host.parentNode.removeChild(host); }
+      if (host && gParent(host)) { remove(gParent(host), host); }
       open = false; vis = false;
       return;
     }
     if (!host) { build(); }
     vis = true; ensure();
-    badge.setAttribute("aria-expanded", open ? "true" : "false");
-    badge.setAttribute("aria-label", "Argus userscript commands (" + list.length + ")");
-    if (menuEl) { wrap.removeChild(menuEl); menuEl = null; }
-    top(wrap);
+    setA(badge, "aria-expanded", open ? "true" : "false");
+    setA(badge, "aria-label", "Argus userscript commands (" + list.length + ")");
+    if (menuEl) { remove(wrap, menuEl); menuEl = null; }
+    if (fShow) { try { apply(fShow, wrap, []); } catch (e) { /* already open */ } }
     if (!open) { return; }
-    var kids = [], groups = {}, order = [];
-    list.forEach(function (c) { var g = String(c.script); if (!groups[g]) { groups[g] = []; order.push(g); } groups[g].push(c); });
-    if (!order.length) { kids.push(h("p", { class: "n", text: "No commands registered." })); }
-    order.forEach(function (g) {
-      kids.push(h("div", { class: "t", text: String(groups[g][0].scriptName || g) }));
-      groups[g].forEach(function (c) {
-        kids.push(h("button", { type: "button", class: "c", "data-k": "c-" + g + "-" + c.id, on: { click: function (e) {
-          if (!e.isTrusted || now() - openedAt < 400 || !intact()) { return; }
-          setOpen(false);
-          try { reg.invoke(c.script, c.id); } catch (x) { /* ignore */ }
-        } } }, [h("span", { text: String(c.caption) })]));
-      });
-    });
-    menuEl = h("div", { class: "m", role: "menu", "aria-label": "Userscript commands" }, kids);
-    if (typeof menuEl.showPopover === "function") { menuEl.setAttribute("popover", "manual"); }
-    wrap.insertBefore(menuEl, badge);
-    top(menuEl);
+    var kids = [], ids = [], names = [], groups = [];
+    for (i = 0; i < list.length; i++) {
+      var c = list[i], sid = Str(c.script);
+      for (j = 0; j < ids.length; j++) { if (ids[j] === sid) { break; } }
+      if (j === ids.length) { ids[j] = sid; names[j] = Str(c.scriptName || sid); groups[j] = []; }
+      groups[j][groups[j].length] = c;
+    }
+    if (!ids.length) { kids[kids.length] = h("p", ["class", "n"], "No commands registered.", [], []); }
+    for (j = 0; j < ids.length; j++) {
+      kids[kids.length] = h("div", ["class", "t"], names[j], [], []);
+      for (g = 0; g < groups[j].length; g++) { kids[kids.length] = item(groups[j][g], ids[j]); }
+    }
+    menuEl = h("div", fShow ? ["class", "m", "role", "menu", "aria-label", "Userscript commands", "popover", "manual"] : ["class", "m", "role", "menu", "aria-label", "Userscript commands"], null, [], kids);
+    apply(fInsB, wrap, [menuEl, badge]);
+    if (fShow) { try { apply(fShow, menuEl, []); } catch (e) { /* ignore */ } }
+  }
+  function item(c, sid) {
+    var btn = h("button", ["type", "button", "class", "c", "data-k", "c-" + sid + "-" + c.id], null, ["click", function (e) {
+      if (!trusted(e) || now() - openedAt < 400 || !intact(btn, false)) { return; }
+      setOpen(false);
+      try { reg.invoke(c.script, c.id); } catch (x) { /* ignore */ }
+    }], [h("span", [], Str(c.caption), [], [])]);
+    return btn;
   }
   function watch() {
     try {
-      if (!W.MutationObserver || !D.documentElement) { return; }
-      if (!mo) { mo = new W.MutationObserver(function () { if (vis) { watch(); ensure(); } }); mo.observe(D, { childList: true }); }
-      if (moRoot !== D.documentElement) { moRoot = D.documentElement; mo.observe(moRoot, { childList: true }); }
+      if (typeof MO !== "function" || !fObs || !gDocEl(D)) { return; }
+      if (!mo) { mo = new MO(function () { if (vis) { watch(); ensure(); } }); apply(fObs, mo, [D, { childList: true }]); }
+      var r = gDocEl(D);
+      if (moRoot !== r) { moRoot = r; apply(fObs, mo, [r, { childList: true }]); }
     } catch (e) { /* ignore */ }
   }
   reg.subscribe(render);
-  D.addEventListener("click", function (e) { if (open && e.target !== host) { setOpen(false); } }, true);
-  ["DOMContentLoaded", "load"].forEach(function (n) { D.addEventListener(n, function () { if (vis) { watch(); ensure(); } }); });
-  ["popstate", "hashchange", "pageshow"].forEach(function (n) { W.addEventListener(n, function () { render(); }); });
+  add(D, "click", function (e) { if (open && e.target !== host) { setOpen(false); } });
+  add(D, "DOMContentLoaded", function () { if (vis) { watch(); ensure(); } });
+  add(W, "load", function () { if (vis) { watch(); ensure(); } });
+  add(W, "popstate", render); add(W, "hashchange", render); add(W, "pageshow", render);
   watch();
   render();
 }

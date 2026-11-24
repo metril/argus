@@ -21,7 +21,7 @@ function (W) {
       var o = [];
       for (var i = 0; i < menu.length; i++) {
         var m = menu[i];
-        o.push({ script: m.script, scriptName: m.scriptName, id: m.id, caption: m.caption, accessKey: m.accessKey });
+        o[o.length] = { script: m.script, scriptName: m.scriptName, id: m.id, caption: m.caption, accessKey: m.accessKey };
       }
       return o;
     },
@@ -29,7 +29,7 @@ function (W) {
       for (var i = 0; i < menu.length; i++) { if (menu[i].script === s && menu[i].id === id) { menu[i].run(); return true; } }
       return false;
     },
-    subscribe: function (f) { if (typeof f === "function") { subs.push(f); } }
+    subscribe: function (f) { if (typeof f === "function") { subs[subs.length] = f; } }
   };
   var c = W.document && W.document.currentScript, mode = "off", nonce = "";
   try { if (c) { mode = c.getAttribute("data-m") || "off"; nonce = c.nonce || c.getAttribute("nonce") || ""; } } catch (e) { /* ignore */ }
