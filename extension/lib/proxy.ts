@@ -130,7 +130,7 @@ export class ProxyController {
   }
 
   /** Firefox `proxy.onRequest`: our listener for enabled stores, direct otherwise. */
-  async route(d: { cookieStoreId?: string; url?: string }): Promise<{ type: string; host?: string; port?: number }> {
+  async route(d: { cookieStoreId?: string; url?: string }): Promise<{ type: string; host?: string; port?: number; username?: string; password?: string; proxyDNS?: boolean }> {
     if (!this.active() || !this.storeEnabled(d.cookieStoreId)) return { type: 'direct' };
     const t = await this.target();
     if (!t) return { type: 'direct' };
@@ -140,24 +140,13 @@ export class ProxyController {
         if (u.hostname === (await this.d.argusHost())) return { type: 'direct' };
       } catch { /* proxy it */ }
     }
-    return { type: 'http', host: t.host, port: t.port };
-  }
-
-  /**
-   * Firefox `webRequest.onBeforeSendHeaders` (blocking) for documents: a request of a non-default
-   * store carries that store's opaque token in `X-Argus-Store`. The credentials of the proxy
-   * name only the session, because Firefox keeps one proxy-credential cache for all containers
-   * (the first answer would bind every container to its store); the store therefore rides in
-   * this header. The proxy reads it only on document requests of an authenticated extension
-   * connection and always removes it; a page cannot set it on a navigation, and a guessed token
-   * is useless (random, new for every session).
-   */
-  stampStore(d: { cookieStoreId?: string; requestHeaders?: { name: string; value?: string }[] }): { requestHeaders?: { name: string; value?: string }[] } {
-    if (!this.active() || !this.storeEnabled(d.cookieStoreId)) return {};
+    // SOCKS5 with per-request credentials: `ext` / `sid[:store token]`. Firefox keeps one
+    // proxy-credential cache for HTTP proxies that all containers share (the first container's
+    // answer would bind every other one), and `proxyAuthorizationHeader` is ignored for HTTPS
+    // tunnels; SOCKS user/password is sent per connection, and Firefox already keeps
+    // containers' connections apart. Nothing travels inside the request itself.
     const tok = this.tokenFor(d.cookieStoreId);
-    const hs = (d.requestHeaders ?? []).filter((h) => h.name.toLowerCase() !== 'x-argus-store');
-    if (tok) hs.push({ name: 'X-Argus-Store', value: tok });
-    return { requestHeaders: hs };
+    return { type: 'socks', host: t.host, port: t.port, username: 'ext', password: tok ? `${this.sid}:${tok}` : this.sid!, proxyDNS: true };
   }
 
   /**

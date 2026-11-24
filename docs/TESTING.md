@@ -67,7 +67,7 @@ the normal suite.
 extension into a real browser and run it against a real `argus` process (own temp data dir,
 ephemeral ports, a stub DNS server that resolves every name to loopback). They are opt-in:
 
-    cd extension && ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*' npx wxt build -b chrome
+    cd extension && ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*,*://127.0.0.1/*' npx wxt build -b chrome
     cd extension && npx wxt build -b firefox
     ARGUS_EXT_E2E=1 ARGUS_EXT_BROWSER=<chromium with --load-extension> \
         cargo nextest run -p e2e-browser --test extension_chromium --no-capture

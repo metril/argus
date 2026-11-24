@@ -68,7 +68,7 @@ describe('ProxyController (Firefox containers)', () => {
     await c.setSid('a'.repeat(32));
     await c.setState({ enabled: true, stores: { 'firefox-container-2': false, 'firefox-private': false } });
     for (const store of ['firefox-default', 'firefox-container-1']) {
-      expect(await c.route({ cookieStoreId: store, url: 'https://x.test/' })).toEqual({ type: 'http', host: '10.0.0.5', port: 3130 });
+      expect(await c.route({ cookieStoreId: store, url: 'https://x.test/' })).toMatchObject({ type: 'socks', host: '10.0.0.5', port: 3130 });
     }
     expect(await c.route({ cookieStoreId: 'firefox-container-2', url: 'https://x.test/' })).toEqual({ type: 'direct' });
     expect(await c.route({ cookieStoreId: 'firefox-private', url: 'https://x.test/' })).toEqual({ type: 'direct' });
@@ -76,37 +76,30 @@ describe('ProxyController (Firefox containers)', () => {
     await c.setSid(null);
     expect(await c.route({ cookieStoreId: 'firefox-default', url: 'https://x.test/' })).toEqual({ type: 'direct' });
   });
-  it('answers with the session only (a container cannot ride in the shared credential cache)', async () => {
+  it('routes through SOCKS5 with per-request credentials: the session, plus the store token for a container', async () => {
     const { c } = mk(true);
     await c.init();
     await c.setServer('10.0.0.5', 3130);
     await c.setSid('a'.repeat(32));
-    const r = await c.auth({ ...ch('10.0.0.5'), cookieStoreId: 'firefox-container-1' });
-    expect(r.authCredentials).toEqual({ username: 'ext', password: 'a'.repeat(32) });
-  });
-  it('stamps documents with the store token; each store has its own, a new session new ones', async () => {
-    const { c } = mk(true);
-    await c.init();
-    await c.setServer('10.0.0.5', 3130);
-    await c.setSid('a'.repeat(32));
-    const tok = (store: string, hs: any[] = []) => (c.stampStore({ cookieStoreId: store, requestHeaders: hs }).requestHeaders ?? []).find((h) => h.name === 'X-Argus-Store')?.value;
-    expect(tok('firefox-default')).toBeUndefined();
-    const a = tok('firefox-container-1')!;
-    const b = tok('firefox-container-2')!;
-    expect(a).toMatch(/^[a-z0-9]{12}$/);
-    expect(a).not.toBe(b);
-    // a header a page managed to put there is replaced, never forwarded
-    expect(tok('firefox-container-1', [{ name: 'x-argus-store', value: 'forged' }])).toBe(a);
-    expect(c.stampStore({ cookieStoreId: 'firefox-default', requestHeaders: [{ name: 'X-Argus-Store', value: 'forged' }] }).requestHeaders).toEqual([]);
-    expect(c.storeForToken(a)).toBe('firefox-container-1');
+    const r = async (store: string) => c.route({ cookieStoreId: store, url: 'https://x.test/' });
+    const d = await r('firefox-default');
+    expect(d).toMatchObject({ type: 'socks', host: '10.0.0.5', port: 3130, username: 'ext', proxyDNS: true });
+    expect(d.password).toBe('a'.repeat(32));
+    const a = await r('firefox-container-1');
+    const b = await r('firefox-container-2');
+    const [sid, ta] = a.password!.split(':');
+    expect(sid).toBe('a'.repeat(32));
+    expect(ta).toMatch(/^[a-z0-9]{12}$/);
+    expect(ta).not.toBe(b.password!.split(':')[1]);
+    expect(a.password).not.toContain('container');
+    expect(c.storeForToken(ta!)).toBe('firefox-container-1');
     expect(c.storeForToken('forged')).toBeUndefined();
     expect(c.storeForToken('')).toBe('firefox-default');
     await c.setSid('b'.repeat(32));
-    expect(c.storeForToken(a)).toBeUndefined();
-    // a switched-off store goes direct and is not stamped
+    expect(c.storeForToken(ta!)).toBeUndefined();
+    // a switched-off store goes direct
     await c.setState({ enabled: true, stores: { 'firefox-container-1': false } });
-    expect(await c.route({ cookieStoreId: 'firefox-container-1', url: 'https://x.test/' })).toEqual({ type: 'direct' });
-    expect(c.stampStore({ cookieStoreId: 'firefox-container-1', requestHeaders: [] })).toEqual({});
+    expect(await r('firefox-container-1')).toEqual({ type: 'direct' });
   });
 });
 

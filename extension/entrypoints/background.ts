@@ -35,13 +35,6 @@ export default defineBackground(() => {
   if (firefox && b.proxy?.onRequest) {
     b.proxy.onRequest.addListener((d: { cookieStoreId?: string; url?: string }) => proxy.route(d), { urls: ['<all_urls>'] });
   }
-  if (firefox) {
-    b.webRequest?.onBeforeSendHeaders?.addListener(
-      (d: any) => proxy.stampStore(d),
-      { urls: ['<all_urls>'], types: ['main_frame', 'sub_frame'] },
-      ['blocking', 'requestHeaders'],
-    );
-  }
   // Only our own listener's realm is ever answered (see ProxyController.auth).
   b.webRequest?.onAuthRequired?.addListener(
     (d: any, cb?: (r: unknown) => void) => {

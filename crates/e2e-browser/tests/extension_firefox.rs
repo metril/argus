@@ -270,35 +270,6 @@ async fn containers_private_windows_and_per_store_relays_in_real_firefox() {
     )
     .await;
 
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    eprintln!(
-        "DBG origin {:?}",
-        origin
-            .requests()
-            .iter()
-            .map(|r| format!("{} {}{}", r.method, r.host, r.path_and_query))
-            .collect::<Vec<_>>()
-    );
-    eprintln!(
-        "DBG tabs {}",
-        api(&mut m, "tabs.query", json!([{}]))
-            .await
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| format!("{} {} {}", t["id"], t["url"], t["title"]))
-            .collect::<Vec<_>>()
-            .join(" | ")
-    );
-    eprintln!(
-        "DBG proxy {}",
-        api(
-            &mut m,
-            "runtime.sendMessage",
-            json!([{"type": "proxy-get"}])
-        )
-        .await
-    );
     let seen = |tag: &str| {
         origin
             .requests()
@@ -363,6 +334,92 @@ async fn containers_private_windows_and_per_store_relays_in_real_firefox() {
             "{store} holds {vals:?}, expected only from={who}"
         );
     }
+
+    // a host Argus tunnels without decrypting: the browser's own request reaches the origin, and
+    // nothing of the binding (session, store token, proxy credentials) is in it or in any other
+    argus
+        .admin(
+            "POST",
+            "/api/v1/bypass/entries",
+            Some(json!({"pattern": "byp.test", "mode": "no_decrypt"})),
+        )
+        .await;
+    let normal_win = api(&mut m, "tabs.query", json!([{}]))
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["incognito"] == false)
+        .unwrap()["windowId"]
+        .clone();
+    api(
+        &mut m,
+        "tabs.create",
+        json!([{"url": format!("https://byp.test:{port}/page?c=BYP"), "cookieStoreId": a, "windowId": normal_win}]),
+    )
+    .await;
+    until("the passthrough page to reach the origin", async || {
+        origin
+            .requests()
+            .iter()
+            .any(|r| r.host.starts_with("byp.test"))
+    })
+    .await;
+    let sid = api(
+        &mut m,
+        "runtime.sendMessage",
+        json!([{"type": "bridge-status"}]),
+    )
+    .await["sid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut secrets = vec![sid];
+    for store in [a.as_str(), b.as_str(), "firefox-private"] {
+        secrets.push(
+            api(
+                &mut m,
+                "runtime.sendMessage",
+                json!([{"type": "store-token", "storeId": store}]),
+            )
+            .await
+            .as_str()
+            .unwrap()
+            .to_string(),
+        );
+    }
+    for r in origin.requests() {
+        for (n, v) in &r.headers {
+            let (nl, vl) = (n.to_ascii_lowercase(), v.to_ascii_lowercase());
+            assert!(
+                !nl.starts_with("x-argus") && nl != "proxy-authorization",
+                "{} {}: header {n}",
+                r.host,
+                r.path_and_query
+            );
+            for sec in &secrets {
+                assert!(
+                    !vl.contains(&sec.to_ascii_lowercase()),
+                    "{} {}: a secret is in {n}",
+                    r.host,
+                    r.path_and_query
+                );
+            }
+            assert!(
+                !vl.starts_with("ext:"),
+                "{} {}: {n}",
+                r.host,
+                r.path_and_query
+            );
+        }
+    }
+    assert!(
+        origin
+            .requests()
+            .iter()
+            .any(|r| r.host.starts_with("byp.test")),
+        "the passthrough request was checked too"
+    );
 
     // per-container routing: B switched off goes direct (not bound, no relay), A still relays
     api(

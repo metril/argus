@@ -1321,18 +1321,6 @@ impl Drop for JobGuard {
     }
 }
 
-/// Header the Firefox extension puts on document requests of a non-default cookie store: the
-/// store's opaque token (Firefox shares one proxy-credential cache among containers, so the
-/// store cannot ride in the proxy credentials). Always removed; read only for documents.
-pub const STORE_HEADER: &str = "x-argus-store";
-
-/// Take [`STORE_HEADER`] off a request; `Some` only when it is a well-formed token.
-pub fn take_store_header(h: &mut hyper::HeaderMap) -> Option<String> {
-    h.remove(STORE_HEADER)
-        .and_then(|v| v.to_str().ok().map(str::to_string))
-        .filter(|t| !t.is_empty() && t.len() <= 40 && t.bytes().all(|b| b.is_ascii_alphanumeric()))
-}
-
 /// Take the relay header off a request's header map and return its value. Called for every
 /// request the proxy is about to forward: it may never leave. (`HeaderMap::remove` drops every
 /// value of the name.) The session is never read from a header: it comes from the

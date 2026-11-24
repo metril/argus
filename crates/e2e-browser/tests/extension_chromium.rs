@@ -3,7 +3,7 @@
 //! a browser-cookie relay, and the toggle going direct again.
 //!
 //! Needs an unpacked build with test host permissions (`ARGUS_E2E_HOSTS`, see `docs/TESTING.md`):
-//!   cd extension && ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*' npx wxt build -b chrome
+//!   cd extension && ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*,*://127.0.0.1/*' npx wxt build -b chrome
 //! and a Chromium that honours `--load-extension` (Playwright's, `ARGUS_EXT_BROWSER`); branded
 //! Chrome 137+ removed the switch. Without them the test skips, unless `ARGUS_EXT_E2E=1`.
 
@@ -62,6 +62,57 @@ async fn eval(page: &Page, js: &str) -> Value {
         Ok(r) => r.value().cloned().unwrap_or(Value::Null),
         Err(e) => panic!("eval `{js}`: {e}"),
     }
+}
+
+/// Evaluate `js` in target `target` over a second CDP connection (chromiumoxide cannot attach to
+/// a popup target): attach with flattened sessions, `Runtime.evaluate`, detach.
+async fn cdp_eval(ws_url: &str, target: &str, js: &str) -> Value {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .expect("cdp ws");
+    let mut next = 0u32;
+    let mut call = |m: &str, p: Value, sid: Option<&str>| {
+        next += 1;
+        let mut v = json!({"id": next, "method": m, "params": p});
+        if let Some(s) = sid {
+            v["sessionId"] = json!(s);
+        }
+        (next, Message::Text(v.to_string()))
+    };
+    async fn answer(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        id: u32,
+    ) -> Value {
+        while let Some(Ok(Message::Text(t))) = ws.next().await {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["id"] == id {
+                return v;
+            }
+        }
+        panic!("cdp closed");
+    }
+    let (id, m) = call(
+        "Target.attachToTarget",
+        json!({"targetId": target, "flatten": true}),
+        None,
+    );
+    ws.send(m).await.unwrap();
+    let sid = answer(&mut ws, id).await["result"]["sessionId"]
+        .as_str()
+        .expect("session")
+        .to_string();
+    let (id, m) = call(
+        "Runtime.evaluate",
+        json!({"expression": js, "awaitPromise": true, "returnByValue": true}),
+        Some(&sid),
+    );
+    ws.send(m).await.unwrap();
+    let r = answer(&mut ws, id).await;
+    r["result"]["result"]["value"].clone()
 }
 
 async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
@@ -297,6 +348,55 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
         )
         .await;
         v["mode"] != "fixed_servers"
+    })
+    .await;
+
+    // the real popup, opened for the active tab: it lists the command and clicking it runs it
+    let page_target = page.target_id().as_ref().to_string();
+    eval(&page, "document.documentElement.dataset.fired = '0'").await;
+    page.bring_to_front().await.unwrap();
+    let opened = eval(
+        &ext_page,
+        "chrome.action.openPopup().then(() => 'ok', e => String(e))",
+    )
+    .await;
+    assert_eq!(opened, "ok", "chrome.action.openPopup: {opened}");
+    let popup_url = format!("chrome-extension://{id}/popup.html");
+    let mut popup_target = String::new();
+    until("the popup target", async || {
+        let ts = browser.fetch_targets().await.unwrap_or_default();
+        if let Some(t) = ts.iter().find(|t| t.url == popup_url) {
+            popup_target = t.target_id.as_ref().to_string();
+        }
+        !popup_target.is_empty()
+    })
+    .await;
+    let ws_url = browser.websocket_address().clone();
+    until("the popup to list the command", async || {
+        cdp_eval(
+            &ws_url,
+            &popup_target,
+            "[...document.querySelectorAll('button.cmd')].some(b => b.textContent === 'Mark')",
+        )
+        .await
+            == true
+    })
+    .await;
+    cdp_eval(
+        &ws_url,
+        &popup_target,
+        "[...document.querySelectorAll('button.cmd')].find(b => b.textContent === 'Mark').click()",
+    )
+    .await;
+    // (the popup closes itself: from here on only a second CDP connection is used)
+    until("the popup's click to run the command", async || {
+        cdp_eval(
+            &ws_url,
+            &page_target,
+            "document.documentElement.dataset.fired === '1'",
+        )
+        .await
+            == true
     })
     .await;
 

@@ -106,6 +106,8 @@ impl Origin {
 pub enum Entry<IO> {
     /// A CONNECT target to intercept or tunnel.
     Target(ConnectionTarget, IO),
+    /// Plain HTTP inside a SOCKS5 tunnel to `host:port` (extension listener).
+    PlainTo(IO, String, u16),
     /// Plain proxy-style HTTP; the stream replays the bytes already read.
     PlainHttp(IO),
 }
@@ -152,6 +154,21 @@ impl ConnectionHandler {
                 return;
             }
         }
+    }
+
+    /// Bind the connection to the session `sid` names (and the cookie store `store`).
+    fn ext_bind(&self, sid: &str, store: &str) -> bool {
+        let hub = self.ext_hub();
+        let Some(session) = hub.authenticate(sid) else {
+            return false;
+        };
+        self.conn.set_ext(
+            self.shared.ctx.profiles(),
+            session,
+            store,
+            hub.pinned_profile(session),
+        );
+        true
     }
 
     /// Authenticate `Proxy-Authorization` as an extension session and bind the connection.
@@ -293,6 +310,17 @@ impl ConnectionHandler {
         match self.resolve_entry(stream).await? {
             Entry::Target(target, io) => self.intercept_and_serve(io, target).await,
             Entry::PlainHttp(io) => self.serve_http(io, plain_origin()).await,
+            Entry::PlainTo(io, host, port) => {
+                self.serve_http(
+                    io,
+                    Origin {
+                        scheme: "http",
+                        authority: Some((host, port)),
+                        strict_host: false,
+                    },
+                )
+                .await
+            }
         }
     }
 
@@ -303,12 +331,29 @@ impl ConnectionHandler {
         let limit = self.shared.timeouts.load().handshake;
         let mut buf = Vec::with_capacity(1024);
 
-        match read_at_least(&mut stream, &mut buf, 8, limit).await {
+        // (a SOCKS5 greeting is only three bytes; on the extension listener look at the first)
+        let first = if self.conn.is_ext_listener() { 1 } else { 8 };
+        match read_at_least(&mut stream, &mut buf, first, limit).await {
             Ok(()) => {}
             Err(HeadError::Closed) => {
                 return Err(Error::Connection("closed before request".into()))
             }
             Err(e) => return Err(self.reject(&mut stream, e).await),
+        }
+
+        // The extension listener also speaks SOCKS5 (Firefox: one set of credentials per request,
+        // which its shared HTTP proxy-credential cache cannot do).
+        if self.conn.is_ext_listener() && buf[0] == 0x05 {
+            return self.socks5_entry(stream, buf, limit).await;
+        }
+        if buf.len() < 8 {
+            match read_at_least(&mut stream, &mut buf, 8, limit).await {
+                Ok(()) => {}
+                Err(HeadError::Closed) => {
+                    return Err(Error::Connection("closed before request".into()))
+                }
+                Err(e) => return Err(self.reject(&mut stream, e).await),
+            }
         }
 
         if !buf.starts_with(b"CONNECT ") {
@@ -402,6 +447,124 @@ impl ConnectionHandler {
             intercept_tls,
         };
         Ok(Entry::Target(target, Prefixed::new(leftover, stream)))
+    }
+
+    /// SOCKS5 (RFC 1928) with username/password (RFC 1929) on the extension listener: the user
+    /// name is `ext`, the password `sid[:store]`. Only `CONNECT` is served; the requested
+    /// `host:port` then goes through exactly the checks of an HTTP `CONNECT`.
+    async fn socks5_entry(
+        &self,
+        mut stream: TcpStream,
+        mut buf: Vec<u8>,
+        limit: Duration,
+    ) -> Result<Entry<Prefixed<TcpStream>>> {
+        macro_rules! need {
+            ($n:expr) => {
+                if let Err(e) = read_at_least(&mut stream, &mut buf, $n, limit).await {
+                    return Err(self.reject(&mut stream, e).await);
+                }
+            };
+        }
+        let fail =
+            |what: &str| Error::Connection(format!("socks5 from {}: {what}", self.client_addr));
+        // greeting
+        need!(2);
+        let n = buf[1] as usize;
+        need!(2 + n);
+        if !buf[2..2 + n].contains(&2) {
+            let _ = stream.write_all(&[5, 0xff]).await;
+            return Err(fail("no username/password method"));
+        }
+        buf.drain(..2 + n);
+        stream.write_all(&[5, 2]).await?;
+        // credentials
+        need!(2);
+        let ulen = buf[1] as usize;
+        need!(3 + ulen);
+        let plen = buf[2 + ulen] as usize;
+        need!(3 + ulen + plen);
+        let user = String::from_utf8_lossy(&buf[2..2 + ulen]).to_string();
+        let pass = String::from_utf8_lossy(&buf[3 + ulen..3 + ulen + plen]).to_string();
+        let version_ok = buf[0] == 1;
+        buf.drain(..3 + ulen + plen);
+        let (sid, store) = pass.split_once(':').unwrap_or((pass.as_str(), ""));
+        let store_ok = store.len() <= 40 && store.bytes().all(|b| b.is_ascii_alphanumeric());
+        if !(version_ok && user == "ext" && store_ok && self.ext_bind(sid, store)) {
+            let _ = stream.write_all(&[1, 1]).await;
+            return Err(fail("credentials refused"));
+        }
+        stream.write_all(&[1, 0]).await?;
+        // request
+        need!(5);
+        let reply = |code: u8| [5, code, 0, 1, 0, 0, 0, 0, 0, 0];
+        if buf[0] != 5 || buf[1] != 1 {
+            let _ = stream.write_all(&reply(7)).await;
+            return Err(fail("only CONNECT is served"));
+        }
+        let (host, used) = match buf[3] {
+            1 => {
+                need!(4 + 4 + 2);
+                (
+                    std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]).to_string(),
+                    8,
+                )
+            }
+            3 => {
+                let l = buf[4] as usize;
+                need!(5 + l + 2);
+                (String::from_utf8_lossy(&buf[5..5 + l]).to_string(), 5 + l)
+            }
+            4 => {
+                need!(4 + 16 + 2);
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&buf[4..20]);
+                (std::net::Ipv6Addr::from(o).to_string(), 20)
+            }
+            _ => {
+                let _ = stream.write_all(&reply(8)).await;
+                return Err(fail("unknown address type"));
+            }
+        };
+        let port = u16::from_be_bytes([buf[used], buf[used + 1]]);
+        let leftover = buf.split_off(used + 2);
+        let host = authority::normalize_host(&host).unwrap_or(host);
+        debug!("SOCKS5 CONNECT {host}:{port} from {}", self.client_addr);
+        let intercept_tls = self.intercepts(&host);
+        let ctx = &self.shared.ctx;
+        let refused = if intercept_tls {
+            ctx.policy().check_literal(&host, port).is_err()
+        } else {
+            matches!(
+                tokio::time::timeout(
+                    limit,
+                    ctx.policy().resolve(&host, port, ctx.resolve_all_to())
+                )
+                .await,
+                Ok(Err(crate::policy::ResolveError::Refused(_)))
+            )
+        };
+        if refused {
+            common::faults::note(common::faults::Fault::PolicyRefusal, &host);
+            let _ = stream.write_all(&reply(2)).await;
+            return Err(Error::DestinationRefused(format!("{host}:{port}")));
+        }
+        stream.write_all(&reply(0)).await?;
+        let mut leftover = leftover;
+        // What follows decides: a TLS ClientHello is intercepted (or tunnelled) like a CONNECT,
+        // anything else is plain HTTP to this host.
+        if leftover.is_empty() {
+            let _ = read_at_least(&mut stream, &mut leftover, 1, limit).await;
+        }
+        if leftover.first() == Some(&0x16) || leftover.is_empty() {
+            let target = ConnectionTarget {
+                host,
+                port,
+                client_addr: self.client_addr,
+                intercept_tls,
+            };
+            return Ok(Entry::Target(target, Prefixed::new(leftover, stream)));
+        }
+        Ok(Entry::PlainTo(Prefixed::new(leftover, stream), host, port))
     }
 
     /// Best-effort error reply for a failed head read; returns the error to propagate.

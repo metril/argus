@@ -793,3 +793,81 @@ e2e_test!(
         assert!(env.origin.requests().iter().all(|r| r.path() != "/x"));
     }
 );
+
+e2e_test!(
+    the_extension_listener_speaks_socks5_with_per_connection_credentials,
+    rules = [],
+    explicit_only,
+    |env| {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let h = hub(&env);
+        let (sess, sid, _rx) = session(&h, "t1");
+        let addr = env.proxy.ext_addr().await;
+        let connect = |user: &'static str, pass: String| {
+            let host = "app.test";
+            async move {
+                let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                s.write_all(&[5, 2, 0, 2]).await.unwrap();
+                let mut m = [0u8; 2];
+                s.read_exact(&mut m).await.unwrap();
+                assert_eq!(m, [5, 2], "username/password is the method");
+                let mut a = vec![1, user.len() as u8];
+                a.extend_from_slice(user.as_bytes());
+                a.push(pass.len() as u8);
+                a.extend_from_slice(pass.as_bytes());
+                s.write_all(&a).await.unwrap();
+                let mut r = [0u8; 2];
+                s.read_exact(&mut r).await.unwrap();
+                if r[1] != 0 {
+                    return (r, None);
+                }
+                let mut q = vec![5, 1, 0, 3, host.len() as u8];
+                q.extend_from_slice(host.as_bytes());
+                q.extend_from_slice(&443u16.to_be_bytes());
+                s.write_all(&q).await.unwrap();
+                let mut rep = [0u8; 10];
+                s.read_exact(&mut rep).await.unwrap();
+                (r, Some((rep[1], s)))
+            }
+        };
+        // no username/password method offered: refused
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[5, 1, 0]).await.unwrap();
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [5, 0xff]);
+        // wrong user, wrong secret, a malformed store: all refused before any request
+        for (u, p) in [
+            ("ext", "0".repeat(32)),
+            ("other", sid.clone()),
+            ("ext", format!("{sid}:bad token!")),
+        ] {
+            assert_eq!(connect(u, p).await.0, [1, 1]);
+        }
+        // the session's secret opens a tunnel, with or without a store token
+        for p in [sid.clone(), format!("{sid}:c1x")] {
+            let (r, t) = connect("ext", p).await;
+            assert_eq!(r, [1, 0]);
+            assert_eq!(t.as_ref().map(|t| t.0), Some(0), "request granted");
+        }
+        // the session ends: its tunnel is closed and its secret no longer works
+        let (_, t) = connect("ext", sid.clone()).await;
+        let (_, mut open) = t.unwrap();
+        h.close(sess);
+        let mut rest = Vec::new();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), open.read_to_end(&mut rest))
+                .await
+                .is_ok()
+        );
+        assert_eq!(connect("ext", sid.clone()).await.0, [1, 1]);
+        // the normal port does not speak SOCKS
+        let mut s = tokio::net::TcpStream::connect(env.proxy.addr)
+            .await
+            .unwrap();
+        s.write_all(&[5, 1, 2]).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+        assert!(!out.starts_with(&[5, 2]));
+    }
+);

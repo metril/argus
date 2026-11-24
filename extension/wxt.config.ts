@@ -27,7 +27,7 @@ export default defineConfig({
     // for webRequest observation of arbitrary sites.
     optional_host_permissions: ['http://*/*', 'https://*/*'],
     // Test builds only (never set in releases): per-host permissions a headless browser cannot be
-    // asked for, e.g. ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*'.
+    // asked for, e.g. ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*,*://127.0.0.1/*'.
     ...(process.env.ARGUS_E2E_HOSTS && browser !== 'firefox'
       ? { host_permissions: process.env.ARGUS_E2E_HOSTS.split(',') }
       : {}),

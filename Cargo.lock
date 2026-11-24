@@ -1660,6 +1660,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
  "userscript-engine",
  "web-api",

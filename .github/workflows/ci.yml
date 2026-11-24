@@ -149,11 +149,10 @@ jobs:
           ARGUS_KERNEL_TEST: "1"
 
   # The real extension in real browsers against a real Argus process (own data dir, ephemeral
-  # ports, stub DNS). One shard per browser; Firefox is advisory until its suite passes.
+  # ports, stub DNS). One shard per browser.
   ext-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.browser == 'firefox' }}
     strategy:
       fail-fast: false
       matrix:
@@ -177,7 +176,7 @@ jobs:
         working-directory: extension
         run: |
           npm ci
-          ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*' npx wxt build -b chrome
+          ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*,*://127.0.0.1/*' npx wxt build -b chrome
           npx wxt build -b firefox
       - name: Chromium that honours --load-extension (branded Chrome 137+ removed it)
         if: matrix.browser == 'chromium'
