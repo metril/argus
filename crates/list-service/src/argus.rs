@@ -63,8 +63,16 @@ pub fn verify(public_key: &str, data: &[u8], sig_text: &str) -> Result<(), Strin
         .map_err(|e| format!("signature does not verify: {e}"))
 }
 
+/// Like [`verify`], and returns the signed (trusted) comment.
+pub fn verify_trusted(public_key: &str, data: &[u8], sig_text: &str) -> Result<String, String> {
+    verify(public_key, data, sig_text)?;
+    let sig = minisign_verify::Signature::decode(sig_text)
+        .map_err(|e| format!("invalid signature file: {e}"))?;
+    Ok(sig.trusted_comment().to_string())
+}
+
 /// `vYYYY.MM.DD[.N]` as comparable numbers.
-fn version_key(v: &str) -> Option<Vec<u64>> {
+pub(crate) fn version_key(v: &str) -> Option<Vec<u64>> {
     let rest = v.strip_prefix('v')?;
     let parts: Option<Vec<u64>> = rest.split('.').map(|p| p.parse().ok()).collect();
     parts.filter(|p| p.len() >= 3)
@@ -83,7 +91,7 @@ fn max_version(a: Option<String>, b: Option<String>) -> Option<String> {
 }
 
 /// Compare two release versions (a missing `.N` is `.0`).
-fn version_cmp(a: &str, b: &str) -> Option<Ordering> {
+pub(crate) fn version_cmp(a: &str, b: &str) -> Option<Ordering> {
     let (mut a, mut b) = (version_key(a)?, version_key(b)?);
     let n = a.len().max(b.len());
     a.resize(n, 0);
@@ -436,7 +444,7 @@ fn meta_info(m: &Meta) -> std::collections::BTreeMap<String, bypass::ArgusCatego
         .collect()
 }
 
-fn sha256_hex(b: &[u8]) -> String {
+pub(crate) fn sha256_hex(b: &[u8]) -> String {
     Sha256::digest(b)
         .iter()
         .map(|x| format!("{x:02x}"))

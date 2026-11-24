@@ -1146,7 +1146,9 @@ async fn list_format_allowlist_and_catalogue() {
     );
 
     let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
-    let cat = cat.as_array().unwrap();
+    assert_eq!(cat["source"], "builtin");
+    assert!(cat["fetched_at"].is_null());
+    let cat = cat["entries"].as_array().unwrap();
     assert!(cat.len() >= 10 && cat.iter().all(|e| e["added"] == false));
     let added = admin.post("/api/v1/lists/catalogue/adaway").await;
     assert_eq!(added.status_code(), StatusCode::CREATED);
@@ -1167,11 +1169,76 @@ async fn list_format_allowlist_and_catalogue() {
         .await
         .assert_status_not_found();
     let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
-    assert!(cat
+    assert!(cat["entries"]
         .as_array()
         .unwrap()
         .iter()
         .any(|e| e["id"] == "adaway" && e["added"] == true));
+}
+
+fn catalogue_doc(
+    ctx: &TestContext,
+    signer: &list_service::testkit::Signer,
+) -> std::sync::Arc<list_service::SignedDoc<list_service::FilterCatalogueEntry>> {
+    let doc = list_service::SignedDoc::new(
+        "filters",
+        None,
+        list_service::ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: signer.public_key(),
+            cache_dir: None,
+        },
+    );
+    assert!(ctx.state.filter_catalogue.set(doc.clone()).is_ok());
+    doc
+}
+
+#[tokio::test]
+async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
+    use list_service::testkit::{filters_json, Signer};
+    let ctx = TestContext::new().await.unwrap();
+    let signer = Signer::new();
+    let doc = catalogue_doc(&ctx, &signer);
+    let admin = ctx.admin().await;
+
+    // A copy signed with the wrong key is refused: the built-in catalogue still serves.
+    let text = filters_json("ubo");
+    let bad = Signer::new().sign(&text, "v2026.11.23", "filters.json");
+    assert!(doc.apply(text.clone(), bad, None).await.is_err());
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    assert_eq!(cat["source"], "builtin");
+
+    let sig = signer.sign(&text, "v2026.11.23", "filters.json");
+    doc.apply(text, sig, None).await.unwrap();
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    assert_eq!(cat["source"], "signed");
+    assert_eq!(cat["version"], "v2026.11.23");
+    assert!(cat["fetched_at"].is_string());
+    let e = &cat["entries"][0];
+    assert_eq!(
+        (e["id"].as_str(), e["format"].as_str(), e["source"].as_str()),
+        (Some("fx"), Some("ubo"), Some("signed"))
+    );
+    assert_eq!(
+        (e["region"].as_str(), e["noncommercial"].as_bool()),
+        (Some("de"), Some(true))
+    );
+    assert_eq!(cat["entries"].as_array().unwrap().len(), 1);
+
+    let added = admin.post("/api/v1/lists/catalogue/fx").await;
+    assert_eq!(added.status_code(), StatusCode::CREATED);
+    let a: Value = added.json();
+    assert_eq!(
+        (a["format"].as_str(), a["enabled"].as_bool()),
+        (Some("ubo"), Some(true))
+    );
+    // Built-in ids are not in the signed catalogue.
+    admin
+        .post("/api/v1/lists/catalogue/adaway")
+        .await
+        .assert_status_not_found();
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    assert_eq!(cat["entries"][0]["added"], true);
 }
 
 #[tokio::test]

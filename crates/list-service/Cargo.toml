@@ -25,8 +25,11 @@ common = { path = "../common" }
 async-compression = { workspace = true, features = ["zstd"] }
 tokio-util = { workspace = true }
 minisign-verify = "0.3"
+minisign = { version = "0.7", optional = true }
 
 [features]
+# Signing helpers for tests of code that consumes signed documents.
+testkit = ["dep:minisign"]
 default = ["bundled-ubo-resources"]
 # Propagates to filter-engine: embed the GPL-3.0 uBO scriptlet snapshot.
 bundled-ubo-resources = ["filter-engine/bundled-ubo-resources"]

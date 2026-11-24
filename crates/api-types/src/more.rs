@@ -703,11 +703,40 @@ pub struct CatalogueEntryResponse {
     pub id: String,
     pub name: String,
     pub url: String,
+    /// `abp`, `ubo`, `adguard`, `hosts`, `domains` or `ips`.
     pub format: String,
     pub category: String,
     pub licence: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub homepage: String,
+    /// Language/region the list targets (`de`, `fr`, ...).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// The licence forbids commercial use.
+    #[serde(default)]
+    pub noncommercial: bool,
+    #[serde(default)]
+    pub licence_note: Option<String>,
+    /// `signed` (verified argus-lists catalogue) or `builtin`.
+    #[serde(default)]
+    pub source: String,
     /// Already added as a list.
     pub added: bool,
+}
+
+/// The catalogue and where it came from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CatalogueResponse {
+    /// `signed` or `builtin`.
+    pub source: String,
+    /// When the signed copy was verified (RFC 3339); absent for the built-in one.
+    pub fetched_at: Option<String>,
+    /// Release of the signed copy.
+    pub version: Option<String>,
+    pub entries: Vec<CatalogueEntryResponse>,
 }
 
 /// A handed-off rule and what the extended-rule index did with it.

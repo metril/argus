@@ -8,8 +8,8 @@ use super::client::{ApiClient, ApiError};
 pub use api_types::FilterListResponse as FilterList;
 pub use api_types::{
     AddFilterListRequest, BlockedEntry, BuildState, BuildSummary, CatalogueEntryResponse,
-    CustomRulesResponse, ListReport, RecentBlockedResponse, UpdateCustomRulesRequest,
-    UpdateFilterListRequest,
+    CatalogueResponse, CustomRulesResponse, ListReport, RecentBlockedResponse,
+    UpdateCustomRulesRequest, UpdateFilterListRequest,
 };
 pub type FilterListsResponse = api_types::Page<FilterList>;
 
@@ -229,7 +229,7 @@ impl ApiClient {
     }
 
     /// The catalogue of well-known lists
-    pub async fn get_catalogue(&self) -> Result<Vec<CatalogueEntryResponse>, ApiError> {
+    pub async fn get_catalogue(&self) -> Result<CatalogueResponse, ApiError> {
         self.get("/lists/catalogue").await
     }
 

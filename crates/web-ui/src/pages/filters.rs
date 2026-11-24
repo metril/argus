@@ -63,6 +63,43 @@ pub fn FiltersPage() -> impl IntoView {
     let show_catalogue = RwSignal::new(false);
     let catalogue = RwSignal::new(Vec::<CatalogueEntryResponse>::new());
     let catalogue_add = RwSignal::new(Option::<String>::None);
+    let cat_source = RwSignal::new(String::new());
+    let cat_fetched = RwSignal::new(Option::<String>::None);
+    let cat_q = RwSignal::new(String::new());
+    let cat_category = RwSignal::new(String::new());
+    let cat_region = RwSignal::new(String::new());
+    let cat_filtered = Signal::derive(move || {
+        let q = cat_q.get().to_lowercase();
+        let (c, r) = (cat_category.get(), cat_region.get());
+        catalogue
+            .get()
+            .into_iter()
+            .filter(|e| {
+                (c.is_empty() || e.category == c)
+                    && (r.is_empty() || e.region.as_deref() == Some(r.as_str()))
+                    && (q.is_empty()
+                        || e.name.to_lowercase().contains(&q)
+                        || e.description.to_lowercase().contains(&q)
+                        || e.id.to_lowercase().contains(&q))
+            })
+            .collect::<Vec<_>>()
+    });
+    let cat_categories = Memo::new(move |_| {
+        let mut v: Vec<String> = catalogue.get().iter().map(|e| e.category.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    });
+    let cat_regions = Memo::new(move |_| {
+        let mut v: Vec<String> = catalogue
+            .get()
+            .iter()
+            .filter_map(|e| e.region.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    });
 
     // Add-list form
     let add_name = RwSignal::new(String::new());
@@ -340,7 +377,11 @@ pub fn FiltersPage() -> impl IntoView {
                                 let app_c = app_state.clone();
                                 wasm_bindgen_futures::spawn_local(async move {
                                     match ApiClient::new().get_catalogue().await {
-                                        Ok(c) => catalogue.set(c),
+                                        Ok(c) => {
+                                            cat_source.set(c.source);
+                                            cat_fetched.set(c.fetched_at);
+                                            catalogue.set(c.entries);
+                                        }
                                         Err(e) => app_c.error(format!("Failed to load catalogue: {e}")),
                                     }
                                 });
@@ -573,21 +614,50 @@ pub fn FiltersPage() -> impl IntoView {
                 open=show_catalogue
                 on_close=Callback::new(move |_| show_catalogue.set(false))
             >
-                <p class="hint">"Well-known hosts, domain and IP lists. Check each list's licence before use."</p>
+                <p class="hint">
+                    {move || if cat_source.get() == "signed" {
+                        format!("Signed · {}", cat_fetched.get().map(|d| d.chars().take(10).collect::<String>()).unwrap_or_default())
+                    } else {
+                        "Built-in".to_string()
+                    }}
+                    " · Check each list's licence before use."
+                </p>
+                <div class="chips" style="margin-bottom:8px">
+                    <input class="input" placeholder="Search" aria-label="Search the catalogue"
+                        prop:value=move || cat_q.get() on:input=move |ev| cat_q.set(event_target_value(&ev)) />
+                    <select class="select" aria-label="Category" on:change=move |ev| cat_category.set(event_target_value(&ev))>
+                        <option value="">"All categories"</option>
+                        {move || cat_categories.get().into_iter().map(|c| view! { <option value=c.clone()>{c.clone()}</option> }).collect_view()}
+                    </select>
+                    <select class="select" aria-label="Region" on:change=move |ev| cat_region.set(event_target_value(&ev))>
+                        <option value="">"All regions"</option>
+                        {move || cat_regions.get().into_iter().map(|c| view! { <option value=c.clone()>{c.clone()}</option> }).collect_view()}
+                    </select>
+                </div>
                 <ul class="flist">
                     <For
-                        each=move || catalogue.get()
+                        each=move || cat_filtered.get()
                         key=|e| (e.id.clone(), e.added)
                         children=move |e| {
                             let id = e.id.clone();
+                            let tip = e.licence_note.clone().unwrap_or_else(|| format!("Licence {} forbids commercial use", e.licence));
                             view! {
                                 <li style="grid-template-columns:minmax(0,1fr) auto">
                                     <div style="min-width:0">
-                                        <div class="nm">{e.name.clone()}</div>
-                                        <div class="url">{e.format.clone()}" | "{e.category.clone()}" | "{e.licence.clone()}</div>
+                                        <div class="nm">
+                                            {e.name.clone()}" "
+                                            <span class="badge">{if e.source == "signed" { "signed" } else { "built-in" }}</span>
+                                            {e.noncommercial.then(|| view! { " " <span class="badge" title=tip.clone()>"non-commercial"</span> })}
+                                        </div>
+                                        <div class="url">
+                                            {e.format.clone()}" | "{e.category.clone()}
+                                            {e.region.clone().map(|r| format!(" | {r}"))}
+                                            " | "{e.licence.clone()}
+                                        </div>
+                                        {(!e.description.is_empty()).then(|| view! { <div class="url">{e.description.clone()}</div> })}
                                     </div>
                                     {if e.added {
-                                        view! { <Pill kind="ok" text="added" /> }.into_any()
+                                        view! { <Pill kind="ok" text="Added" /> }.into_any()
                                     } else {
                                         view! {
                                             <button type="button" class="btn sm primary" on:click=move |_| catalogue_add.set(Some(id.clone()))>"Add"</button>

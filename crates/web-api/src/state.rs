@@ -247,6 +247,12 @@ pub struct AppState {
 
     /// The first-party list manager (installed by the proxy; created on first use otherwise).
     pub argus: OnceLock<Arc<list_service::ArgusLists>>,
+    /// Signed filter-list catalogue (argus-lists).
+    pub filter_catalogue:
+        OnceLock<Arc<list_service::SignedDoc<list_service::FilterCatalogueEntry>>>,
+    /// Signed userscript catalogue (argus-lists).
+    pub userscript_catalogue:
+        OnceLock<Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>>>,
 
     /// Serialises config updates and reloads (ETag check through save and commit).
     pub config_lock: tokio::sync::Mutex<()>,
@@ -818,6 +824,8 @@ pub async fn build_state_full(
         roots: OnceLock::new(),
         chain_probe: OnceLock::new(),
         argus: OnceLock::new(),
+        filter_catalogue: OnceLock::new(),
+        userscript_catalogue: OnceLock::new(),
         config_lock: tokio::sync::Mutex::new(()),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
         timeseries: Default::default(),
@@ -876,6 +884,39 @@ impl AppState {
                 bypass.data_dir().map(|d| d.join("argus-lists")),
             );
             list_service::ArgusLists::new(bypass, self.list_service.clone(), cfg)
+        })
+    }
+
+    fn catalogue_cfg(&self) -> list_service::ArgusConfig {
+        list_service::ArgusConfig::from_config(
+            &self.proxy_state.config.read().bypass,
+            self.bypass().data_dir().map(|d| d.join("argus-lists")),
+        )
+    }
+
+    /// The signed filter-list catalogue (empty until verified).
+    pub fn filter_catalogue(
+        &self,
+    ) -> &Arc<list_service::SignedDoc<list_service::FilterCatalogueEntry>> {
+        self.filter_catalogue.get_or_init(|| {
+            list_service::SignedDoc::new(
+                "filters",
+                Some(self.list_service.clone()),
+                self.catalogue_cfg(),
+            )
+        })
+    }
+
+    /// The signed userscript catalogue (empty until verified).
+    pub fn userscript_catalogue(
+        &self,
+    ) -> &Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>> {
+        self.userscript_catalogue.get_or_init(|| {
+            list_service::SignedDoc::new(
+                "userscripts",
+                Some(self.list_service.clone()),
+                self.catalogue_cfg(),
+            )
         })
     }
 

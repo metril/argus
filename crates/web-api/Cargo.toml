@@ -89,6 +89,7 @@ test-hooks = []
 web-api = { path = ".", features = ["test-hooks"] }
 axum-test = "18"
 minisign = "0.7"
+list-service = { path = "../list-service", default-features = false, features = ["testkit"] }
 futures-util = { workspace = true }
 tempfile = "3.10"
 rcgen = { workspace = true }
