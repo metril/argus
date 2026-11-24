@@ -1038,7 +1038,14 @@
           "category": {
             "type": "string"
           },
+          "description": {
+            "type": "string"
+          },
           "format": {
+            "description": "`abp`, `ubo`, `adguard`, `hosts`, `domains` or `ips`.",
+            "type": "string"
+          },
+          "homepage": {
             "type": "string"
           },
           "id": {
@@ -1047,7 +1054,28 @@
           "licence": {
             "type": "string"
           },
+          "licence_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
+            "type": "string"
+          },
+          "noncommercial": {
+            "description": "The licence forbids commercial use.",
+            "type": "boolean"
+          },
+          "region": {
+            "description": "Language/region the list targets (`de`, `fr`, ...).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`signed` (verified argus-lists catalogue) or `builtin`.",
             "type": "string"
           },
           "url": {
@@ -1062,6 +1090,40 @@
           "category",
           "licence",
           "added"
+        ],
+        "type": "object"
+      },
+      "CatalogueResponse": {
+        "description": "The catalogue and where it came from.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogueEntryResponse"
+            },
+            "type": "array"
+          },
+          "fetched_at": {
+            "description": "When the signed copy was verified (RFC 3339); absent for the built-in one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`signed` or `builtin`.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Release of the signed copy.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "entries"
         ],
         "type": "object"
       },
@@ -11380,10 +11442,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/CatalogueEntryResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/CatalogueResponse"
                 }
               }
             },
@@ -11442,7 +11501,7 @@
             ]
           }
         ],
-        "summary": "The default-disabled catalogue of well-known lists (hosts, domain and IP lists).",
+        "summary": "The catalogue of well-known lists: the signed argus-lists one when verified, else the\nbuilt-in hosts/domain/IP lists.",
         "tags": [
           "lists"
         ]
