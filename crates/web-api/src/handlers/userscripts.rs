@@ -9,7 +9,8 @@ use api_types::{
     ExportedAssets, ExportedRequire, ExportedResource, ExportedUserscript, ImportResultDto,
     ImportUserscriptsResponse, InstallUserscriptRequest, MessageResponse, PendingUpdateDto,
     PlanRequireDto, PlanResourceDto, PlanUpdateDto, PlanUserscriptRequest, Scope,
-    SetEnabledRequest, StorageValueDto, UpdateDiffDto, UserscriptBundle, UserscriptCounts,
+    SetEnabledRequest, StorageValueDto, UpdateDiffDto, UserscriptBundle,
+    UserscriptCatalogueEntryDto, UserscriptCatalogueResponse, UserscriptCounts,
     UserscriptPlanResponse, UserscriptResponse, UserscriptSourceResponse, UserscriptStatsResponse,
     UserscriptStorageResponse, UserscriptsPage, LEGACY_USERSCRIPT_BUNDLE_FORMAT,
     USERSCRIPT_BUNDLE_FORMAT,
@@ -450,6 +451,52 @@ fn plan_response(state: &AppState, plan_id: String, sp: &StoredPlan) -> Userscri
         }),
         installed_version: existing.and_then(|s| s.metadata.version),
     }
+}
+
+/// The signed catalogue of curated userscripts (installs still go through plan and confirm).
+#[utoipa::path(
+    get, path = "/userscripts/catalogue", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:read"])),
+    params(ProfileQuery),
+    responses((status = 200, description = "Catalogue", body = UserscriptCatalogueResponse))
+)]
+pub async fn get_userscript_catalogue(
+    State(state): State<Arc<AppState>>,
+    // The catalogue is the same for every profile; the parameter keeps the scope's profile rule.
+    _profile: ProfileParam,
+) -> ApiResult<Json<UserscriptCatalogueResponse>> {
+    let Some(doc) = state.userscript_catalogue().get() else {
+        return Ok(Json(UserscriptCatalogueResponse {
+            source: "unavailable".into(),
+            fetched_at: None,
+            version: None,
+            entries: Vec::new(),
+        }));
+    };
+    let entries = doc
+        .entries
+        .iter()
+        .map(|e| UserscriptCatalogueEntryDto {
+            id: e.id.clone(),
+            name: e.name.clone(),
+            description: e.description.clone(),
+            install_url: e.install_url.clone(),
+            homepage: e.homepage.clone(),
+            sites: e.sites.clone(),
+            category: e.category.clone(),
+            licence: e.licence.clone(),
+            licence_note: e.licence_note.clone(),
+            needs_gm: e.needs_gm.clone(),
+            connect: e.connect.clone(),
+            requires: e.requires.clone(),
+        })
+        .collect();
+    Ok(Json(UserscriptCatalogueResponse {
+        source: "signed".into(),
+        fetched_at: Some(doc.fetched_at.clone()),
+        version: Some(doc.version.clone()),
+        entries,
+    }))
 }
 
 /// Plan an install from source or URL.
