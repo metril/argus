@@ -246,7 +246,8 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 
 /* ---------- dashboard ---------- */
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,168px),1fr));gap:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-card);overflow:hidden}
-.tile{background:var(--surface);box-shadow:1px 1px 0 0 var(--line);padding:var(--s3) var(--s4);display:flex;flex-direction:column;gap:6px;min-width:0}
+.tile{position:relative;background:var(--surface);padding:var(--s3) var(--s4);display:flex;flex-direction:column;gap:6px;min-width:0}
+.tile::after{content:"";position:absolute;inset:0 -1px -1px 0;border:solid var(--line);border-width:0 1px 1px 0;pointer-events:none;z-index:1}
 .tile .k{font:600 var(--fs-11)/1 var(--font-head);text-transform:uppercase;letter-spacing:.09em;color:var(--text-3)}
 .tile .v{font:500 var(--fs-24)/1.1 var(--font-mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
 .tile .d{font-size:var(--fs-12);color:var(--text-3)}
