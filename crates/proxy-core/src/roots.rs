@@ -789,9 +789,7 @@ impl rustls::client::danger::ServerCertVerifier for LiveVerifier {
 pub struct RootsManager {
     handle: Arc<RootsHandle>,
     svc: Option<Arc<list_service::ListService>>,
-    base_url: String,
-    public_key: String,
-    cache_dir: Option<PathBuf>,
+    cfg: parking_lot::RwLock<Arc<dyn Fn() -> list_service::ArgusConfig + Send + Sync>>,
     /// Highest serial ever accepted, kept apart from the cache so it outlives it.
     min_serial: std::sync::atomic::AtomicU64,
     /// One check at a time.
@@ -818,28 +816,43 @@ impl RootsManager {
         Arc::new(Self {
             handle,
             svc: Some(svc),
-            base_url: cfg.base_url.clone(),
-            public_key: cfg.public_key.clone(),
-            cache_dir: cfg.cache_dir.clone(),
+            cfg: parking_lot::RwLock::new(Arc::new({
+                let cfg = cfg.clone();
+                move || cfg.clone()
+            })),
             min_serial: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
     }
 
+    /// Read the base URL, key and cache directory from `f` on every use (the live config), so a
+    /// change in the UI applies on the next refresh without a restart.
+    pub fn set_config_source(
+        &self,
+        f: impl Fn() -> list_service::ArgusConfig + Send + Sync + 'static,
+    ) {
+        *self.cfg.write() = Arc::new(f);
+    }
+
+    fn cfg(&self) -> list_service::ArgusConfig {
+        let f = self.cfg.read().clone();
+        f()
+    }
+
     fn url(&self, file: &str) -> String {
-        format!("{}/{file}", self.base_url.trim_end_matches('/'))
+        format!("{}/{file}", self.cfg().base_url.trim_end_matches('/'))
     }
 
     /// Check the signature and the content of a fetched or cached copy.
     fn check(&self, bytes: &[u8], sig: &str) -> std::result::Result<RootsData, String> {
-        list_service::verify_minisign(&self.public_key, bytes, sig)
+        list_service::verify_minisign(&self.cfg().public_key, bytes, sig)
             .map_err(|e| format!("roots.json: {e}"))?;
         RootsData::parse(bytes)
     }
 
     /// Load the last good verified copy from the cache, if any (verified again on every load).
     pub fn init_cache(&self) {
-        let Some(dir) = &self.cache_dir else {
+        let Some(dir) = self.cfg().cache_dir else {
             return;
         };
         // The highest serial ever accepted: enforced even when the cache itself is gone.
@@ -921,7 +934,7 @@ impl RootsManager {
     }
 
     async fn apply(&self, text: String, sig: String) -> std::result::Result<RootsOutcome, String> {
-        let key = self.public_key.clone();
+        let key = self.cfg().public_key;
         let (text, sig, data) = tokio::task::spawn_blocking(move || {
             list_service::verify_minisign(&key, text.as_bytes(), &sig)
                 .map_err(|e| format!("roots.json: {e}"))?;
@@ -947,7 +960,7 @@ impl RootsManager {
         self.handle.install(Arc::new(data))?;
         self.min_serial
             .fetch_max(serial, std::sync::atomic::Ordering::Relaxed);
-        if let Some(dir) = self.cache_dir.clone() {
+        if let Some(dir) = self.cfg().cache_dir {
             let (t, s) = (text.into_bytes(), sig.into_bytes());
             let written = tokio::task::spawn_blocking(move || {
                 // The serial first, then the data, the signature last: a half-written cache
@@ -1129,9 +1142,14 @@ mod tests {
         Arc::new(RootsManager {
             handle: handle.clone(),
             svc: None,
-            base_url: "http://unused.test".into(),
-            public_key: key.to_string(),
-            cache_dir: Some(cache.to_path_buf()),
+            cfg: parking_lot::RwLock::new(Arc::new({
+                let cfg = list_service::ArgusConfig {
+                    base_url: "http://unused.test".into(),
+                    public_key: key.to_string(),
+                    cache_dir: Some(cache.to_path_buf()),
+                };
+                move || cfg.clone()
+            })),
             min_serial: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
@@ -1240,6 +1258,22 @@ mod tests {
                 serial: FLOOR_SERIAL + 5
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_key_change_makes_a_previously_valid_signature_fail() {
+        let r = rig();
+        let body = roots_json(FLOOR_SERIAL + 5, &[], &[], MIN_ROOTS);
+        let sig = sign(&r.sk, &r.pk, body.as_bytes());
+        let (other_pk, _) = keypair();
+        let cfg = list_service::ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: pk_b64(&other_pk),
+            cache_dir: None,
+        };
+        r.manager.set_config_source(move || cfg.clone());
+        let e = r.manager.refresh_from(body, sig).await.unwrap_err();
+        assert!(e.contains("signature"), "{e}");
     }
 
     #[tokio::test]

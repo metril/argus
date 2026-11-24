@@ -892,23 +892,30 @@ impl AppState {
         })
     }
 
-    /// Make both catalogues read the lists base URL and key from the live config on every
+    /// Make the bypass lists and both catalogues read the lists base URL and key from the live config on every
     /// refresh. Holds the state weakly (the catalogues live inside it).
     pub fn follow_live_catalogue_config(self: &Arc<Self>) {
-        let (a, b) = (Arc::downgrade(self), Arc::downgrade(self));
+        let (a, b, c) = (
+            Arc::downgrade(self),
+            Arc::downgrade(self),
+            Arc::downgrade(self),
+        );
         let cfg = |w: &std::sync::Weak<Self>| {
             let s = w.upgrade()?;
             Some(s.catalogue_cfg())
         };
         let fallback = self.catalogue_cfg();
-        let fb = fallback.clone();
+        let (fb, fc) = (fallback.clone(), fallback.clone());
+        self.argus()
+            .set_config_source(move || cfg(&c).unwrap_or_else(|| fc.clone()));
         self.filter_catalogue()
             .set_config_source(move || cfg(&a).unwrap_or_else(|| fb.clone()));
         self.userscript_catalogue()
             .set_config_source(move || cfg(&b).unwrap_or_else(|| fallback.clone()));
     }
 
-    fn catalogue_cfg(&self) -> list_service::ArgusConfig {
+    /// The lists base URL, key and cache directory from the live config.
+    pub fn catalogue_cfg(&self) -> list_service::ArgusConfig {
         list_service::ArgusConfig::from_config(
             &self.proxy_state.config.read().bypass,
             self.bypass().data_dir().map(|d| d.join("argus-lists")),

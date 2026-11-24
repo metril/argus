@@ -127,17 +127,18 @@ async fn main() -> Result<()> {
 
     // Trusted roots: the compiled-in set until a signed one (same release, same key) has been
     // verified; then swapped in live.
-    if let Some(roots) = ctx.roots() {
-        proxy_core::roots::RootsManager::new(
+    let roots_manager = ctx.roots().map(|roots| {
+        let m = proxy_core::roots::RootsManager::new(
             roots.clone(),
             list_service.clone(),
             &list_service::ArgusConfig::from_config(
                 &config.bypass,
                 bypass_engine.data_dir().map(|d| d.join("argus-lists")),
             ),
-        )
-        .start();
-    }
+        );
+        m.start();
+        m
+    });
 
     // Userscripts: one manager (one database, one live index) shared by the proxy's injection
     // and GM endpoints and by the management API. The proxy only uses it when enabled.
@@ -252,6 +253,7 @@ async fn main() -> Result<()> {
                 control,
                 bypass_for_api,
                 argus.clone(),
+                roots_manager,
                 (filter_catalogue.clone(), userscript_catalogue.clone()),
             )
             .await?,
@@ -298,6 +300,7 @@ async fn start_webui_server(
     control: Arc<proxy_core::server::ProxyControl>,
     bypass: Arc<common::bypass::BypassEngine>,
     argus: Arc<list_service::ArgusLists>,
+    roots_manager: Option<Arc<proxy_core::roots::RootsManager>>,
     catalogues: (
         Arc<list_service::SignedDoc<list_service::FilterCatalogueEntry>>,
         Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>>,
@@ -380,6 +383,13 @@ async fn start_webui_server(
     // The lists location and key follow the live config (editable in the UI), not the one read at
     // startup.
     state.follow_live_catalogue_config();
+    if let Some(m) = roots_manager {
+        let (w, fb) = (Arc::downgrade(&state), state.catalogue_cfg());
+        m.set_config_source(move || {
+            w.upgrade()
+                .map_or_else(|| fb.clone(), |s| s.catalogue_cfg())
+        });
+    }
 
     info!(
         "Web UI API server starting on {}:{}",

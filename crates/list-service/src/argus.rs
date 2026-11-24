@@ -130,7 +130,7 @@ pub enum RefreshOutcome {
 pub struct ArgusLists {
     engine: Arc<BypassEngine>,
     svc: Arc<ListService>,
-    cfg: ArgusConfig,
+    cfg: parking_lot::RwLock<Arc<dyn Fn() -> ArgusConfig + Send + Sync>>,
     /// One check at a time.
     busy: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
@@ -145,14 +145,25 @@ impl ArgusLists {
         Arc::new(Self {
             engine,
             svc,
-            cfg,
+            cfg: parking_lot::RwLock::new(Arc::new(move || cfg.clone())),
             busy: tokio::sync::Mutex::new(()),
             wake: tokio::sync::Notify::new(),
         })
     }
 
+    /// Read the base URL, key and cache directory from `f` on every use (the live config), so a
+    /// change in the UI applies on the next refresh without a restart.
+    pub fn set_config_source(&self, f: impl Fn() -> ArgusConfig + Send + Sync + 'static) {
+        *self.cfg.write() = Arc::new(f);
+    }
+
+    fn cfg(&self) -> ArgusConfig {
+        let f = self.cfg.read().clone();
+        f()
+    }
+
     fn url(&self, file: &str) -> String {
-        format!("{}/{file}", self.cfg.base_url.trim_end_matches('/'))
+        format!("{}/{file}", self.cfg().base_url.trim_end_matches('/'))
     }
 
     /// Check again soon (a category was enabled, or the user asked).
@@ -163,10 +174,10 @@ impl ArgusLists {
     /// Load the last good copy from the cache: every file is verified again against the key (and
     /// the signed `meta.json` digests), so a tampered or stale-keyed cache loads nothing.
     pub fn init_cache(&self) {
-        let Some(dir) = &self.cfg.cache_dir else {
+        let Some(dir) = self.cfg().cache_dir else {
             return;
         };
-        let loaded = self.read_cache(dir);
+        let loaded = self.read_cache(&dir);
         let now = bypass::now();
         let res = self.engine.update(|s| {
             match &loaded {
@@ -223,9 +234,10 @@ impl ArgusLists {
         let read = |name: &str| std::fs::read(dir.join(name)).ok();
         let meta_bytes = read("meta.json")?;
         let sig = String::from_utf8(read("meta.json.minisig")?).ok()?;
-        verify(&self.cfg.public_key, &meta_bytes, &sig).ok()?;
+        verify(&self.cfg().public_key, &meta_bytes, &sig).ok()?;
         let meta: Meta = serde_json::from_slice(&meta_bytes).ok()?;
         version_key(&meta.version)?;
+        let key = self.cfg().public_key;
         let mut lists = std::collections::BTreeMap::new();
         for c in &meta.categories {
             let Some(bytes) = read(&format!("{}.txt", c.id)) else {
@@ -236,8 +248,7 @@ impl ArgusLists {
             else {
                 continue;
             };
-            if verify(&self.cfg.public_key, &bytes, &sig).is_err() || sha256_hex(&bytes) != c.sha256
-            {
+            if verify(&key, &bytes, &sig).is_err() || sha256_hex(&bytes) != c.sha256 {
                 continue;
             }
             let (hosts, _) = bypass::parse_exclusion_list_counted_with(
@@ -276,7 +287,7 @@ impl ArgusLists {
     async fn refresh_inner(&self) -> Result<RefreshOutcome, String> {
         let meta_text = self.fetch("meta.json").await?;
         let meta_sig = self.fetch("meta.json.minisig").await?;
-        verify(&self.cfg.public_key, meta_text.as_bytes(), &meta_sig)
+        verify(&self.cfg().public_key, meta_text.as_bytes(), &meta_sig)
             .map_err(|e| format!("meta.json: {e}"))?;
         let meta: Meta = serde_json::from_str(&meta_text).map_err(|e| format!("meta.json: {e}"))?;
         if version_key(&meta.version).is_none() {
@@ -321,7 +332,7 @@ impl ArgusLists {
             // Verifying and parsing a big list is CPU work: off the async threads.
             let allowed = allowed.clone();
             let (key, want_sha, name) = (
-                self.cfg.public_key.clone(),
+                self.cfg().public_key.clone(),
                 c.sha256.clone(),
                 cat.to_string(),
             );
@@ -343,7 +354,7 @@ impl ArgusLists {
             lists.push((cat.to_string(), sig, text.into_bytes(), hosts));
         }
         // Cache (lists first, meta last: a half-written cache fails verification, never lies).
-        if let Some(dir) = self.cfg.cache_dir.clone() {
+        if let Some(dir) = self.cfg().cache_dir {
             let files: Vec<(String, Vec<u8>)> = lists
                 .iter()
                 .flat_map(|(cat, sig, text, _)| {
@@ -661,6 +672,37 @@ mod tests {
             r.lists.refresh().await.unwrap(),
             RefreshOutcome::Current {
                 version: "v2025.11.23".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_config_change_applies_on_the_next_refresh_and_a_key_change_rejects_old_signatures(
+    ) {
+        let (pk_a, sk_a) = keypair();
+        let (pk_b, sk_b) = keypair();
+        let (addr_a, _a) = serve(release(&sk_a, &pk_a, "v2025.11.23", &[])).await;
+        let (addr_b, _b) = serve(release(&sk_b, &pk_b, "v2025.11.24", &[])).await;
+        let r = rig(addr_a, &pk_a, None);
+        assert!(r.lists.refresh().await.is_ok());
+        // The key changes: the same, previously valid release no longer verifies.
+        let cache = Some(r.cache.clone());
+        let src = |addr: std::net::SocketAddr, pk: &minisign::PublicKeyBox| {
+            let c = ArgusConfig {
+                base_url: format!("http://{addr}"),
+                public_key: pk_b64(pk),
+                cache_dir: cache.clone(),
+            };
+            move || c.clone()
+        };
+        r.lists.set_config_source(src(addr_a, &pk_b));
+        assert!(r.lists.refresh().await.is_err());
+        // The location and key change together: the other release installs.
+        r.lists.set_config_source(src(addr_b, &pk_b));
+        assert_eq!(
+            r.lists.refresh().await.unwrap(),
+            RefreshOutcome::Installed {
+                version: "v2025.11.24".into()
             }
         );
     }
