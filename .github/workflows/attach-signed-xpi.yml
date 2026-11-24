@@ -1,0 +1,38 @@
+name: Attach signed Firefox xpi
+
+# Manual repair: fetch the AMO-signed xpi for an existing release tag and
+# attach it, for releases whose signing step failed or predates the secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.3.2)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Fetch signed xpi from AMO
+        env:
+          TAG: ${{ inputs.tag }}
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+          v="${TAG#v}"
+          mkdir -p dist
+          python3 scripts/amo_fetch_signed.py "$v" "dist/argus-extension-${v}-firefox.xpi"
+      - name: Upload to release
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${TAG#v}"
+          gh release upload "$TAG" "dist/argus-extension-${v}-firefox.xpi" --clobber -R "$GITHUB_REPOSITORY"

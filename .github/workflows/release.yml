@@ -76,12 +76,18 @@ jobs:
             echo "xpi already on the release; reusing"
             exit 0
           fi
-          npx --yes web-ext@8.9.0 sign \
+          if npx --yes web-ext@8.9.0 sign \
             --source-dir extension/.output/firefox-mv3 \
             --artifacts-dir signed \
             --channel unlisted \
-            --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET"
-          cp signed/*.xpi "dist/$xpi"
+            --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET"; then
+            cp signed/*.xpi "dist/$xpi"
+          else
+            # AMO signs a version only once. If this version was already
+            # submitted (earlier run or manual upload), fetch its signed file.
+            echo "web-ext sign failed; fetching existing signed $VERSION from AMO"
+            python3 scripts/amo_fetch_signed.py "$VERSION" "dist/$xpi"
+          fi
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
           fi
