@@ -472,7 +472,7 @@ pub fn FiltersPage() -> impl IntoView {
                         <VList
                             items=feed.items
                             row_h=row_h
-                            key=|f: &FilterList| format!("{}:{}:{}:{}:{}:{}:{:?}:{:?}", f.id, f.enabled, f.allowlist, f.trusted, f.format, f.rule_count, f.last_error, f.last_updated)
+                            key=|f: &FilterList| f.id.clone()
                             render=Callback::new(move |f: FilterList| view! { <FilterRow filter=f sel=sel sel_open=sel_open feed=feed /> }.into_any())
                             on_end=Callback::new(move |()| feed.more())
                             error=feed.error
@@ -688,6 +688,7 @@ fn FilterRow(
 ) -> impl IntoView {
     let app_state = use_app_state();
     let id = filter.id.clone();
+    let r = live_row(feed.items, filter, |f: &FilterList| f.id.as_str());
     let on_flag = {
         let (app_state, id) = (app_state.clone(), id.clone());
         Callback::new(move |v: bool| {
@@ -701,9 +702,10 @@ fn FilterRow(
         })
     };
     let update = {
-        let (app_state, id, name) = (app_state.clone(), id.clone(), filter.name.clone());
+        let (app_state, id) = (app_state.clone(), id.clone());
         move |_| {
-            let (app_state, id, name) = (app_state.clone(), id.clone(), name.clone());
+            let (app_state, id) = (app_state.clone(), id.clone());
+            let name = r.with_untracked(|f| f.name.clone());
             wasm_bindgen_futures::spawn_local(async move {
                 match ApiClient::new().refresh_list(&id).await {
                     Ok(_) => app_state.success(format!("Fetching {name}")),
@@ -712,39 +714,48 @@ fn FilterRow(
             });
         }
     };
-    let (pill_kind, pill_text) = if filter.last_error.is_some() {
-        ("error", "error")
-    } else if !filter.enabled {
-        ("neutral", "disabled")
-    } else {
-        ("ok", "ok")
+    let pill = move || {
+        r.with(|f| {
+            let (kind, text) = if f.last_error.is_some() {
+                ("error", "error")
+            } else if !f.enabled {
+                ("neutral", "disabled")
+            } else {
+                ("ok", "ok")
+            };
+            view! { <Pill kind=kind text=text /> }
+        })
     };
-    let count = if filter.rule_count > 0 {
-        format!("{} rules", format_number(filter.rule_count as u64))
-    } else {
-        "-".to_string()
+    let count = move || {
+        r.with(|f| {
+            if f.rule_count > 0 {
+                format!("{} rules", format_number(f.rule_count as u64))
+            } else {
+                "-".to_string()
+            }
+        })
     };
     let open_id = id.clone();
 
     view! {
         <li>
-            <Switch checked=filter.enabled label=format!("Enable {}", filter.name) on_change=on_flag />
+            <Switch checked=Signal::derive(move || r.with(|f| f.enabled)) label=format!("Enable {}", r.with_untracked(|f| f.name.clone())) on_change=on_flag />
             <div style="min-width:0">
                 <div class="nm">
                     <button type="button" class="nmbtn" title="Options" on:click=move |_| {
                         sel.set(Some(open_id.clone()));
                         sel_open.set(true);
-                    }>{filter.name.clone()}</button>
+                    }>{move || r.with(|f| f.name.clone())}</button>
                     " "
-                    {filter.trusted.then(|| view! { <span class="badge" title="Rules may inject scriptlets">"trusted"</span> })}
-                    {filter.allowlist.then(|| view! { <span class="badge">"allowlist"</span> })}
+                    {move || r.with(|f| f.trusted).then(|| view! { <span class="badge" title="Rules may inject scriptlets">"trusted"</span> })}
+                    {move || r.with(|f| f.allowlist).then(|| view! { <span class="badge">"allowlist"</span> })}
                 </div>
-                <div class="url" title=filter.last_error.clone().unwrap_or_default()>{filter.url.clone()}</div>
+                <div class="url" title=move || r.with(|f| f.last_error.clone().unwrap_or_default())>{move || r.with(|f| f.url.clone())}</div>
             </div>
             <div class="meta">
-                <Pill kind=pill_kind text=pill_text />
+                {pill}
                 <span class="cnt num">{count}</span>
-                <span class="tm">{ago_rfc3339(filter.last_updated.as_deref())}</span>
+                <span class="tm">{move || r.with(|f| ago_rfc3339(f.last_updated.as_deref()))}</span>
             </div>
             <div class="meta">
                 <button type="button" class="btn sm ghost act" on:click=update>"Update"</button>

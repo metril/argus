@@ -414,7 +414,8 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
             .fetch_exclusion_list(&Self::url(&cfg, &format!("{file}.minisig")))
             .await?;
         // The signed meta.json is a cross-check; the file's own signature still protects us.
-        let meta = async {
+        let cache = svc.meta_cache();
+        let fetch_meta = || async {
             let t = svc
                 .fetch_exclusion_list(&Self::url(&cfg, "meta.json"))
                 .await?;
@@ -422,10 +423,23 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                 .fetch_exclusion_list(&Self::url(&cfg, "meta.json.minisig"))
                 .await?;
             Ok::<_, String>((t, s))
+        };
+        let (meta, shared) = match cache.get_or_fetch(&cfg, fetch_meta).await {
+            Ok((m, hit)) => (Some(m), hit),
+            Err(_) => (None, false),
+        };
+        let r = self
+            .apply_locked(&cfg, text.clone(), sig.clone(), meta)
+            .await;
+        if r.is_err() {
+            cache.invalidate(&cfg).await;
+            if shared {
+                // The shared meta may predate a release published since: retry once with a fresh one.
+                let meta = cache.get_or_fetch(&cfg, fetch_meta).await.ok().map(|x| x.0);
+                return self.apply_locked(&cfg, text, sig, meta).await;
+            }
         }
-        .await
-        .ok();
-        self.apply_locked(&cfg, text, sig, meta).await
+        r
     }
 
     /// Verify and install a copy already in hand (also what tests drive).

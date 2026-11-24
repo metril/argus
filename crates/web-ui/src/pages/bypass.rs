@@ -26,6 +26,13 @@ pub fn BypassPage() -> impl IntoView {
     let settings = RwSignal::new(Option::<BypassSettings>::None);
     let subs = RwSignal::new(Vec::<BypassSubscriptionDto>::new());
     let suggested = RwSignal::new(Vec::<SuggestedSubscription>::new());
+    let cats = Signal::derive(move || {
+        argus
+            .read()
+            .as_ref()
+            .map(|a| a.categories.clone())
+            .unwrap_or_default()
+    });
     let counts = RwSignal::new(api_types::BypassEntryCounts::default());
     let checking = RwSignal::new(false);
 
@@ -328,12 +335,12 @@ pub fn BypassPage() -> impl IntoView {
                         <Pill kind="passthrough" text="don't decrypt" />
                     </div>
                     <For
-                        each=move || argus.read().as_ref().map(|a| a.categories.clone()).unwrap_or_default()
-                        key=|c| format!("{}{}{}{}", c.id, c.enabled, mode_key(c.mode), c.host_count)
+                        each=move || cats.get()
+                        key=|c| c.id.clone()
                         children=move |c| {
                             let (id1, id2, id3) = (c.id.clone(), c.id.clone(), c.id.clone());
                             let (title, title2) = (c.name.clone(), c.name.clone());
-                            let enabled = c.enabled;
+                            let r = live_row(cats, c, |c: &api_types::ArgusCategoryDto| c.id.as_str());
                             let update = move |id: String, u: UpdateBypassCategory| {
                                 wasm_bindgen_futures::spawn_local(async move {
                                     match ApiClient::new().update_bypass_category(&id, &u).await {
@@ -345,22 +352,22 @@ pub fn BypassPage() -> impl IntoView {
                                 });
                             };
                             view! {
-                                <div class=if enabled { "srow cat" } else { "srow cat off" }>
+                                <div class=move || if r.with(|c| c.enabled) { "srow cat" } else { "srow cat off" }>
                                     <Switch
-                                        checked=enabled
+                                        checked=Signal::derive(move || r.with(|c| c.enabled))
                                         label=format!("{title}")
                                         on_change=Callback::new(move |v| update(id1.clone(), UpdateBypassCategory { enabled: Some(v), ..Default::default() }))
                                     />
-                                    <div class="txt"><b>{c.name.clone()}</b><small>{c.description.clone()}</small></div>
+                                    <div class="txt"><b>{move || r.with(|c| c.name.clone())}</b><small>{move || r.with(|c| c.description.clone())}</small></div>
                                     <Segmented
                                         label=format!("Mode, {title2}")
                                         options=mode_opts()
-                                        value=mode_key(c.mode).to_string()
+                                        value=Signal::derive(move || r.with(|c| mode_key(c.mode).to_string()))
                                         on_change=Callback::new(move |v: String| update(id2.clone(), UpdateBypassCategory { mode: Some(parse_mode(&v)), ..Default::default() }))
                                     />
-                                    <span class="cnt dim num">{if c.loaded { format!("{} hosts", format_number(c.host_count as u64)) } else { "not loaded".to_string() }}</span>
+                                    <span class="cnt dim num">{move || r.with(|c| if c.loaded { format!("{} hosts", format_number(c.host_count as u64)) } else { "not loaded".to_string() })}</span>
                                     <button class="btn sm ghost" type="button" on:click={
-                                        let name = c.name.clone();
+                                        let name = r.with_untracked(|c| c.name.clone());
                                         move |_| {
                                             hosts_id.set(id3.clone());
                                             hosts_title.set(name.clone());
@@ -449,20 +456,21 @@ pub fn BypassPage() -> impl IntoView {
                         <VList
                             items=feed.items
                             row_h=row_h
-                            key=|e: &BypassEntryDto| format!("{}/{}/{}/{}", e.id, e.pattern, mode_key(e.mode), e.updated_at)
+                            key=|e: &BypassEntryDto| e.id.clone()
                             render=Callback::new(move |e: BypassEntryDto| {
                                 let (id1, id2) = (e.id.clone(), e.id.clone());
                                 let pat = e.pattern.clone();
+                                let r = live_row(feed.items, e, |e: &BypassEntryDto| e.id.as_str());
                                 view! {
                                     <div class="siterow">
                                         <div class="h">
                                             <b title=pat.clone()>{pat.clone()}</b>
-                                            <small>{e.source.clone()}{e.note.clone().map(|n| format!(" \u{b7} {n}"))}</small>
+                                            <small>{move || r.with(|e| format!("{}{}", e.source, e.note.as_ref().map(|n| format!(" \u{b7} {n}")).unwrap_or_default()))}</small>
                                         </div>
                                         <Segmented
                                             label=format!("Mode for {pat}")
                                             options=mode_opts()
-                                            value=mode_key(e.mode).to_string()
+                                            value=Signal::derive(move || r.with(|e| mode_key(e.mode).to_string()))
                                             on_change=Callback::new(move |v: String| {
                                                 let id = id1.clone();
                                                 wasm_bindgen_futures::spawn_local(async move {
@@ -533,14 +541,15 @@ pub fn BypassPage() -> impl IntoView {
                 <div class="card-b sitebar">
                     <span class="lbl">"Suggested lists"</span>
                     <div class="chips" role="group" aria-label="Suggested subscriptions">
-                        <For each=move || suggested.get() key=|s| format!("{}{}", s.id, s.subscribed) children=move |s| {
+                        <For each=move || suggested.get() key=|s| s.id.clone() children=move |s| {
                             let id = s.id.clone();
-                            let subscribed = s.subscribed;
+                            let r = live_row(suggested, s, |s: &SuggestedSubscription| s.id.as_str());
+                            let subscribed = move || r.with(|s| s.subscribed);
                             view! {
-                                <button type="button" class="chip" aria-pressed=subscribed.to_string() disabled=subscribed title=s.description.clone()
+                                <button type="button" class="chip" aria-pressed=move || subscribed().to_string() disabled=subscribed title=r.with_untracked(|s| s.description.clone())
                                     on:click=move |_| add_sub(CreateBypassSubscription { suggested_id: Some(id.clone()), ..Default::default() })>
                                     <span class="ck"><Icon name="check" /></span>
-                                    {if subscribed { s.name.clone() } else { format!("+ {}", s.name) }}
+                                    {move || r.with(|s| if s.subscribed { s.name.clone() } else { format!("+ {}", s.name) })}
                                 </button>
                             }
                         } />
@@ -548,14 +557,15 @@ pub fn BypassPage() -> impl IntoView {
                     <span class="hint">"Maintained by AdGuard and downloaded when Argus runs. Nothing is bundled."</span>
                 </div>
                 <ul class="flist" aria-label="Bypass subscriptions">
-                    <For each=move || subs.get() key=|s| format!("{}{}{}{}{:?}{:?}{}", s.id, s.enabled, mode_key(s.mode), s.host_count, s.last_fetched, s.last_error, s.skipped_lines) children=move |s| {
+                    <For each=move || subs.get() key=|s| s.id.clone() children=move |s| {
                         let (id1, id2, id3) = (s.id.clone(), s.id.clone(), s.id.clone());
-                        let err = s.last_error.clone();
+                        let name0 = s.name.clone();
+                        let r = live_row(subs, s, |s: &BypassSubscriptionDto| s.id.as_str());
                         view! {
                             <li>
                                 <Switch
-                                    checked=s.enabled
-                                    label=format!("Enable {}", s.name)
+                                    checked=Signal::derive(move || r.with(|s| s.enabled))
+                                    label=format!("Enable {name0}")
                                     on_change=Callback::new(move |v| {
                                         let id = id1.clone();
                                         wasm_bindgen_futures::spawn_local(async move {
@@ -566,14 +576,14 @@ pub fn BypassPage() -> impl IntoView {
                                         });
                                     })
                                 />
-                                <div style="min-width:0"><div class="nm">{s.name.clone()}</div><div class="url">{s.url.clone()}</div></div>
+                                <div style="min-width:0"><div class="nm">{move || r.with(|s| s.name.clone())}</div><div class="url">{move || r.with(|s| s.url.clone())}</div></div>
                                 <div class="meta">
-                                    {match err.clone() {
+                                    {move || r.with(|s| match s.last_error.clone() {
                                         Some(e) => view! { <span title=e><Pill kind="error" text="error" /></span> }.into_any(),
                                         None => view! { <Pill kind="passthrough" text=mode_label(s.mode) /> }.into_any(),
-                                    }}
-                                    <span class="cnt num">{format!("{} hosts", format_number(s.host_count as u64))}</span>
-                                    <span class="tm">{s.last_fetched.as_deref().map(fmt_ago).unwrap_or_else(|| "never".into())}</span>
+                                    })}
+                                    <span class="cnt num">{move || r.with(|s| format!("{} hosts", format_number(s.host_count as u64)))}</span>
+                                    <span class="tm">{move || r.with(|s| s.last_fetched.as_deref().map(fmt_ago).unwrap_or_else(|| "never".into()))}</span>
                                 </div>
                                 <div class="meta">
                                     <button class="btn sm ghost act" type="button" on:click=move |_| {
@@ -595,10 +605,10 @@ pub fn BypassPage() -> impl IntoView {
                                         });
                                     }) />
                                 </div>
-                                {err.map(|e| view! { <div class="err" style="grid-column:2/-1">{e}</div> })}
-                                {(s.skipped_lines > 0).then(|| view! {
+                                {move || r.with(|s| s.last_error.clone()).map(|e| view! { <div class="err" style="grid-column:2/-1">{e}</div> })}
+                                {move || r.with(|s| (s.skipped_lines > 0).then(|| view! {
                                     <div class="dim" style="grid-column:2/-1" title=s.skipped_sample.join("\n")>{format!("{} lines skipped (too broad or invalid)", s.skipped_lines)}</div>
-                                })}
+                                }))}
                             </li>
                         }
                     } />

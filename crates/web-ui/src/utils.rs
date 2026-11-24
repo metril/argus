@@ -2,25 +2,17 @@
 
 use web_sys::window;
 
-/// Get the current window location origin (e.g., "http://localhost:3000")
+/// Get the current window location origin
 pub fn get_origin() -> String {
     window()
         .and_then(|w| w.location().origin().ok())
-        .unwrap_or_else(|| "http://localhost:3000".to_string())
+        .unwrap_or_default()
 }
 
-/// Get the API base URL
+/// Get the API base URL: always the page's own origin (`trunk serve` proxies `/api/` to the
+/// backend), in debug and release alike.
 pub fn api_base_url() -> String {
-    // In development, the API runs on port 3000
-    // In production, it's served from the same origin
-    #[cfg(debug_assertions)]
-    {
-        "http://localhost:3000".to_string()
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        get_origin()
-    }
+    get_origin()
 }
 
 /// Format a number with thousand separators

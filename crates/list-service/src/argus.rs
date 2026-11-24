@@ -50,6 +50,62 @@ impl ArgusConfig {
     }
 }
 
+/// How long a fetched `meta.json` is shared between the catalogues and the lists.
+const META_TTL: Duration = Duration::from_secs(60);
+
+type MetaPair = (String, String);
+
+/// Short-lived share of the fetched (still unverified) `meta.json` and signature, so one refresh
+/// cycle fetches it once. Keyed by base URL and public key; every consumer still verifies the
+/// signature and its own digest and version itself.
+#[derive(Default)]
+pub struct MetaCache {
+    inner: tokio::sync::Mutex<
+        std::collections::HashMap<(String, String), (std::time::Instant, MetaPair)>,
+    >,
+}
+
+impl MetaCache {
+    /// The cached pair for this source, or the result of `fetch` (stored on success). Concurrent
+    /// callers wait for one fetch.
+    pub async fn get_or_fetch<F, Fut>(
+        &self,
+        cfg: &ArgusConfig,
+        fetch: F,
+    ) -> Result<(MetaPair, bool), String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<MetaPair, String>>,
+    {
+        let key = (cfg.base_url.clone(), cfg.public_key.clone());
+        let mut m = self.inner.lock().await;
+        if let Some((at, pair)) = m.get(&key) {
+            if at.elapsed() < META_TTL {
+                return Ok((pair.clone(), true));
+            }
+        }
+        let pair = fetch().await?;
+        m.insert(key, (std::time::Instant::now(), pair.clone()));
+        Ok((pair, false))
+    }
+
+    /// Store a freshly fetched pair for this source.
+    pub async fn put(&self, cfg: &ArgusConfig, pair: MetaPair) {
+        self.inner.lock().await.insert(
+            (cfg.base_url.clone(), cfg.public_key.clone()),
+            (std::time::Instant::now(), pair),
+        );
+    }
+
+    /// Forget this source's copy (after a copy that failed to verify or match).
+    pub async fn invalidate(&self, cfg: &ArgusConfig) {
+        self.inner
+            .lock()
+            .await
+            .remove(&(cfg.base_url.clone(), cfg.public_key.clone()));
+    }
+}
+
 /// Verify `sig_text` (a `.minisig` file) over `data` with `public_key` (base64). Only prehashed
 /// (`ED`) minisign signatures made with that key's id are accepted.
 pub fn verify(public_key: &str, data: &[u8], sig_text: &str) -> Result<(), String> {
@@ -308,6 +364,9 @@ impl ArgusLists {
         let cfg = self.cfg();
         self.sync_key(&cfg);
         let result = self.refresh_inner(&cfg).await;
+        if result.is_err() {
+            self.svc.meta_cache().invalidate(&cfg).await;
+        }
         let now = bypass::now();
         let err = result.as_ref().err().cloned();
         // Status only: kept in memory, saved with the next real change (no write per check).
@@ -325,8 +384,14 @@ impl ArgusLists {
     }
 
     async fn refresh_inner(&self, cfg: &ArgusConfig) -> Result<RefreshOutcome, String> {
+        // Always fetched fresh (a check answers "is there a newer release now"), then shared
+        // with the catalogues for the next minute.
         let meta_text = self.fetch(cfg, "meta.json").await?;
         let meta_sig = self.fetch(cfg, "meta.json.minisig").await?;
+        self.svc
+            .meta_cache()
+            .put(cfg, (meta_text.clone(), meta_sig.clone()))
+            .await;
         verify(&cfg.public_key, meta_text.as_bytes(), &meta_sig)
             .map_err(|e| format!("meta.json: {e}"))?;
         let meta: Meta = serde_json::from_str(&meta_text).map_err(|e| format!("meta.json: {e}"))?;
@@ -1095,5 +1160,34 @@ mod tests {
         // A third-party list never gets the first-party allow-list.
         let (hosts, skipped) = bypass::parse_exclusion_list_counted("*.ltd.uk\nfine.test\n", 10);
         assert_eq!((hosts, skipped.count), (vec!["fine.test".to_string()], 1));
+    }
+
+    #[tokio::test]
+    async fn meta_is_fetched_once_per_source_and_not_shared_across_keys_or_urls() {
+        let c = MetaCache::default();
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let cfg = |u: &str, k: &str| ArgusConfig {
+            base_url: u.into(),
+            public_key: k.into(),
+            cache_dir: None,
+        };
+        let f = || async {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(("m".to_string(), "s".to_string()))
+        };
+        let a = cfg("u1", "k1");
+        c.get_or_fetch(&a, f).await.unwrap();
+        c.get_or_fetch(&a, f).await.unwrap();
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 1);
+        c.get_or_fetch(&cfg("u1", "k2"), f).await.unwrap();
+        c.get_or_fetch(&cfg("u2", "k1"), f).await.unwrap();
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 3);
+        c.invalidate(&a).await;
+        c.get_or_fetch(&a, f).await.unwrap();
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(c
+            .get_or_fetch(&cfg("u3", "k"), || async { Err("x".into()) })
+            .await
+            .is_err());
     }
 }
