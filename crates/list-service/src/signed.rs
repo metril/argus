@@ -119,6 +119,11 @@ pub struct SignedDoc<E> {
     svc: Option<Arc<ListService>>,
     cfg: parking_lot::RwLock<Arc<dyn Fn() -> ArgusConfig + Send + Sync>>,
     current: parking_lot::RwLock<Option<Arc<Loaded<E>>>>,
+    /// Text and signature of the copy in force, and the key it was verified with: a key change
+    /// verifies it again.
+    installed: parking_lot::Mutex<Option<(String, String)>>,
+    applied_key: parking_lot::Mutex<String>,
+    wake: tokio::sync::Notify,
     /// Newest release ever accepted (outlives the cache file).
     min_version: parking_lot::Mutex<Option<String>>,
     busy: tokio::sync::Mutex<()>,
@@ -129,8 +134,11 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         Arc::new(Self {
             kind,
             svc,
+            applied_key: parking_lot::Mutex::new(cfg.public_key.clone()),
             cfg: parking_lot::RwLock::new(Arc::new(move || cfg.clone())),
             current: Default::default(),
+            installed: Default::default(),
+            wake: Default::default(),
             min_version: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
@@ -160,22 +168,48 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         format!("{}/{file}", cfg.base_url.trim_end_matches('/'))
     }
 
-    fn path(&self, name: &str) -> Option<PathBuf> {
-        self.cfg().cache_dir.map(|d| d.join(name))
+    fn path(cfg: &ArgusConfig, name: &str) -> Option<PathBuf> {
+        cfg.cache_dir.as_ref().map(|d| d.join(name))
+    }
+
+    /// Check again soon (the lists location or key changed).
+    pub fn nudge(&self) {
+        self.wake.notify_one();
+    }
+
+    /// On a key change, verify the copy in force again with the new key, as a restart would;
+    /// if it fails, drop it. The downgrade floor is kept.
+    fn sync_key(&self, cfg: &ArgusConfig) {
+        {
+            let mut k = self.applied_key.lock();
+            if *k == cfg.public_key {
+                return;
+            }
+            k.clone_from(&cfg.public_key);
+        }
+        let Some((text, sig)) = self.installed.lock().clone() else {
+            return;
+        };
+        if let Err(e) = self.check(cfg, &text, &sig, None) {
+            tracing::warn!("{}: dropping the installed copy: {e}", self.kind);
+            *self.current.write() = None;
+            *self.installed.lock() = None;
+        }
     }
 
     /// Verify the signature, the kind, the release and the digest of a copy; returns its entries
     /// and release. `meta` is the signed `meta.json` and its signature, when available.
     fn check(
         &self,
+        cfg: &ArgusConfig,
         text: &str,
         sig: &str,
         meta: Option<(&str, &str)>,
     ) -> Result<(Vec<E>, String), String> {
         let file = self.file();
-        let key = self.cfg().public_key;
+        let key = &cfg.public_key;
         let comment =
-            verify_trusted(&key, text.as_bytes(), sig).map_err(|e| format!("{file}: {e}"))?;
+            verify_trusted(key, text.as_bytes(), sig).map_err(|e| format!("{file}: {e}"))?;
         let doc: CatalogueDoc<E> =
             serde_json::from_str(text).map_err(|e| format!("{file}: {e}"))?;
         if doc.kind != self.kind {
@@ -200,7 +234,7 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
             .map(str::to_string)
             .ok_or_else(|| format!("{file}: signature names no release"))?;
         if let Some((mtext, msig)) = meta {
-            verify_trusted(&key, mtext.as_bytes(), msig).map_err(|e| format!("meta.json: {e}"))?;
+            verify_trusted(key, mtext.as_bytes(), msig).map_err(|e| format!("meta.json: {e}"))?;
             let m: Meta = serde_json::from_str(mtext).map_err(|e| format!("meta.json: {e}"))?;
             let c = m
                 .catalogues
@@ -232,8 +266,9 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
 
     /// Load the last good copy from the cache (verified again).
     pub fn init_cache(&self) {
-        if let Some(v) = self
-            .path(&format!("{}.version", self.kind))
+        let cfg = self.cfg();
+        self.applied_key.lock().clone_from(&cfg.public_key);
+        if let Some(v) = Self::path(&cfg, &format!("{}.version", self.kind))
             .and_then(|p| std::fs::read_to_string(p).ok())
         {
             let v = v.trim();
@@ -242,15 +277,15 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
             }
         }
         let (Some(tp), Some(sp)) = (
-            self.path(&self.file()),
-            self.path(&format!("{}.minisig", self.file())),
+            Self::path(&cfg, &self.file()),
+            Self::path(&cfg, &format!("{}.minisig", self.file())),
         ) else {
             return;
         };
         let (Ok(text), Ok(sig)) = (std::fs::read_to_string(tp), std::fs::read_to_string(sp)) else {
             return;
         };
-        match self.check(&text, &sig, None) {
+        match self.check(&cfg, &text, &sig, None) {
             Ok((entries, version)) => {
                 if let Some(f) = self.floor() {
                     if version_cmp(&version, &f) == Some(Ordering::Less) {
@@ -267,6 +302,7 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
                     version,
                     fetched_at: chrono::Utc::now().to_rfc3339(),
                 }));
+                *self.installed.lock() = Some((text, sig));
             }
             Err(e) => tracing::warn!("{}: ignoring the cached copy: {e}", self.kind),
         }
@@ -275,7 +311,12 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
     /// Fetch, verify and install the newest copy. Returns the release in force.
     pub async fn refresh(&self) -> Result<String, String> {
         let svc = self.svc.as_ref().ok_or("no fetcher")?;
+        // One check at a time, and the config is read under the lock so a refresh that waited
+        // never installs with a key that has since been replaced.
+        let _g = self.busy.lock().await;
         let cfg = self.cfg();
+        // A key change drops what the old key vouched for even if the new source is down.
+        self.sync_key(&cfg);
         let file = self.file();
         let text = svc.fetch_exclusion_list(&Self::url(&cfg, &file)).await?;
         let sig = svc
@@ -293,7 +334,7 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         }
         .await
         .ok();
-        self.apply(text, sig, meta).await
+        self.apply_locked(&cfg, text, sig, meta).await
     }
 
     /// Verify and install a copy already in hand (also what tests drive).
@@ -304,7 +345,21 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         meta: Option<(String, String)>,
     ) -> Result<String, String> {
         let _g = self.busy.lock().await;
+        let cfg = self.cfg();
+        self.apply_locked(&cfg, text, sig, meta).await
+    }
+
+    /// [`Self::apply`] with `busy` already held and the configuration read under it.
+    async fn apply_locked(
+        &self,
+        cfg: &ArgusConfig,
+        text: String,
+        sig: String,
+        meta: Option<(String, String)>,
+    ) -> Result<String, String> {
+        self.sync_key(cfg);
         let (entries, version) = self.check(
+            cfg,
             &text,
             &sig,
             meta.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
@@ -323,10 +378,11 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
             version: version.clone(),
             fetched_at: chrono::Utc::now().to_rfc3339(),
         }));
+        *self.installed.lock() = Some((text.clone(), sig.clone()));
         if let (Some(vp), Some(tp), Some(sp)) = (
-            self.path(&format!("{}.version", self.kind)),
-            self.path(&self.file()),
-            self.path(&format!("{}.minisig", self.file())),
+            Self::path(cfg, &format!("{}.version", self.kind)),
+            Self::path(cfg, &self.file()),
+            Self::path(cfg, &format!("{}.minisig", self.file())),
         ) {
             let w = |p: PathBuf, b: &[u8]| common::config::write_atomic(&p, b);
             // Version first, signature last: a half-written cache fails verification.
@@ -365,7 +421,10 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
                         w
                     }
                 };
-                tokio::time::sleep(wait).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = this.wake.notified() => {}
+                }
             }
         });
     }
@@ -650,6 +709,77 @@ mod tests {
             (l.version.as_str(), l.entries[0].id.as_str()),
             ("v2026.11.23", "us1")
         );
+    }
+
+    #[tokio::test]
+    async fn a_key_change_reverifies_the_installed_copy_and_drops_it_on_failure() {
+        let (a, b) = (Signer::new(), Signer::new());
+        let d = doc(&a, "filters", None);
+        let text = filters_json("abp");
+        d.apply(
+            text.clone(),
+            a.sign(&text, "v2026.11.23", "filters.json"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(d.get().is_some());
+        // Same key again (a URL-only change): the copy stays.
+        let key_a = a.public_key();
+        d.set_config_source(move || ArgusConfig {
+            base_url: "http://mirror.test".into(),
+            public_key: key_a.clone(),
+            cache_dir: None,
+        });
+        let older = a.sign(&text, "v2026.11.01", "filters.json");
+        assert!(d.apply(text.clone(), older, None).await.is_err());
+        assert!(d.get().is_some());
+        // Another key: the installed copy no longer verifies and is dropped; the floor stays.
+        let key_b = b.public_key();
+        d.set_config_source(move || ArgusConfig {
+            base_url: "http://mirror.test".into(),
+            public_key: key_b.clone(),
+            cache_dir: None,
+        });
+        let older = b.sign(&text, "v2026.11.01", "filters.json");
+        assert!(d.apply(text.clone(), older, None).await.is_err());
+        assert!(d.get().is_none());
+        assert!(d
+            .apply(
+                text.clone(),
+                b.sign(&text, "v2026.11.24", "filters.json"),
+                None
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn racing_applies_with_different_keys_resolve_to_the_new_key() {
+        let (a, b) = (Signer::new(), Signer::new());
+        let d = doc(&a, "filters", None);
+        let text = filters_json("abp");
+        let key_b = b.public_key();
+        // The key was replaced; a straggler still carrying the old key's document must lose.
+        d.set_config_source(move || ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: key_b.clone(),
+            cache_dir: None,
+        });
+        let old = d.apply(
+            text.clone(),
+            a.sign(&text, "v2026.11.23", "filters.json"),
+            None,
+        );
+        let new = d.apply(
+            text.clone(),
+            b.sign(&text, "v2026.11.24", "filters.json"),
+            None,
+        );
+        let (old, new) = tokio::join!(old, new);
+        assert!(old.is_err());
+        assert_eq!(new.unwrap(), "v2026.11.24");
+        assert_eq!(d.get().unwrap().version, "v2026.11.24");
     }
 
     #[tokio::test]

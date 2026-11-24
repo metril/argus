@@ -178,6 +178,34 @@ impl ApiClient {
         Ok(self.request(HttpMethod::Get, path, None, None).await?.0)
     }
 
+    /// GET a binary body (a file download) through the same send path as every other call:
+    /// cookies, and a refresh-and-retry on `401`. Returns the bytes and the file name the server
+    /// suggested (`Content-Disposition`), if any.
+    pub async fn get_bytes(&self, path: &str) -> Result<(Vec<u8>, Option<String>), ApiError> {
+        let mut response = self.send_once(HttpMethod::Get, path, None, None).await?;
+        if response.status() == 401 && !is_no_retry(path) {
+            self.ensure_refreshed().await?;
+            response = self.send_once(HttpMethod::Get, path, None, None).await?;
+        }
+        if (200..300).contains(&response.status()) {
+            let name = response.headers().get("content-disposition").and_then(|h| {
+                h.split("filename=\"")
+                    .nth(1)
+                    .map(|r| r.trim_end_matches('"').to_string())
+            });
+            let bytes = response
+                .binary()
+                .await
+                .map_err(|e| ApiError::Network(e.to_string()))?;
+            return Ok((bytes, name));
+        }
+        // Not a success: map the status like every other call.
+        match self.handle_response::<serde_json::Value>(response).await {
+            Err(e) => Err(e),
+            Ok(_) => Err(ApiError::Network("Unexpected response".into())),
+        }
+    }
+
     /// GET returning the response `ETag` as well (for `If-Match` on the next update).
     pub async fn get_etag<T: DeserializeOwned>(
         &self,

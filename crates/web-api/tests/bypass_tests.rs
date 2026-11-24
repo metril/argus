@@ -1069,3 +1069,205 @@ async fn argus_lists_status_reports_the_trusted_roots_and_their_last_error() {
         "roots.json: signature does not verify"
     );
 }
+
+/// Sign with an explicit trusted comment (the catalogues name the release and the file).
+fn sign_named(k: &Keys, data: &[u8], comment: &str) -> Vec<u8> {
+    let pk = k.0.clone().into_public_key().unwrap();
+    minisign::sign(
+        Some(&pk),
+        &k.1,
+        std::io::Cursor::new(data),
+        Some(comment),
+        None,
+    )
+    .unwrap()
+    .to_string()
+    .into_bytes()
+}
+
+fn pk_line(k: &Keys) -> String {
+    k.0.to_string().lines().nth(1).unwrap().to_string()
+}
+
+/// A release of the lists plus a signed filter catalogue and a `meta.json` listing it.
+fn release_with_catalogue(k: &Keys, version: &str) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut files = release(k, version, &[("banking_finance", "chase.test")]);
+    let cats: Value = serde_json::from_slice(&files["meta.json"]).unwrap();
+    let doc = list_service::testkit::filters_json("abp");
+    let meta = json!({
+        "version": version,
+        "categories": cats["categories"],
+        "catalogues": [{"kind": "filters", "sha256": sha(doc.as_bytes())}],
+    })
+    .to_string();
+    files.insert("meta.json.minisig".into(), sign(k, meta.as_bytes()));
+    files.insert("meta.json".into(), meta.into_bytes());
+    files.insert(
+        "filters.json.minisig".into(),
+        sign_named(
+            k,
+            doc.as_bytes(),
+            &format!("argus-lists {version} filters.json"),
+        ),
+    );
+    files.insert("filters.json".into(), doc.into_bytes());
+    files
+}
+
+async fn put_config_raw(sess: &common::Sess, body: Value) -> axum_test::TestResponse {
+    let etag = sess
+        .get("/api/v1/config")
+        .await
+        .header("etag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    sess.put("/api/v1/config")
+        .add_header("if-match", etag)
+        .json(&body)
+        .await
+}
+
+async fn put_config(sess: &common::Sess, body: Value) -> Value {
+    let r = put_config_raw(sess, body).await;
+    r.assert_status_ok();
+    r.json()
+}
+
+#[tokio::test]
+async fn changing_the_lists_source_through_the_config_api_is_followed_live() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let (a, b) = (keys(), keys());
+    let (addr, _s) = serve_files(release_with_catalogue(&a, "v2025.11.23")).await;
+    ctx.state.follow_live_catalogue_config();
+    let nudged = std::sync::Arc::new(AtomicUsize::new(0));
+    let n = nudged.clone();
+    ctx.state.on_lists_config_changed(move || {
+        n.fetch_add(1, Ordering::SeqCst);
+    });
+
+    // Bad input is refused; unrelated settings do not nudge anything.
+    put_config_raw(&admin, json!({"bypass": {"lists_base_url": "ftp://x"}}))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    put_config(&admin, json!({"request_timeout_secs": 61})).await;
+    assert_eq!(nudged.load(Ordering::SeqCst), 0);
+
+    // New location and key: the next refresh of every subscription uses them, no restart.
+    let r = put_config(
+        &admin,
+        json!({"bypass": {"lists_base_url": format!("http://{addr}"), "lists_public_key": pk_line(&a)}}),
+    )
+    .await;
+    assert_eq!(r["bypass"]["lists_public_key"], pk_line(&a));
+    assert_eq!(nudged.load(Ordering::SeqCst), 1);
+    admin
+        .post("/api/v1/bypass/argus-lists/refresh")
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        ctx.state.filter_catalogue().refresh().await.unwrap(),
+        "v2025.11.23"
+    );
+    assert!(ctx.state.bypass().lookup("chase.test").is_some());
+    assert!(ctx.state.filter_catalogue().get().is_some());
+
+    // A new key: what is installed no longer verifies and is dropped on the next refresh, as a
+    // restart would; the old signatures are refused.
+    put_config(&admin, json!({"bypass": {"lists_public_key": pk_line(&b)}})).await;
+    assert_eq!(nudged.load(Ordering::SeqCst), 2);
+    assert!(!admin
+        .post("/api/v1/bypass/argus-lists/refresh")
+        .await
+        .status_code()
+        .is_success());
+    assert!(ctx.state.filter_catalogue().refresh().await.is_err());
+    assert!(ctx.state.bypass().lookup("chase.test").is_none());
+    assert!(ctx.state.bypass().failsafe_active());
+    assert!(ctx.state.filter_catalogue().get().is_none());
+}
+
+#[tokio::test]
+async fn a_key_change_drops_old_content_even_when_the_new_source_is_unreachable() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let (a, b) = (keys(), keys());
+    let (addr, _s) = serve_files(release_with_catalogue(&a, "v2025.11.23")).await;
+    ctx.state.follow_live_catalogue_config();
+    put_config(
+        &admin,
+        json!({"bypass": {"lists_base_url": format!("http://{addr}"), "lists_public_key": pk_line(&a)}}),
+    )
+    .await;
+    admin
+        .post("/api/v1/bypass/argus-lists/refresh")
+        .await
+        .assert_status_ok();
+    ctx.state.filter_catalogue().refresh().await.unwrap();
+    assert!(ctx.state.bypass().lookup("chase.test").is_some());
+
+    // New key and a source that is down: the refreshes fail, but nothing old stays trusted.
+    put_config(
+        &admin,
+        json!({"bypass": {"lists_base_url": "http://127.0.0.1:1", "lists_public_key": pk_line(&b)}}),
+    )
+    .await;
+    assert!(ctx.state.filter_catalogue().refresh().await.is_err());
+    assert!(ctx.state.filter_catalogue().get().is_none());
+    assert!(!admin
+        .post("/api/v1/bypass/argus-lists/refresh")
+        .await
+        .status_code()
+        .is_success());
+    assert!(ctx.state.bypass().lookup("chase.test").is_none());
+    assert!(ctx.state.bypass().failsafe_active());
+
+    // The change is in the audit trail with who, the URLs and key fingerprints (not the keys).
+    let log: Value = admin.get("/api/v1/audit?limit=50").await.json();
+    let e = log["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["route"]
+                .as_str()
+                .is_some_and(|r| r.contains("bypass.lists_source"))
+        })
+        .expect("audit entry");
+    assert_eq!(e["actor_name"], "admin_user");
+    let t = e["target"].as_str().unwrap();
+    assert!(t.contains("127.0.0.1:1") && t.contains("->"), "{t}");
+    assert!(!t.contains(&pk_line(&b)), "{t}");
+}
+
+#[tokio::test]
+async fn changing_the_lists_source_needs_config_write_and_validates_its_input() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let user = ctx.user(&admin, "plain", "user").await;
+    let body = json!({"bypass": {"lists_base_url": "http://mirror.test"}});
+    put_config_raw(&user, body.clone())
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    let weak = ctx.token(&admin, &["config:read"]).await;
+    ctx.bearer("PUT", "/api/v1/config", &weak)
+        .add_header("if-match", "\"x\"")
+        .json(&body)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    for bad in [
+        json!({"lists_base_url": "ftp://x.test"}),
+        json!({"lists_base_url": "http://"}),
+        json!({"lists_base_url": "not a url"}),
+        json!({"lists_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
+        json!({"lists_public_key": "short"}),
+    ] {
+        put_config_raw(&admin, json!({ "bypass": bad }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    let cfg: Value = admin.get("/api/v1/config").await.json();
+    assert_ne!(cfg["bypass"]["lists_base_url"], "http://mirror.test");
+}

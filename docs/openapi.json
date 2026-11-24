@@ -924,6 +924,42 @@
         ],
         "type": "object"
       },
+      "BypassSourceDto": {
+        "description": "Where the signed first-party lists come from. Empty = the built-in location and key.",
+        "properties": {
+          "lists_base_url": {
+            "description": "Directory the signed lists are fetched from.",
+            "type": "string"
+          },
+          "lists_public_key": {
+            "description": "Minisign public key (base64 line) the lists must be signed with.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lists_base_url",
+          "lists_public_key"
+        ],
+        "type": "object"
+      },
+      "BypassSourceUpdate": {
+        "description": "Partial update of [`BypassSourceDto`]; omitted fields keep their value. Applied live: the\nlists, trusted roots and catalogues check again right away. A mirror must not serve older\nreleases than the ones already installed: those are refused.",
+        "properties": {
+          "lists_base_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lists_public_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "BypassSubscriptionDto": {
         "description": "A subscribed exclusion list.",
         "properties": {
@@ -4331,6 +4367,10 @@
             "description": "Also refuse private-range destinations.",
             "type": "boolean"
           },
+          "bypass": {
+            "$ref": "#/components/schemas/BypassSourceDto",
+            "description": "Source of the signed first-party lists."
+          },
           "connection_timeout_secs": {
             "format": "int64",
             "minimum": 0,
@@ -5910,6 +5950,17 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "bypass": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BypassSourceUpdate",
+                "description": "Source of the signed first-party lists; applied live."
+              }
             ]
           },
           "connection_timeout_secs": {

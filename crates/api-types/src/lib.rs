@@ -239,6 +239,9 @@ pub struct ProxyConfigResponse {
     pub webui_host: String,
     #[serde(default)]
     pub webui_port: u16,
+    /// Source of the signed first-party lists.
+    #[serde(default)]
+    pub bypass: BypassSourceDto,
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
@@ -269,6 +272,26 @@ pub struct DnsUpdate {
     pub min_ttl_secs: Option<u64>,
     pub max_ttl_secs: Option<u64>,
     pub negative_ttl_secs: Option<u64>,
+}
+
+/// Where the signed first-party lists come from. Empty = the built-in location and key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BypassSourceDto {
+    /// Directory the signed lists are fetched from.
+    pub lists_base_url: String,
+    /// Minisign public key (base64 line) the lists must be signed with.
+    pub lists_public_key: String,
+}
+
+/// Partial update of [`BypassSourceDto`]; omitted fields keep their value. Applied live: the
+/// lists, trusted roots and catalogues check again right away. A mirror must not serve older
+/// releases than the ones already installed: those are refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BypassSourceUpdate {
+    pub lists_base_url: Option<String>,
+    pub lists_public_key: Option<String>,
 }
 
 /// A listener's effective switches (its own setting, else the global one).
@@ -389,6 +412,8 @@ pub struct UpdateProxyConfigRequest {
     /// Web API listen port; the listener is rebound live.
     #[cfg_attr(feature = "server", validate(range(min = 1, max = 65535)))]
     pub webui_port: Option<u16>,
+    /// Source of the signed first-party lists; applied live.
+    pub bypass: Option<BypassSourceUpdate>,
 }
 
 /// Connection statistics.

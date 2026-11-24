@@ -55,6 +55,10 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         transparent: flags_view(config, true),
         webui_host: config.webui.host.clone(),
         webui_port: config.webui.port,
+        bypass: api_types::BypassSourceDto {
+            lists_base_url: config.bypass.lists_base_url.clone(),
+            lists_public_key: config.bypass.lists_public_key.clone(),
+        },
         bind: None,
     }
 }
@@ -153,6 +157,62 @@ pub async fn get_config(
     let etag = config_etag(&r);
     r.bind = bind_result(&state).await;
     Ok(([(ETAG, etag)], Json(r)))
+}
+
+/// Short fingerprint of a lists key for the audit trail (never the key itself in full).
+fn key_fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    if key.trim().is_empty() {
+        return "built-in".into();
+    }
+    Sha256::digest(key.trim().as_bytes())
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Record a change of the lists location or key as its own audit entry: who, old -> new URL and
+/// old -> new key fingerprint. It decides what the proxy trusts, so the generic entry for the
+/// route is not enough.
+fn audit_lists_source(
+    state: &AppState,
+    who: &str,
+    old: &common::config::BypassConfig,
+    new: &common::config::BypassConfig,
+) {
+    let show = |u: &str| {
+        if u.is_empty() {
+            "built-in".to_string()
+        } else {
+            u.to_string()
+        }
+    };
+    let entry = api_types::AuditEntry {
+        id: String::new(),
+        at: chrono::Utc::now().to_rfc3339(),
+        actor_type: "user".into(),
+        actor_id: None,
+        actor_name: Some(who.to_string()),
+        method: "PUT".into(),
+        route: "/api/v1/config#bypass.lists_source".into(),
+        scope: "config:write".into(),
+        target: Some(format!(
+            "url {} -> {}; key {} -> {}",
+            show(&old.lists_base_url),
+            show(&new.lists_base_url),
+            key_fingerprint(&old.lists_public_key),
+            key_fingerprint(&new.lists_public_key)
+        )),
+        status: 200,
+        outcome: "success".into(),
+        ip: None,
+        user_agent: None,
+        request_id: None,
+    };
+    if let Err(e) = state.audit.append(entry) {
+        tracing::error!("Failed to write audit entry: {e}");
+    }
 }
 
 /// Apply a partial update: validate, move listeners and apply access lists live, persist the
@@ -267,6 +327,35 @@ async fn apply_update_locked(
         can_web
     );
     field!("webui_port", config.webui.port, req.webui_port, can_web);
+    if let Some(b) = req.bypass {
+        if let Some(u) = b.lists_base_url {
+            let u = u.trim().trim_end_matches('/').to_string();
+            if !u.is_empty() {
+                let ok = url::Url::parse(&u)
+                    .is_ok_and(|p| matches!(p.scheme(), "http" | "https") && p.host().is_some());
+                if !ok {
+                    return Err(ApiError::ValidationError(
+                        "bypass.lists_base_url: use an http:// or https:// URL with a host".into(),
+                    ));
+                }
+            }
+            config.bypass.lists_base_url = u;
+        }
+        if let Some(k) = b.lists_public_key {
+            let k = k.trim().to_string();
+            if !k.is_empty() {
+                list_service::check_public_key(&k).map_err(|e| {
+                    ApiError::ValidationError(format!(
+                        "bypass.lists_public_key: expected the base64 line of a minisign public key ({e})"
+                    ))
+                })?;
+            }
+            config.bypass.lists_public_key = k;
+        }
+        if config.bypass != old.bypass {
+            applied.push("bypass".into());
+        }
+    }
     field!(
         "max_connections",
         config.performance.max_connections,
@@ -428,7 +517,18 @@ async fn apply_update_locked(
     info!("Proxy configuration updated by {who}");
     apply_live(state, &config);
     let mut response = proxy_config_response(&config);
+    let lists_changed = old.bypass != config.bypass;
     *state.proxy_state.config.write() = config;
+    if lists_changed {
+        audit_lists_source(
+            state,
+            who,
+            &old.bypass,
+            &state.proxy_state.config.read().bypass,
+        );
+        // The lists, roots and catalogues read the new location and key and check right away.
+        state.lists_config_changed();
+    }
     response.bind = bind_result(state).await;
     if let (Some(b), Some(m)) = (response.bind.as_mut(), moved_to) {
         b.webui_moved_to = Some(m);
@@ -580,7 +680,17 @@ pub async fn reload_config(
     let old = state.proxy_state.config.read().clone();
     apply_runtime(&state, &old, &new_config).await?;
     apply_live(&state, &new_config);
+    let lists_changed = old.bypass != new_config.bypass;
     *state.proxy_state.config.write() = new_config;
+    if lists_changed {
+        audit_lists_source(
+            &state,
+            &p.username,
+            &old.bypass,
+            &state.proxy_state.config.read().bypass,
+        );
+        state.lists_config_changed();
+    }
     info!("Proxy configuration reloaded by {}", p.username);
     Ok(Json(MessageResponse {
         message: "Configuration reloaded successfully".into(),

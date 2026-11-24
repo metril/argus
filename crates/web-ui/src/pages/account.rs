@@ -6,7 +6,7 @@ use crate::api::auth::SessionInfo;
 use crate::api::ApiClient;
 use crate::components::{Card, ConfirmButton, Layout};
 use crate::state::{use_app_state, use_auth_state};
-use crate::utils::api_base_url;
+use crate::utils::{api_base_url, get_origin};
 
 /// Account page component
 #[component]
@@ -116,6 +116,8 @@ pub fn AccountPage() -> impl IntoView {
                     </p>
                 </Card>
 
+                <ExtensionCard />
+
                 <Card title="Sessions" class="settings-card">
                     <Show when=move || !loading_sessions.get() fallback=|| view! {
                         <div class="loading">"Loading..."</div>
@@ -150,5 +152,111 @@ pub fn AccountPage() -> impl IntoView {
                 </Card>
             </div>
         </Layout>
+    }
+}
+
+/// Fetch an extension build (cookie session, with a refresh on `401`) and hand it to the
+/// browser as a file. A 404 means no release asset is published for this version.
+async fn download_extension(browser: &'static str) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let path = format!("/downloads/extension/{browser}");
+    let (bytes, name) = ApiClient::new()
+        .get_bytes(&path)
+        .await
+        .map_err(|e| match e {
+            crate::api::ApiError::NotFound(_) => {
+                format!("No {browser} extension is published for this version of Argus yet.")
+            }
+            crate::api::ApiError::Network(m) | crate::api::ApiError::Server(m) => {
+                format!("Could not download the extension: {m}")
+            }
+            e => e.to_string(),
+        })?;
+    let name = name.unwrap_or_else(|| format!("argus-extension-{browser}.zip"));
+    let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let arr = js_sys::Uint8Array::from(bytes.as_slice());
+    let parts = js_sys::Array::new();
+    parts.push(&arr);
+    let blob = web_sys::Blob::new_with_u8_array_sequence(&parts).map_err(err)?;
+    let obj = web_sys::Url::create_object_url_with_blob(&blob).map_err(err)?;
+    let a: web_sys::HtmlAnchorElement = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?
+        .create_element("a")
+        .map_err(err)?
+        .dyn_into()
+        .map_err(|_| "anchor")?;
+    a.set_href(&obj);
+    a.set_download(&name);
+    a.click();
+    // Not revoked at once: some browsers start the save after the click returns.
+    gloo_timers::callback::Timeout::new(30_000, move || {
+        let _ = web_sys::Url::revoke_object_url(&obj);
+    })
+    .forget();
+    Ok(())
+}
+
+/// Browser extension downloads and install steps.
+#[component]
+fn ExtensionCard() -> impl IntoView {
+    let msg = RwSignal::new(Option::<String>::None);
+    let busy = RwSignal::new(false);
+    let origin = get_origin();
+    let user = use_auth_state().user;
+    // Creating a token needs `tokens:self`, and the token itself needs `logs:read`.
+    let can_token = Signal::derive(move || {
+        user.get()
+            .map(|u| {
+                ["logs:read", "tokens:self"]
+                    .iter()
+                    .all(|n| u.scopes.iter().any(|s| s.as_str() == *n))
+            })
+            .unwrap_or(false)
+    });
+    let get = move |browser: &'static str| {
+        busy.set(true);
+        msg.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = download_extension(browser).await {
+                msg.set(Some(e));
+            }
+            busy.set(false);
+        });
+    };
+    view! {
+        <Card title="Browser extension" class="settings-card">
+            <p class="form-help">
+                "Shows what each page blocked, from the browser toolbar."
+            </p>
+            <div class="modal-actions">
+                <button class="btn btn-primary" disabled=move || busy.get() on:click=move |_| get("chrome")>
+                    "Download for Chrome"
+                </button>
+                <button class="btn btn-primary" disabled=move || busy.get() on:click=move |_| get("firefox")>
+                    "Download for Firefox"
+                </button>
+            </div>
+            {move || msg.get().map(|m| view! { <p class="form-help" role="alert" style="color:var(--danger, #c0392b)">{m}</p> })}
+            <p class="form-help">
+                <strong>"Chrome: "</strong>
+                "unzip the download, open chrome://extensions, turn on Developer mode, choose "
+                "\"Load unpacked\" and pick the unzipped folder."
+            </p>
+            <p class="form-help">
+                <strong>"Firefox: "</strong>
+                "a signed .xpi installs directly when opened. If you got a .zip, open "
+                "about:debugging, choose \"This Firefox\" and \"Load Temporary Add-on\"."
+            </p>
+            <p class="form-help">
+                <strong>"Both: "</strong>
+                {move || if can_token.get() {
+                    "create an API token with the logs:read scope, then enter it and this Argus URL in the extension: "
+                } else {
+                    "ask an admin to issue an API token with logs:read, then enter it and this Argus URL in the extension: "
+                }}
+                <code>{origin}</code>
+            </p>
+        </Card>
     }
 }

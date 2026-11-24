@@ -700,6 +700,24 @@ impl RootsHandle {
         }
     }
 
+    /// Fall back to the compiled-in set (plus the extra CAs), as a restart with nothing
+    /// trustworthy cached would.
+    pub fn reset_to_floor(&self) {
+        let mut st = self.state.lock();
+        match ActiveRoots::floor_with(&st.extras) {
+            Ok(a) => {
+                let (serial, roots) = (a.serial, a.root_count);
+                self.active.store(Arc::new(a));
+                st.data = None;
+                let mut s = self.cell.status.write();
+                s.serial = serial;
+                s.roots = roots;
+                s.signed = false;
+            }
+            Err(e) => tracing::warn!("trusted roots: could not fall back to the built-in set: {e}"),
+        }
+    }
+
     /// Prepare and commit in one step (tests, and callers with nothing to roll back).
     pub fn set_extras(&self, extra_ca_paths: &[PathBuf]) -> Result<()> {
         self.commit_extras(self.prepare_extras(extra_ca_paths)?);
@@ -789,9 +807,11 @@ impl rustls::client::danger::ServerCertVerifier for LiveVerifier {
 pub struct RootsManager {
     handle: Arc<RootsHandle>,
     svc: Option<Arc<list_service::ListService>>,
-    base_url: String,
-    public_key: String,
-    cache_dir: Option<PathBuf>,
+    cfg: parking_lot::RwLock<Arc<dyn Fn() -> list_service::ArgusConfig + Send + Sync>>,
+    /// Text and signature of the set in force, and the key it was verified with: a key change
+    /// verifies it again.
+    installed: parking_lot::Mutex<Option<(String, String)>>,
+    applied_key: parking_lot::Mutex<String>,
     /// Highest serial ever accepted, kept apart from the cache so it outlives it.
     min_serial: std::sync::atomic::AtomicU64,
     /// One check at a time.
@@ -818,28 +838,76 @@ impl RootsManager {
         Arc::new(Self {
             handle,
             svc: Some(svc),
-            base_url: cfg.base_url.clone(),
-            public_key: cfg.public_key.clone(),
-            cache_dir: cfg.cache_dir.clone(),
+            cfg: parking_lot::RwLock::new(Arc::new({
+                let cfg = cfg.clone();
+                move || cfg.clone()
+            })),
+            installed: Default::default(),
+            applied_key: parking_lot::Mutex::new(cfg.public_key.clone()),
             min_serial: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
     }
 
-    fn url(&self, file: &str) -> String {
-        format!("{}/{file}", self.base_url.trim_end_matches('/'))
+    /// Read the base URL, key and cache directory from `f` on every use (the live config), so a
+    /// change in the UI applies on the next refresh without a restart.
+    pub fn set_config_source(
+        &self,
+        f: impl Fn() -> list_service::ArgusConfig + Send + Sync + 'static,
+    ) {
+        *self.cfg.write() = Arc::new(f);
+    }
+
+    fn cfg(&self) -> list_service::ArgusConfig {
+        let f = self.cfg.read().clone();
+        f()
+    }
+
+    fn url(cfg: &list_service::ArgusConfig, file: &str) -> String {
+        format!("{}/{file}", cfg.base_url.trim_end_matches('/'))
+    }
+
+    /// Check again soon (the lists location or key changed).
+    pub fn nudge(&self) {
+        self.handle.cell.wake.notify_one();
+    }
+
+    /// On a key change, verify the set in force again with the new key, as a restart would; if
+    /// that fails, fall back to the built-in set. The serial floor is kept.
+    fn sync_key(&self, cfg: &list_service::ArgusConfig) {
+        {
+            let mut k = self.applied_key.lock();
+            if *k == cfg.public_key {
+                return;
+            }
+            k.clone_from(&cfg.public_key);
+        }
+        let Some((text, sig)) = self.installed.lock().clone() else {
+            return;
+        };
+        if let Err(e) = Self::check(cfg, text.as_bytes(), &sig) {
+            tracing::warn!("trusted roots: dropping the installed set: {e}");
+            self.handle.reset_to_floor();
+            *self.installed.lock() = None;
+        }
     }
 
     /// Check the signature and the content of a fetched or cached copy.
-    fn check(&self, bytes: &[u8], sig: &str) -> std::result::Result<RootsData, String> {
-        list_service::verify_minisign(&self.public_key, bytes, sig)
+    fn check(
+        cfg: &list_service::ArgusConfig,
+        bytes: &[u8],
+        sig: &str,
+    ) -> std::result::Result<RootsData, String> {
+        list_service::verify_minisign(&cfg.public_key, bytes, sig)
             .map_err(|e| format!("roots.json: {e}"))?;
         RootsData::parse(bytes)
     }
 
     /// Load the last good verified copy from the cache, if any (verified again on every load).
     pub fn init_cache(&self) {
-        let Some(dir) = &self.cache_dir else {
+        let cfg = self.cfg();
+        self.applied_key.lock().clone_from(&cfg.public_key);
+        let Some(dir) = cfg.cache_dir.clone() else {
             return;
         };
         // The highest serial ever accepted: enforced even when the cache itself is gone.
@@ -857,7 +925,8 @@ impl RootsManager {
             return;
         };
         let min = self.min_serial.load(std::sync::atomic::Ordering::Relaxed);
-        match self.check(&bytes, &sig).and_then(|d| {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        match Self::check(&cfg, &bytes, &sig).and_then(|d| {
             if d.serial < min {
                 tracing::warn!(
                     "trusted roots: the cached set (serial {}) is older than the highest ever accepted ({min}); running on the built-in set until the next fetch",
@@ -870,10 +939,13 @@ impl RootsManager {
             }
             self.handle.install(Arc::new(d))
         }) {
-            Ok(()) => tracing::info!(
+            Ok(()) => {
+                *self.installed.lock() = Some((text, sig));
+                tracing::info!(
                 "trusted roots: serial {} from the cache",
                 self.handle.serial()
-            ),
+                )
+            }
             Err(e) => tracing::warn!("trusted roots: ignoring the cached copy: {e}"),
         }
     }
@@ -882,9 +954,13 @@ impl RootsManager {
     /// that is not newer is refused and leaves the set in force as it was.
     pub async fn refresh(&self) -> std::result::Result<RootsOutcome, String> {
         let _g = self.busy.lock().await;
-        let fetched = self.fetch().await;
+        // One configuration for the whole check: never a mix of two URLs or keys.
+        let cfg = self.cfg();
+        // A key change drops what the old key vouched for even if the new source is down.
+        self.sync_key(&cfg);
+        let fetched = self.fetch(&cfg).await;
         self.finish(match fetched {
-            Ok((text, sig)) => self.apply(text, sig).await,
+            Ok((text, sig)) => self.apply(&cfg, text, sig).await,
             Err(e) => Err(e),
         })
     }
@@ -896,7 +972,8 @@ impl RootsManager {
         sig: String,
     ) -> std::result::Result<RootsOutcome, String> {
         let _g = self.busy.lock().await;
-        self.finish(self.apply(text, sig).await)
+        let cfg = self.cfg();
+        self.finish(self.apply(&cfg, text, sig).await)
     }
 
     /// Record the outcome of a check in the status.
@@ -911,17 +988,28 @@ impl RootsManager {
         r
     }
 
-    async fn fetch(&self) -> std::result::Result<(String, String), String> {
+    async fn fetch(
+        &self,
+        cfg: &list_service::ArgusConfig,
+    ) -> std::result::Result<(String, String), String> {
         let svc = self.svc.as_ref().ok_or("no fetcher")?;
-        let text = svc.fetch_exclusion_list(&self.url("roots.json")).await?;
+        let text = svc
+            .fetch_exclusion_list(&Self::url(cfg, "roots.json"))
+            .await?;
         let sig = svc
-            .fetch_exclusion_list(&self.url("roots.json.minisig"))
+            .fetch_exclusion_list(&Self::url(cfg, "roots.json.minisig"))
             .await?;
         Ok((text, sig))
     }
 
-    async fn apply(&self, text: String, sig: String) -> std::result::Result<RootsOutcome, String> {
-        let key = self.public_key.clone();
+    async fn apply(
+        &self,
+        cfg: &list_service::ArgusConfig,
+        text: String,
+        sig: String,
+    ) -> std::result::Result<RootsOutcome, String> {
+        self.sync_key(cfg);
+        let key = cfg.public_key.clone();
         let (text, sig, data) = tokio::task::spawn_blocking(move || {
             list_service::verify_minisign(&key, text.as_bytes(), &sig)
                 .map_err(|e| format!("roots.json: {e}"))?;
@@ -945,9 +1033,10 @@ impl RootsManager {
         let serial = data.serial;
         // The rest of the rollback protection and the build live in `install`.
         self.handle.install(Arc::new(data))?;
+        *self.installed.lock() = Some((text.clone(), sig.clone()));
         self.min_serial
             .fetch_max(serial, std::sync::atomic::Ordering::Relaxed);
-        if let Some(dir) = self.cache_dir.clone() {
+        if let Some(dir) = cfg.cache_dir.clone() {
             let (t, s) = (text.into_bytes(), sig.into_bytes());
             let written = tokio::task::spawn_blocking(move || {
                 // The serial first, then the data, the signature last: a half-written cache
@@ -1129,9 +1218,16 @@ mod tests {
         Arc::new(RootsManager {
             handle: handle.clone(),
             svc: None,
-            base_url: "http://unused.test".into(),
-            public_key: key.to_string(),
-            cache_dir: Some(cache.to_path_buf()),
+            cfg: parking_lot::RwLock::new(Arc::new({
+                let cfg = list_service::ArgusConfig {
+                    base_url: "http://unused.test".into(),
+                    public_key: key.to_string(),
+                    cache_dir: Some(cache.to_path_buf()),
+                };
+                move || cfg.clone()
+            })),
+            installed: Default::default(),
+            applied_key: parking_lot::Mutex::new(key.to_string()),
             min_serial: Default::default(),
             busy: tokio::sync::Mutex::new(()),
         })
@@ -1240,6 +1336,43 @@ mod tests {
                 serial: FLOOR_SERIAL + 5
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_key_change_reverifies_the_installed_set_and_drops_it_on_failure() {
+        let r = rig();
+        let body = roots_json(FLOOR_SERIAL + 5, &[], &[], MIN_ROOTS);
+        r.push(&body).await.unwrap();
+        assert!(r.handle.cell.status.read().signed);
+        let (other_pk, other_sk) = keypair();
+        let set = |key: String| {
+            let cfg = list_service::ArgusConfig {
+                base_url: "http://unused.test".into(),
+                public_key: key,
+                cache_dir: None,
+            };
+            r.manager.set_config_source(move || cfg.clone());
+        };
+        // A URL-only change keeps the set; an older serial is refused.
+        set(pk_b64(&r.pk));
+        let older = roots_json(FLOOR_SERIAL + 1, &[], &[], MIN_ROOTS);
+        assert!(r.push(&older).await.is_err());
+        assert_eq!(r.handle.serial(), FLOOR_SERIAL + 5);
+        // The key changes: the old signature fails, the set no longer verifies and the built-in
+        // set is back. The serial floor stays: B's older set is refused.
+        set(pk_b64(&other_pk));
+        let sig = sign(&r.sk, &r.pk, body.as_bytes());
+        let e = r.manager.refresh_from(body, sig).await.unwrap_err();
+        assert!(e.contains("signature"), "{e}");
+        assert!(!r.handle.cell.status.read().signed);
+        assert_eq!(r.handle.serial(), FLOOR_SERIAL);
+        let low = roots_json(FLOOR_SERIAL + 2, &[], &[], MIN_ROOTS);
+        let sig = sign(&other_sk, &other_pk, low.as_bytes());
+        assert!(r.manager.refresh_from(low, sig).await.is_err());
+        let up = roots_json(FLOOR_SERIAL + 9, &[], &[], MIN_ROOTS);
+        let sig = sign(&other_sk, &other_pk, up.as_bytes());
+        r.manager.refresh_from(up, sig).await.unwrap();
+        assert_eq!(r.handle.serial(), FLOOR_SERIAL + 9);
     }
 
     #[tokio::test]
