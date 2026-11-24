@@ -6398,6 +6398,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "attention": {
+            "description": "Scripts that need a look: pending update, error, or awaiting approval.",
+            "minimum": 0,
+            "type": "integer"
+          },
           "disabled": {
             "minimum": 0,
             "type": "integer"
@@ -6417,6 +6422,11 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "updates": {
+            "description": "Scripts with a pending update.",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -6654,6 +6664,10 @@
             ]
           },
           "noframes": {
+            "type": "boolean"
+          },
+          "pending_approval": {
+            "description": "Imported without approval; stays off until approved.",
             "type": "boolean"
           },
           "pending_update": {
@@ -17920,7 +17934,7 @@
             }
           },
           {
-            "description": "`enabled`, `disabled` or `error` (unsupported features).",
+            "description": "`enabled`, `disabled`, `error` (unsupported features) or `attention` (pending update,\nerror, or awaiting approval).",
             "in": "query",
             "name": "status",
             "required": false,
@@ -18890,6 +18904,109 @@
           }
         ],
         "summary": "Get one userscript.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/{id}/approve": {
+      "post": {
+        "operationId": "approve_script",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Userscript id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptResponse"
+                }
+              }
+            },
+            "description": "Approved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:write"
+            ]
+          }
+        ],
+        "summary": "Approve an imported script: enable it and, when asked, allow its `@connect *`.",
         "tags": [
           "userscripts"
         ]

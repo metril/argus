@@ -33,14 +33,13 @@ use plan::{PlanDrawer, Review};
 pub struct Ctx {
     /// Restart the list and the overview.
     pub reload: RwSignal<u32>,
-    /// Refresh only the overview (tiles, installed keys).
-    pub ov: RwSignal<u32>,
-    /// Ids imported without approval and still off.
-    pub approval: RwSignal<Vec<String>>,
     /// Every installed script (for tiles, the catalogue's installed state, attention counts).
     pub all: RwSignal<Vec<Userscript>>,
     pub counts: RwSignal<Option<UserscriptCounts>>,
-    pub attention: Memo<usize>,
+    /// Total executions (stats endpoint).
+    pub runs: RwSignal<u64>,
+    /// The overview could not be (re)loaded; the previous data stays on screen.
+    pub ov_err: RwSignal<Option<String>>,
     pub status: RwSignal<String>,
     /// Ids whose update check is running.
     pub checking: RwSignal<Vec<String>>,
@@ -58,19 +57,12 @@ pub struct Ctx {
 pub fn UserscriptsPage() -> impl IntoView {
     let app = StoredValue::new(use_app_state());
     let all = RwSignal::new(Vec::<Userscript>::new());
-    let approval = RwSignal::new(approval_load());
     let ctx = Ctx {
         reload: RwSignal::new(0),
-        ov: RwSignal::new(0),
-        approval,
         all,
         counts: RwSignal::new(None),
-        attention: Memo::new(move |_| {
-            all.with(|a| {
-                let ap = approval.get();
-                a.iter().filter(|s| needs_attention(s, &ap)).count()
-            })
-        }),
+        runs: RwSignal::new(0),
+        ov_err: RwSignal::new(None),
         status: RwSignal::new(query_get("um").unwrap_or_default()),
         checking: RwSignal::new(Vec::new()),
         failed: RwSignal::new(Vec::new()),
@@ -82,16 +74,20 @@ pub fn UserscriptsPage() -> impl IntoView {
     };
     let (reload, counts) = (ctx.reload, ctx.counts);
 
-    // Overview: every installed script, 200 at a time.
+    // Overview: every installed script, 200 at a time, no cap. A newer load supersedes an older
+    // one, and a failed load keeps the previous data (with an error banner).
+    let generation = StoredValue::new(0u64);
     Effect::new(move |_| {
         reload.track();
-        ctx.ov.track();
-        approval.set(approval_load());
+        let my = generation.get_value() + 1;
+        generation.set_value(my);
         wasm_bindgen_futures::spawn_local(async move {
+            let client = ApiClient::new();
             let mut v = Vec::new();
             let mut cursor: Option<String> = None;
-            for _ in 0..50 {
-                match ApiClient::new()
+            let mut failed = None;
+            loop {
+                match client
                     .list_userscripts_paged("", "", "name", cursor.as_deref(), None, 200)
                     .await
                 {
@@ -102,10 +98,27 @@ pub fn UserscriptsPage() -> impl IntoView {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                        break;
+                    }
                 }
             }
-            all.set(v);
+            if generation.get_value() != my {
+                return;
+            }
+            match failed {
+                None => {
+                    all.set(v);
+                    ctx.ov_err.set(None);
+                }
+                Some(e) => ctx.ov_err.set(Some(e)),
+            }
+            if let Ok(st) = client.get_userscript_stats().await {
+                if generation.get_value() == my {
+                    ctx.runs.set(st.total_executions);
+                }
+            }
         });
     });
 
@@ -240,16 +253,6 @@ pub fn UserscriptsPage() -> impl IntoView {
             match ApiClient::new().import_userscripts(&bundle).await {
                 Ok(r) => {
                     let (ok, skipped, errs) = import_summary(&r);
-                    approval_add(
-                        r.results
-                            .iter()
-                            .filter(|x| {
-                                x.pending_approval
-                                    && matches!(x.status.as_str(), "installed" | "replaced")
-                            })
-                            .filter_map(|x| x.id.clone()),
-                    );
-                    approval.set(approval_load());
                     let msg = format!("Import: {ok} done, {skipped} skipped, {errs} failed");
                     if errs > 0 {
                         app.get_value().error(msg);
@@ -319,16 +322,14 @@ pub fn UserscriptsPage() -> impl IntoView {
             ("browse".to_string(), "Browse".to_string(), ctx.cat_n.get()),
         ]
     });
-    let updates =
-        Memo::new(move |_| all.with(|a| a.iter().filter(|s| s.pending_update.is_some()).count()));
+    let updates = move || counts.get().map(|c| c.updates).unwrap_or(0);
     let upd_style = move || {
-        if updates.get() > 0 {
+        if updates() > 0 {
             "color:var(--error)"
         } else {
             ""
         }
     };
-    let runs = Memo::new(move |_| all.with(|a| a.iter().map(|s| s.execution_count).sum::<u64>()));
 
     view! {
         <Layout>
@@ -377,14 +378,20 @@ pub fn UserscriptsPage() -> impl IntoView {
                         <div class="tile"><span class="k">"Enabled"</span>
                             <span class="v">{move || format_number(counts.get().map(|c| c.enabled).unwrap_or(0) as u64)}</span></div>
                         <div class="tile"><span class="k">"Updates available"</span>
-                            <span class="v" style=upd_style>{move || updates.get()}</span>
-                            <span class="d">{move || (updates.get() > 0).then(|| view! {
+                            <span class="v" style=upd_style>{updates}</span>
+                            <span class="d">{move || (updates() > 0).then(|| view! {
                                 <button type="button" class="linkish" on:click=move |_| ctx.status.set("attention".into())>"Review"</button>
                             })}</span></div>
                         <div class="tile"><span class="k">"Runs (total)"</span>
-                            <span class="v">{move || format_number(runs.get())}</span></div>
+                            <span class="v">{move || format_number(ctx.runs.get())}</span></div>
                     </div>
                 </Show>
+                {move || ctx.ov_err.get().map(|e| view! {
+                    <div class="err row-gap" role="alert">
+                        <span>{format!("Couldn't refresh the overview (showing the last data): {e}")}</span>
+                        <button type="button" class="btn sm" on:click=move |_| reload.update(|n| *n += 1)>"Retry"</button>
+                    </div>
+                })}
                 <InstalledPanel ctx=ctx />
             </div>
             <div role="tabpanel" id="panel-browse" aria-labelledby="tab-browse" class="us-panel" hidden=move || ctx.tab.get() != "browse">

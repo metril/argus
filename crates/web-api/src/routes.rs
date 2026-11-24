@@ -154,6 +154,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(userscripts::get_userscript_source))
         .routes(routes!(userscripts::set_enabled))
+        .routes(routes!(userscripts::approve_script))
         // script policy
         .routes(routes!(policy::get_settings, policy::put_settings))
         .routes(routes!(policy::list_site_rules, policy::create_site_rule))

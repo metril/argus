@@ -18,16 +18,6 @@ use crate::utils::format_number;
 
 type Sc = RwSignal<Option<Userscript>>;
 
-/// The id in `/userscripts/<encoded id>`.
-fn id_from_path(path: &str) -> String {
-    let raw = path.strip_prefix("/userscripts/").unwrap_or("");
-    let raw = raw.split(['?', '#']).next().unwrap_or("");
-    js_sys::decode_uri_component(raw)
-        .ok()
-        .and_then(|v| v.as_string())
-        .unwrap_or_else(|| raw.to_string())
-}
-
 const SECTIONS: [(&str, &str); 5] = [
     ("overview", "Overview"),
     ("permissions", "Permissions"),
@@ -485,7 +475,6 @@ fn DangerSec(id: Memo<String>) -> impl IntoView {
         wasm_bindgen_futures::spawn_local(async move {
             match ApiClient::new().uninstall_userscript(&id).await {
                 Ok(_) => {
-                    approval_remove(&id);
                     app.get_value().success("Userscript uninstalled");
                     navigate("/userscripts", Default::default());
                 }
@@ -532,7 +521,6 @@ pub fn UserscriptDetailPage() -> impl IntoView {
     let missing = RwSignal::new(false);
     let load_err = RwSignal::new(Option::<String>::None);
     let rev = RwSignal::new(0u32);
-    let approval = RwSignal::new(approval_load());
     let review = RwSignal::new(Option::<Review>::None);
     let show_review = RwSignal::new(false);
     let want_src = RwSignal::new(false);
@@ -549,7 +537,6 @@ pub fn UserscriptDetailPage() -> impl IntoView {
         loading.set(true);
         missing.set(false);
         load_err.set(None);
-        approval.set(approval_load());
         wasm_bindgen_futures::spawn_local(async move {
             match ApiClient::new().get_userscript(&id).await {
                 Ok(s) => sc.set(Some(s)),
@@ -606,10 +593,6 @@ pub fn UserscriptDetailPage() -> impl IntoView {
         wasm_bindgen_futures::spawn_local(async move {
             match ApiClient::new().set_userscript_enabled(&id, v).await {
                 Ok(s) => {
-                    if v {
-                        approval_remove(&id);
-                        approval.set(approval_load());
-                    }
                     sc.set(Some(s));
                 }
                 Err(e) => toggle_err.set(Some(format!(
@@ -694,14 +677,14 @@ pub fn UserscriptDetailPage() -> impl IntoView {
                     <div class="ttl">
                         <h1 class="page-title">{move || sc.with(|s| s.as_ref().map(|s| s.name.clone()).unwrap_or_default())}</h1>
                         {move || sc.with(|s| s.as_ref().and_then(|s| s.version.clone())).map(|v| view! { <span class="ver">{v}</span> })}
-                        {move || sc.with(|s| s.as_ref().map(|s| update_status(s, &approval.get()))).and_then(|st| state_line(&st))}
+                        {move || sc.with(|s| s.as_ref().map(update_status)).and_then(|st| state_line(&st))}
                     </div>
                     <div class="acts">
                         <Switch
                             checked=Signal::derive(move || sc.with(|s| s.as_ref().is_some_and(|s| s.enabled)))
                             label="Enabled"
                             text=Signal::derive(move || if sc.with(|s| s.as_ref().is_some_and(|s| s.enabled)) { "Enabled".to_string() } else { "Disabled".to_string() })
-                            disabled=Signal::derive(move || toggling.get())
+                            disabled=Signal::derive(move || toggling.get() || sc.with(|s| s.as_ref().is_some_and(|s| s.pending_approval && !s.enabled)))
                             on_change=Callback::new(toggle) />
                         <button type="button" class="btn"
                             disabled=move || check_busy.get() || sc.with(|s| s.as_ref().is_some_and(|s| s.update_url.is_none()))
@@ -725,7 +708,7 @@ pub fn UserscriptDetailPage() -> impl IntoView {
                     {move || toggle_err.get().map(|e| view! { <div class="err fullrow" role="alert">{e}</div> })}
                     {move || {
                         let s = sc.get()?;
-                        (update_status(&s, &approval.get()) == UpdateState::NeedsApproval).then(|| {
+                        (update_status(&s) == UpdateState::NeedsApproval).then(|| {
                             let s2 = s.clone();
                             view! {
                                 <div class="hint box row-gap fullrow">

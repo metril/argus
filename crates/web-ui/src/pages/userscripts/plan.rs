@@ -58,8 +58,8 @@ pub struct Review {
     pub notes: Vec<String>,
     pub diff: Option<UpdateDiffDto>,
     pub needs_reapproval: bool,
-    /// Consent to `@connect *` that confirming gives.
-    pub allow_connect_all: bool,
+    /// The script declares `@connect *`: the review asks whether to allow it.
+    pub wants_any: bool,
 }
 
 fn warn_from(raw: &str, unsupported: bool) -> Warn {
@@ -166,7 +166,7 @@ impl Review {
             notes,
             needs_reapproval: p.update.as_ref().is_some_and(|u| u.needs_reapproval),
             diff: p.update.map(|u| u.diff),
-            allow_connect_all: p.connect_all,
+            wants_any: p.connect_all,
         }
     }
 
@@ -213,7 +213,7 @@ impl Review {
             false,
         );
         r.new_version = p.new_version.clone();
-        r.allow_connect_all = p.diff.added_connect.iter().any(|c| c == "*");
+        r.wants_any = p.diff.added_connect.iter().any(|c| c == "*");
         r.needs_reapproval = p.needs_reapproval;
         r.notes.push(format!("Found {}", fmt_abs(&p.found_at)));
         r.diff = Some(p.diff);
@@ -250,7 +250,7 @@ impl Review {
             notes: Vec::new(),
             diff: None,
             needs_reapproval: false,
-            allow_connect_all: false,
+            wants_any: s.connect.iter().any(|c| c == "*"),
         }
     }
 
@@ -421,8 +421,11 @@ pub fn PlanDrawer(
     let busy = RwSignal::new(false);
     let err = RwSignal::new(Option::<String>::None);
     let all_pats = RwSignal::new(false);
+    // Permission question for `@connect *`; always starts off.
+    let allow = RwSignal::new(false);
     Effect::new(move |_| {
         if open.get() {
+            allow.set(false);
             err.set(None);
             all_pats.set(false);
         }
@@ -462,27 +465,21 @@ pub fn PlanDrawer(
             let c = ApiClient::new();
             let res: Result<&str, crate::api::ApiError> = match (&r.kind, discard) {
                 (ReviewKind::Install(pid), _) => c
-                    .confirm_userscript_plan(pid, r.allow_connect_all)
+                    .confirm_userscript_plan(pid, r.wants_any && allow.get_untracked())
                     .await
                     .map(|_| "Userscript installed"),
                 (ReviewKind::Update(id), false) => c
-                    .approve_userscript_update(id, r.allow_connect_all)
+                    .approve_userscript_update(id, r.wants_any && allow.get_untracked())
                     .await
                     .map(|_| "Update applied"),
                 (ReviewKind::Update(id), true) => c
                     .discard_userscript_update(id)
                     .await
                     .map(|_| "Update discarded"),
-                (ReviewKind::Approve(id), _) => {
-                    let out = c
-                        .set_userscript_enabled(id, true)
-                        .await
-                        .map(|_| "Script approved and enabled");
-                    if out.is_ok() {
-                        approval_remove(id);
-                    }
-                    out
-                }
+                (ReviewKind::Approve(id), _) => c
+                    .approve_userscript(id, r.wants_any && allow.get_untracked())
+                    .await
+                    .map(|_| "Script approved and enabled"),
             };
             match res {
                 Ok(msg) => {
@@ -497,6 +494,23 @@ pub fn PlanDrawer(
     };
     let footer: ChildrenFn = Arc::new(move || {
         view! {
+            {move || review.get().filter(|r| r.wants_any).map(|r| {
+                let verb = match r.kind {
+                    ReviewKind::Install(_) => "installed",
+                    ReviewKind::Update(_) => "updated",
+                    ReviewKind::Approve(_) => "approved",
+                };
+                view! {
+                    <label class="ask">
+                        <input type="checkbox" prop:checked=move || allow.get()
+                            on:change=move |ev| allow.set(event_target_checked(&ev)) />
+                        <span>
+                            <b>"Allow contacting any site"</b>
+                            <span class="muted">{format!(" This script declares @connect *. Off: it is {verb}, but its requests to other sites are blocked.")}</span>
+                        </span>
+                    </label>
+                }
+            })}
             <button type="button" class="btn ghost" on:click=move |_| open.set(false)>"Cancel"</button>
             {move || matches!(review.get().map(|r| r.kind), Some(ReviewKind::Update(_))).then(|| view! {
                 <button type="button" class="btn danger" aria-disabled=move || busy.get().to_string() on:click=move |_| run(true)>"Discard update"</button>
@@ -607,5 +621,88 @@ pub fn PlanDrawer(
             })}
             {move || err.get().map(|e| view! { <div class="err" role="alert">{format!("Failed: {e}")}</div> })}
         </Drawer>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn script(
+        grants: &[&str],
+        connect: &[&str],
+        matches: &[&str],
+        pend: Option<serde_json::Value>,
+    ) -> Userscript {
+        serde_json::from_value(serde_json::json!({
+            "id": "ns:n", "name": "n", "enabled": true, "execution_count": 0,
+            "match_patterns": matches, "pending_update": pend,
+            "grants": grants, "connect": connect, "connect_all_approved": false,
+            "unsupported": [], "warnings": [], "noframes": false, "storage_bytes": 0,
+            "require_count": 0, "resource_count": 0, "updated_at": "", "error": false
+        }))
+        .unwrap()
+    }
+
+    fn pending(add_m: &[&str], add_c: &[&str], add_g: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "new_version": "2.0", "needs_reapproval": true, "found_at": "2026-01-01T00:00:00Z",
+            "diff": {"added_matches": add_m, "added_connect": add_c, "added_grants": add_g,
+                     "removed_matches": [], "removed_connect": [], "removed_grants": [], "widened": []}
+        })
+    }
+
+    #[test]
+    fn risk_levels() {
+        let low =
+            Review::from_approval(&script(&["gm_getvalue"], &[], &["https://a.test/*"], None));
+        assert_eq!(low.risk().0, "low");
+        let med = Review::from_approval(&script(
+            &["gm_setclipboard"],
+            &[],
+            &["https://a.test/*"],
+            None,
+        ));
+        assert_eq!(med.risk().0, "med");
+        let every = Review::from_approval(&script(&[], &[], &["*://*/*"], None));
+        assert_eq!(every.risk().0, "med");
+        let high = Review::from_approval(&script(
+            &["gm_xmlhttprequest"],
+            &["*"],
+            &["https://a.test/*"],
+            None,
+        ));
+        assert_eq!(high.risk().0, "high");
+        assert!(high.wants_any);
+        // xhr with no @connect: same wording as the catalogue, still high.
+        let none = Review::from_approval(&script(
+            &["GM_xmlhttpRequest"],
+            &[],
+            &["https://a.test/*"],
+            None,
+        ));
+        assert_eq!(none.risk().0, "high");
+        assert!(!none.wants_any);
+    }
+
+    #[test]
+    fn update_review_judges_the_new_version() {
+        let s = script(
+            &["gm_getvalue"],
+            &[],
+            &["https://a.test/*"],
+            Some(pending(
+                &["@match https://*.b.test/*"],
+                &["*"],
+                &["gm_xmlhttprequest"],
+            )),
+        );
+        let r = Review::from_update(&s).unwrap();
+        assert_eq!(r.risk().0, "high");
+        assert!(r.wants_any);
+        assert!(r.matches.contains(&"https://*.b.test/*".to_string()));
+        assert!(r.grants.contains(&"gm_xmlhttprequest".to_string()));
+        assert_eq!(r.new_version.as_deref(), Some("2.0"));
+        assert!(Review::from_update(&script(&[], &[], &[], None)).is_none());
     }
 }

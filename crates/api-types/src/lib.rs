@@ -732,6 +732,9 @@ pub struct UserscriptResponse {
     /// Uses features the proxy cannot run (see `unsupported`).
     #[serde(default)]
     pub error: bool,
+    /// Imported without approval; stays off until approved.
+    #[serde(default)]
+    pub pending_approval: bool,
 }
 
 /// Userscripts per status, for the current search text.
@@ -743,6 +746,12 @@ pub struct UserscriptCounts {
     pub disabled: usize,
     /// Scripts with unsupported features (may also be enabled).
     pub error: usize,
+    /// Scripts that need a look: pending update, error, or awaiting approval.
+    #[serde(default)]
+    pub attention: usize,
+    /// Scripts with a pending update.
+    #[serde(default)]
+    pub updates: usize,
     /// First characters (`A`-`Z`, `#`) present among the rows matching the current filters.
     #[serde(default)]
     pub letters: Vec<String>,

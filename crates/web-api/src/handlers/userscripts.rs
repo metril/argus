@@ -94,6 +94,7 @@ fn userscript_response(
         match_patterns: script.metadata.matches.clone(),
         updated_at: script.updated_at.to_rfc3339(),
         error: !m.unsupported().is_empty(),
+        pending_approval: script.pending_approval,
     }
 }
 
@@ -132,7 +133,8 @@ pub struct ListUserscriptsQuery {
     pub enabled: Option<bool>,
     /// Case-insensitive substring of the name, namespace or description.
     pub q: Option<String>,
-    /// `enabled`, `disabled` or `error` (unsupported features).
+    /// `enabled`, `disabled`, `error` (unsupported features) or `attention` (pending update,
+    /// error, or awaiting approval).
     pub status: Option<String>,
     /// `name` (natural order, default) or `updated` (most recent first).
     pub sort: Option<String>,
@@ -144,6 +146,10 @@ pub struct ListUserscriptsQuery {
     pub cursor: Option<String>,
     /// With `sort=name`: start at the first name at or after this prefix.
     pub from: Option<String>,
+}
+
+fn needs_attention(s: &UserscriptResponse) -> bool {
+    s.error || s.pending_update.is_some() || s.pending_approval
 }
 
 /// List userscripts.
@@ -160,10 +166,10 @@ pub async fn list_userscripts(
 ) -> ApiResult<Json<UserscriptsPage>> {
     let status = match q.status.as_deref() {
         None => None,
-        Some(s @ ("enabled" | "disabled" | "error")) => Some(s),
+        Some(s @ ("enabled" | "disabled" | "error" | "attention")) => Some(s),
         Some(o) => {
             return Err(ApiError::ValidationError(format!(
-                "unknown status '{o}' (enabled, disabled, error)"
+                "unknown status '{o}' (enabled, disabled, error, attention)"
             )))
         }
     };
@@ -208,6 +214,11 @@ pub async fn list_userscripts(
         enabled: matching.iter().filter(|s| s.enabled).count(),
         disabled: matching.iter().filter(|s| !s.enabled).count(),
         error: matching.iter().filter(|s| s.error).count(),
+        attention: matching.iter().filter(|s| needs_attention(s)).count(),
+        updates: matching
+            .iter()
+            .filter(|s| s.pending_update.is_some())
+            .count(),
         letters: Vec::new(),
     };
     let rows: Vec<Keyed<UserscriptResponse>> = matching
@@ -215,6 +226,7 @@ pub async fn list_userscripts(
         .filter(|s| match status {
             Some("enabled") => s.enabled,
             Some("disabled") => !s.enabled,
+            Some("attention") => needs_attention(s),
             Some(_) => s.error,
             None => q.enabled.is_none_or(|e| s.enabled == e),
         })
@@ -384,6 +396,44 @@ pub async fn set_enabled(
             _ => ApiError::Internal(format!("Failed to update: {e}")),
         })?;
     info!("Userscript {id} enabled={} by {}", req.enabled, p.username);
+    Ok(Json(respond(
+        &state,
+        &get_script(&state, &profile.name, &id)?,
+    )))
+}
+
+/// Approve an imported script: enable it and, when asked, allow its `@connect *`.
+#[utoipa::path(
+    post, path = "/userscripts/{id}/approve", tag = "userscripts",
+    security(("bearer_auth" = ["scripts:write"])),
+    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
+    request_body = ApproveUpdateRequest,
+    responses((status = 200, description = "Approved", body = UserscriptResponse))
+)]
+pub async fn approve_script(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(req): ApiJson<ApproveUpdateRequest>,
+) -> ApiResult<Json<UserscriptResponse>> {
+    let script = get_script(&state, &profile.name, &id)?;
+    if req.allow_connect_all && !script.metadata.connect.iter().any(|c| c == "*") {
+        return Err(ApiError::ValidationError(
+            "allow_connect_all given but the script does not declare @connect *".into(),
+        ));
+    }
+    state
+        .userscript_manager
+        .approve_in(&profile.name, &id, req.allow_connect_all)
+        .map_err(|e| match e {
+            userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
+            _ => ApiError::Internal(format!("Failed to approve: {e}")),
+        })?;
+    info!(
+        "Userscript {id} approved by {} (connect_all={})",
+        p.username, req.allow_connect_all
+    );
     Ok(Json(respond(
         &state,
         &get_script(&state, &profile.name, &id)?,
@@ -1057,6 +1107,7 @@ pub async fn import_userscripts(
         // A file cannot approve itself: without `approve`, scripts arrive disabled and without
         // `@connect *` approval, whatever the bundle says.
         script.enabled = entry.enabled && bundle.approve;
+        script.pending_approval = !bundle.approve;
         if !bundle.approve {
             script.allow_connect_all = false;
         }

@@ -195,9 +195,9 @@ pub enum UpdateState {
     NeedsApproval,
 }
 
-/// State of a script; `approval` is the ids imported without approval.
-pub fn update_status(s: &Userscript, approval: &[String]) -> UpdateState {
-    if !s.enabled && approval.contains(&s.id) {
+/// State of a script.
+pub fn update_status(s: &Userscript) -> UpdateState {
+    if s.pending_approval && !s.enabled {
         UpdateState::NeedsApproval
     } else if let Some(p) = &s.pending_update {
         UpdateState::Update(p.new_version.clone().unwrap_or_else(|| "?".into()))
@@ -221,42 +221,30 @@ pub fn state_pill(st: &UpdateState) -> Option<(&'static str, String)> {
     }
 }
 
-/// Whether the "Needs attention" filter lists the script.
-pub fn needs_attention(s: &Userscript, approval: &[String]) -> bool {
-    matches!(
-        update_status(s, approval),
-        UpdateState::Update(_) | UpdateState::Error | UpdateState::NeedsApproval
-    ) || s.pending_update.is_some()
-        || s.error
-}
-
-// ---------------------------------------------------------------------------
-// Imported scripts awaiting approval (the server only says "disabled"; this remembers why)
-// ---------------------------------------------------------------------------
-
-const APPROVAL_KEY: &str = "us.approval";
-
-pub fn approval_load() -> Vec<String> {
-    use gloo_storage::Storage;
-    gloo_storage::LocalStorage::get::<Vec<String>>(APPROVAL_KEY).unwrap_or_default()
-}
-
-pub fn approval_add(ids: impl IntoIterator<Item = String>) {
-    use gloo_storage::Storage;
-    let mut v = approval_load();
-    for id in ids {
-        if !v.contains(&id) {
-            v.push(id);
+/// Percent-decode a URL path segment (invalid escapes are kept as written).
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if let Some(Ok(v)) = s.get(i + 1..i + 3).map(|h| u8::from_str_radix(h, 16)) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
         }
+        out.push(b[i]);
+        i += 1;
     }
-    let _ = gloo_storage::LocalStorage::set(APPROVAL_KEY, v);
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
-pub fn approval_remove(id: &str) {
-    use gloo_storage::Storage;
-    let mut v = approval_load();
-    v.retain(|x| x != id);
-    let _ = gloo_storage::LocalStorage::set(APPROVAL_KEY, v);
+/// The script id in `/userscripts/<encoded id>[?query][#hash]`.
+pub fn id_from_path(path: &str) -> String {
+    let raw = path.strip_prefix("/userscripts/").unwrap_or("");
+    let raw = raw.split(['?', '#']).next().unwrap_or("");
+    percent_decode(raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -573,5 +561,62 @@ mod tests {
             results: vec![r("installed"), r("replaced"), r("skipped"), r("error")],
         };
         assert_eq!(import_summary(&resp), (2, 1, 1));
+    }
+
+    fn script(extra: serde_json::Value) -> Userscript {
+        let mut v = serde_json::json!({
+            "id": "ns:name", "name": "n", "enabled": true, "execution_count": 0,
+            "match_patterns": ["https://a.test/*"], "pending_update": null,
+            "grants": [], "connect": [], "connect_all_approved": false,
+            "unsupported": [], "warnings": [], "noframes": false, "storage_bytes": 0,
+            "require_count": 0, "resource_count": 0, "updated_at": "", "error": false,
+            "pending_approval": false
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn row_states() {
+        assert_eq!(
+            update_status(&script(serde_json::json!({}))),
+            UpdateState::Ok
+        );
+        let off = script(serde_json::json!({"enabled": false}));
+        assert_eq!(update_status(&off), UpdateState::Off);
+        let err = script(serde_json::json!({"error": true}));
+        assert_eq!(update_status(&err), UpdateState::Error);
+        let pend =
+            script(serde_json::json!({"enabled": false, "pending_approval": true, "error": true}));
+        assert_eq!(update_status(&pend), UpdateState::NeedsApproval);
+        let upd = script(serde_json::json!({"pending_update": {
+            "new_version": "2.0", "needs_reapproval": false, "found_at": "2026-01-01T00:00:00Z",
+            "diff": {"added_matches": [], "added_connect": [], "added_grants": [],
+                     "removed_matches": [], "removed_connect": [], "removed_grants": [], "widened": []}
+        }}));
+        assert_eq!(update_status(&upd), UpdateState::Update("2.0".into()));
+        assert_eq!(
+            state_pill(&UpdateState::NeedsApproval).unwrap().1,
+            "Needs approval"
+        );
+    }
+
+    #[test]
+    fn percent_decoding_round_trips_script_ids() {
+        use crate::api::userscripts::encode_component;
+        for id in [
+            "https://greasyfork.org/en/users/1375891-wibu-elite:Universal Anti Adblock Popup Remover",
+            "urn:x:y z",
+            "a/b%c:d+e",
+            "h\u{e9}llo:\u{4e16}\u{754c}",
+        ] {
+            let path = format!("/userscripts/{}", encode_component(id));
+            assert_eq!(id_from_path(&path), id);
+            assert_eq!(id_from_path(&format!("{path}?tab=x#updates")), id);
+        }
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%41"), "%zzA");
     }
 }

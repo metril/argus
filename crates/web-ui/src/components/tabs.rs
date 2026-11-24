@@ -72,11 +72,16 @@ pub fn Tabs(
         <div class="tabs" role="tablist" aria-label=label node_ref=list
             on:keydown=move |ev: web_sys::KeyboardEvent| {
                 let key = ev.key();
-                if key != "ArrowRight" && key != "ArrowLeft" { return }
+                if !["ArrowRight", "ArrowLeft", "Home", "End"].contains(&key.as_str()) { return }
                 let v = items.get_untracked();
                 let Some(i) = v.iter().position(|t| t.0 == active.get_untracked()) else { return };
                 let n = v.len();
-                let j = if key == "ArrowRight" { (i + 1) % n } else { (i + n - 1) % n };
+                let j = match key.as_str() {
+                    "Home" => 0,
+                    "End" => n - 1,
+                    "ArrowRight" => (i + 1) % n,
+                    _ => (i + n - 1) % n,
+                };
                 ev.prevent_default();
                 select(v[j].0.clone());
                 if let Some(l) = list.get_untracked() {

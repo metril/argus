@@ -123,6 +123,21 @@ impl Toast {
     }
 }
 
+/// Add a toast: an identical message collapses into one toast with a count, and at most three
+/// stay (the oldest goes).
+pub fn push_toast(toasts: &mut Vec<Toast>, mut toast: Toast) {
+    if let Some(i) = toasts
+        .iter()
+        .position(|t| t.message == toast.message && t.toast_type == toast.toast_type)
+    {
+        toast.count = toasts.remove(i).count + 1;
+    }
+    toasts.push(toast);
+    while toasts.len() > 3 {
+        toasts.remove(0);
+    }
+}
+
 /// Application-wide state
 #[derive(Clone)]
 pub struct AppState {
@@ -182,21 +197,7 @@ impl AppState {
 
     /// Show a toast notification
     pub fn show_toast(&self, toast: Toast) {
-        self.toasts.update(|toasts| {
-            let mut toast = toast;
-            // An identical message collapses into one toast with a count.
-            if let Some(i) = toasts
-                .iter()
-                .position(|t| t.message == toast.message && t.toast_type == toast.toast_type)
-            {
-                toast.count = toasts.remove(i).count + 1;
-            }
-            toasts.push(toast);
-            // At most three at a time; the oldest goes.
-            while toasts.len() > 3 {
-                toasts.remove(0);
-            }
-        });
+        self.toasts.update(|toasts| push_toast(toasts, toast));
     }
 
     /// Remove a toast by ID
@@ -248,4 +249,32 @@ pub fn provide_app_state() -> AppState {
 /// Use app state from context
 pub fn use_app_state() -> AppState {
     expect_context::<AppState>()
+}
+
+#[cfg(test)]
+mod toast_tests {
+    use super::*;
+
+    #[test]
+    fn identical_toasts_collapse_with_a_count() {
+        let mut v = Vec::new();
+        push_toast(&mut v, Toast::error("Update check failed"));
+        push_toast(&mut v, Toast::error("Update check failed"));
+        push_toast(&mut v, Toast::error("Update check failed"));
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].count, 3);
+        // Same text, other type: separate.
+        push_toast(&mut v, Toast::success("Update check failed"));
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn at_most_three_toasts_the_oldest_dropped() {
+        let mut v = Vec::new();
+        for i in 0..5 {
+            push_toast(&mut v, Toast::info(format!("m{i}")));
+        }
+        let msgs: Vec<_> = v.iter().map(|t| t.message.as_str()).collect();
+        assert_eq!(msgs, ["m2", "m3", "m4"]);
+    }
 }

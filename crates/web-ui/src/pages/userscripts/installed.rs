@@ -51,7 +51,7 @@ fn UsRow(
     let href = script_href(&id);
     let st = {
         let s = script.clone();
-        Memo::new(move |_| update_status(&s, &ctx.approval.get()))
+        Memo::new(move |_| update_status(&s))
     };
     let hint_id = format!(
         "ap-{}",
@@ -184,54 +184,15 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
             status.get_untracked(),
             sort.get_untracked(),
         );
-        let approval = ctx.approval.get_untracked();
-        let attention_total = ctx.attention.get_untracked();
         Box::pin(async move {
-            let client = ApiClient::new();
-            if st == "attention" {
-                // The server filters errors only: scan pages until enough rows match.
-                let mut acc: Vec<Userscript> = Vec::new();
-                let mut cur = cursor;
-                let mut from = from;
-                loop {
-                    let r = client
-                        .list_userscripts_paged(
-                            &qv,
-                            "",
-                            &so,
-                            cur.as_deref(),
-                            from.take().as_deref(),
-                            200,
-                        )
-                        .await;
-                    match r {
-                        Ok(r) => {
-                            counts.set(Some(r.counts));
-                            acc.extend(
-                                r.items
-                                    .into_iter()
-                                    .filter(|s| needs_attention(s, &approval)),
-                            );
-                            cur = r.next_cursor;
-                            if cur.is_none() || acc.len() >= 20 {
-                                break;
-                            }
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                let total = attention_total.max(acc.len());
-                Ok((acc, cur, total))
-            } else {
-                client
-                    .list_userscripts_paged(&qv, &st, &so, cursor.as_deref(), from.as_deref(), 40)
-                    .await
-                    .map(|r| {
-                        dead.set(dead_letters(&r.counts.letters));
-                        counts.set(Some(r.counts));
-                        (r.items, r.next_cursor, r.total)
-                    })
-            }
+            ApiClient::new()
+                .list_userscripts_paged(&qv, &st, &so, cursor.as_deref(), from.as_deref(), 40)
+                .await
+                .map(|r| {
+                    dead.set(dead_letters(&r.counts.letters));
+                    counts.set(Some(r.counts));
+                    (r.items, r.next_cursor, r.total)
+                })
         })
     });
     let feed = Feed::new(fetch);
@@ -244,7 +205,7 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
         sort.track();
         let from = if first.get_value() {
             first.set_value(false);
-            if sort.get_untracked() == "name" && status.get_untracked() != "attention" {
+            if sort.get_untracked() == "name" {
                 anchor0.clone()
             } else {
                 None
@@ -265,7 +226,7 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
         ]);
     });
     let on_anchor = Callback::new(move |i: usize| {
-        if sort.get_untracked() != "name" || status.get_untracked() == "attention" {
+        if sort.get_untracked() != "name" {
             return;
         }
         let label = feed
@@ -294,10 +255,6 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
                     let st = status.get_untracked();
                     let gone = (st == "enabled" && !updated.enabled)
                         || (st == "disabled" && updated.enabled);
-                    if enabled {
-                        approval_remove(&id);
-                        ctx.approval.set(approval_load());
-                    }
                     if gone {
                         feed.items.update(|v| v.retain(|x| x.id != id));
                         feed.total.update(|t| *t = t.saturating_sub(1));
@@ -308,7 +265,13 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
                             }
                         });
                     }
-                    ctx.ov.update(|n| *n += 1);
+                    // Keep the overview in step without refetching it.
+                    ctx.all.update(|v| {
+                        if let Some(x) = v.iter_mut().find(|x| x.id == id) {
+                            x.enabled = enabled;
+                            x.pending_approval = false;
+                        }
+                    });
                 }
                 Err(e) => list_err.set(Some(format!(
                     "Couldn't {} the script: {e}",
@@ -333,7 +296,7 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
         counts.get().map(|c| match val {
             "enabled" => c.enabled,
             "disabled" => c.disabled,
-            "attention" => ctx.attention.get(),
+            "attention" => c.attention,
             _ => c.all,
         })
     };
@@ -413,7 +376,7 @@ pub fn InstalledPanel(ctx: Ctx) -> impl IntoView {
                             reset=feed.tok
                             label="Userscripts"
                         />
-                        <nav class="azrail" aria-label="Jump to letter" hidden=move || !(sort.get() == "name" && status.get() != "attention" && feed.total.get() > 12)>
+                        <nav class="azrail" aria-label="Jump to letter" hidden=move || !(sort.get() == "name" && feed.total.get() > 12)>
                             {LETTERS.iter().map(|&l| view! {
                                 <button type="button" disabled=move || dead.get().contains(&l)
                                     on:click=move |_| feed.reload(

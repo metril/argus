@@ -645,6 +645,60 @@ async fn imported_scripts_arrive_disabled_and_unapproved_unless_confirmed() {
     assert_eq!(s["connect_all_approved"], true);
 }
 
+#[tokio::test]
+async fn import_marks_pending_and_approve_clears_it_and_grants_connect() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let bundle = json!({
+        "format": "argus-userscripts-v1",
+        "scripts": [{
+            "source": src("1.0", "// @grant GM_xmlhttpRequest\n// @connect *"),
+            "enabled": true,
+            "allow_connect_all": true,
+            "assets": {"requires": [], "resources": []}
+        }]
+    });
+    let res: Value = admin
+        .post("/api/v1/userscripts/import")
+        .json(&bundle)
+        .await
+        .json();
+    let id = res["results"][0]["id"].as_str().unwrap().to_string();
+    let url = format!("/api/v1/userscripts/{}", enc(&id));
+    let s: Value = admin.get(&url).await.json();
+    assert_eq!(s["pending_approval"], true);
+    let page: Value = admin
+        .get("/api/v1/userscripts?status=attention")
+        .await
+        .json();
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["counts"]["attention"], 1);
+
+    let r = admin
+        .post(&format!("{url}/approve"))
+        .json(&json!({"allow_connect_all": true}))
+        .await;
+    r.assert_status_ok();
+    let s: Value = r.json();
+    assert_eq!(s["pending_approval"], false);
+    assert_eq!(s["enabled"], true);
+    assert_eq!(s["connect_all_approved"], true);
+    let page: Value = admin
+        .get("/api/v1/userscripts?status=attention")
+        .await
+        .json();
+    assert_eq!(page["total"], 0);
+
+    // @connect * cannot be granted to a script that does not declare it.
+    admin.delete(&url).await.assert_status_ok();
+    let other = install_plain(&admin, &src("2.0", "")).await;
+    let r = admin
+        .post(&format!("/api/v1/userscripts/{}/approve", enc(&other)))
+        .json(&json!({"allow_connect_all": true}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
 // ---------------------------------------------------------------- signed catalogue
 
 fn catalogue_doc(

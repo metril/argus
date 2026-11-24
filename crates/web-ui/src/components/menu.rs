@@ -70,7 +70,7 @@ pub fn Menu(#[prop(into)] label: String, children: ChildrenFn) -> impl IntoView 
                 <svg class="i" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
             </button>
             <Show when=move || open.get()>
-                <div class="menu-scrim" on:click=move |_| open.set(false)></div>
+                <div class="menu-scrim" on:click=move |_| close()></div>
                 <div class="menu" role="menu" node_ref=menu
                     on:keydown=move |ev: web_sys::KeyboardEvent| {
                         let key = ev.key();

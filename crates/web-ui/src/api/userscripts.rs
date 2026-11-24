@@ -153,6 +153,19 @@ impl ApiClient {
         .await
     }
 
+    /// Approve an imported script: enable it and, when asked, allow its `@connect *`.
+    pub async fn approve_userscript(
+        &self,
+        id: &str,
+        allow_connect_all: bool,
+    ) -> Result<Userscript, ApiError> {
+        self.post(
+            &script_path(id, "/approve"),
+            &ApproveUpdateRequest { allow_connect_all },
+        )
+        .await
+    }
+
     /// Discard the pending update.
     pub async fn discard_userscript_update(&self, id: &str) -> Result<MessageResponse, ApiError> {
         self.delete(&script_path(id, "/update")).await
