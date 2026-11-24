@@ -468,3 +468,38 @@ test("a page that re-tampers the host's inline style right before every click ne
   it.fire("click", T());
   assert.equal(hit, 1);
 });
+
+test("Chrome for Android: after the URL bar hides, fixed elements anchor to the larger (inner) viewport", async () => {
+  const env = page("on_demand");
+  const api = await run(env, { grants: GR });
+  api.GM_registerMenuCommand("x", () => {});
+  const badge = kq(hostOf(env).shadow, "badge");
+  // documentElement.clientHeight is still the smaller one; the window's inner height grew by 56px
+  env.root.chh = 768;
+  env.W.innerWidth = 1024; env.W.innerHeight = 824;
+  badge.rect = { width: 28, height: 28, left: 984, top: 784, right: 1012, bottom: 812 };
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "true", "matches the inner viewport");
+  badge.fire("click", T());
+  // something that matches neither is still refused
+  badge.rect = { width: 28, height: 28, left: 984, top: 700, right: 1012, bottom: 728 };
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "false");
+  // the visual viewport is a candidate too
+  env.W.innerHeight = 700;
+  env.W.visualViewport = { width: 1024, height: 740 };
+  badge.rect = { width: 28, height: 28, left: 984, top: 700, right: 1012, bottom: 728 };
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "false", "no visual viewport was captured at install, so it is not trusted later");
+});
+
+test("a visual viewport present at install is a candidate anchor", async () => {
+  const env = page("on_demand");
+  env.W.visualViewport = { width: 1024, height: 740 };
+  const api = await run(env, { grants: GR });
+  api.GM_registerMenuCommand("x", () => {});
+  const badge = kq(hostOf(env).shadow, "badge");
+  badge.rect = { width: 28, height: 28, left: 984, top: 700, right: 1012, bottom: 728 };
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "true");
+});

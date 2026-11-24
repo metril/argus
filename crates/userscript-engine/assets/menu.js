@@ -46,6 +46,10 @@ function (W, reg, mode, nonce) {
       gCompat = getter(DOp, "compatMode"), gCW = getter(ELp, "clientWidth"), gCH = getter(ELp, "clientHeight"), gKey = getter(KEp, "key"), gTarget = getter(EVp, "target"),
       rW = getter(RCp, "width"), rH = getter(RCp, "height"), rL = getter(RCp, "left"), rT = getter(RCp, "top"), rR = getter(RCp, "right"), rB = getter(RCp, "bottom");
   var sText = setterOf(NDp, "textContent");
+  var vv = null, gIW = getter(W, "innerWidth"), gIH = getter(W, "innerHeight"), gVW = getter(null, "width"), gVH = getter(null, "height");
+  try {
+    if (W.visualViewport) { vv = W.visualViewport; gVW = getter(pr(W.VisualViewport), "width"); gVH = getter(pr(W.VisualViewport), "height"); }
+  } catch (e) { vv = null; }
   // isTrusted lives on the instance (unforgeable) in browsers: save its getter from a fresh event.
   var getTrusted = null;
   try {
@@ -105,9 +109,17 @@ function (W, reg, mode, nonce) {
     hideShow(wrap);
     if (menuEl) { hideShow(menuEl); }
   }
-  function viewport() {
-    var el = gCompat(D) === "BackCompat" ? gBody(D) : gDocEl(D);
-    return el ? [gCW(el), gCH(el)] : null;
+  // Candidate viewport sizes a fixed element may anchor to: the document's client size (excludes a
+  // classic scrollbar; body in quirks mode), the window's inner size and, if present, the visual
+  // viewport. On Chrome for Android, once the URL bar hides, fixed elements anchor to the larger
+  // one. Each axis passes if any candidate matches; with no candidate it fails closed.
+  function near(a, b) { return abs(a - b) <= 4; }
+  function anchored(r) {
+    var right = rR(r), bottom = rB(r), wOk = false, hOk = false, el = gCompat(D) === "BackCompat" ? gBody(D) : gDocEl(D);
+    if (el) { wOk = near(gCW(el) - 12, right); hOk = near(gCH(el) - 12, bottom); }
+    wOk = wOk || near(gIW(W) - 12, right); hOk = hOk || near(gIH(W) - 12, bottom);
+    if (vv) { wOk = wOk || near(gVW(vv) - 12, right); hOk = hOk || near(gVH(vv) - 12, bottom); }
+    return wOk && hOk;
   }
   // False when the page hides, fades, moves or covers the badge (or an ancestor) with styles.
   // Order matters: the page's state is READ first and judged, and only then do we pin our own
@@ -125,8 +137,8 @@ function (W, reg, mode, nonce) {
         }
       }
       if (ok && isBadge && fRect) {
-        var r0 = apply(fRect, el, NOARGS), vp = viewport();
-        if (!vp || abs(rW(r0) - 28) > 2 || abs(rH(r0) - 28) > 2 || abs(vp[0] - rR(r0) - 12) > 4 || abs(vp[1] - rB(r0) - 12) > 4) { ok = false; }
+        var r0 = apply(fRect, el, NOARGS);
+        if (abs(rW(r0) - 28) > 2 || abs(rH(r0) - 28) > 2 || !anchored(r0)) { ok = false; }
       }
     } catch (e) { ok = false; }
     pin();

@@ -4,6 +4,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use chromiumoxide::cdp::browser_protocol::emulation::{
+    SetDeviceMetricsOverrideParams, SetTouchEmulationEnabledParams,
+};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
@@ -579,6 +582,51 @@ panel_test!(
         }
         assert_eq!(s.eval("window.__c1").await, 1);
         assert_eq!(s.eval("window.__c2").await, 1);
+    }
+);
+
+// Mobile emulation (400x800, touch): the badge is where we expect it and a real click works on the
+// badge and on an item.
+panel_test!(
+    menu_badge_works_under_mobile_emulation,
+    PanelAuth::Pin,
+    |s, _sites| {
+        s.page
+            .execute(SetDeviceMetricsOverrideParams::new(400, 800, 2.0, true))
+            .await
+            .unwrap();
+        s.page
+            .execute(SetTouchEmulationEnabledParams::new(true))
+            .await
+            .unwrap();
+        install_two_command_scripts(&s);
+        routes(&s, "");
+        // routes() builds a page without a viewport meta; a mobile page has one.
+        let cdn = s.url("cdn.test", "/x.js");
+        s.origin.route(
+            "/",
+            MockResponse::html(
+                doc("")
+                    .replace("CDN", &cdn)
+                    .replace("<meta charset=utf-8>", "<meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"),
+            ),
+        );
+        s.goto(&s.url("sp.test", "/")).await;
+        s.wait_for("the badge", "(window.__spy || []).length > 0")
+            .await;
+        assert_eq!(s.eval("innerWidth").await, 400);
+        let badge = "window.__spy.at(0).querySelector('[data-k=badge]')";
+        let expanded = format!("{badge}.getAttribute('aria-expanded')");
+        let (x, y) = center(&s, badge).await;
+        assert!(x > 300.0 && y > 700.0, "badge in the bottom right: {x},{y}");
+        mouse_click(&s, x, y).await;
+        s.wait_for("the menu", &format!("{expanded} === 'true'"))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let item = "[...window.__spy.at(0).querySelectorAll('button')].find(b => b.textContent === 'One command')";
+        let (x, y) = center(&s, item).await;
+        mouse_click(&s, x, y).await;
+        s.wait_for("the command", "window.__c1 === 1").await;
     }
 );
 
