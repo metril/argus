@@ -627,7 +627,8 @@ textarea.form-input{height:auto;padding:8px 10px;font-family:var(--font-mono);fo
 .userscript-item:first-child{border-top:0;padding-top:0}
 .userscript-item.disabled .userscript-info{opacity:.6}
 .userscript-name{margin:0;font-weight:500;font-size:var(--fs-13);display:flex;gap:var(--s2);align-items:baseline;flex-wrap:wrap}
-.userscript-version{font:11px var(--font-mono);color:var(--text-3)}
+.userscript-version{font:11px var(--font-mono);color:var(--text-3);margin-left:var(--s2)}
+.us-warn,.us-danger{min-width:0;overflow-wrap:anywhere}
 .userscript-description{margin:2px 0 0;color:var(--text-2)}
 .userscript-meta{display:flex;flex-wrap:wrap;gap:var(--s2) var(--s4);color:var(--text-3);font-size:var(--fs-12);margin-top:4px;align-items:center}
 .userscript-actions{display:flex;gap:var(--s3);align-items:center;flex-wrap:wrap;justify-content:flex-end}
