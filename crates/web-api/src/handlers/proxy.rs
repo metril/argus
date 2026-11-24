@@ -40,6 +40,7 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         auto_update: config.adblock.auto_update,
         update_interval_hours: config.adblock.update_interval_hours,
         transparent_port: config.proxy.transparent_port,
+        ext_port: config.proxy.ext_port,
         tls_passthrough_hosts: config.proxy.tls_passthrough_hosts.clone(),
         block_private_destinations: config.proxy.block_private_destinations,
         allowed_destinations: config.proxy.allowed_destinations.clone(),
@@ -297,6 +298,12 @@ async fn apply_update_locked(
         can_proxy
     );
     field!(
+        "ext_port",
+        config.proxy.ext_port,
+        req.ext_port.map(|p| (p != 0).then_some(p)),
+        can_proxy
+    );
+    field!(
         "tls_passthrough_hosts",
         config.proxy.tls_passthrough_hosts,
         req.tls_passthrough_hosts,
@@ -509,6 +516,7 @@ async fn apply_update_locked(
                     .rebind_proxy(&old.proxy.host, old.proxy.port, old.proxy.transparent_port)
                     .await;
             }
+            let _ = rt.rebind_ext(&old.proxy.host, old.proxy.ext_port).await;
             let _ = rt.apply_access(&old).await;
         }
         return Err(ApiError::Internal(format!("Failed to save settings: {e}")));
@@ -568,6 +576,16 @@ async fn apply_runtime(
                 .await
                 .map_err(&bind_err)?;
             proxy_moved = true;
+        }
+        if listeners_changed || old.proxy.ext_port != new.proxy.ext_port {
+            if let Err(e) = rt.rebind_ext(&new.proxy.host, new.proxy.ext_port).await {
+                if proxy_moved {
+                    let _ = rt
+                        .rebind_proxy(&old.proxy.host, old.proxy.port, old.proxy.transparent_port)
+                        .await;
+                }
+                return Err(bind_err(e));
+            }
         }
         match rt.apply_access(new).await {
             Ok(()) => {}

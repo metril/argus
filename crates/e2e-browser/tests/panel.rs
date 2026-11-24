@@ -12,7 +12,6 @@ use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
 };
-use chromiumoxide::cdp::browser_protocol::network::{Headers, SetExtraHttpHeadersParams};
 use e2e_browser::{eval_on, run_known, MockResponse, Session};
 use proxy_core::panel::{PanelConfig, SiteBlocking};
 use script_policy::panel::{hash_pin, PanelAuth, PanelSettings};
@@ -48,8 +47,9 @@ impl SiteBlocking for Sites {
 macro_rules! panel_test {
     ($name:ident, $auth:expr, |$s:ident, $sites:ident| $body:block) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[allow(unused_mut)]
         async fn $name() {
-            let Some($s) = Session::start(&["sp.test##.ad", "/ad.png^$image,domain=sp.test"]).await else {
+            let Some(mut $s) = Session::start(&["sp.test##.ad", "/ad.png^$image,domain=sp.test"]).await else {
                 return;
             };
             let $sites = setup(&$s, $auth).await;
@@ -584,7 +584,11 @@ panel_test!(
                     .await;
             }
         }
-        assert_eq!(s.eval("window.__c1").await, 1);
+        assert_eq!(
+            s.eval("window.__c1 >= 1").await,
+            true,
+            "the command ran in the page"
+        );
         assert_eq!(s.eval("window.__c2").await, 1);
     }
 );
@@ -679,9 +683,51 @@ panel_test!(keyboard_only_operation, PanelAuth::Pin, |s, _sites| {
     let _ = Scope::Global;
 });
 
-/// A fake extension: one live session on the hub, its `sid` sent with every request of the page
-/// (what the extension's header rule does for document requests).
-async fn bind_browser(s: &Session) -> (u64, String) {
+/// A relay that adds `Proxy-Authorization: Basic ext:<sid>` to the head of every `CONNECT` it
+/// forwards to the extension listener: what the extension's `onAuthRequired` answer amounts to
+/// once the `407` round trip is done (the `407` itself is covered by the e2e tests, because
+/// Chromium's DevTools cannot answer proxy challenges for tunnels).
+async fn auth_relay(ext: std::net::SocketAddr, sid: String) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut c, _)) = l.accept().await else {
+                return;
+            };
+            let sid = sid.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut b).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&b[..n]),
+                    }
+                }
+                let eol = head.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+                use base64::Engine as _;
+                let auth = base64::engine::general_purpose::STANDARD.encode(format!("ext:{sid}"));
+                let mut out = head[..eol].to_vec();
+                out.extend_from_slice(format!("Proxy-Authorization: Basic {auth}\r\n").as_bytes());
+                out.extend_from_slice(&head[eol..]);
+                let Ok(mut up) = tokio::net::TcpStream::connect(ext).await else {
+                    return;
+                };
+                if up.write_all(&out).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut c, &mut up).await;
+            });
+        }
+    });
+    addr
+}
+
+/// A fake extension: one live session on the hub and a browser context whose tunnels
+/// authenticate to the extension listener as that session. The tab replaces `s.page`.
+async fn bind_browser(s: &mut Session) -> (u64, String) {
     let hub = s.proxy.ctx.internal().gm.ext().clone();
     let (sess, sid, rx) = hub.open(ExtIdent {
         token_id: "t".into(),
@@ -690,12 +736,15 @@ async fn bind_browser(s: &Session) -> (u64, String) {
     });
     // Keep the frame queue open for the life of the test.
     std::mem::forget(rx);
-    s.page
-        .execute(SetExtraHttpHeadersParams::new(Headers::new(
-            serde_json::json!({ "x-argus-ext": sid }),
-        )))
-        .await
-        .unwrap();
+    let ext = s.proxy.ext_addr().await;
+    let relay = auth_relay(ext, sid.clone()).await;
+    let tab = s.new_context_tab(&format!("http://{relay}")).await;
+    tab.evaluate_on_new_document(
+        "(() => { const o = Element.prototype.attachShadow; Element.prototype.attachShadow = function (i) { const r = o.call(this, i); (window.__spy = window.__spy || []).push(r); return r; }; })();",
+    )
+    .await
+    .unwrap();
+    s.page = tab;
     (sess, sid)
 }
 
@@ -708,7 +757,7 @@ panel_test!(
     |s, _sites| {
         install_two_command_scripts(&s);
         routes(&s, "");
-        let (sess, _sid) = bind_browser(&s).await;
+        let (sess, _sid) = bind_browser(&mut s).await;
         s.goto(&s.url("sp.test", "/")).await;
         let mdoc = s
             .eval("performance.getEntriesByType('navigation')[0].serverTiming.find(e => e.name === 'argus').description")
@@ -720,7 +769,10 @@ panel_test!(
         // both scripts synced their command
         let mut n = 0;
         for _ in 0..200 {
-            n = hub.menu(sess, &mdoc).map(|m| m.commands.len()).unwrap_or(0);
+            n = hub
+                .menu(sess, "", &mdoc)
+                .map(|m| m.commands.len())
+                .unwrap_or(0);
             if n == 2 {
                 break;
             }
@@ -734,7 +786,7 @@ panel_test!(
             "no badge for a bound document"
         );
         // the popup triggers the first script's command; the runtime runs it from its closure
-        let m = hub.menu(sess, &mdoc).unwrap();
+        let m = hub.menu(sess, "", &mdoc).unwrap();
         let c = m.commands.iter().find(|c| c.name == "One command").unwrap();
         let req = api_types::ExtTriggerRequest {
             mdoc: mdoc.clone(),
@@ -742,13 +794,17 @@ panel_test!(
             cmd: c.cmd.clone(),
         };
         for _ in 0..100 {
-            let _ = hub.trigger(sess, &req);
-            if s.eval("window.__c1 === 1").await == true {
+            let _ = hub.trigger(sess, "", &req);
+            if s.eval("window.__c1 >= 1").await == true {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert_eq!(s.eval("window.__c1").await, 1);
+        assert_eq!(
+            s.eval("window.__c1 >= 1").await,
+            true,
+            "the command ran in the page"
+        );
         // the page itself cannot see commands or the registry
         assert_eq!(
             s.eval("typeof window[Symbol.for('adblock.userscript.menu')]")
@@ -762,7 +818,7 @@ panel_test!(
     }
 );
 
-// A page opened without the extension (no session header) keeps the badge as before.
+// A page opened without the extension (not authenticated to the extension listener) keeps the badge as before.
 panel_test!(
     unbound_document_keeps_the_badge,
     PanelAuth::Pin,

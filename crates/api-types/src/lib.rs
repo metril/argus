@@ -216,6 +216,10 @@ pub struct ProxyConfigResponse {
     /// Transparent-gateway listener port (`None` = off).
     #[serde(default)]
     pub transparent_port: Option<u16>,
+    /// Port of the extension-only listener (`None` = off): the Argus browser extension sends its
+    /// browser through it so documents are bound to the extension session.
+    #[serde(default)]
+    pub ext_port: Option<u16>,
     /// TLS hosts never intercepted (exact or `*.suffix`).
     #[serde(default)]
     pub tls_passthrough_hosts: Vec<String>,
@@ -395,6 +399,8 @@ pub struct UpdateProxyConfigRequest {
 
     /// Transparent listener port; `0` turns it off. Applied live (the listener is rebound).
     pub transparent_port: Option<u16>,
+    /// Extension listener port; `0` turns it off. Applied live.
+    pub ext_port: Option<u16>,
     /// Replaces the TLS passthrough host list. Applied live.
     pub tls_passthrough_hosts: Option<Vec<String>>,
     /// Applied live.

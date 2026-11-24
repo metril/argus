@@ -321,7 +321,6 @@ pub async fn proxy_upgrade(
             // make the origin wait for one.
             if name == HeaderName::from_static("proxy-authorization")
                 || name == HeaderName::from_static("proxy-connection")
-                || name == HeaderName::from_static(crate::ext_bridge::SESSION_HEADER)
                 || name == HeaderName::from_static(crate::ext_bridge::RELAY_HEADER)
                 || name == HOST
                 || name == hyper::header::CONTENT_LENGTH

@@ -115,6 +115,20 @@ const SECTIONS: &[Section] = &[
                 dep: Some("transparent_on"),
             },
             Def {
+                key: "ext_on",
+                label: "Extension listener",
+                desc: "Lets the Argus browser extension bind its browser to its session. Answers 407 to everything else.",
+                kind: Kind::Switch,
+                dep: None,
+            },
+            Def {
+                key: "ext_port",
+                label: "Extension port",
+                desc: "Proxy port the extension sends its browser through (the extension learns it from Argus).",
+                kind: Kind::Port,
+                dep: Some("ext_on"),
+            },
+            Def {
                 key: "webui_host",
                 label: "Web UI host",
                 desc: "Where this console is served.",
@@ -306,6 +320,8 @@ fn defaults(key: &str) -> Val {
         "explicit_port" => Val::S("8080".into()),
         "transparent_on" => Val::B(true),
         "transparent_port" => Val::S("3129".into()),
+        "ext_on" => Val::B(false),
+        "ext_port" => Val::S("3130".into()),
         "webui_host" => Val::S("0.0.0.0".into()),
         "webui_port" => Val::S("3000".into()),
         "conn_timeout" => Val::S("30".into()),
@@ -346,6 +362,8 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
             "transparent_port",
             Val::S(c.transparent_port.unwrap_or(3129).to_string()),
         ),
+        ("ext_on", Val::B(c.ext_port.is_some())),
+        ("ext_port", Val::S(c.ext_port.unwrap_or(3130).to_string())),
         ("webui_host", Val::S(c.webui_host.clone())),
         ("webui_port", Val::S(c.webui_port.to_string())),
         (
@@ -375,6 +393,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "explicit_host" => &["host"],
         "explicit_port" => &["port"],
         "transparent_on" | "transparent_port" => &["transparent_port"],
+        "ext_on" | "ext_port" => &["ext_port"],
         "webui_host" => &["webui_host"],
         "webui_port" => &["webui_port"],
         "conn_timeout" => &["connection_timeout_secs"],
@@ -452,10 +471,13 @@ fn error_of(f: &F, all: &[F]) -> Option<String> {
                 let others = [
                     ("explicit_port", "explicit proxy"),
                     ("transparent_port", "transparent listener"),
+                    ("ext_port", "extension listener"),
                     ("webui_port", "web UI"),
                 ];
                 for (k, name) in others {
-                    if k == f.def.key || (k == "transparent_port" && !is_on(all, "transparent_on"))
+                    if k == f.def.key
+                        || (k == "transparent_port" && !is_on(all, "transparent_on"))
+                        || (k == "ext_port" && !is_on(all, "ext_on"))
                     {
                         continue;
                     }
@@ -505,6 +527,13 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     if dirty("transparent_on") || dirty("transparent_port") {
         r.transparent_port = Some(if val("transparent_on").b() {
             num("transparent_port") as u16
+        } else {
+            0
+        });
+    }
+    if dirty("ext_on") || dirty("ext_port") {
+        r.ext_port = Some(if val("ext_on").b() {
+            num("ext_port") as u16
         } else {
             0
         });
@@ -783,6 +812,8 @@ fn SettingsInner() -> impl IntoView {
                                     | "explicit_port"
                                     | "transparent_port"
                                     | "transparent_on"
+                                    | "ext_port"
+                                    | "ext_on"
                                     | "webui_host"
                                     | "webui_port"
                             );

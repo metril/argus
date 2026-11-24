@@ -1,5 +1,6 @@
-//! The extension bridge through the real proxy: the session header binds a document and never
-//! reaches the origin, the relay token is checked per hop and never forwarded, and credentialed
+//! The extension bridge through the real proxy: the extension listener binds a connection (and
+//! every document in it) to a session by proxy authentication, the credentials never reach the
+//! origin, the relay token is checked per hop and never forwarded, and credentialed
 //! GM calls reach a fake extension only after every server-side check.
 
 use std::time::Duration;
@@ -48,21 +49,28 @@ fn session(h: &ExtHub, token: &str) -> (u64, String, tokio::sync::mpsc::Receiver
     })
 }
 
+/// A client whose browser authenticated to the extension listener as session `sid`.
+async fn ext_client(env: &TestEnv, sid: &str, store: &str) -> TestClient {
+    let addr = env.proxy.ext_addr().await;
+    TestClient::via_ext(&env.proxy, addr, sid, store)
+}
+
+fn b64(b: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(b)
+}
+
 async fn page(
     env: &TestEnv,
     c: &TestClient,
     host: &str,
     path: &str,
-    sid: Option<&str>,
 ) -> (String, reqwest::header::HeaderMap) {
     env.origin.route(path, MockResponse::html(PAGE));
-    let mut rb = c
+    let rb = c
         .request(reqwest::Method::GET, &env.origin.https_url(host, path))
         .header("sec-fetch-dest", "document")
         .header("accept", "text/html");
-    if let Some(s) = sid {
-        rb = rb.header("x-argus-ext", s);
-    }
     let r = rb.send().await.expect("page");
     assert_eq!(r.status(), 200);
     let h = r.headers().clone();
@@ -94,8 +102,8 @@ fn value_in(js: &str, key: &str) -> String {
 }
 
 /// Load a bound page and take the script bundle's token and document id.
-async fn bound_bundle(env: &TestEnv, c: &TestClient, sid: &str, path: &str) -> (String, String) {
-    let (html, h) = page(env, c, "app.test", path, Some(sid)).await;
+async fn bound_bundle(env: &TestEnv, c: &TestClient, path: &str) -> (String, String) {
+    let (html, h) = page(env, c, "app.test", path).await;
     assert!(html.contains("data-m=\"ext:"), "bound: {html}");
     let s = srcs(&html);
     let b = c
@@ -184,11 +192,16 @@ async fn cookie(env: &TestEnv, c: &TestClient, tok: &str, body: Value) -> (u16, 
 }
 
 async fn next_job(rx: &mut tokio::sync::mpsc::Receiver<ExtOut>) -> (u32, Value) {
-    let Some(ExtOut::Binary(b)) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("a job")
-    else {
-        panic!("expected a binary frame")
+    // (text frames, such as the listener's `proxy` announcement, are not jobs)
+    let b = loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a job")
+        {
+            Some(ExtOut::Binary(b)) => break b,
+            Some(ExtOut::Text(_)) => continue,
+            other => panic!("expected a binary frame, got {other:?}"),
+        }
     };
     let (t, job, p) = parse_job_frame(&b).unwrap();
     assert_eq!(t, F_JOB);
@@ -196,85 +209,211 @@ async fn next_job(rx: &mut tokio::sync::mpsc::Receiver<ExtOut>) -> (u32, Value) 
 }
 
 fn no_more(rx: &mut tokio::sync::mpsc::Receiver<ExtOut>) -> bool {
-    matches!(
-        rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    )
+    // (a text frame is the listener's `proxy` announcement, not a job)
+    loop {
+        match rx.try_recv() {
+            Ok(ExtOut::Text(_)) => continue,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return true,
+            _ => return false,
+        }
+    }
 }
 
 e2e_test!(
-    the_session_header_binds_the_document_and_never_reaches_the_origin,
+    the_extension_listener_binds_connections_by_proxy_authentication,
     rules = [],
     explicit_only,
     |env| {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         env.proxy
             .userscripts()
             .install_script("default", script("", false))
             .unwrap();
         let h = hub(&env);
         let (sess, sid, _rx) = session(&h, "t1");
-        let c = env.client();
+        let ext = ext_client(&env, &sid, "").await;
 
-        let (html, hd) = page(&env, &c, "app.test", "/p", Some(&sid)).await;
+        // a bound document: ext tag, Server-Timing, and the session can list it
+        let (html, hd) = page(&env, &ext, "app.test", "/p").await;
         assert!(html.contains("data-m=\"ext:"), "bound document: {html}");
-        let mdoc = mdoc_of(&hd).expect("Server-Timing on a userscript document");
+        let mdoc = mdoc_of(&hd).expect("Server-Timing on a bound userscript document");
+        assert!(h.menu(sess, "", &mdoc).is_ok(), "bound to the session");
+        // the same connection serves further documents (bound by connection identity)
+        let (html, _) = page(&env, &ext, "app.test", "/p2").await;
+        assert!(html.contains("data-m=\"ext:"));
+
+        // a normal port never 407s and binds nothing: no id, no Server-Timing, no ext tag
+        let plain = env.client();
+        let (html2, hd2) = page(&env, &plain, "app.test", "/q").await;
+        assert!(!html2.contains("ext:"), "unbound: {html2}");
         assert!(
-            h.menu(sess, &mdoc).is_ok(),
-            "the document is bound to the session"
+            hd2.get("server-timing").is_none(),
+            "unbound pages carry no id"
+        );
+        assert_eq!(
+            h.menu(sess, "", "deadbeef"),
+            Err(api_types::ExtError::NotFound)
         );
 
-        // an unknown or wrong sid binds nothing; the header is still stripped
-        let (html2, hd2) = page(
-            &env,
-            &c,
-            "app.test",
-            "/q",
-            Some("00000000000000000000000000000000"),
-        )
-        .await;
-        assert!(!html2.contains("ext:"), "unknown sid: {html2}");
-        let m2 = mdoc_of(&hd2).expect("still a userscript document");
-        assert_eq!(h.menu(sess, &m2), Err(api_types::ExtError::Forbidden));
-        let (html3, _) = page(&env, &c, "app.test", "/r", None).await;
-        assert!(!html3.contains("ext:"));
+        // a document served to a Firefox container's credentials belongs to that store only
+        let boxed = ext_client(&env, &sid, "c1x").await;
+        let (_, hd3) = page(&env, &boxed, "app.test", "/box").await;
+        let m3 = mdoc_of(&hd3).expect("bound in a store");
+        assert!(h.menu(sess, "c1x", &m3).is_ok());
+        assert_eq!(h.menu(sess, "", &m3), Err(api_types::ExtError::Forbidden));
+        assert_eq!(
+            h.menu(sess, "other", &m3),
+            Err(api_types::ExtError::Forbidden)
+        );
+        assert_eq!(
+            h.menu(sess, "c1x", &mdoc),
+            Err(api_types::ExtError::Forbidden)
+        );
 
-        // no Server-Timing on a document without userscripts, or on a non-document
-        let (_, other) = page(&env, &c, "other.test", "/o", Some(&sid)).await;
-        assert!(other.get("server-timing").is_none());
-        env.origin.route("/a.js", MockResponse::ok("1"));
-        let r = c
-            .request(
-                reqwest::Method::GET,
-                &env.origin.https_url("app.test", "/a.js"),
-            )
-            .header("x-argus-ext", &sid)
-            .header("x-argus-relay", "whatever")
-            .send()
+        // raw 407: no credentials, wrong credentials, a made-up sid
+        let addr = env.proxy.ext_addr().await;
+        for auth in [
+            None,
+            Some(format!(
+                "Basic {}",
+                b64(b"ext:00000000000000000000000000000000")
+            )),
+            Some(format!("Basic {}", b64(format!("user:{sid}").as_bytes()))),
+            Some("Bearer x".to_string()),
+        ] {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut req = String::from("CONNECT app.test:443 HTTP/1.1\r\nHost: app.test:443\r\n");
+            if let Some(a) = &auth {
+                req += &format!("Proxy-Authorization: {a}\r\n");
+            }
+            req += "\r\n";
+            sock.write_all(req.as_bytes()).await.unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut out)).await;
+            let text = String::from_utf8_lossy(&out).to_string();
+            assert!(text.starts_with("HTTP/1.1 407"), "{auth:?}: {text}");
+            assert!(text.contains("realm=\"argus-ext\""), "{text}");
+        }
+        // plain (non-CONNECT) request without credentials: 407 too, nothing forwarded
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let url = env.origin.http_url("app.test", "/noauth");
+        env.origin.route("/noauth", MockResponse::ok("x"));
+        sock.write_all(format!("GET {url} HTTP/1.1\r\nHost: app.test\r\n\r\n").as_bytes())
             .await
             .unwrap();
-        // an unknown relay token is refused (and never forwarded)
-        assert_eq!(r.status(), 403);
-        let r = c
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), sock.read_to_end(&mut out)).await;
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 407"));
+        assert!(env.origin.requests_for("/noauth").is_empty());
+        // the normal port: a raw CONNECT with no credentials is served, never 407
+        let mut sock = tokio::net::TcpStream::connect(env.proxy.addr)
+            .await
+            .unwrap();
+        sock.write_all(b"CONNECT app.test:443 HTTP/1.1\r\nHost: app.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+
+        // Proxy-Authorization (and the relay header) never reach the origin: a plain-HTTP
+        // request through the extension listener carries it in the clear
+        env.origin.route("/plain", MockResponse::ok("p"));
+        let r = ext
             .request(
                 reqwest::Method::GET,
-                &env.origin.https_url("app.test", "/a.js"),
+                &env.origin.http_url("app.test", "/plain"),
             )
-            .header("x-argus-ext", &sid)
             .send()
             .await
             .unwrap();
         assert_eq!(r.status(), 200);
-        assert!(r.headers().get("server-timing").is_none());
-
         for rq in env.origin.requests() {
             assert!(
                 rq.headers.iter().all(|(n, _)| {
-                    !n.eq_ignore_ascii_case("x-argus-ext")
+                    !n.eq_ignore_ascii_case("proxy-authorization")
                         && !n.eq_ignore_ascii_case("x-argus-relay")
                 }),
-                "bridge header reached the origin: {rq:?}"
+                "a bridge header reached the origin: {rq:?}"
             );
         }
+
+        // a relay token is refused when it does not come from the job's own session
+        env.origin.route("/a.js", MockResponse::ok("1"));
+        let r = ext
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("app.test", "/a.js"),
+            )
+            .header("x-argus-relay", "whatever")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+
+        // the session ends: new connections are refused and an open tunnel is closed
+        let mut tunnel = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tunnel
+            .write_all(
+                format!(
+                    "CONNECT app.test:443 HTTP/1.1\r\nHost: app.test:443\r\nProxy-Authorization: Basic {}\r\n\r\n",
+                    b64(format!("ext:{sid}").as_bytes())
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        tunnel.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        h.close(sess);
+        let mut rest = Vec::new();
+        let ended =
+            tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut rest)).await;
+        assert!(ended.is_ok(), "the tunnel died with its session");
+        // a new request is refused (a refused tunnel, or a 407 on a connection that was still open)
+        let after = ext
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("app.test", "/p3"),
+            )
+            .send()
+            .await;
+        assert!(after.map_or(true, |r| r.status() == 407));
+        assert!(
+            env.origin.requests_for("/p3").is_empty(),
+            "nothing reached the origin"
+        );
+    }
+);
+
+e2e_test!(
+    revoking_a_token_drops_the_sessions_proxy_connections,
+    rules = [],
+    explicit_only,
+    |env| {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let h = hub(&env);
+        let (_s, sid, _rx) = session(&h, "tok-r");
+        let addr = env.proxy.ext_addr().await;
+        let mut tunnel = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tunnel
+            .write_all(
+                format!(
+                    "CONNECT app.test:443 HTTP/1.1\r\nHost: app.test:443\r\nProxy-Authorization: Basic {}\r\n\r\n",
+                    b64(format!("ext:{sid}").as_bytes())
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut head = [0u8; 12];
+        tunnel.read_exact(&mut head).await.unwrap();
+        h.close_token("tok-r");
+        let mut rest = Vec::new();
+        let ended =
+            tokio::time::timeout(Duration::from_secs(5), tunnel.read_to_end(&mut rest)).await;
+        assert!(ended.is_ok(), "revocation closes the proxy connection");
     }
 );
 
@@ -290,14 +429,19 @@ e2e_test!(
             .install_script("default", s)
             .unwrap();
         let h = hub(&env);
-        let (sess, _sid, mut rx) = session(&h, "t1");
+        let (sess, sid, mut rx) = session(&h, "t1");
+        h.on_text(
+            sess,
+            &json!({"t": "perms", "origins": ["*://*.api.test/*"]}).to_string(),
+        )
+        .await;
         let _job = h
             .dispatch(sess, json!({"op": "xhr"}), "default", &id, "app.test", None)
             .await
             .unwrap();
         let (_, meta) = next_job(&mut rx).await;
         let relay = meta["relay"].as_str().unwrap().to_string();
-        let c = env.client();
+        let c = ext_client(&env, &sid, "").await;
         env.origin.route("/ok", MockResponse::ok("fine"));
         env.origin.route("/bad", MockResponse::ok("never"));
         let get = |host: &'static str, path: &'static str, tok: String| {
@@ -312,6 +456,38 @@ e2e_test!(
         // a redirect hop to a host outside @connect is refused before it is fetched
         let r = get("evil.test", "/bad", relay.clone()).await;
         assert_eq!(r.status(), 403);
+        // so is one from a connection of another session, or of a container store
+        let (_o, osid, _orx) = session(&h, "t9");
+        let other = ext_client(&env, &osid, "").await;
+        let r = other
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("api.test", "/ok"),
+            )
+            .header("x-argus-relay", relay.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            403,
+            "another session cannot use the job's token"
+        );
+        let boxed = ext_client(&env, &sid, "c1x").await;
+        let r = boxed
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("api.test", "/ok"),
+            )
+            .header("x-argus-relay", relay.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            403,
+            "a container store cannot use the job's token"
+        );
         let r = get("api.test", "/ok", "unknown".into()).await;
         assert_eq!(r.status(), 403);
         assert!(env.origin.requests().iter().all(|r| r.path() != "/bad"));
@@ -346,8 +522,8 @@ e2e_test!(
             &json!({"t": "perms", "origins": ["<all_urls>"]}).to_string(),
         )
         .await;
-        let c = env.client();
-        let (tok, mdoc) = bound_bundle(&env, &c, &sid, "/x").await;
+        let c = ext_client(&env, &sid, "").await;
+        let (tok, mdoc) = bound_bundle(&env, &c, "/x").await;
         env.origin.route("/jar", MockResponse::ok("from the proxy"));
 
         // happy path: the job reaches the bound session (not the other one) and its answer is
@@ -452,8 +628,8 @@ e2e_test!(
             &json!({"t": "perms", "origins": ["*://*.api.test/*"]}).to_string(),
         )
         .await;
-        let c = env.client();
-        let (tok, mdoc) = bound_bundle(&env, &c, &sid, "/c").await;
+        let c = ext_client(&env, &sid, "").await;
+        let (tok, mdoc) = bound_bundle(&env, &c, "/c").await;
         let call = cookie(
             &env,
             &c,

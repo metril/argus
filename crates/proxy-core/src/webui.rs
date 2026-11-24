@@ -44,12 +44,7 @@ impl web_api::ExtBridge for crate::ext_bridge::ExtHub {
         &self,
         ident: api_types::ExtIdent,
     ) -> (u64, String, tokio::sync::mpsc::Receiver<api_types::ExtOut>) {
-        let (id, sid, rx) = crate::ext_bridge::ExtHub::open(self, ident);
-        // The extension gets its host list right after the welcome frame.
-        if let Some(hub) = self.arc() {
-            tokio::spawn(async move { hub.push_hosts(id, true).await });
-        }
-        (id, sid, rx)
+        crate::ext_bridge::ExtHub::open(self, ident)
     }
 
     async fn on_text(&self, session: u64, text: &str) {
@@ -64,6 +59,14 @@ impl web_api::ExtBridge for crate::ext_bridge::ExtHub {
         crate::ext_bridge::ExtHub::close(self, session)
     }
 
+    fn proxy_msg(&self) -> String {
+        crate::ext_bridge::ExtHub::proxy_msg(self)
+    }
+
+    fn close_token(&self, token_id: &str) {
+        crate::ext_bridge::ExtHub::close_token(self, token_id)
+    }
+
     fn session_for(&self, sid: &str, token_id: &str) -> Option<u64> {
         crate::ext_bridge::ExtHub::session_for(self, sid, token_id)
     }
@@ -71,17 +74,19 @@ impl web_api::ExtBridge for crate::ext_bridge::ExtHub {
     fn menu(
         &self,
         session: u64,
+        store: &str,
         mdoc: &str,
     ) -> Result<api_types::ExtMenuResponse, api_types::ExtError> {
-        crate::ext_bridge::ExtHub::menu(self, session, mdoc)
+        crate::ext_bridge::ExtHub::menu(self, session, store, mdoc)
     }
 
     fn trigger(
         &self,
         session: u64,
+        store: &str,
         req: &api_types::ExtTriggerRequest,
     ) -> Result<bool, api_types::ExtError> {
-        crate::ext_bridge::ExtHub::trigger(self, session, req)
+        crate::ext_bridge::ExtHub::trigger(self, session, store, req)
     }
 
     fn browser_fallback(&self, profile: &str, script: &str) -> bool {
@@ -146,7 +151,6 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
             }),
         );
     }
-    hub.spawn_pusher();
     let _ = state.certs.set(ctx.certs().clone());
     if let Some(r) = ctx.roots() {
         let _ = state.roots.set(r.cell.clone());
@@ -183,6 +187,13 @@ impl web_api::RuntimeControl for ProxyRuntime {
             .rebind(host, port, transparent_port)
             .await
             .map(bind)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn rebind_ext(&self, host: &str, port: Option<u16>) -> Result<(), String> {
+        self.0
+            .rebind_ext(host, port)
+            .await
             .map_err(|e| e.to_string())
     }
 

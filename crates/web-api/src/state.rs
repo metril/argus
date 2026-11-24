@@ -141,15 +141,29 @@ impl Drop for LogStreamGuard {
 #[async_trait::async_trait]
 pub trait ExtBridge: Send + Sync {
     /// Register a session. Returns its id, the secret `sid` the extension puts in the
-    /// `X-Argus-Ext` header and the queue of frames to send.
+    /// `ext:<sid>` proxy credentials and the queue of frames to send.
     fn open(&self, ident: ExtIdent) -> (u64, String, tokio::sync::mpsc::Receiver<ExtOut>);
     async fn on_text(&self, session: u64, text: &str);
     async fn on_binary(&self, session: u64, data: Vec<u8>);
     fn close(&self, session: u64);
+    /// Close every live session of a token (revoked, expired, or its owner disabled/deleted).
+    fn close_token(&self, token_id: &str);
+    /// `{"t":"proxy","host":..,"port":..}` telling the extension where its proxy listener is.
+    fn proxy_msg(&self) -> String;
     /// The live session whose `sid` is `sid` and that belongs to token `token_id`.
     fn session_for(&self, sid: &str, token_id: &str) -> Option<u64>;
-    fn menu(&self, session: u64, mdoc: &str) -> Result<api_types::ExtMenuResponse, ExtError>;
-    fn trigger(&self, session: u64, req: &api_types::ExtTriggerRequest) -> Result<bool, ExtError>;
+    fn menu(
+        &self,
+        session: u64,
+        store: &str,
+        mdoc: &str,
+    ) -> Result<api_types::ExtMenuResponse, ExtError>;
+    fn trigger(
+        &self,
+        session: u64,
+        store: &str,
+        req: &api_types::ExtTriggerRequest,
+    ) -> Result<bool, ExtError>;
     /// A script approved for browser logins whose last request fell back to the jar.
     fn browser_fallback(&self, profile: &str, script: &str) -> bool;
     /// Sink for audit records (installed by [`AppState::ext_audit`] wiring).
@@ -176,6 +190,10 @@ pub trait RuntimeControl: Send + Sync {
         port: u16,
         transparent_port: Option<u16>,
     ) -> Result<ProxyBind, String>;
+    /// Move the extension-only listener (`None` = off).
+    async fn rebind_ext(&self, _host: &str, _port: Option<u16>) -> Result<(), String> {
+        Ok(())
+    }
     /// Apply the client ACL, TLS passthrough hosts, destination rules, DNS, limits and
     /// per-listener switches, all or nothing.
     async fn apply_access(&self, config: &ProxyConfig) -> Result<(), String>;

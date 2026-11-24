@@ -22,6 +22,8 @@ struct Fake {
     texts: Mutex<Vec<String>>,
     triggers: Mutex<Vec<ExtTriggerRequest>>,
     closed: Mutex<Vec<u64>>,
+    closed_tokens: Mutex<Vec<String>>,
+    stores: Mutex<Vec<String>>,
     fallback: Mutex<bool>,
     outs: Mutex<Vec<tokio::sync::mpsc::Sender<ExtOut>>>,
 }
@@ -47,8 +49,16 @@ impl ExtBridge for Fake {
         let mine = self.idents.lock().iter().any(|i| i.token_id == token_id);
         (sid == SID && mine).then_some(7)
     }
-    fn menu(&self, session: u64, mdoc: &str) -> Result<ExtMenuResponse, ExtError> {
+    fn close_token(&self, token_id: &str) {
+        self.closed_tokens.lock().push(token_id.into());
+    }
+    fn proxy_msg(&self) -> String {
+        r#"{"t":"proxy","host":null,"port":3130}"#.into()
+    }
+    fn menu(&self, session: u64, store: &str, mdoc: &str) -> Result<ExtMenuResponse, ExtError> {
+        self.stores.lock().push(store.into());
         match (session, mdoc) {
+            (7, "bound") if !store.is_empty() => Err(ExtError::Forbidden),
             (7, "bound") => Ok(ExtMenuResponse {
                 commands: vec![ExtMenuCommand {
                     script: "s".into(),
@@ -70,8 +80,13 @@ impl ExtBridge for Fake {
             _ => Err(ExtError::NotFound),
         }
     }
-    fn trigger(&self, session: u64, req: &ExtTriggerRequest) -> Result<bool, ExtError> {
-        self.menu(session, &req.mdoc)?;
+    fn trigger(
+        &self,
+        session: u64,
+        store: &str,
+        req: &ExtTriggerRequest,
+    ) -> Result<bool, ExtError> {
+        self.menu(session, store, &req.mdoc)?;
         self.triggers.lock().push(req.clone());
         Ok(true)
     }
@@ -173,10 +188,12 @@ async fn hello_needs_a_live_token_with_the_bridge_scope() {
     assert_eq!(fake.idents.lock().len(), 1);
     ws.send_text(r#"{"t":"perms","origins":[]}"#).await;
     let out = fake.outs.lock()[0].clone();
-    out.send(ExtOut::Text(r#"{"t":"hosts"}"#.into()))
+    // the extension learns where its proxy listener is right after welcome
+    assert_eq!(ws.receive_json::<Value>().await["port"], 3130);
+    out.send(ExtOut::Text(r#"{"t":"proxy","port":3131}"#.into()))
         .await
         .unwrap();
-    assert_eq!(ws.receive_text().await, r#"{"t":"hosts"}"#);
+    assert_eq!(ws.receive_text().await, r#"{"t":"proxy","port":3131}"#);
     ws.close().await;
     for _ in 0..100 {
         if !fake.closed.lock().is_empty() {
@@ -262,6 +279,17 @@ async fn menu_calls_need_the_scope_and_the_callers_own_bound_session() {
     get(&good, "zzz", Some(SID))
         .await
         .assert_status(StatusCode::NOT_FOUND);
+    // another container's tab (its store token) cannot see the document
+    get(&good, "bound", Some(SID))
+        .add_header("x-argus-store", "c1x")
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    assert_eq!(fake.stores.lock().last().unwrap(), "c1x");
+    // a store header that is not an opaque token is ignored (default store)
+    get(&good, "bound", Some(SID))
+        .add_header("x-argus-store", "../../x")
+        .await
+        .assert_status_ok();
 
     // trigger: same rules
     let body = json!({"mdoc": "bound", "script": "s", "cmd": "c1"});
@@ -400,4 +428,37 @@ async fn browser_logins_are_approved_only_during_review() {
         .assert_status_ok();
     let s: Value = admin.get(&url).await.json();
     assert_eq!(s["browser_cookies_approved"], true);
+}
+
+#[tokio::test]
+async fn revoking_a_token_closes_its_live_channels_and_a_ping_backstop_catches_the_rest() {
+    let (ctx, fake) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let server = ws_server(&ctx);
+    let tok = ctx.token(&admin, &["userscripts:bridge"]).await;
+    // explicit revoke (the owner's own endpoint) tells the bridge
+    let list: Value = admin.get("/api/v1/tokens").await.json();
+    let id = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["scopes"] == json!(["userscripts:bridge"]))
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .expect("token id");
+    // a live channel; then the token is revoked: the next pings notice even if close_token missed
+    let mut ws = hello(&server, &tok).await;
+    let _: Value = ws.receive_json().await;
+    let _: Value = ws.receive_json().await;
+    admin
+        .delete(&format!("/api/v1/tokens/{id}"))
+        .await
+        .assert_status_ok();
+    assert_eq!(*fake.closed_tokens.lock(), vec![id.clone()]);
+    for _ in 0..3 {
+        ws.send_text(r#"{"t":"ping"}"#).await;
+    }
+    match ws.receive_message().await {
+        WsMessage::Close(Some(f)) => assert_eq!(u16::from(f.code), 4401),
+        m => panic!("expected a close, got {m:?}"),
+    }
 }

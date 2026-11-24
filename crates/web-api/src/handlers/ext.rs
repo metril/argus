@@ -49,6 +49,26 @@ pub const CLOSE_HELLO_TIMEOUT: u16 = 4408;
 pub const CLOSE_BAD_HELLO: u16 = 4400;
 
 impl AppState {
+    /// Close the live extension channels of these tokens (revoked, or their owner is gone).
+    pub fn close_ext_tokens(&self, ids: &[String]) {
+        if let Some(b) = self.ext.get() {
+            for id in ids {
+                b.close_token(id);
+            }
+        }
+    }
+
+    /// Close the live extension channels of every token `user` owns.
+    pub fn close_ext_for_user(&self, user: &uuid::Uuid) {
+        let ids: Vec<String> = self
+            .tokens
+            .list(Some(user))
+            .into_iter()
+            .map(|t| t.id.clone())
+            .collect();
+        self.close_ext_tokens(&ids);
+    }
+
     /// Append a bridge audit record to the persisted audit log.
     pub fn record_ext_audit(&self, ev: ExtAuditEvent) {
         let entry = AuditEntry {
@@ -166,6 +186,28 @@ fn identify(state: &AppState, token: &str) -> Result<ExtIdent, u16> {
     })
 }
 
+/// How many pings pass between token re-verifications of a live channel.
+const REVERIFY_PINGS: u32 = 3;
+
+/// [`identify`] without marking the token used.
+fn identify_quiet(state: &AppState, token: &str) -> Result<(), u16> {
+    let cached = state.tokens.verify(token).map_err(|_| CLOSE_BAD_TOKEN)?;
+    let user = state
+        .session_store
+        .get_user(&cached.stored.created_by)
+        .ok()
+        .flatten()
+        .filter(|u| u.enabled)
+        .ok_or(CLOSE_BAD_TOKEN)?;
+    if cached.stored.scopes.contains(&Scope::UserscriptsBridge)
+        && user.role.scopes().contains(&Scope::UserscriptsBridge)
+    {
+        Ok(())
+    } else {
+        Err(CLOSE_NO_SCOPE)
+    }
+}
+
 async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebSocket) {
     let first = tokio::time::timeout(HELLO_TIMEOUT, sock.recv()).await;
     let text = match first {
@@ -188,11 +230,20 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
         b.close(id);
         return;
     }
+    if sock
+        .send(Message::Text(b.proxy_msg().into()))
+        .await
+        .is_err()
+    {
+        b.close(id);
+        return;
+    }
     state.record_ext_audit(ExtAuditEvent {
         actor: user.clone(),
         action: "session_open".into(),
         target: Some(id.to_string()),
     });
+    let mut pings = 0u32;
     loop {
         tokio::select! {
             o = out.recv() => match o {
@@ -206,7 +257,18 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
             },
             m = tokio::time::timeout(IDLE_TIMEOUT, sock.recv()) => match m {
                 Err(_) | Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => break,
-                Ok(Some(Ok(Message::Text(t)))) => b.on_text(id, &t).await,
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    // Backstop for revocation, expiry and disabled owners: re-verify the token
+                    // every few pings (explicit revocation closes the channel at once).
+                    if t.contains("\"ping\"") {
+                        pings += 1;
+                        if pings.is_multiple_of(REVERIFY_PINGS) && identify_quiet(&state, &hello.token).is_err() {
+                            let _ = sock.send(Message::Close(Some(CloseFrame { code: CLOSE_BAD_TOKEN, reason: "revoked".into() }))).await;
+                            break;
+                        }
+                    }
+                    b.on_text(id, &t).await
+                }
                 Ok(Some(Ok(Message::Binary(v)))) => b.on_binary(id, v.to_vec()).await,
                 Ok(Some(Ok(_))) => {}
             },
@@ -242,6 +304,16 @@ fn session_of(state: &AppState, p: &Principal, h: &HeaderMap) -> ApiResult<u64> 
             "No live extension session for this token",
         )
     })
+}
+
+/// The cookie store (Firefox container) of the popup's tab, as the opaque token the extension
+/// used in its proxy credentials; empty for the default store.
+fn store_of(h: &HeaderMap) -> String {
+    h.get("x-argus-store")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() <= 40 && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .unwrap_or("")
+        .to_string()
 }
 
 fn map_err(e: ExtError) -> ApiError {
@@ -280,7 +352,9 @@ pub async fn menu(
     Query(q): Query<MenuQuery>,
 ) -> ApiResult<Json<ExtMenuResponse>> {
     let session = session_of(&state, &p, &headers)?;
-    let r = bridge(&state)?.menu(session, &q.mdoc).map_err(map_err)?;
+    let r = bridge(&state)?
+        .menu(session, &store_of(&headers), &q.mdoc)
+        .map_err(map_err)?;
     Ok(Json(r))
 }
 
@@ -302,6 +376,8 @@ pub async fn trigger(
     ApiJson(req): ApiJson<ExtTriggerRequest>,
 ) -> ApiResult<Json<ExtTriggerResponse>> {
     let session = session_of(&state, &p, &headers)?;
-    let delivered = bridge(&state)?.trigger(session, &req).map_err(map_err)?;
+    let delivered = bridge(&state)?
+        .trigger(session, &store_of(&headers), &req)
+        .map_err(map_err)?;
     Ok(Json(ExtTriggerResponse { delivered }))
 }

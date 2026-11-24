@@ -60,6 +60,7 @@ thiserror = { workspace = true }
 
 # Utilities
 async-trait = { workspace = true }
+psl = "2"
 url = { workspace = true }
 bytes = { workspace = true }
 

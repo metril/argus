@@ -1,10 +1,10 @@
 //! The hub of the browser-extension bridge (protocol: `docs/USERSCRIPT-PROTOCOL.md` section 8).
 //!
 //! * **Sessions.** The extension opens a WebSocket on the web API; the hub registers it under a
-//!   fresh random `sid` (new on every connection). The extension makes its browser send that
-//!   `sid` in `X-Argus-Ext` on document requests to the hosts the hub lists; the proxy reads the
-//!   header, always strips it, and binds the document it is about to inject scripts into to the
-//!   session with that `sid`. Nothing about a client address is used.
+//!   fresh random `sid` (new on every connection). The extension sends its browser through the
+//!   proxy's extension-only listener, which answers `407` until the browser authenticates with
+//!   `ext:<sid>`; the connection (and every document decrypted on it) is then bound to the session
+//!   with that `sid`. Nothing about a client address, and no request header, is used.
 //! * **Menus.** Each such document gets a random public `mdoc`. Its scripts sync their menu
 //!   commands to the hub; the popup lists and triggers them through the web API, which only
 //!   serves a document bound to the caller's own session. A trigger reaches the page through the
@@ -21,16 +21,16 @@ use api_types::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rand::RngCore;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 use userscript_engine::backend::{ErrorCode, GmError, GmResult};
-use userscript_engine::{HostPolicy, SecurityAuditor, UserscriptManager};
+use userscript_engine::{SecurityAuditor, UserscriptManager};
 
-/// Header the extension's browser adds to document requests; always stripped by the proxy.
-pub const SESSION_HEADER: &str = "x-argus-ext";
+/// Realm of the extension listener's `407`; the credentials are `ext:<sid>`.
+pub const EXT_REALM: &str = "argus-ext";
 /// Header the extension's relay fetches carry (the job's relay token); always stripped.
 pub const RELAY_HEADER: &str = "x-argus-relay";
 
@@ -38,8 +38,8 @@ pub const RELAY_HEADER: &str = "x-argus-relay";
 pub const MAX_SESSIONS_PER_TOKEN: usize = 8;
 /// Concurrent jobs per session.
 pub const MAX_JOBS_PER_SESSION: usize = 32;
-/// Documents with a menu record (oldest evicted first).
-pub const MENU_DOC_CAP: usize = 4096;
+/// Documents with a menu record per session (that session's oldest is evicted first).
+pub const MENU_DOCS_PER_SESSION: usize = 256;
 /// A menu record is dropped after this long without use.
 pub const MENU_TTL: Duration = Duration::from_secs(6 * 3600);
 /// Long-poll length of `menu/wait`.
@@ -51,9 +51,10 @@ const MAX_TEXT: usize = 200;
 const FIRE_TTL: Duration = Duration::from_secs(10);
 /// How long a fallback to the jar keeps the warning on the script's page.
 const FALLBACK_TTL: Duration = Duration::from_secs(3600);
-/// Host list limits (beyond them the hub pushes an empty, fail-safe list).
-pub const HOSTS_CAP: usize = 5000;
-pub const EXCLUDE_CAP: usize = 20_000;
+/// Queued answers per job before a slow page fails the job.
+pub const JOB_QUEUE: usize = 32;
+/// A live channel re-verifies its token every this many pings.
+pub const REVERIFY_PINGS: u32 = 3;
 
 // frame types (see USERSCRIPT-PROTOCOL.md 5.1 and 8)
 pub const F_JOB: u8 = 0;
@@ -107,21 +108,25 @@ fn ct_eq(a: &str, b: &str) -> bool {
 // ---- granted host permissions --------------------------------------------------------------
 
 /// Host permissions the extension reported (`permissions.getAll().origins`).
+///
+/// Relay authority comes only from patterns naming a host (`*://host/*`, `*://*.host/*`), the
+/// shape of the popup's per-host grant. `<all_urls>`, `*://*/*`, public-suffix patterns and
+/// patterns with a port or path never count: a broad permission held for other reasons must
+/// not make every request of a script go through the browser.
 #[derive(Debug, Default, Clone)]
 pub struct Perms {
-    any: bool,
     exact: HashSet<String>,
     suffix: HashSet<String>,
+}
+
+fn is_public_suffix(host: &str) -> bool {
+    psl::suffix(host.as_bytes()).is_some_and(|s| s.as_bytes() == host.as_bytes())
 }
 
 impl Perms {
     pub fn from_origins(origins: &[String]) -> Self {
         let mut p = Perms::default();
         for o in origins {
-            if o == "<all_urls>" {
-                p.any = true;
-                continue;
-            }
             let Some((scheme, rest)) = o.split_once("://") else {
                 continue;
             };
@@ -136,24 +141,28 @@ impl Perms {
                 continue;
             }
             let host = host.to_ascii_lowercase();
-            if host == "*" {
-                p.any = true;
-            } else if let Some(d) = host.strip_prefix("*.") {
-                p.suffix.insert(d.to_string());
-            } else {
+            if let Some(d) = host.strip_prefix("*.") {
+                if !d.is_empty() && !d.contains('*') && !is_public_suffix(d) {
+                    p.suffix.insert(d.to_string());
+                }
+            } else if !host.contains('*') && !is_public_suffix(&host) {
                 p.exact.insert(host);
             }
         }
         p
     }
 
-    /// Does the extension hold a permission covering `host`?
+    /// Does the extension hold a per-host permission covering `host`?
     pub fn has(&self, host: &str) -> bool {
         let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-        if self.any || self.exact.contains(&host) {
+        if self.exact.contains(&host) {
             return true;
         }
-        let mut rest = host.as_str();
+        self.suffix_covers(&host)
+    }
+
+    fn suffix_covers(&self, bare: &str) -> bool {
+        let mut rest = bare;
         loop {
             if self.suffix.contains(rest) {
                 return true;
@@ -168,66 +177,36 @@ impl Perms {
 
 // ---- host list ------------------------------------------------------------------------------
 
-/// The list the extension turns into its header rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HostsMsg {
-    pub wildcard: bool,
-    pub hosts: Vec<String>,
-    pub exclude: Vec<String>,
-}
-
-impl HostsMsg {
-    pub fn to_json(&self) -> String {
-        serde_json::json!({"t": "hosts", "wildcard": self.wildcard, "hosts": self.hosts, "exclude": self.exclude}).to_string()
+/// Loopback, private, link-local and unspecified targets (and `localhost` names).
+pub fn is_local_target(host: &str) -> bool {
+    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".internal")
+    {
+        return true;
     }
-}
-
-fn under(host: &str, domain: &str) -> bool {
-    host == domain
-        || (host.len() > domain.len()
-            && host.ends_with(domain)
-            && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
-}
-
-/// Build the host list from what the scripts can inject on, minus every host Argus passes
-/// through (`passthrough`: bare domains, matched by suffix like the extension's rule matches).
-/// Hosts the proxy does not decrypt must never see the session header.
-pub fn build_hosts(policy: &HostPolicy, passthrough: &[String]) -> HostsMsg {
-    let fail_safe = HostsMsg {
-        wildcard: false,
-        hosts: vec![],
-        exclude: vec![],
-    };
-    if policy.any {
-        if passthrough.len() > EXCLUDE_CAP {
-            return fail_safe;
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => {
+            let o = a.octets();
+            a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
         }
-        return HostsMsg {
-            wildcard: true,
-            hosts: vec![],
-            exclude: passthrough.to_vec(),
-        };
-    }
-    let all: BTreeSet<&String> = policy.exact.iter().chain(policy.suffix.iter()).collect();
-    let hosts: Vec<String> = all
-        .into_iter()
-        .filter(|h| !passthrough.iter().any(|p| under(h, p)))
-        .cloned()
-        .collect();
-    if hosts.len() > HOSTS_CAP {
-        return fail_safe;
-    }
-    // A passthrough domain below a listed host would still get the header from the extension's
-    // domain match: exclude it explicitly.
-    let exclude: Vec<String> = passthrough
-        .iter()
-        .filter(|p| hosts.iter().any(|h| under(p, h)))
-        .cloned()
-        .collect();
-    HostsMsg {
-        wildcard: false,
-        hosts,
-        exclude,
+        Ok(std::net::IpAddr::V6(a)) => {
+            let seg = a.segments();
+            a.is_loopback()
+                || a.is_unspecified()
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || a.to_ipv4_mapped()
+                    .is_some_and(|v| is_local_target(&v.to_string()))
+        }
+        Err(_) => false,
     }
 }
 
@@ -239,12 +218,17 @@ struct Session {
     user: String,
     /// Namespaces the session's token may serve (`None`: all).
     profiles: Option<Vec<String>>,
+    /// Profile id the session's proxy connections are pinned to (token restricted to profiles).
+    pinned: Option<u64>,
     tx: mpsc::Sender<ExtOut>,
     perms: Perms,
-    jobs: HashMap<u32, mpsc::Sender<JobEvent>>,
+    jobs: HashMap<u32, (mpsc::Sender<JobEvent>, Arc<AtomicBool>)>,
     next_job: u32,
-    last_hosts: Option<String>,
     opened: Instant,
+    /// Documents registered for this session (bounded by [`MENU_DOCS_PER_SESSION`]).
+    ndocs: usize,
+    /// Pings received (the channel re-verifies its token every [`REVERIFY_PINGS`]).
+    pings: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -267,15 +251,19 @@ struct ScriptMenu {
 }
 
 struct MenuDoc {
+    /// Cookie store the document was served to (empty: default). Menus and jobs of a document
+    /// are only reachable from that store.
+    store: String,
     profile: String,
     origin: String,
     scripts: Vec<(String, String)>,
-    session: Option<u64>,
+    session: u64,
     menus: HashMap<String, ScriptMenu>,
     touched: Instant,
 }
 
 struct RelayInfo {
+    session: u64,
     profile: String,
     script: String,
     page_host: String,
@@ -315,10 +303,15 @@ pub enum Fallback {
     NotApproved,
     /// The request named no document, or an unknown or foreign one.
     NoDocument,
-    /// The document was not bound to a session when it was served.
-    Unbound,
     /// The bound session is gone.
     Dead,
+    /// Argus does not decrypt the target (bypass entry, or the bypass fail-safe is holding
+    /// decryption back): the relay's per-hop check could not run.
+    Bypassed,
+    /// A loopback, private or link-local target.
+    LocalTarget,
+    /// `redirect: "manual"`: a browser fetch cannot expose the redirect response.
+    ManualRedirect,
     /// The extension holds no host permission for the target.
     NoPermission,
 }
@@ -339,6 +332,8 @@ pub struct ExtHub {
     ctx: OnceLock<HubCtx>,
     audit: OnceLock<Arc<dyn Fn(ExtAuditEvent) + Send + Sync>>,
     auditor: OnceLock<Arc<SecurityAuditor>>,
+    /// Where the extension's proxy listener is (host if specific, port; 0 = off).
+    proxy: Mutex<(Option<String>, u16)>,
 }
 
 impl Default for ExtHub {
@@ -360,6 +355,7 @@ impl ExtHub {
             ctx: OnceLock::new(),
             audit: OnceLock::new(),
             auditor: OnceLock::new(),
+            proxy: Mutex::new((None, 0)),
         }
     }
 
@@ -403,6 +399,11 @@ impl ExtHub {
         let (tx, rx) = mpsc::channel(256);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let sid = rand_hex(16);
+        let pinned = ident
+            .profiles
+            .as_ref()
+            .and_then(|v| v.first())
+            .and_then(|p| p.parse::<u64>().ok());
         let profiles = ident.profiles.map(|v| {
             v.iter()
                 .filter_map(|p| p.parse::<u64>().ok())
@@ -430,12 +431,14 @@ impl ExtHub {
                 token_id: ident.token_id,
                 user: ident.user,
                 profiles,
+                pinned,
                 tx,
                 perms: Perms::default(),
                 jobs: HashMap::new(),
                 next_job: 1,
-                last_hosts: None,
                 opened: Instant::now(),
+                ndocs: 0,
+                pings: 0,
             },
         );
         (id, sid, rx)
@@ -445,7 +448,7 @@ impl ExtHub {
     pub fn close(&self, id: u64) {
         let mut g = self.inner.lock();
         if let Some(s) = g.sessions.remove(&id) {
-            for tx in s.jobs.values() {
+            for (tx, _) in s.jobs.values() {
                 let _ = tx.try_send(JobEvent::Error(
                     br#"{"kind":"network","code":"network","message":"extension disconnected"}"#
                         .to_vec(),
@@ -454,7 +457,7 @@ impl ExtHub {
         }
         // Wake every waiter bound to it so the runtime can fall back to its own button.
         let g = &mut *g;
-        for d in g.docs.values_mut().filter(|d| d.session == Some(id)) {
+        for d in g.docs.values_mut().filter(|d| d.session == id) {
             for m in d.menus.values() {
                 m.wake.notify_waiters();
             }
@@ -466,6 +469,26 @@ impl ExtHub {
         });
     }
 
+    /// Close every live session of token `token_id` at once (the token was revoked or expired,
+    /// or its owner was disabled or deleted). Pending jobs fail; the extension removes its
+    /// header rule when its socket closes.
+    pub fn close_token(&self, token_id: &str) {
+        let ids: Vec<u64> = {
+            let g = self.inner.lock();
+            g.sessions
+                .iter()
+                .filter(|(_, s)| s.token_id == token_id)
+                .map(|(i, s)| {
+                    let _ = s.tx.try_send(ExtOut::Close(4401));
+                    *i
+                })
+                .collect()
+        };
+        for id in ids {
+            self.close(id);
+        }
+    }
+
     pub fn is_live(&self, id: u64) -> bool {
         self.inner.lock().sessions.contains_key(&id)
     }
@@ -474,21 +497,53 @@ impl ExtHub {
         self.inner.lock().sessions.len()
     }
 
-    /// Bind a document of namespace `profile` to the session whose `sid` is `sid`: constant-time
-    /// compare against every live session; an unknown `sid` binds nothing.
-    pub fn bind(&self, sid: &str, profile: &str) -> Option<u64> {
+    /// Authenticate the credentials of the extension's proxy listener: the session whose `sid`
+    /// is `sid` (constant-time compare against every live session). Nothing else is consulted.
+    pub fn authenticate(&self, sid: &str) -> Option<u64> {
         let g = self.inner.lock();
         let mut found = None;
         for (id, s) in &g.sessions {
-            if ct_eq(&s.sid, sid)
-                && s.profiles
-                    .as_ref()
-                    .is_none_or(|p| p.iter().any(|x| x == profile))
-            {
+            if ct_eq(&s.sid, sid) {
                 found = Some(*id);
             }
         }
         found
+    }
+
+    /// May documents of namespace `profile` be bound to `session`? (the token's profiles)
+    pub fn allows(&self, session: u64, profile: &str) -> bool {
+        self.inner.lock().sessions.get(&session).is_some_and(|s| {
+            s.profiles
+                .as_ref()
+                .is_none_or(|p| p.iter().any(|x| x == profile))
+        })
+    }
+
+    /// The profile a session's connections are pinned to: the first profile its token is
+    /// restricted to (`None`: the usual resolution by client address and device token).
+    pub fn pinned_profile(&self, session: u64) -> Option<u64> {
+        self.inner.lock().sessions.get(&session)?.pinned
+    }
+
+    /// The extension listener's port (0 = off), told to every session after hello.
+    pub fn set_proxy(&self, host: Option<String>, port: u16) {
+        let msg = self.proxy_msg_for(host.clone(), port);
+        *self.proxy.lock() = (host, port);
+        let g = self.inner.lock();
+        for s in g.sessions.values() {
+            let _ = s.tx.try_send(ExtOut::Text(msg.clone()));
+        }
+    }
+
+    fn proxy_msg_for(&self, host: Option<String>, port: u16) -> String {
+        serde_json::json!({"t": "proxy", "host": host, "port": (port != 0).then_some(port)})
+            .to_string()
+    }
+
+    /// `{"t":"proxy",...}` for the current listener.
+    pub fn proxy_msg(&self) -> String {
+        let (h, p) = self.proxy.lock().clone();
+        self.proxy_msg_for(h, p)
     }
 
     /// The session of `sid` belonging to token `token_id` (for the web API).
@@ -510,9 +565,11 @@ impl ExtHub {
         };
         match v.get("t").and_then(|t| t.as_str()) {
             Some("ping") => {
-                let tx = self.inner.lock().sessions.get(&id).map(|s| s.tx.clone());
-                if let Some(tx) = tx {
-                    let _ = tx.send(ExtOut::Text(r#"{"t":"pong"}"#.into())).await;
+                // Never wait on the outgoing queue: the reader loop must keep reading.
+                let mut g = self.inner.lock();
+                if let Some(s) = g.sessions.get_mut(&id) {
+                    s.pings = s.pings.wrapping_add(1);
+                    let _ = s.tx.try_send(ExtOut::Text(r#"{"t":"pong"}"#.into()));
                 }
             }
             Some("perms") => {
@@ -555,131 +612,97 @@ impl ExtHub {
         };
         // Only this session's own jobs are reachable from its frames. A finished job is
         // forgotten at once, so dropping its handle later sends no cancel frame.
+        //
+        // Nothing here waits: the WebSocket reader must keep reading (pongs, other jobs). When
+        // the job's queue is full the page is too slow: the job is removed, the extension is
+        // told to cancel, and the page gets an error (its receiver sees the queue end without
+        // an END and reports it). A chunk is never dropped and followed by a normal END.
         let last = matches!(t, F_END | F_ERROR);
-        let tx = {
-            let mut g = self.inner.lock();
-            g.sessions.get_mut(&id).and_then(|s| {
-                if last {
-                    s.jobs.remove(&job)
-                } else {
-                    s.jobs.get(&job).cloned()
-                }
-            })
+        let mut g = self.inner.lock();
+        let Some(s) = g.sessions.get_mut(&id) else {
+            return;
         };
-        if let Some(tx) = tx {
-            let _ = tokio::time::timeout(Duration::from_secs(30), tx.send(ev)).await;
+        let Some((tx, overflow)) = s.jobs.get(&job) else {
+            return;
+        };
+        match tx.try_send(ev) {
+            Ok(()) => {
+                if last {
+                    s.jobs.remove(&job);
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                overflow.store(true, Ordering::Release);
+                s.jobs.remove(&job);
+                let _ = s.tx.try_send(ExtOut::Binary(job_frame(F_CANCEL, job, &[])));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                s.jobs.remove(&job);
+                let _ = s.tx.try_send(ExtOut::Binary(job_frame(F_CANCEL, job, &[])));
+            }
         }
     }
 
     // ---- host list ----------------------------------------------------------------------
 
-    fn namespaces_for(&self, profiles: &Option<Vec<String>>) -> Vec<String> {
-        let all: Vec<String> = match self.ctx.get().and_then(|c| c.profiles.as_ref()) {
-            Some(store) => store
-                .list()
-                .map(|v| {
-                    v.into_iter()
-                        .map(|p| common::profile_store::namespace(p.id))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            None => vec![userscript_engine::DEFAULT_PROFILE.to_string()],
-        };
-        match profiles {
-            Some(allowed) => all.into_iter().filter(|n| allowed.contains(n)).collect(),
-            None => all,
-        }
-    }
-
-    /// The host list for one session (blocking: reads the profile store).
-    pub fn hosts_for(&self, id: u64) -> Option<HostsMsg> {
-        let ctx = self.ctx.get()?;
-        let profiles = self.inner.lock().sessions.get(&id)?.profiles.clone();
-        let mut pol = HostPolicy::default();
-        for ns in self.namespaces_for(&profiles) {
-            let p = ctx.manager.index_for(&ns).host_policy();
-            pol.any |= p.any;
-            pol.exact.extend(p.exact);
-            pol.suffix.extend(p.suffix);
-        }
-        pol.exact.sort();
-        pol.exact.dedup();
-        pol.suffix.sort();
-        pol.suffix.dedup();
-        Some(build_hosts(&pol, &ctx.bypass.domains()))
-    }
-
-    /// Compute and push the host list to session `id` when it changed (or `force`).
-    pub async fn push_hosts(self: &Arc<Self>, id: u64, force: bool) {
-        let me = self.clone();
-        let msg = tokio::task::spawn_blocking(move || me.hosts_for(id))
-            .await
-            .ok()
-            .flatten();
-        let Some(msg) = msg else { return };
-        let text = msg.to_json();
-        let tx = {
-            let mut g = self.inner.lock();
-            let Some(s) = g.sessions.get_mut(&id) else {
-                return;
-            };
-            if !force && s.last_hosts.as_deref() == Some(text.as_str()) {
-                return;
-            }
-            s.last_hosts = Some(text.clone());
-            s.tx.clone()
-        };
-        let _ = tx.send(ExtOut::Text(text)).await;
-    }
-
-    /// Push to every session (used after script or bypass changes, and by the poller).
-    pub async fn push_all(self: &Arc<Self>) {
-        let ids: Vec<u64> = self.inner.lock().sessions.keys().copied().collect();
-        for id in ids {
-            self.push_hosts(id, false).await;
-        }
-    }
-
-    /// Re-push host lists every few seconds (changes only): picks up script and bypass edits.
-    pub fn spawn_pusher(self: &Arc<Self>) {
-        let weak: Weak<Self> = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                let Some(h) = weak.upgrade() else { return };
-                h.push_all().await;
-            }
-        });
-    }
-
     // ---- documents and menus ------------------------------------------------------------
 
-    /// Register a document that is about to get userscripts; returns its public `mdoc`.
+    /// Register a document bound to live session `session`; returns its public `mdoc`. Only
+    /// bound documents are registered, so unbound pages never take room here; the session's
+    /// own oldest documents are evicted beyond [`MENU_DOCS_PER_SESSION`], never another's.
     pub fn register_doc(
         &self,
         profile: &str,
         origin: &str,
         scripts: Vec<(String, String)>,
-        session: Option<u64>,
+        session: u64,
+        store: &str,
     ) -> String {
         let mdoc = rand_hex(16);
         let mut g = self.inner.lock();
+        let g = &mut *g;
+        // Stale documents (any session) expire.
         while let Some(front) = g.doc_order.front() {
             let stale = g
                 .docs
                 .get(front)
                 .is_none_or(|d| d.touched.elapsed() > MENU_TTL);
-            if stale || g.doc_order.len() >= MENU_DOC_CAP {
-                let f = g.doc_order.pop_front().expect("front");
-                g.docs.remove(&f);
-            } else {
+            if !stale {
                 break;
             }
+            let f = g.doc_order.pop_front().expect("front");
+            if let Some(d) = g.docs.remove(&f) {
+                if let Some(s) = g.sessions.get_mut(&d.session) {
+                    s.ndocs = s.ndocs.saturating_sub(1);
+                }
+            }
+        }
+        while g
+            .sessions
+            .get(&session)
+            .is_some_and(|s| s.ndocs >= MENU_DOCS_PER_SESSION)
+        {
+            let Some(pos) = g
+                .doc_order
+                .iter()
+                .position(|m| g.docs.get(m).is_some_and(|d| d.session == session))
+            else {
+                break;
+            };
+            let m = g.doc_order.remove(pos).expect("pos");
+            g.docs.remove(&m);
+            if let Some(s) = g.sessions.get_mut(&session) {
+                s.ndocs = s.ndocs.saturating_sub(1);
+            }
+        }
+        if let Some(s) = g.sessions.get_mut(&session) {
+            s.ndocs += 1;
         }
         g.doc_order.push_back(mdoc.clone());
         g.docs.insert(
             mdoc.clone(),
             MenuDoc {
+                store: store.to_string(),
                 profile: profile.to_string(),
                 origin: origin.to_string(),
                 scripts,
@@ -724,7 +747,7 @@ impl ExtHub {
         let mut g = self.inner.lock();
         let live_ids: HashSet<u64> = g.sessions.keys().copied().collect();
         let d = Self::doc_for(&mut g, mdoc, profile, origin, script)?;
-        let live = d.session.is_some_and(|s| live_ids.contains(&s));
+        let live = live_ids.contains(&d.session);
         let clip = |s: String| s.chars().take(MAX_TEXT).collect::<String>();
         let m = d.menus.entry(script.to_string()).or_default();
         m.cmds = cmds
@@ -754,7 +777,7 @@ impl ExtHub {
             let mut g = self.inner.lock();
             let live_ids: HashSet<u64> = g.sessions.keys().copied().collect();
             let d = Self::doc_for(&mut g, mdoc, profile, origin, script)?;
-            if !d.session.is_some_and(|s| live_ids.contains(&s)) {
+            if !live_ids.contains(&d.session) {
                 return Ok(Wait::NoExt);
             }
             let m = d.menus.entry(script.to_string()).or_default();
@@ -803,7 +826,7 @@ impl ExtHub {
                 let Some(d) = g.docs.get_mut(mdoc) else {
                     return Ok(Wait::NoExt);
                 };
-                if !d.session.is_some_and(|s| live_ids.contains(&s)) {
+                if !live_ids.contains(&d.session) {
                     return Ok(Wait::NoExt);
                 }
                 let Some(m) = d.menus.get_mut(script) else {
@@ -829,13 +852,15 @@ impl ExtHub {
     fn bound_doc<'a>(
         g: &'a mut Inner,
         session: u64,
+        store: &str,
         mdoc: &str,
     ) -> Result<&'a mut MenuDoc, ExtError> {
         if !g.sessions.contains_key(&session) {
             return Err(ExtError::Forbidden);
         }
         let d = g.docs.get_mut(mdoc).ok_or(ExtError::NotFound)?;
-        if d.session != Some(session) {
+        // Another container's page is as foreign as another browser's.
+        if d.session != session || d.store != store {
             return Err(ExtError::Forbidden);
         }
         d.touched = Instant::now();
@@ -843,14 +868,14 @@ impl ExtHub {
     }
 
     /// Commands and pending host grants of a document bound to `session`.
-    pub fn menu(&self, session: u64, mdoc: &str) -> Result<ExtMenuResponse, ExtError> {
+    pub fn menu(&self, session: u64, store: &str, mdoc: &str) -> Result<ExtMenuResponse, ExtError> {
         let mut g = self.inner.lock();
         let perms = g
             .sessions
             .get(&session)
             .map(|s| s.perms.clone())
             .unwrap_or_default();
-        let d = Self::bound_doc(&mut g, session, mdoc)?;
+        let d = Self::bound_doc(&mut g, session, store, mdoc)?;
         let mut out = ExtMenuResponse::default();
         for (sid, name) in &d.scripts {
             if let Some(m) = d.menus.get(sid) {
@@ -887,7 +912,7 @@ impl ExtHub {
                         .unwrap_or("");
                     let bare = h.strip_prefix("*.").unwrap_or(h);
                     let satisfied = if h.starts_with("*.") {
-                        perms.suffix_or_any(bare)
+                        perms.suffix_covers(bare)
                     } else {
                         perms.has(bare)
                     };
@@ -907,9 +932,14 @@ impl ExtHub {
     }
 
     /// Queue a command for the page; returns whether the page was waiting for it.
-    pub fn trigger(&self, session: u64, req: &ExtTriggerRequest) -> Result<bool, ExtError> {
+    pub fn trigger(
+        &self,
+        session: u64,
+        store: &str,
+        req: &ExtTriggerRequest,
+    ) -> Result<bool, ExtError> {
         let mut g = self.inner.lock();
-        let d = Self::bound_doc(&mut g, session, &req.mdoc)?;
+        let d = Self::bound_doc(&mut g, session, store, &req.mdoc)?;
         let m = d.menus.get_mut(&req.script).ok_or(ExtError::NotFound)?;
         if !m.cmds.iter().any(|c| c.id == req.cmd) {
             return Err(ExtError::NotFound);
@@ -947,16 +977,31 @@ impl ExtHub {
         else {
             return Route::Jar(Fallback::NoDocument);
         };
-        let Some(sid) = d.session else {
-            return Route::Jar(Fallback::Unbound);
-        };
+        let sid = d.session;
         let Some(s) = g.sessions.get(&sid) else {
             return Route::Jar(Fallback::Dead);
         };
+        // The relay's per-hop check runs in the proxy, so it works only on traffic the proxy
+        // decrypts; and a browser must not be pointed at local or private targets.
+        if is_local_target(host) {
+            return Route::Jar(Fallback::LocalTarget);
+        }
+        if self.ctx.get().is_none_or(|c| {
+            c.bypass.failsafe_active() || c.bypass.mode_of(host.trim_matches(['[', ']'])).is_some()
+        }) {
+            return Route::Jar(Fallback::Bypassed);
+        }
         if !s.perms.has(host) {
             return Route::Jar(Fallback::NoPermission);
         }
         Route::Ext(sid)
+    }
+
+    /// The cookie store token of document `mdoc` (empty: default store). The extension maps it
+    /// to the real store and relays with that store's cookies.
+    pub fn doc_store(&self, mdoc: Option<&str>) -> String {
+        mdoc.and_then(|m| self.inner.lock().docs.get(m).map(|d| d.store.clone()))
+            .unwrap_or_default()
     }
 
     /// Remember whether the last credentialed request of a script used the browser.
@@ -996,7 +1041,8 @@ impl ExtHub {
         let relay = rand_hex(16);
         meta["relay"] = serde_json::Value::String(relay.clone());
         meta["hasBody"] = serde_json::Value::Bool(upload.is_some());
-        let (etx, erx) = mpsc::channel(8);
+        let (etx, erx) = mpsc::channel(JOB_QUEUE);
+        let overflow = Arc::new(AtomicBool::new(false));
         let (job, tx) = {
             let mut g = self.inner.lock();
             let s = g
@@ -1011,11 +1057,12 @@ impl ExtHub {
                 job = job.wrapping_add(1);
             }
             s.next_job = job.wrapping_add(1);
-            s.jobs.insert(job, etx);
+            s.jobs.insert(job, (etx, overflow.clone()));
             let tx = s.tx.clone();
             g.relays.insert(
                 relay.clone(),
                 RelayInfo {
+                    session,
                     profile: profile.to_string(),
                     script: script.to_string(),
                     page_host: page_host.to_string(),
@@ -1064,6 +1111,7 @@ impl ExtHub {
         }
         Ok(JobHandle {
             rx: erx,
+            overflow,
             _guard: guard,
         })
     }
@@ -1078,19 +1126,45 @@ impl ExtHub {
         }
     }
 
-    /// Re-check one hop of a relayed request: the job is live and the hop passes the script's
-    /// stored `@connect`. `None` for an unknown relay token.
-    pub fn check_relay(&self, relay: &str, url: &url::Url) -> bool {
+    /// Re-check one hop of a relayed request (the browser follows redirects itself, so every
+    /// hop that goes through the proxy arrives here): the job is live, its session still holds a
+    /// host permission for the hop's host, the hop is not a local or private target, Argus is
+    /// decrypting it, and it passes the script's stored `@connect`. `false` for an unknown
+    /// relay token.
+    pub fn check_relay(
+        &self,
+        relay: &str,
+        url: &url::Url,
+        conn_session: Option<u64>,
+        conn_store: &str,
+    ) -> bool {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
         let (profile, script, page_host) = {
             let g = self.inner.lock();
-            match g.relays.get(relay) {
-                Some(r) => (r.profile.clone(), r.script.clone(), r.page_host.clone()),
-                None => return false,
+            let Some(r) = g.relays.get(relay) else {
+                return false;
+            };
+            // The hop must arrive on a connection that authenticated as the job's session.
+            if conn_session != Some(r.session) || !conn_store.is_empty() {
+                return false;
             }
+            let Some(s) = g.sessions.get(&r.session) else {
+                return false;
+            };
+            if !s.perms.has(&host) {
+                return false;
+            }
+            (r.profile.clone(), r.script.clone(), r.page_host.clone())
         };
+        if host.is_empty() || is_local_target(&host) {
+            return false;
+        }
         let Some(ctx) = self.ctx.get() else {
             return false;
         };
+        if ctx.bypass.failsafe_active() || ctx.bypass.mode_of(&host).is_some() {
+            return false;
+        }
         let idx = ctx.manager.index_for(&profile);
         let Some(cs) = idx.get(&script) else {
             return false;
@@ -1124,24 +1198,6 @@ impl ExtHub {
     }
 }
 
-impl Perms {
-    fn suffix_or_any(&self, bare: &str) -> bool {
-        if self.any {
-            return true;
-        }
-        let mut rest = bare;
-        loop {
-            if self.suffix.contains(rest) {
-                return true;
-            }
-            match rest.find('.') {
-                Some(i) => rest = &rest[i + 1..],
-                None => return false,
-            }
-        }
-    }
-}
-
 /// `(label, pattern)` host permissions a script's `@connect` list asks the user to grant.
 /// Wildcard `@connect *` and TLD wildcards are never offered.
 pub fn grant_patterns(connect: &[String], page_host: &str) -> Vec<(String, String)> {
@@ -1158,6 +1214,10 @@ pub fn grant_patterns(connect: &[String], page_host: &str) -> Vec<(String, Strin
             continue;
         }
         let bare = host.strip_prefix("*.").unwrap_or(&host);
+        // A public suffix (`com`, `co.uk`) is never offered: it would be a blanket grant.
+        if is_public_suffix(bare) {
+            continue;
+        }
         let pat = if bare == "localhost" || bare.parse::<std::net::IpAddr>().is_ok() {
             format!("*://{bare}/*")
         } else {
@@ -1173,7 +1233,16 @@ pub fn grant_patterns(connect: &[String], page_host: &str) -> Vec<(String, Strin
 /// An in-flight job: the answers arrive on `rx`; dropping it cancels the job.
 pub struct JobHandle {
     pub rx: mpsc::Receiver<JobEvent>,
+    overflow: Arc<AtomicBool>,
     _guard: JobGuard,
+}
+
+impl JobHandle {
+    /// The job was failed because its queue filled up (the page read too slowly): its
+    /// receiver ends without an `End`.
+    pub fn overflowed(&self) -> bool {
+        self.overflow.load(Ordering::Acquire)
+    }
 }
 
 struct JobGuard {
@@ -1189,15 +1258,11 @@ impl Drop for JobGuard {
     }
 }
 
-/// Take both bridge headers off a request's header map; returns `(session sid, relay token)`.
-/// Called for every request the proxy is about to forward: neither header may ever leave.
-/// (`HeaderMap::remove` drops every value of the name.)
-pub fn take_headers(h: &mut hyper::HeaderMap) -> (Option<String>, Option<String>) {
-    let sid = h
-        .remove(SESSION_HEADER)
-        .and_then(|v| v.to_str().ok().map(str::to_string));
-    let relay = h
-        .remove(RELAY_HEADER)
-        .and_then(|v| v.to_str().ok().map(str::to_string));
-    (sid, relay)
+/// Take the relay header off a request's header map and return its value. Called for every
+/// request the proxy is about to forward: it may never leave. (`HeaderMap::remove` drops every
+/// value of the name.) The session is never read from a header: it comes from the
+/// authenticated connection of the extension's own listener.
+pub fn take_headers(h: &mut hyper::HeaderMap) -> Option<String> {
+    h.remove(RELAY_HEADER)
+        .and_then(|v| v.to_str().ok().map(str::to_string))
 }

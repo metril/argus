@@ -142,6 +142,11 @@ pub struct ProxySettings {
     /// proxy configuration on the client). Off when unset. Linux only.
     #[serde(default)]
     pub transparent_port: Option<u16>,
+    /// Optional listener for the Argus browser extension (proxy authentication binds a browser to
+    /// its extension session; see `docs/USERSCRIPT-PROTOCOL.md` section 8). Off when unset. It
+    /// answers `407` to anything without the extension's credentials; bound to `proxy.host`.
+    #[serde(default)]
+    pub ext_port: Option<u16>,
     /// Settings of the explicit-proxy listener (`[proxy.explicit]`). A key left out falls back
     /// to the global setting (`mitm.enabled`, `proxy.enable_http2`, `proxy.enable_websockets`,
     /// `adblock.enabled`).
@@ -502,6 +507,7 @@ impl Default for ProxyConfig {
                 port: 8080,
                 enable_http2: true,
                 transparent_port: None,
+                ext_port: None,
                 explicit: ListenerOverrides::default(),
                 transparent: ListenerOverrides::default(),
                 tls_passthrough_hosts: Vec::new(),
@@ -614,6 +620,13 @@ impl ProxyConfig {
                 .expect("table")
                 .insert("transparent_port".into(), toml::Value::Integer(0));
         }
+        if base_effective.proxy.ext_port.is_some() && self.proxy.ext_port.is_none() {
+            diff.entry("proxy")
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .expect("table")
+                .insert("ext_port".into(), toml::Value::Integer(0));
+        }
         let text = format!(
             "# Settings saved from the web UI; they override the base config file.\n{}",
             toml::to_string_pretty(&diff).map_err(|e| ConfigError::Serialize(e.to_string()))?
@@ -637,6 +650,9 @@ impl ProxyConfig {
         // `0` means off (the overlay's spelling of "unset").
         if cfg.proxy.transparent_port == Some(0) {
             cfg.proxy.transparent_port = None;
+        }
+        if cfg.proxy.ext_port == Some(0) {
+            cfg.proxy.ext_port = None;
         }
         Ok(cfg)
     }

@@ -193,7 +193,7 @@ pub struct DocPlan {
     /// Some script adds styles (`GM_addStyle`, `@unwrap`): needs the style nonce.
     pub style: bool,
     /// Public document id (`Server-Timing: argus;desc="<mdoc>"`).
-    pub mdoc: String,
+    pub mdoc: Option<String>,
     /// The document is bound to a live extension session: no in-page menu button.
     pub ext_bound: bool,
 }
@@ -437,6 +437,7 @@ impl GmHost {
         origin: &str,
         anonymous: bool,
         download: bool,
+        manual_redirect: bool,
         mdoc: Option<&str>,
         host: &str,
     ) -> Route {
@@ -445,6 +446,9 @@ impl GmHost {
         }
         if !script.browser_cookies {
             return Route::Jar(crate::ext_bridge::Fallback::NotApproved);
+        }
+        if manual_redirect {
+            return Route::Jar(crate::ext_bridge::Fallback::ManualRedirect);
         }
         let r = self.ext.route(mdoc, profile, origin, &script.id, host);
         self.ext
@@ -523,7 +527,7 @@ impl GmHost {
         origin: &str,
         is_top_frame: bool,
     ) -> Option<DocPlan> {
-        self.plan_document_bound(index, profile, host, url, origin, is_top_frame, None)
+        self.plan_document_bound(index, profile, host, url, origin, is_top_frame, None, "")
     }
 
     /// [`Self::plan_document_in`] for a document the request header bound to extension session
@@ -538,6 +542,7 @@ impl GmHost {
         origin: &str,
         is_top_frame: bool,
         ext_session: Option<u64>,
+        store: &str,
     ) -> Option<DocPlan> {
         let guard = index;
         if guard.is_empty() {
@@ -563,8 +568,10 @@ impl GmHost {
             .iter()
             .map(|c| (c.script.id.clone(), c.script.metadata.name.clone()))
             .collect();
-        let mdoc = self.ext.register_doc(profile, origin, names, ext_session);
-        let ext_bound = ext_session.is_some();
+        // Only a document bound to a live extension session gets a record and a public id;
+        // every other page behaves exactly as without the bridge.
+        let mdoc = ext_session.map(|s| self.ext.register_doc(profile, origin, names, s, store));
+        let ext_bound = mdoc.is_some();
         let doc = Doc {
             index: Arc::clone(guard),
             fetched: vec![false; ids.len()],
@@ -574,7 +581,7 @@ impl GmHost {
             origin: origin.to_string(),
             top: is_top_frame,
             created: Instant::now(),
-            mdoc: ext_bound.then(|| mdoc.clone()),
+            mdoc: mdoc.clone(),
         };
         let n = doc.ids.len();
         let id = self.docs.insert(doc);
@@ -1017,6 +1024,7 @@ impl GmHost {
                 &a.origin,
                 false,
                 false,
+                false,
                 mdoc.as_deref(),
                 &host,
             ) {
@@ -1027,6 +1035,7 @@ impl GmHost {
                     let connect = connect_spec(s, &a.page_host);
                     let meta = json!({
                         "op": "cookie", "script": a.id, "connect": connect, "cookie": req,
+                        "store": self.ext.doc_store(mdoc.as_deref()),
                     });
                     self.ext.audit_relay(session, &a.id, &host, "", "cookie");
                     let mut h = self
@@ -1134,6 +1143,7 @@ impl GmHost {
         session: u64,
         held: Held,
         upload: Option<Upload>,
+        store: String,
     ) -> Response<ProxyBody> {
         let s = a.script();
         // Headers a page cannot set in a browser fetch (Cookie, Origin, Host) are dropped: the
@@ -1144,7 +1154,7 @@ impl GmHost {
             .filter(|(n, _)| {
                 !matches!(
                     n.to_ascii_lowercase().as_str(),
-                    "cookie" | "origin" | "host" | "x-argus-relay" | "x-argus-ext"
+                    "cookie" | "origin" | "host" | "x-argus-relay" | "proxy-authorization"
                 )
             })
             .map(|(n, v)| [n.as_str(), v.as_str()])
@@ -1164,6 +1174,7 @@ impl GmHost {
             "headers": headers,
             "redirect": redirect,
             "timeout": out.timeout.as_millis() as u64,
+            "store": store,
         });
         self.ext
             .audit_relay(session, &a.id, &host, &out.method, "xhr");
@@ -1190,7 +1201,8 @@ impl GmHost {
                         return;
                     }
                     Ok(None) => {
-                        yield Ok(Frame::data(err_frame("network", "network", "extension disconnected")));
+                        let why = if handle.overflowed() { "response not read fast enough" } else { "extension disconnected" };
+                        yield Ok(Frame::data(err_frame("network", "network", why)));
                         return;
                     }
                     Ok(Some(JobEvent::Head(b))) => {
@@ -1331,11 +1343,21 @@ impl GmHost {
                 &a.origin,
                 meta.anonymous,
                 meta.op == "download",
+                out.redirect == Redirect::Manual,
                 meta.mdoc.as_deref(),
                 &host,
             ) {
                 Route::Ext(session) => {
-                    return self.run_relayed(a, out, session, held, upload).await;
+                    return self
+                        .run_relayed(
+                            a,
+                            out,
+                            session,
+                            held,
+                            upload,
+                            self.ext.doc_store(meta.mdoc.as_deref()),
+                        )
+                        .await;
                 }
                 Route::Jar(why) => {
                     tracing::debug!("xhr of {} used the jar: {why:?}", a.id);

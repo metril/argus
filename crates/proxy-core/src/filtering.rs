@@ -680,7 +680,7 @@ impl ProxyContext {
         let mut headers = parts.headers;
         // The extension bridge's headers never leave: the session secret and the relay token
         // are read here and removed from the request.
-        let (ext_sid, relay) = crate::ext_bridge::take_headers(&mut headers);
+        let relay = crate::ext_bridge::take_headers(&mut headers);
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -704,8 +704,14 @@ impl ProxyContext {
         // hop arrives here). Like the proxy's own GM requests it is not filtered.
         let mut bypass_full = bypass_full;
         if let Some(r) = relay.as_deref() {
-            let allowed =
-                reqwest::Url::parse(&url).is_ok_and(|u| self.internal.gm.ext().check_relay(r, &u));
+            let allowed = reqwest::Url::parse(&url).is_ok_and(|u| {
+                self.internal.gm.ext().check_relay(
+                    r,
+                    &u,
+                    rctx.ext,
+                    rctx.ext_store.as_deref().unwrap_or(""),
+                )
+            });
             if !allowed {
                 debug!("Refused a relayed request for {host}");
                 return Ok(Response::builder()
@@ -1158,10 +1164,12 @@ impl ProxyContext {
                         if idx.is_empty() {
                             return None; // zero cost: no allocation, no probe
                         }
-                        // Bound to the extension session whose secret the browser sent, if any.
-                        let session = ext_sid
-                            .as_deref()
-                            .and_then(|s| self.internal.gm.ext().bind(s, &prof.name));
+                        // Bound to the extension session this connection authenticated as
+                        // on the extension listener, if any (never from a header).
+                        let session = rctx
+                            .ext
+                            .filter(|s| self.internal.gm.ext().allows(*s, &prof.name));
+                        let store = rctx.ext_store.as_deref().unwrap_or("");
                         self.internal.gm.plan_document_bound(
                             &idx,
                             &prof.name,
@@ -1170,10 +1178,11 @@ impl ProxyContext {
                             &origin_of(scheme, &url_host, port),
                             rtype != RequestType::Subdocument,
                             session,
+                            store,
                         )
                     })
                 };
-                server_timing = us.as_ref().map(|p| p.mdoc.clone());
+                server_timing = us.as_ref().and_then(|p| p.mdoc.clone());
                 let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
                 let panel_key = if enabled && !blocks_scripts {
                     self.internal.panel.hotkey(rctx)

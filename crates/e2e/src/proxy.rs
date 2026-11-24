@@ -102,6 +102,8 @@ pub struct TestProxy {
     /// The proxy's connection admission (counters for accepted/rejected connections).
     pub load_manager: Arc<proxy_core::load_manager::LoadManager>,
     shutdown: broadcast::Sender<()>,
+    control: Arc<proxy_core::server::ProxyControl>,
+    ext_addr: Mutex<Option<SocketAddr>>,
     dir: Option<tempfile::TempDir>,
     userscripts: Mutex<Option<Arc<userscript_engine::UserscriptManager>>>,
     script: Mutex<Option<ScriptHandles>>,
@@ -257,6 +259,7 @@ impl TestProxy {
                 port: 0,
                 enable_http2: true,
                 transparent_port: (mode == EntryMode::Transparent).then_some(0),
+                ext_port: None,
                 tls_passthrough_hosts: passthrough.iter().map(|s| s.to_string()).collect(),
                 block_private_destinations: false,
                 allowed_destinations: Vec::new(),
@@ -325,6 +328,7 @@ impl TestProxy {
             .with_original_dst(dst.clone());
         let mitm = server.mitm_handler().cloned();
         let load_manager = server.load_manager().clone();
+        let control = server.control();
         let ca_pem = std::fs::read(&ca_cert_path).map_err(|e| e.to_string())?;
 
         // Bind and keep the listener: connections queue in the backlog until `serve` accepts, so
@@ -360,11 +364,36 @@ impl TestProxy {
             ctx,
             load_manager,
             shutdown,
+            control,
+            ext_addr: Mutex::new(None),
             dir: Some(dir),
             userscripts: Mutex::new(None),
             script: Mutex::new(None),
             profiles: Mutex::new(None),
         })
+    }
+
+    /// The extension-only listener (started on first use, on an ephemeral loopback port).
+    pub async fn ext_addr(&self) -> SocketAddr {
+        if let Some(a) = *self.ext_addr.lock() {
+            return a;
+        }
+        let mut last = String::new();
+        for _ in 0..100 {
+            match self.control.rebind_ext("127.0.0.1", Some(0)).await {
+                Ok(()) => break,
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let msg: serde_json::Value =
+            serde_json::from_str(&self.ctx.internal().gm.ext().proxy_msg()).expect("proxy msg");
+        let port = msg["port"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no ext listener: {last}"));
+        let a = SocketAddr::from(([127, 0, 0, 1], port as u16));
+        *self.ext_addr.lock() = Some(a);
+        a
     }
 
     /// The listener a client of this entry mode dials directly (explicit proxy port, or the

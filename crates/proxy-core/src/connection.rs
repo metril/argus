@@ -127,6 +127,55 @@ impl ConnectionHandler {
         }
     }
 
+    /// Mark the connection as accepted on the extension-only listener: it must authenticate as a
+    /// live extension session (`407` otherwise) and is bound to that session.
+    pub fn on_ext_listener(self) -> Self {
+        self.conn.mark_ext_listener();
+        self
+    }
+
+    fn ext_hub(&self) -> &Arc<crate::ext_bridge::ExtHub> {
+        self.shared.ctx.internal().gm.ext()
+    }
+
+    /// Resolves when the extension session this connection authenticated as is gone (never
+    /// before it authenticated: that needs a request, and an unauthenticated connection gets a
+    /// `407` and is closed).
+    pub async fn ext_session_closed(&self) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if self
+                .conn
+                .ext_session()
+                .is_some_and(|s| !self.ext_hub().is_live(s))
+            {
+                return;
+            }
+        }
+    }
+
+    /// Authenticate `Proxy-Authorization` as an extension session and bind the connection.
+    /// `false`: no valid credentials (the caller answers `407`).
+    fn ext_authenticate(&self, auth: Option<&[u8]>) -> bool {
+        if let Some(s) = self.conn.ext_session() {
+            return self.ext_hub().is_live(s);
+        }
+        let Some((sid, store)) = auth.and_then(ext_creds_from_proxy_auth) else {
+            return false;
+        };
+        let hub = self.ext_hub();
+        let Some(session) = hub.authenticate(&sid) else {
+            return false;
+        };
+        self.conn.set_ext(
+            self.shared.ctx.profiles(),
+            session,
+            &store,
+            hub.pinned_profile(session),
+        );
+        true
+    }
+
     /// A handler for a connection accepted by the listener owning `flags`.
     pub fn with_listener(
         client_addr: SocketAddr,
@@ -263,8 +312,11 @@ impl ConnectionHandler {
         }
 
         if !buf.starts_with(b"CONNECT ") {
-            // Plain proxy request: its first request may carry the device token.
-            self.conn.await_token();
+            // Plain proxy request: its first request may carry the device token. (On the
+            // extension listener it carries the session credentials, checked per request.)
+            if !self.conn.is_ext_listener() {
+                self.conn.await_token();
+            }
             return Ok(Entry::PlainHttp(Prefixed::new(buf, stream)));
         }
 
@@ -281,15 +333,26 @@ impl ConnectionHandler {
                 return Err(e);
             }
         };
+        // The extension listener: only a live session's credentials in the CONNECT head open
+        // a tunnel; everything inside it is bound to that session.
+        if self.conn.is_ext_listener() && !self.ext_authenticate(proxy_auth_value(&buf[..head_len]))
+        {
+            let _ = stream.write_all(EXT_AUTH_REQUIRED_RAW).await;
+            return Err(Error::Connection(format!(
+                "extension credentials required from {}",
+                self.client_addr
+            )));
+        }
         // Device token: only the CONNECT head decides; nothing inside the tunnel can.
         let profiles = self.shared.ctx.profiles();
-        let digest =
-            proxy_auth_value(&buf[..head_len]).and_then(crate::profiles::digest_from_proxy_auth);
+        let digest = proxy_auth_value(&buf[..head_len])
+            .and_then(crate::profiles::digest_from_proxy_auth)
+            .filter(|_| !self.conn.is_ext_listener());
         let known = digest.is_some_and(|d| ConnCtx::token_known(profiles, &d));
         if let Some(d) = digest {
             self.conn.set_token(profiles, d);
         }
-        if self.shared.ctx.require_device_token() && !known {
+        if self.shared.ctx.require_device_token() && !known && !self.conn.is_ext_listener() {
             let _ = stream.write_all(PROXY_AUTH_REQUIRED_RAW).await;
             return Err(Error::Connection(format!(
                 "device token required from {}",
@@ -568,6 +631,40 @@ impl ConnectionHandler {
     }
 }
 
+const EXT_AUTH_REQUIRED_RAW: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"argus-ext\"\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+
+fn ext_auth_required() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header("proxy-authenticate", "Basic realm=\"argus-ext\"")
+        .header("connection", "close")
+        .body(full_body(Bytes::new()))
+        .expect("static response")
+}
+
+/// `(sid, store token)` of `Proxy-Authorization: Basic base64("ext:" + sid [+ ":" + store])`. The
+/// store token is opaque (a Firefox container or private window; empty for the default store).
+fn ext_creds_from_proxy_auth(value: &[u8]) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let v = value.trim_ascii();
+    let rest = v
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case(b"basic "))
+        .map(|_| v[6..].trim_ascii())?;
+    if rest.len() > 128 {
+        return None;
+    }
+    let mut buf = [0u8; 96];
+    let n = base64::engine::general_purpose::STANDARD
+        .decode_slice(rest, &mut buf)
+        .ok()?;
+    let creds = std::str::from_utf8(&buf[..n]).ok()?;
+    let rest = creds.strip_prefix("ext:")?;
+    let (sid, store) = rest.split_once(':').unwrap_or((rest, ""));
+    (store.len() <= 40 && store.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| (sid.to_string(), store.to_string()))
+}
+
 const PROXY_AUTH_REQUIRED_RAW: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nproxy-authenticate: Basic realm=\"argus\"\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
 
 fn proxy_auth_required() -> Response<ProxyBody> {
@@ -606,7 +703,25 @@ async fn handle_request(
     origin: Origin,
 ) -> Result<Response<ProxyBody>> {
     let profiles = shared.ctx.profiles();
-    let require = shared.ctx.require_device_token();
+    let require = shared.ctx.require_device_token() && !conn.is_ext_listener();
+    // The extension listener: the connection must be (or become, with this request's
+    // credentials) bound to a live extension session. Nothing else is served.
+    if conn.is_ext_listener() {
+        let hub = shared.ctx.internal().gm.ext();
+        let ok = match conn.ext_session() {
+            Some(s) => hub.is_live(s),
+            None => req
+                .headers()
+                .get(hyper::header::PROXY_AUTHORIZATION)
+                .and_then(|v| ext_creds_from_proxy_auth(v.as_bytes()))
+                .and_then(|(sid, store)| hub.authenticate(&sid).map(|s| (s, store)))
+                .map(|(s, store)| conn.set_ext(profiles, s, &store, hub.pinned_profile(s)))
+                .is_some(),
+        };
+        if !ok {
+            return Ok(ext_auth_required());
+        }
+    }
     // Plain proxy connections: the first request's `Proxy-Authorization` picks the device. It is
     // never read again, and never on a decrypted (tunnelled) connection.
     if conn.take_awaiting() {

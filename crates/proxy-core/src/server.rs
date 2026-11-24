@@ -158,6 +158,10 @@ pub struct ProxyControl {
     /// Switches of each listener, shared with its connections.
     explicit_flags: Arc<crate::listener_flags::ListenerFlags>,
     transparent_flags: Arc<crate::listener_flags::ListenerFlags>,
+    /// Switches of the extension listener (the explicit listener's values).
+    ext_flags: Arc<crate::listener_flags::ListenerFlags>,
+    /// The extension-only listener (see [`Self::rebind_ext`]).
+    ext: tokio::sync::Mutex<Option<Listener>>,
     /// Live time limits, shared with every connection.
     timeouts: Arc<ArcSwap<Timeouts>>,
     /// Set once the server runs: what a lazy MITM / WebSocket enable installs into.
@@ -321,6 +325,7 @@ impl ProxyControl {
         self.acl.store(Arc::new(acl));
         self.explicit_flags.set(config.listener_flags(false));
         self.transparent_flags.set(config.listener_flags(true));
+        self.ext_flags.set(config.listener_flags(false));
         {
             let mut cur = self.dns_cfg.lock();
             if format!("{:?}", *cur) != format!("{:?}", config.dns) {
@@ -639,6 +644,72 @@ impl ProxyControl {
         Ok(run.info())
     }
 
+    /// Move the extension-only listener to `host:port` (`None` = off) without a restart. The new
+    /// socket is bound first; on failure nothing changes. The listener answers `407` to anything
+    /// without a live extension session's credentials; sessions learn the new port at once.
+    pub async fn rebind_ext(self: &Arc<Self>, host: &str, port: Option<u16>) -> Result<()> {
+        let hub = self.ctx.internal().gm.ext().clone();
+        let run = self.running.lock().await;
+        let run = run
+            .as_ref()
+            .ok_or_else(|| Error::Connection("proxy is not running".into()))?;
+        let mut cur = self.ext.lock().await;
+        let want = port.map(|p| (host.to_string(), p));
+        let same = match (&*cur, &want) {
+            (None, None) => true,
+            (Some(l), Some(w)) => w.1 != 0 && !l.down && &l.requested == w,
+            _ => false,
+        };
+        if same {
+            return Ok(());
+        }
+        let mut new = None;
+        if let Some((h, p)) = &want {
+            // Same port, other host: the old socket must go first.
+            if let Some(l) = cur.as_mut().filter(|l| *p != 0 && l.addr.port() == *p) {
+                l.close().await;
+            }
+            let a = spec_addr(h, *p);
+            let l = TcpListener::bind(&a).await.map_err(|e| {
+                Error::Connection(format!("cannot bind extension listener to {a}: {e}"))
+            })?;
+            new = Some(l);
+        }
+        let old = cur.take();
+        let (adv_host, adv_port) = match new {
+            Some(l) => {
+                let lst = self.spawn_listener_kind(
+                    l,
+                    run.shared.clone(),
+                    None,
+                    &run.shutdown_tx,
+                    want.clone().expect("want"),
+                    true,
+                );
+                let ip = lst.addr.ip();
+                let h = (!ip.is_unspecified()).then(|| ip.to_string());
+                let p = lst.addr.port();
+                *cur = Some(lst);
+                (h, p)
+            }
+            None => (None, 0),
+        };
+        if let Some(o) = old {
+            tokio::spawn(o.stop());
+        }
+        drop(cur);
+        hub.set_proxy(adv_host, adv_port);
+        info!(
+            "Extension listener {}",
+            if adv_port == 0 {
+                "off".to_string()
+            } else {
+                format!("on port {adv_port}")
+            }
+        );
+        Ok(())
+    }
+
     /// Start an accept loop on `listener`.
     fn spawn_listener(
         self: &Arc<Self>,
@@ -648,6 +719,19 @@ impl ProxyControl {
         shutdown_tx: &broadcast::Sender<()>,
         requested: (String, u16),
     ) -> Listener {
+        self.spawn_listener_kind(listener, shared, entry, shutdown_tx, requested, false)
+    }
+
+    /// [`Self::spawn_listener`]; `ext` makes it the extension-only listener.
+    fn spawn_listener_kind(
+        self: &Arc<Self>,
+        listener: TcpListener,
+        shared: Arc<ConnectionShared>,
+        entry: Option<Arc<TransparentEntry>>,
+        shutdown_tx: &broadcast::Sender<()>,
+        requested: (String, u16),
+        ext: bool,
+    ) -> Listener {
         let addr = listener
             .local_addr()
             .unwrap_or(SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -655,7 +739,7 @@ impl ProxyControl {
         let this = self.clone();
         let shutdown_tx = shutdown_tx.clone();
         let task = tokio::spawn(async move {
-            this.accept_loop(listener, shared, entry, &shutdown_tx, stop_rx)
+            this.accept_loop(listener, shared, entry, &shutdown_tx, stop_rx, ext)
                 .await
         });
         Listener {
@@ -677,10 +761,13 @@ impl ProxyControl {
         entry: Option<Arc<TransparentEntry>>,
         shutdown_tx: &broadcast::Sender<()>,
         mut stop: tokio::sync::oneshot::Receiver<()>,
+        ext: bool,
     ) {
         let mut main_shutdown_rx = shutdown_tx.subscribe();
         let transparent = entry.is_some();
-        let flags = if transparent {
+        let flags = if ext {
+            self.ext_flags.clone()
+        } else if transparent {
             self.transparent_flags.clone()
         } else {
             self.explicit_flags.clone()
@@ -719,8 +806,16 @@ impl ProxyControl {
                             // counted it, and the guard releases it even if the task never runs.
                             spawn_admitted(&self.load_manager, async move {
                                 let _active = active;
-                                let handler = ConnectionHandler::with_listener(client_addr, shared, flags, transparent);
+                                let mut handler = ConnectionHandler::with_listener(client_addr, shared, flags, transparent);
+                                if ext {
+                                    handler = handler.on_ext_listener();
+                                }
                                 tokio::select! {
+                                    // The extension's session ended (closed or revoked): its
+                                    // tunnels and keep-alive connections end with it.
+                                    _ = handler.ext_session_closed(), if ext => {
+                                        debug!("Extension connection from {} closed with its session", client_addr);
+                                    }
                                     result = async {
                                         match &entry {
                                             Some(entry) => entry.handle(&handler, stream).await,
@@ -843,6 +938,10 @@ impl ProxyServer {
             transparent_flags: Arc::new(crate::listener_flags::ListenerFlags::new(
                 config.listener_flags(true),
             )),
+            ext_flags: Arc::new(crate::listener_flags::ListenerFlags::new(
+                config.listener_flags(false),
+            )),
+            ext: tokio::sync::Mutex::new(None),
             timeouts: Arc::new(ArcSwap::from_pointee(Timeouts::from_config(
                 &config.performance,
             ))),
@@ -1054,6 +1153,7 @@ impl ProxyServer {
             }
         });
         ctl.publish_own(&explicit, transparent.as_ref());
+        let ext_port = self.config.proxy.ext_port;
         *ctl.running.lock().await = Some(Running {
             shared,
             shutdown_tx: shutdown_tx.clone(),
@@ -1062,8 +1162,17 @@ impl ProxyServer {
             entry,
         });
 
+        if let Some(p) = ext_port {
+            if let Err(e) = ctl.rebind_ext(&cfg_host, Some(p)).await {
+                warn!("Extension listener is NOT listening: {e}");
+            }
+        }
+
         // Serve until shutdown; rebinds replace the loops in `running` meanwhile.
         let _ = shutdown_rx.recv().await;
+        if let Some(l) = ctl.ext.lock().await.take() {
+            l.stop().await;
+        }
         if let Some(run) = ctl.running.lock().await.take() {
             run.explicit.stop().await;
             if let Some(t) = run.transparent {
