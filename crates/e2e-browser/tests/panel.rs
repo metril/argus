@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use api_types::ExtIdent;
 use chromiumoxide::cdp::browser_protocol::emulation::{
     SetDeviceMetricsOverrideParams, SetTouchEmulationEnabledParams,
 };
@@ -11,6 +12,7 @@ use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
 };
+use chromiumoxide::cdp::browser_protocol::network::{Headers, SetExtraHttpHeadersParams};
 use e2e_browser::{eval_on, run_known, MockResponse, Session};
 use proxy_core::panel::{PanelConfig, SiteBlocking};
 use script_policy::panel::{hash_pin, PanelAuth, PanelSettings};
@@ -543,6 +545,8 @@ panel_test!(
             .await;
         let badge = "window.__spy.at(0).querySelector('[data-k=badge]')";
         let expanded = format!("{badge}.getAttribute('aria-expanded')");
+        // A fresh badge ignores clicks for 300 ms.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         // A script-made click is untrusted and does nothing.
         s.eval(&format!("{badge}.click()")).await;
         assert_eq!(s.eval(&expanded).await, "false");
@@ -619,6 +623,7 @@ panel_test!(
         let expanded = format!("{badge}.getAttribute('aria-expanded')");
         let (x, y) = center(&s, badge).await;
         assert!(x > 300.0 && y > 700.0, "badge in the bottom right: {x},{y}");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         mouse_click(&s, x, y).await;
         s.wait_for("the menu", &format!("{expanded} === 'true'"))
             .await;
@@ -673,3 +678,99 @@ panel_test!(keyboard_only_operation, PanelAuth::Pin, |s, _sites| {
     );
     let _ = Scope::Global;
 });
+
+/// A fake extension: one live session on the hub, its `sid` sent with every request of the page
+/// (what the extension's header rule does for document requests).
+async fn bind_browser(s: &Session) -> (u64, String) {
+    let hub = s.proxy.ctx.internal().gm.ext().clone();
+    let (sess, sid, rx) = hub.open(ExtIdent {
+        token_id: "t".into(),
+        user: "u".into(),
+        profiles: None,
+    });
+    // Keep the frame queue open for the life of the test.
+    std::mem::forget(rx);
+    s.page
+        .execute(SetExtraHttpHeadersParams::new(Headers::new(
+            serde_json::json!({ "x-argus-ext": sid }),
+        )))
+        .await
+        .unwrap();
+    (sess, sid)
+}
+
+// With a connected extension session bound to the document the in-page button is not mounted, the
+// commands are synced to the proxy and triggered from the (fake) popup through the long poll, and
+// when the session goes away the page falls back to its own button.
+panel_test!(
+    bound_document_has_no_badge_runs_triggered_commands_and_falls_back,
+    PanelAuth::Pin,
+    |s, _sites| {
+        install_two_command_scripts(&s);
+        routes(&s, "");
+        let (sess, _sid) = bind_browser(&s).await;
+        s.goto(&s.url("sp.test", "/")).await;
+        let mdoc = s
+            .eval("performance.getEntriesByType('navigation')[0].serverTiming.find(e => e.name === 'argus').description")
+            .await
+            .as_str()
+            .expect("Server-Timing mdoc")
+            .to_string();
+        let hub = s.proxy.ctx.internal().gm.ext().clone();
+        // both scripts synced their command
+        let mut n = 0;
+        for _ in 0..200 {
+            n = hub.menu(sess, &mdoc).map(|m| m.commands.len()).unwrap_or(0);
+            if n == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(n, 2, "commands synced");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            s.eval("(window.__spy || []).length").await,
+            0,
+            "no badge for a bound document"
+        );
+        // the popup triggers the first script's command; the runtime runs it from its closure
+        let m = hub.menu(sess, &mdoc).unwrap();
+        let c = m.commands.iter().find(|c| c.name == "One command").unwrap();
+        let req = api_types::ExtTriggerRequest {
+            mdoc: mdoc.clone(),
+            script: c.script.clone(),
+            cmd: c.cmd.clone(),
+        };
+        for _ in 0..100 {
+            let _ = hub.trigger(sess, &req);
+            if s.eval("window.__c1 === 1").await == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(s.eval("window.__c1").await, 1);
+        // the page itself cannot see commands or the registry
+        assert_eq!(
+            s.eval("typeof window[Symbol.for('adblock.userscript.menu')]")
+                .await,
+            "undefined"
+        );
+        // the session ends: the runtime is told and mounts its own button
+        hub.close(sess);
+        s.wait_for("the fallback badge", "(window.__spy || []).length > 0")
+            .await;
+    }
+);
+
+// A page opened without the extension (no session header) keeps the badge as before.
+panel_test!(
+    unbound_document_keeps_the_badge,
+    PanelAuth::Pin,
+    |s, _sites| {
+        install_two_command_scripts(&s);
+        routes(&s, "");
+        s.goto(&s.url("sp.test", "/")).await;
+        s.wait_for("the badge", "(window.__spy || []).length > 0")
+            .await;
+    }
+);

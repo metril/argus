@@ -1168,7 +1168,7 @@ impl GmHost {
         self.ext
             .audit_relay(session, &a.id, &host, &out.method, "xhr");
         let rx = upload.map(|u| u.rx);
-        let mut handle = match self
+        let handle = match self
             .ext
             .dispatch(session, meta, &a.profile, &a.id, &a.page_host, rx)
             .await

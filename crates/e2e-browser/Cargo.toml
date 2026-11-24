@@ -16,6 +16,7 @@ futures-util = { workspace = true }
 chromiumoxide = { version = "0.9", default-features = false }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+api-types = { workspace = true }
 x509-parser = "0.18"
 sha2 = { workspace = true }
 base64 = "0.22"
