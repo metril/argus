@@ -1,5 +1,6 @@
 import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
 import { Bridge } from '../lib/bridge';
+import { respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
 import { StoreRelay } from '../lib/storerelay';
 
@@ -84,7 +85,7 @@ export default defineBackground(() => {
     );
   }
 
-  browser.runtime.onMessage.addListener((msg: { type?: string; tabId?: number }, sender: { id?: string }) => {
+  browser.runtime.onMessage.addListener(respondAsync((msg: { type?: string; tabId?: number }, sender: { id?: string }) => {
     if (msg?.type === 'interception' && msg.tabId !== undefined) {
       return Promise.resolve((intercepted.get(msg.tabId) ?? 'unknown') as Interception);
     }
@@ -100,5 +101,5 @@ export default defineBackground(() => {
       return Promise.resolve(bridge.status());
     }
     return undefined;
-  });
+  }));
 });
