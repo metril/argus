@@ -33,6 +33,12 @@ class CSD {
   getPropertyValue(k) { const x = this.v[k]; return x === undefined ? "" : x; }
 }
 class SS { replaceSync(c) { this.css = c; } }
+class Rect {
+  constructor(r) { this.r = r; }
+  get width() { return this.r.width; } get height() { return this.r.height; }
+  get left() { return this.r.left; } get top() { return this.r.top; }
+  get right() { return this.r.right; } get bottom() { return this.r.bottom; }
+}
 class ET {
   addEventListener(t, f) { const m = this.l || (this.l = nul()); const a = m[t] || (m[t] = mkList()); lpush(a, f); }
 }
@@ -74,7 +80,7 @@ class El extends Nd {
   showPopover() { this.popped = (this.popped || 0) + 1; }
   hidePopover() { this.hid = (this.hid || 0) + 1; }
   focus() { this.focused = true; }
-  getBoundingClientRect() { return this.rect || { width: 28, height: 28, left: 984, top: 728, right: 1012, bottom: 756 }; }
+  getBoundingClientRect() { return new Rect(this.rect || { width: 28, height: 28, left: 984, top: 728, right: 1012, bottom: 756 }); }
 }
 class N extends El {
   constructor(tag) { super(); this.tag = tag; this.at = nul(); this.sx = new CSD(); this.popped = 0; this.cw = 0; this.chh = 0; }
@@ -96,7 +102,7 @@ function page(mode) {
   const root = new N("html");
   root.cw = 1024; root.chh = 768;
   const W = env.W;
-  Object.assign(W, { EventTarget: ET, Node: Nd, Element: El, HTMLElement: El, ShadowRoot: SR, CSSStyleDeclaration: CSD, CSSStyleSheet: SS, Event: TEvent, KeyboardEvent: KEvent, MouseEvent: MEvent });
+  Object.assign(W, { EventTarget: ET, Node: Nd, Element: El, HTMLElement: El, ShadowRoot: SR, CSSStyleDeclaration: CSD, CSSStyleSheet: SS, DOMRectReadOnly: Rect, Event: TEvent, KeyboardEvent: KEvent, MouseEvent: MEvent });
   W.Document.prototype.createElement = (t) => new N(t);
   W.Document.prototype.elementsFromPoint = () => env.hits();
   Object.defineProperty(W.Document.prototype, "documentElement", { get() { return this.__root; }, set() {}, configurable: true });
@@ -110,7 +116,7 @@ function page(mode) {
   env.timers = [];
   W.setTimeout = (f, ms) => env.timers.push([f, ms]);
   const mos = [];
-  W.MutationObserver = class { constructor(cb) { this.cb = cb; this.targets = []; this.opts = []; mos.push(this); } observe(t, o) { this.targets.push(t); this.opts.push(o); } };
+  env.MO = W.MutationObserver = class { constructor(cb) { this.cb = cb; this.targets = []; this.opts = []; mos.push(this); } observe(t, o) { this.targets.push(t); this.opts.push(o); } };
   env.hits = () => [root.ch[0]];
   env.fireW = (t) => { const a = W.l && W.l[t]; if (a) for (let i = 0; i < a.length; i++) a[i]({}); };
   env.mutate = () => mos.forEach((m) => m.cb([]));
@@ -133,7 +139,9 @@ test("on_demand: nothing without commands; badge appears on first command and go
   assert.ok(cls(sh, "w").popped > 0, "badge is in the top layer");
   assert.equal(Object.getPrototypeOf(hostOf(env).shadowInit), null);
   assert.deepEqual(Object.keys(hostOf(env).shadowInit).sort(), ["clonable", "delegatesFocus", "mode", "serializable", "slotAssignment"]);
-  assert.ok(Object.getOwnPropertyDescriptor(sh.ss, Symbol.iterator), "adopted sheets array has its own iterator");
+  assert.equal(sh.ss, undefined, "no constructed stylesheet is adopted");
+  const st0 = all(sh).find((n) => n.tag === "style");
+  assert.ok(st0 && st0.at.nonce === "n1" && st0.textContent.includes(".w{"), "nonce'd <style> inside the closed root");
   assert.equal(env.mos[0].opts[0].childList, true);
   assert.equal(Object.getPrototypeOf(env.mos[0].opts[0]), null);
   api.GM_unregisterMenuCommand(id);
@@ -221,6 +229,16 @@ test("badge moved or resized is not clickable; a classic scrollbar's width is to
   badge.rect = { width: 28, height: 28, left: 984, top: 728, right: 1012, bottom: 756 };
   badge.fire("click", T());
   assert.equal(badge.at["aria-expanded"], "true");
+  // no viewport element at all: fail closed
+  badge.fire("click", T()); // closes it
+  env.document.__body = null;
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "false", "unknown viewport refuses the click");
+  // an empty hit-test list is a failure, not a pass
+  env.document.__compat = "CSS1Compat"; env.root.cw = 1024; env.root.chh = 768;
+  env.hits = () => [];
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "false");
 });
 
 test("always: top frame shows with no commands; frames behave like on_demand", async () => {
@@ -290,7 +308,7 @@ test("page code cannot list or invoke commands: no registry on the window", asyn
 
 const rApply = Reflect.apply, rDefine = Object.defineProperty, origPush = Array.prototype.push;
 
-function boobyTraps(st) {
+function boobyTraps(st, extra) {
   const rec = (what) => { if (st.armed) { st.armed = false; rApply(origPush, st.hits, [what]); st.armed = true; } };
   const replace = (obj, key, desc) => {
     const old = Object.getOwnPropertyDescriptor(obj, key);
@@ -318,6 +336,9 @@ function boobyTraps(st) {
       set(v) { rec("Object.prototype." + name + " set"); rDefine(this, name, nd({ value: v, writable: true, enumerable: true, configurable: true })); },
     });
   }
+  for (const name of ["id", "accessKey"]) {
+    replace(String.prototype, name, { get() { rec("String.prototype." + name + " get"); return undefined; }, set() { rec("String.prototype." + name + " set"); } });
+  }
   // Array.prototype: indices 0-50 (getter and setter), every method, the iterator.
   for (let i = 0; i <= 50; i++) {
     replace(Array.prototype, String(i), {
@@ -328,11 +349,11 @@ function boobyTraps(st) {
   for (const k of Reflect.ownKeys(Array.prototype)) if (k !== "constructor" && k !== "length") wrapMember(Array.prototype, k, "Array.prototype");
   // The fake DOM's classes stand for the platform's prototypes.
   const protos = { EventTarget: ET.prototype, Node: Nd.prototype, Element: El.prototype, ShadowRoot: SR.prototype, CSSStyleSheet: SS.prototype,
-    CSSStyleDeclaration: CSD.prototype, Event: TEvent.prototype, KeyboardEvent: KEvent.prototype, MouseEvent: MEvent.prototype };
+    CSSStyleDeclaration: CSD.prototype, DOMRectReadOnly: Rect.prototype, Document: Object.getPrototypeOf(extra.doc), MutationObserver: extra.mo, ArrayIterator: Object.getPrototypeOf([][Symbol.iterator]()), Event: TEvent.prototype, KeyboardEvent: KEvent.prototype, MouseEvent: MEvent.prototype };
   for (const [label, p] of Object.entries(protos)) for (const k of Reflect.ownKeys(p)) wrapMember(p, k, label);
   // Globals and statics the runtime must not look up late.
-  for (const [obj, label] of [[Object, "Object"], [Reflect, "Reflect"], [Math, "Math"], [Function.prototype, "Function.prototype"], [Date, "Date"], [String.prototype, "String.prototype"]]) {
-    for (const k of ["create", "getOwnPropertyDescriptor", "keys", "apply", "defineProperty", "abs", "max", "min", "call", "bind", "now", "toString", "concat", "indexOf"]) wrapMember(obj, k, label);
+  for (const [obj, label] of [[Object.prototype, "Object.prototype"], [Object, "Object"], [Reflect, "Reflect"], [Math, "Math"], [Function.prototype, "Function.prototype"], [Date, "Date"], [String.prototype, "String.prototype"]]) {
+    for (const k of ["create", "getOwnPropertyDescriptor", "keys", "apply", "defineProperty", "abs", "max", "min", "call", "bind", "now", "toString", "concat", "indexOf", "hasOwnProperty"]) wrapMember(obj, k, label);
   }
 }
 
@@ -342,7 +363,7 @@ test("acceptance: with every hookable built-in booby-trapped, registering, openi
   // The page's own document-start code has run; now it sets its traps.
   const st = { armed: false, hits: [], undo: [] };
   try {
-    boobyTraps(st);
+    boobyTraps(st, { mo: env.MO.prototype, doc: env.document });
     st.armed = true; const probe = []; probe[0] = 1; const pl = {}; pl.mode = 1; st.armed = false;
     assert.ok(st.hits.length >= 2, "control: the traps fire");
     st.hits.length = 0;
@@ -352,6 +373,9 @@ test("acceptance: with every hookable built-in booby-trapped, registering, openi
     st.armed = true;
     const id = api.GM_registerMenuCommand("Secret", () => { ran++; });
     api.GM_registerMenuCommand("Other", () => {});
+    api.GM_registerMenuCommand("Str", () => {}, "k");
+    api.GM_registerMenuCommand("NoId", () => {}, {});
+    api.GM_registerMenuCommand("Key", () => {}, { accessKey: "x" });
     st.armed = false;
     assert.equal(env.root.ch.length, 1, "badge shown");
     const sh = hostOf(env).shadow, badge = kq(sh, "badge");

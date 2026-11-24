@@ -316,7 +316,9 @@ literal and no array method, and dynamic lists (the registry, the menu's own lis
 null-prototype objects with a counter, never arrays (an index write or `push` walks
 `Array.prototype`, where a page can plant setters that would receive the callbacks); dictionaries
 handed to the platform (`attachShadow`, `observe`) are null-prototype with every member explicit;
-stylesheet adoption uses saved `replaceSync` and `adoptedStyleSheets` setter with an own iterator;
+the UI is styled by a nonce'd `<style>` inside the closed root, not an adopted constructed
+stylesheet (adoption converts a sequence through the page-hookable array iterator, which would hand
+the sheet over); menu options are read only as own properties of a real object;
 `key`, `target`, `focus`, `compatMode` and the viewport size (body in quirks mode) come from saved
 getters. `menu.test.mjs` booby-traps every hookable prototype member and asserts the runtime
 touches none while registering, opening, typing and clicking. `Object.prototype`/`Array.prototype` pollution is inert. After the

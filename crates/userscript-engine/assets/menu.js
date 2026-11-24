@@ -17,8 +17,8 @@ function (W, reg, mode, nonce) {
   "use strict";
   if (mode !== "always" && mode !== "on_demand") { return; }
   if (mode === "always") { try { if (W !== W.top) { mode = "on_demand"; } } catch (e) { mode = "on_demand"; } }
-  var apply = Reflect.apply, defProp = Reflect.defineProperty, gopd = Object.getOwnPropertyDescriptor, ObjCreate = Object.create, Str = String,
-      pf = parseFloat, abs = Math.abs, max = Math.max, min = Math.min, dnow = Date.now, DateC = Date, SymIter = Symbol.iterator, arrValues = Array.prototype[Symbol.iterator];
+  var apply = Reflect.apply, gopd = Object.getOwnPropertyDescriptor, ObjCreate = Object.create, Str = String,
+      pf = parseFloat, abs = Math.abs, max = Math.max, min = Math.min, dnow = Date.now, DateC = Date;
   var D = W.document, always = mode === "always";
   function pr(c) { try { return c && c.prototype; } catch (e) { return null; } }
   function fn(p, n) { var f; try { f = p && p[n]; } catch (e) { f = null; } return typeof f === "function" ? f : null; }
@@ -36,12 +36,12 @@ function (W, reg, mode, nonce) {
   function lst() { var l = ObjCreate(null); l.length = 0; return l; }
   function push(l, v) { var n = l.length; l[n] = v; l.length = n + 1; }
   var ETp = pr(W.EventTarget), NDp = pr(W.Node), ELp = pr(W.Element), HEp = pr(W.HTMLElement) || ELp, DOp = pr(W.Document), CSp = pr(W.CSSStyleDeclaration),
-      MOp = pr(W.MutationObserver), RCp = pr(W.DOMRectReadOnly), SRp = pr(W.ShadowRoot), SSp = pr(W.CSSStyleSheet), EVp = pr(W.Event), KEp = pr(W.KeyboardEvent);
+      MOp = pr(W.MutationObserver), RCp = pr(W.DOMRectReadOnly), EVp = pr(W.Event), KEp = pr(W.KeyboardEvent);
   var fAdd = fn(ETp, "addEventListener"), fCreate = fn(DOp, "createElement"), fAttach = fn(ELp, "attachShadow"), fRect = fn(ELp, "getBoundingClientRect"),
       fSetAttr = fn(ELp, "setAttribute"), fAppend = fn(NDp, "appendChild"), fInsB = fn(NDp, "insertBefore"), fRemove = fn(NDp, "removeChild"),
       fShow = fn(HEp, "showPopover"), fHide = fn(HEp, "hidePopover"), fFocus = fn(HEp, "focus"), fFromPts = fn(DOp, "elementsFromPoint"),
-      fSetProp = fn(CSp, "setProperty"), fGetProp = fn(CSp, "getPropertyValue"), fObs = fn(MOp, "observe"), fReplace = fn(SSp, "replaceSync"),
-      sAdopt = setterOf(SRp, "adoptedStyleSheets"), gcs = W.getComputedStyle, setT = W.setTimeout, MO = W.MutationObserver, Sheet = W.CSSStyleSheet;
+      fSetProp = fn(CSp, "setProperty"), fGetProp = fn(CSp, "getPropertyValue"), fObs = fn(MOp, "observe"),
+      gcs = W.getComputedStyle, setT = W.setTimeout, MO = W.MutationObserver;
   var gStyle = getter(HEp, "style"), gParent = getter(NDp, "parentNode"), gDocEl = getter(DOp, "documentElement"), gBody = getter(DOp, "body"),
       gCompat = getter(DOp, "compatMode"), gCW = getter(ELp, "clientWidth"), gCH = getter(ELp, "clientHeight"), gKey = getter(KEp, "key"), gTarget = getter(EVp, "target"),
       rW = getter(RCp, "width"), rH = getter(RCp, "height"), rL = getter(RCp, "left"), rT = getter(RCp, "top"), rR = getter(RCp, "right"), rB = getter(RCp, "bottom");
@@ -59,8 +59,6 @@ function (W, reg, mode, nonce) {
   var OBS_INIT = ObjCreate(null);
   OBS_INIT.childList = true; OBS_INIT.attributes = false; OBS_INIT.characterData = false; OBS_INIT.subtree = false;
   OBS_INIT.attributeOldValue = false; OBS_INIT.characterDataOldValue = false;
-  var ITER_DESC = ObjCreate(null);
-  ITER_DESC.value = arrValues; ITER_DESC.writable = false; ITER_DESC.enumerable = false; ITER_DESC.configurable = false;
   var NOARGS = [];
   function trusted(e) { try { return apply(getTrusted, e, NOARGS) === true; } catch (x) { return false; } }
   function now() { return apply(dnow, DateC, NOARGS); }
@@ -128,7 +126,7 @@ function (W, reg, mode, nonce) {
         var r = apply(fRect, el, NOARGS), l = rL(r), t = rT(r), rr = rR(r), b = rB(r);
         if (isBadge) {
           var vp = viewport();
-          if (vp && (abs(rW(r) - 28) > 2 || abs(rH(r) - 28) > 2 || abs(vp[0] - rr - 12) > 4 || abs(vp[1] - b - 12) > 4)) { return false; }
+          if (!vp || abs(rW(r) - 28) > 2 || abs(rH(r) - 28) > 2 || abs(vp[0] - rr - 12) > 4 || abs(vp[1] - b - 12) > 4) { return false; }
         } else if (menuEl) {
           // The item may be scrolled partly out of the menu: test the visible part.
           var m = apply(fRect, menuEl, NOARGS);
@@ -137,28 +135,18 @@ function (W, reg, mode, nonce) {
         }
         if (fFromPts) {
           var hits = apply(fFromPts, D, [(l + rr) / 2, (t + b) / 2]);
-          if (!hits || hits[0] !== host) { return false; }
+          if (!hits || !(hits.length > 0) || hits[0] !== host) { return false; }
         }
       }
     } catch (e) { return false; }
     return true;
   }
-  function styleUi(root) {
-    if (Sheet && fReplace && sAdopt) {
-      try {
-        var sh = new Sheet(), arr = [sh];
-        apply(fReplace, sh, [CSS]);
-        defProp(arr, SymIter, ITER_DESC); // own iterator: Array.prototype[Symbol.iterator] is not consulted
-        apply(sAdopt, root, [arr]);
-        return;
-      } catch (e) { /* fall back to a <style> */ }
-    }
-    append(root, h("style", nonce ? ["nonce", nonce] : [], CSS, [], []));
-  }
   function build() {
     host = apply(fCreate, D, ["div"]);
     var root = apply(fAttach, host, [SHADOW_INIT]);
-    styleUi(root);
+    // A <style> in the closed root (nonce for CSP). Constructed stylesheets are not used: adopting
+    // one converts a sequence through the page-hookable array iterator, which would hand it over.
+    append(root, h("style", nonce ? ["nonce", nonce] : [], CSS, [], []));
     badge = h("button", ["type", "button", "class", "b", "data-k", "badge", "aria-haspopup", "true", "aria-expanded", "false"], "A", ["click", function (e) {
       if (trusted(e) && intact(badge, true)) { setOpen(!open); }
     }], []);

@@ -789,8 +789,11 @@ function (cfg, entries, W) {
     }
     expose("gm_notification", "GM_notification", "notification", notification, function (a, b, c, d3) { return resolved(notification(a, b, c, d3)); });
     function registerMenu(caption, fn, opt) {
-      var id = SH.next(), key = typeof opt === "string" ? opt : (opt && opt.accessKey) || "", rep = false;
-      if (opt && opt.id) { id = opt.id; rep = true; }
+      // Read options only as own properties of a real object, so a polluted prototype is never consulted.
+      var id = SH.next(), key = "", rep = false, o = typeof opt === "object" && opt !== null;
+      if (typeof opt === "string") { key = opt; }
+      else if (o && hasOwn(opt, "accessKey") && opt.accessKey) { key = Str(opt.accessKey); }
+      if (o && hasOwn(opt, "id") && opt.id) { id = Str(opt.id); rep = true; }
       SH.add({ script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key,
         run: function () { safeCall(label, fn, W, []); } }, rep);
       menuChanged();
