@@ -373,6 +373,11 @@ impl TestProxy {
         })
     }
 
+    /// The proxy's live-control handle (rebinding, access settings).
+    pub fn control(&self) -> Arc<proxy_core::server::ProxyControl> {
+        self.control.clone()
+    }
+
     /// The extension-only listener (started on first use, on an ephemeral loopback port).
     pub async fn ext_addr(&self) -> SocketAddr {
         if let Some(a) = *self.ext_addr.lock() {

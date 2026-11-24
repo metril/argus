@@ -985,29 +985,125 @@ async fn socks_refuses_an_invalid_host_and_one_deadline_covers_the_whole_handsha
     let mut rep = [0u8; 10];
     s.read_exact(&mut rep).await.unwrap();
     assert_eq!(rep[1], 4);
-    // a client trickling one byte per 400 ms is closed at the (1 s) deadline, not per read
+    // a client trickling a valid handshake, one byte per 400 ms, never trips a per-read timeout
+    // (1 s) but is cut at the one deadline for the whole handshake
     let mut t = tokio::net::TcpStream::connect(addr).await.unwrap();
     let start = std::time::Instant::now();
-    let mut closed = false;
-    for b in [5u8, 1, 2, 1, 3, b'e', b'x', b't'] {
-        if t.write_all(&[b]).await.is_err() {
-            closed = true;
-            break;
+    let mut hs = vec![5u8, 1, 2, 1, 3];
+    hs.extend_from_slice(b"ext");
+    hs.push(sid.len() as u8);
+    hs.extend_from_slice(sid.as_bytes());
+    let (mut rd, mut wr) = t.split();
+    let writer = async {
+        for b in hs {
+            if wr.write_all(&[b]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let mut buf = [0u8; 8];
-        if let Ok(Ok(0)) = tokio::time::timeout(Duration::from_millis(5), t.read(&mut buf)).await {
-            closed = true;
-            break;
-        }
-    }
-    assert!(closed || start.elapsed() > Duration::from_secs(1));
-    let mut rest = Vec::new();
-    let end = tokio::time::timeout(Duration::from_secs(2), t.read_to_end(&mut rest)).await;
-    assert!(end.is_ok(), "the connection was closed");
-    assert!(
-        start.elapsed() < Duration::from_secs(4),
-        "within the deadline, not per read: {:?}",
+    };
+    let reader = async {
+        let mut buf = Vec::new();
+        let _ = rd.read_to_end(&mut buf).await;
         start.elapsed()
+    };
+    let closed_at = tokio::select! {
+        d = reader => d,
+        _ = writer => {
+            let mut buf = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(3), rd.read_to_end(&mut buf)).await;
+            start.elapsed()
+        }
+    };
+    assert!(
+        closed_at < Duration::from_millis(1600),
+        "closed at the 1 s deadline, not after the last byte: {closed_at:?}"
     );
+}
+
+#[tokio::test]
+async fn argus_own_hosts_follow_the_live_configuration_and_resolution() {
+    use proxy_core::config::ProxyConfig;
+    use proxy_core::ext_bridge::{Fallback, Route};
+    let env = TestEnv::start_tweaked(e2e::EntryMode::Explicit, &[], &|_| {}).await;
+    let (h, sess, id) = mitm_hub(&env).await;
+    h.on_text(
+        sess,
+        &json!({"t": "perms", "origins": ["*://*.api.test/*"]}).to_string(),
+    )
+    .await;
+    let m = h.register_doc(
+        "default",
+        "https://app.test",
+        vec![(id.clone(), "n".into())],
+        sess,
+        "",
+    );
+    let go = |host: &str| {
+        h.route(
+            Some((sess, "")),
+            Some(&m),
+            "default",
+            "https://app.test",
+            &id,
+            host,
+            443,
+        )
+    };
+    assert_eq!(go("dash.api.test"), Route::Ext(sess));
+    assert_eq!(go("console.api.test"), Route::Ext(sess));
+    // the dashboard URL and the web API host are read from the live configuration
+    let ctl = env.proxy.control();
+    let mut c = ProxyConfig::default();
+    c.script_control.dashboard_url = "https://dash.api.test/".into();
+    c.webui.host = "console.api.test".into();
+    ctl.apply_access(&c).await.unwrap();
+    assert_eq!(
+        go("dash.api.test"),
+        Route::Jar(Fallback::OwnHost),
+        "any port, by name"
+    );
+    assert_eq!(go("console.api.test"), Route::Jar(Fallback::OwnHost));
+    assert_eq!(go("DASH.api.test"), Route::Jar(Fallback::OwnHost));
+    // changed again: the old names are free, the new one is Argus
+    c.script_control.dashboard_url = "https://other.api.test/".into();
+    c.webui.host = "0.0.0.0".into();
+    ctl.apply_access(&c).await.unwrap();
+    assert_eq!(go("dash.api.test"), Route::Ext(sess));
+    assert_eq!(go("console.api.test"), Route::Ext(sess));
+    assert_eq!(go("other.api.test"), Route::Jar(Fallback::OwnHost));
+    // a name that resolves to the web API's bind address on its port is Argus too
+    ctl.set_webui_listener("127.0.0.1", 3000).await;
+    assert!(h.is_own_target("localhost", 3000).await);
+    assert!(!h.is_own_target("localhost", 3001).await);
+    assert!(!h.is_own_target("example.invalid", 3000).await);
+}
+
+#[tokio::test]
+async fn a_revoked_session_ends_its_real_upgraded_websocket() {
+    let env = TestEnv::start(e2e::EntryMode::Explicit, &[]).await;
+    let h = hub(&env);
+    let (sess, sid, _rx) = session(&h, "tw");
+    let mut ws =
+        e2e::connect_ws_via_ext(&env.proxy, &sid, "ws.test", env.origin.http_port(), "/ws").await;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    ws.send(Message::Text("hi".into())).await.unwrap();
+    let echo = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("echo");
+    assert!(matches!(echo, Some(Ok(_))), "{echo:?}");
+    // the token is revoked: the spliced WebSocket ends (the accept loop cannot reach this task)
+    h.close_token("tw");
+    let end = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "the upgraded WebSocket outlived its session");
+    assert!(!h.is_live(sess));
 }

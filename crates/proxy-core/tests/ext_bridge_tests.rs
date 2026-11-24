@@ -1186,3 +1186,31 @@ async fn a_listener_that_does_not_decrypt_never_relays() {
     assert_eq!(go(), Route::Jar(Fallback::Bypassed));
     assert!(!hub.check_relay(&relay, &ok, Some(sess), ""));
 }
+
+#[tokio::test]
+async fn a_relay_records_the_store_of_its_job_for_audit() {
+    let f = fx(true);
+    let hub = f.gm.ext().clone();
+    let (sess, _sid, mut rx) = hub.open(ident("t"));
+    let mut meta = json!({"op": "xhr", "url": "https://api.test/x", "store": "c1x"});
+    let _h = hub
+        .dispatch(sess, meta.take(), "default", &f.id, "hit.test", None)
+        .await
+        .unwrap();
+    let Some(ExtOut::Binary(b)) = rx.recv().await else {
+        panic!("job")
+    };
+    let relay = serde_json::from_slice::<serde_json::Value>(parse_job_frame(&b).unwrap().2)
+        .unwrap()["relay"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(hub.relay_store(&relay).as_deref(), Some("c1x"));
+    assert_eq!(hub.relay_store("nope"), None);
+    let (_h2, _j, relay2) = job3(&hub, sess, &f, &mut rx).await;
+    assert_eq!(
+        hub.relay_store(&relay2).as_deref(),
+        Some(""),
+        "the default store"
+    );
+}

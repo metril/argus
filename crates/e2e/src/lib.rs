@@ -28,7 +28,7 @@ pub use codec::{decode, encode, encode_stacked, Coding};
 pub use origin::{MockResponse, RecordedRequest, StreamSpec, TestOrigin};
 pub use proxy::{install_rules_text, ProfileHandles, ScriptHandles, TestDst, TestProxy};
 pub use relay::SourceRelay;
-pub use ws::{connect_ws, connect_wss, tls_via_proxy, WsStream};
+pub use ws::{connect_ws, connect_ws_via_ext, connect_wss, tls_via_proxy, WsStream};
 
 use std::sync::Once;
 

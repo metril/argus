@@ -287,6 +287,8 @@ struct MenuDoc {
 
 struct RelayInfo {
     session: u64,
+    /// The cookie store token of the job's document (empty: default), for audit.
+    store: String,
     profile: String,
     script: String,
     page_host: String,
@@ -306,6 +308,12 @@ pub struct HubCtx {
     pub manager: Arc<UserscriptManager>,
     pub profiles: Option<Arc<common::profile_store::ProfileStore>>,
     pub bypass: Arc<common::bypass::BypassEngine>,
+}
+
+/// Does `host:port` resolve, right now, to where Argus's own web API listens?
+#[async_trait::async_trait]
+pub trait OwnResolve: Send + Sync {
+    async fn resolves_to_own(&self, host: &str, port: u16) -> bool;
 }
 
 /// Is `host:port` Argus itself?
@@ -368,6 +376,7 @@ pub struct ExtHub {
     mitm_probe: OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Hosts that are Argus itself (the console, the panel): never relayed to.
     own_guard: OnceLock<OwnGuard>,
+    own_resolve: OnceLock<Arc<dyn OwnResolve>>,
 }
 
 impl Default for ExtHub {
@@ -393,6 +402,7 @@ impl ExtHub {
             ev_gate: OnceLock::new(),
             mitm_probe: OnceLock::new(),
             own_guard: OnceLock::new(),
+            own_resolve: OnceLock::new(),
         }
     }
 
@@ -414,6 +424,22 @@ impl ExtHub {
         let _ = self.own_guard.set(f);
     }
 
+    pub fn set_own_resolver(&self, r: Arc<dyn OwnResolve>) {
+        let _ = self.own_resolve.set(r);
+    }
+
+    /// Is `host:port` Argus itself by name (the sync guard) or because the name resolves, at this
+    /// moment, to the web API's bind address? The caller refuses a relay to it.
+    pub async fn is_own_target(&self, host: &str, port: u16) -> bool {
+        if self.is_own(host, port) {
+            return true;
+        }
+        match self.own_resolve.get() {
+            Some(r) => r.resolves_to_own(host.trim_matches(['[', ']']), port).await,
+            None => false,
+        }
+    }
+
     /// Will the extension listener decrypt right now? No probe means no.
     fn decrypting(&self) -> bool {
         self.mitm_probe.get().is_some_and(|f| f())
@@ -424,6 +450,7 @@ impl ExtHub {
     }
 
     /// The session and store token a document was served to.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn doc_binding(&self, mdoc: Option<&str>) -> Option<(u64, String)> {
         let g = self.inner.lock();
         mdoc.and_then(|m| g.docs.get(m))
@@ -460,6 +487,12 @@ impl ExtHub {
         conn_store: &str,
     ) -> bool {
         self.check_relay(relay, url, conn_session, conn_store)
+            && !self
+                .is_own_target(
+                    url.host_str().unwrap_or_default(),
+                    url.port_or_known_default().unwrap_or(443),
+                )
+                .await
             && self
                 .ev_allows(
                     url.host_str().unwrap_or_default(),
@@ -1177,6 +1210,11 @@ impl ExtHub {
                 relay.clone(),
                 RelayInfo {
                     session,
+                    store: meta
+                        .get("store")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     profile: profile.to_string(),
                     script: script.to_string(),
                     page_host: page_host.to_string(),
@@ -1290,6 +1328,11 @@ impl ExtHub {
         cs.script.enabled
             && cs.script.browser_cookies
             && userscript_engine::backend::check_connect(&cs.script, &page_host, url).is_ok()
+    }
+
+    /// The store token the relay token's job runs for (audit); `None` for an unknown token.
+    pub fn relay_store(&self, relay: &str) -> Option<String> {
+        self.inner.lock().relays.get(relay).map(|r| r.store.clone())
     }
 
     /// Audit one relayed request.

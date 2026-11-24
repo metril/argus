@@ -1056,7 +1056,11 @@ impl GmHost {
                     if !self
                         .ext
                         .ev_allows(&host, url.port_or_known_default().unwrap_or(443))
-                        .await =>
+                        .await
+                        || self
+                            .ext
+                            .is_own_target(&host, url.port_or_known_default().unwrap_or(443))
+                            .await =>
                 {
                     Route::Jar(crate::ext_bridge::Fallback::Bypassed)
                 }
@@ -1390,7 +1394,11 @@ impl GmHost {
                     if !self
                         .ext
                         .ev_allows(&host, out.url.port_or_known_default().unwrap_or(443))
-                        .await =>
+                        .await
+                        || self
+                            .ext
+                            .is_own_target(&host, out.url.port_or_known_default().unwrap_or(443))
+                            .await =>
                 {
                     Route::Jar(crate::ext_bridge::Fallback::Bypassed)
                 }

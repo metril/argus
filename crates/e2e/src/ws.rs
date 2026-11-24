@@ -31,6 +31,34 @@ pub async fn connect_ws(proxy: &TestProxy, host: &str, port: u16, path: &str) ->
     ws
 }
 
+/// `ws://host:port/path` through the extension listener (plain-HTTP path), authenticating the
+/// connection as session `sid` with a `Proxy-Authorization` header.
+pub async fn connect_ws_via_ext(
+    proxy: &TestProxy,
+    sid: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> WsStream {
+    use base64::Engine as _;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let tcp = TcpStream::connect(proxy.ext_addr().await)
+        .await
+        .expect("connect ext listener");
+    let io: Box<dyn Io> = Box::new(tcp);
+    let mut req = format!("ws://{host}:{port}{path}")
+        .into_client_request()
+        .expect("request");
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("ext:{sid}"));
+    req.headers_mut().insert(
+        "proxy-authorization",
+        format!("Basic {auth}").parse().unwrap(),
+    );
+    let (ws, resp) = client_async(req, io).await.expect("ws handshake");
+    assert_eq!(resp.status(), 101);
+    ws
+}
+
 /// A TLS session with the proxy's interception for `host:port` (client trusts only the proxy
 /// CA): CONNECT first in explicit mode, straight to the transparent listener otherwise.
 pub async fn tls_via_proxy(

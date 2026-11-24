@@ -155,6 +155,9 @@ pub struct ProxyControl {
     original_dst: Option<Arc<dyn OriginalDst>>,
     /// The web API listener, for the destination policy's loop protection.
     webui_own: parking_lot::Mutex<Option<(u16, Option<IpAddr>)>>,
+    /// Names that are Argus itself (web API host, panel host, dashboard host), from the live
+    /// configuration (refreshed by every `apply_access`).
+    own_names: parking_lot::Mutex<Vec<String>>,
     /// Switches of each listener, shared with its connections.
     explicit_flags: Arc<crate::listener_flags::ListenerFlags>,
     transparent_flags: Arc<crate::listener_flags::ListenerFlags>,
@@ -178,6 +181,49 @@ pub struct ProxyControl {
     /// The proxy's own ports (explicit + transparent) for the transparent loop guard.
     entry_ports: Arc<parking_lot::RwLock<Vec<u16>>>,
     running: tokio::sync::Mutex<Option<Running>>,
+}
+
+/// The names that are Argus itself in `c`: the web API's host, the panel host and the dashboard
+/// host (lowercase; IP literals and wildcard binds are not names).
+fn own_names_of(c: &ProxyConfig) -> Vec<String> {
+    let mut v = vec![c.webui.host.to_ascii_lowercase()];
+    v.push(c.script_control.panel_host.to_ascii_lowercase());
+    if let Some(h) = url::Url::parse(&c.script_control.dashboard_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    {
+        v.push(h);
+    }
+    v.retain(|n| !n.is_empty() && n.parse::<IpAddr>().is_err());
+    v
+}
+
+/// Resolves a relay target at check time and compares it with the web API's bind address.
+struct OwnResolver(std::sync::Weak<ProxyControl>);
+
+#[async_trait::async_trait]
+impl crate::ext_bridge::OwnResolve for OwnResolver {
+    async fn resolves_to_own(&self, host: &str, port: u16) -> bool {
+        let Some(c) = self.0.upgrade() else {
+            return false;
+        };
+        let own = *c.webui_own.lock();
+        let Some((p, Some(ip))) = own else {
+            return false;
+        };
+        if p != port || ip.is_unspecified() {
+            return false;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        {
+            Ok(Ok(mut it)) => it.any(|a| a.ip() == ip),
+            _ => false,
+        }
+    }
 }
 
 fn spec_addr(host: &str, port: u16) -> String {
@@ -323,6 +369,7 @@ impl ProxyControl {
             &config.proxy.allowed_destinations,
         );
         self.acl.store(Arc::new(acl));
+        *self.own_names.lock() = own_names_of(config);
         self.explicit_flags.set(config.listener_flags(false));
         self.transparent_flags.set(config.listener_flags(true));
         self.ext_flags.set(config.listener_flags(false));
@@ -932,6 +979,7 @@ impl ProxyServer {
             ctx: ctx.clone(),
             load_manager: load_manager.clone(),
             original_dst: None,
+            own_names: parking_lot::Mutex::new(own_names_of(&config)),
             webui_own: parking_lot::Mutex::new(
                 config
                     .webui
@@ -1080,13 +1128,13 @@ impl ProxyServer {
                 })
             }));
             let (wc, wx) = (Arc::downgrade(&self.control), Arc::downgrade(&self.ctx));
-            let dashboard = url::Url::parse(&self.config.script_control.dashboard_url)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+            hub.set_own_resolver(Arc::new(OwnResolver(Arc::downgrade(&self.control))));
             hub.set_own_guard(Arc::new(move |host: &str, port: u16| {
                 let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-                if dashboard.as_deref() == Some(host.as_str())
-                    || wx.upgrade().is_some_and(|x| x.is_panel_host(&host))
+                if wx.upgrade().is_some_and(|x| x.is_panel_host(&host))
+                    || wc
+                        .upgrade()
+                        .is_some_and(|c| c.own_names.lock().contains(&host))
                 {
                     return true;
                 }
