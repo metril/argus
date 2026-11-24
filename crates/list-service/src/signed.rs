@@ -27,6 +27,25 @@ fn https(url: &str) -> bool {
     url.len() > 8 && url[..8].eq_ignore_ascii_case("https://")
 }
 
+/// Plain http to a loopback host, for local test servers only; never accepted in production.
+#[cfg(any(test, feature = "testkit"))]
+fn test_loopback_http(u: &str) -> bool {
+    url::Url::parse(u).is_ok_and(|u| {
+        u.scheme() == "http"
+            && matches!(
+                u.host(),
+                Some(url::Host::Domain("localhost"))
+                    | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                    | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+            )
+    })
+}
+
+#[cfg(not(any(test, feature = "testkit")))]
+fn test_loopback_http(_: &str) -> bool {
+    false
+}
+
 fn named(id: &str, name: &str, category: &str) -> Result<(), String> {
     if id.trim().is_empty() || name.trim().is_empty() {
         return Err("empty id or name".into());
@@ -110,12 +129,7 @@ where
 impl CatalogueEntry for UserscriptCatalogueEntry {
     fn validate(&self) -> Result<(), String> {
         named(&self.id, &self.name, &self.category)?;
-        // Plain http is only accepted for a loopback address (local test servers); the fetch
-        // guard still refuses loopback unless the operator allows it.
-        let loopback = self.install_url.starts_with("http://127.0.0.1")
-            || self.install_url.starts_with("http://localhost")
-            || self.install_url.starts_with("http://[::1]");
-        if !https(&self.install_url) && !loopback {
+        if !https(&self.install_url) && !test_loopback_http(&self.install_url) {
             return Err("install_url is not https".into());
         }
         Ok(())
