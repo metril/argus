@@ -6216,6 +6216,104 @@
         ],
         "type": "object"
       },
+      "UserscriptCatalogueEntryDto": {
+        "description": "One script of the signed userscript catalogue. The catalogue vouches for curation (a person\nchose it and checked its install URL), not for the code.",
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "connect": {
+            "description": "`@connect` hosts (`*` means any site).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": "string"
+          },
+          "homepage": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "install_url": {
+            "description": "Where the script installs from (the install flow's `url`).",
+            "type": "string"
+          },
+          "licence": {
+            "type": "string"
+          },
+          "licence_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "needs_gm": {
+            "description": "`none`, `basic` or `xhr`: which GM APIs it needs.",
+            "type": "string"
+          },
+          "requires": {
+            "description": "`@require` URLs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sites": {
+            "description": "Sites it runs on (`*` for any).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "install_url",
+          "category",
+          "licence"
+        ],
+        "type": "object"
+      },
+      "UserscriptCatalogueResponse": {
+        "description": "The signed userscript catalogue.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/UserscriptCatalogueEntryDto"
+            },
+            "type": "array"
+          },
+          "fetched_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "description": "`signed`, or `unavailable` while none has verified yet (then `entries` is empty).",
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "entries"
+        ],
+        "type": "object"
+      },
       "UserscriptCounts": {
         "description": "Userscripts per status, for the current search text.",
         "properties": {
@@ -17570,6 +17668,90 @@
           }
         ],
         "summary": "Install a userscript from its source.",
+        "tags": [
+          "userscripts"
+        ]
+      }
+    },
+    "/api/v1/userscripts/catalogue": {
+      "get": {
+        "operationId": "get_userscript_catalogue",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserscriptCatalogueResponse"
+                }
+              }
+            },
+            "description": "Catalogue"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "scripts:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "scripts:read"
+            ]
+          }
+        ],
+        "summary": "The signed catalogue of curated userscripts (installs still go through plan and confirm).",
         "tags": [
           "userscripts"
         ]

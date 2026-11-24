@@ -17,7 +17,9 @@ pub use api_types::{
     UserscriptBundle, UserscriptPlanResponse, UserscriptStorageResponse,
 };
 
-pub use api_types::{UserscriptCounts, UserscriptsPage};
+pub use api_types::{
+    UserscriptCatalogueEntryDto, UserscriptCatalogueResponse, UserscriptCounts, UserscriptsPage,
+};
 
 impl ApiClient {
     /// Cursor-paged list. `status`: "" | enabled | disabled | error; `sort`: name | updated;
@@ -99,6 +101,11 @@ impl ApiClient {
     /// Get userscript statistics
     pub async fn get_userscript_stats(&self) -> Result<UserscriptStats, ApiError> {
         self.get("/userscripts/stats").await
+    }
+
+    /// The signed catalogue of curated userscripts.
+    pub async fn get_userscript_catalogue(&self) -> Result<UserscriptCatalogueResponse, ApiError> {
+        self.get("/userscripts/catalogue").await
     }
 
     /// Plan an install from pasted source or a URL (nothing is installed yet).

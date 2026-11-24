@@ -129,6 +129,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             userscripts::install_userscript
         ))
         .routes(routes!(userscripts::get_stats))
+        .routes(routes!(userscripts::get_userscript_catalogue))
         .routes(routes!(userscripts::plan_userscript))
         .routes(routes!(userscripts::confirm_plan))
         .routes(routes!(userscripts::export_userscripts))
