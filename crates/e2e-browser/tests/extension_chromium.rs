@@ -12,6 +12,9 @@ use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::network::CookieParam;
+use chromiumoxide::cdp::browser_protocol::target::{
+    CreateBrowserContextParams, CreateTargetParams,
+};
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::Page;
 use e2e::{MockResponse, TestOrigin};
@@ -161,6 +164,22 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
 
     let profile = tempfile::tempdir().unwrap();
     let ext = ext_dir.canonicalize().unwrap();
+    // "Allow in Incognito" is a per-extension profile preference (the toggle on chrome://extensions,
+    // which a driven browser cannot open): written into the new profile before the first start.
+    {
+        use sha2::{Digest, Sha256};
+        let id: String = Sha256::digest(ext.to_string_lossy().as_bytes())[..16]
+            .iter()
+            .flat_map(|b| [b >> 4, b & 15])
+            .map(|n| (b'a' + n) as char)
+            .collect();
+        std::fs::create_dir_all(profile.path().join("Default")).unwrap();
+        std::fs::write(
+            profile.path().join("Default/Preferences"),
+            json!({"extensions": {"settings": {id: {"incognito": true}}}}).to_string(),
+        )
+        .unwrap();
+    }
     let args = [
         "no-first-run",
         "no-default-browser-check",
@@ -334,6 +353,83 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
         .await,
         0
     );
+
+    // a private window: the extension's incognito instance (its own channel, session and cookie
+    // jar) binds it and relays with the private jar, never the regular profile's
+    let private = browser
+        .create_browser_context(CreateBrowserContextParams::default())
+        .await
+        .expect("an off-the-record context");
+    let inc = browser
+        .new_page(
+            CreateTargetParams::builder()
+                .url("about:blank")
+                .browser_context_id(private)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("a private tab");
+    // (the incognito instance connects on its own; the first load may precede its proxy setting)
+    let mut incognito_cookie_seen = false;
+    for round in 0..40 {
+        inc.goto(format!("https://app.test:{port}/page?r={round}"))
+            .await
+            .ok();
+        inc.set_cookies(vec![CookieParam::builder()
+            .name("sess")
+            .value("incognito-cookie")
+            .url(format!("{api}/"))
+            .build()
+            .unwrap()])
+            .await
+            .ok();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if origin.requests_for("/cookies").iter().any(|r| {
+            r.headers.iter().any(|(n, v)| {
+                n.eq_ignore_ascii_case("cookie") && v.contains("sess=incognito-cookie")
+            })
+        }) {
+            incognito_cookie_seen = true;
+            break;
+        }
+    }
+    assert!(
+        incognito_cookie_seen,
+        "the private window relayed with its own cookie jar"
+    );
+    assert!(
+        origin.requests_for("/cookies").iter().all(|r| {
+            let c = r
+                .headers
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case("cookie"))
+                .map(|(_, v)| v.as_str())
+                .collect::<String>();
+            !(c.contains("sess=incognito-cookie") && c.contains("sess=real-profile-cookie"))
+        }),
+        "no request mixed the two jars"
+    );
+    let private_timing = eval(&inc, "(performance.getEntriesByType('navigation')[0].serverTiming.find(e => e.name === 'argus') || {}).description || null").await;
+    let private_mdoc = private_timing
+        .as_str()
+        .expect("the private document is bound")
+        .to_string();
+    // it belongs to another session than the regular window's
+    let (st, _) = argus
+        .bridge(
+            "GET",
+            &format!("/api/v1/ext/menu?mdoc={private_mdoc}"),
+            &sid,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        st, 403,
+        "the regular session cannot list the private window's document"
+    );
+    inc.close().await.ok();
 
     // toggle off: the setting is cleared, nothing is answered, a new page is not bound
     eval(

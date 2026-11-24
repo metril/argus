@@ -373,7 +373,12 @@ listener of its own**.
    the connection. The normal ports never answer `407` for this, and nothing in this section
    applies to them. The transparent listener (no proxy configuration on the client) has no
    binding at all.
-2. **Credentials.** `Proxy-Authorization: Basic base64("ext:" + sid [+ ":" + store])`. `sid` is the
+2. **Credentials.** HTTP: `Proxy-Authorization: Basic base64("ext:" + sid [+ ":" + store])`. The
+   listener also speaks **SOCKS5** (it sniffs the first byte, `0x05`): only username/password
+   authentication (RFC 1929) is accepted (a client offering no such method is refused), the user
+   name is `ext` and the password `sid[:store]`; the `CONNECT` it then asks for goes through the
+   same destination policy, bypass, EV and MITM decisions as an HTTP `CONNECT` (a TLS ClientHello
+   is intercepted or tunnelled, anything else is plain HTTP to that host). `sid` is the
    channel's session secret and is compared in constant time against every live session; `store`
    is optional and opaque (8.3). Credentials of an unknown, closed or revoked session are
    refused with `407` like missing ones. `Proxy-Authorization` is always removed before a request
@@ -393,9 +398,13 @@ listener of its own**.
    Chrome). The popup has "Use Argus in this browser" (off by default). While it is on and the
    channel is connected and has told the extension where the listener is, Chrome has
    `proxy.settings` (`fixed_servers`, scope `regular`, the Argus host and `<local>` bypassed) and
-   Firefox answers `proxy.onRequest` with the listener; off or disconnected, Chrome clears the
-   setting and Firefox answers `direct`. The `407` is answered by `webRequest.onAuthRequired` and
-   only when `isProxy`, the realm is `argus-ext` and the challenger is the listener host and port
+   Firefox answers `proxy.onRequest` with the listener as a SOCKS5 proxy with per-request
+   credentials (Firefox keeps one HTTP proxy-credential cache for all containers, which would
+   bind every container to the first one's store, and ignores `proxyAuthorizationHeader` for
+   HTTPS tunnels; so in Firefox the identity rides on the proxy connection only and nothing of it
+   is in any request, which matters on hosts Argus tunnels without decrypting); off or
+   disconnected, Chrome clears the setting and Firefox answers `direct`. In Chrome the `407` is
+   answered by `webRequest.onAuthRequired` and only when `isProxy`, the realm is `argus-ext` and the challenger is the listener host and port
    the server announced; each request id is answered once. The host and port come from the server
    over the channel, never from a page. Nothing else (any other proxy, any other realm) is
    ever answered.

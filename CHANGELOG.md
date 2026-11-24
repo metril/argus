@@ -28,6 +28,11 @@
   the fail-safe and the Extended Validation setting, or the response becomes a `502` without
   `Location` or `Set-Cookie`. Hosts Argus would tunnel (EV with "do not decrypt EV sites" on) are no
   longer relayed to at all.
+* The extension listener also speaks SOCKS5 (username/password only), which Firefox uses so that
+  every container's connections carry their own store credentials; no identity is placed in any
+  request, so none can reach an origin through a tunnelled host. The extension works in Firefox
+  again (its explicit CSP no longer upgrades the channel to `wss://`, and the store-relay listeners
+  register).
 * Real-browser suites (`crates/e2e-browser/tests/extension_chromium.rs`, `extension_firefox.rs`) run
   the built extension against a real Argus process; they are opt-in (`ARGUS_EXT_E2E=1`) and have
   their own CI shard.
