@@ -3,9 +3,30 @@
 ## Unreleased
 
 * Extension bridge: the Argus extension can connect to the proxy (`GET /api/v1/ext/channel`, token
-  scope `userscripts:bridge`). A random per-connection secret in the `X-Argus-Ext` request header
-  (set by the extension on hosts where userscripts can run, never on passthrough hosts, always
-  stripped by the proxy) binds a document to that browser. No client address is used.
+  scope `userscripts:bridge`). A new extension-only proxy listener (`proxy.ext_port`, Settings in the
+  web UI, off by default, applied live) answers `407` to anything without the extension's session
+  credentials (`Proxy-Authorization: Basic ext:<sid>`); a connection that authenticates, and every
+  document decrypted on it, is bound to that browser's session. No client address and no request
+  header is used; normal ports never answer this `407`, and the transparent listener does not bind.
+  The extension has a "Use Argus in this browser" switch (Chrome: `proxy.settings`; Firefox:
+  `proxy.onRequest`, with per-container and private-window switches and per-store credentials) and
+  answers only that listener's `407`. Unbound pages behave exactly as before: no `Server-Timing`
+  entry, no per-document record.
+* Revoking a token, expiring it, or disabling or deleting its owner closes its live extension
+  channels and drops the proxy connections they authenticated (within half a second); the channel
+  also re-verifies its token every three pings.
+* A slow page can no longer corrupt or stall a relay: a full job queue fails that job with an error
+  and tells the extension to cancel, and never delays pongs or other jobs.
+* Credentialed requests go through the browser only for hosts Argus decrypts and that are public:
+  bypassed, passthrough, Extended Validation (tunnelled), loopback, private and link-local targets,
+  and `redirect: "manual"` calls use the script's own jar. Every hop must arrive on a connection
+  that authenticated as the job's session. Relay authority comes only from per-host permissions
+  (never `<all_urls>`, `*://*/*` or public suffixes); the options page button that asked for all
+  sites is gone. Public suffixes are no longer offered as host grants.
+* Relays for Firefox containers and private windows use that store's cookies (the fetch is made
+  without the default store's, the store's go in per hop and `Set-Cookie` is written back to it);
+  menus and documents are scoped to the store. Chrome's incognito windows are served by a second
+  (`split`) extension instance with its own session and cookie jar.
 * Userscript menu commands are listed and triggered from the extension popup; for pages opened in
   that browser the in-page button is not mounted, and it comes back when the extension is not
   serving the page. A freshly shown or re-attached badge ignores clicks for 300 ms.

@@ -4545,6 +4545,15 @@
             "$ref": "#/components/schemas/ListenerFlagsView",
             "description": "Effective switches of the explicit-proxy listener."
           },
+          "ext_port": {
+            "description": "Port of the extension-only listener (`None` = off): the Argus browser extension sends its\nbrowser through it so documents are bound to the extension session.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "host": {
             "type": "string"
           },
@@ -6165,6 +6174,15 @@
                 "$ref": "#/components/schemas/ListenerFlagsUpdate",
                 "description": "Switches of the explicit-proxy listener only. Applied live."
               }
+            ]
+          },
+          "ext_port": {
+            "description": "Extension listener port; `0` turns it off. Applied live.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
             ]
           },
           "host": {
