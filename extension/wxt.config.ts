@@ -13,9 +13,12 @@ export default defineConfig({
     icons,
     action: { default_icon: icons },
     permissions: [
-      'storage', 'tabs', 'cookies', 'scripting', 'activeTab', 'alarms', 'declarativeNetRequest',
-      ...(browser === 'firefox' ? ['webRequest', 'webRequestBlocking'] : []),
+      'storage', 'tabs', 'cookies', 'scripting', 'activeTab', 'alarms', 'proxy', 'webRequest',
+      ...(browser === 'firefox' ? ['webRequestBlocking', 'contextualIdentities'] : ['webRequestAuthProvider']),
     ],
+    // Chrome: a separate instance runs in incognito windows, with its own connection, session
+    // and cookie store, so incognito pages bind and relay with incognito cookies.
+    ...(browser === 'firefox' ? {} : { incognito: 'split' as const }),
     // Argus URL is user-entered: request its origin at runtime. Firefox needs <all_urls>
     // for webRequest observation of arbitrary sites.
     optional_host_permissions: ['http://*/*', 'https://*/*'],

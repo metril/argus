@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Bridge } from '../lib/bridge';
+import { StoreRelay } from '../lib/storerelay';
 import { decodeFrame, encodeFrame, payloadJson } from '../lib/frames';
 
 class FakeWS {
@@ -21,17 +22,17 @@ class FakeWS {
 const tick = () => new Promise((r) => setTimeout(r, 5));
 const SID = 'a'.repeat(32);
 
-function setup(opts: { perm?: boolean; fetch?: any } = {}) {
+function setup(opts: { perm?: boolean; fetch?: any; proxy?: any; storeRelay?: any } = {}) {
   const br = {
-    declarativeNetRequest: { updateSessionRules: vi.fn(async () => {}) },
     permissions: {
       contains: vi.fn(async () => opts.perm ?? true),
       getAll: vi.fn(async () => ({ origins: ['https://a.com/*', 'chrome://x/*', '<all_urls>'] })),
     },
     cookies: { getAll: vi.fn(async () => []), set: vi.fn(), remove: vi.fn() },
+    storage: { local: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) } },
   };
   const b = new Bridge({
-    WebSocketCtor: FakeWS as any, browser: br, fetch: opts.fetch,
+    WebSocketCtor: FakeWS as any, browser: br, fetch: opts.fetch, proxy: opts.proxy, storeRelay: opts.storeRelay,
     getSettings: async () => ({ argusUrl: 'https://argus.local:8443', token: 'tok' }),
   });
   return { br, b };
@@ -65,25 +66,21 @@ describe('Bridge', () => {
     ws.recv(JSON.stringify({ t: 'welcome', sid: SID, v: 1 }));
     await tick();
     expect(b.status()).toEqual({ connected: true, sid: SID });
-    expect(ws.texts()[1]).toEqual({ t: 'perms', origins: ['https://a.com/*', '<all_urls>'] });
+    expect(ws.texts()[1]).toEqual({ t: 'perms', origins: ['https://a.com/*'] });
     await b.stop();
   });
 
-  it('hosts installs the rule; disconnect removes it', async () => {
-    const { b, br } = setup();
+  it('the proxy message configures the browser proxy; disconnect clears it', async () => {
+    const proxy = { setSid: vi.fn(async () => {}), setServer: vi.fn(async () => {}) };
+    const { b } = setup({ proxy });
     const ws = await welcome(b);
-    ws.recv(JSON.stringify({ t: 'hosts', wildcard: false, hosts: ['a.com'], exclude: [] }));
+    expect(proxy.setSid).toHaveBeenLastCalledWith(SID);
+    ws.recv(JSON.stringify({ t: 'proxy', host: null, port: 3130 }));
     await tick();
-    const call = (br.declarativeNetRequest.updateSessionRules.mock.calls as any[]).at(-1)![0];
-    expect(call.removeRuleIds).toEqual([1]);
-    expect(call.addRules[0].condition.requestDomains).toEqual(['a.com']);
-    expect(call.addRules[0].action.requestHeaders[0].value).toBe(SID);
-    ws.recv(JSON.stringify({ t: 'hosts', wildcard: false, hosts: [] }));
-    await tick();
-    expect((br.declarativeNetRequest.updateSessionRules.mock.calls as any[]).at(-1)![0].addRules).toEqual([]);
+    expect(proxy.setServer).toHaveBeenLastCalledWith(null, 3130);
     ws.drop();
     await tick();
-    expect((br.declarativeNetRequest.updateSessionRules.mock.calls as any[]).at(-1)![0]).toEqual({ removeRuleIds: [1] });
+    expect(proxy.setSid).toHaveBeenLastCalledWith(null);
     expect(b.status().connected).toBe(false);
     await b.stop();
   });
@@ -106,6 +103,66 @@ describe('Bridge', () => {
     ws.recv(encodeFrame(0, 3, meta({ url: 'https://evil.com/' })));
     await tick();
     expect(payloadJson<any>(ws.frames().at(-1)!.payload).code).toBe('connect_denied');
+    await b.stop();
+  });
+
+  it('refuses loopback and private targets even when @connect allows them', async () => {
+    const { b } = setup();
+    const ws = await welcome(b);
+    for (const [i, host] of ['127.0.0.1', '10.0.0.5', '192.168.1.1', '169.254.169.254', '[::1]', 'localhost'].entries()) {
+      ws.recv(encodeFrame(0, 20 + i, meta({ url: `https://${host}/`, connect: { page: 'p.com', list: [host.replace(/[\[\]]/g, '')], all: true } })));
+    }
+    await tick();
+    const errs = ws.frames().filter((f) => f.type === 4);
+    expect(errs).toHaveLength(6);
+    expect(errs.every((f) => payloadJson<any>(f.payload).code === 'connect_denied')).toBe(true);
+    await b.stop();
+  });
+
+  it('a redirect that ends outside @connect is an error, not a response', async () => {
+    const f = vi.fn(async () => {
+      const r = new Response('secret');
+      Object.defineProperty(r, 'url', { value: 'https://evil.com/x' });
+      return r;
+    });
+    const { b } = setup({ fetch: f });
+    const ws = await welcome(b);
+    ws.recv(encodeFrame(0, 5, meta({})));
+    await tick(); await tick();
+    const fr = ws.frames();
+    expect(fr.some((x) => x.type === 1 || x.type === 2)).toBe(false);
+    expect(payloadJson<any>(fr.at(-1)!.payload).code).toBe('connect_denied');
+    await b.stop();
+  });
+
+  it('a hop the proxy refused (its marker header) is an error frame', async () => {
+    const f = vi.fn(async () => new Response('', { status: 403, headers: { 'x-adblock-note': 'relayed request refused' } }));
+    const { b } = setup({ fetch: f });
+    const ws = await welcome(b);
+    ws.recv(encodeFrame(0, 5, meta({})));
+    await tick(); await tick();
+    const fr = ws.frames();
+    expect(fr.some((x) => x.type === 1)).toBe(false);
+    expect(fr.at(-1)!.type).toBe(4);
+    await b.stop();
+  });
+
+  it('manual redirects are not relayed (the proxy keeps them on the jar)', async () => {
+    const f = vi.fn();
+    const { b } = setup({ fetch: f });
+    const ws = await welcome(b);
+    ws.recv(encodeFrame(0, 5, meta({ redirect: 'manual' })));
+    await tick();
+    expect(f).not.toHaveBeenCalled();
+    expect(ws.frames().at(-1)!.type).toBe(4);
+    await b.stop();
+  });
+
+  it('reports only per-host permissions: broad patterns and <all_urls> are left out', async () => {
+    const { b, br } = setup();
+    br.permissions.getAll.mockResolvedValue({ origins: ['<all_urls>', '*://*/*', 'https://*/*', 'http://*/*', 'https://a.com/*', '*://*.b.com/*'] } as any);
+    const ws = await welcome(b);
+    expect(ws.texts()[1]).toEqual({ t: 'perms', origins: ['https://a.com/*', '*://*.b.com/*'] });
     await b.stop();
   });
 
@@ -171,6 +228,41 @@ describe('Bridge', () => {
     expect(res).toHaveLength(1);
     expect(JSON.stringify(res)).not.toContain('"S"');
     expect(fr[1]!.type).toBe(3);
+    await b.stop();
+  });
+
+  it('a container job fetches without the default cookies, with the marker, through the store relay', async () => {
+    const proxy = { setSid: async () => {}, setServer: async () => {}, storeForToken: (t: string) => (t === 'tok1' ? 'firefox-container-1' : undefined) };
+    let seen: any;
+    const f = vi.fn(async (_u: string, init: any) => { seen = init; return new Response('ok'); });
+    const { b, br } = setup({ fetch: f, proxy });
+    const sr = new StoreRelay(br);
+    (br as any).webRequest = { onBeforeSendHeaders: { addListener: vi.fn() }, onHeadersReceived: { addListener: vi.fn() } };
+    const b2 = new Bridge({ WebSocketCtor: FakeWS as any, browser: br, fetch: f as any, proxy: proxy as any, storeRelay: sr, getSettings: async () => ({ argusUrl: 'https://argus.local:8443', token: 'tok' }) });
+    await b2.connect();
+    const ws = FakeWS.last; ws.open(); ws.recv(JSON.stringify({ t: 'welcome', sid: SID, v: 1 })); await tick();
+    ws.recv(encodeFrame(0, 5, meta({ store: 'tok1' })));
+    await tick(); await tick();
+    expect(seen.credentials).toBe('omit');
+    expect(seen.headers.get('X-Argus-Job')).toBeTruthy();
+    expect(sr.active()).toBe(0); // released after the job
+    // an unknown token is refused, nothing is fetched
+    f.mockClear();
+    ws.recv(encodeFrame(0, 6, meta({ store: 'forged' })));
+    await tick();
+    expect(f).not.toHaveBeenCalled();
+    expect(payloadJson<any>(ws.frames().at(-1)!.payload).code).toBe('store');
+    await b.stop(); await b2.stop();
+  });
+
+  it('a container cookie job reads and writes that store only', async () => {
+    const proxy = { setSid: async () => {}, setServer: async () => {}, storeForToken: (t: string) => (t === 'tok1' ? 'firefox-container-1' : undefined) };
+    const { b, br } = setup({ proxy });
+    br.cookies.getAll.mockResolvedValue([{ name: 'a', value: '1', domain: 'a.com', path: '/', httpOnly: false }] as any);
+    const ws = await welcome(b);
+    ws.recv(encodeFrame(0, 4, { op: 'cookie', script: 's', relay: 'r', store: 'tok1', connect: { page: 'a.com', list: [], all: false }, cookie: { op: 'list', url: 'https://a.com/' } }));
+    await tick();
+    expect(br.cookies.getAll).toHaveBeenCalledWith({ url: 'https://a.com/', storeId: 'firefox-container-1' });
     await b.stop();
   });
 });

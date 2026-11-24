@@ -29,6 +29,26 @@ export function connectAllows(c: ConnectSpec, hostIn: string): boolean {
   return false;
 }
 
+/** Loopback, private, link-local and unspecified targets (and local names): never relayed. */
+export function isLocalTarget(hostIn: string): boolean {
+  const h = normHost(hostIn);
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+  }
+  if (h.includes(':')) {
+    if (h === '::' || h === '::1') return true;
+    const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+    if (m) return isLocalTarget(m[1]!);
+    const first = parseInt(h.split(':')[0] || '0', 16);
+    return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80;
+  }
+  return false;
+}
+
 /** Parses an http(s) URL; returns the normalised host or null. */
 export function httpHost(url: string): { host: string; scheme: string } | null {
   try {

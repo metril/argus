@@ -12,16 +12,20 @@ export function mapCookie(c: any): CookieOut {
 
 const HTTP_ONLY = 'httpOnly cookies are not accessible';
 
-/** Default cookie store only (no storeId). httpOnly cookies are never read, written or deleted. */
-export async function cookieOp(br: any, req: CookieReq): Promise<unknown> {
+/**
+ * The job's cookie store (`storeId`; the default store when omitted). httpOnly cookies are never
+ * read, written or deleted here.
+ */
+export async function cookieOp(br: any, req: CookieReq, storeId?: string): Promise<unknown> {
+  const st = storeId ? { storeId } : {};
   if (req.op === 'list') {
-    const all: any[] = await br.cookies.getAll({ url: req.url, ...(req.name ? { name: req.name } : {}) });
+    const all: any[] = await br.cookies.getAll({ url: req.url, ...(req.name ? { name: req.name } : {}), ...st });
     return all.filter((c) => !c.httpOnly).map(mapCookie);
   }
   if (req.op === 'set') {
     const c: CookieIn = req.cookie;
     if (c.http_only) throw new BridgeError('denied', 'bad_request', HTTP_ONLY);
-    const existing: any[] = await br.cookies.getAll({ url: req.url, name: c.name });
+    const existing: any[] = await br.cookies.getAll({ url: req.url, name: c.name, ...st });
     if (existing.some((e) => e.httpOnly)) throw new BridgeError('denied', 'bad_request', HTTP_ONLY);
     const d: Record<string, unknown> = { url: req.url, name: c.name, value: c.value };
     if (c.domain !== undefined) d.domain = c.domain;
@@ -29,11 +33,11 @@ export async function cookieOp(br: any, req: CookieReq): Promise<unknown> {
     if (c.secure !== undefined) d.secure = c.secure;
     if (c.same_site && toBrowser[c.same_site]) d.sameSite = toBrowser[c.same_site];
     if (c.expiration_date !== undefined) d.expirationDate = c.expiration_date;
-    await br.cookies.set(d);
+    await br.cookies.set({ ...d, ...st });
     return null;
   }
-  const existing: any[] = await br.cookies.getAll({ url: req.url, name: req.name });
+  const existing: any[] = await br.cookies.getAll({ url: req.url, name: req.name, ...st });
   if (existing.some((e) => e.httpOnly)) throw new BridgeError('denied', 'bad_request', HTTP_ONLY);
-  await br.cookies.remove({ url: req.url, name: req.name });
+  await br.cookies.remove({ url: req.url, name: req.name, ...st });
   return null;
 }

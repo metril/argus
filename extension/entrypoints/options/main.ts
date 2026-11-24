@@ -35,10 +35,3 @@ $('test').addEventListener('click', async () => {
     r.kind === 'auth' ? `Auth failed (HTTP ${r.status}): check the token and that it has logs:read.` :
     r.kind === 'unconfigured' ? 'Enter a URL and token.' : `Failed: ${r.message}`;
 });
-
-$('menu-perm').addEventListener('click', async () => {
-  try {
-    const ok = await browser.permissions.request({ origins: ['http://*/*', 'https://*/*'] });
-    msg.textContent = ok ? 'Userscript menu allowed on all sites.' : 'Permission denied.';
-  } catch { msg.textContent = 'Permission request failed.'; }
-});

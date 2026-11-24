@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import { fakeBrowser } from 'wxt/testing/fake-browser';
 import { decodeFrame, encodeFrame, payloadJson } from '../lib/frames';
 import { connectAllows } from '../lib/connect';
-import { buildRule } from '../lib/dnr';
 import { cookieOp } from '../lib/cookies';
 import { renderMenu } from '../lib/menu';
 import { getSettings } from '../lib/api';
@@ -42,26 +41,6 @@ describe('connectAllows', () => {
   ];
   it.each(cases)('%j all=%s host=%s -> %s', (list, all, host, want) => {
     expect(connectAllows(c(list, all), host)).toBe(want);
-  });
-});
-
-describe('buildRule', () => {
-  it('null when no hosts', () => expect(buildRule('s', { wildcard: false, hosts: [] })).toBeNull());
-  it('hosts rule', () => {
-    const r = buildRule('sid1', { wildcard: false, hosts: ['a.com'], exclude: ['x.com'] })!;
-    expect(r.id).toBe(1);
-    expect(r.priority).toBe(1);
-    expect(r.condition).toEqual({
-      resourceTypes: ['main_frame', 'sub_frame'],
-      requestDomains: ['a.com'],
-      excludedRequestDomains: ['x.com'],
-    });
-    expect(r.action.requestHeaders).toEqual([{ header: 'X-Argus-Ext', operation: 'set', value: 'sid1' }]);
-  });
-  it('wildcard with exclude', () => {
-    const r = buildRule('s', { wildcard: true, hosts: ['a.com'], exclude: ['x.com'] })!;
-    expect(r.condition).toEqual({ resourceTypes: ['main_frame', 'sub_frame'], excludedRequestDomains: ['x.com'] });
-    expect(buildRule('s', { wildcard: true, hosts: [] })!.condition).toEqual({ resourceTypes: ['main_frame', 'sub_frame'] });
   });
 });
 

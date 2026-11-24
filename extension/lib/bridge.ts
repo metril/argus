@@ -1,14 +1,20 @@
-import { BridgeError, T, type ErrBody, type HostsMsg, type JobMeta, type XhrMeta } from './bridge-types';
-import { connectAllows, httpHost } from './connect';
+import { BridgeError, T, type ErrBody, type JobMeta, type ProxyMsg, type XhrMeta } from './bridge-types';
+import { connectAllows, httpHost, isLocalTarget } from './connect';
 import { cookieOp } from './cookies';
-import { buildRule, RULE_ID } from './dnr';
 import { decodeFrame, encodeFrame, payloadJson } from './frames';
+import { reportedOrigins } from './grants';
+import type { ProxyController } from './proxy';
+import { JOB_HEADER, StoreRelay } from './storerelay';
 
 export interface BridgeDeps {
   WebSocketCtor: new (url: string) => any;
   browser: any;
   getSettings: () => Promise<{ argusUrl: string; token: string }>;
   fetch?: typeof fetch;
+  /** Sends the browser through Argus and answers its 407 (see `ProxyController`). */
+  proxy?: ProxyController;
+  /** Relays for non-default cookie stores (Firefox containers, private windows). */
+  storeRelay?: StoreRelay;
 }
 
 const MAX_JOBS = 8;
@@ -54,7 +60,7 @@ export class Bridge {
     if (this.ws) return;
     const s = await this.d.getSettings();
     if (this.ws || this.stopped) return;
-    if (!s.argusUrl || !s.token) { await this.removeRule(); return; }
+    if (!s.argusUrl || !s.token) { await this.d.proxy?.setSid(null); return; }
     let ws: any;
     try { ws = new this.d.WebSocketCtor(wsUrl(s.argusUrl)); } catch { this.scheduleRetry(); return; }
     const gen = ++this.gen;
@@ -90,7 +96,8 @@ export class Bridge {
     for (const j of this.jobs.values()) { j.cancelled = true; j.abort.abort(); }
     this.jobs.clear();
     if (ws && closeSocket) { try { ws.close(); } catch { /* ignore */ } }
-    await this.removeRule();
+    // Disconnected: the browser goes direct and no 407 is answered.
+    await this.d.proxy?.setSid(null);
   }
 
   private async onClose() {
@@ -105,15 +112,10 @@ export class Bridge {
     this.retryTimer = setTimeout(() => { this.retryTimer = null; void this.connect(); }, wait);
   }
 
-  async removeRule() {
-    try { await this.d.browser.declarativeNetRequest.updateSessionRules({ removeRuleIds: [RULE_ID] }); } catch { /* ignore */ }
-  }
-
   async sendPerms() {
     if (!this.sid || !this.ws) return;
     try {
-      const p = await this.d.browser.permissions.getAll();
-      const origins = ((p?.origins ?? []) as string[]).filter((o) => /^(https?|\*):\/\//.test(o) || o === '<all_urls>');
+      const origins = await reportedOrigins(this.d.browser);
       this.ws.send(JSON.stringify({ t: 'perms', origins }));
     } catch { /* ignore */ }
   }
@@ -125,24 +127,18 @@ export class Bridge {
       if (m?.t === 'welcome' && typeof m.sid === 'string') {
         this.sid = m.sid;
         this.backoff = 1000;
+        await this.d.proxy?.setSid(m.sid);
         this.pingTimer = setInterval(() => { try { this.ws?.send('{"t":"ping"}'); } catch { /* ignore */ } }, PING_MS);
         await this.sendPerms();
-      } else if (m?.t === 'hosts' && this.sid) {
-        await this.applyHosts(m as HostsMsg);
+      } else if (m?.t === 'proxy' && this.sid) {
+        const p = m as ProxyMsg;
+        await this.d.proxy?.setServer(p.host, p.port);
       }
       return;
     }
     if (!this.sid) return;
     const f = decodeFrame(data as ArrayBuffer);
     if (f) this.onFrame(f.type, f.job, f.payload);
-  }
-
-  async applyHosts(msg: HostsMsg) {
-    if (!this.sid) return;
-    const rule = buildRule(this.sid, { wildcard: !!msg.wildcard, hosts: msg.hosts ?? [], exclude: msg.exclude });
-    try {
-      await this.d.browser.declarativeNetRequest.updateSessionRules({ removeRuleIds: [RULE_ID], addRules: rule ? [rule] : [] });
-    } catch { /* ignore */ }
   }
 
   private send(type: number, job: number, payload?: Uint8Array | string | object) {
@@ -187,17 +183,26 @@ export class Bridge {
   private async authorise(meta: JobMeta, url: string) {
     const h = httpHost(url);
     if (!h) throw new BridgeError('denied', 'bad_request', 'only http and https URLs are allowed');
+    if (isLocalTarget(h.host)) throw new BridgeError('denied', 'connect_denied', 'local and private targets are not relayed');
     if (!connectAllows(meta.connect, h.host)) throw new BridgeError('denied', 'connect_denied', 'host not allowed by @connect');
     const host = h.host.includes(':') ? `[${h.host}]` : h.host;
     const ok = await this.d.browser.permissions.contains({ origins: [`${h.scheme}://${host}/*`] });
     if (!ok) throw new BridgeError('denied', 'permission', 'extension lacks host permission');
   }
 
+  /** The real cookie store of a job's store token (`undefined`: the default store). */
+  private storeOf(token: string | undefined): string | undefined {
+    if (!token) return undefined;
+    const id = this.d.proxy?.storeForToken(token);
+    if (!id) throw new BridgeError('denied', 'store', 'unknown cookie store');
+    return id;
+  }
+
   private async run(id: number, job: Job, meta: JobMeta) {
     try {
       if (meta.op === 'cookie') {
         await this.authorise(meta, meta.cookie.url);
-        const result = await cookieOp(this.d.browser, meta.cookie);
+        const result = await cookieOp(this.d.browser, meta.cookie, this.storeOf(meta.store));
         if (job.cancelled) return;
         this.send(T.HEAD, id, { result });
         this.send(T.END, id, {});
@@ -214,6 +219,9 @@ export class Bridge {
   }
 
   private async xhr(id: number, job: Job, meta: XhrMeta) {
+    // A browser fetch cannot expose a redirect response (`manual` yields an opaque one), so
+    // the proxy keeps those calls on its own jar; refuse if one arrives anyway.
+    if (meta.redirect === 'manual') throw new BridgeError('denied', 'bad_request', 'manual redirects are not relayed');
     await this.authorise(meta, meta.url);
     let body: Uint8Array | undefined;
     if (meta.hasBody) {
@@ -231,6 +239,17 @@ export class Bridge {
       try { headers.append(k, v); } catch { /* skip invalid header */ }
     }
     headers.set('X-Argus-Relay', meta.relay);
+    // A non-default cookie store (container, private window): the fetch is made without the
+    // default store's cookies; the store's own go in per hop and its Set-Cookie comes back to it.
+    const storeId = this.storeOf(meta.store);
+    let marker: string | null = null;
+    if (storeId) {
+      const sr = this.d.storeRelay;
+      if (!sr || !sr.install()) throw new BridgeError('denied', 'store', 'this browser cannot relay for that cookie store');
+      marker = crypto.randomUUID();
+      headers.set(JOB_HEADER, marker);
+      sr.register(marker, storeId);
+    }
     let timedOut = false;
     const timer = meta.timeout && meta.timeout > 0
       ? setTimeout(() => { timedOut = true; job.abort.abort(); }, meta.timeout) : null;
@@ -239,8 +258,8 @@ export class Bridge {
       let res: Response;
       try {
         res = await f(meta.url, {
-          method: meta.method, headers, credentials: 'include',
-          redirect: meta.redirect === 'manual' ? 'manual' : meta.redirect,
+          method: meta.method, headers, credentials: storeId ? 'omit' : 'include',
+          redirect: meta.redirect,
           signal: job.abort.signal, body: body as BodyInit | undefined,
         });
       } catch {
@@ -248,6 +267,17 @@ export class Bridge {
         throw new BridgeError('network', 'network', 'network error');
       }
       if (job.cancelled) return;
+      // Every hop passed through the proxy, which checks it (live job, the session's host
+      // permission, `@connect`, local targets) and answers a refused one with this marker.
+      if (res.headers.get('x-adblock-note') === 'relayed request refused') {
+        void res.body?.cancel();
+        throw new BridgeError('denied', 'connect_denied', 'a redirect hop was refused');
+      }
+      // The browser followed redirects itself and the intermediate hops are not visible here,
+      // but the final URL is: it must pass the job's @connect, the permission and the local check.
+      if (res.url && res.url !== meta.url) {
+        try { await this.authorise(meta, res.url); } catch (e) { void res.body?.cancel(); throw e; }
+      }
       const hdrs: [string, string][] = [];
       res.headers.forEach((v, k) => { if (k.toLowerCase() !== 'set-cookie') hdrs.push([k, v]); });
       this.send(T.HEAD, id, { status: res.status, statusText: res.statusText, headers: hdrs, finalUrl: res.url, redirected: res.redirected });
@@ -273,6 +303,7 @@ export class Bridge {
       this.send(T.END, id, {});
     } finally {
       if (timer) clearTimeout(timer);
+      if (marker) this.d.storeRelay?.release(marker);
     }
   }
 }
