@@ -110,24 +110,32 @@ function (W, reg, mode, nonce) {
     return el ? [gCW(el), gCH(el)] : null;
   }
   // False when the page hides, fades, moves or covers the badge (or an ancestor) with styles.
+  // Order matters: the page's state is READ first and judged, and only then do we pin our own
+  // styles back (re-pinning first would erase a page's inline tampering before we looked at it).
   function intact(el, isBadge) {
-    pin(); raise();
+    var ok = true;
     try {
       if (typeof gcs === "function") {
         var cs = apply(gcs, W, [host]);
         if (!(pf(gp(cs, "opacity")) >= 1) || gp(cs, "transform") !== "none" || gp(cs, "filter") !== "none" || gp(cs, "clip-path") !== "none" ||
-            gp(cs, "visibility") !== "visible" || gp(cs, "display") === "none" || gp(cs, "pointer-events") === "none") { return false; }
-        if (!fShow) {
+            gp(cs, "visibility") !== "visible" || gp(cs, "display") === "none" || gp(cs, "pointer-events") === "none") { ok = false; }
+        if (ok && !fShow) {
           var de = apply(gcs, W, [gDocEl(D)]);
-          if (!(pf(gp(de, "opacity")) >= 1) || gp(de, "filter") !== "none" || gp(de, "transform") !== "none") { return false; }
+          if (!(pf(gp(de, "opacity")) >= 1) || gp(de, "filter") !== "none" || gp(de, "transform") !== "none") { ok = false; }
         }
       }
+      if (ok && isBadge && fRect) {
+        var r0 = apply(fRect, el, NOARGS), vp = viewport();
+        if (!vp || abs(rW(r0) - 28) > 2 || abs(rH(r0) - 28) > 2 || abs(vp[0] - rR(r0) - 12) > 4 || abs(vp[1] - rB(r0) - 12) > 4) { ok = false; }
+      }
+    } catch (e) { ok = false; }
+    pin();
+    if (!ok) { return false; }
+    raise();
+    try {
       if (fRect) {
         var r = apply(fRect, el, NOARGS), l = rL(r), t = rT(r), rr = rR(r), b = rB(r);
-        if (isBadge) {
-          var vp = viewport();
-          if (!vp || abs(rW(r) - 28) > 2 || abs(rH(r) - 28) > 2 || abs(vp[0] - rr - 12) > 4 || abs(vp[1] - b - 12) > 4) { return false; }
-        } else if (menuEl) {
+        if (!isBadge && menuEl) {
           // The item may be scrolled partly out of the menu: test the visible part.
           var m = apply(fRect, menuEl, NOARGS);
           l = max(l, rL(m)); t = max(t, rT(m)); rr = min(rr, rR(m)); b = min(b, rB(m));

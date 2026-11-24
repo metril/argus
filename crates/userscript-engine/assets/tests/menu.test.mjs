@@ -112,7 +112,14 @@ function page(mode) {
   env.document.currentScript = { nonce: "n1", getAttribute: (n) => (n === "data-m" ? mode : null) };
   W.top = W;
   env.cs = new CSD(GOOD);
-  W.getComputedStyle = () => env.cs;
+  W.getComputedStyle = (el) => {
+    const c = new CSD(), v = env.cs.v, ks = okeys(v);
+    for (let i = 0; i < ks.length; i++) c.v[ks[i]] = v[ks[i]];
+    const s = el && el.sx && el.sx.s, is = s ? okeys(s) : [];
+    for (let i = 0; i < is.length; i++) c.v[is[i]] = s[is[i]][0];
+    return c;
+  };
+  env.tamper = (k, v) => { hostOf(env).sx.s[k] = [v, "important"]; };
   env.timers = [];
   W.setTimeout = (f, ms) => env.timers.push([f, ms]);
   const mos = [];
@@ -170,10 +177,9 @@ test("grouped by script; synthetic/fake clicks, early clicks, tampered styles an
   badge.fire("click", U());
   badge.fire("click", { isTrusted: true }); // a plain object: the saved getter refuses it
   assert.equal(badge.at["aria-expanded"], "false");
-  env.cs.v.opacity = "0.01";
+  env.tamper("opacity", "0.01");
   badge.fire("click", T());
   assert.equal(badge.at["aria-expanded"], "false", "faded badge ignores clicks");
-  env.cs.v.opacity = "1";
   env.hits = () => [{}, hostOf(env)];
   badge.fire("click", T());
   assert.equal(badge.at["aria-expanded"], "false", "covered badge ignores clicks");
@@ -191,10 +197,9 @@ test("grouped by script; synthetic/fake clicks, early clicks, tampered styles an
   item().fire("click", U());
   item().fire("click", { isTrusted: true });
   assert.deepEqual(hits, []);
-  env.cs.v.transform = "scale(2)";
+  env.tamper("transform", "scale(2)");
   item().fire("click", T());
   assert.deepEqual(hits, [], "transformed host ignored");
-  env.cs.v.transform = "none";
   // the item's visible part is what is hit-tested: scrolled fully out of the menu box it is ignored
   item().rect = { width: 28, height: 20, left: 984, top: 100, right: 1012, bottom: 120 };
   item().fire("click", T());
@@ -419,14 +424,47 @@ test("a page that fades the badge and lies via a replaced getComputedStyle still
   const env = page("on_demand");
   const api = await run(env, { grants: GR });
   let hit = 0;
-  env.cs.v.opacity = "0.01";
-  env.W.getComputedStyle = () => new CSD(GOOD);
   api.GM_registerMenuCommand("secret", () => hit++);
+  env.W.getComputedStyle = () => new CSD(GOOD);
   const badge = kq(hostOf(env).shadow, "badge");
+  env.tamper("opacity", "0");
   badge.fire("click", T());
   assert.equal(badge.at["aria-expanded"], "false");
-  env.cs.v.opacity = "1";
   badge.fire("click", T());
   assert.equal(badge.at["aria-expanded"], "true");
   assert.equal(hit, 0);
+});
+
+test("a page that re-tampers the host's inline style right before every click never gets one through", async () => {
+  const env = page("on_demand");
+  const api = await run(env, { grants: GR });
+  let hit = 0;
+  api.GM_registerMenuCommand("x", () => hit++);
+  const badge = kq(hostOf(env).shadow, "badge");
+  const bad = [["opacity", "0"], ["transform", "translate(-200px,-200px)"], ["visibility", "hidden"], ["display", "none"], ["pointer-events", "none"], ["filter", "blur(1px)"], ["clip-path", "inset(50%)"]];
+  for (const [k, v] of bad) {
+    for (let i = 0; i < 3; i++) {
+      env.tamper(k, v); // what the page's 5 ms loop does, applied just before the user's click
+      badge.fire("click", T());
+      assert.equal(badge.at["aria-expanded"], "false", k + " tampering refused");
+    }
+  }
+  // moved by a page transform: the rect check catches it as well
+  env.tamper("transform", "translate(-200px,-200px)");
+  badge.rect = { width: 28, height: 28, left: 784, top: 528, right: 812, bottom: 556 };
+  badge.fire("click", T());
+  assert.equal(badge.at["aria-expanded"], "false");
+  badge.rect = undefined;
+  badge.fire("click", T()); // after the refusals the host was pinned back: a clean click works
+  assert.equal(badge.at["aria-expanded"], "true");
+  // the same for an item
+  advance(450);
+  const it = all(hostOf(env).shadow).find((n) => n.at && n.at.class === "c");
+  for (const [k, v] of bad) {
+    env.tamper(k, v);
+    it.fire("click", T());
+    assert.equal(hit, 0, k + " tampering refused for items");
+  }
+  it.fire("click", T());
+  assert.equal(hit, 1);
 });
