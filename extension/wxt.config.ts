@@ -11,6 +11,10 @@ export default defineConfig({
     author: 'metril',
     homepage_url: 'https://github.com/metril/argus',
     icons,
+    // Firefox's default MV3 policy adds `upgrade-insecure-requests`, which turns the channel's
+    // `ws://` into `wss://` and breaks a plain-http Argus console; Chrome's has no such directive.
+    // Stated explicitly so both behave the same (still no remote code).
+    content_security_policy: { extension_pages: "script-src 'self'; object-src 'self';" },
     action: { default_icon: icons },
     permissions: [
       'storage', 'tabs', 'cookies', 'scripting', 'activeTab', 'alarms', 'proxy', 'webRequest',

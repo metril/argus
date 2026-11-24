@@ -681,6 +681,7 @@ impl ProxyContext {
         // The extension bridge's headers never leave: the session secret and the relay token
         // are read here and removed from the request.
         let relay = crate::ext_bridge::take_headers(&mut headers);
+        let store_header = crate::ext_bridge::take_store_header(&mut headers);
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -1203,7 +1204,19 @@ impl ProxyContext {
                         let session = rctx
                             .ext
                             .filter(|s| self.internal.gm.ext().allows(*s, &prof.name));
-                        let store = rctx.ext_store.as_deref().unwrap_or("");
+                        // The store: from the connection's credentials, else (Firefox) from the
+                        // token the extension stamped on this document request.
+                        let store = match rctx.ext_store.as_deref() {
+                            Some(s) if !s.is_empty() => s,
+                            _ if matches!(
+                                rtype,
+                                RequestType::Document | RequestType::Subdocument
+                            ) =>
+                            {
+                                store_header.as_deref().unwrap_or("")
+                            }
+                            _ => "",
+                        };
                         self.internal.gm.plan_document_bound(
                             &idx,
                             &prof.name,

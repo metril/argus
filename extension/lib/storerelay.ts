@@ -36,8 +36,12 @@ export class StoreRelay {
     if (this.installed) return true;
     if (!wr?.onBeforeSendHeaders?.addListener || !wr?.onHeadersReceived?.addListener) return false;
     const filter = { urls: ['<all_urls>'], types: ['xmlhttprequest'] };
-    wr.onBeforeSendHeaders.addListener((d: any) => this.beforeSend(d), filter, ['blocking', 'requestHeaders', 'extraHeaders']);
-    wr.onHeadersReceived.addListener((d: any) => this.received(d), filter, ['blocking', 'responseHeaders', 'extraHeaders']);
+    // `extraHeaders` (needed in Chrome to see Cookie and Set-Cookie) is not a valid option in Firefox.
+    const add = (ev: any, fn: (d: any) => unknown, base: string[]) => {
+      try { ev.addListener(fn, filter, [...base, 'extraHeaders']); } catch { ev.addListener(fn, filter, base); }
+    };
+    add(wr.onBeforeSendHeaders, (d) => this.beforeSend(d), ['blocking', 'requestHeaders']);
+    add(wr.onHeadersReceived, (d) => this.received(d), ['blocking', 'responseHeaders']);
     this.installed = true;
     return true;
   }

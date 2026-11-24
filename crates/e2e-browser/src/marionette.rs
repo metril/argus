@@ -115,6 +115,22 @@ impl Marionette {
         Ok(())
     }
 
+    /// Trust `ca_pem` as a certificate authority for websites (browser-level, all tabs).
+    pub async fn trust_ca(&mut self, ca_pem: &str) -> Result<(), String> {
+        let b64: String = ca_pem.lines().filter(|l| !l.starts_with("-----")).collect();
+        self.call("Marionette:SetContext", json!({"value": "chrome"}))
+            .await?;
+        let r = self
+            .call(
+                "WebDriver:ExecuteScript",
+                json!({"script": "const db = Cc['@mozilla.org/security/x509certdb;1'].getService(Ci.nsIX509CertDB); db.addCertFromBase64(arguments[0], 'C,,'); return true;", "args": [b64]}),
+            )
+            .await;
+        self.call("Marionette:SetContext", json!({"value": "content"}))
+            .await?;
+        r.map(|_| ())
+    }
+
     /// Run `body` (an async function body using `arguments`-style `args`) in the current page and
     /// return its JSON value. `wrappedJSObject.browser` is the extension API on an extension page.
     pub async fn run(&mut self, body: &str, args: Value) -> Result<Value, String> {

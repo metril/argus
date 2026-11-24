@@ -54,7 +54,7 @@ async fn api(m: &mut Marionette, path: &str, args: Value) -> Value {
         const s = w.JSON.stringify(r === undefined ? null : r); return JSON.parse(s);";
     m.run(body, json!([path, args.to_string()]))
         .await
-        .unwrap_or_else(|e| panic!("browser.{path}: {e}"))
+        .unwrap_or_else(|e| panic!("browser.{path} {args}: {e}"))
 }
 
 async fn until(what: &str, mut f: impl AsyncFnMut() -> bool) {
@@ -164,6 +164,13 @@ async fn containers_private_windows_and_per_store_relays_in_real_firefox() {
         .expect("spawn firefox");
 
     let mut m = Marionette::connect(mport).await.expect("marionette");
+    m.trust_ca(&String::from_utf8_lossy(&argus.ca_pem))
+        .await
+        .expect("trust the Argus CA");
+    // (direct loads of a switched-off container reach the origin without Argus)
+    m.trust_ca(origin.ca_pem())
+        .await
+        .expect("trust the origin CA");
     m.install_addon(ext_dir.to_str().unwrap())
         .await
         .expect("install the add-on");
@@ -263,6 +270,35 @@ async fn containers_private_windows_and_per_store_relays_in_real_firefox() {
     )
     .await;
 
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    eprintln!(
+        "DBG origin {:?}",
+        origin
+            .requests()
+            .iter()
+            .map(|r| format!("{} {}{}", r.method, r.host, r.path_and_query))
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "DBG tabs {}",
+        api(&mut m, "tabs.query", json!([{}]))
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| format!("{} {} {}", t["id"], t["url"], t["title"]))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    eprintln!(
+        "DBG proxy {}",
+        api(
+            &mut m,
+            "runtime.sendMessage",
+            json!([{"type": "proxy-get"}])
+        )
+        .await
+    );
     let seen = |tag: &str| {
         origin
             .requests()
@@ -345,16 +381,25 @@ async fn containers_private_windows_and_per_store_relays_in_real_firefox() {
             == false
     })
     .await;
+    // (the last focused window is the private one: name the normal window)
+    let win = api(&mut m, "tabs.query", json!([{}]))
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["incognito"] == false)
+        .unwrap()["windowId"]
+        .clone();
     api(
         &mut m,
         "tabs.create",
-        json!([{"url": open("B2"), "cookieStoreId": b}]),
+        json!([{"url": open("B2"), "cookieStoreId": b, "windowId": win}]),
     )
     .await;
     api(
         &mut m,
         "tabs.create",
-        json!([{"url": open("A2"), "cookieStoreId": a}]),
+        json!([{"url": open("A2"), "cookieStoreId": a, "windowId": win}]),
     )
     .await;
     until("A's second page to relay", async || !seen("A2").is_empty()).await;

@@ -144,6 +144,23 @@ export class ProxyController {
   }
 
   /**
+   * Firefox `webRequest.onBeforeSendHeaders` (blocking) for documents: a request of a non-default
+   * store carries that store's opaque token in `X-Argus-Store`. The credentials of the proxy
+   * name only the session, because Firefox keeps one proxy-credential cache for all containers
+   * (the first answer would bind every container to its store); the store therefore rides in
+   * this header. The proxy reads it only on document requests of an authenticated extension
+   * connection and always removes it; a page cannot set it on a navigation, and a guessed token
+   * is useless (random, new for every session).
+   */
+  stampStore(d: { cookieStoreId?: string; requestHeaders?: { name: string; value?: string }[] }): { requestHeaders?: { name: string; value?: string }[] } {
+    if (!this.active() || !this.storeEnabled(d.cookieStoreId)) return {};
+    const tok = this.tokenFor(d.cookieStoreId);
+    const hs = (d.requestHeaders ?? []).filter((h) => h.name.toLowerCase() !== 'x-argus-store');
+    if (tok) hs.push({ name: 'X-Argus-Store', value: tok });
+    return { requestHeaders: hs };
+  }
+
+  /**
    * `webRequest.onAuthRequired`: answer only our own listener (host, port, realm) and only while
    * active; each request id is answered once (a rejected secret ends there, no retry loop).
    */
@@ -157,7 +174,6 @@ export class ProxyController {
       if (this.answered.size > 2000) this.answered.clear();
     }
     if (!this.storeEnabled(d.cookieStoreId)) return {};
-    const tok = this.d.firefox ? this.tokenFor(d.cookieStoreId) : '';
-    return { authCredentials: { username: 'ext', password: tok ? `${this.sid}:${tok}` : this.sid } };
+    return { authCredentials: { username: 'ext', password: this.sid } };
   }
 }
