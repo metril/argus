@@ -58,6 +58,51 @@ pub fn use_focus_return(open: Signal<bool>) {
     });
 }
 
+// Number of open overlays that want the page behind them frozen.
+thread_local! {
+    static SCROLL_LOCKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Freeze page scrolling (class `noscroll` on `<body>`) while `open` is true. Counted, so
+/// overlapping overlays release it only when the last one closes.
+pub fn use_body_scroll_lock(open: Signal<bool>) {
+    let set = |on: bool| {
+        let n = SCROLL_LOCKS.with(|c| {
+            let n = if on {
+                c.get() + 1
+            } else {
+                c.get().saturating_sub(1)
+            };
+            c.set(n);
+            n
+        });
+        if let Some(b) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.body())
+        {
+            let _ = b.class_list().toggle_with_force("noscroll", n > 0);
+        }
+    };
+    // Whether this overlay took the lock, so cleanup releases exactly what it holds.
+    let held = StoredValue::new_local(false);
+    Effect::new(move |_| {
+        let now = open.get();
+        if now && !held.get_value() {
+            held.set_value(true);
+            set(true);
+        } else if !now && held.get_value() {
+            held.set_value(false);
+            set(false);
+        }
+    });
+    on_cleanup(move || {
+        if held.try_get_value().unwrap_or(false) {
+            held.set_value(false);
+            set(false);
+        }
+    });
+}
+
 /// Drawer. `children` is the body; `footer` (optional) renders in the footer bar.
 #[component]
 pub fn Drawer(
@@ -70,6 +115,7 @@ pub fn Drawer(
     fill: bool,
 ) -> impl IntoView {
     use_focus_return(open.into());
+    use_body_scroll_lock(open.into());
     let node: NodeRef<leptos::html::Aside> = NodeRef::new();
     Effect::new(move |_| {
         if open.get() {

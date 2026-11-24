@@ -236,6 +236,11 @@ fn PolicyTop(reload: RwSignal<u32>) -> impl IntoView {
                     />
                     <div></div>
                 </div>
+                {move || panel.get().filter(|p| p.auth == "pin" && !p.pin_set).map(|_| view! {
+                    <p class="hint" role="alert" style="color:var(--error)">
+                        "No PIN is set, so the in-page panel cannot apply changes (they are refused). Set a PIN below, or choose another confirmation method."
+                    </p>
+                })}
                 <InlineRow
                     label="PIN"
                     sub="4 to 8 digits. Empty and Save removes it."
@@ -480,7 +485,7 @@ fn SitesCard(reload: RwSignal<u32>) -> impl IntoView {
         }
         let label = feed
             .items
-            .with_untracked(|v| v.get(i).map(|r| r.scope.clone()));
+            .with_untracked(|v| v.get(i).filter(|_| i > 0).map(|r| r.scope.clone()));
         anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("sa", label)]))));
     });
 

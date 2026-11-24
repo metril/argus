@@ -321,8 +321,29 @@ fn count_rules(content: &str) -> usize {
     content
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with(['!', '#']))
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with('!')
+                // `# comment` (hosts style) is a comment; `##sel`, `#@#`, `#?#`, `#$#`, `#%#` are
+                // cosmetic rules.
+                && (!l.starts_with('#') || is_cosmetic_hash_line(l))
+        })
         .count()
+}
+
+/// A line starting with `#` that is a cosmetic rule rather than a `# comment`: `##sel`, `#@#`,
+/// `#?#`, `#$#`, `#%#`. `##` must be followed by a selector character, so `## Title` and
+/// `####` banner lines count as comments.
+fn is_cosmetic_hash_line(l: &str) -> bool {
+    if let Some(rest) = l.strip_prefix("##") {
+        return rest
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '#');
+    }
+    ["#@#", "#?#", "#$#", "#%#"]
+        .iter()
+        .any(|p| l.starts_with(p))
 }
 
 fn sorted_includes(m: &HashMap<String, String>) -> Vec<(&String, &String)> {
@@ -822,6 +843,7 @@ impl ListService {
             if id != CUSTOM_REPORT_ID {
                 if let Ok(Some(mut list)) = self.store.get(id) {
                     list.rule_count = report.network + report.cosmetic + report.ext;
+                    list.duplicate_count = Some(report.duplicates);
                     let _ = self.store.upsert(&list);
                 }
             }
@@ -1047,6 +1069,7 @@ impl ListService {
             }) => {
                 list.etag = etag;
                 list.rule_count = count_rules(&text);
+                list.duplicate_count = None;
                 list.last_updated = status.last_checked;
                 status.last_modified = last_modified;
                 status.last_success = status.last_checked;
@@ -1269,6 +1292,20 @@ enum Fetched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_rules_counts_cosmetic_and_skips_comments() {
+        let t = "[Adblock Plus 2.0]\n! c\n# hosts comment\n||a.example^\n##.ad\nx.com#@#.y\n\n";
+        // The `[Adblock ...]` header line is counted by this approximation; the build report
+        // replaces it with exact figures.
+        assert_eq!(count_rules(t), 4);
+        let hosts = "####################\n## Title\n# comment\n0.0.0.0 a.example\n#### end\n";
+        assert_eq!(count_rules(hosts), 1);
+        assert_eq!(
+            count_rules("##.ad\n#?#div:has(a)\n#$#a{x:y}\n#%#//scriptlet('x')\n"),
+            4
+        );
+    }
 
     #[tokio::test]
     async fn panicking_build_does_not_hang_and_records_status() {

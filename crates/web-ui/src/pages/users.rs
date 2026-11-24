@@ -239,7 +239,7 @@ fn UsersInner() -> impl IntoView {
         <div class="card">
             <Scroller feed=users class="tbl-wrap">
                 <table class="tbl">
-                    <thead><tr><th>"User"</th><th>"Role"</th><th>"Enabled"</th><th>"Profile"</th><th class="r">"Sessions"</th><th>"Last seen"</th><th></th></tr></thead>
+                    <thead><tr><th>"User"</th><th>"Role"</th><th>"Enabled"</th><th>"Profile"</th><th class="r">"Sessions"</th><th title="When the user last signed in (not their last activity)">"Last sign-in"</th><th></th></tr></thead>
                     <tbody>
                         <For
                             each=move || users.items.get()

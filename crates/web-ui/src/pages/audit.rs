@@ -92,8 +92,11 @@ fn AuditInner() -> impl IntoView {
         feed.reload(None, false, None);
     });
 
+    // Only routes with an id in the path carry a target; hide the column when none loaded do.
+    let has_target = Memo::new(move |_| feed.items.with(|v| v.iter().any(|e| e.target.is_some())));
+
     view! {
-        <div class="toolbar">
+        <div class="toolbar audbar">
             <div class="search grow">
                 <Icon name="search" />
                 <label class="sr" for="audQ">"Search audit log"</label>
@@ -118,17 +121,18 @@ fn AuditInner() -> impl IntoView {
         <div class="card">
             <Scroller feed=feed class="tbl-wrap">
                 <table class="tbl">
-                    <thead><tr><th>"Time"</th><th>"Actor"</th><th>"Action"</th><th>"Target"</th><th>"IP"</th><th>"Result"</th></tr></thead>
+                    <thead><tr><th>"Time"</th><th>"Actor"</th><th>"Action"</th>{move || has_target.get().then(|| view! { <th>"Target"</th> })}<th>"IP"</th><th>"Result"</th></tr></thead>
                     <tbody>
                         <For each=move || feed.items.get() key=|e| e.id.clone() children=move |e| {
                             let who = e.actor_name.clone().unwrap_or_else(|| e.actor_type.clone());
                             let ok = e.outcome == "success";
+                            let target = e.target.clone().unwrap_or_default();
                             view! {
                                 <tr>
                                     <td class="mono num dim">{fmt_datetime(&e.at)}</td>
                                     <td>{who}</td>
                                     <td class="mono">{format!("{} {}", e.method, e.route)}</td>
-                                    <td class="mono" style="white-space:normal;min-width:160px">{e.target.clone().unwrap_or_default()}</td>
+                                    {move || has_target.get().then(|| view! { <td class="mono" style="white-space:normal;min-width:160px">{target.clone()}</td> })}
                                     <td class="mono dim">{e.ip.clone().unwrap_or_default()}</td>
                                     <td><Pill kind=if ok { "ok" } else { "failed" } text=if ok { "ok".to_string() } else { e.outcome.clone() } /></td>
                                 </tr>

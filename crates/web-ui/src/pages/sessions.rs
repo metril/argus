@@ -12,7 +12,7 @@ use crate::api::ApiClient;
 use crate::components::{ConfirmButton, Layout, RequireAdmin};
 use crate::pages::tokens::scope_tags;
 use crate::state::use_app_state;
-use crate::utils::{fmt_ago, fmt_datetime};
+use crate::utils::{fmt_ago, fmt_datetime, ua_label};
 
 #[component]
 pub fn SessionsPage() -> impl IntoView {
@@ -152,7 +152,7 @@ fn SessionsInner() -> impl IntoView {
                                 view! {
                                     <tr>
                                         <td>{s.username.clone()}{s.current.then(|| view! { " " <span class="badge">"this session"</span> })}</td>
-                                        <td>{s.user_agent.clone().unwrap_or_else(|| "Unknown".into())}</td>
+                                        <td><span class="ua" title=s.user_agent.clone().unwrap_or_default()>{s.user_agent.as_deref().map(ua_label).unwrap_or_else(|| "Unknown".into())}</span></td>
                                         <td class="mono">{s.ip_address.clone().unwrap_or_default()}</td>
                                         <td class="num">{fmt_datetime(&s.created_at)}</td>
                                         <td class="num">{fmt_ago(&s.last_activity)}</td>

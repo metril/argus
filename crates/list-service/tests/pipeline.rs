@@ -145,6 +145,10 @@ async fn hosts_list_is_converted_detected_and_reported() {
     let s = e.svc.summary();
     assert_eq!((s.lists, s.network, s.from_persisted), (1, 2, false));
     assert_eq!(e.svc.store().get("l").unwrap().unwrap().rule_count, 2);
+    assert_eq!(
+        e.svc.store().get("l").unwrap().unwrap().duplicate_count,
+        Some(0)
+    );
 }
 
 #[tokio::test]

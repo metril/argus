@@ -12,6 +12,7 @@ use crate::api::profiles::{
 use crate::api::ApiClient;
 use crate::components::{ConfirmButton, Drawer, Icon, Layout};
 use crate::state::use_app_state;
+use crate::utils::format_number;
 use gloo_timers::callback::Timeout;
 use std::rc::Rc;
 
@@ -126,9 +127,9 @@ pub fn DevicesPage() -> impl IntoView {
         if sort.get_untracked() != "name" {
             return;
         }
-        let label = feed
-            .items
-            .with_untracked(|v: &Vec<DeviceDto>| v.get(i).map(|r| r.name.clone()));
+        let label = feed.items.with_untracked(|v: &Vec<DeviceDto>| {
+            v.get(i).filter(|_| i > 0).map(|r| r.name.clone())
+        });
         anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("da", label)]))));
     });
     Effect::new(move |_| {
@@ -317,10 +318,10 @@ pub fn DevicesPage() -> impl IntoView {
                         </div>
                         <select class="select" aria-label="Filter by profile" prop:value=move || prof.get()
                             on:change=move |ev| prof.set(event_target_value(&ev))>
-                            <option value="">{move || format!("All profiles ({})", counts.get().map(|c| c.all).unwrap_or(0))}</option>
+                            <option value="">{move || format!("All profiles ({})", format_number(profiles.with(|p| p.len()) as u64))}</option>
                             {move || profiles.get().into_iter().map(|p| {
                                 let n = counts.get().and_then(|c| c.by_profile.get(&p.id).copied()).unwrap_or(0);
-                                view! { <option value=p.id.clone()>{format!("{} ({n})", p.name)}</option> }
+                                view! { <option value=p.id.clone()>{format!("{} ({} {})", p.name, format_number(n as u64), if n == 1 { "device" } else { "devices" })}</option> }
                             }).collect_view()}
                         </select>
                         <select class="select" aria-label="Sort" prop:value=move || sort.get()

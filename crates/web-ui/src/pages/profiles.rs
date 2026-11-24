@@ -11,7 +11,7 @@ use super::vlist::{Feed, Fetcher, Scroller};
 use crate::api::filters::FilterList;
 use crate::api::profiles::{CreateProfileRequest, ProfileDto, UpdateProfileRequest};
 use crate::api::{ApiClient, ApiError};
-use crate::components::{Card, ChipSelect, Drawer, Layout};
+use crate::components::{Card, ChipSelect, Drawer, Icon, Layout};
 use crate::state::use_app_state;
 
 /// The built-in default profile (its lists and rules are the global ones).
@@ -199,6 +199,7 @@ pub fn ProfilesPage() -> impl IntoView {
             </p>
             <Card title="Profiles" class="settings-card">
                 <div class="search">
+                    <Icon name="search" />
                     <label class="sr" for="profQ">"Search profiles"</label>
                     <input class="input" id="profQ" placeholder="Search profiles"
                         prop:value=move || pq_raw.get()

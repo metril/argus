@@ -31,6 +31,7 @@ fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> F
         enabled: list.enabled,
         last_updated: list.last_updated.map(|dt| dt.to_rfc3339()),
         rule_count: list.rule_count,
+        duplicate_count: list.duplicate_count,
         last_error: status.last_error,
         last_checked: status.last_checked.map(|dt| dt.to_rfc3339()),
         format: list.format.as_str().to_string(),
@@ -305,6 +306,7 @@ pub async fn update_filter_list(
             list.etag = None;
             list.last_updated = None;
             list.rule_count = 0;
+            list.duplicate_count = None;
             reset_status = true;
         }
     }
