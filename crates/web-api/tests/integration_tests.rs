@@ -1225,7 +1225,7 @@ async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
     );
     assert_eq!(cat["entries"].as_array().unwrap().len(), 1);
 
-    // An entry in a format we cannot add is left out of the listing (and refused when added).
+    // An entry in a format we cannot add is left out of the listing (and not found when added).
     let text = filters_json("clash");
     let sig = signer.sign(&text, "v2026.11.24", "filters.json");
     doc.apply(text, sig, None).await.unwrap();
@@ -1234,7 +1234,7 @@ async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
     admin
         .post("/api/v1/lists/catalogue/fx")
         .await
-        .assert_status_bad_request();
+        .assert_status_not_found();
     let text = filters_json("ubo");
     let sig = signer.sign(&text, "v2026.11.25", "filters.json");
     doc.apply(text, sig, None).await.unwrap();

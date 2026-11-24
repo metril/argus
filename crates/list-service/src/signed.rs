@@ -18,6 +18,44 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// Most entries accepted from one document.
 const MAX_ENTRIES: usize = 5000;
 
+/// An entry that can be checked after parsing; invalid ones are skipped, not fatal.
+pub trait CatalogueEntry: DeserializeOwned {
+    fn validate(&self) -> Result<(), String>;
+}
+
+fn https(url: &str) -> bool {
+    url.len() > 8 && url[..8].eq_ignore_ascii_case("https://")
+}
+
+/// Plain http to a loopback host, for local test servers only; never accepted in production.
+#[cfg(any(test, feature = "testkit"))]
+fn test_loopback_http(u: &str) -> bool {
+    url::Url::parse(u).is_ok_and(|u| {
+        u.scheme() == "http"
+            && matches!(
+                u.host(),
+                Some(url::Host::Domain("localhost"))
+                    | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                    | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+            )
+    })
+}
+
+#[cfg(not(any(test, feature = "testkit")))]
+fn test_loopback_http(_: &str) -> bool {
+    false
+}
+
+fn named(id: &str, name: &str, category: &str) -> Result<(), String> {
+    if id.trim().is_empty() || name.trim().is_empty() {
+        return Err("empty id or name".into());
+    }
+    if category.trim().is_empty() {
+        return Err("empty category".into());
+    }
+    Ok(())
+}
+
 /// The envelope of a catalogue file.
 #[derive(Debug, Deserialize)]
 pub struct CatalogueDoc<E> {
@@ -31,21 +69,35 @@ pub struct CatalogueDoc<E> {
 pub struct FilterCatalogueEntry {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub description: String,
     pub url: String,
     /// `abp`, `ubo`, `adguard`, `hosts`, `domains` or `ips`.
     pub format: String,
     pub category: String,
+    #[serde(default, deserialize_with = "null_default")]
     pub licence: String,
     #[serde(default)]
     pub licence_note: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub homepage: String,
     #[serde(default)]
     pub region: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub noncommercial: bool,
+}
+
+impl CatalogueEntry for FilterCatalogueEntry {
+    fn validate(&self) -> Result<(), String> {
+        named(&self.id, &self.name, &self.category)?;
+        if !https(&self.url) {
+            return Err("url is not https".into());
+        }
+        if self.list_format().is_none() {
+            return Err(format!("unknown format {:?}", self.format));
+        }
+        Ok(())
+    }
 }
 
 impl FilterCatalogueEntry {
@@ -64,28 +116,50 @@ impl FilterCatalogueEntry {
     }
 }
 
+/// Treats an explicit JSON `null` like a missing field (the published catalogue uses `null` for
+/// "unknown"), so one sloppy entry cannot make the whole document unparseable.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+impl CatalogueEntry for UserscriptCatalogueEntry {
+    fn validate(&self) -> Result<(), String> {
+        named(&self.id, &self.name, &self.category)?;
+        if !https(&self.install_url) && !test_loopback_http(&self.install_url) {
+            return Err("install_url is not https".into());
+        }
+        Ok(())
+    }
+}
+
 /// One entry of `userscripts.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserscriptCatalogueEntry {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub description: String,
     pub install_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub homepage: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub sites: Vec<String>,
+    #[serde(default, deserialize_with = "null_default")]
     pub category: String,
+    #[serde(default, deserialize_with = "null_default")]
     pub licence: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub licence_note: Option<String>,
     /// `none`, `basic` or `xhr`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub needs_gm: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub connect: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub requires: Vec<String>,
 }
 
@@ -129,7 +203,7 @@ pub struct SignedDoc<E> {
     busy: tokio::sync::Mutex<()>,
 }
 
-impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
+impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
     pub fn new(kind: &'static str, svc: Option<Arc<ListService>>, cfg: ArgusConfig) -> Arc<Self> {
         Arc::new(Self {
             kind,
@@ -210,7 +284,7 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         let key = &cfg.public_key;
         let comment =
             verify_trusted(key, text.as_bytes(), sig).map_err(|e| format!("{file}: {e}"))?;
-        let doc: CatalogueDoc<E> =
+        let doc: CatalogueDoc<serde_json::Value> =
             serde_json::from_str(text).map_err(|e| format!("{file}: {e}"))?;
         if doc.kind != self.kind {
             return Err(format!(
@@ -248,7 +322,24 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
                 return Err(format!("{file}: release differs from meta.json's"));
             }
         }
-        Ok((doc.entries, version))
+        let entries = doc
+            .entries
+            .into_iter()
+            .filter_map(|v| {
+                let r = serde_json::from_value::<E>(v.clone())
+                    .map_err(|e| e.to_string())
+                    .and_then(|e| e.validate().map(|()| e));
+                match r {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+                        tracing::warn!("{file}: skipping entry {id:?}: {e}");
+                        None
+                    }
+                }
+            })
+            .collect();
+        Ok((entries, version))
     }
 
     fn floor(&self) -> Option<String> {
@@ -709,6 +800,70 @@ mod tests {
             (l.version.as_str(), l.entries[0].id.as_str()),
             ("v2026.11.23", "us1")
         );
+    }
+
+    async fn load_filters(entries: &str) -> Vec<String> {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = format!(r#"{{"schema":1,"kind":"filters","entries":[{entries}]}}"#);
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        d.apply(text, sig, None).await.unwrap();
+        d.get()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_bad_entry_never_drops_the_document() {
+        let ok = r#"{"id":"ok","name":"Ok","url":"https://x.test/a.txt","format":"abp","category":"ads","licence":null,"homepage":null,"description":null,"region":null,"licence_note":null}"#;
+        let bad = [
+            r#"{"id":"nourl","name":"N","format":"abp","category":"ads"}"#,
+            r#"{"id":"nullurl","name":"N","url":null,"format":"abp","category":"ads"}"#,
+            r#"{"name":"noid","url":"https://x.test/a","format":"abp","category":"ads"}"#,
+            r#"{"id":"nocat","name":"N","url":"https://x.test/a","format":"abp","category":""}"#,
+            r#"{"id":"http","name":"N","url":"http://x.test/a","format":"abp","category":"ads"}"#,
+            r#"{"id":"fmt","name":"N","url":"https://x.test/a","format":"zip","category":"ads"}"#,
+            r#"{"id":"","name":"N","url":"https://x.test/a","format":"abp","category":"ads"}"#,
+        ];
+        let all = format!("{},{ok}", bad.join(","));
+        assert_eq!(load_filters(&all).await, vec!["ok"]);
+    }
+
+    #[tokio::test]
+    async fn a_userscript_entry_without_an_https_install_url_is_skipped() {
+        let s = Signer::new();
+        let d = SignedDoc::<UserscriptCatalogueEntry>::new(
+            "userscripts",
+            None,
+            ArgusConfig {
+                base_url: "http://unused.test".into(),
+                public_key: s.public_key(),
+                cache_dir: None,
+            },
+        );
+        let text = r#"{"schema":1,"kind":"userscripts","entries":[{"id":"a","name":"A","install_url":null,"category":"ads"},{"id":"b","name":"B","install_url":"http://x.test/b.user.js","category":"ads"},{"id":"c","name":"C","install_url":"https://x.test/c.user.js","category":"ads","licence":null}]}"#.to_string();
+        let sig = s.sign(&text, "v2026.11.23", "userscripts.json");
+        d.apply(text, sig, None).await.unwrap();
+        let ids: Vec<_> = d
+            .get()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["c"]);
+    }
+
+    #[test]
+    fn a_null_field_in_an_entry_reads_as_empty() {
+        let e: UserscriptCatalogueEntry = serde_json::from_str(
+            r#"{"id":"a","name":"A","install_url":"https://x.test/a.user.js","category":"ads","licence":null,"homepage":null,"sites":null}"#,
+        )
+        .unwrap();
+        assert_eq!((e.licence.as_str(), e.sites.len()), ("", 0));
     }
 
     #[tokio::test]

@@ -70,6 +70,21 @@ pub fn url_key(u: &str) -> String {
     u.to_string()
 }
 
+/// Sites and licence line of a catalogue row; an unknown licence is said so, not left blank.
+fn catalogue_meta(e: &UserscriptCatalogueEntryDto) -> String {
+    let sites = if e.sites.is_empty() {
+        "*".to_string()
+    } else {
+        e.sites.join(", ")
+    };
+    let licence = if e.licence.is_empty() {
+        "licence unknown"
+    } else {
+        e.licence.as_str()
+    };
+    format!("{sites} | {licence}")
+}
+
 /// Warnings a catalogue entry shows before the plan review: (text, is_danger).
 pub fn catalogue_badges(e: &UserscriptCatalogueEntryDto) -> Vec<(String, bool)> {
     let mut v = Vec::new();
@@ -807,7 +822,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                                         <div style="min-width:0">
                                             <div class="nm">{e.name.clone()}" "<span class="badge">{e.category.clone()}</span></div>
                                             <div class="url">{e.description.clone()}</div>
-                                            <div class="url">{e.sites.join(", ")}" | "{e.licence.clone()}</div>
+                                            <div class="url">{catalogue_meta(&e)}</div>
                                             <div class="chips">
                                                 {badges.into_iter().map(|(t, danger)| view! {
                                                     <span class=if danger { "badge admin" } else { "badge" }>{t}</span>
@@ -874,7 +889,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                     </div>
                 </div>
                 <Show
-                    when=move || !feed.items.with(|v| v.is_empty())
+                    when=move || !feed.items.with(|v| v.is_empty()) || feed.error.get().is_some()
                     fallback=move || view! {
                         <div class="empty">
                             <b>{move || if feed.loading.get() { "Loading..." } else { "No userscripts match" }}</b>
@@ -1041,7 +1056,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                                 {tag_list(p.grants.clone(), true)}
                             </div>
                         </div>
-                        <div class="us-section">
+                        <div class="us-section" hidden=p.connect.is_empty() && !p.connect_all>
                             <h4>"@connect hosts"</h4>
                             {p.connect_all.then(|| view! {
                                 <div class="us-danger">
@@ -1285,6 +1300,10 @@ mod tests {
         let b = catalogue_badges(&e);
         assert!(b.contains(&("can contact any site".to_string(), true)));
         assert!(b.contains(&("1 @require".to_string(), false)));
+        assert_eq!(catalogue_meta(&e), "* | MIT");
+        e.licence.clear();
+        e.sites = vec!["a.test".into(), "b.test".into()];
+        assert_eq!(catalogue_meta(&e), "a.test, b.test | licence unknown");
         e.connect.clear();
         e.requires.clear();
         e.needs_gm = "none".into();

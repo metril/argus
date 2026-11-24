@@ -331,10 +331,10 @@ pub fn DevicesPage() -> impl IntoView {
                     </div>
                 </div>
                 <Show
-                    when=move || !feed.items.with(|v| v.is_empty())
+                    when=move || !feed.items.with(|v| v.is_empty()) || feed.error.get().is_some()
                     fallback=move || view! {
                         <div class="empty">
-                            <b>{move || if feed.loading.get() { "Loading..." } else { "No devices match" }}</b>
+                            <b>{move || if feed.loading.get() { "Loading..." } else if q.get().is_empty() && prof.get().is_empty() { "No devices yet" } else { "No devices match" }}</b>
                         </div>
                     }
                 >
