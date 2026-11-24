@@ -341,7 +341,7 @@ pub fn ProfilesPage() -> impl IntoView {
                 {move || delete_error.get().map(|m| view! { <div class="us-warn">{m}</div> })}
                 <div class="row-gap">
                     <button class="btn" on:click=move |_| show_delete.set(false)>"Cancel"</button>
-                    <button class="btn danger sm" disabled=move || busy.get() on:click=confirm_delete>"Delete"</button>
+                    <button class="btn danger" disabled=move || busy.get() on:click=confirm_delete>"Delete"</button>
                 </div>
             </Drawer>
         </Layout>
