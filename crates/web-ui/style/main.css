@@ -863,3 +863,8 @@ a.btn{text-decoration:none}
   li.usrow:has(.pill) .hd .nm{flex:1 1 100%}
   li.usrow:has(.pill) .desc{display:none}
 }
+.callout{flex:1 1 100%;display:flex;gap:var(--s2);align-items:flex-start;padding:var(--s2) var(--s3);border:1px solid var(--block);border-left-width:3px;border-radius:var(--r-ctl);background:var(--block-soft);color:var(--text);text-align:left}
+.callout svg.i{color:var(--block);margin-top:2px}
+.callout ul{margin:0;padding-left:16px}
+.callout{min-width:0;overflow-wrap:anywhere;max-height:34vh;overflow:auto}
+.callout li{min-width:0}

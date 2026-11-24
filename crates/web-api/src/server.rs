@@ -114,7 +114,10 @@ pub fn create_router_with(
                     async move {
                         use tower::Service;
                         let last = req.uri().path().rsplit('/').next().unwrap_or("");
-                        if last.contains('.') {
+                        // `/userscripts/<id>` ids are URLs ("https://greasyfork.org/..." encoded),
+                        // so a dot in the last segment is not an asset there.
+                        let is_script_page = req.uri().path().starts_with("/userscripts/");
+                        if last.contains('.') && !is_script_page {
                             return Ok::<_, std::convert::Infallible>(
                                 StatusCode::NOT_FOUND.into_response(),
                             );

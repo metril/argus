@@ -55,6 +55,8 @@ pub struct Review {
     /// Number of external files when their details are unknown (an installed script).
     pub req_count: usize,
     pub warns: Vec<Warn>,
+    /// Serious warnings (from the server's `high_warnings`), shown in a danger callout.
+    pub high: Vec<String>,
     pub notes: Vec<String>,
     pub diff: Option<UpdateDiffDto>,
     pub needs_reapproval: bool,
@@ -118,6 +120,17 @@ impl Review {
         }));
         let mut warns: Vec<Warn> = p.unsupported.iter().map(|u| warn_from(u, true)).collect();
         warns.extend(p.warnings.iter().map(|w| warn_from(w, false)));
+        // A high warning is shown once, in the callout, not again in the list.
+        warns.retain(|w| {
+            let pat = w
+                .detail
+                .split_once(' ')
+                .map(|(_, r)| r.split(": bad regex").next().unwrap_or("").trim())
+                .unwrap_or("");
+            !p.high_warnings
+                .iter()
+                .any(|h| *h == w.detail || (!pat.is_empty() && h.contains(pat)))
+        });
         let unhashed = reqs.iter().filter(|r| !r.sri).count();
         if unhashed > 0 {
             warns.push(Warn {
@@ -163,6 +176,7 @@ impl Review {
             reqs,
             req_count: 0,
             warns,
+            high: p.high_warnings.clone(),
             notes,
             needs_reapproval: p.update.as_ref().is_some_and(|u| u.needs_reapproval),
             diff: p.update.map(|u| u.diff),
@@ -247,6 +261,7 @@ impl Review {
             reqs: Vec::new(),
             req_count: s.require_count + s.resource_count,
             warns,
+            high: Vec::new(),
             notes: Vec::new(),
             diff: None,
             needs_reapproval: false,
@@ -494,6 +509,12 @@ pub fn PlanDrawer(
     };
     let footer: ChildrenFn = Arc::new(move || {
         view! {
+            {move || review.get().filter(|r| !r.high.is_empty()).map(|r| view! {
+                <div class="callout" role="alert">
+                    <Icon name="alert" />
+                    <ul>{r.high.iter().map(|h| view! { <li>{h.clone()}</li> }).collect_view()}</ul>
+                </div>
+            })}
             {move || review.get().filter(|r| r.wants_any).map(|r| {
                 let verb = match r.kind {
                     ReviewKind::Install(_) => "installed",
