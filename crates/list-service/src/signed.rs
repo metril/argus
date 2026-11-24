@@ -110,7 +110,12 @@ where
 impl CatalogueEntry for UserscriptCatalogueEntry {
     fn validate(&self) -> Result<(), String> {
         named(&self.id, &self.name, &self.category)?;
-        if !https(&self.install_url) {
+        // Plain http is only accepted for a loopback address (local test servers); the fetch
+        // guard still refuses loopback unless the operator allows it.
+        let loopback = self.install_url.starts_with("http://127.0.0.1")
+            || self.install_url.starts_with("http://localhost")
+            || self.install_url.starts_with("http://[::1]");
+        if !https(&self.install_url) && !loopback {
             return Err("install_url is not https".into());
         }
         Ok(())
