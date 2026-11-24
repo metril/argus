@@ -1,7 +1,7 @@
 {
   "name": "argus-extension",
   "private": true,
-  "version": "0.3.5",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "gen:api": "openapi-typescript ../docs/openapi.json -o lib/api-schema.d.ts",
