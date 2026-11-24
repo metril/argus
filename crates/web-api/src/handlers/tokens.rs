@@ -8,7 +8,8 @@ use chrono::{Duration, Utc};
 use tracing::info;
 use validator::Validate;
 
-use super::PageQuery;
+use super::paging::{page_of, ts_key_desc, Keyed};
+use super::CursorQuery;
 use crate::auth::authz::Principal;
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
@@ -70,21 +71,33 @@ pub async fn create_token(
     ))
 }
 
+/// Tokens as paging rows, newest first.
+fn token_rows(all: Vec<ApiTokenInfo>) -> Vec<Keyed<ApiTokenInfo>> {
+    all.into_iter()
+        .map(|t| Keyed {
+            key: ts_key_desc(&t.created_at),
+            id: t.id.clone(),
+            label: t.name.clone(),
+            item: t,
+        })
+        .collect()
+}
+
 /// List your own API tokens (never includes secrets).
 #[utoipa::path(
     get, path = "/tokens", tag = "tokens",
     security(("bearer_auth" = ["tokens:self"])),
-    params(PageQuery),
+    params(CursorQuery),
     responses((status = 200, description = "Your tokens", body = Page<ApiTokenInfo>))
 )]
 pub async fn list_tokens(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
-    ApiQuery(q): ApiQuery<PageQuery>,
+    ApiQuery(q): ApiQuery<CursorQuery>,
 ) -> ApiResult<Json<Page<ApiTokenInfo>>> {
     let (st, uid) = (state.clone(), p.user_id);
     let tokens = blocking(move || Ok(st.tokens.list(Some(&uid)))).await?;
-    Ok(Json(Page::from_vec(tokens, q.page, q.limit)))
+    Ok(Json(page_of(token_rows(tokens), &q)?))
 }
 
 /// Revoke one of your own tokens; it stops working immediately.
@@ -115,16 +128,16 @@ pub async fn revoke_token(
 #[utoipa::path(
     get, path = "/admin/tokens", tag = "tokens",
     security(("bearer_auth" = ["tokens:admin"])),
-    params(PageQuery),
+    params(CursorQuery),
     responses((status = 200, description = "All tokens", body = Page<ApiTokenInfo>))
 )]
 pub async fn admin_list_tokens(
     State(state): State<Arc<AppState>>,
-    ApiQuery(q): ApiQuery<PageQuery>,
+    ApiQuery(q): ApiQuery<CursorQuery>,
 ) -> ApiResult<Json<Page<ApiTokenInfo>>> {
     let st = state.clone();
     let tokens = blocking(move || Ok(st.tokens.list(None))).await?;
-    Ok(Json(Page::from_vec(tokens, q.page, q.limit)))
+    Ok(Json(page_of(token_rows(tokens), &q)?))
 }
 
 /// Revoke any user's token.

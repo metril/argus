@@ -141,10 +141,12 @@ impl ApiClient {
     pub async fn list_source_rules(
         &self,
         page_scope: &str,
+        cursor: Option<&str>,
     ) -> Result<Page<SourceRuleDto>, ApiError> {
         self.get(&format!(
-            "/policy/source-rules?limit=200&page_scope={}",
-            enc(page_scope)
+            "/policy/source-rules?limit=60&page_scope={}{}",
+            enc(page_scope),
+            super::admin::cur(cursor)
         ))
         .await
     }

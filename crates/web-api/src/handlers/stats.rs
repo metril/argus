@@ -251,12 +251,15 @@ pub struct LogFilterQuery {
 #[into_params(parameter_in = Query)]
 pub struct LogQuery {
     pub page: Option<u32>,
-    /// Page size (1..=200, default 50).
+    /// Page size (1..=1000, default 50; the ring holds at most its capacity).
     pub limit: Option<u32>,
     pub action: Option<LogAction>,
     pub client: Option<String>,
     pub q: Option<String>,
     pub mode: Option<LogMode>,
+    /// Only requests at or after this RFC 3339 time (re-seeding after a stream reconnect).
+    #[param(value_type = Option<String>)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A parsed filter plus the caller's profile restriction.
@@ -375,17 +378,27 @@ pub async fn get_request_log(
         .shared_engine
         .recent_requests(capacity)
         .into_iter()
+        .filter(|e| q.since.is_none_or(|s| e.ts >= s))
         .filter(|e| filter.matches(e, None))
         .map(log_entry)
         .collect();
-    let p = Page::from_vec(entries, q.page, q.limit);
+    // Not `Page::from_vec`: it clamps to 200, which would cut a 300-entry seed short.
+    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    let page = q.page.unwrap_or(1).max(1);
+    let total = entries.len();
+    let start = ((page - 1) as usize).saturating_mul(limit as usize);
+    let items: Vec<RequestLogEntry> = entries
+        .into_iter()
+        .skip(start)
+        .take(limit as usize)
+        .collect();
     Ok(Json(RequestLogResponse {
         capacity,
-        total: p.total,
-        page: p.page,
-        limit: p.limit,
-        has_more: p.has_more,
-        entries: p.items,
+        total,
+        page,
+        limit,
+        has_more: start + items.len() < total,
+        entries: items,
     }))
 }
 

@@ -6,8 +6,21 @@ use super::client::{ApiClient, ApiError};
 pub use api_types::{CreateUserRequest, Page, UpdateUserRequest, UserInfo, UserRole};
 
 impl ApiClient {
-    pub async fn list_users(&self) -> Result<Page<UserInfo>, ApiError> {
-        self.get("/users?limit=200").await
+    /// One page of users, oldest first; `roles` is comma-separated (empty = all).
+    pub async fn list_users(
+        &self,
+        q: &str,
+        roles: &str,
+        cursor: Option<&str>,
+    ) -> Result<Page<UserInfo>, ApiError> {
+        let enc = |s: &str| String::from(js_sys::encode_uri_component(s));
+        self.get(&format!(
+            "/users?limit=40&q={}&roles={}{}",
+            enc(q.trim()),
+            enc(roles),
+            super::admin::cur(cursor)
+        ))
+        .await
     }
 
     pub async fn create_user(

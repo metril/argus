@@ -94,13 +94,25 @@ fn decode(token: &str) -> ApiResult<(String, String)> {
 /// * `from`: start at the first row whose key is >= `from_key` (a name-sorted seek).
 /// * `page`: deprecated 1-based offset paging.
 pub fn paginate<T>(
-    mut rows: Vec<Keyed<T>>,
+    rows: Vec<Keyed<T>>,
     limit: Option<u32>,
     cursor: Option<&str>,
     from_key: Option<&str>,
     page: Option<u32>,
 ) -> ApiResult<CursorPage<T>> {
-    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    paginate_max(rows, limit, cursor, from_key, page, MAX_LIMIT)
+}
+
+/// [`paginate`] with a larger page-size ceiling, for endpoints whose older form allowed it.
+pub fn paginate_max<T>(
+    mut rows: Vec<Keyed<T>>,
+    limit: Option<u32>,
+    cursor: Option<&str>,
+    from_key: Option<&str>,
+    page: Option<u32>,
+    max_limit: u32,
+) -> ApiResult<CursorPage<T>> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, max_limit);
     rows.sort_by(|a, b| (&a.key, &a.id).cmp(&(&b.key, &b.id)));
     let total = rows.len();
     let letters: Vec<String> = rows
@@ -140,6 +152,48 @@ pub fn paginate<T>(
         has_more,
         page: page_echo,
         letters,
+    })
+}
+
+/// ASCII case-insensitive substring test without allocating; `needle` must be lower case.
+pub fn ci_contains(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.is_empty() || (n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n)))
+}
+
+/// Sort key for a timestamp, oldest first (RFC 3339 text; unparsable sorts first).
+pub fn ts_key(rfc3339: &str) -> String {
+    format!("{:020}", ts_millis(rfc3339))
+}
+
+/// Sort key for a timestamp, newest first.
+pub fn ts_key_desc(rfc3339: &str) -> String {
+    desc_key(ts_millis(rfc3339))
+}
+
+fn ts_millis(rfc3339: &str) -> u64 {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.timestamp_millis().max(0) as u64)
+        .unwrap_or(0)
+}
+
+/// Serve a [`api_types::Page`] (default page size 50) from keyed rows, honouring `cursor` and
+/// the deprecated `page`.
+pub fn page_of<T>(rows: Vec<Keyed<T>>, q: &super::CursorQuery) -> ApiResult<api_types::Page<T>> {
+    let p = paginate(
+        rows,
+        Some(q.limit.unwrap_or(50)),
+        q.cursor.as_deref(),
+        None,
+        q.page,
+    )?;
+    Ok(api_types::Page {
+        items: p.items,
+        total: p.total,
+        page: p.page.unwrap_or(1),
+        limit: p.limit,
+        has_more: p.has_more,
+        next_cursor: p.next_cursor,
     })
 }
 

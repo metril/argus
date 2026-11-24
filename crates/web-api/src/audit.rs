@@ -25,6 +25,14 @@ pub struct AuditFilter {
     pub target: Option<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Case-insensitive substring of `"METHOD route"`.
+    pub action: Option<String>,
+    /// Case-insensitive substring of actor, route, target or address.
+    pub q: Option<String>,
+}
+
+fn has_ci(hay: &str, needle: &str) -> bool {
+    hay.to_lowercase().contains(needle)
 }
 
 impl AuditFilter {
@@ -36,6 +44,8 @@ impl AuditFilter {
             && self.target.is_none()
             && self.since.is_none()
             && self.until.is_none()
+            && self.action.is_none()
+            && self.q.is_none()
     }
 
     fn matches(&self, e: &AuditEntry) -> bool {
@@ -59,6 +69,26 @@ impl AuditFilter {
             && self
                 .until
                 .is_none_or(|u| at.as_ref().is_ok_and(|a| *a <= u))
+            && self.action.as_ref().is_none_or(|a| {
+                has_ci(
+                    &format!("{} {}", e.method, e.route),
+                    &a.trim().to_lowercase(),
+                )
+            })
+            && self.q.as_ref().is_none_or(|q| {
+                let q = q.trim().to_lowercase();
+                [
+                    e.actor_name.as_deref(),
+                    e.actor_id.as_deref(),
+                    Some(e.route.as_str()),
+                    Some(e.method.as_str()),
+                    e.target.as_deref(),
+                    e.ip.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|f| has_ci(f, &q))
+            })
     }
 }
 
@@ -205,6 +235,73 @@ impl AuditStore {
         }
         let total = if unfiltered { self.len() } else { seen };
         (items, total, scanned)
+    }
+
+    /// Keyset form of [`Self::query`]: up to `limit` matching entries older than `before` (an
+    /// entry key from [`Self::entry_key`]; `None` starts at the newest). The second value is
+    /// the key to continue from when more may follow: the last entry served, or, when the scan
+    /// budget ran out first, the last entry examined (the page may then be short or empty).
+    pub fn query_before(
+        &self,
+        f: &AuditFilter,
+        before: Option<u64>,
+        limit: usize,
+    ) -> (Vec<AuditEntry>, Option<u64>) {
+        self.query_before_budget(f, before, limit, 100_000)
+    }
+
+    /// [`Self::query_before`] with an explicit bound on entries examined.
+    pub fn query_before_budget(
+        &self,
+        f: &AuditFilter,
+        before: Option<u64>,
+        limit: usize,
+        budget: usize,
+    ) -> (Vec<AuditEntry>, Option<u64>) {
+        self.db.flush_deferred();
+        let mut items: Vec<AuditEntry> = Vec::new();
+        let mut next = None;
+        let mut scanned = 0usize;
+        let mut last_key = None;
+        let res = self.db.read::<_, DbError>(|r| {
+            let t = r.open_table(tables::AUDIT)?;
+            for item in t.range(0..before.unwrap_or(u64::MAX))?.rev() {
+                let (k, v) = item?;
+                if scanned >= budget {
+                    // Out of budget with entries left: continue after the last one examined.
+                    next = last_key;
+                    break;
+                }
+                scanned += 1;
+                last_key = Some(k.value());
+                let Ok(e) = serde_json::from_slice::<AuditEntry>(v.value()) else {
+                    continue;
+                };
+                if let (Some(since), Ok(at)) = (f.since, DateTime::parse_from_rfc3339(&e.at)) {
+                    if at.with_timezone(&Utc) < since {
+                        break;
+                    }
+                }
+                if !f.matches(&e) {
+                    continue;
+                }
+                if items.len() == limit {
+                    next = items.last().and_then(|e| Self::entry_key(&e.id));
+                    break;
+                }
+                items.push(e);
+            }
+            Ok(())
+        });
+        if let Err(e) = res {
+            tracing::error!("audit query failed: {e}");
+        }
+        (items, next)
+    }
+
+    /// The numeric key of an entry id (`{:016x}`).
+    pub fn entry_key(id: &str) -> Option<u64> {
+        u64::from_str_radix(id, 16).ok()
     }
 
     pub fn len(&self) -> usize {
@@ -358,5 +455,35 @@ mod tests {
         let (items, total, _) = store.query_scanned(&f, 0, 5);
         assert_eq!(items.len(), 5);
         assert!(total > items.len());
+    }
+
+    #[test]
+    fn scan_budget_cutoff_hands_back_a_cursor_instead_of_ending() {
+        let (store, _d) = store(10_000, 30);
+        for i in 0..30 {
+            store
+                .append(entry(if i == 0 { "rare" } else { "common" }))
+                .unwrap();
+        }
+        // The only match is the oldest entry; a budget of 10 cannot reach it in one query.
+        let f = AuditFilter {
+            actor: Some("rare".into()),
+            ..Default::default()
+        };
+        let (mut items, mut next) = store.query_before_budget(&f, None, 5, 10);
+        assert!(
+            items.is_empty() && next.is_some(),
+            "budget ran out: continue, not end"
+        );
+        let mut rounds = 1;
+        while let Some(k) = next {
+            let (more, n) = store.query_before_budget(&f, Some(k), 5, 10);
+            items.extend(more);
+            next = n;
+            rounds += 1;
+            assert!(rounds < 10);
+        }
+        assert_eq!(items.len(), 1);
+        assert_eq!(rounds, 3);
     }
 }

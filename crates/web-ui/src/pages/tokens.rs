@@ -2,8 +2,11 @@
 
 use std::collections::BTreeMap;
 
+use std::rc::Rc;
+
 use leptos::prelude::*;
 
+use super::vlist::{Feed, Fetcher, Scroller};
 use crate::api::tokens::{ApiTokenInfo, Scope};
 use crate::api::ApiClient;
 use crate::components::{Card, ChipSelect, ConfirmButton, Icon, Layout, Segmented};
@@ -36,7 +39,6 @@ pub fn TokensPage() -> impl IntoView {
     let app_state = use_app_state();
     let user = use_auth_state().user;
 
-    let tokens = RwSignal::new(Vec::<ApiTokenInfo>::new());
     let name = RwSignal::new(String::new());
     let expiry = RwSignal::new("90".to_string());
     let selected = RwSignal::new(Vec::<Scope>::new());
@@ -45,19 +47,26 @@ pub fn TokensPage() -> impl IntoView {
 
     let available = Memo::new(move |_| user.get().map(|u| grouped(&u.scopes)).unwrap_or_default());
 
-    {
+    let fetch: Fetcher<ApiTokenInfo> = {
         let app_state = app_state.clone();
-        Effect::new(move |_| {
-            reload.get();
+        Rc::new(move |cursor, _| {
             let app_state = app_state.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                match ApiClient::new().list_tokens().await {
-                    Ok(page) => tokens.set(page.items),
-                    Err(e) => app_state.error(format!("Failed to load tokens: {e}")),
+            Box::pin(async move {
+                match ApiClient::new().list_tokens(cursor.as_deref()).await {
+                    Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                    Err(e) => {
+                        app_state.error(format!("Failed to load tokens: {e}"));
+                        Err(e)
+                    }
                 }
-            });
-        });
-    }
+            })
+        })
+    };
+    let tokens = Feed::new(fetch);
+    Effect::new(move |_| {
+        reload.track();
+        tokens.reload(None, false, None);
+    });
 
     let create = {
         let app_state = app_state.clone();
@@ -194,12 +203,12 @@ pub fn TokensPage() -> impl IntoView {
 
             <div class="card">
                 <div class="card-h"><h3>"Your tokens"</h3></div>
-                <div class="tbl-wrap">
+                <Scroller feed=tokens class="tbl-wrap">
                     <table class="tbl">
                         <thead><tr><th>"Name"</th><th>"Scopes"</th><th>"Last used"</th><th>"Expires"</th><th></th></tr></thead>
                         <tbody>
                             <For
-                                each=move || tokens.get()
+                                each=move || tokens.items.get()
                                 key=|t| format!("{}{}", t.id, t.revoked)
                                 children={
                                     let revoke = revoke.clone();
@@ -226,10 +235,10 @@ pub fn TokensPage() -> impl IntoView {
                             />
                         </tbody>
                     </table>
-                    <Show when=move || tokens.read().is_empty()>
+                    <Show when=move || tokens.items.with(|v| v.is_empty()) && !tokens.loading.get()>
                         <div class="empty"><b>"No tokens yet"</b>"Create one above."</div>
                     </Show>
-                </div>
+                </Scroller>
             </div>
         </Layout>
     }

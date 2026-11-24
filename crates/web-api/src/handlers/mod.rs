@@ -33,6 +33,18 @@ pub struct PageQuery {
     pub limit: Option<u32>,
 }
 
+/// Cursor-capable pagination parameters (`page` is the deprecated offset form).
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct CursorQuery {
+    /// Deprecated: use `cursor`.
+    pub page: Option<u32>,
+    /// Items per page, 1..=200 (default 50).
+    pub limit: Option<u32>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+}
+
 /// Weak-validator `ETag` for a serialisable value (content hash).
 pub fn etag_of(bytes: &[u8]) -> String {
     format!("\"{}\"", &blake3::hash(bytes).to_hex()[..32])

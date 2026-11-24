@@ -8,15 +8,22 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-use crate::audit::AuditFilter;
-use crate::error::{ApiQuery, ApiResult};
+use crate::audit::{AuditFilter, AuditStore};
+use crate::error::{ApiError, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct AuditQuery {
+    /// Deprecated: use `cursor`.
     pub page: Option<u32>,
     pub limit: Option<u32>,
+    /// `next_cursor` of the previous page (newest first; stable while entries are appended).
+    pub cursor: Option<String>,
+    /// Case-insensitive substring of `METHOD route`, e.g. `delete /lists`.
+    pub action: Option<String>,
+    /// Case-insensitive substring of actor, route, target or address.
+    pub q: Option<String>,
     /// Actor user id, token id or username.
     pub actor: Option<String>,
     /// HTTP method.
@@ -35,7 +42,18 @@ pub struct AuditQuery {
     pub until: Option<DateTime<Utc>>,
 }
 
-/// Read the audit log, newest first.
+/// Cursor: the entry key to continue below, and the first page's `total`.
+fn encode_cursor(key: u64, total: usize) -> String {
+    format!("{key:016x}.{total}")
+}
+
+fn decode_cursor(c: &str) -> Option<(u64, usize)> {
+    let (k, t) = c.split_once('.')?;
+    Some((AuditStore::entry_key(k)?, t.parse().ok()?))
+}
+
+/// Read the audit log, newest first. `total` on the first page is exact for an unfiltered
+/// query and otherwise a lower bound; later pages (with `cursor`) repeat that first-page value.
 #[utoipa::path(
     get, path = "/audit", tag = "audit",
     security(("bearer_auth" = ["audit:read"])),
@@ -56,17 +74,46 @@ pub async fn list_audit(
         target: q.target,
         since: q.since,
         until: q.until,
+        action: q.action.filter(|s| !s.trim().is_empty()),
+        q: q.q.filter(|s| !s.trim().is_empty()),
     };
+    if let Some(c) = q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        let (before, total) =
+            decode_cursor(c).ok_or_else(|| ApiError::ValidationError("invalid cursor".into()))?;
+        let st = state.clone();
+        let (items, next) =
+            blocking(move || Ok(st.audit.query_before(&filter, Some(before), limit as usize)))
+                .await?;
+        return Ok(Json(Page {
+            // Echoed from the first page, so it does not change while paging.
+            total,
+            items,
+            page,
+            limit,
+            has_more: next.is_some(),
+            next_cursor: next.map(|k| encode_cursor(k, total)),
+        }));
+    }
     let offset = (page as usize - 1) * limit as usize;
     // The query waits for the deferred-write flush and reads the table: never on an async worker.
     let st = state.clone();
     let (items, total) =
         blocking(move || Ok(st.audit.query(&filter, offset, limit as usize))).await?;
+    let has_more = offset + items.len() < total;
+    let next_cursor = has_more
+        .then(|| {
+            items
+                .last()
+                .and_then(|e| AuditStore::entry_key(&e.id))
+                .map(|k| encode_cursor(k, total))
+        })
+        .flatten();
     Ok(Json(Page {
-        has_more: offset + items.len() < total,
+        has_more,
         items,
         total,
         page,
         limit,
+        next_cursor,
     }))
 }

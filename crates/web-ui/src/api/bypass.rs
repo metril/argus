@@ -59,10 +59,12 @@ impl ApiClient {
         &self,
         id: &str,
         q: &str,
+        cursor: Option<&str>,
     ) -> Result<BypassHostsResponse, ApiError> {
         self.get(&format!(
-            "/bypass/categories/{id}/hosts?limit=200&q={}",
-            enc(q)
+            "/bypass/categories/{id}/hosts?limit=100&q={}{}",
+            enc(q),
+            super::admin::cur(cursor)
         ))
         .await
     }

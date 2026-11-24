@@ -12,7 +12,8 @@ use common::profile_store::ProfileRecord;
 use tracing::info;
 use validator::Validate;
 
-use super::PageQuery;
+use super::paging::{natural_key, page_of, Keyed};
+use super::CursorQuery;
 use crate::auth::authz::Principal;
 use crate::auth::profile::ProfileParam;
 use crate::error::{ApiError, ApiJson, ApiQuery, ApiResult};
@@ -57,26 +58,51 @@ fn check_lists(state: &AppState, lists: &[String]) -> ApiResult<()> {
     Ok(())
 }
 
-/// List the profiles the caller may access.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ProfilesQuery {
+    /// Deprecated: use `cursor`.
+    pub page: Option<u32>,
+    /// Items per page, 1..=200 (default 50).
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    /// Case-insensitive substring of the name.
+    pub q: Option<String>,
+}
+
+/// List the profiles the caller may access, A-Z.
 #[utoipa::path(
     get, path = "/profiles", tag = "profiles",
     security(("bearer_auth" = ["profiles:read"])),
-    params(PageQuery),
+    params(ProfilesQuery),
     responses((status = 200, description = "Profiles", body = Page<ProfileDto>))
 )]
 pub async fn list_profiles(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
-    ApiQuery(q): ApiQuery<PageQuery>,
+    ApiQuery(q): ApiQuery<ProfilesQuery>,
 ) -> ApiResult<Json<Page<ProfileDto>>> {
     let st = state.clone();
     let all = blocking(move || Ok(st.profiles.list()?)).await?;
-    let items = all
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let rows = all
         .iter()
         .filter(|r| p.may_access_profile(&r.id.to_string()))
         .map(|r| profile_dto(&state, r))
+        .filter(|d| needle.is_empty() || d.name.to_lowercase().contains(&needle))
+        .map(|d| Keyed {
+            key: natural_key(&d.name),
+            id: format!("{:020}", d.id.parse::<u64>().unwrap_or(0)),
+            label: d.name.clone(),
+            item: d,
+        })
         .collect();
-    Ok(Json(Page::from_vec(items, q.page, q.limit)))
+    let cq = CursorQuery {
+        page: q.page,
+        limit: q.limit,
+        cursor: q.cursor,
+    };
+    Ok(Json(page_of(rows, &cq)?))
 }
 
 /// Create a profile. Not available to profile-restricted tokens.

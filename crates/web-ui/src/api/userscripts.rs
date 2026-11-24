@@ -156,8 +156,16 @@ impl ApiClient {
     pub async fn get_userscript_storage(
         &self,
         id: &str,
+        q: &str,
+        cursor: Option<&str>,
     ) -> Result<UserscriptStorageResponse, ApiError> {
-        self.get(&format!("/userscripts/{}/storage", id)).await
+        self.get(&format!(
+            "/userscripts/{}/storage?limit=40&q={}{}",
+            id,
+            encode_component(q.trim()),
+            super::admin::cur(cursor)
+        ))
+        .await
     }
 
     /// Clear all stored values of a script.

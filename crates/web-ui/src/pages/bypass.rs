@@ -91,20 +91,28 @@ pub fn BypassPage() -> impl IntoView {
     let hosts_title = RwSignal::new(String::new());
     let hosts_id = RwSignal::new(String::new());
     let hosts_q = RwSignal::new(String::new());
-    let hosts = RwSignal::new(Vec::<String>::new());
-    let hosts_total = RwSignal::new(0usize);
+    // The query the loaded pages were fetched with (see the rules drawer).
+    let hosts_q_snap = RwSignal::new(String::new());
     let hosts_t = StoredValue::new_local(None::<Timeout>);
-    let load_hosts = move || {
-        let (id, q) = (hosts_id.get_untracked(), hosts_q.get_untracked());
-        wasm_bindgen_futures::spawn_local(async move {
-            match ApiClient::new().bypass_category_hosts(&id, &q).await {
-                Ok(r) => {
-                    hosts_total.set(r.total);
-                    hosts.set(r.items);
+    let hosts_fetch: Fetcher<String> = Rc::new(move |cursor, _| {
+        let (id, q) = (hosts_id.get_untracked(), hosts_q_snap.get_untracked());
+        Box::pin(async move {
+            match ApiClient::new()
+                .bypass_category_hosts(&id, &q, cursor.as_deref())
+                .await
+            {
+                Ok(r) => Ok((r.items, r.next_cursor, r.total)),
+                Err(e) => {
+                    app.get_value().error(format!("Failed to load hosts: {e}"));
+                    Err(e)
                 }
-                Err(e) => app.get_value().error(format!("Failed to load hosts: {e}")),
             }
-        });
+        })
+    });
+    let hosts = Feed::new(hosts_fetch);
+    let load_hosts = move || {
+        hosts_q_snap.set(hosts_q.get_untracked());
+        hosts.reload(None, false, None);
     };
 
     // ---- entries (vlist) ----
@@ -357,7 +365,7 @@ pub fn BypassPage() -> impl IntoView {
                                             hosts_id.set(id3.clone());
                                             hosts_title.set(name.clone());
                                             hosts_q.set(String::new());
-                                            hosts.set(Vec::new());
+                                            hosts.items.set(Vec::new());
                                             hosts_open.set(true);
                                             load_hosts();
                                         }
@@ -600,7 +608,7 @@ pub fn BypassPage() -> impl IntoView {
                 </Show>
             </div>
 
-            <Drawer open=hosts_open title=Signal::derive(move || format!("{} hosts", hosts_title.get()))>
+            <Drawer fill=true open=hosts_open title=Signal::derive(move || format!("{} hosts", hosts_title.get()))>
                 <div class="search">
                     <Icon name="search" />
                     <label class="sr" for="hostQ">"Search hosts"</label>
@@ -611,10 +619,19 @@ pub fn BypassPage() -> impl IntoView {
                             hosts_t.set_value(Some(Timeout::new(200, load_hosts)));
                         } />
                 </div>
-                <span class="hint">{move || format!("Showing {} of {}", hosts.with(|h| h.len()), format_number(hosts_total.get() as u64))}</span>
-                <div>
-                    <For each=move || hosts.get() key=|h| h.clone() children=|h| view! { <div class="hrow" title=h.clone()>{h.clone()}</div> } />
-                </div>
+                <span class="hint" aria-live="polite">{move || format!("Showing {} of {}", hosts.items.with(|h| h.len()), format_number(hosts.total.get() as u64))}</span>
+                <VList
+                    items=hosts.items
+                    row_h=Signal::derive(|| 34.0)
+                    key=|h: &String| h.clone()
+                    render=Callback::new(|h: String| view! { <div class="hrow" title=h.clone()>{h.clone()}</div> }.into_any())
+                    on_end=Callback::new(move |()| hosts.more())
+                    error=hosts.error
+                    on_retry=Callback::new(move |()| hosts.retry())
+                    on_anchor=Callback::new(|_| ())
+                    reset=hosts.tok
+                    label="Hosts"
+                />
             </Drawer>
 
             <Drawer

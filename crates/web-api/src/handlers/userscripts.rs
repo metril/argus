@@ -22,7 +22,7 @@ use userscript_engine::install::{self, Approvals};
 use userscript_engine::storage::ns;
 use utoipa::IntoParams;
 
-use super::paging::{desc_key, natural_key, paginate, Keyed};
+use super::paging::{desc_key, natural_key, paginate, paginate_max, Keyed};
 use crate::auth::authz::Principal;
 use crate::auth::profile::{ProfileParam, ProfileQuery};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
@@ -688,17 +688,29 @@ pub async fn discard_update(
 
 // ------------------------------------------------------------------ storage
 
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct StorageQuery {
+    /// Case-insensitive substring of the value name.
+    pub q: Option<String>,
+    /// Page size (1..=1000, default 1000).
+    pub limit: Option<u32>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+}
+
 /// A script's stored GM values.
 #[utoipa::path(
     get, path = "/userscripts/{id}/storage", tag = "userscripts",
     security(("bearer_auth" = ["scripts:write"])),
-    params(ProfileQuery, ("id" = String, Path, description = "Userscript id")),
+    params(ProfileQuery, StorageQuery, ("id" = String, Path, description = "Userscript id")),
     responses((status = 200, description = "Values", body = UserscriptStorageResponse))
 )]
 pub async fn get_storage(
     State(state): State<Arc<AppState>>,
     profile: ProfileParam,
     ApiPath(id): ApiPath<String>,
+    ApiQuery(q): ApiQuery<StorageQuery>,
 ) -> ApiResult<Json<UserscriptStorageResponse>> {
     get_script(&state, &profile.name, &id)?;
     let space = ns(&profile.name, &id);
@@ -708,9 +720,29 @@ pub async fn get_storage(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     sizes.sort();
     let used: usize = sizes.iter().map(|(_, n)| n).sum();
-    let values = sizes
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+    let rows = sizes
         .into_iter()
-        .take(1000)
+        .filter(|(n, _)| needle.is_empty() || n.to_lowercase().contains(&needle))
+        .map(|(name, size)| Keyed {
+            key: name.clone(),
+            id: String::new(),
+            label: name.clone(),
+            item: (name, size),
+        })
+        .collect();
+    // Without a cursor or limit the old behaviour holds: up to 1000 values in one response.
+    let p = paginate_max(
+        rows,
+        Some(q.limit.unwrap_or(1000)),
+        q.cursor.as_deref(),
+        None,
+        None,
+        1000,
+    )?;
+    let values = p
+        .items
+        .into_iter()
         .map(|(name, size)| {
             let preview = storage
                 .get_raw(&space, &name)
@@ -729,6 +761,9 @@ pub async fn get_storage(
         used_bytes: used as u64,
         quota_bytes: state.userscript_manager.gm().quotas().per_script as u64,
         values,
+        total: p.total,
+        next_cursor: p.next_cursor,
+        has_more: p.has_more,
     }))
 }
 

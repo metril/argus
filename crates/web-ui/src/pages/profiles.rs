@@ -2,8 +2,12 @@
 //! (a profile with devices cannot be deleted). Uses only the public `/api/v1/profiles` API;
 //! every user-supplied name is rendered as text.
 
+use std::rc::Rc;
+
+use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 
+use super::vlist::{Feed, Fetcher, Scroller};
 use crate::api::filters::FilterList;
 use crate::api::profiles::{CreateProfileRequest, ProfileDto, UpdateProfileRequest};
 use crate::api::{ApiClient, ApiError};
@@ -29,8 +33,11 @@ pub fn delete_failure(e: &ApiError) -> String {
 #[component]
 pub fn ProfilesPage() -> impl IntoView {
     let app = StoredValue::new(use_app_state());
-    let profiles = RwSignal::new(Vec::<ProfileDto>::new());
-    let lists = RwSignal::new(Vec::<FilterList>::new());
+    let pq_raw = RwSignal::new(String::new());
+    let pq = RwSignal::new(String::new()); // debounced
+    let pq_t = StoredValue::new_local(None::<Timeout>);
+    let lq = RwSignal::new(String::new()); // filter-list picker search (debounced)
+    let lq_t = StoredValue::new_local(None::<Timeout>);
     let reload = RwSignal::new(0u32);
     let busy = RwSignal::new(false);
 
@@ -47,19 +54,43 @@ pub fn ProfilesPage() -> impl IntoView {
     let delete_target = RwSignal::new(Option::<ProfileDto>::None);
     let delete_error = RwSignal::new(Option::<String>::None);
 
+    let pfetch: Fetcher<ProfileDto> = Rc::new(move |cursor, _| {
+        let q = pq.get_untracked();
+        Box::pin(async move {
+            match ApiClient::new()
+                .list_profiles_page(&q, cursor.as_deref())
+                .await
+            {
+                Ok(p) => Ok((p.items, p.next_cursor, p.total)),
+                Err(e) => {
+                    app.get_value()
+                        .error(format!("Failed to load profiles: {e}"));
+                    Err(e)
+                }
+            }
+        })
+    });
+    let profiles = Feed::new(pfetch);
     Effect::new(move || {
         reload.track();
-        wasm_bindgen_futures::spawn_local(async move {
-            match ApiClient::new().list_profiles().await {
-                Ok(p) => profiles.set(p),
-                Err(e) => app
-                    .get_value()
-                    .error(format!("Failed to load profiles: {e}")),
-            }
-            if let Ok(l) = ApiClient::new().list_filter_lists(1, 200).await {
-                lists.set(l.items);
-            }
-        });
+        pq.track();
+        profiles.reload(None, false, None);
+    });
+
+    // The filter-list picker: searchable, paged by name.
+    let lfetch: Fetcher<FilterList> = Rc::new(move |cursor, _| {
+        let q = lq.get_untracked();
+        Box::pin(async move {
+            ApiClient::new()
+                .list_filter_lists_paged(&q, "", "name", cursor.as_deref(), None, 40)
+                .await
+                .map(|p| (p.items, p.next_cursor, p.total))
+        })
+    });
+    let lists = Feed::new(lfetch);
+    Effect::new(move || {
+        lq.track();
+        lists.reload(None, false, None);
     });
 
     let open_create = move |_| {
@@ -167,7 +198,17 @@ pub fn ProfilesPage() -> impl IntoView {
                  lists and custom rules and cannot be renamed or deleted."
             </p>
             <Card title="Profiles" class="settings-card">
-                <div class="tbl-wrap"><table class="tbl">
+                <div class="search">
+                    <label class="sr" for="profQ">"Search profiles"</label>
+                    <input class="input" id="profQ" placeholder="Search profiles"
+                        prop:value=move || pq_raw.get()
+                        on:input=move |ev| {
+                            let v = event_target_value(&ev);
+                            pq_raw.set(v.clone());
+                            pq_t.set_value(Some(Timeout::new(250, move || pq.set(v))));
+                        } />
+                </div>
+                <Scroller feed=profiles class="tbl-wrap"><table class="tbl">
                     <thead>
                         <tr>
                             <th>"Name"</th>
@@ -178,7 +219,7 @@ pub fn ProfilesPage() -> impl IntoView {
                     </thead>
                     <tbody>
                         <For
-                            each=move || profiles.get()
+                            each=move || profiles.items.get()
                             key=|p| format!("{}/{}/{}", p.id, p.name, p.updated_at)
                             children=move |p| {
                                 let builtin = is_default(&p);
@@ -219,7 +260,7 @@ pub fn ProfilesPage() -> impl IntoView {
                             }
                         />
                     </tbody>
-                </table></div>
+                </table></Scroller>
             </Card>
 
             <Drawer title="Profile" open=show_edit>
@@ -240,12 +281,19 @@ pub fn ProfilesPage() -> impl IntoView {
                 </div>
                 <div class="field">
                     <label>"Enabled filter lists"</label>
+                    <input class="input" placeholder="Search filter lists" aria-label="Search filter lists"
+                        on:input=move |ev| {
+                            let v = event_target_value(&ev);
+                            lq_t.set_value(Some(Timeout::new(250, move || lq.set(v))));
+                        } />
+                    <p class="hint">{move || format!("{} enabled", enabled.with(|e| e.len()))}</p>
                     <Show
-                        when=move || !lists.get().is_empty()
-                        fallback=|| view! { <p class="hint">"No filter lists are installed yet."</p> }
+                        when=move || !lists.items.with(|v| v.is_empty())
+                        fallback=move || view! { <p class="hint">{if lists.loading.get() { "Loading..." } else { "No filter lists match." }}</p> }
                     >
+                        <Scroller feed=lists class="chips">
                         <For
-                            each=move || lists.get()
+                            each=move || lists.items.get()
                             key=|l| l.id.clone()
                             children=move |l| {
                                 let id = l.id.clone();
@@ -266,6 +314,7 @@ pub fn ProfilesPage() -> impl IntoView {
                                 }
                             }
                         />
+                        </Scroller>
                     </Show>
                 </div>
                 <div class="field">

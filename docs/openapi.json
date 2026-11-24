@@ -865,6 +865,9 @@
       "BypassHostsResponse": {
         "description": "The domains of a category.",
         "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
           "items": {
             "description": "Matching domains (a bare domain covers its subdomains too; `*.x` only subdomains).",
             "items": {
@@ -872,8 +875,15 @@
             },
             "type": "array"
           },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "total": {
-            "description": "Matching domains before `limit`.",
+            "description": "Matching domains across all pages.",
             "minimum": 0,
             "type": "integer"
           }
@@ -2116,6 +2126,11 @@
             },
             "type": "array"
           },
+          "index": {
+            "description": "Position in the engine's handed-off rule list (stable within one build).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "kind": {
             "type": "string"
           },
@@ -3049,6 +3064,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "page": {
             "format": "int32",
             "minimum": 0,
@@ -3164,6 +3186,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "page": {
             "format": "int32",
             "minimum": 0,
@@ -3200,6 +3229,11 @@
                   },
                   "type": "array"
                 },
+                "index": {
+                  "description": "Position in the engine's handed-off rule list (stable within one build).",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "kind": {
                   "type": "string"
                 },
@@ -3235,6 +3269,13 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "page": {
             "format": "int32",
@@ -3306,6 +3347,13 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "page": {
             "format": "int32",
@@ -3393,6 +3441,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "page": {
             "format": "int32",
             "minimum": 0,
@@ -3469,6 +3524,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "page": {
             "format": "int32",
             "minimum": 0,
@@ -3541,6 +3603,13 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "page": {
             "format": "int32",
@@ -3628,6 +3697,13 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page). Cursor paging is\nstable under inserts and deletes; `page` is the older offset form of the same list.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "page": {
             "format": "int32",
@@ -6451,8 +6527,23 @@
       "UserscriptStorageResponse": {
         "description": "A script's stored values.",
         "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "next_cursor": {
+            "description": "Pass back as `cursor` for the next page (absent on the last page).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "quota_bytes": {
             "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Stored values matching `q`, across all pages.",
             "minimum": 0,
             "type": "integer"
           },
@@ -6462,6 +6553,7 @@
             "type": "integer"
           },
           "values": {
+            "description": "One page of values, sorted by name.",
             "items": {
               "$ref": "#/components/schemas/StorageValueDto"
             },
@@ -6673,6 +6765,14 @@
             }
           },
           {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Only this user's sessions.",
             "in": "query",
             "name": "user_id",
@@ -6841,7 +6941,7 @@
         "operationId": "admin_list_tokens",
         "parameters": [
           {
-            "description": "1-based page number (default 1).",
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -6860,6 +6960,15 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -7022,6 +7131,7 @@
         "operationId": "list_audit",
         "parameters": [
           {
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -7039,6 +7149,33 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page (newest first; stable while entries are appended).",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of `METHOD route`, e.g. `delete /lists`.",
+            "in": "query",
+            "name": "action",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of actor, route, target or address.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           },
           {
@@ -7169,7 +7306,7 @@
             ]
           }
         ],
-        "summary": "Read the audit log, newest first.",
+        "summary": "Read the audit log, newest first. `total` on the first page is exact for an unfiltered\nquery and otherwise a lower bound; later pages (with `cursor`) repeat that first-page value.",
         "tags": [
           "audit"
         ]
@@ -7604,7 +7741,7 @@
         "operationId": "list_sessions",
         "parameters": [
           {
-            "description": "1-based page number (default 1).",
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -7623,6 +7760,15 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -8122,7 +8268,7 @@
             }
           },
           {
-            "description": "Most domains returned (default 200, max 1000).",
+            "description": "Page size (1..=1000, default 200).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -8130,6 +8276,15 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -12129,7 +12284,7 @@
             }
           },
           {
-            "description": "Page size (1..=200, default 50).",
+            "description": "Page size (1..=1000, default 50; the ring holds at most its capacity).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -12169,6 +12324,15 @@
             "required": false,
             "schema": {
               "$ref": "#/components/schemas/LogMode"
+            }
+          },
+          {
+            "description": "Only requests at or after this RFC 3339 time (re-seeding after a stream reconnect).",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -13708,6 +13872,14 @@
             }
           },
           {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Case-insensitive substring of the page scope or the source scope.",
             "in": "query",
             "name": "site",
@@ -14450,7 +14622,7 @@
         "operationId": "list_profiles",
         "parameters": [
           {
-            "description": "1-based page number (default 1).",
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -14469,6 +14641,23 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the name.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -14536,7 +14725,7 @@
             ]
           }
         ],
-        "summary": "List the profiles the caller may access.",
+        "summary": "List the profiles the caller may access, A-Z.",
         "tags": [
           "profiles"
         ]
@@ -15138,6 +15327,25 @@
             }
           },
           {
+            "description": "Case-insensitive substring of the rule text or its list.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only rules of this filter list id.",
+            "in": "query",
+            "name": "list",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -15148,6 +15356,7 @@
             }
           },
           {
+            "description": "Page size (1..=200, default 50).",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -15155,6 +15364,15 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -16318,7 +16536,7 @@
         "operationId": "list_tokens",
         "parameters": [
           {
-            "description": "1-based page number (default 1).",
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -16337,6 +16555,15 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -16580,7 +16807,7 @@
         "operationId": "list_users",
         "parameters": [
           {
-            "description": "1-based page number (default 1).",
+            "description": "Deprecated: use `cursor`.",
             "in": "query",
             "name": "page",
             "required": false,
@@ -16599,6 +16826,32 @@
               "format": "int32",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the username.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated roles to keep (`admin`, `user`, `viewer`).",
+            "in": "query",
+            "name": "roles",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -16666,7 +16919,7 @@
             ]
           }
         ],
-        "summary": "List user accounts.",
+        "summary": "List user accounts, oldest first.",
         "tags": [
           "users"
         ]
@@ -18333,6 +18586,35 @@
             "description": "Profile id (decimal). Omitted: the default profile, `0`.",
             "in": "query",
             "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the value name.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size (1..=1000, default 1000).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
             "required": false,
             "schema": {
               "type": "string"

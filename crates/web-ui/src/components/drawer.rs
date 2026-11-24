@@ -65,6 +65,9 @@ pub fn Drawer(
     #[prop(into)] title: Signal<String>,
     children: ChildrenFn,
     #[prop(optional)] footer: Option<ChildrenFn>,
+    /// The body does not scroll itself: a `VList` child fills it and scrolls instead.
+    #[prop(optional)]
+    fill: bool,
 ) -> impl IntoView {
     use_focus_return(open.into());
     let node: NodeRef<leptos::html::Aside> = NodeRef::new();
@@ -103,7 +106,7 @@ pub fn Drawer(
                         <Icon name="x" />
                     </button>
                 </div>
-                <div class="drawer-b">{children()}</div>
+                <div class=if fill { "drawer-b fill" } else { "drawer-b" }>{children()}</div>
                 {move || footer.get_value().map(|f| view! { <div class="drawer-f">{f()}</div> })}
             </aside>
         </Show>

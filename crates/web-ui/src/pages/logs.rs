@@ -102,8 +102,119 @@ struct StreamCtx {
     err_handler: StoredValue<ErrHandler, LocalStorage>,
     notice: RwSignal<Option<String>>,
     alive: StoredValue<bool>,
+    /// Set once the stream has opened; a later open is a reconnect.
+    ever_open: StoredValue<bool>,
     app: crate::state::AppState,
     auth_user: RwSignal<Option<api_types::UserInfo>>,
+}
+
+/// Identity of a log entry (the server gives none): the same request seen via the stream and
+/// via a re-seed must produce the same key.
+fn entry_key(e: &RequestLogEntry) -> String {
+    format!(
+        "{}|{}|{}|{}|{:?}|{:?}|{:?}|{}",
+        e.ts,
+        e.method,
+        e.url,
+        action_key(e.action),
+        e.status,
+        e.client,
+        e.source_host,
+        e.request_type
+    )
+}
+
+/// The fetched entries not already held. `held` is matched as a multiset: each held key
+/// cancels one fetched entry with that key, so identical requests in the same instant are not
+/// collapsed, and duplicates within the fetched batch are never dropped.
+fn unseen(
+    held: impl IntoIterator<Item = String>,
+    fetched: Vec<RequestLogEntry>,
+) -> Vec<RequestLogEntry> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for k in held {
+        *counts.entry(k).or_default() += 1;
+    }
+    fetched
+        .into_iter()
+        .filter(|e| match counts.get_mut(&entry_key(e)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// After a reconnect, fetch what the gap missed (`since` the newest entry held) and merge it,
+/// skipping entries already held, keeping newest-first order.
+fn reseed(ctx: &StreamCtx) {
+    let StreamCtx {
+        buffer,
+        pending,
+        paused,
+        next_id,
+        app,
+        ..
+    } = ctx.clone();
+    let newest = |rows: &[Row]| {
+        rows.iter()
+            .map(|r| r.e.ts.clone())
+            .max_by(|a, b| js_sys::Date::parse(a).total_cmp(&js_sys::Date::parse(b)))
+    };
+    let since = [
+        buffer.with_untracked(|b| newest(b)),
+        pending.with_untracked(|b| newest(b)),
+    ]
+    .into_iter()
+    .flatten()
+    .max_by(|a, b| js_sys::Date::parse(a).total_cmp(&js_sys::Date::parse(b)));
+    wasm_bindgen_futures::spawn_local(async move {
+        let c = ApiClient::new();
+        let r = match &since {
+            Some(s) => c.get_request_log_since(s, 1000).await,
+            None => c.get_request_log(300).await,
+        };
+        match r {
+            Ok(r) => {
+                if r.has_more {
+                    app.warning(format!(
+                        "The stream fell behind; {} requests were skipped.",
+                        r.total.saturating_sub(r.entries.len())
+                    ));
+                }
+                let mut held: Vec<String> = Vec::new();
+                buffer.with_untracked(|b| held.extend(b.iter().map(|r| entry_key(&r.e))));
+                pending.with_untracked(|b| held.extend(b.iter().map(|r| entry_key(&r.e))));
+                let fresh: Vec<Row> = unseen(held, r.entries)
+                    .into_iter()
+                    .map(|e| {
+                        let id = next_id.get_value();
+                        next_id.set_value(id + 1);
+                        Row { id, e }
+                    })
+                    .collect();
+                if fresh.is_empty() {
+                    return;
+                }
+                let target = if paused.get_untracked() {
+                    pending
+                } else {
+                    buffer
+                };
+                target.update(|b| {
+                    b.extend(fresh);
+                    b.sort_by_cached_key(|r| {
+                        // Newest first; ties keep their order (the sort is stable).
+                        std::cmp::Reverse((js_sys::Date::parse(&r.e.ts) * 1000.0) as i64)
+                    });
+                    b.truncate(BUFFER_MAX);
+                });
+            }
+            Err(e) => app.error(format!("Failed to recover missed requests: {e}")),
+        }
+    });
 }
 
 /// Open the SSE stream. When the browser closes it for good (expired cookie, refused stream),
@@ -167,9 +278,14 @@ fn open_stream(ctx: StreamCtx, attempt: u32) {
                 "The stream fell behind; {n} requests were skipped."
             ));
         });
+    let ctx_open = ctx.clone();
     let on_open =
         Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_ev: web_sys::MessageEvent| {
             opened.set_value(true);
+            if ctx_open.ever_open.get_value() {
+                reseed(&ctx_open);
+            }
+            ctx_open.ever_open.set_value(true);
             notice.set(None);
             stream.set(Stream::Live);
         });
@@ -345,6 +461,7 @@ pub fn LogsPage() -> impl IntoView {
         err_handler,
         notice,
         alive,
+        ever_open: StoredValue::new(false),
         app: app.clone(),
         auth_user: use_auth_state().user,
     };
@@ -631,5 +748,43 @@ pub fn LogsPage() -> impl IntoView {
                 })}
             </Drawer>
         </Layout>
+    }
+}
+
+#[cfg(test)]
+mod reseed_tests {
+    use super::*;
+
+    fn entry(url: &str, client: &str) -> RequestLogEntry {
+        serde_json::from_value(serde_json::json!({
+            "ts": "2026-01-01T00:00:00+00:00", "action": "allowed", "method": "GET", "url": url,
+            "source_host": null, "client": client, "request_type": "script", "rule": null,
+            "list_id": null, "status": 200, "mode": "explicit"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn held_entries_cancel_one_fetched_each_and_batch_duplicates_survive() {
+        let a = entry("https://a.test/", "1");
+        let b = entry("https://a.test/", "2"); // same instant, other client
+                                               // Two identical requests were fetched; one is already held: one is new.
+        let held = vec![entry_key(&a)];
+        let out = unseen(held, vec![a.clone(), a.clone(), b.clone()]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.client.as_deref() == Some("1"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.client.as_deref() == Some("2"))
+                .count(),
+            1
+        );
+        // Nothing held: the batch is kept whole, duplicates included.
+        assert_eq!(unseen(Vec::new(), vec![a.clone(), a]).len(), 2);
     }
 }
