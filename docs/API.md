@@ -51,6 +51,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `ca:admin` | - | - | yes | Manage the CA certificate (reserved). |
 | `scripts:read` | yes | yes | yes | View userscripts and their source. |
 | `scripts:write` | - | yes | yes | Install, update, enable, disable and remove userscripts; view and clear their stored values. |
+| `userscripts:bridge` | - | yes | yes | Connect the browser extension to userscripts: list and trigger a page's menu commands, and let approved scripts use this browser's logins. |
 | `policy:read` | yes | yes | yes | View script policy rules, explanations, temporary permissions and blocked-source reports. |
 | `policy:write` | - | yes | yes | Change script policy settings, rules and temporary permissions; import policy. |
 | `profiles:read` | yes | yes | yes | List and view filtering profiles (lists and overlay rules) the token may access. |
@@ -168,9 +169,10 @@ Routes take `?profile=<id>` (default `0`). Writes are audited.
 | `GET /userscripts`, `GET /userscripts/{id}`, `/source`, `/stats` | `scripts:read` | List, inspect, source, counters. |
 | `POST /userscripts` | `scripts:write` | Install directly from `source` (no dependencies fetched, no `@connect *` approval). |
 | `POST /userscripts/plan` | `scripts:write` | Body `{source}` or `{url}`: parse, fetch `@require`/`@resource` (integrity hashes verified, size capped, control-plane fetch policy) and return a plan summary with `plan_id` (grants, connect, matches, `broad_match`, `connect_all`, capability flags, warnings, dependencies, `already_installed`). Plans live 15 min in memory (max 32). |
-| `POST /userscripts/plan/{plan_id}/confirm` | `scripts:write` | Body `{allow_connect_all?, enable?}` installs the plan (201). `allow_connect_all` only for scripts declaring `@connect *`. 404 unknown/expired plan, 409 already installed. |
+| `POST /userscripts/plan/{plan_id}/confirm` | `scripts:write` | Body `{allow_connect_all?, browser_cookies?, enable?}` installs the plan (201). `allow_connect_all` only for scripts declaring `@connect *`; `browser_cookies` (use the browser's logins through the extension) only for scripts with a network or cookie grant. 404 unknown/expired plan, 409 already installed. |
 | `POST /userscripts/{id}/check-update` | `scripts:write` | Body `{apply?}`. Fetches the update URL; result `up_to_date`, `updated` (only with `apply`, and only if the update does not widen `@match`/`@connect`/`@grant`) or `pending_approval` (stored on the script, returned with its diff). |
-| `POST /userscripts/{id}/update/approve` | `scripts:write` | Apply the pending update (`{allow_connect_all?}`). |
+| `POST /userscripts/{id}/update/approve` | `scripts:write` | Apply the pending update (`{allow_connect_all?, browser_cookies?}`). |
+| `POST /userscripts/{id}/approve` | `scripts:write` | Approve an imported script (`{allow_connect_all?, browser_cookies?}`); both flags only while it awaits approval (`409 not_pending_approval` otherwise). |
 | `DELETE /userscripts/{id}/update` | `scripts:write` | Discard the pending update. |
 | `GET /userscripts/{id}/storage` | `scripts:write` | Stored GM values: `used_bytes`, `quota_bytes`, per value name, size and 200-char preview. |
 | `DELETE /userscripts/{id}/storage`, `/storage/{name}` | `scripts:write` | Clear all values or one. |
@@ -181,6 +183,19 @@ Config (`[userscripts]`): `update_check_interval_hours` (0 = off, default) sched
 script with an update URL; `auto_apply_updates` (default false) applies found updates only when they
 do not widen `@match`/`@connect`/`@grant`. Installing from a `.user.js` URL is `POST /userscripts/plan`
 with `url`; there is no proxy interception.
+
+## Extension bridge
+
+Used by the browser extension (`docs/USERSCRIPT-PROTOCOL.md` section 8). `/ext/menu*` need a token
+(not a cookie login) with `userscripts:bridge` and the header `X-Argus-Session: <sid>` of one of
+that token's live channel sessions; the document must be bound to that session. A profile-restricted
+token may use them: the binding already limits it to its profiles.
+
+| Method and path | Scope | Purpose |
+|---|---|---|
+| `GET /ext/channel` | public at HTTP level | WebSocket; the first frame `{"t":"hello","token","v":1}` authenticates (token with `userscripts:bridge`). Only from an extension origin. 503 without a bridge. |
+| `GET /ext/menu?mdoc=` | `userscripts:bridge` | Menu commands of a bound document, and host grants its scripts wait for. 403 `ext_session_required` / `ext_document_not_bound`, 404 unknown document. |
+| `POST /ext/menu/trigger` | `userscripts:bridge` | Body `{mdoc,script,cmd}`: queue a synced command for the page; `{delivered}`. |
 
 ## Script policy and the in-page panel
 

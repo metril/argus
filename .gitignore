@@ -1,5 +1,6 @@
 # Rust
 /target
+__pycache__/
 
 # Runtime directories (any certs/ dir created by a local run, incl. crates/*/certs)
 **/certs/*.key

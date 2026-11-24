@@ -287,6 +287,14 @@ and the document, at most about 20 times a second). `always` is skipped in frame
 still applies there). The UI is in a closed Shadow DOM under `all: initial`, with no `innerHTML`,
 no inline handlers and no network.
 
+**With the Argus extension connected** (`docs/USERSCRIPT-PROTOCOL.md` section 8) the badge is not
+mounted on pages opened in that browser: `data-m` is `ext:<mode>`, the commands are synced to the
+proxy and listed and triggered from the extension popup, and a trigger runs the command from the
+runtime's closure through a long poll. Without a connected extension, on a page the extension did not
+tag, or when the proxy answers `{ext:false}` (session gone, or three failed polls), the runtime
+mounts the badge exactly as above with the mode from `data-m`. A page that forges the marker only
+hides the badge. A freshly shown or re-attached badge ignores clicks for 300 ms.
+
 **The command registry is not reachable from page code.** It used to be published as a frozen object
 under `Symbol.for("adblock.userscript.menu")`, so a page could list captions and invoke commands.
 It is now a closure variable of the runtime script and is handed only to the menu button. Scripts
@@ -366,7 +374,8 @@ address) is the alternative.
 **Residual risks, honestly.** (a) A hostile page can read everything the panel reads: the preset
 name, which sources were blocked (it can see its own failed loads anyway), blocked counts, the
 userscripts that match the page (these last two it could not otherwise learn). Menu commands are
-not readable or invokable by the page: the registry is private to the runtime. (b) It can open the confirmation page with a proposal of its
+not readable or invokable by the page: the registry is private to the runtime (the extension path
+needs a bridge token and a session bound to the document). (b) It can open the confirmation page with a proposal of its
 choosing (a popup or navigation); a user who then reads nothing and types the PIN applies it. The page
 shows the change in plain words and says to continue only when the user started it. (c) A page can
 spam proposals; they do nothing until confirmed. (d) With `auth = none`, a user clicking through a
