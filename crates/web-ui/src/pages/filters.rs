@@ -461,7 +461,7 @@ pub fn FiltersPage() -> impl IntoView {
                     </ul>
                 </Show>
                 <Show
-                    when=move || !feed.items.with(|v| v.is_empty())
+                    when=move || !feed.items.with(|v| v.is_empty()) || feed.error.get().is_some()
                     fallback=move || view! {
                         <div class="empty">
                             <b>{move || if feed.loading.get() { "Loading..." } else { "No lists match" }}</b>

@@ -694,7 +694,7 @@ fn SitesCard(reload: RwSignal<u32>) -> impl IntoView {
                 </div>
             </div>
             <Show
-                when=move || !feed.items.with(|v| v.is_empty())
+                when=move || !feed.items.with(|v| v.is_empty()) || feed.error.get().is_some()
                 fallback=move || view! {
                     <div class="empty">
                         <b>{move || if feed.loading.get() { "Loading..." } else { "No sites match" }}</b>
