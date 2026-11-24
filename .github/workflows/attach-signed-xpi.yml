@@ -35,4 +35,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           v="${TAG#v}"
-          gh release upload "$TAG" "dist/argus-extension-${v}-firefox.xpi" --clobber -R "$GITHUB_REPOSITORY"
+          xpi="argus-extension-${v}-firefox.xpi"
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+          gh release upload "$TAG" "dist/$xpi" --clobber -R "$GITHUB_REPOSITORY"
+          cd dist
+          if gh release download "$TAG" -R "$GITHUB_REPOSITORY" --pattern SHA256SUMS 2>/dev/null; then
+            grep -v " $xpi\$" SHA256SUMS > SHA256SUMS.new || true
+            mv SHA256SUMS.new SHA256SUMS
+          fi
+          sha256sum "$xpi" >> SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber -R "$GITHUB_REPOSITORY"

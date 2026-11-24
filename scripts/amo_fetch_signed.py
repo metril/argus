@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -47,7 +48,20 @@ def main() -> None:
     version, out = sys.argv[1], sys.argv[2]
     api = f"https://addons.mozilla.org/api/v5/addons/addon/{GUID}/versions/v{version}/"
     for _ in range(30):
-        f = json.load(get(api)).get("file") or {}
+        try:
+            f = json.load(get(api)).get("file") or {}
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404):
+                sys.exit(f"AMO lookup failed: HTTP {e.code} for {version}")
+            print("AMO HTTP", e.code, "- retrying")
+            time.sleep(20)
+            continue
+        except urllib.error.URLError as e:
+            print("AMO unreachable:", e.reason, "- retrying")
+            time.sleep(20)
+            continue
+        if f.get("status") == "disabled":
+            sys.exit(f"version {version} is disabled on AMO")
         if f.get("status") == "public" and f.get("url"):
             with open(out, "wb") as fh:
                 fh.write(get(f["url"]).read())
