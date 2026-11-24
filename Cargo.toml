@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 # Real floor: oxc_parser 0.126 (filter-engine) requires Rust 1.92. Toolchain is pinned to
 # stable in rust-toolchain.toml; no nightly features are used.
