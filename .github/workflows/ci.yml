@@ -151,7 +151,7 @@ jobs:
   # The real extension in real browsers against a real Argus process (own data dir, ephemeral
   # ports, stub DNS). One shard per browser.
   ext-e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # Playwright 1.56 has no Chromium build for ubuntu 26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
