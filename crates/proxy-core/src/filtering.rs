@@ -1145,6 +1145,11 @@ impl ProxyContext {
                 } else {
                     None
                 };
+                let menu_mode = if us.is_some() && enabled && !blocks_scripts {
+                    self.internal.panel.menu_mode(rctx)
+                } else {
+                    None
+                };
                 let unregister_sw = !blocks_scripts
                     && us.is_some()
                     && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
@@ -1157,6 +1162,7 @@ impl ProxyContext {
                         unregister_sw,
                         userscripts: us_srcs,
                         panel: panel_key.as_ref(),
+                        menu: menu_mode,
                         ext_script: &ext_script,
                         cosmetics: &cos,
                         internal: &self.internal,

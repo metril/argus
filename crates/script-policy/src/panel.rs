@@ -20,10 +20,42 @@ pub enum PanelAuth {
     None,
 }
 
+/// When the small corner button for userscript menu commands is shown (independent of the panel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MenuButton {
+    Off,
+    /// Only on pages where a userscript registered at least one menu command (default).
+    #[default]
+    OnDemand,
+    /// On every page where a userscript runs, even with no commands.
+    Always,
+}
+
+impl MenuButton {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MenuButton::Off => "off",
+            MenuButton::OnDemand => "on_demand",
+            MenuButton::Always => "always",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "off" => MenuButton::Off,
+            "on_demand" => MenuButton::OnDemand,
+            "always" => MenuButton::Always,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PanelSettings {
     pub enabled: bool,
+    /// Corner button listing userscript menu commands; see [`MenuButton`].
+    pub menu_button: MenuButton,
     /// `Alt+Shift+A`-style chord: modifiers `Ctrl`, `Alt`, `Shift`, `Meta` and one key.
     pub hotkey: String,
     pub auth: PanelAuth,
@@ -37,6 +69,7 @@ impl Default for PanelSettings {
     fn default() -> Self {
         PanelSettings {
             enabled: false,
+            menu_button: MenuButton::default(),
             hotkey: DEFAULT_HOTKEY.into(),
             auth: PanelAuth::Pin,
             pin_hash: None,

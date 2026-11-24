@@ -34,7 +34,12 @@ fn gm_js_unit_tests() {
     let dir = tests_dir();
     let out = cmd
         .current_dir(&dir)
-        .args(["--test", "runtime.test.mjs", "hostile.test.mjs"])
+        .args([
+            "--test",
+            "runtime.test.mjs",
+            "hostile.test.mjs",
+            "menu.test.mjs",
+        ])
         .output()
         .expect("run node");
     let text =

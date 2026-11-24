@@ -248,17 +248,7 @@ test("addStyle / addElement / log / openInTab / menu commands", async () => {
   api.GM_openInTab("/x"); assert.equal(env.opened, "https://page.test/x");
   let clicked = 0;
   const id = api.GM_registerMenuCommand("Do it", () => clicked++, "d");
-  const reg = env.W[env.W.Symbol.for("adblock.userscript.menu")];
-  assert.deepEqual(reg.commands(), [{ script: "s1", scriptName: "Menu Script", id, caption: "Do it", accessKey: "d" }]);
-  assert.ok(reg.invoke("s1", id));
-  assert.equal(clicked, 1);
-  assert.throws(() => { reg.commands = null; }, TypeError, "registry object is frozen");
-  let subs = 0;
-  reg.subscribe(() => subs++);
   api.GM_unregisterMenuCommand(id);
-  assert.equal(reg.commands().length, 0);
-  assert.equal(subs, 1);
-  assert.equal(reg.invoke("s1", id), false);
 });
 
 test("tabs, cookies and unsupported webRequest", async () => {
@@ -328,24 +318,47 @@ test("capability tokens never appear on window, in the DOM or in URLs other than
   assert.ok(env.backend.calls.filter((c) => c.path !== "resource").every((c) => !c.url.includes("v1.")));
 });
 
-test("menu commands of every script on the page share one registry", async () => {
+
+test("openInTab: background refocuses, onclose polls closed, close() fires onclose once", async () => {
   const env = makeEnv();
-  const grants = ["gm_registermenucommand", "gm_unregistermenucommand"];
-  const a = await run(env, { grants, id: "s1", name: "First" }, (api) => api);
-  const b = await run(env, { grants, id: "s2", name: "Second" }, (api) => api);
-  let hits = [];
-  a.GM_registerMenuCommand("A cmd", () => hits.push("a"));
-  const idB = b.GM_registerMenuCommand("B cmd", () => hits.push("b"));
-  const reg = env.W[env.W.Symbol.for("adblock.userscript.menu")];
-  let changes = 0;
-  reg.subscribe(() => changes++);
-  const cmds = reg.commands();
-  assert.deepEqual(cmds.map((c) => [c.scriptName, c.caption]), [["First", "A cmd"], ["Second", "B cmd"]]);
-  assert.ok(cmds.every((c) => c.run === undefined && c.fn === undefined), "callbacks are not exposed");
-  assert.equal(reg.invoke("s2", idB), true);
-  assert.equal(reg.invoke("s1", 999), false);
-  assert.deepEqual(hits, ["b"]);
-  b.GM_unregisterMenuCommand(idB);
-  assert.equal(changes, 1);
-  assert.equal(reg.commands().length, 1);
+  let focused = 0;
+  const wins = [];
+  env.W.focus = () => focused++;
+  env.W.open = (u) => { const w = { url: u, closed: false, close() { this.closed = true; } }; wins.push(w); return w; };
+  env.W.setInterval = (f) => { const h = setInterval(f, 10); h.unref(); return h; };
+  const api = await run(env, { grants: ["gm_openintab"] }, (a) => a);
+  api.GM_openInTab("/fg");
+  assert.equal(focused, 0);
+  const bg = api.GM_openInTab("/bg", { active: false });
+  assert.equal(focused, 1);
+  api.GM_openInTab("/legacy", true);
+  assert.equal(focused, 2);
+  let closes = 0;
+  bg.onclose = () => closes++;
+  assert.equal(bg.closed, false);
+  wins[1].closed = true;
+  await until(() => closes === 1);
+  assert.equal(bg.closed, true);
+  await sleep(40);
+  assert.equal(closes, 1, "onclose fires once");
+  const t2 = api.GM_openInTab("/c");
+  let c2 = 0;
+  t2.onclose = () => c2++;
+  t2.close();
+  assert.equal(wins[3].closed, true);
+  assert.equal(c2, 1);
+  env.W.open = () => null; // popup blocked
+  const blocked = api.GM_openInTab("/x");
+  assert.equal(blocked.closed, true);
+  blocked.close();
+});
+
+test("GM_info.platform comes from userAgentData or the user agent", async () => {
+  const ua = (userAgent, userAgentData) => { const env = makeEnv(); env.W.navigator = { userAgent, userAgentData }; return run(env, { grants: ["gm_info"] }, (a) => a.GM_info.platform); };
+  assert.deepEqual(await ua("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"), { os: "win", arch: "x86-64", browserName: "Firefox", browserVersion: "130.0" });
+  assert.deepEqual(await ua("Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0.0.0 Safari/537.36", { platform: "Linux", brands: [{ brand: "Not/A)Brand", version: "8" }, { brand: "Chromium", version: "126" }, { brand: "Google Chrome", version: "126" }] }), { os: "linux", arch: "x86-64", browserName: "Google Chrome", browserVersion: "126" });
+  const p = await ua("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36");
+  assert.equal(p.os, "android");
+  assert.equal((await ua("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17.4 Safari/605.1.15")).os, "mac");
+  assert.equal((await ua("test-agent")).os, "unknown");
 });

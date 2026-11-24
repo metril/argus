@@ -118,15 +118,9 @@ function render() {
     p.appendChild(section("Ad blocking", [h("div", { class: "r" }, [
       btn("On for " + st.site, (stagedAdblock === null ? !st.adblock_off : stagedAdblock), function () { var cur2 = stagedAdblock === null ? !st.adblock_off : stagedAdblock; stagedAdblock = !cur2 === !st.adblock_off ? null : !cur2; render(); }, "adblock"),
       h("span", { class: "m", text: st.blocked + " blocked on this page" })])]));
-    var reg = null;
-    try { reg = W[Symbol.for("adblock.userscript.menu")]; } catch (e) { /* ignore */ }
-    var cmds = reg ? reg.commands() : [];
     var uk = (st.userscripts || []).map(function (u) {
       var on = u.id in stagedUs ? stagedUs[u.id] : u.enabled;
       var row = [btn(u.name + (on ? ": on" : ": off"), on, function () { if (u.id in stagedUs) { delete stagedUs[u.id]; } else { stagedUs[u.id] = !u.enabled; } render(); }, "u-" + u.id)];
-      cmds.filter(function (c) { return c.script === u.id; }).forEach(function (c) {
-        row.push(h("button", { type: "button", "data-k": "c-" + c.id, on: { click: function () { reg.invoke(c.script, c.id); } } }, [c.caption]));
-      });
       return h("div", { class: "r" }, row);
     });
     p.appendChild(section("Userscripts", uk.length ? uk : [h("p", { class: "m", text: "No userscript matches this page." })]));
@@ -175,7 +169,6 @@ function open() {
   timer = setInterval(refresh, 3000);
   W.addEventListener("focus", refresh);
   D.addEventListener("securitypolicyviolation", onViol, true);
-  try { var reg = W[Symbol.for("adblock.userscript.menu")]; if (reg) { reg.subscribe(function () { if (host) { render(); } }); } } catch (e) { /* ignore */ }
 }
 function close() {
   if (!host) { return; }

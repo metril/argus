@@ -266,8 +266,65 @@ The panel renders in a closed Shadow DOM under `all: initial`, at the top z-inde
 inline handlers and no `eval` (so it works under strict CSP and Trusted Types). It shows the site's
 preset, the sources blocked on the page by registrable domain with a toggle per capability, a TTL
 choice for temporary allows, "allow all temporarily", "revoke temporary permissions", the count of
-blocked requests, per-site ad blocking, the userscripts matching the page (with their menu commands)
+blocked requests, per-site ad blocking, the userscripts matching the page
 and a "reload to apply" prompt when the settings change.
+
+### Menu button for userscript commands
+
+`GM_registerMenuCommand` entries are reachable without the panel through a small corner badge. The
+per-profile setting `menu_button` (`PUT /policy/panel`; dashboard: Policy, "Userscript menu button")
+has three values: `off`, `on_demand` (default: the badge exists only while at least one script on
+the page has a registered command) and `always` (on every page where a userscript runs, with "No
+commands registered." when empty). It does not depend on `panel.enabled` or on
+`script_control.panel_enabled`, and it is never emitted on a page without userscripts, in a
+`sandbox`ed document without `allow-scripts`, or when script injection is off.
+
+The button's code is part of the shared runtime script (`data-m` on its tag carries the mode), so it
+runs at document start with every command already visible and follows later `register`/`unregister`
+through the registry's `subscribe`. A history change (`popstate`, `hashchange`, `pageshow`), a
+replaced root, or the page removing the host re-attaches the badge (observing `documentElement`
+and the document, at most about 20 times a second). `always` is skipped in frames (`on_demand`
+still applies there). The UI is in a closed Shadow DOM under `all: initial`, with no `innerHTML`,
+no inline handlers and no network.
+
+**The command registry is not reachable from page code.** It used to be published as a frozen object
+under `Symbol.for("adblock.userscript.menu")`, so a page could list captions and invoke commands.
+It is now a closure variable of the runtime script and is handed only to the menu button. Scripts
+register through their own `GM_registerMenuCommand`. Consequently the in-page panel no longer lists
+menu commands: use the badge (`menu_button` other than `off`).
+
+**Clickjacking.** The page can style its own DOM, including our host element, so: the host carries
+inline `!important` styles (fixed position, opacity 1, no transform/filter/clip-path, pointer events,
+visibility), re-asserted before each click; the badge and the open menu are rendered in the top layer
+(`popover="manual"`, falling back to a high z-index); before acting, the click handler checks the
+host's and the root's computed style (opacity, transform, filter, visibility, display, clip-path,
+pointer-events) and the badge's size and anchor, and ignores the click if anything is off; menu items
+ignore clicks in the first 400 ms after the menu opens (a page cannot swap the menu under a click);
+and only trusted clicks count. Before acting, ours is re-raised to the top of the top layer (hide,
+then show) and a hit test (`elementsFromPoint` at the clicked element's centre) must return our host
+first; the anchor check uses `documentElement.clientWidth/Height`, so a classic scrollbar does not
+trip it; the ancestor (`html`) opacity/filter/transform check runs only without popover support.
+**Built-ins are captured at document start.** The UI is built lazily, after page scripts may have
+run, so every built-in it uses (`addEventListener`, `createElement`, `attachShadow`,
+`getBoundingClientRect`, `getComputedStyle`, `CSSStyleDeclaration` methods, `showPopover`,
+`MutationObserver`, `setTimeout`, `Date.now`, the property getters) is saved when the runtime
+installs and called only through `Reflect.apply`. A page that hooks `addEventListener` afterwards
+captures no handler, one that hooks `attachShadow` never sees the shadow root, and one that replaces
+`getComputedStyle` cannot fake the checks. `isTrusted` is read through the getter saved from a real
+event, so a fake `{isTrusted: true}` object is refused. The code reads no property of an object
+literal and no array method, and dynamic lists (the registry, the menu's own lists) are
+null-prototype objects with a counter, never arrays (an index write or `push` walks
+`Array.prototype`, where a page can plant setters that would receive the callbacks); dictionaries
+handed to the platform (`attachShadow`, `observe`) are null-prototype with every member explicit;
+the UI is styled by a nonce'd `<style>` inside the closed root, not an adopted constructed
+stylesheet (adoption converts a sequence through the page-hookable array iterator, which would hand
+the sheet over); menu options are read only as own properties of a real object;
+`key`, `target`, `focus`, `compatMode` and the viewport size (body in quirks mode) come from saved
+getters. `menu.test.mjs` booby-traps every hookable prototype member and asserts the runtime
+touches none while registering, opening, typing and clicking. `Object.prototype`/`Array.prototype` pollution is inert. After the
+20-per-second re-attach cap a retry is scheduled for the end of the window. A page can still cover
+the badge with its own later top-layer element (a dialog); a click then lands on the page's
+element, not on ours.
 
 ### Authority: why the panel cannot change anything
 
@@ -308,8 +365,8 @@ address) is the alternative.
 
 **Residual risks, honestly.** (a) A hostile page can read everything the panel reads: the preset
 name, which sources were blocked (it can see its own failed loads anyway), blocked counts, the
-userscripts that match the page and their menu captions (these last three it could not otherwise
-learn), and it can invoke menu commands. (b) It can open the confirmation page with a proposal of its
+userscripts that match the page (these last two it could not otherwise learn). Menu commands are
+not readable or invokable by the page: the registry is private to the runtime. (b) It can open the confirmation page with a proposal of its
 choosing (a popup or navigation); a user who then reads nothing and types the PIN applies it. The page
 shows the change in plain words and says to continue only when the user started it. (c) A page can
 spam proposals; they do nothing until confirmed. (d) With `auth = none`, a user clicking through a

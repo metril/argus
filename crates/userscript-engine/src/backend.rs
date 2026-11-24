@@ -422,6 +422,30 @@ impl GmBackend {
 
 // ---- @connect ------------------------------------------------------------------------------
 
+/// `@connect google.*` / `*.google.*`: the stem followed by any ICANN public suffix (the private
+/// section, e.g. `github.io`, is excluded so a user-registered name cannot pose as the stem).
+/// A stem allows its subdomains, like a plain `@connect` domain.
+fn connect_tld_match(pat: &str, host: &str) -> bool {
+    let stem = pat.strip_suffix(".*").unwrap_or(pat);
+    let stem = stem.strip_prefix("*.").unwrap_or(stem);
+    if stem.is_empty() || stem.contains('*') {
+        return false;
+    }
+    let Some(sfx) = psl::suffix(host.as_bytes()).filter(|s| s.typ() == Some(psl::Type::Icann))
+    else {
+        return false;
+    };
+    let n = sfx.as_bytes().len();
+    if host.len() <= n + 1 || host.as_bytes()[host.len() - n - 1] != b'.' {
+        return false;
+    }
+    let rest = &host[..host.len() - n - 1];
+    rest == stem
+        || (rest.len() > stem.len()
+            && rest.ends_with(stem)
+            && rest.as_bytes()[rest.len() - stem.len() - 1] == b'.')
+}
+
 /// Whether `target` may be contacted by the script on behalf of a page on `page_host`.
 ///
 /// Matches Tampermonkey's documented `@connect`: a domain allows itself and its subdomains,
@@ -447,10 +471,12 @@ pub fn check_connect(script: &Userscript, page_host: &str, target: &Url) -> GmRe
         return Ok(());
     }
     for c in &script.metadata.connect {
+        let c = c.to_ascii_lowercase();
         let ok = match c.as_str() {
             "*" => script.allow_connect_all,
             "self" => host == page_host,
             "localhost" => host == "localhost",
+            c if c.ends_with(".*") => connect_tld_match(c, &host),
             c => {
                 let d = c.strip_prefix("*.").unwrap_or(c);
                 !d.is_empty()
@@ -836,6 +862,31 @@ mod tests {
             script: s,
             page_host: "page.test",
         }
+    }
+
+    #[test]
+    fn connect_tld_wildcards() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        let s = script("// @connect google.*\n// @connect *.example.*", false);
+        let ok = |url: &str| check_connect(&s, "page.test", &u(url)).is_ok();
+        assert!(ok("https://google.com/"));
+        assert!(ok("https://google.co.uk/x"));
+        assert!(ok("https://www.google.de/"));
+        assert!(ok("https://api.example.org/") && ok("https://example.com.au/"));
+        assert!(!ok("https://notgoogle.com/"));
+        assert!(!ok("https://google.evil.com/"));
+        assert!(
+            !ok("https://google.github.io/"),
+            "private suffixes do not count"
+        );
+        assert!(!ok("https://google/") && !ok("http://1.2.3.4/"));
+        assert!(!ok("https://google.com.evil.invalid/"));
+        let mut upper = script("// @connect a.test", false);
+        upper.metadata.connect = vec!["GOOGLE.*".into()];
+        assert!(check_connect(&upper, "page.test", &u("https://google.com/")).is_ok());
+        // A bare `*.` stem or an inner wildcard never matches.
+        let bad = script("// @connect .*\n// @connect g*.*", false);
+        assert!(check_connect(&bad, "page.test", &u("https://google.com/")).is_err());
     }
 
     #[test]

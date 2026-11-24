@@ -4,7 +4,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chromiumoxide::cdp::browser_protocol::input::{DispatchKeyEventParams, DispatchKeyEventType};
+use chromiumoxide::cdp::browser_protocol::emulation::{
+    SetDeviceMetricsOverrideParams, SetTouchEmulationEnabledParams,
+};
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    MouseButton,
+};
 use e2e_browser::{eval_on, run_known, MockResponse, Session};
 use proxy_core::panel::{PanelConfig, SiteBlocking};
 use script_policy::panel::{hash_pin, PanelAuth, PanelSettings};
@@ -468,31 +474,159 @@ panel_test!(
     }
 );
 
-panel_test!(
-    menu_commands_of_two_scripts_appear_and_fire,
-    PanelAuth::Pin,
-    |s, _sites| {
-        for (n, g) in [("One", "__c1"), ("Two", "__c2")] {
-            s.proxy.install_userscript(&format!(
+fn install_two_command_scripts(s: &Session) {
+    for (n, g) in [("One", "__c1"), ("Two", "__c2")] {
+        s.proxy.install_userscript(&format!(
             "// ==UserScript==\n// @name {n}\n// @namespace sp\n// @version 1\n// @match *://sp.test/*\n// @grant GM_registerMenuCommand\n// ==/UserScript==\nGM_registerMenuCommand('{n} command', () => {{ window.{g} = (window.{g} || 0) + 1; }});\n"
         ));
+    }
+}
+
+/// A real (trusted) left click at viewport coordinates.
+async fn mouse_click(s: &Session, x: f64, y: f64) {
+    for (t, buttons) in [
+        (DispatchMouseEventType::MouseMoved, None),
+        (DispatchMouseEventType::MousePressed, Some(1)),
+        (DispatchMouseEventType::MouseReleased, Some(1)),
+    ] {
+        let mut b = DispatchMouseEventParams::builder().r#type(t).x(x).y(y);
+        if buttons.is_some() {
+            b = b.button(MouseButton::Left).click_count(1);
         }
+        s.page.execute(b.build().unwrap()).await.unwrap();
+    }
+}
+
+async fn center(s: &Session, js_el: &str) -> (f64, f64) {
+    let v = s
+        .eval(&format!(
+            "(() => {{ const e = {js_el}; const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }})()"
+        ))
+        .await;
+    (v[0].as_f64().unwrap(), v[1].as_f64().unwrap())
+}
+
+// The panel no longer lists or runs menu commands: the command registry is private to the
+// runtime and only the menu button reads it.
+panel_test!(
+    panel_does_not_list_or_fire_menu_commands,
+    PanelAuth::Pin,
+    |s, _sites| {
+        install_two_command_scripts(&s);
         routes(&s, "");
         s.goto(&s.url("sp.test", "/")).await;
         hotkey(&s).await;
-        wait_text(&s, "both commands", "Two command").await;
+        wait_text(&s, "the userscripts section", "Userscripts").await;
         let t = panel_text(&s).await;
         assert!(
-            t.contains("One command") && t.contains("Two command"),
+            !t.contains("One command") && !t.contains("Two command"),
             "{t}"
         );
+        assert_eq!(s.eval("typeof window.__c1").await, "undefined");
+        assert_eq!(
+            s.eval("typeof window[Symbol.for('adblock.userscript.menu')]")
+                .await,
+            "undefined",
+            "no registry on the window"
+        );
+    }
+);
+
+panel_test!(
+    menu_badge_lists_commands_of_two_scripts_and_fires_on_real_clicks,
+    PanelAuth::Pin,
+    |s, _sites| {
+        install_two_command_scripts(&s);
+        routes(&s, "");
+        s.goto(&s.url("sp.test", "/")).await;
+        s.wait_for("the badge", "(window.__spy || []).length > 0")
+            .await;
+        let badge = "window.__spy.at(0).querySelector('[data-k=badge]')";
+        let expanded = format!("{badge}.getAttribute('aria-expanded')");
+        // A script-made click is untrusted and does nothing.
+        s.eval(&format!("{badge}.click()")).await;
+        assert_eq!(s.eval(&expanded).await, "false");
+        // A real click opens the menu with both scripts' commands.
+        let (x, y) = center(&s, badge).await;
+        mouse_click(&s, x, y).await;
+        s.wait_for("the menu", &format!("{expanded} === 'true'"))
+            .await;
+        let menu = s
+            .eval("window.__spy.at(0).textContent")
+            .await
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            menu.contains("One command") && menu.contains("Two command"),
+            "{menu}"
+        );
         for (label, g) in [("One command", "__c1"), ("Two command", "__c2")] {
-            s.eval(&format!(
-            "(() => {{ const b = [...window.__spy.at(-1).querySelectorAll('button')].find(b => b.textContent === {label:?}); b.click(); }})()"
-        ))
-        .await;
+            let item = format!(
+                "[...window.__spy.at(0).querySelectorAll('button')].find(b => b.textContent === {label:?})"
+            );
+            // Items ignore clicks in the first 400 ms, and ignore untrusted ones always.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            s.eval(&format!("{item}.click()")).await;
+            assert_eq!(s.eval(&format!("typeof window.{g}")).await, "undefined");
+            let (x, y) = center(&s, &item).await;
+            mouse_click(&s, x, y).await;
             s.wait_for(label, &format!("window.{g} === 1")).await;
+            if g == "__c1" {
+                // The menu closed after the command; reopen it for the next one.
+                let (x, y) = center(&s, badge).await;
+                mouse_click(&s, x, y).await;
+                s.wait_for("the menu again", &format!("{expanded} === 'true'"))
+                    .await;
+            }
         }
+        assert_eq!(s.eval("window.__c1").await, 1);
+        assert_eq!(s.eval("window.__c2").await, 1);
+    }
+);
+
+// Mobile emulation (400x800, touch): the badge is where we expect it and a real click works on the
+// badge and on an item.
+panel_test!(
+    menu_badge_works_under_mobile_emulation,
+    PanelAuth::Pin,
+    |s, _sites| {
+        s.page
+            .execute(SetDeviceMetricsOverrideParams::new(400, 800, 2.0, true))
+            .await
+            .unwrap();
+        s.page
+            .execute(SetTouchEmulationEnabledParams::new(true))
+            .await
+            .unwrap();
+        install_two_command_scripts(&s);
+        routes(&s, "");
+        // routes() builds a page without a viewport meta; a mobile page has one.
+        let cdn = s.url("cdn.test", "/x.js");
+        s.origin.route(
+            "/",
+            MockResponse::html(
+                doc("")
+                    .replace("CDN", &cdn)
+                    .replace("<meta charset=utf-8>", "<meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"),
+            ),
+        );
+        s.goto(&s.url("sp.test", "/")).await;
+        s.wait_for("the badge", "(window.__spy || []).length > 0")
+            .await;
+        assert_eq!(s.eval("innerWidth").await, 400);
+        let badge = "window.__spy.at(0).querySelector('[data-k=badge]')";
+        let expanded = format!("{badge}.getAttribute('aria-expanded')");
+        let (x, y) = center(&s, badge).await;
+        assert!(x > 300.0 && y > 700.0, "badge in the bottom right: {x},{y}");
+        mouse_click(&s, x, y).await;
+        s.wait_for("the menu", &format!("{expanded} === 'true'"))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let item = "[...window.__spy.at(0).querySelectorAll('button')].find(b => b.textContent === 'One command')";
+        let (x, y) = center(&s, item).await;
+        mouse_click(&s, x, y).await;
+        s.wait_for("the command", "window.__c1 === 1").await;
     }
 );
 

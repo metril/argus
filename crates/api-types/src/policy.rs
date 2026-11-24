@@ -333,6 +333,10 @@ pub struct PolicyReportDto {
 pub struct PanelSettingsDto {
     /// Offer the in-page panel on pages of this profile (off by default).
     pub enabled: bool,
+    /// Corner button for userscript menu commands: `off`, `on_demand` (default; only when a script
+    /// registered a command) or `always`. Independent of `enabled`.
+    #[serde(default)]
+    pub menu_button: String,
     /// Hotkey, for example `Alt+Shift+A`.
     pub hotkey: String,
     /// `pin`, `session` or `none`.
@@ -349,6 +353,9 @@ pub struct PanelSettingsDto {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct PanelSettingsInput {
     pub enabled: Option<bool>,
+    /// `off`, `on_demand` or `always`.
+    #[serde(default)]
+    pub menu_button: Option<String>,
     pub hotkey: Option<String>,
     pub auth: Option<String>,
     /// Set a new PIN (4 to 64 characters).

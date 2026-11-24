@@ -202,6 +202,7 @@ fn PolicyTop(reload: RwSignal<u32>) -> impl IntoView {
     let ep_pin = edit_panel.clone();
     let ep_hot = edit_panel.clone();
     let ep_on = edit_panel.clone();
+    let ep_menu = edit_panel.clone();
 
     view! {
         <div class="card">
@@ -231,7 +232,7 @@ fn PolicyTop(reload: RwSignal<u32>) -> impl IntoView {
                         ]
                         value=Signal::derive(move || panel.get().map(|p| p.auth).unwrap_or_default())
                         on_change=Callback::new(move |a: String| ep_auth(PanelSettingsInput {
-                            enabled: None, hotkey: None, auth: Some(a), pin: None, clear_pin: false,
+                            auth: Some(a), ..Default::default()
                         }))
                     />
                     <div></div>
@@ -250,8 +251,7 @@ fn PolicyTop(reload: RwSignal<u32>) -> impl IntoView {
                     on_save=Callback::new(move |p: String| {
                         let clear = p.is_empty();
                         ep_pin(PanelSettingsInput {
-                            enabled: None, hotkey: None, auth: None,
-                            pin: (!clear).then_some(p), clear_pin: clear,
+                            pin: (!clear).then_some(p), clear_pin: clear, ..Default::default()
                         })
                     })
                 />
@@ -260,7 +260,7 @@ fn PolicyTop(reload: RwSignal<u32>) -> impl IntoView {
                     sub="Opens the in-page panel"
                     saved=Signal::derive(move || panel.get().map(|p| p.hotkey).unwrap_or_default())
                     on_save=Callback::new(move |h: String| ep_hot(PanelSettingsInput {
-                        enabled: None, hotkey: Some(h), auth: None, pin: None, clear_pin: false,
+                        hotkey: Some(h), ..Default::default()
                     }))
                 />
                 <span class="hint">
@@ -286,9 +286,21 @@ fn PolicyTop(reload: RwSignal<u32>) -> impl IntoView {
                         checked=Signal::derive(move || panel.get().is_some_and(|p| p.enabled))
                         label="Offer the in-page panel"
                         on_change=Callback::new(move |v: bool| ep_on(PanelSettingsInput {
-                            enabled: Some(v), hotkey: None, auth: None, pin: None, clear_pin: false,
+                            enabled: Some(v), ..Default::default()
                         }))
                     />
+                </div>
+                <div class="srow">
+                    <div class="txt"><b>"Userscript menu button"</b><small>"Corner button listing GM menu commands, without the panel"</small></div>
+                    <select class="select" aria-label="Userscript menu button"
+                        prop:value=move || panel.get().map(|p| p.menu_button).unwrap_or_default()
+                        on:change=move |ev| ep_menu(PanelSettingsInput {
+                            menu_button: Some(event_target_value(&ev)), ..Default::default()
+                        })>
+                        <option value="off">"Off"</option>
+                        <option value="on_demand">"When scripts register commands"</option>
+                        <option value="always">"Always"</option>
+                    </select>
                 </div>
             </div>
         </div>

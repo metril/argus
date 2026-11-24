@@ -196,7 +196,7 @@ for the model. Routes take `?profile=<id>` (default `0`) and writes are audited.
 | `GET /policy/explain?url=`, `POST /policy/preview` | read | The CSP, HTML actions and hints for a URL; before/after for a proposed change. |
 | `GET /policy/export`, `POST /policy/import` | read / write | JSON document; temporary grants are not exported. |
 | `GET /policy/reports?site=` | read | Blocked sources per page for one-click allow, fed by the proxy's blocks and the browsers' violation reports of the policy the proxy added. |
-| `GET`, `PUT /policy/panel` | read / write | In-page panel: `enabled` (per profile, off by default), `hotkey` (default `Alt+Shift+A`; modifiers plus one key, with Alt, Ctrl or Meta), `auth` (`pin` default, `session`, `none`), `pin` (4 to 64 characters; write-only, `pin_set` says whether one is set), `clear_pin`. Returns `reserved_host`. |
+| `GET`, `PUT /policy/panel` | read / write | In-page panel: `enabled` (per profile, off by default), `hotkey` (default `Alt+Shift+A`; modifiers plus one key, with Alt, Ctrl or Meta), `menu_button` (`off`, `on_demand` default, `always`: corner button for userscript menu commands, independent of `enabled`), `auth` (`pin` default, `session`, `none`), `pin` (4 to 64 characters; write-only, `pin_set` says whether one is set), `clear_pin`. Returns `reserved_host`. |
 | `GET /rules/site-exceptions` | `rules:read` | Sites with ad blocking switched off. |
 | `PUT`, `DELETE /rules/site-exceptions/{site}` | `rules:write` | Switch ad blocking off or on for a site (a host name, lowercase punycode). Stored as custom rules (`@@$domain=site` plus the sentinel `\|\|adblock.invalid^`), so they appear in `GET /rules/custom`. |
 
