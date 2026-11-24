@@ -62,6 +62,7 @@ export default defineBackground(() => {
   });
   browser.storage.onChanged.addListener((changes: Record<string, unknown>) => {
     if ('argusUrl' in changes || 'token' in changes) { clearCache(); void bridge.reconnect(); }
+    if ('argusProxy' in changes) void proxy.reload();
   });
   browser.tabs.onRemoved.addListener((id) => intercepted.delete(id));
 

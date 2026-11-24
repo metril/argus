@@ -23,6 +23,14 @@
   that authenticated as the job's session. Relay authority comes only from per-host permissions
   (never `<all_urls>`, `*://*/*` or public suffixes); the options page button that asked for all
   sites is gone. Public suffixes are no longer offered as host grants.
+* A relayed response that redirects is checked by the proxy before the browser can follow it:
+  the target must pass `@connect`, the session's permissions, the public-host and bypass rules,
+  the fail-safe and the Extended Validation setting, or the response becomes a `502` without
+  `Location` or `Set-Cookie`. Hosts Argus would tunnel (EV with "do not decrypt EV sites" on) are no
+  longer relayed to at all.
+* Real-browser suites (`crates/e2e-browser/tests/extension_chromium.rs`, `extension_firefox.rs`) run
+  the built extension against a real Argus process; they are opt-in (`ARGUS_EXT_E2E=1`) and have
+  their own CI shard.
 * Relays for Firefox containers and private windows use that store's cookies (the fetch is made
   without the default store's, the store's go in per hop and `Set-Cookie` is written back to it);
   menus and documents are scoped to the store. Chrome's incognito windows are served by a second

@@ -22,6 +22,11 @@ export default defineConfig({
     // Argus URL is user-entered: request its origin at runtime. Firefox needs <all_urls>
     // for webRequest observation of arbitrary sites.
     optional_host_permissions: ['http://*/*', 'https://*/*'],
+    // Test builds only (never set in releases): per-host permissions a headless browser cannot be
+    // asked for, e.g. ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*'.
+    ...(process.env.ARGUS_E2E_HOSTS && browser !== 'firefox'
+      ? { host_permissions: process.env.ARGUS_E2E_HOSTS.split(',') }
+      : {}),
     ...(browser === 'firefox'
       ? {
           host_permissions: ['<all_urls>'],

@@ -54,6 +54,12 @@ export class ProxyController {
     await this.apply();
   }
 
+  /** The stored state changed elsewhere (storage): read it again. */
+  async reload() {
+    this.state = await loadProxyState(this.d.browser);
+    await this.apply();
+  }
+
   getState(): ProxyState { return this.state; }
 
   async setState(s: ProxyState) {

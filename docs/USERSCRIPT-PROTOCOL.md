@@ -509,16 +509,22 @@ and the header is removed before it goes upstream. A refused hop gets `403` with
 `relayed request refused`, which the extension turns into an error frame.
 
 Redirects. `fetch(..., {redirect: 'manual'})` returns an opaque response whose `Location` the
-extension cannot read, so the extension cannot follow hops itself; the per-hop checks therefore
-run in the proxy, where every hop arrives. `redirect: "manual"` calls are never relayed (they use
-the jar, which returns the real 3xx); `error` is the browser's own `redirect: 'error'`; `follow`
-is the browser following redirects, with every hop checked as above, and the extension re-checking
-the *final* URL against the job's `@connect`, its host permission and the local-target rule before
-any byte of the answer is passed on (an error frame otherwise). The extension also refuses
-loopback and private targets for the first URL. Residual: an intermediate hop to a host Argus does
-not decrypt is not visible to either side (the relay token would travel through a tunnel to that
-host); its response is never delivered to the script unless it is also the final URL, and the
-final URL check refuses it.
+extension cannot read, so the extension cannot follow hops itself; the checks run in the proxy
+instead, by induction. The first hop is approved by the routing rules above before anything is
+dispatched. Every relayed response is decrypted by Argus, so when one is a `3xx` with a `Location`
+the proxy resolves it against the request URL and runs the full hop check on the target *before
+the browser can follow it*: the job is live and the hop arrives on its session's connection, the
+session holds a permission for the host, the host is public (not loopback, private or
+link-local) and is not bypassed, the bypass fail-safe is not active, the script's `@connect`
+allows it, and Argus will decrypt it (with the Extended Validation setting on, a probe must have
+shown the host is not EV; an EV or unprobeable host is tunnelled, so it fails). A hop that fails
+is replaced by `502` with `x-adblock-note: relayed redirect refused`, without `Location` or
+`Set-Cookie`, which the extension turns into an error frame. Every hop the browser follows was
+therefore approved before it was requested, whatever the chain looks like; there is no hop the
+proxy cannot see. `redirect: "manual"` calls are never relayed (they use the jar, which returns the
+real 3xx); `error` is the browser's own `redirect: 'error'`. The extension also re-checks the
+*final* URL against the job's `@connect`, its host permission and the local-target rule before any
+byte of the answer is passed on, and refuses loopback and private targets for the first URL.
 
 **Cookie stores.** A background `fetch` always uses the extension's default store. For a job whose
 document belongs to another store (`store` in the job, a Firefox container or private window) the
