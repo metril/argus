@@ -9,22 +9,64 @@ pub use api_types::{
 };
 
 /// Short-lived share of the unfiltered first page: the navbar and the page behind it both ask
-/// for it on every navigation. Any profile write drops it.
-#[derive(Default)]
-struct FirstPage {
+/// for it on every navigation. Any profile write (and logout) drops it, and a fetch that was
+/// already running when that happened is not stored.
+struct FirstPage<T> {
     inflight: bool,
     at: f64,
-    page: Option<Page<ProfileDto>>,
+    /// Bumped by every invalidation.
+    gen: u64,
+    page: Option<T>,
+}
+
+impl<T: Clone> FirstPage<T> {
+    const fn new() -> Self {
+        Self {
+            inflight: false,
+            at: 0.0,
+            gen: 0,
+            page: None,
+        }
+    }
+
+    fn fresh(&self, now: f64, ttl: f64) -> Option<T> {
+        self.page.clone().filter(|_| now - self.at < ttl)
+    }
+
+    fn invalidate(&mut self) {
+        self.gen += 1;
+        self.page = None;
+    }
+
+    /// Begin a fetch: returns the generation to hand back to [`Self::finish`].
+    fn start(&mut self) -> u64 {
+        self.inflight = true;
+        self.gen
+    }
+
+    fn finish(&mut self, started_gen: u64, now: f64, result: Option<&T>) {
+        self.inflight = false;
+        if let (Some(p), true) = (result, started_gen == self.gen) {
+            self.page = Some(p.clone());
+            self.at = now;
+        }
+    }
 }
 
 thread_local! {
-    static FIRST_PAGE: std::cell::RefCell<FirstPage> = std::cell::RefCell::new(FirstPage::default());
+    static FIRST_PAGE: std::cell::RefCell<FirstPage<Page<ProfileDto>>> =
+        const { std::cell::RefCell::new(FirstPage::new()) };
 }
 
 const FIRST_PAGE_TTL_MS: f64 = 2000.0;
 
 fn invalidate_first_page() {
-    FIRST_PAGE.with(|c| c.borrow_mut().page = None);
+    FIRST_PAGE.with(|c| c.borrow_mut().invalidate());
+}
+
+/// Drop cached profile data (on logout, so the next user never sees it).
+pub fn clear_profile_cache() {
+    invalidate_first_page();
 }
 
 impl ApiClient {
@@ -55,12 +97,10 @@ impl ApiClient {
         loop {
             let hit = FIRST_PAGE.with(|c| {
                 let c = c.borrow();
-                match &c.page {
-                    Some(p) if js_sys::Date::now() - c.at < FIRST_PAGE_TTL_MS => {
-                        Some(Some(p.clone()))
-                    }
-                    _ if c.inflight => Some(None),
-                    _ => None,
+                match c.fresh(js_sys::Date::now(), FIRST_PAGE_TTL_MS) {
+                    Some(p) => Some(Some(p)),
+                    None if c.inflight => Some(None),
+                    None => None,
                 }
             });
             match hit {
@@ -69,15 +109,11 @@ impl ApiClient {
                 None => break,
             }
         }
-        FIRST_PAGE.with(|c| c.borrow_mut().inflight = true);
+        let g = FIRST_PAGE.with(|c| c.borrow_mut().start());
         let r = self.fetch_profiles_page("", None).await;
         FIRST_PAGE.with(|c| {
-            let mut c = c.borrow_mut();
-            c.inflight = false;
-            if let Ok(p) = &r {
-                c.page = Some(p.clone());
-                c.at = js_sys::Date::now();
-            }
+            c.borrow_mut()
+                .finish(g, js_sys::Date::now(), r.as_ref().ok());
         });
         r
     }
@@ -219,5 +255,43 @@ mod tests {
             proxy_url("abd_x", "fd00::1", 8080),
             "http://device:abd_x@[fd00::1]:8080"
         );
+    }
+}
+
+#[cfg(test)]
+mod first_page_tests {
+    use super::FirstPage;
+
+    #[test]
+    fn fresh_page_is_served_until_ttl() {
+        let mut c = FirstPage::<u32>::new();
+        let g = c.start();
+        c.finish(g, 100.0, Some(&7));
+        assert_eq!(c.fresh(1000.0, 2000.0), Some(7));
+        assert_eq!(c.fresh(2200.0, 2000.0), None);
+    }
+
+    #[test]
+    fn write_during_fetch_keeps_stale_result_out_of_the_cache() {
+        let mut c = FirstPage::<u32>::new();
+        let g = c.start();
+        // A profile write lands while the fetch is in flight.
+        c.invalidate();
+        c.finish(g, 100.0, Some(&1));
+        assert_eq!(c.fresh(101.0, 2000.0), None);
+        assert!(!c.inflight);
+        // The next fetch started after the write is stored.
+        let g = c.start();
+        c.finish(g, 200.0, Some(&2));
+        assert_eq!(c.fresh(201.0, 2000.0), Some(2));
+    }
+
+    #[test]
+    fn invalidate_drops_a_cached_page() {
+        let mut c = FirstPage::<u32>::new();
+        let g = c.start();
+        c.finish(g, 0.0, Some(&3));
+        c.invalidate();
+        assert_eq!(c.fresh(1.0, 2000.0), None);
     }
 }

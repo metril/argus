@@ -42,6 +42,7 @@ impl ApiClient {
 
     /// Logout the current user
     pub async fn logout(&self) -> Result<MessageResponse, ApiError> {
+        super::profiles::clear_profile_cache();
         self.post("/auth/logout", &()).await
     }
 

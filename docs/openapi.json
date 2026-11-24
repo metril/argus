@@ -2427,9 +2427,12 @@
             "type": "boolean"
           },
           "duplicate_count": {
-            "description": "Rules of this list dropped as duplicates of an earlier list (or of itself) at the last\nbuild; `rule_count + duplicate_count` is the list's total.",
+            "description": "Rules of this list dropped as duplicates of an earlier list (or of itself) at the last\nbuild of its current download; `rule_count + duplicate_count` is the list's total.\nAbsent until a build has seen the current download.",
             "minimum": 0,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "enabled": {
             "type": "boolean"

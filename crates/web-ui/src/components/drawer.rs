@@ -83,17 +83,21 @@ pub fn use_body_scroll_lock(open: Signal<bool>) {
             let _ = b.class_list().toggle_with_force("noscroll", n > 0);
         }
     };
-    Effect::new(move |was: Option<bool>| {
+    // Whether this overlay took the lock, so cleanup releases exactly what it holds.
+    let held = StoredValue::new_local(false);
+    Effect::new(move |_| {
         let now = open.get();
-        match (was.unwrap_or(false), now) {
-            (false, true) => set(true),
-            (true, false) => set(false),
-            _ => {}
+        if now && !held.get_value() {
+            held.set_value(true);
+            set(true);
+        } else if !now && held.get_value() {
+            held.set_value(false);
+            set(false);
         }
-        now
     });
     on_cleanup(move || {
-        if open.try_get_untracked().unwrap_or(false) {
+        if held.try_get_value().unwrap_or(false) {
+            held.set_value(false);
             set(false);
         }
     });

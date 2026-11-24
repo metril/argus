@@ -24,12 +24,6 @@ use crate::state::{blocking, AppState};
 fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> FilterListResponse {
     let status = state.filter_store.get_status(&list.id).unwrap_or_default();
     let attention = needs_attention(list, status.last_error.is_some());
-    let duplicate_count = state
-        .filter_store
-        .get_report(&list.id)
-        .ok()
-        .flatten()
-        .map_or(0, |r| r.duplicates);
     FilterListResponse {
         id: list.id.clone(),
         name: list.name.clone(),
@@ -37,7 +31,7 @@ fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> F
         enabled: list.enabled,
         last_updated: list.last_updated.map(|dt| dt.to_rfc3339()),
         rule_count: list.rule_count,
-        duplicate_count,
+        duplicate_count: list.duplicate_count,
         last_error: status.last_error,
         last_checked: status.last_checked.map(|dt| dt.to_rfc3339()),
         format: list.format.as_str().to_string(),
@@ -312,6 +306,7 @@ pub async fn update_filter_list(
             list.etag = None;
             list.last_updated = None;
             list.rule_count = 0;
+            list.duplicate_count = None;
             reset_status = true;
         }
     }

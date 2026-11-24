@@ -20,6 +20,10 @@ pub struct FilterList {
     pub last_updated: Option<DateTime<Utc>>,
     /// Number of rules in the list
     pub rule_count: usize,
+    /// Rules dropped as duplicates at the last build that used the current download; `None`
+    /// when no build has seen this content yet (then `rule_count` is only an approximation).
+    #[serde(default)]
+    pub duplicate_count: Option<usize>,
     /// ETag for conditional requests
     pub etag: Option<String>,
     /// Format override; `Auto` (the default) detects it from the content.
@@ -44,6 +48,7 @@ impl FilterList {
             enabled: true,
             last_updated: None,
             rule_count: 0,
+            duplicate_count: None,
             etag: None,
             format: ListFormat::Auto,
             allowlist: false,

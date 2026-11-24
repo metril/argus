@@ -496,3 +496,34 @@ async fn devices_search_profile_filter_sort_and_counts() {
             .assert_status(StatusCode::BAD_REQUEST);
     }
 }
+
+#[tokio::test]
+async fn list_response_reports_duplicates_only_when_a_build_has_seen_the_download() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let store = &ctx.state.filter_store;
+    let mut built = list(
+        "da",
+        "Dq Built",
+        "https://a.test/dq-a.txt",
+        true,
+        10,
+        Some(1),
+    );
+    built.duplicate_count = Some(90);
+    // Downloaded since the last build, or never built: no duplicate figure.
+    let fresh = list(
+        "db",
+        "Dq Fresh",
+        "https://b.test/dq-b.txt",
+        true,
+        10,
+        Some(1),
+    );
+    for l in [&built, &fresh] {
+        store.upsert_durable(l).unwrap();
+    }
+    let r = admin.get("/api/v1/lists?q=dq").await.json::<Value>();
+    assert_eq!(r["items"][0]["duplicate_count"], 90);
+    assert_eq!(r["items"][1]["duplicate_count"], Value::Null);
+}
