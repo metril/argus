@@ -63,7 +63,7 @@ impl ApiClient {
 
     /// Get a specific userscript
     pub async fn get_userscript(&self, id: &str) -> Result<Userscript, ApiError> {
-        self.get(&format!("/userscripts/{}", id)).await
+        self.get(&script_path(id, "")).await
     }
 
     /// Get userscript source code
@@ -71,7 +71,7 @@ impl ApiClient {
         &self,
         id: &str,
     ) -> Result<UserscriptSourceResponse, ApiError> {
-        self.get(&format!("/userscripts/{}/source", id)).await
+        self.get(&script_path(id, "/source")).await
     }
 
     /// Install a new userscript
@@ -84,7 +84,7 @@ impl ApiClient {
 
     /// Uninstall a userscript
     pub async fn uninstall_userscript(&self, id: &str) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!("/userscripts/{}", id)).await
+        self.delete(&script_path(id, "")).await
     }
 
     /// Enable or disable a userscript
@@ -94,8 +94,7 @@ impl ApiClient {
         enabled: bool,
     ) -> Result<Userscript, ApiError> {
         let req = SetEnabledRequest { enabled };
-        self.put(&format!("/userscripts/{}/enabled", id), &req)
-            .await
+        self.put(&script_path(id, "/enabled"), &req).await
     }
 
     /// Get userscript statistics
@@ -135,7 +134,7 @@ impl ApiClient {
     /// Check a script's update URL (never auto-applies from the UI).
     pub async fn check_userscript_update(&self, id: &str) -> Result<CheckUpdateResponse, ApiError> {
         self.post(
-            &format!("/userscripts/{}/check-update", id),
+            &script_path(id, "/check-update"),
             &CheckUpdateRequest { apply: false },
         )
         .await
@@ -148,7 +147,7 @@ impl ApiClient {
         allow_connect_all: bool,
     ) -> Result<Userscript, ApiError> {
         self.post(
-            &format!("/userscripts/{}/update/approve", id),
+            &script_path(id, "/update/approve"),
             &ApproveUpdateRequest { allow_connect_all },
         )
         .await
@@ -156,7 +155,7 @@ impl ApiClient {
 
     /// Discard the pending update.
     pub async fn discard_userscript_update(&self, id: &str) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!("/userscripts/{}/update", id)).await
+        self.delete(&script_path(id, "/update")).await
     }
 
     /// Stored GM values of a script.
@@ -167,8 +166,8 @@ impl ApiClient {
         cursor: Option<&str>,
     ) -> Result<UserscriptStorageResponse, ApiError> {
         self.get(&format!(
-            "/userscripts/{}/storage?limit=40&q={}{}",
-            id,
+            "{}?limit=40&q={}{}",
+            script_path(id, "/storage"),
             encode_component(q.trim()),
             super::admin::cur(cursor)
         ))
@@ -177,7 +176,7 @@ impl ApiClient {
 
     /// Clear all stored values of a script.
     pub async fn clear_userscript_storage(&self, id: &str) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!("/userscripts/{}/storage", id)).await
+        self.delete(&script_path(id, "/storage")).await
     }
 
     /// Delete one stored value.
@@ -186,10 +185,9 @@ impl ApiClient {
         id: &str,
         name: &str,
     ) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!(
-            "/userscripts/{}/storage/{}",
+        self.delete(&script_path(
             id,
-            encode_component(name)
+            &format!("/storage/{}", encode_component(name)),
         ))
         .await
     }
@@ -209,7 +207,13 @@ impl ApiClient {
     }
 }
 
-/// Percent-encode a path segment.
+/// `/userscripts/<id><tail>` with the id percent-encoded as one path segment. Ids are
+/// `<namespace>:<name>` and namespaces are often URLs, so a raw id would split the route.
+pub fn script_path(id: &str, tail: &str) -> String {
+    format!("/userscripts/{}{}", encode_component(id), tail)
+}
+
+/// Percent-encode a path segment (`encodeURIComponent` semantics: "/" becomes %2F).
 pub fn encode_component(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
@@ -224,7 +228,27 @@ pub fn encode_component(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_component;
+    use super::{encode_component, script_path};
+
+    const ID: &str =
+        "https://greasyfork.org/en/users/1375891-wibu-elite:Universal Anti Adblock Popup Remover";
+
+    #[test]
+    fn script_paths_encode_the_id() {
+        let p = script_path(ID, "/source");
+        assert_eq!(
+            p,
+            "/userscripts/https%3A%2F%2Fgreasyfork.org%2Fen%2Fusers%2F1375891-wibu-elite%3AUniversal%20Anti%20Adblock%20Popup%20Remover/source"
+        );
+        assert_eq!(p.matches('/').count(), 3);
+        assert_eq!(script_path("a:b", ""), "/userscripts/a%3Ab");
+        assert_eq!(
+            script_path(ID, &format!("/storage/{}", encode_component("k/1")))
+                .matches("%2F")
+                .count(),
+            5 + 1
+        );
+    }
 
     #[test]
     fn encodes_segments() {

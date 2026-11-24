@@ -113,6 +113,9 @@ pub fn Drawer(
     /// The body does not scroll itself: a `VList` child fills it and scrolls instead.
     #[prop(optional)]
     fill: bool,
+    /// Extra classes on the panel (e.g. `wide`).
+    #[prop(into, optional)]
+    class: String,
 ) -> impl IntoView {
     use_focus_return(open.into());
     use_body_scroll_lock(open.into());
@@ -130,7 +133,7 @@ pub fn Drawer(
         <Show when=move || open.get()>
             <div class="scrim" on:click=move |_| open.set(false)></div>
             <aside
-                class="drawer drawer-trap"
+                class=format!("drawer drawer-trap {class}")
                 role="dialog"
                 aria-modal="true"
                 aria-label=move || title.get()

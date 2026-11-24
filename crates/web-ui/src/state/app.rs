@@ -79,6 +79,8 @@ pub struct Toast {
     pub message: String,
     pub toast_type: ToastType,
     pub duration_ms: u32,
+    /// How many identical messages this toast stands for.
+    pub count: u32,
 }
 
 impl Toast {
@@ -90,6 +92,7 @@ impl Toast {
             message: message.into(),
             toast_type,
             duration_ms: 5000,
+            count: 1,
         }
     }
 
@@ -179,7 +182,21 @@ impl AppState {
 
     /// Show a toast notification
     pub fn show_toast(&self, toast: Toast) {
-        self.toasts.update(|toasts| toasts.push(toast));
+        self.toasts.update(|toasts| {
+            let mut toast = toast;
+            // An identical message collapses into one toast with a count.
+            if let Some(i) = toasts
+                .iter()
+                .position(|t| t.message == toast.message && t.toast_type == toast.toast_type)
+            {
+                toast.count = toasts.remove(i).count + 1;
+            }
+            toasts.push(toast);
+            // At most three at a time; the oldest goes.
+            while toasts.len() > 3 {
+                toasts.remove(0);
+            }
+        });
     }
 
     /// Remove a toast by ID

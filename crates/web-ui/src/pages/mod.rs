@@ -38,4 +38,4 @@ pub use sessions::SessionsPage;
 pub use settings::SettingsPage;
 pub use tokens::TokensPage;
 pub use users::UsersPage;
-pub use userscripts::UserscriptsPage;
+pub use userscripts::{UserscriptDetailPage, UserscriptsPage};
