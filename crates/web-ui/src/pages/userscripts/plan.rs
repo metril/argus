@@ -122,11 +122,16 @@ impl Review {
         warns.extend(p.warnings.iter().map(|w| warn_from(w, false)));
         // A high warning is shown once, in the callout, not again in the list.
         warns.retain(|w| {
-            let pat = w
-                .detail
-                .split_once(' ')
-                .map(|(_, r)| r.split(": bad regex").next().unwrap_or("").trim())
-                .unwrap_or("");
+            // Only "@exclude /re/: bad regex: ..." lines are matched by their pattern; anything
+            // else must be identical to a high warning to count as a duplicate.
+            let pat = if w.detail.contains(": bad regex") {
+                w.detail
+                    .split_once(' ')
+                    .map(|(_, r)| r.split(": bad regex").next().unwrap_or("").trim())
+                    .unwrap_or("")
+            } else {
+                ""
+            };
             !p.high_warnings
                 .iter()
                 .any(|h| *h == w.detail || (!pat.is_empty() && h.contains(pat)))

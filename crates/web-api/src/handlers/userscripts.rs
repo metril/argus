@@ -423,6 +423,12 @@ pub async fn approve_script(
             "allow_connect_all given but the script does not declare @connect *".into(),
         ));
     }
+    if req.allow_connect_all && !script.pending_approval {
+        return Err(ApiError::conflict(
+            "not_pending_approval",
+            "allow_connect_all can only be granted while the script is awaiting approval",
+        ));
+    }
     state
         .userscript_manager
         .approve_in(&profile.name, &id, req.allow_connect_all)
@@ -1084,7 +1090,7 @@ pub async fn import_userscripts(
             error,
             pending_approval: !bundle.approve,
         };
-        let existing = mgr.get(&id);
+        let existing = mgr.get_in(&profile.name, &id);
         if existing.is_some() && !replace {
             results.push(result("skipped", None));
             continue;
