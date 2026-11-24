@@ -312,7 +312,14 @@ installs and called only through `Reflect.apply`. A page that hooks `addEventLis
 captures no handler, one that hooks `attachShadow` never sees the shadow root, and one that replaces
 `getComputedStyle` cannot fake the checks. `isTrusted` is read through the getter saved from a real
 event, so a fake `{isTrusted: true}` object is refused. The code reads no property of an object
-literal and no array method, so `Object.prototype`/`Array.prototype` pollution is inert. After the
+literal and no array method, and dynamic lists (the registry, the menu's own lists) are
+null-prototype objects with a counter, never arrays (an index write or `push` walks
+`Array.prototype`, where a page can plant setters that would receive the callbacks); dictionaries
+handed to the platform (`attachShadow`, `observe`) are null-prototype with every member explicit;
+stylesheet adoption uses saved `replaceSync` and `adoptedStyleSheets` setter with an own iterator;
+`key`, `target`, `focus`, `compatMode` and the viewport size (body in quirks mode) come from saved
+getters. `menu.test.mjs` booby-traps every hookable prototype member and asserts the runtime
+touches none while registering, opening, typing and clicking. `Object.prototype`/`Array.prototype` pollution is inert. After the
 20-per-second re-attach cap a retry is scheduled for the end of the window. A page can still cover
 the badge with its own later top-layer element (a dialog); a click then lands on the page's
 element, not on ours.

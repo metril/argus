@@ -150,9 +150,8 @@ function (cfg, entries, W) {
   }
 
   // ---- 3. per-script API ---------------------------------------------------------------------
-  // The command registry is shared by every script of the document (and by the in-page panel):
+  // The command registry is shared by every script of the document (it is private to the runtime):
   // it lives in SH, created once by the shared runtime script (see bundle::runtime_script).
-  var menu = SH.menu;
   function menuChanged() { SH.changed(); }
 
   var urlListeners = null;
@@ -790,16 +789,14 @@ function (cfg, entries, W) {
     }
     expose("gm_notification", "GM_notification", "notification", notification, function (a, b, c, d3) { return resolved(notification(a, b, c, d3)); });
     function registerMenu(caption, fn, opt) {
-      var id = SH.next(), key = typeof opt === "string" ? opt : (opt && opt.accessKey) || "";
-      if (opt && opt.id) { id = opt.id; for (var j = 0; j < menu.length; j++) { if (menu[j].script === d.id && menu[j].id === id) { aSplice(menu, j, 1); break; } } }
-      aPush(menu, { script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key,
-        run: function () { safeCall(label, fn, W, []); } });
+      var id = SH.next(), key = typeof opt === "string" ? opt : (opt && opt.accessKey) || "", rep = false;
+      if (opt && opt.id) { id = opt.id; rep = true; }
+      SH.add({ script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key,
+        run: function () { safeCall(label, fn, W, []); } }, rep);
       menuChanged();
       return id;
     }
-    function unregisterMenu(id) {
-      for (var j = 0; j < menu.length; j++) { if (menu[j].script === d.id && menu[j].id === id) { aSplice(menu, j, 1); menuChanged(); return; } }
-    }
+    function unregisterMenu(id) { if (SH.remove(d.id, id)) { menuChanged(); } }
     expose("gm_registermenucommand", "GM_registerMenuCommand", "registerMenuCommand", registerMenu, function (c, f, o) { return resolved(registerMenu(c, f, o)); });
     expose("gm_unregistermenucommand", "GM_unregisterMenuCommand", "unregisterMenuCommand", unregisterMenu, function (id) { unregisterMenu(id); return resolved(); });
     function log() { var a = aSlice(arguments); a = aConcat(["[" + label + "]"], a); fApply(conLog, con, a); }
