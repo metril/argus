@@ -835,6 +835,7 @@ fn SettingsInner() -> impl IntoView {
                 {SECTIONS.iter().map(|s| { let id = s.id; view! {
                     <a class="chip link" href=format!("#set-{id}") on:click=move |ev| { ev.prevent_default(); jump(id); }>{s.title}</a>
                 } }).collect_view()}
+                <a class="chip link" href="#set-https" on:click=move |ev| { ev.prevent_default(); jump("https"); }>"HTTPS"</a>
             </nav>
         </div>
         <Show when=move || loaded.get() fallback=|| view! { <div class="empty"><span class="spin"></span></div> }>
@@ -845,6 +846,7 @@ fn SettingsInner() -> impl IntoView {
                         <div>{rows_for(s)}</div>
                     </div>
                 }).collect_view()}
+                <super::settings_https::HttpsCard />
             </div>
         </Show>
         <Show when=move || !dirty_n().is_empty() || matches!(bar.get(), Bar::Redirect(..))>

@@ -501,6 +501,9 @@ pub struct SystemStatusResponse {
     pub mitm_enabled: bool,
     pub active_sessions: usize,
     pub engine: EngineStatusResponse,
+    /// HTTPS is configured for the web UI but not being served (the page is plain HTTP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

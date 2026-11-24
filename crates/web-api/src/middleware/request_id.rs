@@ -18,6 +18,11 @@ pub struct RequestId(pub String);
 
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// Request extension set by the listener for connections that used its own TLS (as opposed to
+/// a proxy's `X-Forwarded-Proto`, which cannot be trusted without a configured proxy).
+#[derive(Debug, Clone, Copy)]
+pub struct NativeTls;
+
 /// Per-request facts every handler and the audit log can rely on.
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
@@ -92,11 +97,12 @@ pub async fn request_id_middleware(
             peer,
             &state.api_config.network.trusted_proxies,
         ),
-        https: request_is_https(
-            req.headers(),
-            peer,
-            &state.api_config.network.trusted_proxies,
-        ),
+        https: req.extensions().get::<NativeTls>().is_some()
+            || request_is_https(
+                req.headers(),
+                peer,
+                &state.api_config.network.trusted_proxies,
+            ),
         user_agent: req
             .headers()
             .get(axum::http::header::USER_AGENT)

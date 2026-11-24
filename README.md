@@ -186,6 +186,22 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
 
 That's it — ad/tracker requests matching your enabled lists are now blocked at the proxy.
 
+### HTTPS for the web UI
+
+The web UI and API speak plain HTTP by default, so on a LAN the login and session cookie cross the
+network in clear text. Two ways to fix that:
+
+1. **Built in (Settings > HTTPS).** Pick *Issued by the Argus CA* (a certificate for the names you
+   list, valid 397 days, renewed automatically 30 days before expiry) or *Uploaded certificate*
+   (paste your own chain and key, e.g. from Let's Encrypt). It applies live on the same port: TLS
+   and plain HTTP are told apart on the first byte, optionally redirecting HTTP to HTTPS (the CA
+   download stays on plain HTTP). Browsers must trust the Argus CA first (download it from the
+   Account page or `/api/v1/ca.crt`), otherwise they show a warning. Session cookies get `Secure`
+   automatically. Uploaded keys are stored under `<data_dir>/webui-tls/` (mode 0600) and never
+   shown again.
+2. **Behind a reverse proxy** (Caddy, nginx, ...) that terminates TLS: see
+   [docs/REVERSE-PROXY.md](docs/REVERSE-PROXY.md).
+
 ## Configuration
 
 Edit `config/default.toml`:
@@ -236,7 +252,8 @@ enabled = true
 enabled = true
 host = "0.0.0.0"
 port = 3000                # Web UI + API
-# Binding beyond loopback serves plain HTTP: put a TLS-terminating reverse proxy in front.
+# Binding beyond loopback serves plain HTTP: turn on HTTPS in Settings (below) or put a
+# TLS-terminating reverse proxy in front.
 cookie_secure = "auto"     # "auto" | "always" | "never": Secure flag on session cookies; auto = when
                            # the request came over HTTPS through a proxy listed in trusted_proxies
 trusted_proxies = []       # proxy IPs whose X-Forwarded-For / X-Forwarded-Proto are believed

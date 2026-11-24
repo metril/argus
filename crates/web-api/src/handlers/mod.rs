@@ -22,6 +22,7 @@ pub mod stats;
 pub mod tokens;
 pub mod users;
 pub mod userscripts;
+pub mod webui_tls;
 
 /// Pagination parameters shared by every list endpoint.
 #[derive(Debug, Default, Deserialize, IntoParams)]

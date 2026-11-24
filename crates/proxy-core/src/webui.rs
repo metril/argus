@@ -128,6 +128,13 @@ impl web_api::RuntimeControl for ProxyRuntime {
         self.0.bind_info().await.map(bind)
     }
 
+    async fn issue_webui_cert(&self, sans: &[String]) -> Result<(String, String), String> {
+        self.0
+            .issue_webui_cert(sans.to_vec())
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn note_webui(&self, host: &str, port: u16) {
         self.0.set_webui_listener(host, port).await;
     }

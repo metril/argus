@@ -68,6 +68,16 @@ pub fn Protected(children: Children) -> impl IntoView {
 pub fn Layout(#[prop(into, optional)] class: String, children: Children) -> impl IntoView {
     let app_state = use_app_state();
     let (collapsed, nav_open) = (app_state.collapsed, app_state.nav_open);
+    // HTTPS configured but not served: say so on every page (Layout only renders when logged in).
+    let tls_error = RwSignal::new(Option::<String>::None);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(s) = crate::api::ApiClient::new()
+            .get::<api_types::SystemStatusResponse>("/system/status")
+            .await
+        {
+            tls_error.set(s.tls_error);
+        }
+    });
     // A navigation closes the off-canvas menu.
     nav_open.set(false);
 
@@ -82,6 +92,11 @@ pub fn Layout(#[prop(into, optional)] class: String, children: Children) -> impl
             <Sidebar />
             <Navbar />
             <main class="main" id="main" tabindex="-1">
+                {move || tls_error.get().map(|e| view! {
+                    <div class="card" role="alert" style="margin:var(--s3);border-color:var(--block)">
+                        <div class="card-b"><b>"HTTPS is not active. "</b>{e}" "<a href="/settings#set-https" style="color:var(--accent)">"Open HTTPS settings"</a></div>
+                    </div>
+                })}
                 <div class=format!("screen {class}")>
                     {children_view}
                 </div>

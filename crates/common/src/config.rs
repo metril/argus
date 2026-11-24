@@ -446,6 +446,34 @@ pub struct WebUiSettings {
     /// trusted. Empty: the socket peer is always used and requests count as plain HTTP.
     #[serde(default)]
     pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// Built-in HTTPS for the web UI.
+    #[serde(default)]
+    pub tls: WebUiTls,
+}
+
+/// Where the web UI's TLS certificate comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebUiTlsMode {
+    /// Plain HTTP (or a reverse proxy terminates TLS).
+    #[default]
+    Off,
+    /// A certificate issued by the Argus CA, renewed automatically.
+    ArgusCa,
+    /// A certificate and key the admin uploaded.
+    Uploaded,
+}
+
+/// Built-in HTTPS for the web UI. Uploaded PEM files live under `<data_dir>/webui-tls/` and are
+/// never part of the configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebUiTls {
+    pub mode: WebUiTlsMode,
+    /// Host names and IP addresses the Argus CA certificate is issued for.
+    pub sans: Vec<String>,
+    /// Answer plain-HTTP requests on the same port with a redirect to HTTPS.
+    pub redirect_http: bool,
 }
 
 impl Default for WebUiSettings {
@@ -461,6 +489,7 @@ impl Default for WebUiSettings {
             rate_limit_user_rpm: 1000,
             cookie_secure: CookieSecure::Auto,
             trusted_proxies: Vec::new(),
+            tls: WebUiTls::default(),
         }
     }
 }

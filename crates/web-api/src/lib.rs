@@ -17,6 +17,7 @@ pub mod server;
 pub mod state;
 pub mod timeseries;
 pub mod userscript_ops;
+pub mod webui_tls;
 
 // Re-export commonly used items
 pub use config::ApiConfig;

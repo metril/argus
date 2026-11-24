@@ -49,6 +49,7 @@ pub async fn system_status(State(state): State<Arc<AppState>>) -> Json<SystemSta
         mitm_enabled: state.proxy_state.mitm_enabled,
         active_sessions: state.session_manager.active_session_count(),
         engine: engine_status(&state).await,
+        tls_error: crate::webui_tls::not_served(&state),
     })
 }
 
