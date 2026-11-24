@@ -308,6 +308,9 @@ pub struct HubCtx {
     pub bypass: Arc<common::bypass::BypassEngine>,
 }
 
+/// Is `host:port` Argus itself?
+pub type OwnGuard = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+
 /// Where a credentialed request goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
@@ -333,6 +336,8 @@ pub enum Fallback {
     Bypassed,
     /// A loopback, private or link-local target.
     LocalTarget,
+    /// Argus's own console, panel or dashboard host.
+    OwnHost,
     /// `redirect: "manual"`: a browser fetch cannot expose the redirect response.
     ManualRedirect,
     /// The extension holds no host permission for the target.
@@ -358,6 +363,11 @@ pub struct ExtHub {
     /// Where the extension's proxy listener is (host if specific, port; 0 = off).
     proxy: Mutex<(Option<String>, u16)>,
     ev_gate: OnceLock<Arc<dyn EvGate>>,
+    /// Is the extension listener decrypting right now (global MITM on and the listener's own
+    /// switch on)? Mirrors `ConnectionHandler::intercepts`.
+    mitm_probe: OnceLock<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Hosts that are Argus itself (the console, the panel): never relayed to.
+    own_guard: OnceLock<OwnGuard>,
 }
 
 impl Default for ExtHub {
@@ -381,6 +391,8 @@ impl ExtHub {
             auditor: OnceLock::new(),
             proxy: Mutex::new((None, 0)),
             ev_gate: OnceLock::new(),
+            mitm_probe: OnceLock::new(),
+            own_guard: OnceLock::new(),
         }
     }
 
@@ -392,6 +404,30 @@ impl ExtHub {
     /// This hub's `Arc`, when it was built with [`Self::shared`].
     pub fn arc(&self) -> Option<Arc<Self>> {
         self.me.upgrade()
+    }
+
+    pub fn set_mitm_probe(&self, f: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.mitm_probe.set(f);
+    }
+
+    pub fn set_own_guard(&self, f: OwnGuard) {
+        let _ = self.own_guard.set(f);
+    }
+
+    /// Will the extension listener decrypt right now? No probe means no.
+    fn decrypting(&self) -> bool {
+        self.mitm_probe.get().is_some_and(|f| f())
+    }
+
+    fn is_own(&self, host: &str, port: u16) -> bool {
+        self.own_guard.get().is_some_and(|f| f(host, port))
+    }
+
+    /// The session and store token a document was served to.
+    pub fn doc_binding(&self, mdoc: Option<&str>) -> Option<(u64, String)> {
+        let g = self.inner.lock();
+        mdoc.and_then(|m| g.docs.get(m))
+            .map(|d| (d.session, d.store.clone()))
     }
 
     pub fn set_ev_gate(&self, g: Arc<dyn EvGate>) {
@@ -779,6 +815,7 @@ impl ExtHub {
 
     fn doc_for<'a>(
         g: &'a mut Inner,
+        conn: Option<(u64, &str)>,
         mdoc: &str,
         profile: &str,
         origin: &str,
@@ -788,6 +825,8 @@ impl ExtHub {
             .docs
             .get_mut(mdoc)
             .filter(|d| d.profile == profile && d.origin == origin)
+            // Only the connection the document was served to may use it (an mdoc is public).
+            .filter(|d| conn.is_some_and(|(s, st)| d.session == s && d.store == st))
             .filter(|d| d.scripts.iter().any(|(s, _)| s == script))
             .ok_or_else(|| GmError::new(ErrorCode::NotFound, "unknown document"))?;
         d.touched = Instant::now();
@@ -798,6 +837,7 @@ impl ExtHub {
     /// extension session serves the document.
     pub fn menu_sync(
         &self,
+        conn: Option<(u64, &str)>,
         profile: &str,
         origin: &str,
         script: &str,
@@ -809,7 +849,7 @@ impl ExtHub {
         }
         let mut g = self.inner.lock();
         let live_ids: HashSet<u64> = g.sessions.keys().copied().collect();
-        let d = Self::doc_for(&mut g, mdoc, profile, origin, script)?;
+        let d = Self::doc_for(&mut g, conn, mdoc, profile, origin, script)?;
         let live = live_ids.contains(&d.session);
         let clip = |s: String| s.chars().take(MAX_TEXT).collect::<String>();
         let m = d.menus.entry(script.to_string()).or_default();
@@ -830,6 +870,7 @@ impl ExtHub {
     /// the same script supersedes this one.
     pub async fn menu_wait(
         self: &Arc<Self>,
+        conn: Option<(u64, &str)>,
         profile: &str,
         origin: &str,
         script: &str,
@@ -839,7 +880,7 @@ impl ExtHub {
         let (wake, my_gen) = {
             let mut g = self.inner.lock();
             let live_ids: HashSet<u64> = g.sessions.keys().copied().collect();
-            let d = Self::doc_for(&mut g, mdoc, profile, origin, script)?;
+            let d = Self::doc_for(&mut g, conn, mdoc, profile, origin, script)?;
             if !live_ids.contains(&d.session) {
                 return Ok(Wait::NoExt);
             }
@@ -1024,19 +1065,25 @@ impl ExtHub {
     /// Decide where a credentialed request of `script` in document `mdoc` goes. The caller has
     /// already established that the script is approved for browser logins, is not anonymous and
     /// passed `@connect`.
+    #[allow(clippy::too_many_arguments)]
     pub fn route(
         &self,
+        conn: Option<(u64, &str)>,
         mdoc: Option<&str>,
         profile: &str,
         origin: &str,
         script: &str,
         host: &str,
+        port: u16,
     ) -> Route {
         let g = self.inner.lock();
         let Some(d) = mdoc
             .and_then(|m| g.docs.get(m))
             .filter(|d| d.profile == profile && d.origin == origin)
             .filter(|d| d.scripts.iter().any(|(s, _)| s == script))
+            // The request must come over the connection the document was served to: an mdoc and
+            // a GM token are not secrets, another browser or container must not borrow them.
+            .filter(|d| conn.is_some_and(|(s, st)| d.session == s && d.store == st))
         else {
             return Route::Jar(Fallback::NoDocument);
         };
@@ -1051,8 +1098,12 @@ impl ExtHub {
         }
         if self.ctx.get().is_none_or(|c| {
             c.bypass.failsafe_active() || c.bypass.mode_of(host.trim_matches(['[', ']'])).is_some()
-        }) {
+        }) || !self.decrypting()
+        {
             return Route::Jar(Fallback::Bypassed);
+        }
+        if self.is_own(host, port) {
+            return Route::Jar(Fallback::OwnHost);
         }
         if !s.perms.has(host) {
             return Route::Jar(Fallback::NoPermission);
@@ -1226,6 +1277,10 @@ impl ExtHub {
             return false;
         };
         if ctx.bypass.failsafe_active() || ctx.bypass.mode_of(&host).is_some() {
+            return false;
+        }
+        // Argus must be decrypting this listener's traffic, and the target is not Argus itself.
+        if !self.decrypting() || self.is_own(&host, url.port_or_known_default().unwrap_or(443)) {
             return false;
         }
         let idx = ctx.manager.index_for(&profile);

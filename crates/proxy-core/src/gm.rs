@@ -227,6 +227,9 @@ pub struct Caller<'a> {
     pub origin: &'a str,
     /// The requesting profile's name: the namespace of tokens, GM values and cookies.
     pub profile: &'a str,
+    /// The extension session and cookie store the request's connection authenticated as (on
+    /// the extension listener); `None` for every other connection.
+    pub ext: Option<(u64, &'a str)>,
 }
 
 #[derive(Default)]
@@ -310,9 +313,14 @@ struct Authed {
     id: String,
     origin: String,
     page_host: String,
+    /// See [`Caller::ext`].
+    ext: Option<(u64, String)>,
 }
 
 impl Authed {
+    fn conn(&self) -> Option<(u64, &str)> {
+        self.ext.as_ref().map(|(s, st)| (*s, st.as_str()))
+    }
     fn script(&self) -> &userscript_engine::Userscript {
         &self.idx.get(&self.id).expect("authenticated").script
     }
@@ -439,7 +447,9 @@ impl GmHost {
         download: bool,
         manual_redirect: bool,
         mdoc: Option<&str>,
+        conn: Option<(u64, &str)>,
         host: &str,
+        port: u16,
     ) -> Route {
         if anonymous || download {
             return Route::Jar(crate::ext_bridge::Fallback::Anonymous);
@@ -450,7 +460,9 @@ impl GmHost {
         if manual_redirect {
             return Route::Jar(crate::ext_bridge::Fallback::ManualRedirect);
         }
-        let r = self.ext.route(mdoc, profile, origin, &script.id, host);
+        let r = self
+            .ext
+            .route(conn, mdoc, profile, origin, &script.id, host, port);
         self.ext
             .note_route(profile, &script.id, matches!(r, Route::Jar(_)));
         r
@@ -697,6 +709,7 @@ impl GmHost {
             id,
             origin: c.origin.to_string(),
             page_host: c.host.to_ascii_lowercase(),
+            ext: c.ext.map(|(s, st)| (s, st.to_string())),
         })
     }
 
@@ -847,9 +860,9 @@ impl GmHost {
                         ))
                     })
                     .collect::<GmResult<Vec<_>>>()?;
-                let live = self
-                    .ext
-                    .menu_sync(&a.profile, &a.origin, &a.id, mdoc, cmds)?;
+                let live =
+                    self.ext
+                        .menu_sync(a.conn(), &a.profile, &a.origin, &a.id, mdoc, cmds)?;
                 Ok(json!({"ext": live}))
             }
             _ => Err(GmError::new(ErrorCode::NotFound, "no such endpoint")),
@@ -979,7 +992,14 @@ impl GmHost {
             .ok_or_else(|| GmError::new(ErrorCode::BadRequest, "mdoc required"))?;
         let w = self
             .ext
-            .menu_wait(&a.profile, &a.origin, &a.id, mdoc, crate::ext_bridge::WAIT)
+            .menu_wait(
+                a.conn(),
+                &a.profile,
+                &a.origin,
+                &a.id,
+                mdoc,
+                crate::ext_bridge::WAIT,
+            )
             .await?;
         Ok(match w {
             Wait::NoExt => json!({"ext": false}),
@@ -1026,7 +1046,9 @@ impl GmHost {
                 false,
                 false,
                 mdoc.as_deref(),
+                a.conn(),
                 &host,
+                url.port_or_known_default().unwrap_or(443),
             );
             // A host the Extended Validation setting tunnels is not decrypted: jar.
             let route = match route {
@@ -1358,7 +1380,9 @@ impl GmHost {
                 meta.op == "download",
                 out.redirect == Redirect::Manual,
                 meta.mdoc.as_deref(),
+                a.conn(),
                 &host,
+                out.url.port_or_known_default().unwrap_or(443),
             );
             // A host the Extended Validation setting tunnels is not decrypted: jar.
             let route = match route {

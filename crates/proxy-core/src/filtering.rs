@@ -1025,33 +1025,29 @@ impl ProxyContext {
         // the check of the first hop (`route`) this makes every hop the browser follows one the
         // proxy approved beforehand.
         if let (Some(r), true) = (relay.as_deref(), status.is_redirection()) {
-            if let Some(loc) = resp_headers
-                .get(hyper::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-            {
-                let target = reqwest::Url::parse(&url)
-                    .ok()
-                    .and_then(|base| base.join(loc).ok());
-                let ok = match target {
-                    Some(t) => {
-                        self.internal
-                            .gm
-                            .ext()
-                            .check_hop(r, &t, rctx.ext, rctx.ext_store.as_deref().unwrap_or(""))
-                            .await
-                    }
-                    None => false,
-                };
-                if !ok {
-                    debug!("Refused a relayed redirect from {host}");
-                    // No Set-Cookie, no Location: only the refusal.
-                    return Ok(Response::builder()
-                        .status(hyper::StatusCode::BAD_GATEWAY)
-                        .header("cache-control", "no-store")
-                        .header("x-adblock-note", "relayed redirect refused")
-                        .body(crate::inject::full_body(bytes::Bytes::new()))
-                        .expect("relay redirect refusal"));
+            // Exactly one `Location`, non-empty, that parses once decoded the way browsers do
+            // (lossy UTF-8), or the response is refused; the browser would follow what we cannot
+            // read.
+            let ok = match relay_redirect_target(&url, &resp_headers) {
+                Ok(None) => true,
+                Ok(Some(t)) => {
+                    self.internal
+                        .gm
+                        .ext()
+                        .check_hop(r, &t, rctx.ext, rctx.ext_store.as_deref().unwrap_or(""))
+                        .await
                 }
+                Err(()) => false,
+            };
+            if !ok {
+                debug!("Refused a relayed redirect from {host}");
+                // No Set-Cookie, no Location: only the refusal.
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::BAD_GATEWAY)
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "relayed redirect refused")
+                    .body(crate::inject::full_body(bytes::Bytes::new()))
+                    .expect("relay redirect refusal"));
             }
         }
         let mut kind = classify_body(is_head, status, rtype, &resp_headers);
@@ -1599,6 +1595,78 @@ fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
         || h.get("sec-fetch-dest")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("serviceworker"))
+}
+
+/// The hop a redirect response names: `Ok(None)` without a `Location`, `Err` unless there is
+/// exactly one, non-empty, that joins onto `base` (decoded lossily as UTF-8, like a browser).
+fn relay_redirect_target(
+    base: &str,
+    h: &hyper::HeaderMap,
+) -> std::result::Result<Option<reqwest::Url>, ()> {
+    let mut it = h.get_all(hyper::header::LOCATION).iter();
+    let Some(first) = it.next() else {
+        return Ok(None);
+    };
+    if it.next().is_some() {
+        return Err(());
+    }
+    let raw = String::from_utf8_lossy(first.as_bytes());
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(());
+    }
+    reqwest::Url::parse(base)
+        .ok()
+        .and_then(|b| b.join(raw).ok())
+        .map(Some)
+        .ok_or(())
+}
+
+#[cfg(test)]
+mod relay_location_tests {
+    use super::relay_redirect_target;
+    use hyper::header::{HeaderValue, LOCATION};
+
+    fn h(vals: &[&[u8]]) -> hyper::HeaderMap {
+        let mut m = hyper::HeaderMap::new();
+        for v in vals {
+            m.append(LOCATION, HeaderValue::from_bytes(v).unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn exactly_one_parsable_location_is_followed_otherwise_refused() {
+        let base = "https://api.test/a/b";
+        assert_eq!(relay_redirect_target(base, &h(&[])), Ok(None));
+        assert_eq!(
+            relay_redirect_target(base, &h(&[b"/c"]))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "https://api.test/c"
+        );
+        // empty, blank, two of them, unparsable: refused
+        assert!(relay_redirect_target(base, &h(&[b""])).is_err());
+        assert!(relay_redirect_target(base, &h(&[b"  "])).is_err());
+        assert!(relay_redirect_target(base, &h(&[b"/x", b"https://evil.test/"])).is_err());
+        assert!(relay_redirect_target(base, &h(&[b"https://"])).is_err());
+    }
+
+    #[test]
+    fn non_ascii_locations_are_decoded_lossily_not_skipped() {
+        let base = "https://api.test/";
+        // UTF-8 host: the target the browser would go to is what is checked
+        let t = relay_redirect_target(base, &h(&["https://b\u{fc}cher.test/x".as_bytes()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.host_str(), Some("xn--bcher-kva.test"));
+        // invalid UTF-8 bytes become U+FFFD, they do not make the header "disappear"
+        let t = relay_redirect_target(base, &h(&[b"/p\xff\xfe"]))
+            .unwrap()
+            .unwrap();
+        assert!(t.path().starts_with("/p"));
+    }
 }
 
 #[cfg(test)]

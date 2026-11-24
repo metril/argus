@@ -33,6 +33,12 @@
   request, so none can reach an origin through a tunnelled host. The extension works in Firefox
   again (its explicit CSP no longer upgrades the channel to `wss://`, and the store-relay listeners
   register).
+* Hardening of the bridge: a public `mdoc` plus a script token no longer lets another browser,
+  container or unauthenticated connection use a document (relays go to the jar, `menu/sync` and
+  `menu/wait` are refused); redirects with an empty, doubled or unparsable `Location` are refused;
+  relays require a decrypting extension listener and never target Argus's own console or panel;
+  revocation also ends upgraded WebSockets; the SOCKS5 handshake has one deadline and refuses
+  hosts that do not normalise.
 * Real-browser suites (`crates/e2e-browser/tests/extension_chromium.rs`, `extension_firefox.rs`) run
   the built extension against a real Argus process; they are opt-in (`ARGUS_EXT_E2E=1`) and have
   their own CI shard.

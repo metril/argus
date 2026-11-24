@@ -223,7 +223,7 @@ Still possible, so **backend checks must never rely on page-side secrecy**:
   runtime tag or a `menu/wait` answer. That marker only decides whether the in-page button is
   mounted, so a forged `ext:true` (a page script or a service worker that rewrites the markup) hides
   the button and nothing else (a denial of the in-page menu): listing or triggering commands and
-  the credentialed relay all need the bridge token and a live session bound to the document, which
+  the credentialed relay all need the bridge token and a live session bound to the document (and, for the page's own GM calls and relays, the very connection the document was served to), which
   the page cannot obtain (section 8).
 
 ### 6.1 Service workers
@@ -392,7 +392,9 @@ listener of its own**.
 4. **Lifetime.** Every request on a bound connection re-checks that the session is live (a plain
    request, a tunnelled request, a new `CONNECT`); a connection whose session ended (channel
    closed, token revoked, user disabled or deleted) is closed within half a second, tunnels
-   included. The extension gets a new `sid` on every reconnect: its existing connections get a
+   and upgraded WebSocket splices included. The SOCKS5 handshake (greeting, credentials and
+   request) has one deadline (`performance.connection_timeout_secs`), and a destination that
+   does not normalise is refused (reply 4), never dialled as written. The extension gets a new `sid` on every reconnect: its existing connections get a
    `407` and re-authenticate.
 5. **The extension** (`proxy` and `webRequest` permissions, plus `webRequestAuthProvider` in
    Chrome). The popup has "Use Argus in this browser" (off by default). While it is on and the
@@ -428,7 +430,11 @@ alone grants nothing:
   document must be bound to that session and to the caller's cookie store (a document opened by
   another browser, another container or a browser without the extension is refused with `403`);
 * the runtime's calls need a script's capability token, and the document must belong to the token's
-  profile and origin and list that script.
+  profile and origin, list that script, **and have been served to the very connection the call
+  arrives on** (same extension session, same cookie store). An `mdoc` and a script token are not
+  secrets (the page and the browser's own devtools see them), so a call from another browser, another
+  container or an unauthenticated connection that presents them is refused (`menu/sync`,
+  `menu/wait`) or served by the script's own jar (relays), never relayed.
 
 **Cookie stores (Firefox containers, private windows).** The extension's credentials carry a store
 token, `ext:<sid>:<token>`, for every store except the default one (Chrome has a single store per
@@ -480,9 +486,12 @@ unavailable" until a call succeeds through the browser):
 1. the script's own checks pass: grant, `@connect`, method and header rules, destination policy;
 2. the call is not `anonymous`, the script has `browser_cookies`, and `redirect` is not `manual`
    (a browser fetch cannot expose the redirect response itself);
-3. the call names an `mdoc` that belongs to the token's profile and origin and lists the script;
+3. the call names an `mdoc` that belongs to the token's profile and origin, lists the script and
+   was served to the connection the call arrives on (see 8.3);
 4. that document is bound to a session which is still live;
-5. the target is not loopback, private or link-local (IP literals, `localhost`, `*.local`), and Argus
+5. the extension listener is decrypting (global MITM on and the listener's own MITM switch on),
+   the target is not Argus itself (its console, the panel and dashboard hosts), and the target is
+   not loopback, private or link-local (IP literals, `localhost`, `*.local`), and Argus
    decrypts it (not bypassed or passthrough, the bypass fail-safe is not active, the Extended
    Validation setting does not tunnel it): the relay's per-hop check can only run on traffic the
    proxy decrypts, and a relay token must never travel through a tunnel to a third party;
@@ -526,7 +535,9 @@ the browser can follow it*: the job is live and the hop arrives on its session's
 session holds a permission for the host, the host is public (not loopback, private or
 link-local) and is not bypassed, the bypass fail-safe is not active, the script's `@connect`
 allows it, and Argus will decrypt it (with the Extended Validation setting on, a probe must have
-shown the host is not EV; an EV or unprobeable host is tunnelled, so it fails). A hop that fails
+shown the host is not EV; an EV or unprobeable host is tunnelled, so it fails). A response with no
+`Location` is passed; one with more than one `Location`, an empty one, or one that does not parse
+after a lossy UTF-8 decode (what a browser does) is refused like a failed hop. A hop that fails
 is replaced by `502` with `x-adblock-note: relayed redirect refused`, without `Location` or
 `Set-Cookie`, which the extension turns into an error frame. Every hop the browser follows was
 therefore approved before it was requested, whatever the chain looks like; there is no hop the

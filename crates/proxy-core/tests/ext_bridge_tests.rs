@@ -51,6 +51,7 @@ fn fx(browser: bool) -> Fx {
     m.install_script("default", s).unwrap();
     let gm = GmHost::new();
     let bypass = Arc::new(BypassEngine::in_memory());
+    gm.ext().set_mitm_probe(Arc::new(|| true));
     gm.ext().set_ctx(HubCtx {
         manager: m.clone(),
         profiles: None,
@@ -101,7 +102,19 @@ fn plan_in(f: &Fx, session: Option<u64>, store: &str) -> proxy_core::gm::DocPlan
 }
 
 fn route(f: &Fx, s: &Userscript, mdoc: Option<&str>, anonymous: bool, host: &str) -> Route {
-    f.gm.credentialed_route(s, "default", ORIGIN, anonymous, false, false, mdoc, host)
+    let conn = f.gm.ext().doc_binding(mdoc);
+    f.gm.credentialed_route(
+        s,
+        "default",
+        ORIGIN,
+        anonymous,
+        false,
+        false,
+        mdoc,
+        conn.as_ref().map(|(s, st)| (*s, st.as_str())),
+        host,
+        443,
+    )
 }
 
 #[tokio::test]
@@ -176,7 +189,9 @@ async fn routing_matrix_only_a_fully_matching_call_reaches_the_browser() {
             false,
             false,
             plan.mdoc.as_deref(),
-            "api.test"
+            Some((sess, "")),
+            "api.test",
+            443
         ),
         Route::Jar(Fallback::NoDocument)
     );
@@ -189,7 +204,9 @@ async fn routing_matrix_only_a_fully_matching_call_reaches_the_browser() {
             false,
             false,
             plan.mdoc.as_deref(),
-            "api.test"
+            Some((sess, "")),
+            "api.test",
+            443
         ),
         Route::Jar(Fallback::NoDocument)
     );
@@ -364,11 +381,28 @@ fn gm_token(f: &Fx, profile: &str, origin: &str) -> String {
 }
 
 fn sync(f: &Fx, mdoc: &str, cmds: serde_json::Value) -> (u16, serde_json::Value) {
+    let owner = f.gm.ext().doc_binding(Some(mdoc));
+    sync_as(
+        f,
+        mdoc,
+        cmds,
+        owner.as_ref().map(|(s, st)| (*s, st.as_str())),
+    )
+}
+
+/// `menu/sync` from the connection `conn` (session, store).
+fn sync_as(
+    f: &Fx,
+    mdoc: &str,
+    cmds: serde_json::Value,
+    conn: Option<(u64, &str)>,
+) -> (u16, serde_json::Value) {
     let c = Caller {
         manager: &f.m,
         host: "hit.test",
         origin: ORIGIN,
         profile: "default",
+        ext: conn,
     };
     f.gm.json_call(
         &f.m,
@@ -406,6 +440,7 @@ async fn menu_sync_list_trigger_and_wait_are_bound_to_the_session() {
         host: "hit.test",
         origin: "https://other.test",
         profile: "default",
+        ext: None,
     };
     let (st, _) = f.gm.json_call(
         &f.m,
@@ -449,6 +484,7 @@ async fn menu_sync_list_trigger_and_wait_are_bound_to_the_session() {
     // the page's poll picks the queued command up at once
     let w = hub
         .menu_wait(
+            Some((sess, "")),
             "default",
             ORIGIN,
             &f.id,
@@ -462,8 +498,15 @@ async fn menu_sync_list_trigger_and_wait_are_bound_to_the_session() {
     let h2 = hub.clone();
     let (id, mdoc) = (f.id.clone(), plan.mdoc.clone().unwrap());
     let parked = tokio::spawn(async move {
-        h2.menu_wait("default", ORIGIN, &id, &mdoc, Duration::from_secs(5))
-            .await
+        h2.menu_wait(
+            Some((sess, "")),
+            "default",
+            ORIGIN,
+            &id,
+            &mdoc,
+            Duration::from_secs(5),
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(hub.trigger(sess, "", &req("b1")), Ok(true));
@@ -474,6 +517,7 @@ async fn menu_sync_list_trigger_and_wait_are_bound_to_the_session() {
     // an idle poll ends empty
     let w = hub
         .menu_wait(
+            Some((sess, "")),
             "default",
             ORIGIN,
             &f.id,
@@ -487,6 +531,7 @@ async fn menu_sync_list_trigger_and_wait_are_bound_to_the_session() {
     hub.close(sess);
     let w = hub
         .menu_wait(
+            Some((sess, "")),
             "default",
             ORIGIN,
             &f.id,
@@ -793,7 +838,18 @@ async fn the_browser_is_not_used_for_bypassed_local_or_manual_redirect_targets()
         Route::Jar(Fallback::Bypassed)
     );
     assert_eq!(
-        f.gm.credentialed_route(&s, "default", ORIGIN, false, false, true, m, "api.test"),
+        f.gm.credentialed_route(
+            &s,
+            "default",
+            ORIGIN,
+            false,
+            false,
+            true,
+            m,
+            Some((sess, "")),
+            "api.test",
+            443
+        ),
         Route::Jar(Fallback::ManualRedirect)
     );
 }
@@ -932,4 +988,201 @@ async fn a_hop_to_an_ev_or_unprobed_host_is_refused_when_ev_hosts_are_tunnelled(
     assert!(hub.check_hop(&relay, &ok, Some(sess), "").await);
     assert!(!hub.check_hop(&relay, &ev, Some(sess), "").await);
     assert!(hub.ev_allows("api.test", 443).await && !hub.ev_allows("ev.api.test", 443).await);
+}
+
+// ---- a public mdoc is not a credential: only the document's own connection uses it ------------
+
+#[tokio::test]
+async fn another_session_or_store_presenting_a_stolen_mdoc_gets_the_jar_and_cannot_sync_or_wait() {
+    let f = fx(true);
+    let s = f.m.index_for("default").get(&f.id).unwrap().script.clone();
+    let hub = f.gm.ext().clone();
+    let (a, _asid, _arx) = hub.open(ident("ta"));
+    let (b, _bsid, _brx) = hub.open(ident("tb"));
+    grant(&hub, a, &["*://*.api.test/*"]).await;
+    grant(&hub, b, &["*://*.api.test/*"]).await;
+    let doc = plan_in(&f, Some(a), "").mdoc.unwrap();
+    let boxed = plan_in(&f, Some(a), "c1x").mdoc.unwrap();
+    let go = |conn: Option<(u64, &str)>, mdoc: &str| {
+        f.gm.credentialed_route(
+            &s,
+            "default",
+            ORIGIN,
+            false,
+            false,
+            false,
+            Some(mdoc),
+            conn,
+            "api.test",
+            443,
+        )
+    };
+    // the owner
+    assert_eq!(go(Some((a, "")), &doc), Route::Ext(a));
+    assert_eq!(go(Some((a, "c1x")), &boxed), Route::Ext(a));
+    // another browser, the same browser in another container, an unauthenticated connection
+    for (conn, mdoc) in [
+        (Some((b, "")), &doc),
+        (Some((a, "c1x")), &doc),
+        (Some((a, "")), &boxed),
+        (Some((b, "c1x")), &boxed),
+        (None, &doc),
+    ] {
+        assert_eq!(go(conn, mdoc), Route::Jar(Fallback::NoDocument), "{conn:?}");
+    }
+    // menu/sync from a mismatched connection is refused, from the owner it works
+    let cmds = json!([cmd("a1")]);
+    assert_eq!(sync_as(&f, &doc, cmds.clone(), Some((a, ""))).0, 200);
+    for conn in [Some((b, "")), Some((a, "c1x")), None] {
+        assert_eq!(sync_as(&f, &doc, cmds.clone(), conn).0, 404, "{conn:?}");
+    }
+    // menu/wait likewise
+    for conn in [Some((b, "")), Some((a, "c1x")), None] {
+        let r = hub
+            .menu_wait(
+                conn,
+                "default",
+                ORIGIN,
+                &f.id,
+                &doc,
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(r.is_err(), "{conn:?}");
+    }
+    assert!(hub
+        .menu_wait(
+            Some((a, "")),
+            "default",
+            ORIGIN,
+            &f.id,
+            &doc,
+            Duration::from_millis(50)
+        )
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn relays_need_a_decrypting_listener_and_never_go_to_argus_itself() {
+    let f = fx(true);
+    let s = f.m.index_for("default").get(&f.id).unwrap().script.clone();
+    let hub = f.gm.ext().clone();
+    let (sess, _sid, mut rx) = hub.open(ident("t"));
+    grant(&hub, sess, &["*://*.api.test/*", "*://*.argus.test/*"]).await;
+    let mdoc = plan_for(&f, Some(sess)).mdoc;
+    let (_h, _j, relay) = job3(&hub, sess, &f, &mut rx).await;
+    let go = |host: &str, port: u16| {
+        f.gm.credentialed_route(
+            &s,
+            "default",
+            ORIGIN,
+            false,
+            false,
+            false,
+            mdoc.as_deref(),
+            Some((sess, "")),
+            host,
+            port,
+        )
+    };
+    let ok = url::Url::parse("https://api.test/y").unwrap();
+    assert_eq!(go("api.test", 443), Route::Ext(sess));
+    assert!(hub.check_relay(&relay, &ok, Some(sess), ""));
+    // Argus's own console and panel hosts are never relayed to
+    hub.set_own_guard(Arc::new(|h, p| {
+        h == "console.argus.test" || (h == "api.test" && p == 3000)
+    }));
+    assert_eq!(go("console.argus.test", 443), Route::Jar(Fallback::OwnHost));
+    assert_eq!(go("api.test", 3000), Route::Jar(Fallback::OwnHost));
+    assert_eq!(go("api.test", 443), Route::Ext(sess));
+    assert!(!hub.check_relay(
+        &relay,
+        &url::Url::parse("https://console.argus.test/x").unwrap(),
+        Some(sess),
+        ""
+    ));
+    assert!(!hub.check_relay(
+        &relay,
+        &url::Url::parse("https://api.test:3000/x").unwrap(),
+        Some(sess),
+        ""
+    ));
+    assert!(hub.check_relay(&relay, &ok, Some(sess), ""));
+}
+
+#[tokio::test]
+async fn a_listener_that_does_not_decrypt_never_relays() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let m = Arc::new(UserscriptManager::new(dir.path().to_path_buf()).unwrap());
+    let s = script("", true);
+    let id = s.id.clone();
+    m.install_script("default", s).unwrap();
+    let gm = GmHost::new();
+    let on = Arc::new(AtomicBool::new(true));
+    let o2 = on.clone();
+    gm.ext()
+        .set_mitm_probe(Arc::new(move || o2.load(Ordering::Relaxed)));
+    gm.ext().set_ctx(HubCtx {
+        manager: m.clone(),
+        profiles: None,
+        bypass: Arc::new(BypassEngine::in_memory()),
+    });
+    let hub = gm.ext().clone();
+    let (sess, _sid, mut rx) = hub.open(ident("t"));
+    grant(&hub, sess, &["*://*.api.test/*"]).await;
+    let idx = m.index_for("default").clone();
+    let plan = gm
+        .plan_document_bound(
+            &idx,
+            "default",
+            "hit.test",
+            "https://hit.test/",
+            ORIGIN,
+            true,
+            Some(sess),
+            "",
+        )
+        .unwrap();
+    let script = idx.get(&id).unwrap().script.clone();
+    let (_h, _j, relay) = {
+        let h = hub
+            .dispatch(sess, json!({"op": "xhr"}), "default", &id, "hit.test", None)
+            .await
+            .unwrap();
+        let Some(ExtOut::Binary(b)) = rx.recv().await else {
+            panic!("job")
+        };
+        let (_, j, p) = parse_job_frame(&b).unwrap();
+        (
+            h,
+            j,
+            serde_json::from_slice::<serde_json::Value>(p).unwrap()["relay"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    };
+    let go = || {
+        gm.credentialed_route(
+            &script,
+            "default",
+            ORIGIN,
+            false,
+            false,
+            false,
+            plan.mdoc.as_deref(),
+            Some((sess, "")),
+            "api.test",
+            443,
+        )
+    };
+    let ok = url::Url::parse("https://api.test/y").unwrap();
+    assert_eq!(go(), Route::Ext(sess));
+    assert!(hub.check_relay(&relay, &ok, Some(sess), ""));
+    // global MITM off, or the extension listener's own switch off: the probe says no
+    on.store(false, Ordering::Relaxed);
+    assert_eq!(go(), Route::Jar(Fallback::Bypassed));
+    assert!(!hub.check_relay(&relay, &ok, Some(sess), ""));
 }

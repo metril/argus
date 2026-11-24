@@ -458,10 +458,20 @@ impl ConnectionHandler {
         mut buf: Vec<u8>,
         limit: Duration,
     ) -> Result<Entry<Prefixed<TcpStream>>> {
+        // One deadline for the whole handshake (greeting, credentials and request): a client that
+        // trickles a byte at a time cannot keep the connection open past it.
+        let deadline = tokio::time::Instant::now() + limit;
         macro_rules! need {
             ($n:expr) => {
-                if let Err(e) = read_at_least(&mut stream, &mut buf, $n, limit).await {
-                    return Err(self.reject(&mut stream, e).await);
+                match tokio::time::timeout_at(
+                    deadline,
+                    read_at_least(&mut stream, &mut buf, $n, limit),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(self.reject(&mut stream, e).await),
+                    Err(_) => return Err(Error::Timeout),
                 }
             };
         }
@@ -527,7 +537,11 @@ impl ConnectionHandler {
         };
         let port = u16::from_be_bytes([buf[used], buf[used + 1]]);
         let leftover = buf.split_off(used + 2);
-        let host = authority::normalize_host(&host).unwrap_or(host);
+        // A host that does not normalise is not dialled as written: "host unreachable".
+        let Some(host) = authority::normalize_host(&host) else {
+            let _ = stream.write_all(&reply(4)).await;
+            return Err(fail("invalid host"));
+        };
         debug!("SOCKS5 CONNECT {host}:{port} from {}", self.client_addr);
         let intercept_tls = self.intercepts(&host);
         let ctx = &self.shared.ctx;

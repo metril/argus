@@ -427,6 +427,7 @@ impl Internal {
                         host,
                         origin,
                         profile: &profile.name,
+                        ext: None,
                     },
                     &method,
                     req.headers(),
@@ -443,6 +444,9 @@ impl Internal {
                         host,
                         origin,
                         profile: &profile.name,
+                        ext: rctx
+                            .ext
+                            .map(|s| (s, rctx.ext_store.as_deref().unwrap_or(""))),
                     };
                     self.gm.handle_gm(req, &caller, up, r).await
                 }

@@ -754,6 +754,27 @@ e2e_test!(
             assert!(r.headers().get("location").is_none());
             assert!(r.headers().get("set-cookie").is_none());
         }
+        // a Location that cannot be checked is refused too: empty, doubled, or UTF-8 that points
+        // at a bypassed host
+        env.origin.route(
+            "/r-empty",
+            MockResponse::new(302, "").header("location", ""),
+        );
+        env.origin.route(
+            "/r-two",
+            MockResponse::new(302, "")
+                .header("location", "/end")
+                .header("location", "https://evil.test/x"),
+        );
+        env.origin.route(
+            "/r-utf8",
+            MockResponse::new(302, "").header("location", "https://byp.api.test/\u{e9}t\u{e9}"),
+        );
+        for path in ["/r-empty", "/r-two", "/r-utf8"] {
+            let r = fetch(path).await;
+            assert_eq!(r.status(), 502, "{path}");
+            assert!(r.headers().get("location").is_none());
+        }
         // a chain of allowed hops (relative and absolute) passes untouched
         redirect("/r1", "/r2");
         redirect("/r2", "https://v2.api.test/end");
@@ -871,3 +892,122 @@ e2e_test!(
         assert!(!out.starts_with(&[5, 2]));
     }
 );
+
+async fn mitm_hub(env: &TestEnv) -> (Arc<ExtHub>, u64, String) {
+    // (the listener is up once its address exists, and with it the server's shared state)
+    env.proxy.ext_addr().await;
+    let s = script("", true);
+    let id = s.id.clone();
+    env.proxy
+        .userscripts()
+        .install_script("default", s)
+        .unwrap();
+    let h = hub(env);
+    let (sess, _sid, rx) = session(&h, "tm");
+    std::mem::forget(rx);
+    (h, sess, id)
+}
+
+fn route_of(h: &ExtHub, sess: u64, id: &str) -> proxy_core::ext_bridge::Route {
+    let m = h.register_doc(
+        "default",
+        "https://app.test",
+        vec![(id.to_string(), "n".into())],
+        sess,
+        "",
+    );
+    h.route(
+        Some((sess, "")),
+        Some(&m),
+        "default",
+        "https://app.test",
+        id,
+        "api.test",
+        443,
+    )
+}
+
+#[tokio::test]
+async fn relays_follow_the_listeners_decryption_and_the_explicit_listeners_switch() {
+    use proxy_core::ext_bridge::{Fallback, Route};
+    // decrypting: the browser is used
+    let env = TestEnv::start_tweaked(e2e::EntryMode::Explicit, &[], &|_| {}).await;
+    let (h, sess, id) = mitm_hub(&env).await;
+    h.on_text(
+        sess,
+        &json!({"t": "perms", "origins": ["*://*.api.test/*"]}).to_string(),
+    )
+    .await;
+    assert_eq!(route_of(&h, sess, &id), Route::Ext(sess));
+    drop(env);
+    // MITM on globally but off for the explicit listeners ([proxy.explicit] and so the extension listener)
+    let env = TestEnv::start_tweaked(e2e::EntryMode::Explicit, &[], &|c| {
+        c.proxy.explicit.enable_mitm = Some(false)
+    })
+    .await;
+    let (h, sess, id) = mitm_hub(&env).await;
+    h.on_text(
+        sess,
+        &json!({"t": "perms", "origins": ["*://*.api.test/*"]}).to_string(),
+    )
+    .await;
+    assert_eq!(route_of(&h, sess, &id), Route::Jar(Fallback::Bypassed));
+}
+
+#[tokio::test]
+async fn socks_refuses_an_invalid_host_and_one_deadline_covers_the_whole_handshake() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = TestEnv::start_tweaked(e2e::EntryMode::Explicit, &[], &|c| {
+        c.performance.connection_timeout_secs = 1
+    })
+    .await;
+    let h = hub(&env);
+    let (_s, sid, _rx) = session(&h, "ts");
+    let addr = env.proxy.ext_addr().await;
+    // an invalid host is refused ("host unreachable"), never dialled as written
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(&[5, 1, 2]).await.unwrap();
+    let mut m = [0u8; 2];
+    s.read_exact(&mut m).await.unwrap();
+    let mut a = vec![1, 3];
+    a.extend_from_slice(b"ext");
+    a.push(sid.len() as u8);
+    a.extend_from_slice(sid.as_bytes());
+    s.write_all(&a).await.unwrap();
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r, [1, 0]);
+    let bad = b"bad host/with space";
+    let mut q = vec![5, 1, 0, 3, bad.len() as u8];
+    q.extend_from_slice(bad);
+    q.extend_from_slice(&443u16.to_be_bytes());
+    s.write_all(&q).await.unwrap();
+    let mut rep = [0u8; 10];
+    s.read_exact(&mut rep).await.unwrap();
+    assert_eq!(rep[1], 4);
+    // a client trickling one byte per 400 ms is closed at the (1 s) deadline, not per read
+    let mut t = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let start = std::time::Instant::now();
+    let mut closed = false;
+    for b in [5u8, 1, 2, 1, 3, b'e', b'x', b't'] {
+        if t.write_all(&[b]).await.is_err() {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut buf = [0u8; 8];
+        if let Ok(Ok(0)) = tokio::time::timeout(Duration::from_millis(5), t.read(&mut buf)).await {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed || start.elapsed() > Duration::from_secs(1));
+    let mut rest = Vec::new();
+    let end = tokio::time::timeout(Duration::from_secs(2), t.read_to_end(&mut rest)).await;
+    assert!(end.is_ok(), "the connection was closed");
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "within the deadline, not per read: {:?}",
+        start.elapsed()
+    );
+}

@@ -499,6 +499,7 @@ async fn gm_values_are_namespaced_per_profile() {
             host: "hit.test",
             origin,
             profile,
+            ext: None,
         };
         host.json_call(
             &m,
@@ -527,6 +528,7 @@ async fn gm_values_are_namespaced_per_profile() {
         host: "hit.test",
         origin,
         profile: "p2",
+        ext: None,
     };
     let (st, _) = host.json_call(
         &m,
@@ -567,6 +569,7 @@ async fn userscript_chunks_are_bound_to_the_profile_they_were_planned_for() {
             host: "hit.test",
             origin,
             profile: as_profile,
+            ext: None,
         };
         let rest = planned.srcs[0].strip_prefix("/__adblock__/us/").unwrap();
         host.serve_chunk(&m, &c, &Method::GET, &HeaderMap::new(), rest)

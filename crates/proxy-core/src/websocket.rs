@@ -221,6 +221,7 @@ async fn splice<C, U>(
     mut upstream: U,
     idle: Duration,
     shutdown: Option<broadcast::Receiver<()>>,
+    cancel: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
 ) -> std::io::Result<(u64, u64)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -228,12 +229,26 @@ where
 {
     let mut client = IdleIo::new(client, idle);
     let copy = tokio::io::copy_bidirectional(&mut client, &mut upstream);
-    match shutdown {
-        Some(mut rx) => tokio::select! {
-            r = copy => r,
-            _ = rx.recv() => Err(std::io::Error::other("proxy shutting down")),
-        },
-        None => copy.await,
+    // `cancel` ends the splice when its owner is gone (an extension session that was closed or
+    // revoked); `shutdown` when the proxy stops.
+    let cancelled = async {
+        match cancel {
+            Some(c) => c.await,
+            None => std::future::pending().await,
+        }
+    };
+    let down = async {
+        match shutdown {
+            Some(mut rx) => {
+                let _ = rx.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        r = copy => r,
+        _ = down => Err(std::io::Error::other("proxy shutting down")),
+        _ = cancelled => Err(std::io::Error::other("the extension session ended")),
     }
 }
 
@@ -370,12 +385,25 @@ pub async fn proxy_upgrade(
     let desc = check_url.clone();
     let idle = ws.idle_timeout();
     let shutdown = ws.shutdown.as_ref().map(|tx| tx.subscribe());
+    // A splice on a connection that authenticated as an extension session ends with that session.
+    let cancel: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+        rctx.ext.map(|session| {
+            let hub = ctx.internal().gm.ext().clone();
+            Box::pin(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if !hub.is_live(session) {
+                        return;
+                    }
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
     tokio::spawn(async move {
         match tokio::try_join!(client_upgrade, up_upgrade) {
             Ok((client, upstream)) => {
                 let client = TokioIo::new(client);
                 let upstream = TokioIo::new(upstream);
-                match splice(client, upstream, idle, shutdown).await {
+                match splice(client, upstream, idle, shutdown, cancel).await {
                     Ok((up, down)) => debug!("WebSocket {} closed (up {up}B, down {down}B)", desc),
                     Err(e) => debug!("WebSocket {} ended: {}", desc, e),
                 }
@@ -497,8 +525,32 @@ mod tests {
     async fn splice_ends_after_idle_timeout() {
         let (client, _client_peer) = tokio::io::duplex(64);
         let (upstream, _upstream_peer) = tokio::io::duplex(64);
-        let r = splice(client, upstream, Duration::from_millis(100), None).await;
+        let r = splice(client, upstream, Duration::from_millis(100), None, None).await;
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn splice_ends_when_its_extension_session_is_cancelled() {
+        let (client, _client_peer) = tokio::io::duplex(64);
+        let (upstream, _upstream_peer) = tokio::io::duplex(64);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(splice(
+            client,
+            upstream,
+            Duration::from_secs(3600),
+            None,
+            Some(Box::pin(async move {
+                let _ = rx.await;
+            })),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "an idle healthy splice keeps running");
+        tx.send(()).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the splice ends")
+            .unwrap();
+        assert!(r.unwrap_err().to_string().contains("session ended"));
     }
 
     #[tokio::test]
@@ -511,6 +563,7 @@ mod tests {
             upstream,
             Duration::from_secs(3600),
             Some(rx),
+            None,
         ));
         tx.send(()).unwrap();
         assert!(task.await.unwrap().is_err());

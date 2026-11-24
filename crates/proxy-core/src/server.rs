@@ -1065,6 +1065,42 @@ impl ProxyServer {
             Err(_) => warn!("Proxy server is NOT listening (bind failed)"),
         }
 
+        // The extension bridge relays only while the extension listener decrypts, and never to
+        // Argus itself (its console, its panel and dashboard hosts).
+        {
+            let hub = self.ctx.internal().gm.ext();
+            let w = Arc::downgrade(&self.control);
+            hub.set_mitm_probe(Arc::new(move || {
+                w.upgrade().is_some_and(|c| {
+                    c.ext_flags.mitm()
+                        && c.live
+                            .load()
+                            .as_ref()
+                            .is_some_and(|l| l.shared.mitm.load().is_some())
+                })
+            }));
+            let (wc, wx) = (Arc::downgrade(&self.control), Arc::downgrade(&self.ctx));
+            let dashboard = url::Url::parse(&self.config.script_control.dashboard_url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+            hub.set_own_guard(Arc::new(move |host: &str, port: u16| {
+                let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+                if dashboard.as_deref() == Some(host.as_str())
+                    || wx.upgrade().is_some_and(|x| x.is_panel_host(&host))
+                {
+                    return true;
+                }
+                wc.upgrade().is_some_and(|c| {
+                    c.webui_own.lock().is_some_and(|(p, ip)| {
+                        p == port
+                            && ip.is_none_or(|ip| {
+                                ip.is_unspecified() || host.parse::<IpAddr>().ok() == Some(ip)
+                            })
+                    })
+                })
+            }));
+        }
+
         let cfg_host = self.config.proxy.host.clone();
         for (name, t) in [("explicit", false), ("transparent", true)] {
             let f = self.config.listener_flags(t);
