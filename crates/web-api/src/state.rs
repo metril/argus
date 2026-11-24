@@ -259,6 +259,9 @@ pub struct AppState {
     pub userscript_catalogue:
         OnceLock<Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>>>,
 
+    /// Run when the lists location or key changes (nudges the subscriptions to refresh now).
+    lists_hooks: parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+
     /// Serialises config updates and reloads (ETag check through save and commit).
     pub config_lock: tokio::sync::Mutex<()>,
 
@@ -831,6 +834,7 @@ pub async fn build_state_full(
         argus: OnceLock::new(),
         filter_catalogue: OnceLock::new(),
         userscript_catalogue: OnceLock::new(),
+        lists_hooks: Default::default(),
         config_lock: tokio::sync::Mutex::new(()),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
         timeseries: Default::default(),
@@ -912,6 +916,29 @@ impl AppState {
             .set_config_source(move || cfg(&a).unwrap_or_else(|| fb.clone()));
         self.userscript_catalogue()
             .set_config_source(move || cfg(&b).unwrap_or_else(|| fallback.clone()));
+        let (argus, filters, scripts) = (
+            self.argus().clone(),
+            self.filter_catalogue().clone(),
+            self.userscript_catalogue().clone(),
+        );
+        self.on_lists_config_changed(move || {
+            argus.nudge();
+            filters.nudge();
+            scripts.nudge();
+        });
+    }
+
+    /// Register `f` to run whenever the lists location or key changes.
+    pub fn on_lists_config_changed(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.lists_hooks.lock().push(Arc::new(f));
+    }
+
+    /// The lists location or key changed: run the registered hooks.
+    pub fn lists_config_changed(&self) {
+        let hooks = self.lists_hooks.lock().clone();
+        for h in hooks {
+            h();
+        }
     }
 
     /// The lists base URL, key and cache directory from the live config.

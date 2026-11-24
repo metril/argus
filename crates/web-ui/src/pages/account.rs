@@ -155,37 +155,24 @@ pub fn AccountPage() -> impl IntoView {
     }
 }
 
-/// Fetch an extension build with the session cookie and hand it to the browser as a file.
-/// A 404 means no release asset is published for this version.
+/// Fetch an extension build (cookie session, with a refresh on `401`) and hand it to the
+/// browser as a file. A 404 means no release asset is published for this version.
 async fn download_extension(browser: &'static str) -> Result<(), String> {
-    use gloo_net::http::Request;
     use wasm_bindgen::JsCast;
-    let url = format!("{}/api/v1/downloads/extension/{browser}", api_base_url());
-    let resp = Request::get(&url)
-        .credentials(web_sys::RequestCredentials::Include)
-        .send()
+    let path = format!("/downloads/extension/{browser}");
+    let (bytes, name) = ApiClient::new()
+        .get_bytes(&path)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-    match resp.status() {
-        200 => {}
-        404 => {
-            return Err(format!(
-                "No {browser} extension is published for this version of Argus yet."
-            ))
-        }
-        502 => return Err("Could not reach the release server. Try again later.".into()),
-        s => return Err(format!("Download failed (HTTP {s}).")),
-    }
-    let name = resp
-        .headers()
-        .get("content-disposition")
-        .and_then(|h| {
-            h.split("filename=\"")
-                .nth(1)
-                .map(|r| r.trim_end_matches('"').to_string())
-        })
-        .unwrap_or_else(|| format!("argus-extension-{browser}.zip"));
-    let bytes = resp.binary().await.map_err(|e| e.to_string())?;
+        .map_err(|e| match e {
+            crate::api::ApiError::NotFound(_) => {
+                format!("No {browser} extension is published for this version of Argus yet.")
+            }
+            crate::api::ApiError::Network(m) | crate::api::ApiError::Server(m) => {
+                format!("Could not download the extension: {m}")
+            }
+            e => e.to_string(),
+        })?;
+    let name = name.unwrap_or_else(|| format!("argus-extension-{browser}.zip"));
     let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let arr = js_sys::Uint8Array::from(bytes.as_slice());
     let parts = js_sys::Array::new();
@@ -202,7 +189,11 @@ async fn download_extension(browser: &'static str) -> Result<(), String> {
     a.set_href(&obj);
     a.set_download(&name);
     a.click();
-    let _ = web_sys::Url::revoke_object_url(&obj);
+    // Not revoked at once: some browsers start the save after the click returns.
+    gloo_timers::callback::Timeout::new(30_000, move || {
+        let _ = web_sys::Url::revoke_object_url(&obj);
+    })
+    .forget();
     Ok(())
 }
 
@@ -212,6 +203,17 @@ fn ExtensionCard() -> impl IntoView {
     let msg = RwSignal::new(Option::<String>::None);
     let busy = RwSignal::new(false);
     let origin = get_origin();
+    let user = use_auth_state().user;
+    // Creating a token needs `tokens:self`, and the token itself needs `logs:read`.
+    let can_token = Signal::derive(move || {
+        user.get()
+            .map(|u| {
+                ["logs:read", "tokens:self"]
+                    .iter()
+                    .all(|n| u.scopes.iter().any(|s| s.as_str() == *n))
+            })
+            .unwrap_or(false)
+    });
     let get = move |browser: &'static str| {
         busy.set(true);
         msg.set(None);
@@ -248,7 +250,11 @@ fn ExtensionCard() -> impl IntoView {
             </p>
             <p class="form-help">
                 <strong>"Both: "</strong>
-                "create an API token with the logs:read scope, then enter it and this Argus URL in the extension: "
+                {move || if can_token.get() {
+                    "create an API token with the logs:read scope, then enter it and this Argus URL in the extension: "
+                } else {
+                    "ask an admin to issue an API token with logs:read, then enter it and this Argus URL in the extension: "
+                }}
                 <code>{origin}</code>
             </p>
         </Card>

@@ -55,6 +55,10 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         transparent: flags_view(config, true),
         webui_host: config.webui.host.clone(),
         webui_port: config.webui.port,
+        bypass: api_types::BypassSourceDto {
+            lists_base_url: config.bypass.lists_base_url.clone(),
+            lists_public_key: config.bypass.lists_public_key.clone(),
+        },
         bind: None,
     }
 }
@@ -267,6 +271,33 @@ async fn apply_update_locked(
         can_web
     );
     field!("webui_port", config.webui.port, req.webui_port, can_web);
+    if let Some(b) = req.bypass {
+        if let Some(u) = b.lists_base_url {
+            let u = u.trim().trim_end_matches('/').to_string();
+            if !(u.is_empty() || u.starts_with("http://") || u.starts_with("https://")) {
+                return Err(ApiError::ValidationError(
+                    "bypass.lists_base_url: use an http:// or https:// URL".into(),
+                ));
+            }
+            config.bypass.lists_base_url = u;
+        }
+        if let Some(k) = b.lists_public_key {
+            let k = k.trim().to_string();
+            let ok = (20..=100).contains(&k.len())
+                && k.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='));
+            if !k.is_empty() && !ok {
+                return Err(ApiError::ValidationError(
+                    "bypass.lists_public_key: expected the base64 line of a minisign public key"
+                        .into(),
+                ));
+            }
+            config.bypass.lists_public_key = k;
+        }
+        if config.bypass != old.bypass {
+            applied.push("bypass".into());
+        }
+    }
     field!(
         "max_connections",
         config.performance.max_connections,
@@ -428,7 +459,12 @@ async fn apply_update_locked(
     info!("Proxy configuration updated by {who}");
     apply_live(state, &config);
     let mut response = proxy_config_response(&config);
+    let lists_changed = old.bypass != config.bypass;
     *state.proxy_state.config.write() = config;
+    if lists_changed {
+        // The lists, roots and catalogues read the new location and key and check right away.
+        state.lists_config_changed();
+    }
     response.bind = bind_result(state).await;
     if let (Some(b), Some(m)) = (response.bind.as_mut(), moved_to) {
         b.webui_moved_to = Some(m);
@@ -580,7 +616,11 @@ pub async fn reload_config(
     let old = state.proxy_state.config.read().clone();
     apply_runtime(&state, &old, &new_config).await?;
     apply_live(&state, &new_config);
+    let lists_changed = old.bypass != new_config.bypass;
     *state.proxy_state.config.write() = new_config;
+    if lists_changed {
+        state.lists_config_changed();
+    }
     info!("Proxy configuration reloaded by {}", p.username);
     Ok(Json(MessageResponse {
         message: "Configuration reloaded successfully".into(),

@@ -127,6 +127,7 @@ async fn main() -> Result<()> {
 
     // Trusted roots: the compiled-in set until a signed one (same release, same key) has been
     // verified; then swapped in live.
+    #[cfg_attr(not(feature = "webui"), allow(unused_variables))]
     let roots_manager = ctx.roots().map(|roots| {
         let m = proxy_core::roots::RootsManager::new(
             roots.clone(),
@@ -389,6 +390,7 @@ async fn start_webui_server(
             w.upgrade()
                 .map_or_else(|| fb.clone(), |s| s.catalogue_cfg())
         });
+        state.on_lists_config_changed(move || m.nudge());
     }
 
     info!(

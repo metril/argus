@@ -48,6 +48,8 @@ enum Kind {
     Switch,
     Cidr,
     Ip,
+    /// Free text, not validated here (the server checks it).
+    Free,
     Seg(&'static [(&'static str, &'static str)]),
 }
 
@@ -187,6 +189,27 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        id: "lists",
+        title: "Signed lists source",
+        sub: "Where the bypass lists, trusted roots and catalogues are fetched from. Applied at once.",
+        fields: &[
+            Def {
+                key: "lists_url",
+                label: "Base URL",
+                desc: "Empty uses the official release. A mirror must not serve older releases than the ones already installed: those are refused.",
+                kind: Kind::Free,
+                dep: None,
+            },
+            Def {
+                key: "lists_key",
+                label: "Public key",
+                desc: "Minisign key the lists must be signed with. Empty uses the built-in key. Changing it checks the installed lists against the new key and drops any that fail.",
+                kind: Kind::Free,
+                dep: None,
+            },
+        ],
+    },
+    Section {
         id: "timeouts",
         title: "Timeouts and limits",
         sub: "Apply to new connections.",
@@ -307,6 +330,7 @@ fn defaults(key: &str) -> Val {
         "allow_dest" => Val::T(Vec::new()),
         "block_private" => Val::B(false),
         "auto_update" => Val::B(true),
+        "lists_url" | "lists_key" => Val::S(String::new()),
         "dns_servers" => Val::T(Vec::new()),
         "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => Val::S("0".into()),
         _ => Val::S("24".into()),
@@ -335,6 +359,8 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("block_private", Val::B(c.block_private_destinations)),
         ("auto_update", Val::B(c.auto_update)),
         ("update_every", Val::S(c.update_interval_hours.to_string())),
+        ("lists_url", Val::S(c.bypass.lists_base_url.clone())),
+        ("lists_key", Val::S(c.bypass.lists_public_key.clone())),
         ("dns_servers", Val::T(c.dns.servers.clone())),
         ("dns_cache", Val::S(c.dns.cache_size.to_string())),
         ("dns_min_ttl", Val::S(c.dns.min_ttl_secs.to_string())),
@@ -358,6 +384,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "allow_dest" => &["allowed_destinations"],
         "block_private" => &["block_private_destinations"],
         "auto_update" => &["auto_update"],
+        "lists_url" | "lists_key" => &["bypass"],
         "dns_servers" | "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => &["dns"],
         _ => &["update_interval_hours"],
     }
@@ -511,6 +538,12 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("update_every") {
         r.update_interval_hours = Some(num("update_every"));
+    }
+    if dirty("lists_url") || dirty("lists_key") {
+        r.bypass = Some(api_types::BypassSourceUpdate {
+            lists_base_url: dirty("lists_url").then(|| val("lists_url").s()),
+            lists_public_key: dirty("lists_key").then(|| val("lists_key").s()),
+        });
     }
     if [
         "dns_servers",
@@ -922,7 +955,10 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
     let modified = move || f.cur.get() != f.default.get();
     let off = Signal::derive(move || d.dep.map(|k| !is_on(&all_o, k)).unwrap_or(false));
     let err = Signal::derive(move || error_of(&f, &all_e));
-    let is_label = matches!(d.kind, Kind::Text | Kind::Port | Kind::Num { .. });
+    let is_label = matches!(
+        d.kind,
+        Kind::Text | Kind::Free | Kind::Port | Kind::Num { .. }
+    );
     let default_txt = move || {
         let v = f.default.get();
         match d.kind {
@@ -974,14 +1010,14 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 {move || terr.get().map(|e| view! { <span class="fmsg bad" role="alert">{e}</span> })}
             }.into_any()
         }
-        Kind::Text | Kind::Port | Kind::Num { .. } => {
+        Kind::Text | Kind::Free | Kind::Port | Kind::Num { .. } => {
             let unit = if let Kind::Num { unit, .. } = d.kind { Some(unit) } else { None };
-            let cls = match d.kind { Kind::Text => "input mono mid", _ => "input mono short num" };
+            let cls = match d.kind { Kind::Text | Kind::Free => "input mono mid", _ => "input mono short num" };
             let input = view! {
                 <input
                     class=cls
                     id=id.clone()
-                    inputmode=if d.kind == Kind::Text { "text" } else { "numeric" }
+                    inputmode=if matches!(d.kind, Kind::Text | Kind::Free) { "text" } else { "numeric" }
                     autocomplete="off"
                     aria-describedby=msg_id.clone()
                     aria-invalid=move || if err.get().is_some() { "true" } else { "false" }
