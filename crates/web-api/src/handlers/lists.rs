@@ -827,6 +827,12 @@ pub async fn list_ext_rules(
     };
     // One pass, no per-row allocation: count every match, collect the page (plus one row to
     // know whether more follow).
+    let key = (
+        q.list.clone().unwrap_or_default(),
+        q.kind.clone().unwrap_or_default(),
+        needle.clone(),
+    );
+    let cached = state.ext_totals.lock().get(gen_id, &key);
     let mut total = 0usize;
     let mut picked: Vec<usize> = Vec::with_capacity(limit + 1);
     for (i, r) in rules.iter().enumerate() {
@@ -846,7 +852,14 @@ pub async fn list_ext_rules(
             skip -= 1;
         } else if picked.len() <= limit {
             picked.push(i);
+        } else if cached.is_some() {
+            // The total is known; the page and "more follow" are settled.
+            break;
         }
+    }
+    match cached {
+        Some(t) => total = t,
+        None => state.ext_totals.lock().put(gen_id, key, total),
     }
     let has_more = picked.len() > limit;
     picked.truncate(limit);
@@ -877,6 +890,39 @@ pub async fn list_ext_rules(
         has_more,
         next_cursor,
     }))
+}
+
+/// Counted `/rules/ext` totals for the current engine generation, so paging does not recount.
+/// One per `AppState` (generation ids are per engine).
+const EXT_TOTALS_CAP: usize = 64;
+
+type ExtKey = (String, String, String);
+
+#[derive(Default)]
+pub struct ExtTotals {
+    gen: u64,
+    map: Option<std::collections::HashMap<ExtKey, usize>>,
+}
+
+impl ExtTotals {
+    fn get(&mut self, gen: u64, k: &ExtKey) -> Option<usize> {
+        if self.gen != gen {
+            return None;
+        }
+        self.map.as_ref()?.get(k).copied()
+    }
+
+    fn put(&mut self, gen: u64, k: ExtKey, total: usize) {
+        if self.gen != gen || self.map.is_none() {
+            self.gen = gen;
+            self.map = Some(Default::default());
+        }
+        let m = self.map.as_mut().expect("set above");
+        if m.len() >= EXT_TOTALS_CAP {
+            m.clear();
+        }
+        m.insert(k, total);
+    }
 }
 
 fn encode_ext_cursor(gen: u64, index: usize) -> String {
@@ -920,5 +966,33 @@ pub(crate) async fn validate_filter_url(state: &AppState, url: &str) -> ApiResul
             FETCH_DESTINATION_CODE,
             e.to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod ext_totals_tests {
+    use super::*;
+
+    #[test]
+    fn a_total_is_reused_and_dropped_when_the_generation_changes() {
+        let mut c = ExtTotals::default();
+        let k: ExtKey = ("l".into(), "k".into(), "q".into());
+        assert_eq!(c.get(1, &k), None);
+        c.put(1, k.clone(), 7);
+        assert_eq!(c.get(1, &k), Some(7));
+        assert_eq!(c.get(1, &("l".into(), "k".into(), "other".into())), None);
+        assert_eq!(c.get(2, &k), None, "new generation");
+        c.put(2, k.clone(), 9);
+        assert_eq!(c.get(1, &k), None);
+        assert_eq!(c.get(2, &k), Some(9));
+    }
+
+    #[test]
+    fn the_cache_stays_bounded() {
+        let mut c = ExtTotals::default();
+        for i in 0..200 {
+            c.put(1, (i.to_string(), String::new(), String::new()), i);
+        }
+        assert!(c.map.as_ref().unwrap().len() <= EXT_TOTALS_CAP);
     }
 }

@@ -169,6 +169,8 @@ pub struct ListService {
     busy: watch::Sender<bool>,
     builds: AtomicU64,
     installed_once: AtomicBool,
+    /// Fetched `meta.json` shared by the catalogues and the bypass lists.
+    meta_cache: crate::argus::MetaCache,
     /// Cache key of the installed engine, to skip recompiling identical inputs.
     installed_key: Mutex<Option<persist::Key>>,
     summary: Mutex<BuildSummary>,
@@ -330,6 +332,11 @@ fn sorted_includes(m: &HashMap<String, String>) -> Vec<(&String, &String)> {
 }
 
 impl ListService {
+    /// Short-lived share of the fetched `meta.json` (see [`crate::argus::MetaCache`]).
+    pub fn meta_cache(&self) -> &crate::argus::MetaCache {
+        &self.meta_cache
+    }
+
     /// The build pool: `cfg.build_threads` (default cores/2, min 1) low-priority threads, so
     /// list builds neither take every core nor win scheduling against request workers.
     pub(crate) fn build_pool(&self) -> Arc<rayon::ThreadPool> {
@@ -390,6 +397,7 @@ impl ListService {
             busy: watch::channel(false).0,
             builds: AtomicU64::new(0),
             installed_once: AtomicBool::new(false),
+            meta_cache: Default::default(),
             installed_key: Mutex::new(None),
             summary: Mutex::new(summary),
             state: Mutex::new(BuildState::Idle),

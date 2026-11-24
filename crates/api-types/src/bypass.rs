@@ -55,7 +55,7 @@ pub struct BypassHostsResponse {
 }
 
 /// A custom entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct BypassEntryDto {
     pub id: String,
@@ -113,7 +113,7 @@ pub struct BypassEntriesPage {
 }
 
 /// A subscribed exclusion list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct BypassSubscriptionDto {
     pub id: String,
@@ -148,7 +148,7 @@ pub struct CreateBypassSubscription {
 }
 
 /// A ready-made list to subscribe to in one step.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SuggestedSubscription {
     pub id: String,
@@ -188,7 +188,7 @@ pub struct UpdateBypassSettings {
 }
 
 /// One first-party category in `GET /bypass/argus-lists`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ArgusCategoryDto {
     pub id: String,

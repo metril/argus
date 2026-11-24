@@ -261,6 +261,8 @@ pub struct AppState {
 
     /// Run when the lists location or key changes (nudges the subscriptions to refresh now).
     lists_hooks: parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+    /// Counted `/rules/ext` totals for the installed engine generation.
+    pub(crate) ext_totals: parking_lot::Mutex<crate::handlers::lists::ExtTotals>,
 
     /// Serialises config updates and reloads (ETag check through save and commit).
     pub config_lock: tokio::sync::Mutex<()>,
@@ -835,6 +837,7 @@ pub async fn build_state_full(
         filter_catalogue: OnceLock::new(),
         userscript_catalogue: OnceLock::new(),
         lists_hooks: Default::default(),
+        ext_totals: Default::default(),
         config_lock: tokio::sync::Mutex::new(()),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
         timeseries: Default::default(),

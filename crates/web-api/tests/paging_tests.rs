@@ -515,6 +515,64 @@ async fn cursor_row_deleted_between_pages_loses_and_repeats_nothing() {
     );
 }
 
+async fn ext_ctx(n: usize) -> TestContext {
+    let ctx = TestContext::new().await.unwrap();
+    let mut l = filter_engine::FilterList::new(
+        "ag".into(),
+        "AG".into(),
+        "https://127.0.0.1:1/ag.txt".into(),
+    );
+    l.format = filter_engine::ListFormat::Adguard;
+    ctx.state.filter_store.upsert(&l).unwrap();
+    let body: String = (0..n)
+        .map(|i| format!("||x{i}.example^$replace=/a/b/\n"))
+        .collect();
+    ctx.state.filter_store.put_content("ag", &body).unwrap();
+    ctx.state.list_service.reload_now().await;
+    ctx
+}
+
+#[tokio::test]
+async fn ext_rules_cached_total_serves_cursor_pages_correctly() {
+    let ctx = ext_ctx(30).await;
+    let admin = ctx.admin().await;
+    // First page counts and caches; later pages come from the cached total and stop early.
+    let p1: Value = admin.get("/api/v1/rules/ext?limit=10").await.json();
+    assert_eq!(p1["total"], 30);
+    let mut cur = p1["next_cursor"].as_str().unwrap().to_string();
+    let mut first = 10;
+    loop {
+        let p: Value = admin
+            .get(&format!("/api/v1/rules/ext?limit=10&cursor={cur}"))
+            .await
+            .json();
+        assert_eq!(p["total"], 30);
+        assert_eq!(p["items"][0]["index"], first);
+        assert_eq!(p["items"].as_array().unwrap().len(), 10);
+        first += 10;
+        match p["next_cursor"].as_str() {
+            Some(c) => cur = c.to_string(),
+            None => {
+                assert_eq!(p["has_more"], false);
+                break;
+            }
+        }
+    }
+    assert_eq!(first, 30);
+}
+
+#[tokio::test]
+async fn ext_rule_totals_are_per_app_state() {
+    let (a, b) = (ext_ctx(30).await, ext_ctx(31).await);
+    let (sa, sb) = (a.admin().await, b.admin().await);
+    for _ in 0..2 {
+        let ta: Value = sa.get("/api/v1/rules/ext?limit=5").await.json();
+        let tb: Value = sb.get("/api/v1/rules/ext?limit=5").await.json();
+        assert_eq!(ta["total"], 30);
+        assert_eq!(tb["total"], 31);
+    }
+}
+
 #[tokio::test]
 async fn ext_rules_cursor_is_refused_after_a_rebuild() {
     let ctx = TestContext::new().await.unwrap();

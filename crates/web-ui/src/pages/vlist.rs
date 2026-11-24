@@ -171,6 +171,88 @@ impl<T: Clone + Send + Sync + 'static> Feed<T> {
     }
 }
 
+/// The row with this id, if loaded.
+pub fn find_by_id<'a, T>(items: &'a [T], id: &str, id_of: fn(&T) -> &str) -> Option<&'a T> {
+    items.iter().find(|x| id_of(x) == id)
+}
+
+/// Live view of one row: follows the newest copy of the item with `initial`'s id, so a row keyed
+/// by id updates in place (no remount, scroll position kept). If the item is gone it keeps the
+/// initial value until its row is removed. A memo: one scan per update, and dependents rerun
+/// only when this row's data changed.
+pub fn live_row<T>(items: impl Into<Signal<Vec<T>>>, initial: T, id_of: fn(&T) -> &str) -> Memo<T>
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+{
+    let items: Signal<Vec<T>> = items.into();
+    let id = id_of(&initial).to_string();
+    Memo::new(move |_| {
+        items
+            .with(|v| find_by_id(v, &id, id_of).cloned())
+            .unwrap_or_else(|| initial.clone())
+    })
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    #[derive(Clone, PartialEq)]
+    struct R(String, u32);
+    fn id(r: &R) -> &str {
+        &r.0
+    }
+
+    #[test]
+    fn a_row_follows_edits_by_id_and_keeps_its_value_when_dropped() {
+        let items = RwSignal::new(vec![R("a".into(), 1), R("b".into(), 2)]);
+        let b = live_row(items, R("b".into(), 2), id);
+        assert_eq!(b.get().1, 2);
+        items.update(|v| v[1].1 = 5);
+        assert_eq!(b.get().1, 5, "edit shows without a new key");
+        items.update(|v| v.insert(0, R("z".into(), 9)));
+        assert_eq!(b.get().1, 5, "position changes do not matter");
+        items.set(vec![]);
+        assert_eq!(
+            b.get().1,
+            2,
+            "gone: initial value stays until the row is removed"
+        );
+        assert!(find_by_id(&[R("a".into(), 1)], "q", id).is_none());
+    }
+
+    #[test]
+    fn a_row_scans_once_per_update_and_ignores_unrelated_edits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SCANS: AtomicUsize = AtomicUsize::new(0);
+        fn counted(r: &R) -> &str {
+            SCANS.fetch_add(1, Ordering::SeqCst);
+            &r.0
+        }
+        let items = RwSignal::new(vec![R("a".into(), 1), R("b".into(), 2)]);
+        let b = live_row(items, R("b".into(), 2), counted);
+        b.get();
+        let n = SCANS.load(Ordering::SeqCst);
+        b.get();
+        b.get();
+        assert_eq!(
+            SCANS.load(Ordering::SeqCst),
+            n,
+            "repeat reads reuse the memo"
+        );
+        items.update(|v| v[0].1 = 8);
+        assert_eq!(
+            b.get().1,
+            2,
+            "an unrelated edit leaves this row's value as it was"
+        );
+        assert!(
+            SCANS.load(Ordering::SeqCst) > n,
+            "the update caused one rescan"
+        );
+    }
+}
+
 /// Windowed scroller. `render` makes one row; rows must be direct children of the wrapper
 /// (their height is forced to `row_h` by CSS via `--rowh`).
 #[component]
