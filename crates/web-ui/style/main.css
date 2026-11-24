@@ -245,8 +245,8 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 .tbl tr.gone{opacity:0;transition:opacity .25s}
 
 /* ---------- dashboard ---------- */
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,168px),1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--r-card);overflow:hidden}
-.tile{background:var(--surface);padding:var(--s3) var(--s4);display:flex;flex-direction:column;gap:6px;min-width:0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,168px),1fr));gap:0;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-card);overflow:hidden}
+.tile{background:var(--surface);box-shadow:1px 1px 0 0 var(--line);padding:var(--s3) var(--s4);display:flex;flex-direction:column;gap:6px;min-width:0}
 .tile .k{font:600 var(--fs-11)/1 var(--font-head);text-transform:uppercase;letter-spacing:.09em;color:var(--text-3)}
 .tile .v{font:500 var(--fs-24)/1.1 var(--font-mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
 .tile .d{font-size:var(--fs-12);color:var(--text-3)}
@@ -447,8 +447,8 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 }
 @media (max-width:760px){
   .app,.app.collapsed{grid-template-columns:minmax(0,1fr);height:100dvh}
-  .side{position:absolute;inset:0 auto 0 0;width:min(260px,84%);z-index:50;transform:translateX(-102%);transition:transform .2s;box-shadow:var(--shadow)}
-  .app.navopen .side{transform:none}
+  .side{position:absolute;inset:0 auto 0 0;width:min(260px,84%);z-index:50;transform:translateX(-102%);transition:transform .2s,box-shadow .2s}
+  .app.navopen .side{transform:none;box-shadow:var(--shadow)}
   .app.collapsed .nav-label,.app.collapsed .nav .count,.app.collapsed .nav .live-dot,.app.collapsed .nav-group span,.app.collapsed .brand-text,.app.collapsed .side-foot span{display:revert}
   .app.collapsed .nav a,.app.collapsed .side-foot button{justify-content:flex-start;padding:0 8px}
   .collapse-btn{display:none!important}
