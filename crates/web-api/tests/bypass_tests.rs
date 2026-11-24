@@ -1188,3 +1188,86 @@ async fn changing_the_lists_source_through_the_config_api_is_followed_live() {
     assert!(ctx.state.bypass().failsafe_active());
     assert!(ctx.state.filter_catalogue().get().is_none());
 }
+
+#[tokio::test]
+async fn a_key_change_drops_old_content_even_when_the_new_source_is_unreachable() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let (a, b) = (keys(), keys());
+    let (addr, _s) = serve_files(release_with_catalogue(&a, "v2025.11.23")).await;
+    ctx.state.follow_live_catalogue_config();
+    put_config(
+        &admin,
+        json!({"bypass": {"lists_base_url": format!("http://{addr}"), "lists_public_key": pk_line(&a)}}),
+    )
+    .await;
+    admin
+        .post("/api/v1/bypass/argus-lists/refresh")
+        .await
+        .assert_status_ok();
+    ctx.state.filter_catalogue().refresh().await.unwrap();
+    assert!(ctx.state.bypass().lookup("chase.test").is_some());
+
+    // New key and a source that is down: the refreshes fail, but nothing old stays trusted.
+    put_config(
+        &admin,
+        json!({"bypass": {"lists_base_url": "http://127.0.0.1:1", "lists_public_key": pk_line(&b)}}),
+    )
+    .await;
+    assert!(ctx.state.filter_catalogue().refresh().await.is_err());
+    assert!(ctx.state.filter_catalogue().get().is_none());
+    assert!(!admin
+        .post("/api/v1/bypass/argus-lists/refresh")
+        .await
+        .status_code()
+        .is_success());
+    assert!(ctx.state.bypass().lookup("chase.test").is_none());
+    assert!(ctx.state.bypass().failsafe_active());
+
+    // The change is in the audit trail with who, the URLs and key fingerprints (not the keys).
+    let log: Value = admin.get("/api/v1/audit?limit=50").await.json();
+    let e = log["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["route"]
+                .as_str()
+                .is_some_and(|r| r.contains("bypass.lists_source"))
+        })
+        .expect("audit entry");
+    assert_eq!(e["actor_name"], "admin_user");
+    let t = e["target"].as_str().unwrap();
+    assert!(t.contains("127.0.0.1:1") && t.contains("->"), "{t}");
+    assert!(!t.contains(&pk_line(&b)), "{t}");
+}
+
+#[tokio::test]
+async fn changing_the_lists_source_needs_config_write_and_validates_its_input() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let user = ctx.user(&admin, "plain", "user").await;
+    let body = json!({"bypass": {"lists_base_url": "http://mirror.test"}});
+    put_config_raw(&user, body.clone())
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    let weak = ctx.token(&admin, &["config:read"]).await;
+    ctx.bearer("PUT", "/api/v1/config", &weak)
+        .add_header("if-match", "\"x\"")
+        .json(&body)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    for bad in [
+        json!({"lists_base_url": "ftp://x.test"}),
+        json!({"lists_base_url": "http://"}),
+        json!({"lists_base_url": "not a url"}),
+        json!({"lists_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}),
+        json!({"lists_public_key": "short"}),
+    ] {
+        put_config_raw(&admin, json!({ "bypass": bad }))
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
+    let cfg: Value = admin.get("/api/v1/config").await.json();
+    assert_ne!(cfg["bypass"]["lists_base_url"], "http://mirror.test");
+}

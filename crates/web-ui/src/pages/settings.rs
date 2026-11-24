@@ -196,7 +196,7 @@ const SECTIONS: &[Section] = &[
             Def {
                 key: "lists_url",
                 label: "Base URL",
-                desc: "Empty uses the official release. A mirror must not serve older releases than the ones already installed: those are refused.",
+                desc: "Empty uses the official release. A mirror must not serve older releases than the ones already installed: those are refused. A mirror with its own key and lower serials stays on the built-in roots because of the downgrade floor.",
                 kind: Kind::Free,
                 dep: None,
             },
@@ -818,7 +818,10 @@ fn SettingsInner() -> impl IntoView {
                 matches!(f.def.key, "webui_host" | "webui_port")
                     && f.cur.get_untracked() != f.saved.get_untracked()
             });
-            if moving {
+            let key_changed = all.iter().any(|f| {
+                f.def.key == "lists_key" && f.cur.get_untracked() != f.saved.get_untracked()
+            });
+            if moving || key_changed {
                 bar.set(Bar::Confirm);
             } else {
                 apply();
@@ -908,11 +911,17 @@ fn SettingsInner() -> impl IntoView {
                         }
                         Bar::Confirm => {
                             let apply = apply.clone();
+                            let key_changed = dirty_fields().iter().any(|f| f.def.key == "lists_key");
+                            let (msg, label) = if key_changed {
+                                ("Changing the lists key: installed lists, trusted roots and catalogues signed with the old key are dropped until the new source verifies. Until then HTTPS is tunnelled, not decrypted.", "Change key and save")
+                            } else {
+                                ("The web UI will move. This page reconnects at the new address; other open sessions must reload.", "Move web UI and save")
+                            };
                             view! {
-                                <div class="sb-msg" aria-live="polite"><span>"The web UI will move. This page reconnects at the new address; other open sessions must reload."</span></div>
+                                <div class="sb-msg" aria-live="polite"><span>{msg}</span></div>
                                 <div class="sb-act">
                                     <button class="btn" type="button" on:click=move |_| bar.set(Bar::Edit)>"Back"</button>
-                                    <button class="btn primary" type="button" disabled=move || busy.get() on:click=move |_| apply()>"Move web UI and save"</button>
+                                    <button class="btn primary" type="button" disabled=move || busy.get() on:click=move |_| apply()>{label}</button>
                                 </div>
                             }.into_any()
                         }

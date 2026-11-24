@@ -956,6 +956,8 @@ impl RootsManager {
         let _g = self.busy.lock().await;
         // One configuration for the whole check: never a mix of two URLs or keys.
         let cfg = self.cfg();
+        // A key change drops what the old key vouched for even if the new source is down.
+        self.sync_key(&cfg);
         let fetched = self.fetch(&cfg).await;
         self.finish(match fetched {
             Ok((text, sig)) => self.apply(&cfg, text, sig).await,

@@ -63,6 +63,13 @@ pub fn verify(public_key: &str, data: &[u8], sig_text: &str) -> Result<(), Strin
         .map_err(|e| format!("signature does not verify: {e}"))
 }
 
+/// Whether `public_key` is a well-formed minisign public key (the base64 line).
+pub fn check_public_key(public_key: &str) -> Result<(), String> {
+    minisign_verify::PublicKey::from_base64(public_key.trim())
+        .map(|_| ())
+        .map_err(|e| format!("invalid public key: {e}"))
+}
+
 /// Like [`verify`], and returns the signed (trusted) comment.
 pub fn verify_trusted(public_key: &str, data: &[u8], sig_text: &str) -> Result<String, String> {
     verify(public_key, data, sig_text)?;

@@ -311,7 +311,12 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
     /// Fetch, verify and install the newest copy. Returns the release in force.
     pub async fn refresh(&self) -> Result<String, String> {
         let svc = self.svc.as_ref().ok_or("no fetcher")?;
+        // One check at a time, and the config is read under the lock so a refresh that waited
+        // never installs with a key that has since been replaced.
+        let _g = self.busy.lock().await;
         let cfg = self.cfg();
+        // A key change drops what the old key vouched for even if the new source is down.
+        self.sync_key(&cfg);
         let file = self.file();
         let text = svc.fetch_exclusion_list(&Self::url(&cfg, &file)).await?;
         let sig = svc
@@ -329,7 +334,7 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         }
         .await
         .ok();
-        self.apply_with(&cfg, text, sig, meta).await
+        self.apply_locked(&cfg, text, sig, meta).await
     }
 
     /// Verify and install a copy already in hand (also what tests drive).
@@ -339,18 +344,19 @@ impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
         sig: String,
         meta: Option<(String, String)>,
     ) -> Result<String, String> {
+        let _g = self.busy.lock().await;
         let cfg = self.cfg();
-        self.apply_with(&cfg, text, sig, meta).await
+        self.apply_locked(&cfg, text, sig, meta).await
     }
 
-    async fn apply_with(
+    /// [`Self::apply`] with `busy` already held and the configuration read under it.
+    async fn apply_locked(
         &self,
         cfg: &ArgusConfig,
         text: String,
         sig: String,
         meta: Option<(String, String)>,
     ) -> Result<String, String> {
-        let _g = self.busy.lock().await;
         self.sync_key(cfg);
         let (entries, version) = self.check(
             cfg,
@@ -746,6 +752,34 @@ mod tests {
             )
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn racing_applies_with_different_keys_resolve_to_the_new_key() {
+        let (a, b) = (Signer::new(), Signer::new());
+        let d = doc(&a, "filters", None);
+        let text = filters_json("abp");
+        let key_b = b.public_key();
+        // The key was replaced; a straggler still carrying the old key's document must lose.
+        d.set_config_source(move || ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: key_b.clone(),
+            cache_dir: None,
+        });
+        let old = d.apply(
+            text.clone(),
+            a.sign(&text, "v2026.11.23", "filters.json"),
+            None,
+        );
+        let new = d.apply(
+            text.clone(),
+            b.sign(&text, "v2026.11.24", "filters.json"),
+            None,
+        );
+        let (old, new) = tokio::join!(old, new);
+        assert!(old.is_err());
+        assert_eq!(new.unwrap(), "v2026.11.24");
+        assert_eq!(d.get().unwrap().version, "v2026.11.24");
     }
 
     #[tokio::test]

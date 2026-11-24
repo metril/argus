@@ -16,7 +16,8 @@ pub mod site_exceptions;
 mod store;
 
 pub use argus::{
-    verify as verify_minisign, verify_trusted, ArgusConfig, ArgusLists, RefreshOutcome,
+    check_public_key, verify as verify_minisign, verify_trusted, ArgusConfig, ArgusLists,
+    RefreshOutcome,
 };
 pub use error::{Error, Result};
 pub use report::{BuildState, BuildSummary};
