@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 export const runtimeSrc = readFileSync(join(here, "..", "gm.js"), "utf8");
 
-const sharedSrc = readFileSync(join(here, "..", "gm_shared.js"), "utf8").replace("/*RUNTIME*/null", runtimeSrc.trim());
+const sharedSrc = readFileSync(join(here, "..", "gm_shared.js"), "utf8").replace("/*RUNTIME*/null", runtimeSrc.trim()).replace("/*MENU*/null", readFileSync(join(here, "..", "menu.js"), "utf8").trim());
 
 /** The runtime as a page uses it: the shared installer runs once per window, then each call goes
  * through the hook it defines. Returns `(cfg, entries, W)`. */

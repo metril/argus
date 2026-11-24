@@ -471,6 +471,7 @@ pub fn check_connect(script: &Userscript, page_host: &str, target: &Url) -> GmRe
         return Ok(());
     }
     for c in &script.metadata.connect {
+        let c = c.to_ascii_lowercase();
         let ok = match c.as_str() {
             "*" => script.allow_connect_all,
             "self" => host == page_host,
@@ -880,6 +881,9 @@ mod tests {
         );
         assert!(!ok("https://google/") && !ok("http://1.2.3.4/"));
         assert!(!ok("https://google.com.evil.invalid/"));
+        let mut upper = script("// @connect a.test", false);
+        upper.metadata.connect = vec!["GOOGLE.*".into()];
+        assert!(check_connect(&upper, "page.test", &u("https://google.com/")).is_ok());
         // A bare `*.` stem or an inner wildcard never matches.
         let bad = script("// @connect .*\n// @connect g*.*", false);
         assert!(check_connect(&bad, "page.test", &u("https://google.com/")).is_err());

@@ -28,8 +28,9 @@ pub const RUNTIME_JS: &str = include_str!("../assets/gm.js");
 
 /// `Symbol.for` key under which the shared runtime script publishes its entry point.
 pub const RUNTIME_HOOK: &str = "adblock.userscript.runtime";
-/// `Symbol.for` key of the frozen command registry (`commands`, `invoke`, `subscribe`).
-pub const MENU_HOOK: &str = "adblock.userscript.menu";
+/// The menu button (a function expression), inlined into the shared runtime closure so the
+/// command registry is never reachable from page code.
+pub const MENU_JS: &str = include_str!("../assets/menu.js");
 
 /// The script that installs the GM runtime once per document: the runtime function, the command
 /// registry every script of the page registers into (and the in-page panel reads), and one
@@ -41,6 +42,7 @@ pub fn runtime_script() -> String {
         "({})(window);\n",
         SHARED_JS
             .replace("/*RUNTIME*/null", RUNTIME_JS.trim())
+            .replace("/*MENU*/null", MENU_JS.trim())
             .trim()
     )
 }

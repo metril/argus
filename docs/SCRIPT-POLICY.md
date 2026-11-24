@@ -266,7 +266,7 @@ The panel renders in a closed Shadow DOM under `all: initial`, at the top z-inde
 inline handlers and no `eval` (so it works under strict CSP and Trusted Types). It shows the site's
 preset, the sources blocked on the page by registrable domain with a toggle per capability, a TTL
 choice for temporary allows, "allow all temporarily", "revoke temporary permissions", the count of
-blocked requests, per-site ad blocking, the userscripts matching the page (with their menu commands)
+blocked requests, per-site ad blocking, the userscripts matching the page
 and a "reload to apply" prompt when the settings change.
 
 ### Menu button for userscript commands
@@ -279,17 +279,29 @@ commands registered." when empty). It does not depend on `panel.enabled` or on
 `script_control.panel_enabled`, and it is never emitted on a page without userscripts, in a
 `sandbox`ed document without `allow-scripts`, or when script injection is off.
 
-It is one extra tag, `/__adblock__/menu.<hash>.js` (immutable, about 4 KB), emitted after the
-userscript bundles with the per-response nonce, so it runs at document start with every command
-already visible and follows later `register`/`unregister` through the registry's `subscribe`. A
-history change (`popstate`, `hashchange`, `pageshow`) or a replaced root re-attaches the badge, so it
-survives SPA navigation. The UI is in a closed Shadow DOM under `all: initial`, no `innerHTML`, no
-inline handlers, no network. It adds no authority: it reads the same frozen registry the panel and
-the page already reach (`commands`, `invoke`, `subscribe`; callbacks are never exposed), and ignores
-untrusted (`isTrusted: false`) clicks so a page cannot drive it with synthetic events. A hostile
-page can still call `invoke` directly, as before; the badge makes no difference to that. The badge
-itself is visible to the page only as a host element (the shadow root is closed, but the page can
-hook `attachShadow`), and its presence reveals that a script registered a command.
+The button's code is part of the shared runtime script (`data-m` on its tag carries the mode), so it
+runs at document start with every command already visible and follows later `register`/`unregister`
+through the registry's `subscribe`. A history change (`popstate`, `hashchange`, `pageshow`), a
+replaced root, or the page removing the host re-attaches the badge (observing `documentElement`
+and the document, at most about 20 times a second). `always` is skipped in frames (`on_demand`
+still applies there). The UI is in a closed Shadow DOM under `all: initial`, with no `innerHTML`,
+no inline handlers and no network.
+
+**The command registry is not reachable from page code.** It used to be published as a frozen object
+under `Symbol.for("adblock.userscript.menu")`, so a page could list captions and invoke commands.
+It is now a closure variable of the runtime script and is handed only to the menu button. Scripts
+register through their own `GM_registerMenuCommand`. Consequently the in-page panel no longer lists
+menu commands: use the badge (`menu_button` other than `off`).
+
+**Clickjacking.** The page can style its own DOM, including our host element, so: the host carries
+inline `!important` styles (fixed position, opacity 1, no transform/filter/clip-path, pointer events,
+visibility), re-asserted before each click; the badge and the open menu are rendered in the top layer
+(`popover="manual"`, falling back to a high z-index); before acting, the click handler checks the
+host's and the root's computed style (opacity, transform, filter, visibility, display, clip-path,
+pointer-events) and the badge's size and anchor, and ignores the click if anything is off; menu items
+ignore clicks in the first 400 ms after the menu opens (a page cannot swap the menu under a click);
+and only trusted clicks count. A page can still cover the badge with its own later top-layer element
+(a dialog); a click then lands on the page's element, not on ours.
 
 ### Authority: why the panel cannot change anything
 
@@ -330,8 +342,8 @@ address) is the alternative.
 
 **Residual risks, honestly.** (a) A hostile page can read everything the panel reads: the preset
 name, which sources were blocked (it can see its own failed loads anyway), blocked counts, the
-userscripts that match the page and their menu captions (these last three it could not otherwise
-learn), and it can invoke menu commands. (b) It can open the confirmation page with a proposal of its
+userscripts that match the page (these last two it could not otherwise learn). Menu commands are
+not readable or invokable by the page: the registry is private to the runtime. (b) It can open the confirmation page with a proposal of its
 choosing (a popup or navigation); a user who then reads nothing and types the PIN applies it. The page
 shows the change in plain words and says to continue only when the user started it. (c) A page can
 spam proposals; they do nothing until confirmed. (d) With `auth = none`, a user clicking through a

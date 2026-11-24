@@ -136,8 +136,8 @@ pub struct PageSpec<'a> {
     /// The in-page panel's hotkey (`[alt, ctrl, shift, meta, code]`), when the panel is on: the
     /// boot script then registers a key listener that loads the panel on first use.
     pub panel: Option<&'a serde_json::Value>,
-    /// On-demand menu button for userscript menu commands: `"on_demand"` or `"always"`. Emitted
-    /// only together with `userscripts`, after their bundles.
+    /// On-demand menu button for userscript menu commands: `"on_demand"` or `"always"`. Passed to
+    /// the runtime script as `data-m`; only meaningful together with `userscripts`.
     pub menu: Option<&'a str>,
 }
 
@@ -247,9 +247,14 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
         }
         if !spec.userscripts.is_empty() {
             // The runtime once, before any bundle (bundles carry no runtime of their own).
+            let m = match spec.menu {
+                Some("always") => " data-m=\"always\"",
+                Some(_) => " data-m=\"on_demand\"",
+                None => "",
+            };
             let _ = write!(
                 head.html,
-                "<script src=\"{}\" nonce=\"{nonce}\"></script>",
+                "<script src=\"{}\" nonce=\"{nonce}\"{m}></script>",
                 crate::internal::gm_runtime_path()
             );
             head.has_script = true;
@@ -260,18 +265,6 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                 "<script src=\"{src}\" nonce=\"{nonce}\"></script>"
             );
             head.has_script = true;
-        }
-        if let (Some(mode), false) = (spec.menu, spec.userscripts.is_empty()) {
-            let m = if mode == "always" {
-                "always"
-            } else {
-                "on_demand"
-            };
-            let _ = write!(
-                head.html,
-                "<script src=\"{}\" nonce=\"{nonce}\" data-m=\"{m}\"></script>",
-                crate::internal::menu_path()
-            );
         }
     }
     head
@@ -290,20 +283,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn menu_button_script_follows_the_userscripts() {
+    fn menu_mode_rides_on_the_runtime_tag() {
         let (cos, internal) = (Cosmetics::default(), Internal::default());
         let srcs = vec!["/__adblock__/gm/u1.js".to_string()];
         let mut s = spec(&cos, &internal);
         s.userscripts = &srcs;
-        assert!(!build_head(&s).html.contains("menu."));
+        assert!(!build_head(&s).html.contains("data-m"));
         s.menu = Some("always");
         let h = build_head(&s).html;
-        let i = h.find("menu.").expect("menu script");
-        assert!(h.find("u1.js").unwrap() < i, "after the bundles");
-        assert!(h.contains("nonce=\"NONCE\" data-m=\"always\""));
+        assert!(h.contains("nonce=\"NONCE\" data-m=\"always\""), "{h}");
+        assert!(!h.contains("menu."), "no separate menu script");
         s.userscripts = &[];
         assert!(
-            !build_head(&s).html.contains("menu."),
+            !build_head(&s).html.contains("data-m"),
             "never without userscripts"
         );
     }

@@ -293,10 +293,9 @@ look-around; the engine uses the linear-time `regex` crate and has no look-aroun
 the script would run where its author excluded it. The plan then has a high warning: "N exclude
 rules couldn't be compiled; this script will also run on pages its author excluded: <patterns>".
 
-Menu commands are exposed to an in-page panel and to the on-demand menu button through `window[Symbol.for("adblock.userscript.menu")]`:
-a frozen, non-enumerable object `{commands(): [{script, scriptName, id, caption, accessKey}],
-invoke(scriptId, id): boolean, subscribe(callback)}`. It is created once per document by the shared
-runtime script and holds the commands of every script; callbacks are never exposed, only invoked.
-The in-page panel and the menu button (`docs/SCRIPT-POLICY.md`) list and fire them. Like everything in the page's
-JavaScript world it is reachable by the page: a hostile page can list the commands (script names
-and captions) and invoke them, which runs code the script already chose to run on a user action.
+Menu commands live in a registry that is a closure variable of the shared runtime script. It is
+not published on `window` (earlier builds exposed `Symbol.for("adblock.userscript.menu")`): page
+code can neither list nor invoke commands. The registry is handed once to the menu button, which is
+inlined in the same script (`docs/SCRIPT-POLICY.md`); scripts register through `GM_registerMenuCommand`.
+`data-m` (`on_demand` | `always`) on the runtime's `<script>` tag selects the button mode; without it
+no button is shown.

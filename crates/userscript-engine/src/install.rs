@@ -132,6 +132,15 @@ pub fn plan_install(source: &str, origin_url: Option<&Url>) -> Result<InstallPla
     let (_, errs) = Rules::compile(&metadata, Options::default());
     warnings.extend(errs);
     let mut high_warnings = Vec::new();
+    for c in metadata
+        .connect
+        .iter()
+        .filter(|c| c.ends_with(".*") && c.len() > 2)
+    {
+        warnings.push(format!(
+            "@connect {c} is broad: it allows this script to contact that name under every top-level domain"
+        ));
+    }
     let dropped = Rules::dropped_excludes(&metadata);
     if !dropped.is_empty() {
         let msg = format!(
@@ -768,6 +777,16 @@ mod tests {
         )
         .unwrap();
         assert!(ok.high_warnings.is_empty());
+    }
+
+    #[test]
+    fn tld_wildcard_connect_is_flagged_broad() {
+        let p = plan_install(&src("1", "// @connect Google.*\n// @connect a.com"), None).unwrap();
+        assert_eq!(
+            p.warnings.iter().filter(|w| w.contains("is broad")).count(),
+            1
+        );
+        assert!(p.warnings.iter().any(|w| w.contains("google.*")));
     }
 
     #[test]

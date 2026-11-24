@@ -65,21 +65,6 @@ pub fn panel_path() -> &'static str {
     &PANEL
 }
 
-const MENU_JS: &str = include_str!("../assets/menu.js");
-
-static MENU: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{}menu.{}.js",
-        crate::csp::INTERNAL_PREFIX,
-        short_hash(MENU_JS.as_bytes())
-    )
-});
-
-/// Path of the content-hashed on-demand menu button script.
-pub fn menu_path() -> &'static str {
-    &MENU
-}
-
 static GM_RUNTIME: LazyLock<(String, String)> = LazyLock::new(|| {
     let js = userscript_engine::bundle::runtime_script();
     let path = format!(
@@ -468,8 +453,6 @@ impl Internal {
             Some((Bytes::from_static(BOOT_JS.as_bytes()), "immutable"))
         } else if path == panel_path() {
             Some((Bytes::from_static(PANEL_JS.as_bytes()), "immutable"))
-        } else if path == menu_path() {
-            Some((Bytes::from_static(MENU_JS.as_bytes()), "immutable"))
         } else if path == gm_runtime_path() {
             Some((Bytes::from(GM_RUNTIME.0.clone()), "immutable"))
         } else if let Some(h) = rest.strip_prefix("s/").and_then(|r| r.strip_suffix(".js")) {
