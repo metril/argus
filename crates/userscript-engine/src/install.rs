@@ -62,6 +62,9 @@ pub struct InstallPlan {
     pub requires: Vec<FetchSpec>,
     pub resources: Vec<ResourceFetch>,
     pub warnings: Vec<String>,
+    /// Warnings that deserve emphasis (also present in `warnings`): currently dropped
+    /// `@exclude` rules, which make the script run where its author meant to exclude it.
+    pub high_warnings: Vec<String>,
     pub grants_summary: GrantsSummary,
 }
 
@@ -128,6 +131,18 @@ pub fn plan_install(source: &str, origin_url: Option<&Url>) -> Result<InstallPla
         .collect();
     let (_, errs) = Rules::compile(&metadata, Options::default());
     warnings.extend(errs);
+    let mut high_warnings = Vec::new();
+    let dropped = Rules::dropped_excludes(&metadata);
+    if !dropped.is_empty() {
+        let msg = format!(
+            "{} exclude rule{} couldn't be compiled; this script will also run on pages its author excluded: {}",
+            dropped.len(),
+            if dropped.len() == 1 { "" } else { "s" },
+            dropped.join(", ")
+        );
+        warnings.push(msg.clone());
+        high_warnings.push(msg);
+    }
     if metadata.requires.len() > MAX_REQUIRES {
         return Err(Error::InvalidScript(format!(
             "too many @require ({} > {MAX_REQUIRES})",
@@ -183,6 +198,7 @@ pub fn plan_install(source: &str, origin_url: Option<&Url>) -> Result<InstallPla
         requires,
         resources,
         warnings,
+        high_warnings,
     })
 }
 
@@ -720,6 +736,38 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn dropped_excludes_are_a_high_warning() {
+        let p = plan_install(
+            &src(
+                "1",
+                "// @match https://a.com/*\n// @exclude /^https:\\/\\/a\\.com\\/(?!ok)/\n// @exclude https://a.com/x*\n// @exclude-match not-a-pattern",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.high_warnings.len(), 1);
+        let w = &p.high_warnings[0];
+        assert!(
+            w.starts_with("2 exclude rules couldn't be compiled; this script will also run on pages its author excluded: "),
+            "{w}"
+        );
+        assert!(
+            w.contains("(?!ok)") && w.contains("not-a-pattern") && !w.contains("/x*"),
+            "{w}"
+        );
+        assert!(p.warnings.contains(w));
+        let ok = plan_install(
+            &src(
+                "1",
+                "// @match https://a.com/*\n// @exclude https://a.com/x*",
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(ok.high_warnings.is_empty());
     }
 
     #[test]

@@ -269,6 +269,28 @@ choice for temporary allows, "allow all temporarily", "revoke temporary permissi
 blocked requests, per-site ad blocking, the userscripts matching the page (with their menu commands)
 and a "reload to apply" prompt when the settings change.
 
+### Menu button for userscript commands
+
+`GM_registerMenuCommand` entries are reachable without the panel through a small corner badge. The
+per-profile setting `menu_button` (`PUT /policy/panel`; dashboard: Policy, "Userscript menu button")
+has three values: `off`, `on_demand` (default: the badge exists only while at least one script on
+the page has a registered command) and `always` (on every page where a userscript runs, with "No
+commands registered." when empty). It does not depend on `panel.enabled` or on
+`script_control.panel_enabled`, and it is never emitted on a page without userscripts, in a
+`sandbox`ed document without `allow-scripts`, or when script injection is off.
+
+It is one extra tag, `/__adblock__/menu.<hash>.js` (immutable, about 4 KB), emitted after the
+userscript bundles with the per-response nonce, so it runs at document start with every command
+already visible and follows later `register`/`unregister` through the registry's `subscribe`. A
+history change (`popstate`, `hashchange`, `pageshow`) or a replaced root re-attaches the badge, so it
+survives SPA navigation. The UI is in a closed Shadow DOM under `all: initial`, no `innerHTML`, no
+inline handlers, no network. It adds no authority: it reads the same frozen registry the panel and
+the page already reach (`commands`, `invoke`, `subscribe`; callbacks are never exposed), and ignores
+untrusted (`isTrusted: false`) clicks so a page cannot drive it with synthetic events. A hostile
+page can still call `invoke` directly, as before; the badge makes no difference to that. The badge
+itself is visible to the page only as a host element (the shadow root is closed, but the page can
+hook `attachShadow`), and its presence reveals that a script registered a command.
+
 ### Authority: why the panel cannot change anything
 
 The panel runs in the page's JavaScript world. A hostile page can synthesise keys (untrusted events

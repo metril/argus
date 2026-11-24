@@ -416,6 +416,7 @@ fn plan_response(state: &AppState, plan_id: String, sp: &StoredPlan) -> Userscri
         notifications: g.notifications,
         unsupported: g.unsupported.clone(),
         warnings: p.warnings.clone(),
+        high_warnings: p.high_warnings.clone(),
         requires: p
             .requires
             .iter()

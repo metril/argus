@@ -136,6 +136,9 @@ pub struct PageSpec<'a> {
     /// The in-page panel's hotkey (`[alt, ctrl, shift, meta, code]`), when the panel is on: the
     /// boot script then registers a key listener that loads the panel on first use.
     pub panel: Option<&'a serde_json::Value>,
+    /// On-demand menu button for userscript menu commands: `"on_demand"` or `"always"`. Emitted
+    /// only together with `userscripts`, after their bundles.
+    pub menu: Option<&'a str>,
 }
 
 /// The markup for one page, plus what it needs from the page's CSP.
@@ -258,6 +261,18 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
+        if let (Some(mode), false) = (spec.menu, spec.userscripts.is_empty()) {
+            let m = if mode == "always" {
+                "always"
+            } else {
+                "on_demand"
+            };
+            let _ = write!(
+                head.html,
+                "<script src=\"{}\" nonce=\"{nonce}\" data-m=\"{m}\"></script>",
+                crate::internal::menu_path()
+            );
+        }
     }
     head
 }
@@ -273,6 +288,25 @@ fn wrap_scriptlets(js: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_button_script_follows_the_userscripts() {
+        let (cos, internal) = (Cosmetics::default(), Internal::default());
+        let srcs = vec!["/__adblock__/gm/u1.js".to_string()];
+        let mut s = spec(&cos, &internal);
+        s.userscripts = &srcs;
+        assert!(!build_head(&s).html.contains("menu."));
+        s.menu = Some("always");
+        let h = build_head(&s).html;
+        let i = h.find("menu.").expect("menu script");
+        assert!(h.find("u1.js").unwrap() < i, "after the bundles");
+        assert!(h.contains("nonce=\"NONCE\" data-m=\"always\""));
+        s.userscripts = &[];
+        assert!(
+            !build_head(&s).html.contains("menu."),
+            "never without userscripts"
+        );
+    }
 
     #[test]
     fn scriptlets_get_a_private_scope_with_scriptlet_globals() {
@@ -294,6 +328,7 @@ mod tests {
             ext_script: "",
             userscripts: &[],
             panel: None,
+            menu: None,
         }
     }
 

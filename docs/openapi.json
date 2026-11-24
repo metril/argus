@@ -3846,6 +3846,10 @@
             "description": "Hotkey, for example `Alt+Shift+A`.",
             "type": "string"
           },
+          "menu_button": {
+            "description": "Corner button for userscript menu commands: `off`, `on_demand` (default; only when a script\nregistered a command) or `always`. Independent of `enabled`.",
+            "type": "string"
+          },
           "pin_set": {
             "description": "Whether a PIN is set (the PIN itself is never returned).",
             "type": "boolean"
@@ -3883,6 +3887,13 @@
             ]
           },
           "hotkey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "menu_button": {
+            "description": "`off`, `on_demand` or `always`.",
             "type": [
               "string",
               "null"
@@ -6457,6 +6468,13 @@
             "type": "integer"
           },
           "grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "high_warnings": {
+            "description": "Subset of `warnings` to show prominently (dropped `@exclude` rules: the script runs where\nits author excluded it).",
             "items": {
               "type": "string"
             },

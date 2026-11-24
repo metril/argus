@@ -1062,6 +1062,7 @@ pub async fn reports(
 fn panel_out(p: &script_policy::panel::PanelSettings) -> api_types::PanelSettingsDto {
     api_types::PanelSettingsDto {
         enabled: p.enabled,
+        menu_button: p.menu_button.as_str().into(),
         hotkey: p.hotkey.clone(),
         auth: match p.auth {
             script_policy::panel::PanelAuth::Session => "session",
@@ -1126,6 +1127,11 @@ pub async fn put_panel(
         let mut p = st.panel_settings(&profile.name).map_err(store_err)?;
         if let Some(e) = req.enabled {
             p.enabled = e;
+        }
+        if let Some(m) = &req.menu_button {
+            p.menu_button = script_policy::panel::MenuButton::parse(m).ok_or_else(|| {
+                ApiError::ValidationError("menu_button must be off, on_demand or always".into())
+            })?;
         }
         if let Some(h) = &req.hotkey {
             if !valid_hotkey(h) {

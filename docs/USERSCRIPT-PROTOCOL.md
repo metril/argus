@@ -272,15 +272,31 @@ load/error/abort/timeout/progress), `GM_download`, `GM_openInTab`, `GM_setClipbo
 `GM_notification` (Notification API; console fallback), `GM_registerMenuCommand/
 unregisterMenuCommand`, `GM_log`, `GM_getTab/saveTab/getTabs`, `GM_cookie.list/set/delete`,
 `GM_info`, `unsafeWindow`, `window.onurlchange`, both `GM_*` and `GM.*` forms.
-Partial: `upload.onprogress` (emulated), `GM_openInTab` options, `GM_notification` (no
+`GM_openInTab(url, {active:false})` / `loadInBackground` is best effort: a page cannot open a
+background tab, so the runtime opens the tab and then refocuses the current window, which browsers
+may ignore. The returned handle has `close()` and an `onclose` that is driven by polling the
+window's `closed` flag (500 ms, started when a handler is assigned; also fired by `close()`). A
+blocked popup yields a handle with `closed: true`. `GM_info.platform` is `{os, arch, browserName,
+browserVersion}` from `navigator.userAgentData` when present, else the user agent (`os` is one of
+`win`, `mac`, `linux`, `android`, `ios`, `cros`, `openbsd`, `freebsd`, `unknown`).
+`@connect` accepts `google.*` and `*.google.*`: the stem followed by any ICANN public suffix
+(`google.com`, `www.google.co.uk`); private suffixes such as `github.io` do not count, so
+`google.github.io` is not matched. A stem allows its subdomains like a plain domain.
+Partial: `upload.onprogress` (emulated), `GM_notification` (no
 `highlight`), `@sandbox`/`@inject-into` (always the page world; reported as unsupported).
 Unsupported (reported at install): `@run-at context-menu`, `@webRequest`/`GM_webRequest`
 (rejects/throws `unsupported`), `@run-in`.
 
-Menu commands are exposed to an in-page panel through `window[Symbol.for("adblock.userscript.menu")]`:
+Install plans (`POST /userscripts/plan`) carry `warnings` and `high_warnings` (a subset to show
+prominently). `@exclude`/`@exclude-match` rules the engine cannot compile (for example regexes with
+look-around; the engine uses the linear-time `regex` crate and has no look-around) are skipped, so
+the script would run where its author excluded it. The plan then has a high warning: "N exclude
+rules couldn't be compiled; this script will also run on pages its author excluded: <patterns>".
+
+Menu commands are exposed to an in-page panel and to the on-demand menu button through `window[Symbol.for("adblock.userscript.menu")]`:
 a frozen, non-enumerable object `{commands(): [{script, scriptName, id, caption, accessKey}],
 invoke(scriptId, id): boolean, subscribe(callback)}`. It is created once per document by the shared
 runtime script and holds the commands of every script; callbacks are never exposed, only invoked.
-The in-page panel (`docs/SCRIPT-POLICY.md`) lists and fires them. Like everything in the page's
+The in-page panel and the menu button (`docs/SCRIPT-POLICY.md`) list and fire them. Like everything in the page's
 JavaScript world it is reachable by the page: a hostile page can list the commands (script names
 and captions) and invoke them, which runs code the script already chose to run on a user action.

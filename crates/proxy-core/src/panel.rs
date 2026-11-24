@@ -317,6 +317,18 @@ impl PanelHost {
         self.cfg.read().host == host
     }
 
+    /// How the on-demand userscript menu button is offered on this profile's pages. It does not
+    /// depend on the panel switches: it only lists commands the page's own scripts registered.
+    pub fn menu_mode(&self, rctx: &RequestCtx) -> Option<&'static str> {
+        use script_policy::panel::MenuButton;
+        let profile = rctx.profile.load();
+        match profile.script_control.as_ref()?.panel().menu_button {
+            MenuButton::Off => None,
+            MenuButton::OnDemand => Some("on_demand"),
+            MenuButton::Always => Some("always"),
+        }
+    }
+
     /// `[alt, ctrl, shift, meta, code]` for the boot script, when the panel is on for this
     /// profile and deployment.
     pub fn hotkey(&self, rctx: &RequestCtx) -> Option<Value> {

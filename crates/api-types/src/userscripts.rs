@@ -60,6 +60,10 @@ pub struct UserscriptPlanResponse {
     pub notifications: bool,
     pub unsupported: Vec<String>,
     pub warnings: Vec<String>,
+    /// Subset of `warnings` to show prominently (dropped `@exclude` rules: the script runs where
+    /// its author excluded it).
+    #[serde(default)]
+    pub high_warnings: Vec<String>,
     pub requires: Vec<PlanRequireDto>,
     pub resources: Vec<PlanResourceDto>,
     pub already_installed: bool,

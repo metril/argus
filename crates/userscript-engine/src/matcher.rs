@@ -547,6 +547,24 @@ impl Rules {
         )
     }
 
+    /// `@exclude` / `@exclude-match` patterns that cannot be compiled (for example regexes with
+    /// look-around). Such a rule is skipped, so the script also runs where the author excluded it.
+    pub fn dropped_excludes(meta: &UserscriptMetadata) -> Vec<String> {
+        let mut v: Vec<String> = meta
+            .excludes
+            .iter()
+            .filter(|m| IncludeRule::parse(m).is_err())
+            .cloned()
+            .collect();
+        v.extend(
+            meta.exclude_matches
+                .iter()
+                .filter(|m| MatchPattern::parse(m).is_err())
+                .cloned(),
+        );
+        v
+    }
+
     /// Host buckets of the include side; a single `Any` when rule-less and match-all.
     pub fn host_keys(&self) -> Vec<HostKey> {
         if self.declared_none {

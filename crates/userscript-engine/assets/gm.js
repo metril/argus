@@ -196,10 +196,42 @@ function (cfg, entries, W) {
     }
 
     // GM_info
+    function platformInfo() {
+      var n = W.navigator || {}, ua = Str(n.userAgent || ""), ud = n.userAgentData, os = "unknown", arch = "", bn = "unknown", bv = "", m;
+      var p = (ud && ud.platform ? Str(ud.platform) : Str(n.platform || "")).toLowerCase(), u = ua.toLowerCase();
+      if (/android/.test(p) || /android/.test(u)) { os = "android"; }
+      else if (/iphone|ipad|ipod|ios/.test(p) || /iphone|ipad|ipod/.test(u)) { os = "ios"; }
+      else if (/cros|chrome os/.test(p) || /cros/.test(u)) { os = "cros"; }
+      else if (/win/.test(p) || /windows/.test(u)) { os = "win"; }
+      else if (/mac/.test(p) || /macintosh|mac os x/.test(u)) { os = "mac"; }
+      else if (/openbsd/.test(p + u)) { os = "openbsd"; }
+      else if (/freebsd/.test(p + u)) { os = "freebsd"; }
+      else if (/linux|x11/.test(p) || /linux|x11/.test(u)) { os = "linux"; }
+      if (/aarch64|arm64|armv8/.test(u) || (/mac/.test(p) && /arm/.test(p))) { arch = "arm64"; }
+      else if (/\barm/.test(u)) { arch = "arm"; }
+      else if (/x86_64|x64|win64|amd64|wow64/.test(u)) { arch = "x86-64"; }
+      else if (/i[3-6]86|x86/.test(u)) { arch = "x86-32"; }
+      var brands = ud && ud.brands;
+      if (brands && brands.length) {
+        for (var i = 0; i < brands.length; i++) {
+          var b = Str(brands[i].brand);
+          if (!/not.?a.?brand/i.test(b) && (bn === "unknown" || /chromium/i.test(bn))) { bn = b; bv = Str(brands[i].version || ""); }
+        }
+        if (/^chromium$/i.test(bn)) { bn = "Chrome"; }
+      }
+      if (bn === "unknown") {
+        if ((m = /(?:edg|edge|edga|edgios)\/([\d.]+)/i.exec(ua))) { bn = "Edge"; bv = m[1]; }
+        else if ((m = /opr\/([\d.]+)/i.exec(ua))) { bn = "Opera"; bv = m[1]; }
+        else if ((m = /(?:firefox|fxios)\/([\d.]+)/i.exec(ua))) { bn = "Firefox"; bv = m[1]; }
+        else if ((m = /(?:chrome|crios)\/([\d.]+)/i.exec(ua))) { bn = "Chrome"; bv = m[1]; }
+        else if ((m = /version\/([\d.]+).*safari/i.exec(ua))) { bn = "Safari"; bv = m[1]; }
+      }
+      return { os: os, arch: arch, browserName: bn, browserVersion: bv };
+    }
     var info = {
       script: clone(d.meta), scriptMetaStr: d.metaStr, scriptHandler: cfg.handler, version: cfg.handlerVersion,
       scriptWillUpdate: false, scriptUpdateURL: d.meta.updateURL || null, isIncognito: false, injectInto: "page",
-      sandboxMode: "raw", platform: { os: "unknown", browserName: "unknown", browserVersion: "" },
+      sandboxMode: "raw", platform: platformInfo(),
       downloadMode: "browser", isFirstPartyIsolation: false, userAgent: W.navigator ? W.navigator.userAgent : ""
     };
     info.script.uuid = d.id; info.uuid = d.id;
@@ -691,11 +723,30 @@ function (cfg, entries, W) {
     });
 
     // ---- browser-side utilities
+    // Best effort: a page cannot open a background tab. Open, then refocus this window (browsers
+    // may ignore that); `onclose` polls `closed`, started when a handler is assigned.
     function openInTab(url, opts) {
-      var bg = typeof opts === "boolean" ? opts : (opts && opts.active === false);
-      var w = W.open(absUrl(url), "_blank");
+      var bg = typeof opts === "boolean" ? opts : !!(opts && (opts.active === false || opts.loadInBackground === true));
+      var w = W.open(absUrl(url), "_blank"), cb = null, timer = null;
       if (bg && W.focus) { try { W.focus(); } catch (e) { /* ignore */ } }
-      var tab = { closed: !w, close: function () { if (w) { w.close(); } tab.closed = true; }, onclose: null };
+      var tab = { closed: !w, close: function () {
+        if (w) { try { w.close(); } catch (e) { /* ignore */ } }
+        fire();
+      } };
+      function stop() { if (timer !== null) { clearI(timer); timer = null; } }
+      function fire() {
+        if (tab.closed && !w) { return; }
+        tab.closed = true; stop();
+        if (isFn(cb)) { var f = cb; cb = null; safeCall(label, f, tab, []); }
+      }
+      function poll() {
+        var c = true;
+        try { c = !w || w.closed; } catch (e) { /* ignore */ }
+        if (c) { fire(); }
+      }
+      ObjDefine(tab, "onclose", { enumerable: true, configurable: false,
+        get: function () { return cb; },
+        set: function (f) { cb = f; if (isFn(f) && w && !tab.closed && timer === null) { timer = setI(poll, 500); } } });
       return tab;
     }
     expose("gm_openintab", "GM_openInTab", "openInTab", openInTab, function (u, o) { return resolved(openInTab(u, o)); });
