@@ -106,6 +106,25 @@ async fn main() -> Result<()> {
     );
     argus.start();
 
+    // Signed catalogues of filter lists and userscripts (same release, same key).
+    let catalogue_cfg = list_service::ArgusConfig::from_config(
+        &config.bypass,
+        bypass_engine.data_dir().map(|d| d.join("argus-lists")),
+    );
+    let filter_catalogue = list_service::SignedDoc::<list_service::FilterCatalogueEntry>::new(
+        "filters",
+        Some(list_service.clone()),
+        catalogue_cfg.clone(),
+    );
+    filter_catalogue.start();
+    let userscript_catalogue =
+        list_service::SignedDoc::<list_service::UserscriptCatalogueEntry>::new(
+            "userscripts",
+            Some(list_service.clone()),
+            catalogue_cfg,
+        );
+    userscript_catalogue.start();
+
     // Trusted roots: the compiled-in set until a signed one (same release, same key) has been
     // verified; then swapped in live.
     if let Some(roots) = ctx.roots() {
@@ -233,6 +252,7 @@ async fn main() -> Result<()> {
                 control,
                 bypass_for_api,
                 argus.clone(),
+                (filter_catalogue.clone(), userscript_catalogue.clone()),
             )
             .await?,
         )
@@ -278,6 +298,10 @@ async fn start_webui_server(
     control: Arc<proxy_core::server::ProxyControl>,
     bypass: Arc<common::bypass::BypassEngine>,
     argus: Arc<list_service::ArgusLists>,
+    catalogues: (
+        Arc<list_service::SignedDoc<list_service::FilterCatalogueEntry>>,
+        Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>>,
+    ),
 ) -> Result<tokio::task::JoinHandle<()>> {
     use web_api::{start_server, ApiConfig};
 
@@ -351,6 +375,11 @@ async fn start_webui_server(
         .set(Arc::new(proxy_core::webui::ProxyRuntime(control)));
     let _ = state.bypass.set(bypass);
     let _ = state.argus.set(argus);
+    let _ = state.filter_catalogue.set(catalogues.0);
+    let _ = state.userscript_catalogue.set(catalogues.1);
+    // The lists location and key follow the live config (editable in the UI), not the one read at
+    // startup.
+    state.follow_live_catalogue_config();
 
     info!(
         "Web UI API server starting on {}:{}",

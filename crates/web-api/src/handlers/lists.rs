@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use api_types::{
-    AddFilterListRequest, BuildState, BuildSummary, CatalogueEntryResponse, EngineStatusResponse,
-    ExtRuleResponse, FilterListCounts, FilterListResponse, FilterListsPage, ListMetaDto,
-    ListReport, ListStatusResponse, MessageResponse, Page, ReportIssueDto, ScheduleResponse,
-    UpdateFilterListRequest, UpdateProxyConfigRequest, UpdateScheduleRequest,
+    AddFilterListRequest, BuildState, BuildSummary, CatalogueEntryResponse, CatalogueResponse,
+    EngineStatusResponse, ExtRuleResponse, FilterListCounts, FilterListResponse, FilterListsPage,
+    ListMetaDto, ListReport, ListStatusResponse, MessageResponse, Page, ReportIssueDto,
+    ScheduleResponse, UpdateFilterListRequest, UpdateProxyConfigRequest, UpdateScheduleRequest,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Deserialize;
@@ -647,35 +647,75 @@ fn ext_stats_dto(s: &ext_rules::ExtStats) -> api_types::ExtStatsDto {
     }
 }
 
-/// The default-disabled catalogue of well-known lists (hosts, domain and IP lists).
+/// The catalogue of well-known lists: the signed argus-lists one when verified, else the
+/// built-in hosts/domain/IP lists.
 #[utoipa::path(
     get, path = "/lists/catalogue", tag = "lists",
     security(("bearer_auth" = ["lists:read"])),
-    responses((status = 200, description = "Catalogue", body = Vec<CatalogueEntryResponse>))
+    responses((status = 200, description = "Catalogue", body = CatalogueResponse))
 )]
 pub async fn get_catalogue(
     State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<Vec<CatalogueEntryResponse>>> {
+) -> ApiResult<Json<CatalogueResponse>> {
     let have: std::collections::HashSet<String> = state
         .filter_store
         .get_all()?
         .into_iter()
         .map(|l| l.id)
         .collect();
-    Ok(Json(
-        filter_engine::catalogue()
-            .into_iter()
+    if let Some(doc) = state.filter_catalogue().get() {
+        let entries = doc
+            .entries
+            .iter()
+            // An entry whose format we cannot add is not offered.
+            .filter(|e| e.list_format().is_some())
             .map(|e| CatalogueEntryResponse {
-                added: have.contains(e.id),
-                id: e.id.into(),
-                name: e.name.into(),
-                url: e.url.into(),
-                format: e.format.as_str().into(),
-                category: e.category.into(),
-                licence: e.licence.into(),
+                added: have.contains(&e.id),
+                id: e.id.clone(),
+                name: e.name.clone(),
+                url: e.url.clone(),
+                format: e.format.clone(),
+                category: e.category.clone(),
+                licence: e.licence.clone(),
+                description: e.description.clone(),
+                homepage: e.homepage.clone(),
+                region: e.region.clone(),
+                noncommercial: e.noncommercial,
+                licence_note: e.licence_note.clone(),
+                source: "signed".into(),
             })
-            .collect(),
-    ))
+            .collect();
+        return Ok(Json(CatalogueResponse {
+            source: "signed".into(),
+            fetched_at: Some(doc.fetched_at.clone()),
+            version: Some(doc.version.clone()),
+            entries,
+        }));
+    }
+    let entries = filter_engine::catalogue()
+        .into_iter()
+        .map(|e| CatalogueEntryResponse {
+            added: have.contains(e.id),
+            id: e.id.into(),
+            name: e.name.into(),
+            url: e.url.into(),
+            format: e.format.as_str().into(),
+            category: e.category.into(),
+            licence: e.licence.into(),
+            description: String::new(),
+            homepage: String::new(),
+            region: None,
+            noncommercial: e.noncommercial,
+            licence_note: None,
+            source: "builtin".into(),
+        })
+        .collect();
+    Ok(Json(CatalogueResponse {
+        source: "builtin".into(),
+        fetched_at: None,
+        version: None,
+        entries,
+    }))
 }
 
 /// Add a catalogue entry as an enabled list and rebuild the engine.
@@ -690,15 +730,30 @@ pub async fn add_from_catalogue(
     Extension(p): Extension<Principal>,
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<(StatusCode, Json<FilterListResponse>)> {
-    let entry = filter_engine::catalogue()
-        .into_iter()
-        .find(|e| e.id == id)
-        .ok_or_else(|| ApiError::NotFound(format!("Catalogue entry '{id}' not found")))?;
+    let not_found = || ApiError::NotFound(format!("Catalogue entry '{id}' not found"));
+    let mut list = if let Some(doc) = state.filter_catalogue().get() {
+        let e = doc
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or_else(not_found)?;
+        let format = e.list_format().ok_or_else(|| {
+            ApiError::ValidationError(format!("Unsupported list format '{}'", e.format))
+        })?;
+        let mut l = filter_engine::FilterList::new(e.id.clone(), e.name.clone(), e.url.clone());
+        l.format = format;
+        l
+    } else {
+        filter_engine::catalogue()
+            .into_iter()
+            .find(|e| e.id == id)
+            .ok_or_else(not_found)?
+            .to_filter_list()
+    };
     if state.filter_store.exists(&id)? {
         return Err(ApiError::AlreadyExists(format!("Filter list '{id}'")));
     }
-    validate_filter_url(&state, entry.url).await?;
-    let mut list = entry.to_filter_list();
+    validate_filter_url(&state, &list.url).await?;
     list.enabled = true;
     let (st, l) = (state.clone(), list.clone());
     blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;

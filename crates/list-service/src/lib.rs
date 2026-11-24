@@ -11,14 +11,20 @@ mod report;
 mod scriptlets;
 mod service;
 mod sets;
+mod signed;
 pub mod site_exceptions;
 mod store;
 
-pub use argus::{verify as verify_minisign, ArgusConfig, ArgusLists, RefreshOutcome};
+pub use argus::{
+    verify as verify_minisign, verify_trusted, ArgusConfig, ArgusLists, RefreshOutcome,
+};
 pub use error::{Error, Result};
 pub use report::{BuildState, BuildSummary};
 pub use service::{ListService, ListServiceConfig};
 pub use sets::SetKey;
+#[cfg(any(test, feature = "testkit"))]
+pub use signed::testkit;
+pub use signed::{CatalogueDoc, FilterCatalogueEntry, Loaded, SignedDoc, UserscriptCatalogueEntry};
 pub use store::{ListStatus, ListStore};
 
 /// Re-exported so API code needs no direct `filter-engine` dependency for these.

@@ -550,7 +550,9 @@ mod tests {
                     source: Scope::parse("cdn.test").unwrap(),
                     caps: CapSet::of(&[C::Script]),
                 },
-                Some(1),
+                // Expiry is whole-second: 2s leaves a full second before the first check can see it
+                // gone, however the clock ticks.
+                Some(2),
                 false,
                 false,
             )
@@ -561,7 +563,7 @@ mod tests {
         );
         assert!(c.compiled().valid_until().is_some());
         // No further calls: the task alone must notice the expiry.
-        tokio::time::sleep(std::time::Duration::from_millis(2600)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
         assert!(
             c.compiled().valid_until().is_none(),
             "snapshot rebuilt after the grant expired"
@@ -585,7 +587,9 @@ mod tests {
                     source: Scope::parse("cdn.test").unwrap(),
                     caps: CapSet::of(&[C::Script]),
                 },
-                Some(1),
+                // Expiry is whole-second: 2s leaves a full second before the first check can see it
+                // gone, however the clock ticks.
+                Some(2),
                 false,
                 false,
             )
@@ -594,7 +598,7 @@ mod tests {
             c.check_request(&h, "https", "cdn.test", 443).is_none(),
             "granted"
         );
-        std::thread::sleep(std::time::Duration::from_millis(2100));
+        std::thread::sleep(std::time::Duration::from_millis(3100));
         assert!(
             c.check_request(&h, "https", "cdn.test", 443).is_some(),
             "blocked again without waiting for a timer"

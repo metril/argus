@@ -1,0 +1,670 @@
+//! Signed catalogue documents (`filters.json`, `userscripts.json`) from argus-lists: fetched from
+//! the release, verified against the compiled-in minisign key, checked against the signed
+//! `meta.json` digest, cached on the data volume and never replaced by an older release.
+
+use std::cmp::Ordering;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::argus::{sha256_hex, verify_trusted, version_cmp, version_key, ArgusConfig};
+use crate::ListService;
+
+/// Between successful checks (as the first-party lists).
+const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+/// Most entries accepted from one document.
+const MAX_ENTRIES: usize = 5000;
+
+/// The envelope of a catalogue file.
+#[derive(Debug, Deserialize)]
+pub struct CatalogueDoc<E> {
+    pub schema: u32,
+    pub kind: String,
+    pub entries: Vec<E>,
+}
+
+/// One entry of `filters.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilterCatalogueEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub url: String,
+    /// `abp`, `ubo`, `adguard`, `hosts`, `domains` or `ips`.
+    pub format: String,
+    pub category: String,
+    pub licence: String,
+    #[serde(default)]
+    pub licence_note: Option<String>,
+    #[serde(default)]
+    pub homepage: String,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub noncommercial: bool,
+}
+
+impl FilterCatalogueEntry {
+    /// The list format this entry maps to (`None`: not one we can add).
+    pub fn list_format(&self) -> Option<filter_engine::ListFormat> {
+        use filter_engine::ListFormat as F;
+        Some(match self.format.as_str() {
+            "abp" => F::Abp,
+            "ubo" => F::Ubo,
+            "adguard" => F::Adguard,
+            "hosts" => F::Hosts,
+            "domains" => F::Domains,
+            "ips" => F::IpList,
+            _ => return None,
+        })
+    }
+}
+
+/// One entry of `userscripts.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserscriptCatalogueEntry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub install_url: String,
+    #[serde(default)]
+    pub homepage: String,
+    #[serde(default)]
+    pub sites: Vec<String>,
+    pub category: String,
+    pub licence: String,
+    #[serde(default)]
+    pub licence_note: Option<String>,
+    /// `none`, `basic` or `xhr`.
+    #[serde(default)]
+    pub needs_gm: String,
+    #[serde(default)]
+    pub connect: Vec<String>,
+    #[serde(default)]
+    pub requires: Vec<String>,
+}
+
+/// A verified document in force.
+#[derive(Debug)]
+pub struct Loaded<E> {
+    pub entries: Vec<E>,
+    /// Release the document came from (`vYYYY.MM.DD[.N]`).
+    pub version: String,
+    /// When it was verified (RFC 3339).
+    pub fetched_at: String,
+}
+
+#[derive(Deserialize)]
+struct Meta {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    catalogues: Vec<MetaCatalogue>,
+}
+
+#[derive(Deserialize)]
+struct MetaCatalogue {
+    kind: String,
+    sha256: String,
+}
+
+/// One signed catalogue kind: fetch, verify, cache, refresh.
+pub struct SignedDoc<E> {
+    kind: &'static str,
+    svc: Option<Arc<ListService>>,
+    cfg: parking_lot::RwLock<Arc<dyn Fn() -> ArgusConfig + Send + Sync>>,
+    current: parking_lot::RwLock<Option<Arc<Loaded<E>>>>,
+    /// Newest release ever accepted (outlives the cache file).
+    min_version: parking_lot::Mutex<Option<String>>,
+    busy: tokio::sync::Mutex<()>,
+}
+
+impl<E: DeserializeOwned + Send + Sync + 'static> SignedDoc<E> {
+    pub fn new(kind: &'static str, svc: Option<Arc<ListService>>, cfg: ArgusConfig) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            svc,
+            cfg: parking_lot::RwLock::new(Arc::new(move || cfg.clone())),
+            current: Default::default(),
+            min_version: Default::default(),
+            busy: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Read the base URL, key and cache directory from `f` on every use (the live config), so a
+    /// change in the UI applies without a restart.
+    pub fn set_config_source(&self, f: impl Fn() -> ArgusConfig + Send + Sync + 'static) {
+        *self.cfg.write() = Arc::new(f);
+    }
+
+    fn cfg(&self) -> ArgusConfig {
+        let f = self.cfg.read().clone();
+        f()
+    }
+
+    /// The verified document, if one has loaded.
+    pub fn get(&self) -> Option<Arc<Loaded<E>>> {
+        self.current.read().clone()
+    }
+
+    fn file(&self) -> String {
+        format!("{}.json", self.kind)
+    }
+
+    fn url(cfg: &ArgusConfig, file: &str) -> String {
+        format!("{}/{file}", cfg.base_url.trim_end_matches('/'))
+    }
+
+    fn path(&self, name: &str) -> Option<PathBuf> {
+        self.cfg().cache_dir.map(|d| d.join(name))
+    }
+
+    /// Verify the signature, the kind, the release and the digest of a copy; returns its entries
+    /// and release. `meta` is the signed `meta.json` and its signature, when available.
+    fn check(
+        &self,
+        text: &str,
+        sig: &str,
+        meta: Option<(&str, &str)>,
+    ) -> Result<(Vec<E>, String), String> {
+        let file = self.file();
+        let key = self.cfg().public_key;
+        let comment =
+            verify_trusted(&key, text.as_bytes(), sig).map_err(|e| format!("{file}: {e}"))?;
+        let doc: CatalogueDoc<E> =
+            serde_json::from_str(text).map_err(|e| format!("{file}: {e}"))?;
+        if doc.kind != self.kind {
+            return Err(format!(
+                "{file}: kind is {:?}, expected {:?}",
+                doc.kind, self.kind
+            ));
+        }
+        if doc.schema != 1 {
+            return Err(format!("{file}: unsupported schema {}", doc.schema));
+        }
+        if doc.entries.len() > MAX_ENTRIES {
+            return Err(format!("{file}: too many entries"));
+        }
+        // The signed comment names the release and the file ("argus-lists v2026.11.23 filters.json").
+        if comment.split_whitespace().last() != Some(file.as_str()) {
+            return Err(format!("{file}: the signature is for another file"));
+        }
+        let version = comment
+            .split_whitespace()
+            .find(|w| version_key(w).is_some())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{file}: signature names no release"))?;
+        if let Some((mtext, msig)) = meta {
+            verify_trusted(&key, mtext.as_bytes(), msig).map_err(|e| format!("meta.json: {e}"))?;
+            let m: Meta = serde_json::from_str(mtext).map_err(|e| format!("meta.json: {e}"))?;
+            let c = m
+                .catalogues
+                .iter()
+                .find(|c| c.kind == self.kind)
+                .ok_or_else(|| format!("meta.json does not list {file}"))?;
+            if !c.sha256.eq_ignore_ascii_case(&sha256_hex(text.as_bytes())) {
+                return Err(format!("{file} does not match the digest in meta.json"));
+            }
+            if m.version.as_deref() != Some(version.as_str()) {
+                return Err(format!("{file}: release differs from meta.json's"));
+            }
+        }
+        Ok((doc.entries, version))
+    }
+
+    fn floor(&self) -> Option<String> {
+        self.min_version.lock().clone()
+    }
+
+    fn raise_floor(&self, v: &str) {
+        let mut g = self.min_version.lock();
+        if g.as_deref()
+            .is_none_or(|c| version_cmp(v, c) == Some(Ordering::Greater))
+        {
+            *g = Some(v.to_string());
+        }
+    }
+
+    /// Load the last good copy from the cache (verified again).
+    pub fn init_cache(&self) {
+        if let Some(v) = self
+            .path(&format!("{}.version", self.kind))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            let v = v.trim();
+            if version_key(v).is_some() {
+                self.raise_floor(v);
+            }
+        }
+        let (Some(tp), Some(sp)) = (
+            self.path(&self.file()),
+            self.path(&format!("{}.minisig", self.file())),
+        ) else {
+            return;
+        };
+        let (Ok(text), Ok(sig)) = (std::fs::read_to_string(tp), std::fs::read_to_string(sp)) else {
+            return;
+        };
+        match self.check(&text, &sig, None) {
+            Ok((entries, version)) => {
+                if let Some(f) = self.floor() {
+                    if version_cmp(&version, &f) == Some(Ordering::Less) {
+                        tracing::warn!(
+                            "{}: ignoring the cached copy ({version} is older than {f})",
+                            self.kind
+                        );
+                        return;
+                    }
+                }
+                self.raise_floor(&version);
+                *self.current.write() = Some(Arc::new(Loaded {
+                    entries,
+                    version,
+                    fetched_at: chrono::Utc::now().to_rfc3339(),
+                }));
+            }
+            Err(e) => tracing::warn!("{}: ignoring the cached copy: {e}", self.kind),
+        }
+    }
+
+    /// Fetch, verify and install the newest copy. Returns the release in force.
+    pub async fn refresh(&self) -> Result<String, String> {
+        let svc = self.svc.as_ref().ok_or("no fetcher")?;
+        let cfg = self.cfg();
+        let file = self.file();
+        let text = svc.fetch_exclusion_list(&Self::url(&cfg, &file)).await?;
+        let sig = svc
+            .fetch_exclusion_list(&Self::url(&cfg, &format!("{file}.minisig")))
+            .await?;
+        // The signed meta.json is a cross-check; the file's own signature still protects us.
+        let meta = async {
+            let t = svc
+                .fetch_exclusion_list(&Self::url(&cfg, "meta.json"))
+                .await?;
+            let s = svc
+                .fetch_exclusion_list(&Self::url(&cfg, "meta.json.minisig"))
+                .await?;
+            Ok::<_, String>((t, s))
+        }
+        .await
+        .ok();
+        self.apply(text, sig, meta).await
+    }
+
+    /// Verify and install a copy already in hand (also what tests drive).
+    pub async fn apply(
+        &self,
+        text: String,
+        sig: String,
+        meta: Option<(String, String)>,
+    ) -> Result<String, String> {
+        let _g = self.busy.lock().await;
+        let (entries, version) = self.check(
+            &text,
+            &sig,
+            meta.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+        )?;
+        if let Some(f) = self.floor() {
+            if version_cmp(&version, &f) == Some(Ordering::Less) {
+                return Err(format!(
+                    "{}: release {version} is older than {f}, the newest ever accepted",
+                    self.file()
+                ));
+            }
+        }
+        self.raise_floor(&version);
+        *self.current.write() = Some(Arc::new(Loaded {
+            entries,
+            version: version.clone(),
+            fetched_at: chrono::Utc::now().to_rfc3339(),
+        }));
+        if let (Some(vp), Some(tp), Some(sp)) = (
+            self.path(&format!("{}.version", self.kind)),
+            self.path(&self.file()),
+            self.path(&format!("{}.minisig", self.file())),
+        ) {
+            let w = |p: PathBuf, b: &[u8]| common::config::write_atomic(&p, b);
+            // Version first, signature last: a half-written cache fails verification.
+            let r = w(vp, version.as_bytes())
+                .and_then(|_| w(tp, text.as_bytes()))
+                .and_then(|_| w(sp, sig.as_bytes()));
+            if let Err(e) = r {
+                tracing::warn!("{}: could not cache {version}: {e}", self.kind);
+            }
+        }
+        Ok(version)
+    }
+
+    /// Load the cache, then keep the document current (backoff until the first success).
+    pub fn start(self: &Arc<Self>) {
+        self.init_cache();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(10);
+            loop {
+                let wait = match this.refresh().await {
+                    Ok(v) => {
+                        backoff = Duration::from_secs(10);
+                        tracing::info!("{} catalogue: {v}", this.kind);
+                        CHECK_EVERY
+                    }
+                    // A verified copy is in force: retry on the normal schedule, quietly.
+                    Err(e) if this.get().is_some() => {
+                        tracing::debug!("{} catalogue: {e}", this.kind);
+                        CHECK_EVERY
+                    }
+                    Err(e) => {
+                        tracing::warn!("{} catalogue: {e}", this.kind);
+                        let w = backoff;
+                        backoff = (backoff * 2).min(Duration::from_secs(900));
+                        w
+                    }
+                };
+                tokio::time::sleep(wait).await;
+            }
+        });
+    }
+}
+
+/// Test support: a signing key and signed fixtures (no network).
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit {
+    use std::io::Cursor;
+
+    pub struct Signer {
+        pk: minisign::PublicKeyBox,
+        sk: minisign::SecretKey,
+    }
+
+    impl Signer {
+        pub fn new() -> Self {
+            let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+            Self {
+                pk: kp.pk.to_box().unwrap(),
+                sk: kp.sk,
+            }
+        }
+
+        /// The base64 public key line.
+        pub fn public_key(&self) -> String {
+            self.pk.to_string().lines().nth(1).unwrap().to_string()
+        }
+
+        /// A `.minisig` over `data` whose trusted comment names `release` and `file`.
+        pub fn sign(&self, data: &str, release: &str, file: &str) -> String {
+            self.sign_comment(data, &format!("argus-lists {release} {file}"))
+        }
+
+        /// A `.minisig` over `data` with exactly this trusted comment.
+        pub fn sign_comment(&self, data: &str, comment: &str) -> String {
+            let pk = self.pk.clone().into_public_key().unwrap();
+            minisign::sign(
+                Some(&pk),
+                &self.sk,
+                Cursor::new(data.as_bytes()),
+                Some(comment),
+                None,
+            )
+            .unwrap()
+            .to_string()
+        }
+
+        /// Signed `meta.json` (and signature) listing `kind` with the digest of `doc`.
+        pub fn meta(&self, release: &str, kind: &str, doc: &str) -> (String, String) {
+            let sha = super::sha256_hex(doc.as_bytes());
+            let m = format!(
+                r#"{{"version":"{release}","categories":[],"catalogues":[{{"kind":"{kind}","file":"{kind}.json","sha256":"{sha}","entries":1}}]}}"#
+            );
+            let s = self.sign(&m, release, "meta.json");
+            (m, s)
+        }
+    }
+
+    impl Default for Signer {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// A one-entry `filters.json`.
+    pub fn filters_json(format: &str) -> String {
+        format!(
+            r#"{{"schema":1,"kind":"filters","entries":[{{"id":"fx","name":"Fx","description":"d","url":"https://example.test/fx.txt","format":"{format}","category":"ads","licence":"MIT","homepage":"https://example.test","region":"de","noncommercial":true}}]}}"#
+        )
+    }
+
+    /// A one-entry `userscripts.json`.
+    pub fn userscripts_json(install_url: &str) -> String {
+        format!(
+            r#"{{"schema":1,"kind":"userscripts","entries":[{{"id":"us1","name":"Us","description":"d","install_url":"{install_url}","homepage":"https://example.test","sites":["*"],"category":"ads","licence":"MIT","needs_gm":"none","connect":[],"requires":[]}}]}}"#
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testkit::*;
+    use super::*;
+
+    fn doc(
+        signer: &Signer,
+        kind: &'static str,
+        dir: Option<&std::path::Path>,
+    ) -> Arc<SignedDoc<FilterCatalogueEntry>> {
+        SignedDoc::new(
+            kind,
+            None,
+            ArgusConfig {
+                base_url: "http://unused.test".into(),
+                public_key: signer.public_key(),
+                cache_dir: dir.map(|d| d.to_path_buf()),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_signed_document_loads_with_its_release_and_maps_formats() {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = filters_json("ubo");
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        let meta = s.meta("v2026.11.23", "filters", &text);
+        assert_eq!(d.apply(text, sig, Some(meta)).await.unwrap(), "v2026.11.23");
+        let l = d.get().unwrap();
+        assert_eq!(
+            l.entries[0].list_format(),
+            Some(filter_engine::ListFormat::Ubo)
+        );
+        for (f, want) in [
+            ("abp", filter_engine::ListFormat::Abp),
+            ("adguard", filter_engine::ListFormat::Adguard),
+            ("hosts", filter_engine::ListFormat::Hosts),
+            ("domains", filter_engine::ListFormat::Domains),
+            ("ips", filter_engine::ListFormat::IpList),
+        ] {
+            let mut e = l.entries[0].clone();
+            e.format = f.into();
+            assert_eq!(e.list_format(), Some(want));
+        }
+        let mut e = l.entries[0].clone();
+        e.format = "clash".into();
+        assert_eq!(e.list_format(), None);
+    }
+
+    #[tokio::test]
+    async fn a_bad_signature_or_wrong_key_is_refused_and_nothing_loads() {
+        let (s, other) = (Signer::new(), Signer::new());
+        let d = doc(&s, "filters", None);
+        let text = filters_json("abp");
+        let sig = other.sign(&text, "v2026.11.23", "filters.json");
+        assert!(d.apply(text.clone(), sig, None).await.is_err());
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        assert!(d.apply(format!("{text} "), sig, None).await.is_err());
+        assert!(d.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_kind_mismatch_is_refused() {
+        let s = Signer::new();
+        let d = doc(&s, "userscripts", None);
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.23", "userscripts.json");
+        let e = d.apply(text, sig, None).await.unwrap_err();
+        assert!(e.contains("kind"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_digest_that_disagrees_with_the_signed_meta_is_refused() {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        let meta = s.meta("v2026.11.23", "filters", "something else");
+        let e = d.apply(text, sig, Some(meta)).await.unwrap_err();
+        assert!(e.contains("digest"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn an_older_release_is_refused_and_survives_a_lost_cache() {
+        let s = Signer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let d = doc(&s, "filters", Some(dir.path()));
+        let text = filters_json("abp");
+        let new = s.sign(&text, "v2026.11.23", "filters.json");
+        let old = s.sign(&text, "v2026.11.22", "filters.json");
+        d.apply(text.clone(), new, None).await.unwrap();
+        let e = d.apply(text.clone(), old.clone(), None).await.unwrap_err();
+        assert!(e.contains("older"), "{e}");
+        // A restart reloads the verified cache and still refuses the older release, even with the
+        // cached document gone.
+        std::fs::remove_file(dir.path().join("filters.json")).unwrap();
+        let d2 = doc(&s, "filters", Some(dir.path()));
+        d2.init_cache();
+        assert!(d2.get().is_none());
+        assert!(d2.apply(text, old, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_verified_cache_reloads_and_a_tampered_one_does_not() {
+        let s = Signer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        doc(&s, "filters", Some(dir.path()))
+            .apply(text, sig, None)
+            .await
+            .unwrap();
+        let d = doc(&s, "filters", Some(dir.path()));
+        d.init_cache();
+        assert_eq!(d.get().unwrap().version, "v2026.11.23");
+        std::fs::write(dir.path().join("filters.json"), filters_json("hosts")).unwrap();
+        let d = doc(&s, "filters", Some(dir.path()));
+        d.init_cache();
+        assert!(d.get().is_none());
+    }
+
+    #[test]
+    fn abp_and_ubo_lists_parse_with_the_mapped_format() {
+        use filter_engine::formats::{convert, ConvertOptions};
+        let abp = "[Adblock Plus 2.0]\n! Title: t\n||ads.example^\n@@||ok.example^\n";
+        let ubo = "! Title: u\n||trk.example^$third-party\nexample.org##+js(set, a, b)\n";
+        for (text, fmt) in [
+            (abp, filter_engine::ListFormat::Abp),
+            (ubo, filter_engine::ListFormat::Ubo),
+        ] {
+            let c = convert(
+                text,
+                &ConvertOptions {
+                    format: fmt,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(c.format, fmt);
+            assert!(c.rules.contains("example"), "{:?}", c.rules);
+        }
+    }
+
+    #[tokio::test]
+    async fn meta_that_misses_the_kind_or_names_another_release_is_refused() {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        // Lists only another kind.
+        let other = s.meta("v2026.11.23", "userscripts", &text);
+        let e = d
+            .apply(text.clone(), sig.clone(), Some(other))
+            .await
+            .unwrap_err();
+        assert!(e.contains("does not list"), "{e}");
+        // Right digest, different release.
+        let stale = s.meta("v2026.11.22", "filters", &text);
+        let e = d.apply(text.clone(), sig, Some(stale)).await.unwrap_err();
+        assert!(e.contains("release differs"), "{e}");
+        assert!(d.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_comment_without_a_release_or_for_another_file_is_refused() {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = filters_json("abp");
+        let none = s.sign_comment(&text, "argus-lists filters.json");
+        let e = d.apply(text.clone(), none, None).await.unwrap_err();
+        assert!(e.contains("no release"), "{e}");
+        let other = s.sign(&text, "v2026.11.23", "userscripts.json");
+        let e = d.apply(text, other, None).await.unwrap_err();
+        assert!(e.contains("another file"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_userscripts_document_caches_and_refuses_rollback() {
+        let s = Signer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mk = || {
+            SignedDoc::<UserscriptCatalogueEntry>::new(
+                "userscripts",
+                None,
+                ArgusConfig {
+                    base_url: "http://unused.test".into(),
+                    public_key: s.public_key(),
+                    cache_dir: Some(dir.path().to_path_buf()),
+                },
+            )
+        };
+        let text = userscripts_json("https://example.test/a.user.js");
+        let new = s.sign(&text, "v2026.11.23", "userscripts.json");
+        let old = s.sign(&text, "v2026.11.22", "userscripts.json");
+        let d = mk();
+        d.apply(text.clone(), new, None).await.unwrap();
+        assert!(d.apply(text, old, None).await.is_err());
+        let d2 = mk();
+        d2.init_cache();
+        let l = d2.get().unwrap();
+        assert_eq!(
+            (l.version.as_str(), l.entries[0].id.as_str()),
+            ("v2026.11.23", "us1")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_config_source_changes_the_key_without_a_restart() {
+        let (a, b) = (Signer::new(), Signer::new());
+        let d = doc(&a, "filters", None);
+        let text = filters_json("abp");
+        let sig = b.sign(&text, "v2026.11.23", "filters.json");
+        assert!(d.apply(text.clone(), sig.clone(), None).await.is_err());
+        let key = b.public_key();
+        d.set_config_source(move || ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: key.clone(),
+            cache_dir: None,
+        });
+        assert!(d.apply(text, sig, None).await.is_ok());
+    }
+}
