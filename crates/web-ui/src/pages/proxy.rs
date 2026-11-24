@@ -63,13 +63,22 @@ fn flag_update(k: &str, on: bool) -> ListenerFlagsUpdate {
 }
 
 fn nft_snippet(port: u16) -> String {
-    format!(
-        "define LAN  = \"eth1\"   # client-facing interface\ndefine PORT = {port}\n\n\
-table inet argus {{\n  chain nat_prerouting {{\n    type nat hook prerouting priority dstnat; policy accept;\n\
-    iifname != $LAN return\n    # never redirect traffic addressed to the gateway itself (loop guard)\n\
-    fib daddr type local return\n    meta nfproto ipv4 tcp dport {{ 80, 443 }} redirect to :$PORT\n\
-    meta nfproto ipv6 tcp dport {{ 80, 443 }} redirect to :$PORT\n  }}\n}}\n"
-    )
+    // A raw string: `\` line continuations in a normal literal swallow the next line's indent.
+    r#"define LAN  = "eth1"   # client-facing interface
+define PORT = @PORT@
+
+table inet argus {
+  chain nat_prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    iifname != $LAN return
+    # never redirect traffic addressed to the gateway itself (loop guard)
+    fib daddr type local return
+    meta nfproto ipv4 tcp dport { 80, 443 } redirect to :$PORT
+    meta nfproto ipv6 tcp dport { 80, 443 } redirect to :$PORT
+  }
+}
+"#
+    .replace("@PORT@", &port.to_string())
 }
 
 #[component]
@@ -284,5 +293,17 @@ pub fn ProxyPage() -> impl IntoView {
                 </div>
             </div>
         </Layout>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nft_snippet_is_evenly_indented() {
+        let s = super::nft_snippet(3129);
+        assert!(s.contains("define PORT = 3129"));
+        assert!(s.contains("\n  chain nat_prerouting {\n    type nat hook"));
+        assert!(s.contains("\n    iifname != $LAN return\n    # never"));
+        assert!(s.contains("\n    fib daddr type local return\n    meta nfproto ipv4"));
     }
 }

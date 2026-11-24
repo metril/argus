@@ -319,9 +319,14 @@ where
         let end = (first + 2 * vis).div_ceil(8) * 8;
         (start.min(n), end.min(n))
     });
-    Effect::new(move |_| {
+    // Not on first run: reporting the initial position would rewrite the URL before the user
+    // has scrolled.
+    Effect::new(move |prev: Option<()>| {
         let rh = row_h.get_untracked();
-        on_anchor.run((top.get() / rh) as usize);
+        let i = (top.get() / rh) as usize;
+        if prev.is_some() {
+            on_anchor.run(i);
+        }
     });
 
     let rows = move || {

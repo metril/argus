@@ -6,7 +6,7 @@ use crate::api::auth::SessionInfo;
 use crate::api::ApiClient;
 use crate::components::{Card, ConfirmButton, Layout};
 use crate::state::{use_app_state, use_auth_state};
-use crate::utils::{api_base_url, get_origin};
+use crate::utils::{api_base_url, get_origin, ua_label};
 
 /// Account page component
 #[component]
@@ -18,6 +18,14 @@ pub fn AccountPage() -> impl IntoView {
     let loading_sessions = RwSignal::new(true);
 
     let user = auth_state.user;
+
+    // Explicit proxy port from the live config (None until loaded, or when unreadable).
+    let proxy_port = RwSignal::new(Option::<u16>::None);
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Ok(c) = ApiClient::new().get_proxy_config().await {
+            proxy_port.set(Some(c.port));
+        }
+    });
 
     // Public URL of the root CA certificate (same origin as the API).
     let ca_url = format!("{}/api/v1/ca.crt", api_base_url());
@@ -96,8 +104,12 @@ pub fn AccountPage() -> impl IntoView {
                 <Card title="CA Certificate" class="settings-card">
                     <p class="form-help">
                         "Install this root certificate on each device, then point that device's "
-                        "HTTP and HTTPS proxy at this server on port 8080. Without it, MITM'd "
-                        "HTTPS pages will fail to load."
+                        "HTTP and HTTPS proxy at this server"
+                        {move || match proxy_port.get() {
+                            Some(p) => format!(" on port {p}"),
+                            None => " (see the Proxy page for the port)".to_string(),
+                        }}
+                        ". Without it, MITM'd HTTPS pages will fail to load."
                     </p>
                     <div class="modal-actions">
                         <a class="btn btn-primary" href=ca_url.clone() download="argus-ca.crt">
@@ -127,13 +139,16 @@ pub fn AccountPage() -> impl IntoView {
                             key=|session| session.id.clone()
                             children=move |session| {
                                 let session_id = session.id.clone();
-                                let user_agent = session.user_agent.clone().unwrap_or_else(|| "Unknown".to_string());
+                                let full_ua = session.user_agent.clone().unwrap_or_default();
+                                let user_agent = session.user_agent.as_deref().map(ua_label).unwrap_or_else(|| "Unknown".to_string());
+                                let current = session.current;
 
                                 view! {
                                     <div class="session-item">
                                         <div class="session-info">
                                             <div class="session-details">
-                                                {user_agent}
+                                                <span class="ua" title=full_ua>{user_agent}</span>
+                                                {current.then(|| view! { " " <span class="badge">"this session"</span> })}
                                             </div>
                                         </div>
                                         <ConfirmButton

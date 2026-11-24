@@ -8,6 +8,25 @@ pub use api_types::{
     UpdateDeviceRequest, UpdateProfileRequest,
 };
 
+/// Short-lived share of the unfiltered first page: the navbar and the page behind it both ask
+/// for it on every navigation. Any profile write drops it.
+#[derive(Default)]
+struct FirstPage {
+    inflight: bool,
+    at: f64,
+    page: Option<Page<ProfileDto>>,
+}
+
+thread_local! {
+    static FIRST_PAGE: std::cell::RefCell<FirstPage> = std::cell::RefCell::new(FirstPage::default());
+}
+
+const FIRST_PAGE_TTL_MS: f64 = 2000.0;
+
+fn invalidate_first_page() {
+    FIRST_PAGE.with(|c| c.borrow_mut().page = None);
+}
+
 impl ApiClient {
     /// Every profile (for pickers), following the cursor.
     pub async fn list_profiles(&self) -> Result<Vec<ProfileDto>, ApiError> {
@@ -29,6 +48,45 @@ impl ApiClient {
         q: &str,
         cursor: Option<&str>,
     ) -> Result<Page<ProfileDto>, ApiError> {
+        if !q.trim().is_empty() || cursor.is_some() {
+            return self.fetch_profiles_page(q, cursor).await;
+        }
+        // Unfiltered first page: reuse a fresh copy, or wait for the request already in flight.
+        loop {
+            let hit = FIRST_PAGE.with(|c| {
+                let c = c.borrow();
+                match &c.page {
+                    Some(p) if js_sys::Date::now() - c.at < FIRST_PAGE_TTL_MS => {
+                        Some(Some(p.clone()))
+                    }
+                    _ if c.inflight => Some(None),
+                    _ => None,
+                }
+            });
+            match hit {
+                Some(Some(p)) => return Ok(p),
+                Some(None) => gloo_timers::future::TimeoutFuture::new(25).await,
+                None => break,
+            }
+        }
+        FIRST_PAGE.with(|c| c.borrow_mut().inflight = true);
+        let r = self.fetch_profiles_page("", None).await;
+        FIRST_PAGE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.inflight = false;
+            if let Ok(p) = &r {
+                c.page = Some(p.clone());
+                c.at = js_sys::Date::now();
+            }
+        });
+        r
+    }
+
+    async fn fetch_profiles_page(
+        &self,
+        q: &str,
+        cursor: Option<&str>,
+    ) -> Result<Page<ProfileDto>, ApiError> {
         self.get(&format!(
             "/profiles?limit=100&q={}{}",
             js_sys::encode_uri_component(q.trim()),
@@ -38,7 +96,10 @@ impl ApiClient {
     }
 
     pub async fn create_profile(&self, r: &CreateProfileRequest) -> Result<ProfileDto, ApiError> {
-        self.post("/profiles", r).await
+        invalidate_first_page();
+        let out = self.post("/profiles", r).await;
+        invalidate_first_page();
+        out
     }
 
     pub async fn update_profile(
@@ -46,11 +107,17 @@ impl ApiClient {
         id: &str,
         r: &UpdateProfileRequest,
     ) -> Result<ProfileDto, ApiError> {
-        self.put(&format!("/profiles/{id}"), r).await
+        invalidate_first_page();
+        let out = self.put(&format!("/profiles/{id}"), r).await;
+        invalidate_first_page();
+        out
     }
 
     pub async fn delete_profile(&self, id: &str) -> Result<MessageResponse, ApiError> {
-        self.delete(&format!("/profiles/{id}")).await
+        invalidate_first_page();
+        let out = self.delete(&format!("/profiles/{id}")).await;
+        invalidate_first_page();
+        out
     }
 
     pub async fn list_devices(&self) -> Result<Vec<DeviceDto>, ApiError> {

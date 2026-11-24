@@ -63,6 +63,17 @@ pub fn FiltersPage() -> impl IntoView {
     let show_catalogue = RwSignal::new(false);
     let catalogue = RwSignal::new(Vec::<CatalogueEntryResponse>::new());
     let catalogue_add = RwSignal::new(Option::<String>::None);
+    // The catalogue modal and the list-options drawer never stack.
+    Effect::new(move |_| {
+        if show_catalogue.get() {
+            sel_open.set(false);
+        }
+    });
+    Effect::new(move |_| {
+        if sel_open.get() {
+            show_catalogue.set(false);
+        }
+    });
     let cat_source = RwSignal::new(String::new());
     let cat_fetched = RwSignal::new(Option::<String>::None);
     let cat_q = RwSignal::new(String::new());
@@ -187,7 +198,7 @@ pub fn FiltersPage() -> impl IntoView {
         }
         let label = feed
             .items
-            .with_untracked(|v| v.get(i).map(|r| r.name.clone()));
+            .with_untracked(|v| v.get(i).filter(|_| i > 0).map(|r| r.name.clone()));
         anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("fa", label)]))));
     });
     // Custom rules (once)
@@ -202,17 +213,29 @@ pub fn FiltersPage() -> impl IntoView {
         }
     });
 
+    let nudge = Arc::new(AtomicBool::new(false));
     // Poll the build state while the page is open; reload lists when a build finishes.
     {
         let alive = Arc::new(AtomicBool::new(true));
         let flag = alive.clone();
+        let nudge = nudge.clone();
         let app_b = app_state.clone();
         on_cleanup(move || flag.store(false, Ordering::Relaxed));
         wasm_bindgen_futures::spawn_local(async move {
             let client = ApiClient::new();
             let mut was_building = false;
             let mut failing = false;
+            // Poll fast while a build runs; back off while idle (3s, 6s, 12s, then 15s), and
+            // pause entirely while the tab is hidden. Any user action (nudge) resets it.
+            let mut idle_ms = 3000u32;
             while alive.load(Ordering::Relaxed) {
+                if nudge.swap(false, Ordering::Relaxed) {
+                    idle_ms = 3000;
+                }
+                if tab_hidden() {
+                    gloo_timers::future::TimeoutFuture::new(2000).await;
+                    continue;
+                }
                 match client.get_build_summary().await {
                     Ok(b) => {
                         failing = false;
@@ -220,6 +243,11 @@ pub fn FiltersPage() -> impl IntoView {
                             feed.refresh_loaded();
                         }
                         was_building = b.building;
+                        idle_ms = if b.building {
+                            3000
+                        } else {
+                            (idle_ms * 2).min(15_000)
+                        };
                         build.set(Some(b));
                     }
                     Err(e) => {
@@ -230,7 +258,15 @@ pub fn FiltersPage() -> impl IntoView {
                         failing = true;
                     }
                 }
-                gloo_timers::future::TimeoutFuture::new(3000).await;
+                // Sleep in 1s steps so a nudge cuts the wait short.
+                let mut waited = 0;
+                while waited < idle_ms
+                    && alive.load(Ordering::Relaxed)
+                    && !nudge.load(Ordering::Relaxed)
+                {
+                    gloo_timers::future::TimeoutFuture::new(1000).await;
+                    waited += 1000;
+                }
             }
         });
     }
@@ -262,7 +298,9 @@ pub fn FiltersPage() -> impl IntoView {
 
     let add_list = {
         let app_state = app_state.clone();
+        let nudge = nudge.clone();
         move |_| {
+            nudge.store(true, Ordering::Relaxed);
             let (name, url) = (add_name.get_untracked(), add_url.get_untracked());
             if name.trim().is_empty() || url.trim().is_empty() {
                 app_state.error("Give the list a name and a URL");
@@ -296,7 +334,9 @@ pub fn FiltersPage() -> impl IntoView {
 
     let update_all = {
         let app_state = app_state.clone();
+        let nudge = nudge.clone();
         move |_| {
+            nudge.store(true, Ordering::Relaxed);
             let app_state = app_state.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match ApiClient::new().refresh_all_lists().await {
@@ -729,10 +769,26 @@ fn FilterRow(
     let count = move || {
         r.with(|f| {
             if f.rule_count > 0 {
-                format!("{} rules", format_number(f.rule_count as u64))
+                if f.duplicate_count > 0 {
+                    format!("{} unique", format_number(f.rule_count as u64))
+                } else {
+                    format!("{} rules", format_number(f.rule_count as u64))
+                }
             } else {
                 "-".to_string()
             }
+        })
+    };
+    let count_title = move || {
+        r.with(|f| {
+            (f.duplicate_count > 0).then(|| {
+                format!(
+                    "{} unique rules ({} total). {} duplicate rules were dropped because an earlier list, or this one, already has them.",
+                    format_number(f.rule_count as u64),
+                    format_number((f.rule_count + f.duplicate_count) as u64),
+                    format_number(f.duplicate_count as u64)
+                )
+            })
         })
     };
     let open_id = id.clone();
@@ -754,7 +810,7 @@ fn FilterRow(
             </div>
             <div class="meta">
                 {pill}
-                <span class="cnt num">{count}</span>
+                <span class="cnt num" title=move || count_title().unwrap_or_default()>{count}</span>
                 <span class="tm">{move || r.with(|f| ago_rfc3339(f.last_updated.as_deref()))}</span>
             </div>
             <div class="meta">
@@ -873,6 +929,14 @@ fn FilterDrawer(
                             <Switch checked=f.allowlist label="Allowlist" on_change=Callback::new(move |v: bool| set_flag.run((false, v))) />
                         </div>
                         <div class="hint">{format!("format: {}", f.format)}</div>
+                        {(f.duplicate_count > 0).then(|| view! {
+                            <div class="hint">{format!(
+                                "{} unique rules ({} total). {} duplicates were dropped because an earlier list already has them, so a list loaded after a broader one shows fewer.",
+                                format_number(f.rule_count as u64),
+                                format_number((f.rule_count + f.duplicate_count) as u64),
+                                format_number(f.duplicate_count as u64)
+                            )}</div>
+                        })}
                         <ReportSummary id=rid reports=report />
                         <div><button class="btn" type="button" on:click=move |_| rules_open.set(true)>"View rules"</button></div>
                         <div><ConfirmButton label="Delete list" confirm_label="Delete?" on_confirm=delete /></div>
@@ -953,7 +1017,7 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
             </div>
             <span class="hint" aria-live="polite">{move || format!(
                 "Showing {} of {} cosmetic, scriptlet and other extended rules",
-                rules.items.with(|v| v.len()), format_number(rules.total.get() as u64))}</span>
+                format_number(rules.items.with(|v| v.len()) as u64), format_number(rules.total.get() as u64))}</span>
             <VList
                 items=rules.items
                 row_h=Signal::derive(|| 52.0)
@@ -973,6 +1037,13 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
             />
         </Drawer>
     }
+}
+
+/// True while the page is in a background tab.
+fn tab_hidden() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .is_some_and(|d| d.hidden())
 }
 
 /// Readable label for a rule state code.
@@ -1007,7 +1078,9 @@ fn BuildIndicator(summary: RwSignal<Option<BuildSummary>>) -> impl IntoView {
                     let failed = matches!(b.state, BuildState::Failed { .. });
                     let totals = format!(
                         "{} network, {} cosmetic, {} domains, {} handed off (not enforced yet), built in {} ms",
-                        b.network, b.cosmetic, b.domain_set, b.ext, b.compile_ms
+                        format_number(b.network as u64), format_number(b.cosmetic as u64),
+                        format_number(b.domain_set as u64), format_number(b.ext as u64),
+                        format_number(b.compile_ms)
                     );
                     view! {
                         <div>
@@ -1028,7 +1101,12 @@ fn ReportSummary(id: String, reports: RwSignal<HashMap<String, ListReport>>) -> 
         reports.get().get(&id).map(|r| {
             let counts = format!(
                 "{} network, {} cosmetic, {} handed off, {} skipped, {} deduped, {} rejected",
-                r.network, r.cosmetic, r.ext, r.skipped, r.deduped, r.rejected
+                format_number(r.network as u64),
+                format_number(r.cosmetic as u64),
+                format_number(r.ext as u64),
+                format_number(r.skipped as u64),
+                format_number(r.deduped as u64),
+                format_number(r.rejected as u64)
             );
             let issues = r.issues.clone();
             let n = r.error_count;

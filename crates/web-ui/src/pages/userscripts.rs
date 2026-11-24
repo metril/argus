@@ -11,6 +11,7 @@ use crate::api::userscripts::{
 use crate::api::ApiClient;
 use crate::components::{ConfirmButton, Drawer, Icon, Layout, ProfileSelector, Switch};
 use crate::state::use_app_state;
+use crate::utils::format_number;
 use gloo_timers::callback::Timeout;
 use std::rc::Rc;
 
@@ -304,6 +305,7 @@ pub fn UserscriptsPage() -> impl IntoView {
             }
         });
     };
+    let open_browse_empty = open_browse;
     Effect::new(move || {
         reload.get();
         if browse.get_untracked() {
@@ -439,7 +441,7 @@ pub fn UserscriptsPage() -> impl IntoView {
         }
         let label = feed
             .items
-            .with_untracked(|v| v.get(i).map(|r| r.name.clone()));
+            .with_untracked(|v| v.get(i).filter(|_| i > 0).map(|r| r.name.clone()));
         anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("ua", label)]))));
     });
 
@@ -757,7 +759,7 @@ pub fn UserscriptsPage() -> impl IntoView {
 
             <div class="tiles">
                 <div class="stat-badge">
-                    <span class="stat-value">{move || counts.get().map(|c| c.all).unwrap_or(0)}</span>
+                    <span class="stat-value">{move || format_number(counts.get().map(|c| c.all).unwrap_or(0) as u64)}</span>
                     <span class="stat-label">"Installed"</span>
                 </div>
                 <div class="stat-badge">
@@ -849,7 +851,7 @@ pub fn UserscriptsPage() -> impl IntoView {
             <div class="card" hidden=move || browse.get()>
                 <div class="card-h">
                     <h3>"Installed userscripts"</h3>
-                    <span class="sub">{move || format!("{} scripts", counts.get().map(|c| c.all).unwrap_or(0))}</span>
+                    <span class="sub">{move || format!("{} scripts", format_number(counts.get().map(|c| c.all).unwrap_or(0) as u64))}</span>
                 </div>
                 <div class="card-b sitebar">
                     <div class="toolbar">
@@ -876,7 +878,7 @@ pub fn UserscriptsPage() -> impl IntoView {
                                             "disabled" => c.disabled,
                                             "error" => c.error,
                                             _ => c.all,
-                                        }).map(|n| view! { <span class="n">{n}</span> })}
+                                        }).map(|n| view! { <span class="n">{format_number(n as u64)}</span> })}
                                     </button>
                                 })
                                 .collect_view()}
@@ -892,7 +894,22 @@ pub fn UserscriptsPage() -> impl IntoView {
                     when=move || !feed.items.with(|v| v.is_empty()) || feed.error.get().is_some()
                     fallback=move || view! {
                         <div class="empty">
-                            <b>{move || if feed.loading.get() { "Loading..." } else { "No userscripts match" }}</b>
+                            {move || {
+                                let none_installed = counts.get().is_some_and(|c| c.all == 0)
+                                    && q.with(|q| q.is_empty())
+                                    && status.with(|s| s.is_empty());
+                                if feed.loading.get() {
+                                    view! { <b>"Loading..."</b> }.into_any()
+                                } else if none_installed {
+                                    view! {
+                                        <b>"No userscripts installed"</b>
+                                        "Install one from the catalogue to get started. "
+                                        <button type="button" class="btn sm primary" on:click=open_browse_empty>"Browse userscripts"</button>
+                                    }.into_any()
+                                } else {
+                                    view! { <b>"No userscripts match"</b> }.into_any()
+                                }
+                            }}
                         </div>
                     }
                 >

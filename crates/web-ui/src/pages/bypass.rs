@@ -193,9 +193,9 @@ pub fn BypassPage() -> impl IntoView {
         if sort.get_untracked() != "az" {
             return;
         }
-        let label = feed
-            .items
-            .with_untracked(|v: &Vec<BypassEntryDto>| v.get(i).map(|r| r.pattern.clone()));
+        let label = feed.items.with_untracked(|v: &Vec<BypassEntryDto>| {
+            v.get(i).filter(|_| i > 0).map(|r| r.pattern.clone())
+        });
         anchor_t.set_value(Some(Timeout::new(250, move || query_set(&[("ba", label)]))));
     });
 
@@ -556,7 +556,7 @@ pub fn BypassPage() -> impl IntoView {
                     </div>
                     <span class="hint">"Maintained by AdGuard and downloaded when Argus runs. Nothing is bundled."</span>
                 </div>
-                <ul class="flist" aria-label="Bypass subscriptions">
+                <ul class="flist bpsubs" aria-label="Bypass subscriptions">
                     <For each=move || subs.get() key=|s| s.id.clone() children=move |s| {
                         let (id1, id2, id3) = (s.id.clone(), s.id.clone(), s.id.clone());
                         let name0 = s.name.clone();
@@ -585,7 +585,7 @@ pub fn BypassPage() -> impl IntoView {
                                     <span class="cnt num">{move || r.with(|s| format!("{} hosts", format_number(s.host_count as u64)))}</span>
                                     <span class="tm">{move || r.with(|s| s.last_fetched.as_deref().map(fmt_ago).unwrap_or_else(|| "never".into()))}</span>
                                 </div>
-                                <div class="meta">
+                                <div class="acts">
                                     <button class="btn sm ghost act" type="button" on:click=move |_| {
                                         let id = id2.clone();
                                         wasm_bindgen_futures::spawn_local(async move {
@@ -629,7 +629,7 @@ pub fn BypassPage() -> impl IntoView {
                             hosts_t.set_value(Some(Timeout::new(200, load_hosts)));
                         } />
                 </div>
-                <span class="hint" aria-live="polite">{move || format!("Showing {} of {}", hosts.items.with(|h| h.len()), format_number(hosts.total.get() as u64))}</span>
+                <span class="hint" aria-live="polite">{move || format!("Showing {} of {}", format_number(hosts.items.with(|h| h.len()) as u64), format_number(hosts.total.get() as u64))}</span>
                 <VList
                     items=hosts.items
                     row_h=Signal::derive(|| 34.0)

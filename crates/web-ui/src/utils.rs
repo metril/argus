@@ -164,3 +164,83 @@ pub fn copy_text(text: &str) -> bool {
     ta.remove();
     ok
 }
+
+/// Short label for a User-Agent string, e.g. "Chrome on Linux". Unknown agents fall back to the
+/// first product token (or "Unknown"); the full string belongs in a tooltip.
+pub fn ua_label(ua: &str) -> String {
+    let ua = ua.trim();
+    if ua.is_empty() {
+        return "Unknown".into();
+    }
+    let has = |s: &str| ua.contains(s);
+    let browser = if has("Edg/") || has("EdgA/") || has("EdgiOS/") {
+        Some("Edge")
+    } else if has("OPR/") || has("Opera") {
+        Some("Opera")
+    } else if has("Firefox/") || has("FxiOS/") {
+        Some("Firefox")
+    } else if has("Chrome/") || has("CriOS/") || has("Chromium/") {
+        Some("Chrome")
+    } else if has("Safari/") && has("Version/") {
+        Some("Safari")
+    } else {
+        None
+    };
+    let os = if has("Windows") {
+        Some("Windows")
+    } else if has("Android") {
+        Some("Android")
+    } else if has("iPhone") || has("iPad") || has("iPod") {
+        Some("iOS")
+    } else if has("Mac OS X") || has("Macintosh") {
+        Some("macOS")
+    } else if has("CrOS") {
+        Some("ChromeOS")
+    } else if has("Linux") || has("X11") {
+        Some("Linux")
+    } else {
+        None
+    };
+    match (browser, os) {
+        (Some(b), Some(o)) => format!("{b} on {o}"),
+        (Some(b), None) => b.to_string(),
+        (None, Some(o)) => format!("Unknown browser on {o}"),
+        // Non-browser clients ("curl/8.5.0", "python-requests/2.31"): first product token.
+        (None, None) => ua
+            .split_whitespace()
+            .next()
+            .unwrap_or("Unknown")
+            .chars()
+            .take(40)
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_thousands() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1,000");
+        assert_eq!(format_number(3363), "3,363");
+        assert_eq!(format_number(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn labels_user_agents() {
+        let chrome = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+        assert_eq!(ua_label(chrome), "Chrome on Linux");
+        let edge = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36 Edg/126.0";
+        assert_eq!(ua_label(edge), "Edge on Windows");
+        let ff =
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:127.0) Gecko/20100101 Firefox/127.0";
+        assert_eq!(ua_label(ff), "Firefox on macOS");
+        let safari = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+        assert_eq!(ua_label(safari), "Safari on iOS");
+        assert_eq!(ua_label("curl/8.5.0"), "curl/8.5.0");
+        assert_eq!(ua_label(""), "Unknown");
+    }
+}

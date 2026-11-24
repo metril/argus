@@ -2426,6 +2426,11 @@
             "description": "Needs a look: the last fetch failed, or an enabled list was never fetched or is more\nthan 7 days old.",
             "type": "boolean"
           },
+          "duplicate_count": {
+            "description": "Rules of this list dropped as duplicates of an earlier list (or of itself) at the last\nbuild; `rule_count + duplicate_count` is the list's total.",
+            "minimum": 0,
+            "type": "integer"
+          },
           "enabled": {
             "type": "boolean"
           },

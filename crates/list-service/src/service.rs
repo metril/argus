@@ -321,7 +321,13 @@ fn count_rules(content: &str) -> usize {
     content
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with(['!', '#']))
+        .filter(|l| {
+            !l.is_empty()
+                && !l.starts_with('!')
+                // `# comment` (hosts style) is a comment; `##sel`, `#@#`, `#?#`, `#$#`, `#%#` are
+                // cosmetic rules.
+                && (!l.starts_with('#') || l[1..].starts_with(['#', '@', '?', '$', '%']))
+        })
         .count()
 }
 
@@ -1269,6 +1275,14 @@ enum Fetched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_rules_counts_cosmetic_and_skips_comments() {
+        let t = "[Adblock Plus 2.0]\n! c\n# hosts comment\n||a.example^\n##.ad\nx.com#@#.y\n\n";
+        // The `[Adblock ...]` header line is counted by this approximation; the build report
+        // replaces it with exact figures.
+        assert_eq!(count_rules(t), 4);
+    }
 
     #[tokio::test]
     async fn panicking_build_does_not_hang_and_records_status() {

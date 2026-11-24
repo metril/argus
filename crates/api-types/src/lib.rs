@@ -552,6 +552,10 @@ pub struct FilterListResponse {
     pub enabled: bool,
     pub last_updated: Option<String>,
     pub rule_count: usize,
+    /// Rules of this list dropped as duplicates of an earlier list (or of itself) at the last
+    /// build; `rule_count + duplicate_count` is the list's total.
+    #[serde(default)]
+    pub duplicate_count: usize,
     /// Error from the most recent fetch attempt, if it failed (cached content is still used).
     #[serde(default)]
     pub last_error: Option<String>,

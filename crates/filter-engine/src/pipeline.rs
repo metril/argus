@@ -263,6 +263,24 @@ mod tests {
     }
 
     #[test]
+    fn easylist_style_list_after_superset_reports_unique_and_duplicates() {
+        // A broad list first (as AdGuard Base is), then an EasyList-style list that mostly
+        // overlaps it: the overlap is attributed to the first list, not lost or mis-parsed.
+        let easylist = "[Adblock Plus 2.0]\n! Title: EasyList\n||ads.example^\n||tracker.example^$third-party\n/banner/*/img^\n@@||good.example^\n##.ad-box\nexample.com##.sponsor\n";
+        let base = format!("{easylist}||extra.example^\n");
+        let built = build_set(&[
+            input("base", &base, ListFormat::Auto, false),
+            input("easylist", easylist, ListFormat::Auto, false),
+        ]);
+        let (b, e) = (&built.reports[0], &built.reports[1]);
+        assert_eq!(e.format, ListFormat::Abp);
+        assert_eq!(b.network + b.cosmetic, 7);
+        assert_eq!(e.network + e.cosmetic, 0);
+        assert_eq!(e.duplicates, 6);
+        assert_eq!(e.rejected, 0);
+    }
+
+    #[test]
     fn allowlist_and_ip_and_ext_flow_through() {
         let built = build_set(&[
             input("block", "||a.example.com^\n", ListFormat::Auto, false),
