@@ -149,7 +149,7 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 0
-debug = true
+debug = "line-tables-only"
 
 # Hot byte-crunching dependencies stay optimised in dev/test builds so streaming tests are fast.
 [profile.dev.package.lol_html]
