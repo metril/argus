@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-11-24
 
 * Extension bridge: the Argus extension can connect to the proxy (`GET /api/v1/ext/channel`, token
   scope `userscripts:bridge`). A new extension-only proxy listener (`proxy.ext_port`, Settings in the
