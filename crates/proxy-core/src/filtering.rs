@@ -1020,6 +1020,40 @@ impl ProxyContext {
         // Moved out of the response (the body stream does not need them): no header-map copy.
         let mut resp = resp;
         let resp_headers = std::mem::take(resp.headers_mut());
+        // A relayed response that redirects: the hop it names is checked here, before the
+        // browser can follow it (Argus decrypted this hop, so it sees every one). Together with
+        // the check of the first hop (`route`) this makes every hop the browser follows one the
+        // proxy approved beforehand.
+        if let (Some(r), true) = (relay.as_deref(), status.is_redirection()) {
+            if let Some(loc) = resp_headers
+                .get(hyper::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+            {
+                let target = reqwest::Url::parse(&url)
+                    .ok()
+                    .and_then(|base| base.join(loc).ok());
+                let ok = match target {
+                    Some(t) => {
+                        self.internal
+                            .gm
+                            .ext()
+                            .check_hop(r, &t, rctx.ext, rctx.ext_store.as_deref().unwrap_or(""))
+                            .await
+                    }
+                    None => false,
+                };
+                if !ok {
+                    debug!("Refused a relayed redirect from {host}");
+                    // No Set-Cookie, no Location: only the refusal.
+                    return Ok(Response::builder()
+                        .status(hyper::StatusCode::BAD_GATEWAY)
+                        .header("cache-control", "no-store")
+                        .header("x-adblock-note", "relayed redirect refused")
+                        .body(crate::inject::full_body(bytes::Bytes::new()))
+                        .expect("relay redirect refusal"));
+                }
+            }
+        }
         let mut kind = classify_body(is_head, status, rtype, &resp_headers);
         // Script policy applies to every HTML document, `no-transform` or not: it adds headers
         // only, never rewrites a body the origin asked us to leave alone.

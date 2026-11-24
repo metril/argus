@@ -4,8 +4,8 @@
 use api_types::{ExtError, ExtIdent, ExtOut, ExtTriggerRequest};
 use common::bypass::{BypassEngine, BypassMode, Entry};
 use proxy_core::ext_bridge::{
-    grant_patterns, job_frame, parse_job_frame, take_headers, ExtHub, Fallback, HubCtx, JobEvent,
-    Perms, Route, Wait, F_CANCEL, F_DATA, F_END, F_HEAD, F_JOB, RELAY_HEADER,
+    grant_patterns, job_frame, parse_job_frame, take_headers, EvGate, ExtHub, Fallback, HubCtx,
+    JobEvent, Perms, Route, Wait, F_CANCEL, F_DATA, F_END, F_HEAD, F_JOB, RELAY_HEADER,
 };
 use proxy_core::gm::{Caller, GmHost};
 use serde_json::json;
@@ -892,4 +892,44 @@ async fn documents_and_menus_are_scoped_to_the_cookie_store() {
     assert_eq!(hub.doc_store(boxed.mdoc.as_deref()), "c1x");
     assert_eq!(hub.doc_store(def.mdoc.as_deref()), "");
     assert_eq!(hub.doc_store(None), "");
+}
+
+struct NotEv(Vec<&'static str>);
+#[async_trait::async_trait]
+impl EvGate for NotEv {
+    async fn is_not_ev(&self, host: &str, _port: u16) -> bool {
+        self.0.contains(&host)
+    }
+}
+
+#[tokio::test]
+async fn a_hop_to_an_ev_or_unprobed_host_is_refused_when_ev_hosts_are_tunnelled() {
+    let f = fx(true);
+    let hub = f.gm.ext().clone();
+    let (sess, _sid, mut rx) = hub.open(ident("t"));
+    grant(&hub, sess, &["*://*.api.test/*"]).await;
+    let (_h, _j, relay) = job3(&hub, sess, &f, &mut rx).await;
+    let ok = url::Url::parse("https://api.test/y").unwrap();
+    let ev = url::Url::parse("https://ev.api.test/y").unwrap();
+    // setting off: EV hosts are decrypted like any other
+    f.bypass
+        .update(|s| {
+            s.ev_no_decrypt = false;
+            Ok(())
+        })
+        .unwrap();
+    assert!(hub.check_hop(&relay, &ev, Some(sess), "").await);
+    // setting on, no probe available: refused (fail safe)
+    f.bypass
+        .update(|s| {
+            s.ev_no_decrypt = true;
+            Ok(())
+        })
+        .unwrap();
+    assert!(!hub.check_hop(&relay, &ok, Some(sess), "").await);
+    // with the probe: only a host known not to be EV passes; and route's hop 1 uses the same gate
+    hub.set_ev_gate(Arc::new(NotEv(vec!["api.test"])));
+    assert!(hub.check_hop(&relay, &ok, Some(sess), "").await);
+    assert!(!hub.check_hop(&relay, &ev, Some(sess), "").await);
+    assert!(hub.ev_allows("api.test", 443).await && !hub.ev_allows("ev.api.test", 443).await);
 }

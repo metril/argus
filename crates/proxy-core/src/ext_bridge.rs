@@ -177,6 +177,29 @@ impl Perms {
 
 // ---- host list ------------------------------------------------------------------------------
 
+/// Whether a host is known to be tunnelled or decrypted by the Extended Validation setting.
+#[async_trait::async_trait]
+pub trait EvGate: Send + Sync {
+    /// True only when `host:port` was probed and is not Extended Validation.
+    async fn is_not_ev(&self, host: &str, port: u16) -> bool;
+}
+
+/// The proxy's own EV probe, held weakly (the proxy owns the hub).
+pub struct ProxyEvGate(pub Weak<crate::filtering::ProxyContext>);
+
+#[async_trait::async_trait]
+impl EvGate for ProxyEvGate {
+    async fn is_not_ev(&self, host: &str, port: u16) -> bool {
+        let Some(ctx) = self.0.upgrade() else {
+            return false;
+        };
+        matches!(
+            ctx.ev_verdict(host, port, Duration::from_secs(5)).await,
+            crate::ev::EvVerdict::NotEv
+        )
+    }
+}
+
 /// Loopback, private, link-local and unspecified targets (and `localhost` names).
 pub fn is_local_target(host: &str) -> bool {
     let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
@@ -334,6 +357,7 @@ pub struct ExtHub {
     auditor: OnceLock<Arc<SecurityAuditor>>,
     /// Where the extension's proxy listener is (host if specific, port; 0 = off).
     proxy: Mutex<(Option<String>, u16)>,
+    ev_gate: OnceLock<Arc<dyn EvGate>>,
 }
 
 impl Default for ExtHub {
@@ -356,6 +380,7 @@ impl ExtHub {
             audit: OnceLock::new(),
             auditor: OnceLock::new(),
             proxy: Mutex::new((None, 0)),
+            ev_gate: OnceLock::new(),
         }
     }
 
@@ -367,6 +392,44 @@ impl ExtHub {
     /// This hub's `Arc`, when it was built with [`Self::shared`].
     pub fn arc(&self) -> Option<Arc<Self>> {
         self.me.upgrade()
+    }
+
+    pub fn set_ev_gate(&self, g: Arc<dyn EvGate>) {
+        let _ = self.ev_gate.set(g);
+    }
+
+    /// Will Argus decrypt `host:port` right now as far as the Extended Validation setting goes?
+    /// (Bypass entries and the fail-safe are checked by `route` / `check_relay`.) With the setting
+    /// on, EV and EV-unknown hosts are tunnelled; without a probe the answer is no.
+    pub async fn ev_allows(&self, host: &str, port: u16) -> bool {
+        let Some(ctx) = self.ctx.get() else {
+            return false;
+        };
+        if !ctx.bypass.ev_no_decrypt() {
+            return true;
+        }
+        match self.ev_gate.get() {
+            Some(g) => g.is_not_ev(host.trim_matches(['[', ']']), port).await,
+            None => false,
+        }
+    }
+
+    /// The full check of one hop a relay response asks the browser to follow, made before the
+    /// browser can follow it: [`Self::check_relay`] plus the Extended Validation setting.
+    pub async fn check_hop(
+        &self,
+        relay: &str,
+        url: &url::Url,
+        conn_session: Option<u64>,
+        conn_store: &str,
+    ) -> bool {
+        self.check_relay(relay, url, conn_session, conn_store)
+            && self
+                .ev_allows(
+                    url.host_str().unwrap_or_default(),
+                    url.port_or_known_default().unwrap_or(443),
+                )
+                .await
     }
 
     pub fn set_ctx(&self, ctx: HubCtx) {

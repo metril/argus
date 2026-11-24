@@ -853,6 +853,13 @@ impl ProxyControl {
 impl ProxyServer {
     /// Create a new proxy server with the given configuration and filtering context.
     pub fn new(config: ProxyConfig, ctx: Arc<ProxyContext>) -> Result<Self> {
+        // The extension bridge asks the proxy's EV probe before relaying to a host.
+        ctx.internal()
+            .gm
+            .ext()
+            .set_ev_gate(Arc::new(crate::ext_bridge::ProxyEvGate(Arc::downgrade(
+                &ctx,
+            ))));
         // Reject invalid CIDR lists at startup instead of silently ignoring entries.
         DestPolicy::from_config(&config)?;
         let client_acl = Arc::new(ArcSwap::from_pointee(ClientAcl::new(

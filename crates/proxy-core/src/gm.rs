@@ -1018,7 +1018,7 @@ impl GmHost {
         let s = a.script();
         {
             let host = url.host_str().unwrap_or_default().to_string();
-            match self.credentialed_route(
+            let route = self.credentialed_route(
                 s,
                 &a.profile,
                 &a.origin,
@@ -1027,7 +1027,20 @@ impl GmHost {
                 false,
                 mdoc.as_deref(),
                 &host,
-            ) {
+            );
+            // A host the Extended Validation setting tunnels is not decrypted: jar.
+            let route = match route {
+                Route::Ext(_)
+                    if !self
+                        .ext
+                        .ev_allows(&host, url.port_or_known_default().unwrap_or(443))
+                        .await =>
+                {
+                    Route::Jar(crate::ext_bridge::Fallback::Bypassed)
+                }
+                r => r,
+            };
+            match route {
                 Route::Ext(session) => {
                     if matches!(&op, CookieOp::Set { cookie, .. } if cookie.http_only) {
                         return Err(bad("httpOnly cookies are not accessible".into()));
@@ -1337,7 +1350,7 @@ impl GmHost {
         // above (grant, `@connect`, method and header rules, destination policy) have passed.
         {
             let host = out.url.host_str().unwrap_or_default().to_string();
-            match self.credentialed_route(
+            let route = self.credentialed_route(
                 a.script(),
                 &a.profile,
                 &a.origin,
@@ -1346,7 +1359,20 @@ impl GmHost {
                 out.redirect == Redirect::Manual,
                 meta.mdoc.as_deref(),
                 &host,
-            ) {
+            );
+            // A host the Extended Validation setting tunnels is not decrypted: jar.
+            let route = match route {
+                Route::Ext(_)
+                    if !self
+                        .ext
+                        .ev_allows(&host, out.url.port_or_known_default().unwrap_or(443))
+                        .await =>
+                {
+                    Route::Jar(crate::ext_bridge::Fallback::Bypassed)
+                }
+                r => r,
+            };
+            match route {
                 Route::Ext(session) => {
                     return self
                         .run_relayed(

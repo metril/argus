@@ -38,6 +38,11 @@ fn hub(env: &TestEnv) -> Arc<ExtHub> {
         profiles: None,
         bypass: env.proxy.ctx.bypass().clone(),
     });
+    // (the EV setting has its own cases: the fake hosts of these tests cannot be probed)
+    let _ = env.proxy.ctx.bypass().update(|s| {
+        s.ev_no_decrypt = false;
+        Ok(())
+    });
     h
 }
 
@@ -667,5 +672,124 @@ e2e_test!(
         .await;
         assert_eq!(st, 403);
         assert!(no_more(&mut rx));
+    }
+);
+
+e2e_test!(
+    a_relayed_redirect_is_checked_at_the_decrypted_hop_before_the_browser_follows,
+    rules = [],
+    explicit_only,
+    |env| {
+        use common::bypass::{BypassMode, Entry};
+        let s = script("", true);
+        let id = s.id.clone();
+        env.proxy
+            .userscripts()
+            .install_script("default", s)
+            .unwrap();
+        // the script may reach api.test and everything below it
+        let h = hub(&env);
+        let (sess, sid, mut rx) = session(&h, "t1");
+        h.on_text(
+            sess,
+            &json!({"t": "perms", "origins": ["*://*.api.test/*", "*://127.0.0.1/*"]}).to_string(),
+        )
+        .await;
+        env.proxy
+            .ctx
+            .bypass()
+            .update(|st| {
+                st.entries.push(Entry {
+                    id: "b".into(),
+                    pattern: "byp.api.test".into(),
+                    mode: BypassMode::NoDecrypt,
+                    source: "custom".into(),
+                    note: None,
+                    updated_at: 0,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let _job = h
+            .dispatch(sess, json!({"op": "xhr"}), "default", &id, "app.test", None)
+            .await
+            .unwrap();
+        let (_, meta) = next_job(&mut rx).await;
+        let relay = meta["relay"].as_str().unwrap().to_string();
+        let c = ext_client(&env, &sid, "").await;
+        let redirect = |path: &'static str, to: &str| {
+            env.origin.route(
+                path,
+                MockResponse::new(302, "")
+                    .header("location", to)
+                    .header("set-cookie", "leak=1"),
+            );
+        };
+        let fetch = |path: &'static str| {
+            let rb = c
+                .request(
+                    reqwest::Method::GET,
+                    &env.origin.https_url("api.test", path),
+                )
+                .header("x-argus-relay", relay.clone());
+            async move { rb.send().await.unwrap() }
+        };
+        env.origin.route("/end", MockResponse::ok("done"));
+        // refused at the decrypted hop: outside @connect, a bypassed host, loopback, a scheme
+        // that is not http(s); the answer carries no Location and no Set-Cookie
+        for (path, to) in [
+            ("/r-evil", "https://evil.test/x"),
+            ("/r-byp", "https://byp.api.test/x"),
+            ("/r-lo", "https://127.0.0.1/x"),
+            ("/r-lo2", "https://localhost/x"),
+            ("/r-data", "data:text/plain,x"),
+        ] {
+            redirect(path, to);
+            let r = fetch(path).await;
+            assert_eq!(r.status(), 502, "{to}");
+            assert_eq!(
+                r.headers().get("x-adblock-note").unwrap(),
+                "relayed redirect refused"
+            );
+            assert!(r.headers().get("location").is_none());
+            assert!(r.headers().get("set-cookie").is_none());
+        }
+        // a chain of allowed hops (relative and absolute) passes untouched
+        redirect("/r1", "/r2");
+        redirect("/r2", "https://v2.api.test/end");
+        let r = fetch("/r1").await;
+        assert_eq!(r.status(), 302);
+        assert_eq!(r.headers().get("location").unwrap(), "/r2");
+        let r = fetch("/r2").await;
+        assert_eq!(r.status(), 302);
+        let r = c
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("v2.api.test", "/end"),
+            )
+            .header("x-argus-relay", relay.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.text().await.unwrap(), "done");
+        // EV-no-decrypt on: a hop whose certificate cannot be probed (EV or unknown) is not
+        // followed, because Argus would tunnel it
+        env.proxy
+            .ctx
+            .bypass()
+            .update(|st| {
+                st.ev_no_decrypt = true;
+                Ok(())
+            })
+            .unwrap();
+        redirect("/r-ev", "https://api.test:9/x");
+        let r = fetch("/r-ev").await;
+        assert_eq!(
+            r.status(),
+            502,
+            "an unprobeable hop is refused when EV hosts are tunnelled"
+        );
+        // nothing was fetched from the refused targets
+        assert!(env.origin.requests().iter().all(|r| r.path() != "/x"));
     }
 );
