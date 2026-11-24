@@ -64,28 +64,40 @@ impl FilterCatalogueEntry {
     }
 }
 
+/// Treats an explicit JSON `null` like a missing field (the published catalogue uses `null` for
+/// "unknown"), so one sloppy entry cannot make the whole document unparseable.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// One entry of `userscripts.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserscriptCatalogueEntry {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub description: String,
     pub install_url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub homepage: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub sites: Vec<String>,
+    #[serde(default, deserialize_with = "null_default")]
     pub category: String,
+    #[serde(default, deserialize_with = "null_default")]
     pub licence: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub licence_note: Option<String>,
     /// `none`, `basic` or `xhr`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub needs_gm: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub connect: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub requires: Vec<String>,
 }
 
@@ -709,6 +721,15 @@ mod tests {
             (l.version.as_str(), l.entries[0].id.as_str()),
             ("v2026.11.23", "us1")
         );
+    }
+
+    #[test]
+    fn a_null_field_in_an_entry_reads_as_empty() {
+        let e: UserscriptCatalogueEntry = serde_json::from_str(
+            r#"{"id":"a","name":"A","install_url":"https://x.test/a.user.js","category":"ads","licence":null,"homepage":null,"sites":null}"#,
+        )
+        .unwrap();
+        assert_eq!((e.licence.as_str(), e.sites.len()), ("", 0));
     }
 
     #[tokio::test]
