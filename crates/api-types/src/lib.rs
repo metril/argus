@@ -543,7 +543,7 @@ impl<T> Page<T> {
 }
 
 /// Filter list description.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct FilterListResponse {
     pub id: String,

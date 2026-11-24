@@ -966,4 +966,101 @@ mod tests {
         });
         assert!(d.apply(text, sig, None).await.is_ok());
     }
+
+    /// Serve `files` over loopback http; returns the base URL and the `meta.json` request count.
+    async fn serve(
+        files: std::collections::HashMap<String, String>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let metas = Arc::new(AtomicUsize::new(0));
+        let m2 = metas.clone();
+        let files = Arc::new(files);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let (files, m2) = (files.clone(), m2.clone());
+            async move {
+                let name = uri.path().trim_start_matches('/').to_string();
+                if name == "meta.json" {
+                    m2.fetch_add(1, Ordering::SeqCst);
+                }
+                match files.get(&name) {
+                    Some(b) => (axum::http::StatusCode::OK, b.clone()),
+                    None => (axum::http::StatusCode::NOT_FOUND, String::new()),
+                }
+            }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(l, app).await;
+        });
+        (format!("http://{addr}"), metas)
+    }
+
+    fn svc() -> (tempfile::TempDir, Arc<ListService>) {
+        let d = tempfile::tempdir().unwrap();
+        let store = crate::ListStore::open(&d.path().join("store")).unwrap();
+        let svc = ListService::new(
+            crate::ListServiceConfig::default(),
+            store,
+            Arc::new(filter_engine::SharedEngine::new()),
+            reqwest::Client::new(),
+        );
+        (d, svc)
+    }
+
+    fn release_files(s: &Signer, release: &str) -> std::collections::HashMap<String, String> {
+        let text = filters_json("ubo");
+        let (meta, meta_sig) = s.meta(release, "filters", &text);
+        [
+            (
+                "filters.json.minisig",
+                s.sign(&text, release, "filters.json"),
+            ),
+            ("filters.json", text),
+            ("meta.json", meta),
+            ("meta.json.minisig", meta_sig),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stale_shared_meta_is_refetched_once_and_the_refresh_succeeds() {
+        let s = Signer::new();
+        let (_d, svc) = svc();
+        let (base, metas) = serve(release_files(&s, "v2026.11.24")).await;
+        let cfg = ArgusConfig {
+            base_url: base,
+            public_key: s.public_key(),
+            cache_dir: None,
+        };
+        // A validly signed meta for the previous release is still in the shared cache.
+        let (old_meta, old_sig) = s.meta("v2026.11.23", "filters", &filters_json("abp"));
+        svc.meta_cache().put(&cfg, (old_meta, old_sig)).await;
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), cfg);
+        assert_eq!(d.refresh().await.unwrap(), "v2026.11.24");
+        assert_eq!(
+            metas.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one fresh meta fetch after the stale copy failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_catalogues_share_one_meta_fetch() {
+        let s = Signer::new();
+        let (_d, svc) = svc();
+        let (base, metas) = serve(release_files(&s, "v2026.11.24")).await;
+        let cfg = ArgusConfig {
+            base_url: base,
+            public_key: s.public_key(),
+            cache_dir: None,
+        };
+        let a = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), cfg.clone());
+        a.refresh().await.unwrap();
+        let b = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc), cfg);
+        b.refresh().await.unwrap();
+        assert_eq!(metas.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }

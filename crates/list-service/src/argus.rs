@@ -1190,4 +1190,45 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn a_meta_that_fails_verification_is_not_left_for_the_catalogues() {
+        let (pk, sk) = keypair();
+        let rel = release(
+            &sk,
+            &pk,
+            "v2025.11.23",
+            &[("banking_finance", "chase.test")],
+        );
+        let (addr, shared) = serve(rel).await;
+        // Tamper with meta.json after it was signed.
+        shared
+            .lock()
+            .unwrap()
+            .files
+            .get_mut("meta.json")
+            .unwrap()
+            .extend_from_slice(b" ");
+        let r = rig(addr, &pk, None);
+        assert!(r.lists.refresh().await.is_err());
+        let cfg = ArgusConfig {
+            base_url: format!("http://{addr}"),
+            public_key: pk_b64(&pk),
+            cache_dir: None,
+        };
+        let fetched = std::sync::atomic::AtomicBool::new(false);
+        r.lists
+            .svc
+            .meta_cache()
+            .get_or_fetch(&cfg, || async {
+                fetched.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(("m".to_string(), "s".to_string()))
+            })
+            .await
+            .unwrap();
+        assert!(
+            fetched.load(std::sync::atomic::Ordering::SeqCst),
+            "the bad copy was dropped, not served"
+        );
+    }
 }

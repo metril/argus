@@ -832,7 +832,7 @@ pub async fn list_ext_rules(
         q.kind.clone().unwrap_or_default(),
         needle.clone(),
     );
-    let cached = EXT_TOTALS.lock().get(gen_id, &key);
+    let cached = state.ext_totals.lock().get(gen_id, &key);
     let mut total = 0usize;
     let mut picked: Vec<usize> = Vec::with_capacity(limit + 1);
     for (i, r) in rules.iter().enumerate() {
@@ -859,7 +859,7 @@ pub async fn list_ext_rules(
     }
     match cached {
         Some(t) => total = t,
-        None => EXT_TOTALS.lock().put(gen_id, key, total),
+        None => state.ext_totals.lock().put(gen_id, key, total),
     }
     let has_more = picked.len() > limit;
     picked.truncate(limit);
@@ -893,14 +893,13 @@ pub async fn list_ext_rules(
 }
 
 /// Counted `/rules/ext` totals for the current engine generation, so paging does not recount.
-static EXT_TOTALS: parking_lot::Mutex<ExtTotals> =
-    parking_lot::Mutex::new(ExtTotals { gen: 0, map: None });
-
+/// One per `AppState` (generation ids are per engine).
 const EXT_TOTALS_CAP: usize = 64;
 
 type ExtKey = (String, String, String);
 
-struct ExtTotals {
+#[derive(Default)]
+pub struct ExtTotals {
     gen: u64,
     map: Option<std::collections::HashMap<ExtKey, usize>>,
 }
@@ -976,7 +975,7 @@ mod ext_totals_tests {
 
     #[test]
     fn a_total_is_reused_and_dropped_when_the_generation_changes() {
-        let mut c = ExtTotals { gen: 0, map: None };
+        let mut c = ExtTotals::default();
         let k: ExtKey = ("l".into(), "k".into(), "q".into());
         assert_eq!(c.get(1, &k), None);
         c.put(1, k.clone(), 7);
@@ -990,7 +989,7 @@ mod ext_totals_tests {
 
     #[test]
     fn the_cache_stays_bounded() {
-        let mut c = ExtTotals { gen: 0, map: None };
+        let mut c = ExtTotals::default();
         for i in 0..200 {
             c.put(1, (i.to_string(), String::new(), String::new()), i);
         }
