@@ -129,6 +129,11 @@ pub const ADMIN: &[NavItem] = &[
     },
 ];
 
+/// Whether `path` is the nav entry `item` or below it (`/users` is not `/userscripts`).
+fn nav_matches(item: &str, path: &str) -> bool {
+    item == path || (item != "/" && path.strip_prefix(item).is_some_and(|r| r.starts_with('/')))
+}
+
 /// Title and subtitle for a path (used by the top bar).
 pub fn page_meta(path: &str) -> (&'static str, &'static str) {
     OVERVIEW
@@ -136,13 +141,7 @@ pub fn page_meta(path: &str) -> (&'static str, &'static str) {
         .chain(PROTECTION)
         .chain(ACCOUNT)
         .chain(ADMIN)
-        .find(|i| {
-            if i.path == "/" {
-                path == "/"
-            } else {
-                path.starts_with(i.path)
-            }
-        })
+        .find(|i| nav_matches(i.path, path))
         .map(|i| (i.label, i.sub))
         .unwrap_or(("Argus", ""))
 }
@@ -164,8 +163,7 @@ fn group(
             let need = item.scope;
             let allowed = move || need.map(|n| scopes.get().iter().any(|s| s == n)).unwrap_or(true);
             let current = move || {
-                let p = pathname.get();
-                if path == "/" { p == "/" } else { p.starts_with(path) }
+                nav_matches(path, &pathname.get())
             };
             view! {
                 <Show when=allowed>
@@ -231,5 +229,20 @@ pub fn Sidebar() -> impl IntoView {
                 </button>
             </div>
         </aside>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_nav_entry_does_not_match_a_longer_sibling() {
+        assert!(nav_matches("/users", "/users"));
+        assert!(nav_matches("/users", "/users/1"));
+        assert!(!nav_matches("/users", "/userscripts"));
+        assert!(nav_matches("/", "/"));
+        assert!(!nav_matches("/", "/logs"));
+        assert_eq!(page_meta("/userscripts").0, "Userscripts");
     }
 }
