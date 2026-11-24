@@ -12,7 +12,10 @@ export default defineConfig({
     homepage_url: 'https://github.com/metril/argus',
     icons,
     action: { default_icon: icons },
-    permissions: ['storage', 'tabs', ...(browser === 'firefox' ? ['webRequest', 'webRequestBlocking'] : [])],
+    permissions: [
+      'storage', 'tabs', 'cookies', 'scripting', 'activeTab', 'alarms', 'declarativeNetRequest',
+      ...(browser === 'firefox' ? ['webRequest', 'webRequestBlocking'] : []),
+    ],
     // Argus URL is user-entered: request its origin at runtime. Firefox needs <all_urls>
     // for webRequest observation of arbitrary sites.
     optional_host_permissions: ['http://*/*', 'https://*/*'],

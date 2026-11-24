@@ -8,13 +8,16 @@
     "typecheck": "npm run gen:api && wxt prepare && tsc --noEmit",
     "build": "npm run gen:api && wxt build",
     "build:firefox": "npm run gen:api && wxt build -b firefox",
+    "test": "wxt prepare && vitest run",
     "zip": "npm run gen:api && wxt zip",
     "zip:firefox": "npm run gen:api && wxt zip -b firefox"
   },
   "devDependencies": {
     "@types/chrome": "0.3.7",
+    "happy-dom": "^18.0.1",
     "openapi-typescript": "7.13.0",
     "typescript": "5.9.3",
+    "vitest": "^3.2.7",
     "wxt": "0.21.5"
   }
 }

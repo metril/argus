@@ -1,4 +1,5 @@
-import { cachedLookup, clearCache, hostOf, type Interception, type Lookup } from '../lib/api';
+import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
+import { Bridge } from '../lib/bridge';
 
 function badgeFor(v: Lookup): { text: string; color: string } {
   switch (v.kind) {
@@ -21,10 +22,24 @@ export default defineBackground(() => {
     await action.setBadgeBackgroundColor({ tabId, color: b.color });
   }
 
+  // Userscript bridge: channel to the proxy for relayed requests and the page-tagging rule.
+  const bridge = new Bridge({ WebSocketCtor: WebSocket, browser, getSettings });
+  void bridge.removeRule().then(() => bridge.connect());
+  const alarms = (browser as any).alarms;
+  if (alarms) {
+    void alarms.create('argus-bridge', { periodInMinutes: 0.5 });
+    alarms.onAlarm.addListener((a: { name: string }) => {
+      if (a.name === 'argus-bridge' && !bridge.status().connected) void bridge.connect();
+    });
+  }
+  const perms = (browser as any).permissions;
+  perms?.onAdded?.addListener(() => void bridge.sendPerms());
+  perms?.onRemoved?.addListener(() => void bridge.sendPerms());
+
   browser.tabs.onUpdated.addListener((tabId, info, tab) => {
     if (info.status === 'complete' || info.url) void update(tabId, tab.url);
   });
-  browser.storage.onChanged.addListener(() => clearCache());
+  browser.storage.onChanged.addListener(() => { clearCache(); void bridge.reconnect(); });
   browser.tabs.onRemoved.addListener((id) => intercepted.delete(id));
 
   // Firefox only: inspect the certificate the browser actually received.
@@ -45,9 +60,13 @@ export default defineBackground(() => {
     );
   }
 
-  browser.runtime.onMessage.addListener((msg: { type?: string; tabId?: number }) => {
+  browser.runtime.onMessage.addListener((msg: { type?: string; tabId?: number }, sender: { id?: string }) => {
     if (msg?.type === 'interception' && msg.tabId !== undefined) {
       return Promise.resolve((intercepted.get(msg.tabId) ?? 'unknown') as Interception);
+    }
+    if (msg?.type === 'bridge-status') {
+      if (sender?.id !== browser.runtime.id) return undefined;
+      return Promise.resolve(bridge.status());
     }
     return undefined;
   });

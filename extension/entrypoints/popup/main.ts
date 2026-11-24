@@ -1,4 +1,6 @@
 import { cachedLookup, getSettings, hostOf, type Interception } from '../../lib/api';
+import type { MenuData } from '../../lib/bridge-types';
+import { renderMenu } from '../../lib/menu';
 
 const app = document.getElementById('app')!;
 
@@ -17,10 +19,73 @@ function openOptions(label = 'Open settings') {
   app.append(a);
 }
 
+const menuBox = document.createElement('div');
+menuBox.id = 'menu';
+document.body.append(menuBox);
+
+async function userscripts(tab: { id?: number; url?: string } | undefined) {
+  if (tab?.id === undefined || !/^https?:/.test(tab.url ?? '')) return;
+  let mdoc: string | null = null;
+  try {
+    const r = await browser.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
+      func: () => {
+        const e = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
+        const s = e && e.serverTiming && Array.from(e.serverTiming).find((x) => x.name === 'argus');
+        return s ? s.description : null;
+      },
+    });
+    mdoc = (r?.[0]?.result as string | null | undefined) ?? null;
+  } catch { return; }
+  if (!mdoc) return;
+  menuBox.append(el('h2', 'Userscripts'));
+  const body = el('div');
+  menuBox.append(body);
+  const note = (t: string, c: string) => { body.textContent = ''; body.append(el('div', t, `s ${c}`)); };
+  const s = await getSettings();
+  let sid: string | undefined; // held in memory only
+  try {
+    const st = (await browser.runtime.sendMessage({ type: 'bridge-status' })) as { connected?: boolean; sid?: string } | undefined;
+    sid = st?.connected ? st.sid : undefined;
+  } catch { /* ignore */ }
+  if (!s.argusUrl || !sid) { note('The extension is not connected to Argus.', 'warn'); return; }
+  const headers = { Authorization: `Bearer ${s.token}`, 'X-Argus-Session': sid };
+  let data: MenuData;
+  try {
+    const res = await fetch(`${s.argusUrl}/api/v1/ext/menu?mdoc=${encodeURIComponent(mdoc)}`, { headers });
+    if (res.status === 403 || res.status === 409) { note('This page was not opened through the connected extension.', 'warn'); return; }
+    if (!res.ok) { note(`Userscript menu unavailable (HTTP ${res.status}).`, 'warn'); return; }
+    data = (await res.json()) as MenuData;
+  } catch { note('Cannot reach Argus.', 'warn'); return; }
+
+  const pending = [];
+  for (const g of data.grants ?? []) {
+    let all = false;
+    try { all = await browser.permissions.contains({ origins: g.patterns }); } catch { /* treat as missing */ }
+    if (!all) pending.push(g);
+  }
+  renderMenu(body, { commands: data.commands ?? [], grants: pending }, {
+    async trigger(c) {
+      try {
+        const res = await fetch(`${s.argusUrl}/api/v1/ext/menu/trigger`, {
+          method: 'POST',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mdoc, script: c.script, cmd: c.cmd }),
+        });
+        if (!res.ok) return false;
+        return ((await res.json()) as { delivered?: boolean }).delivered === true;
+      } catch { return false; }
+    },
+    grant(g) { return browser.permissions.request({ origins: g.patterns }); },
+    close: () => window.close(),
+  });
+}
+
 (async () => {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   const host = hostOf(tab?.url);
   app.textContent = '';
+  void userscripts(tab);
   if (!host) { status('Not a web page.', 'mut'); return; }
   app.append(el('h2', host));
   const s = await getSettings();
