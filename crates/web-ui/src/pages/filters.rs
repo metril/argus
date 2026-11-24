@@ -357,10 +357,6 @@ pub fn FiltersPage() -> impl IntoView {
 
     view! {
         <Layout>
-            <div class="page-header">
-                <h1 class="page-title">"Filter Lists"</h1>
-            </div>
-
             <BuildIndicator summary=build />
 
             <div class="card">
@@ -954,7 +950,7 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
                 render=Callback::new(|r: api_types::ExtRuleResponse| view! {
                     <div class="hrow rrow" title=r.raw.clone()>
                         <code>{r.raw.clone()}</code>
-                        <small>{r.kind.clone()}" \u{b7} "{r.state.clone()}{r.reason.clone().map(|x| format!(" ({x})"))}</small>
+                        <small>{r.kind.clone()}" \u{b7} "{rule_state_label(&r.state)}{r.reason.clone().map(|x| format!(" ({x})"))}</small>
                     </div>
                 }.into_any())
                 on_end=Callback::new(move |()| rules.more())
@@ -966,6 +962,21 @@ fn RulesDrawer(list: Signal<Option<(String, String)>>, open: RwSignal<bool>) -> 
             />
         </Drawer>
     }
+}
+
+/// Readable label for a rule state code.
+fn rule_state_label(state: &str) -> String {
+    match state {
+        "active" => "active",
+        "dropped_untrusted" => "dropped (list not trusted)",
+        "unsupported" => "unsupported",
+        "invalid" => "invalid",
+        "badfiltered" => "disabled by $badfilter",
+        "badfilter" => "$badfilter",
+        "unknown" => "unknown (index rebuilt)",
+        other => return other.replace('_', " "),
+    }
+    .to_string()
 }
 
 /// One-line build state: idle totals, download progress, compiling or the last failure.
@@ -1024,5 +1035,19 @@ fn ReportSummary(id: String, reports: RwSignal<HashMap<String, ListReport>>) -> 
                 })}
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod state_label_tests {
+    use super::rule_state_label;
+
+    #[test]
+    fn rule_states_read_as_words() {
+        assert_eq!(
+            rule_state_label("dropped_untrusted"),
+            "dropped (list not trusted)"
+        );
+        assert_eq!(rule_state_label("some_new_state"), "some new state");
     }
 }

@@ -236,6 +236,7 @@ textarea.input{height:auto;padding:8px 10px;resize:vertical;font-family:var(--fo
 
 /* tables */
 .tbl-wrap{overflow-x:auto}
+.tbl-wrap,.scrollbox{background:linear-gradient(to right,var(--surface) 30%,transparent) 0 0/24px 100% no-repeat local,linear-gradient(to left,var(--surface) 30%,transparent) 100% 0/24px 100% no-repeat local,radial-gradient(farthest-side at 0 50%,rgb(0 0 0/.2),transparent) 0 0/10px 100% no-repeat scroll,radial-gradient(farthest-side at 100% 50%,rgb(0 0 0/.2),transparent) 100% 0/10px 100% no-repeat scroll}
 table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 .tbl th{text-align:left;font:600 var(--fs-11)/1 var(--font-head);text-transform:uppercase;letter-spacing:.08em;color:var(--text-3);padding:10px var(--s3);border-bottom:1px solid var(--line);white-space:nowrap;background:var(--surface)}
 .tbl td{height:43px;padding:8px var(--s3);border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
@@ -516,6 +517,8 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 .page-header{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s2) var(--s4)}
 .page-title{margin:0;font:600 var(--fs-18)/1.2 var(--font-head)}
 .page-header .page-title{display:none}
+.page-header:not(:has(> :not(.page-title))){display:none}
+.us-section[hidden]{display:none}
 .auth-wrap{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:var(--s5) var(--s4);background:var(--bg);color:var(--text)}
 .reg{min-height:0;padding:0;background:none}
 .drawer-trap{outline:none}
