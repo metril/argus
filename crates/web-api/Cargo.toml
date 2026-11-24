@@ -94,11 +94,11 @@ test-hooks = []
 
 [dev-dependencies]
 web-api = { path = ".", features = ["test-hooks"] }
-axum-test = "18"
+axum-test = { version = "18", features = ["ws"] }
 minisign = "0.7"
 list-service = { path = "../list-service", default-features = false, features = ["testkit"] }
 futures-util = { workspace = true }
 tempfile = "3.10"
 rcgen = { workspace = true }
 regex = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

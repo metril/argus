@@ -122,10 +122,11 @@ function (cfg, entries, W) {
       if (extra) { for (var k in extra) { h[k] = extra[k]; } }
       return h;
     }
-    function json(path, body) {
+    // `raw`: `body` is already JSON text (built by hand where a page-hookable array must not be touched).
+    function json(path, body, raw) {
       return pThen(_fetch(cfg.base + "/v1/" + path, {
         method: "POST", credentials: "omit", cache: "no-store", redirect: "error",
-        headers: headers({ "Content-Type": "application/json" }), body: JSONstringify(body || {})
+        headers: headers({ "Content-Type": "application/json" }), body: raw ? body : JSONstringify(body || {})
       }), function (res) {
         return pThen(respJson(res), function (env) {
           if (!env || env.ok !== true) { throw exposeErr(env, res.status); }
@@ -582,7 +583,8 @@ function (cfg, entries, W) {
           op: op, method: details.method || (body ? "POST" : "GET"), url: url, headers: hdrs.list(),
           anonymous: !!details.anonymous, cookie: details.cookie || null, user: details.user || null,
           password: details.password || null, timeout: details.timeout || 0,
-          redirect: details.redirect === "error" || details.redirect === "manual" ? details.redirect : "follow"
+          redirect: details.redirect === "error" || details.redirect === "manual" ? details.redirect : "follow",
+          mdoc: d.mdoc || null
         };
         var framed = frameRequest(meta, body);
         if (body) { var up = state(1, 0, "", "", url, null, 0, body.length, true); fireUp("onloadstart", up); }
@@ -790,16 +792,57 @@ function (cfg, entries, W) {
     expose("gm_notification", "GM_notification", "notification", notification, function (a, b, c, d3) { return resolved(notification(a, b, c, d3)); });
     function registerMenu(caption, fn, opt) {
       // Read options only as own properties of a real object, so a polluted prototype is never consulted.
-      var id = SH.next(), key = "", rep = false, o = typeof opt === "object" && opt !== null;
+      var id = SH.next(), key = "", rep = false, title = "", auto = true, o = typeof opt === "object" && opt !== null;
       if (typeof opt === "string") { key = opt; }
       else if (o && hasOwn(opt, "accessKey") && opt.accessKey) { key = Str(opt.accessKey); }
       if (o && hasOwn(opt, "id") && opt.id) { id = Str(opt.id); rep = true; }
-      SH.add({ script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key,
+      if (o && hasOwn(opt, "title") && opt.title) { title = Str(opt.title); }
+      if (o && hasOwn(opt, "autoClose") && opt.autoClose === false) { auto = false; }
+      SH.add({ script: d.id, scriptName: label, id: id, caption: Str(caption), accessKey: key, title: title, autoClose: auto,
         run: function () { safeCall(label, fn, W, []); } }, rep);
       menuChanged();
+      menuSync();
       return id;
     }
-    function unregisterMenu(id) { if (SH.remove(d.id, id)) { menuChanged(); } }
+    function unregisterMenu(id) { if (SH.remove(d.id, id)) { menuChanged(); menuSync(); } }
+    // ---- extension menu: only the registrations made through this closure are ever synced. The
+    // body is built by hand (no array of commands that a page could have hooked), and the
+    // long poll that carries triggers back runs only while this script has commands.
+    var syncT = null, waiting = false, failed = 0;
+    function menuBody() {
+      var list = SH.list(d.id), s = "[", i;
+      for (i = 0; i < list.length; i++) { if (i) { s += ","; } s += JSONstringify(list[i]); }
+      return { n: list.length, text: '{"mdoc":' + JSONstringify(d.mdoc) + ',"cmds":' + s + "]}" };
+    }
+    function menuWait() {
+      if (waiting) { return; }
+      waiting = true;
+      (function again() {
+        if (!SH.list(d.id).length) { waiting = false; return; }
+        pThen(client.json("menu/wait", '{"mdoc":' + JSONstringify(d.mdoc) + "}", true), function (r) {
+          failed = 0;
+          if (r && r.ext === false) { waiting = false; SH.fallback(); return; }
+          var f = r && r.fire, i;
+          if (f) { for (i = 0; i < f.length; i++) { if (f[i] && f[i].script === d.id) { SH.invoke(d.id, f[i].cmd); } } }
+          again();
+        }, function () {
+          if (++failed >= 3) { waiting = false; SH.fallback(); return; }
+          setT(again, 5000);
+        });
+      })();
+    }
+    function menuSyncNow() {
+      syncT = null;
+      var b = menuBody();
+      pThen(client.json("menu/sync", b.text, true), function (r) {
+        if (r && r.ext === false) { SH.fallback(); return; }
+        if (b.n) { menuWait(); }
+      }, function () { /* the button is not mounted for a failed sync: the next change retries */ });
+    }
+    function menuSync() {
+      if (!SH.ext || !d.mdoc || syncT !== null) { return; }
+      syncT = setT(menuSyncNow, 50);
+    }
     expose("gm_registermenucommand", "GM_registerMenuCommand", "registerMenuCommand", registerMenu, function (c, f, o) { return resolved(registerMenu(c, f, o)); });
     expose("gm_unregistermenucommand", "GM_unregisterMenuCommand", "unregisterMenuCommand", unregisterMenu, function (id) { unregisterMenu(id); return resolved(); });
     function log() { var a = aSlice(arguments); a = aConcat(["[" + label + "]"], a); fApply(conLog, con, a); }
@@ -842,7 +885,7 @@ function (cfg, entries, W) {
 
     // ---- cookies
     function cookieCall(op, details) {
-      var body = { op: op, url: absUrl(details && details.url ? details.url : L.href) };
+      var body = { op: op, url: absUrl(details && details.url ? details.url : L.href), mdoc: d.mdoc || null };
       if (op === "list") { body.name = details && details.name ? details.name : null; }
       else if (op === "set") { body.cookie = clone(details); delete body.cookie.url; }
       else { body.name = details && details.name; }

@@ -198,6 +198,7 @@ pub async fn update_user(
         // everywhere.
         if !user.enabled {
             st.session_manager.revoke_user_sessions(&user.id, None)?;
+            st.close_ext_for_user(&user.id);
         }
         Ok(user)
     })
@@ -229,6 +230,7 @@ pub async fn delete_user(
         }
         st.session_store.delete_user(&user.id)?;
         st.session_manager.revoke_user_sessions(&user.id, None)?;
+        st.close_ext_for_user(&user.id);
         st.tokens.revoke_all_for_user(&user.id)?;
         Ok(user)
     })

@@ -346,3 +346,14 @@ If you encounter issues:
    - Platform and browser
    - Error messages
    - Installation steps tried
+
+## Browser extension listener
+
+The Argus browser extension binds the pages of its browser to its connection by proxy
+authentication on a listener of its own. Turn it on in the web UI (Settings, "Extension listener",
+or `proxy.ext_port` in the config, for example `3130`); it listens on the same host as the explicit
+proxy, answers `407` to anything that is not the extension, and is applied live. In the extension's
+popup switch on "Use Argus in this browser"; the extension is told the port by Argus, so nothing
+else needs configuring. The browser must also trust the Argus CA (see above). Firefox users choose
+which containers and private windows use Argus in the same popup. The transparent listener cannot
+bind pages. See `docs/USERSCRIPT-PROTOCOL.md` section 8.

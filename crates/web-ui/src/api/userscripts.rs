@@ -122,9 +122,11 @@ impl ApiClient {
         &self,
         plan_id: &str,
         allow_connect_all: bool,
+        browser_cookies: bool,
     ) -> Result<Userscript, ApiError> {
         let req = ConfirmPlanRequest {
             allow_connect_all,
+            browser_cookies,
             enable: true,
         };
         self.post(&format!("/userscripts/plan/{}/confirm", plan_id), &req)
@@ -145,10 +147,14 @@ impl ApiClient {
         &self,
         id: &str,
         allow_connect_all: bool,
+        browser_cookies: bool,
     ) -> Result<Userscript, ApiError> {
         self.post(
             &script_path(id, "/update/approve"),
-            &ApproveUpdateRequest { allow_connect_all },
+            &ApproveUpdateRequest {
+                allow_connect_all,
+                browser_cookies,
+            },
         )
         .await
     }
@@ -158,10 +164,14 @@ impl ApiClient {
         &self,
         id: &str,
         allow_connect_all: bool,
+        browser_cookies: bool,
     ) -> Result<Userscript, ApiError> {
         self.post(
             &script_path(id, "/approve"),
-            &ApproveUpdateRequest { allow_connect_all },
+            &ApproveUpdateRequest {
+                allow_connect_all,
+                browser_cookies,
+            },
         )
         .await
     }

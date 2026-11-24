@@ -74,6 +74,7 @@ fn bench(c: &mut Criterion) {
         host: "hit.test",
         origin,
         profile: userscript_engine::DEFAULT_PROFILE,
+        ext: None,
     };
     c.bench_function("bundle/serve_3_scripts", |b| {
         b.iter(|| {

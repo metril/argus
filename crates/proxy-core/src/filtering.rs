@@ -537,6 +537,11 @@ impl ProxyContext {
         let _ = self.profile_builder.set(builder);
     }
 
+    /// The internal endpoints' state (userscript delivery, panel, extension bridge hub).
+    pub fn internal(&self) -> &Arc<Internal> {
+        &self.internal
+    }
+
     /// The persistent profile and device store, once registered.
     pub fn profile_store(&self) -> Option<&Arc<common::profile_store::ProfileStore>> {
         self.profile_store.get()
@@ -673,6 +678,9 @@ impl ProxyContext {
         // Take the request apart: the header map is moved, not copied, from here on.
         let (parts, body) = req.into_parts();
         let mut headers = parts.headers;
+        // The extension bridge's headers never leave: the session secret and the relay token
+        // are read here and removed from the request.
+        let relay = crate::ext_bridge::take_headers(&mut headers);
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -690,6 +698,31 @@ impl ProxyContext {
             port,
             path_and_query,
         );
+
+        // A fetch the extension relays for a userscript: the job must be live and this hop must
+        // pass the script's stored `@connect` (the browser follows redirects itself, so every
+        // hop arrives here). Like the proxy's own GM requests it is not filtered.
+        let mut bypass_full = bypass_full;
+        if let Some(r) = relay.as_deref() {
+            let allowed = reqwest::Url::parse(&url).is_ok_and(|u| {
+                self.internal.gm.ext().check_relay(
+                    r,
+                    &u,
+                    rctx.ext,
+                    rctx.ext_store.as_deref().unwrap_or(""),
+                )
+            });
+            if !allowed {
+                debug!("Refused a relayed request for {host}");
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::FORBIDDEN)
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "relayed request refused")
+                    .body(crate::inject::full_body(bytes::Bytes::new()))
+                    .expect("relay refusal"));
+            }
+            bypass_full = true;
+        }
 
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
@@ -987,6 +1020,36 @@ impl ProxyContext {
         // Moved out of the response (the body stream does not need them): no header-map copy.
         let mut resp = resp;
         let resp_headers = std::mem::take(resp.headers_mut());
+        // A relayed response that redirects: the hop it names is checked here, before the
+        // browser can follow it (Argus decrypted this hop, so it sees every one). Together with
+        // the check of the first hop (`route`) this makes every hop the browser follows one the
+        // proxy approved beforehand.
+        if let (Some(r), true) = (relay.as_deref(), status.is_redirection()) {
+            // Exactly one `Location`, non-empty, that parses once decoded the way browsers do
+            // (lossy UTF-8), or the response is refused; the browser would follow what we cannot
+            // read.
+            let ok = match relay_redirect_target(&url, &resp_headers) {
+                Ok(None) => true,
+                Ok(Some(t)) => {
+                    self.internal
+                        .gm
+                        .ext()
+                        .check_hop(r, &t, rctx.ext, rctx.ext_store.as_deref().unwrap_or(""))
+                        .await
+                }
+                Err(()) => false,
+            };
+            if !ok {
+                debug!("Refused a relayed redirect from {host}");
+                // No Set-Cookie, no Location: only the refusal.
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::BAD_GATEWAY)
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "relayed redirect refused")
+                    .body(crate::inject::full_body(bytes::Bytes::new()))
+                    .expect("relay redirect refusal"));
+            }
+        }
         let mut kind = classify_body(is_head, status, rtype, &resp_headers);
         // Script policy applies to every HTML document, `no-transform` or not: it adds headers
         // only, never rewrites a body the origin asked us to leave alone.
@@ -1089,6 +1152,8 @@ impl ProxyContext {
         let mut rewritten = false;
         let mut utf8_charset = false;
         let mut text_changed = false;
+        // Public id of a document that got userscripts (`Server-Timing: argus`).
+        let mut server_timing: Option<String> = None;
         let body: ProxyBody = match (kind, codings) {
             (BodyKind::Html, Ok(codings)) if (enabled || spol.is_some()) && body_allowed => {
                 let origin = csp::PageOrigin::new(
@@ -1129,16 +1194,25 @@ impl ProxyContext {
                         if idx.is_empty() {
                             return None; // zero cost: no allocation, no probe
                         }
-                        self.internal.gm.plan_document_in(
+                        // Bound to the extension session this connection authenticated as
+                        // on the extension listener, if any (never from a header).
+                        let session = rctx
+                            .ext
+                            .filter(|s| self.internal.gm.ext().allows(*s, &prof.name));
+                        let store = rctx.ext_store.as_deref().unwrap_or("");
+                        self.internal.gm.plan_document_bound(
                             &idx,
                             &prof.name,
                             &host,
                             &url,
                             &origin_of(scheme, &url_host, port),
                             rtype != RequestType::Subdocument,
+                            session,
+                            store,
                         )
                     })
                 };
+                server_timing = us.as_ref().and_then(|p| p.mdoc.clone());
                 let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
                 let panel_key = if enabled && !blocks_scripts {
                     self.internal.panel.hotkey(rctx)
@@ -1163,6 +1237,7 @@ impl ProxyContext {
                         userscripts: us_srcs,
                         panel: panel_key.as_ref(),
                         menu: menu_mode,
+                        ext: us.as_ref().is_some_and(|p| p.ext_bound),
                         ext_script: &ext_script,
                         cosmetics: &cos,
                         internal: &self.internal,
@@ -1268,6 +1343,9 @@ impl ProxyContext {
             _ => passthrough_body(resp),
         };
         let changed = rewritten || text_changed;
+        if !rewritten {
+            server_timing = None;
+        }
 
         let listed_resp = connection_listed(&resp_headers);
         let mut builder = Response::builder().status(status);
@@ -1364,6 +1442,10 @@ impl ProxyContext {
             if let Ok(v) = HeaderValue::from_str(&csp) {
                 builder = builder.header("content-security-policy", v);
             }
+        }
+        if let Some(m) = server_timing {
+            // Appended, so the site's own timing entries survive.
+            builder = builder.header("server-timing", format!("argus;desc=\"{m}\""));
         }
         let mut response = builder
             .body(body)
@@ -1513,6 +1595,78 @@ fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
         || h.get("sec-fetch-dest")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("serviceworker"))
+}
+
+/// The hop a redirect response names: `Ok(None)` without a `Location`, `Err` unless there is
+/// exactly one, non-empty, that joins onto `base` (decoded lossily as UTF-8, like a browser).
+fn relay_redirect_target(
+    base: &str,
+    h: &hyper::HeaderMap,
+) -> std::result::Result<Option<reqwest::Url>, ()> {
+    let mut it = h.get_all(hyper::header::LOCATION).iter();
+    let Some(first) = it.next() else {
+        return Ok(None);
+    };
+    if it.next().is_some() {
+        return Err(());
+    }
+    let raw = String::from_utf8_lossy(first.as_bytes());
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(());
+    }
+    reqwest::Url::parse(base)
+        .ok()
+        .and_then(|b| b.join(raw).ok())
+        .map(Some)
+        .ok_or(())
+}
+
+#[cfg(test)]
+mod relay_location_tests {
+    use super::relay_redirect_target;
+    use hyper::header::{HeaderValue, LOCATION};
+
+    fn h(vals: &[&[u8]]) -> hyper::HeaderMap {
+        let mut m = hyper::HeaderMap::new();
+        for v in vals {
+            m.append(LOCATION, HeaderValue::from_bytes(v).unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn exactly_one_parsable_location_is_followed_otherwise_refused() {
+        let base = "https://api.test/a/b";
+        assert_eq!(relay_redirect_target(base, &h(&[])), Ok(None));
+        assert_eq!(
+            relay_redirect_target(base, &h(&[b"/c"]))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "https://api.test/c"
+        );
+        // empty, blank, two of them, unparsable: refused
+        assert!(relay_redirect_target(base, &h(&[b""])).is_err());
+        assert!(relay_redirect_target(base, &h(&[b"  "])).is_err());
+        assert!(relay_redirect_target(base, &h(&[b"/x", b"https://evil.test/"])).is_err());
+        assert!(relay_redirect_target(base, &h(&[b"https://"])).is_err());
+    }
+
+    #[test]
+    fn non_ascii_locations_are_decoded_lossily_not_skipped() {
+        let base = "https://api.test/";
+        // UTF-8 host: the target the browser would go to is what is checked
+        let t = relay_redirect_target(base, &h(&["https://b\u{fc}cher.test/x".as_bytes()]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.host_str(), Some("xn--bcher-kva.test"));
+        // invalid UTF-8 bytes become U+FFFD, they do not make the header "disappear"
+        let t = relay_redirect_target(base, &h(&[b"/p\xff\xfe"]))
+            .unwrap()
+            .unwrap();
+        assert!(t.path().starts_with("/p"));
+    }
 }
 
 #[cfg(test)]

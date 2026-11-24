@@ -461,10 +461,12 @@ checksum = "0ce2a8627e8d8851f894696b39f2b67807d6375c177361d376173ace306a21e2"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "bytesize",
  "cookie",
  "expect-json",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper",
@@ -478,8 +480,10 @@ dependencies = [
  "serde_urlencoded",
  "smallvec",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tower",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1596,6 +1600,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "e2e"
 version = "0.3.5"
 dependencies = [
+ "api-types",
  "async-compression",
  "async-trait",
  "axum-test",
@@ -1636,6 +1641,7 @@ dependencies = [
 name = "e2e-browser"
 version = "0.3.5"
 dependencies = [
+ "api-types",
  "async-compression",
  "axum-test",
  "base64 0.22.1",
@@ -1654,6 +1660,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
  "userscript-engine",
  "web-api",
@@ -4192,6 +4199,7 @@ version = "0.3.5"
 dependencies = [
  "adblock",
  "age",
+ "api-types",
  "arc-swap",
  "async-compression",
  "async-stream",
@@ -4224,6 +4232,7 @@ dependencies = [
  "pem",
  "proptest",
  "proxy-core",
+ "psl",
  "rand 0.8.6",
  "rcgen",
  "regex",
@@ -5731,6 +5740,18 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite 0.24.0",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]

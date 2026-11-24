@@ -63,6 +63,34 @@ impl TestClient {
         Self::trusting(proxy, version, &[&proxy.ca_pem])
     }
 
+    /// Client behind the extension-only listener at `ext`, authenticating as
+    /// `ext:<sid>[:<store>]` (what the extension's `onAuthRequired` answers).
+    pub fn via_ext(proxy: &TestProxy, ext: std::net::SocketAddr, sid: &str, store: &str) -> Self {
+        crate::init_crypto();
+        let user = if store.is_empty() {
+            sid.to_string()
+        } else {
+            format!("{sid}:{store}")
+        };
+        let p = reqwest::Proxy::all(format!("http://{ext}"))
+            .expect("proxy url")
+            .basic_auth("ext", &user);
+        Self {
+            inner: reqwest::Client::builder()
+                .use_rustls_tls()
+                .tls_built_in_root_certs(false)
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .add_root_certificate(
+                    reqwest::Certificate::from_pem(&proxy.ca_pem).expect("CA pem"),
+                )
+                .proxy(p)
+                .build()
+                .expect("client"),
+            transparent_port: None,
+        }
+    }
+
     /// Client trusting exactly the given PEM CAs (e.g. the origin CA, to prove a connection
     /// reached the origin without interception).
     pub fn trusting(proxy: &TestProxy, version: HttpVersion, cas: &[&[u8]]) -> Self {

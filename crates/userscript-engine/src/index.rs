@@ -33,6 +33,14 @@ impl CompiledScript {
     }
 }
 
+/// Which hosts the scripts of an index can run on (see [`ScriptIndex::host_policy`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostPolicy {
+    pub any: bool,
+    pub exact: Vec<String>,
+    pub suffix: Vec<String>,
+}
+
 /// Result of building: the index plus per-script pattern problems.
 pub struct BuildReport {
     pub index: ScriptIndex,
@@ -101,6 +109,20 @@ impl ScriptIndex {
 
     pub fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// Hosts the enabled scripts can inject on: `any` when some script matches arbitrary
+    /// hosts, else the exact hosts and the suffixes (a suffix covers itself and subdomains).
+    pub fn host_policy(&self) -> HostPolicy {
+        let mut exact: Vec<String> = self.exact.keys().map(|k| k.to_string()).collect();
+        let mut suffix: Vec<String> = self.suffix.keys().map(|k| k.to_string()).collect();
+        exact.sort();
+        suffix.sort();
+        HostPolicy {
+            any: !self.any.is_empty(),
+            exact,
+            suffix,
+        }
     }
 
     pub fn len(&self) -> usize {

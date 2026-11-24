@@ -137,10 +137,12 @@ pub fn restricted_may_use(p: &Principal, rule: &RouteAuth, method: &Method) -> b
     let RouteAuth::Scopes(required) = rule else {
         return true;
     };
-    if required
-        .iter()
-        .all(|s| matches!(s, Scope::TokensSelf | Scope::SessionsSelf))
-    {
+    if required.iter().all(|s| {
+        matches!(
+            s,
+            Scope::TokensSelf | Scope::SessionsSelf | Scope::UserscriptsBridge
+        )
+    }) {
         return true;
     }
     if is_unsafe(method) {

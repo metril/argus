@@ -83,8 +83,9 @@ nonce'd inline `<script>`.
 * Outbound concurrency: 8 per script, 32 per profile (`429` + `quota_exceeded`). The request body is
   buffered up to `Quotas::max_request_body` (64 MiB); the response is streamed with a 256 MiB cap
   and one overall deadline (`timeout`). `Accept-Encoding: identity` is sent unless the script set one.
-* Not implemented: attaching the browser's own cookies for `anonymous: false` (the proxy cannot
-  see them; only the GM jar is used), and a shared, cacheable runtime URL.
+* The browser's own cookies for `anonymous: false` are attached only through the extension bridge
+  (section 8) and only for scripts approved for it (`browser_cookies`); otherwise the proxy cannot
+  see them and only the GM jar is used. Not implemented: a shared, cacheable runtime URL.
 
 ## 3. Capability token
 
@@ -176,7 +177,7 @@ script itself stored or received are listed to that script, as Tampermonkey's `G
 its `httpOnly` field; scoping follows RFC 6265: domain-match, path-match, host-only, `Secure` only
 over https, `Domain=` refused for public suffixes and unlisted single-label TLDs)
 for send and `Set-Cookie`; the browser's own cookies for third-party sites are not available to
-a proxy.
+a proxy (a script approved for browser logins gets them through the extension, section 8.4).
 
 Response: `200` + `Content-Type: application/x-gm-frames`, then frames
 `u8 type | u32 big-endian len | payload`:
@@ -217,7 +218,13 @@ Still possible, so **backend checks must never rely on page-side secrecy**:
 * it can read the bundle URL if it is guessable or reusable, and thus steal tokens; a stolen
   token is usable only from that origin (the `Origin` header is checked), for that script, until
   expiry, with that script's server-side grants;
-* it can call the endpoints itself with a stolen token, or replace `window.fetch`.
+* it can call the endpoints itself with a stolen token, or replace `window.fetch`;
+* it can read the document's public `mdoc` (`Server-Timing`) and forge the `ext:` marker of the
+  runtime tag or a `menu/wait` answer. That marker only decides whether the in-page button is
+  mounted, so a forged `ext:true` (a page script or a service worker that rewrites the markup) hides
+  the button and nothing else (a denial of the in-page menu): listing or triggering commands and
+  the credentialed relay all need the bridge token and a live session bound to the document (and, for the page's own GM calls and relays, the very connection the document was served to), which
+  the page cannot obtain (section 8).
 
 ### 6.1 Service workers
 
@@ -299,3 +306,273 @@ code can neither list nor invoke commands. The registry is handed once to the me
 inlined in the same script (`docs/SCRIPT-POLICY.md`); scripts register through `GM_registerMenuCommand`.
 `data-m` (`on_demand` | `always`) on the runtime's `<script>` tag selects the button mode; without it
 no button is shown.
+Commands also reach the extension's popup when the document is bound to a connected extension
+session (section 8.3); then the in-page button is not mounted (`data-m="ext:<mode>"`) unless the
+proxy answers `{ext:false}`. After a freshly shown or re-attached badge, clicks are ignored for
+300 ms (menu items keep their 400 ms guard).
+
+## 8. Extension bridge
+
+The Argus browser extension can connect to the proxy. While it is connected (1) the userscript menu
+commands of a page are listed and triggered from the extension's popup, and the in-page button is
+not mounted for pages opened in that browser, and (2) `GM_xmlhttpRequest` and `GM_cookie` of scripts
+approved for it use the browser's own cookies. Without a connected extension, or for a document the
+extension did not bind, everything behaves exactly as described in sections 1 to 7.
+
+Authority never comes from the extension. The proxy decides from the *stored* script (grants,
+`@connect`, `browser_cookies`, anonymous flag, method and header rules, destination policy) before
+it dispatches anything; the extension can only narrow what it was asked to do (it re-checks the
+host against the job's `@connect` and its own host permissions).
+
+### 8.1 Channel
+
+The extension's background script opens a WebSocket `GET /api/v1/ext/channel` on the web API.
+
+* The web API accepts the upgrade only without an `Origin` header or from a `chrome-extension://`,
+  `moz-extension://` or `safari-web-extension://` origin. The route is public at the HTTP layer
+  (browsers cannot set headers on a WebSocket and the token must not be in the URL): the first frame,
+  within 5 seconds, is `{"t":"hello","token":"abk_...","v":1}`. Anything else closes the socket:
+  `4408` no hello in time, `4400` malformed hello, `4401` unknown, revoked or expired token (or
+  disabled owner), `4403` token without the scope `userscripts:bridge`.
+* The server answers `{"t":"welcome","sid":"<32 hex>","v":1}` and then
+  `{"t":"proxy","host":<string|null>,"port":<int|null>}`. `sid` is a random 128-bit secret generated
+  for this connection (every reconnect gets a new one) and shown to nobody but the extension.
+  `proxy` says where the extension listener (8.2) is (`port` null: it is off; `host` null: the host
+  of the Argus URL the extension was configured with). The same message is sent again when the
+  setting changes.
+* Text frames: ext to server `{"t":"ping"}` every 20 seconds (answered `{"t":"pong"}`; the channel is
+  closed after 75 seconds of silence) and `{"t":"perms","origins":[...]}` (the extension's per-host
+  permissions, sent after welcome and on every change).
+* Firefox event pages are suspended: the extension reconnects from an `alarms` tick every 30 seconds.
+* A token may hold at most 8 concurrent sessions (the oldest is closed with `4409`). In Chrome the
+  incognito instance (manifest `incognito: "split"`) is a second client with its own session.
+* Revocation is immediate: revoking a token, or disabling or deleting its owner, closes its live
+  channels (`4401`) and ends the proxy connections its sessions authenticated (8.2). The channel
+  also re-verifies its token every 3 pings (expiry and anything else that invalidates it end the
+  channel within about a minute). When the channel closes the extension stops using the proxy.
+* The proxy never waits on the extension's reader: a job whose page reads too slowly (its queue of
+  32 answers fills up) is removed, the extension gets a cancel frame and the page gets an error; a
+  chunk is never dropped and followed by a normal end.
+* Audit: session open and close, every `perms` report and every relayed request are written to the
+  audit log (`ext/session_open`, `ext/session_close`, `ext/perms`, `ext/relay`; the relay entry names
+  the script, operation, method and host, never URLs, bodies or cookies); changes of the
+  `browser_cookies` approval are audited as the approve and confirm calls they are, and each
+  relayed request is also logged to the script's security audit.
+
+### 8.2 Binding a document to a browser (proxy authentication)
+
+Nothing about the client's address, and no request header, decides which browser a document
+belongs to. The binding is the way enterprise forward proxies do it: **proxy authentication on a
+listener of its own**.
+
+1. **The extension listener.** `proxy.ext_port` (web UI: Settings, "Extension listener"; persisted,
+   applied live, off by default, bound to `proxy.host`) is an explicit-proxy listener with the same
+   switches as the explicit one (MITM, HTTP/2, WebSockets, ad blocking). It answers every request
+   and every `CONNECT` that has no valid credentials with
+   `407 Proxy Authentication Required`, `Proxy-Authenticate: Basic realm="argus-ext"` and closes
+   the connection. The normal ports never answer `407` for this, and nothing in this section
+   applies to them. The transparent listener (no proxy configuration on the client) has no
+   binding at all.
+2. **Credentials.** HTTP: `Proxy-Authorization: Basic base64("ext:" + sid [+ ":" + store])`. The
+   listener also speaks **SOCKS5** (it sniffs the first byte, `0x05`): only username/password
+   authentication (RFC 1929) is accepted (a client offering no such method is refused), the user
+   name is `ext` and the password `sid[:store]`; the `CONNECT` it then asks for goes through the
+   same destination policy, bypass, EV and MITM decisions as an HTTP `CONNECT` (a TLS ClientHello
+   is intercepted or tunnelled, anything else is plain HTTP to that host). `sid` is the
+   channel's session secret and is compared in constant time against every live session; `store`
+   is optional and opaque (8.3). Credentials of an unknown, closed or revoked session are
+   refused with `407` like missing ones. `Proxy-Authorization` is always removed before a request
+   goes upstream (HTTP/1, HTTP/2, WebSocket upgrades, tunnels carry it only in the `CONNECT` head,
+   which the proxy consumes).
+3. **Binding.** The first valid credentials of a connection (the `CONNECT` head, or the first plain
+   request) bind the *whole connection* to the session, and so every request the proxy decrypts
+   inside the tunnel. Nothing inside a tunnel can rebind. If the session's token is restricted to
+   profiles, the connection is pinned to the first of them; otherwise the usual profile resolution
+   applies. A document is bound only when the session's token may serve the document's profile.
+4. **Lifetime.** Every request on a bound connection re-checks that the session is live (a plain
+   request, a tunnelled request, a new `CONNECT`); a connection whose session ended (channel
+   closed, token revoked, user disabled or deleted) is closed within half a second, tunnels
+   and upgraded WebSocket splices included. The SOCKS5 handshake (greeting, credentials and
+   request) has one deadline (`performance.connection_timeout_secs`), and a destination that
+   does not normalise is refused (reply 4), never dialled as written. The extension gets a new `sid` on every reconnect: its existing connections get a
+   `407` and re-authenticate.
+5. **The extension** (`proxy` and `webRequest` permissions, plus `webRequestAuthProvider` in
+   Chrome). The popup has "Use Argus in this browser" (off by default). While it is on and the
+   channel is connected and has told the extension where the listener is, Chrome has
+   `proxy.settings` (`fixed_servers`, scope `regular`, the Argus host and `<local>` bypassed) and
+   Firefox answers `proxy.onRequest` with the listener as a SOCKS5 proxy with per-request
+   credentials (Firefox keeps one HTTP proxy-credential cache for all containers, which would
+   bind every container to the first one's store, and ignores `proxyAuthorizationHeader` for
+   HTTPS tunnels; so in Firefox the identity rides on the proxy connection only and nothing of it
+   is in any request, which matters on hosts Argus tunnels without decrypting); off or
+   disconnected, Chrome clears the setting and Firefox answers `direct`. In Chrome the `407` is
+   answered by `webRequest.onAuthRequired` and only when `isProxy`, the realm is `argus-ext` and the challenger is the listener host and port
+   the server announced; each request id is answered once. The host and port come from the server
+   over the channel, never from a page. Nothing else (any other proxy, any other realm) is
+   ever answered.
+
+A document that is not bound (opened without the extension, through a normal port, before the
+extension connected, or by a connection that did not authenticate) behaves exactly as without the
+bridge: no `Server-Timing` entry, no id, no record in the proxy, the in-page button as usual.
+
+### 8.3 Documents, `mdoc`, menus, cookie stores
+
+Every HTML document that gets userscripts **and is bound to a live session** has a random 128-bit
+public id `mdoc`, separate from the secret bundle id. It is sent as
+`Server-Timing: argus;desc="<mdoc>"` (appended to the site's own timing entries), put in each
+script's descriptor (`d.mdoc`), and the runtime tag becomes `data-m="ext:<mode>"` (`mode` is the
+profile's menu button setting, `off` when it is off). An unbound document gets none of this and
+cannot crowd out a bound one. Records are capped at 256 per session; beyond it that session's own
+oldest is evicted, never another session's. A page can read the `Server-Timing` value, but the id
+alone grants nothing:
+
+* listing and triggering need a bridge token **and** the caller's own live session, and the
+  document must be bound to that session and to the caller's cookie store (a document opened by
+  another browser, another container or a browser without the extension is refused with `403`);
+* the runtime's calls need a script's capability token, and the document must belong to the token's
+  profile and origin, list that script, **and have been served to the very connection the call
+  arrives on** (same extension session, same cookie store). An `mdoc` and a script token are not
+  secrets (the page and the browser's own devtools see them), so a call from another browser, another
+  container or an unauthenticated connection that presents them is refused (`menu/sync`,
+  `menu/wait`) or served by the script's own jar (relays), never relayed.
+
+**Cookie stores (Firefox containers, private windows).** The extension's credentials carry a store
+token, `ext:<sid>:<token>`, for every store except the default one (Chrome has a single store per
+extension instance and sends none). The token is an opaque 12-character id the extension generated
+for this session and maps back to the real `cookieStoreId` (the proxy never sees `firefox-container-3`
+or the like); a new session gets new tokens. A connection and every document on it is bound to
+(session, store). The popup names the store of its tab in `X-Argus-Store: <token>` on `GET /ext/menu`
+and `POST /ext/menu/trigger`; a document of another store is `403`, exactly like a document of
+another browser. Relay jobs (8.4) carry the store token of their document.
+
+Runtime endpoints (`/__adblock__/gm/v1/`, same authentication and fetch metadata rules as section 4):
+
+| route | request | answer |
+|---|---|---|
+| `menu/sync` | `{mdoc, cmds:[{id,name,accessKey,title,autoClose}]}` (needs `@grant GM_registerMenuCommand`; at most 64 commands, texts clipped to 200 characters) | `{ext:bool}`: a live session serves the document |
+| `menu/wait` | `{mdoc}` (long poll, 25 s) | `{ext:true,fire:[{script,cmd}]}` (empty after the poll length or when superseded by a newer poll of the same script) or `{ext:false}` |
+
+The runtime syncs (debounced) after `GM_registerMenuCommand`/`GM_unregisterMenuCommand`, builds the
+body by hand from its own closure (a page cannot add or see entries), polls `menu/wait` only while
+the script has commands, and runs a fired command from its closure. On `{ext:false}` (or after
+three failed polls) it mounts the in-page button as usual, with the mode from `data-m`.
+
+Web API (scope `userscripts:bridge`, header `X-Argus-Session: <sid>` naming a live session of the
+calling token; cookie logins cannot use them):
+
+* `GET /ext/menu?mdoc=` returns `{commands:[{script,script_name,cmd,name,access_key,title,auto_close}],
+  grants:[{script,script_name,host,patterns}]}`. `grants` lists, for scripts approved for browser
+  logins, the `@connect` hosts the extension holds no host permission for (`*://*.host/*` patterns,
+  never `@connect *`, TLD wildcards or public suffixes); the popup offers "Grant" for each.
+* `POST /ext/menu/trigger` with `{mdoc,script,cmd}` queues the command (it must have been synced)
+  and returns `{delivered}`: true when the page's poll was waiting. A queued command expires after
+  10 seconds.
+
+The popup reads the `mdoc` from the active tab with `scripting.executeScript` (isolated world, top
+frame, `performance.getEntriesByType('navigation')[0].serverTiming`).
+
+### 8.4 Credentialed requests and cookies
+
+A script has the approval flag `browser_cookies` (default off). It can be granted only while the
+script is being reviewed: on `POST /userscripts/plan/{id}/confirm`, on `POST /userscripts/{id}/approve`
+of an imported script awaiting approval (`409 not_pending_approval` otherwise), and with an update
+approval. It needs a network or cookie grant (`GM_xmlhttpRequest`, `GM_cookie`) and is never taken
+from a file without `approve`.
+
+A `xhr` (not `download`) or `cookie` call goes to the browser only when all of these hold; otherwise
+the script's own jar is used (and the script's page in the dashboard shows "browser logins
+unavailable" until a call succeeds through the browser):
+
+1. the script's own checks pass: grant, `@connect`, method and header rules, destination policy;
+2. the call is not `anonymous`, the script has `browser_cookies`, and `redirect` is not `manual`
+   (a browser fetch cannot expose the redirect response itself);
+3. the call names an `mdoc` that belongs to the token's profile and origin, lists the script and
+   was served to the connection the call arrives on (see 8.3);
+4. that document is bound to a session which is still live;
+5. the extension listener is decrypting (global MITM on and the listener's own MITM switch on),
+   the target is not Argus itself (its console, the panel and dashboard hosts), and the target is
+   not loopback, private or link-local (IP literals, `localhost`, `*.local`), and Argus
+   decrypts it (not bypassed or passthrough, the bypass fail-safe is not active, the Extended
+   Validation setting does not tunnel it): the relay's per-hop check can only run on traffic the
+   proxy decrypts, and a relay token must never travel through a tunnel to a third party;
+6. that session reported a host permission covering the target host. Only per-host permissions
+   count (`*://host/*`, `*://*.host/*` as the popup grants them): `<all_urls>`, `*://*/*`,
+   `https://*/*` and public-suffix patterns never give relay authority, and the extension reports
+   only per-host grants (it remembers the ones granted through the popup, because Firefox lists
+   just `<all_urls>` for its manifest permission).
+
+The job goes to that session only. Binary frames in both directions are `u8 type | u32 job | payload`
+(big endian), reusing the frame types of section 5.1:
+
+| dir | type | payload |
+|---|---|---|
+| proxy to ext | 0 job | JSON `{op:"xhr"|"cookie", script, relay, store?, connect:{page,list,all}, hasBody, ...}`; `xhr`: `method,url,headers,redirect,timeout`; `cookie`: `cookie:{op:"list"|"set"|"delete",url,...}` |
+| proxy to ext | 2 / 3 | request body chunk / end of request body |
+| proxy to ext | 5 | cancel (the page aborted, or the proxy gave up) |
+| ext to proxy | 1 | head JSON `{status,statusText,headers,finalUrl,redirected}`; for `cookie`: `{result}` |
+| ext to proxy | 2 / 3 | response body chunk / end |
+| ext to proxy | 4 | error `{kind,code,message}` |
+
+The proxy pipes the answer to the page as a section 5.1 stream (removing `Set-Cookie`), with the
+256 MiB cap and the call's deadline. Script-set `Cookie`, `Origin` and `Host` headers are dropped on
+this path (the browser supplies its own). A session can only answer jobs it was given.
+
+`xhr` is a `fetch` with the header `X-Argus-Relay: <relay>`, made by the extension and therefore
+through the extension listener (8.2) like any request of that browser. The proxy checks every hop
+(the browser follows redirects itself): the relay token must belong to a live job **and the hop
+must arrive on a connection that authenticated as that job's session** (in the default store); the
+session must still hold a permission for the hop's host, the host must not be local, private or
+bypassed, and the URL must pass the script's stored `@connect`; the request is then not filtered,
+and the header is removed before it goes upstream. A refused hop gets `403` with the note
+`relayed request refused`, which the extension turns into an error frame.
+
+Redirects. `fetch(..., {redirect: 'manual'})` returns an opaque response whose `Location` the
+extension cannot read, so the extension cannot follow hops itself; the checks run in the proxy
+instead, by induction. The first hop is approved by the routing rules above before anything is
+dispatched. Every relayed response is decrypted by Argus, so when one is a `3xx` with a `Location`
+the proxy resolves it against the request URL and runs the full hop check on the target *before
+the browser can follow it*: the job is live and the hop arrives on its session's connection, the
+session holds a permission for the host, the host is public (not loopback, private or
+link-local) and is not bypassed, the bypass fail-safe is not active, the script's `@connect`
+allows it, and Argus will decrypt it (with the Extended Validation setting on, a probe must have
+shown the host is not EV; an EV or unprobeable host is tunnelled, so it fails). A response with no
+`Location` is passed; one with more than one `Location`, an empty one, or one that does not parse
+after a lossy UTF-8 decode (what a browser does) is refused like a failed hop. A hop that fails
+is replaced by `502` with `x-adblock-note: relayed redirect refused`, without `Location` or
+`Set-Cookie`, which the extension turns into an error frame. Every hop the browser follows was
+therefore approved before it was requested, whatever the chain looks like; there is no hop the
+proxy cannot see. `redirect: "manual"` calls are never relayed (they use the jar, which returns the
+real 3xx); `error` is the browser's own `redirect: 'error'`. The extension also re-checks the
+*final* URL against the job's `@connect`, its host permission and the local-target rule before any
+byte of the answer is passed on, and refuses loopback and private targets for the first URL.
+
+**Cookie stores.** A background `fetch` always uses the extension's default store. For a job whose
+document belongs to another store (`store` in the job, a Firefox container or private window) the
+extension (1) fetches with `credentials: 'omit'` and a per-job marker header `X-Argus-Job`; (2) in a
+blocking `webRequest.onBeforeSendHeaders` listener, for every hop carrying a registered marker,
+replaces `Cookie` with all cookies of that store for the hop's URL (`cookies.getAll({url, storeId})`,
+HttpOnly ones included, because the browser would send them) and removes the marker; (3) in a
+blocking `webRequest.onHeadersReceived` listener removes `Set-Cookie` from the hop's response and
+writes each one to that store (`cookies.set({storeId, ...})`: Domain, Path, Secure, HttpOnly,
+SameSite, Expires and Max-Age honoured, an expired or `Max-Age<=0` cookie deletes). The default
+store is never read or written for such a job; a marker nobody registered gets no cookies and is
+stripped. `GM_cookie` for a store reads and writes with that `storeId`. Chrome has one store per
+extension instance: its incognito windows are served by the second (`split`) instance with its own
+session, cookie jar and connection, so no cross-store case arises. A browser without blocking
+`webRequest` answers a store job with an error (`store`), never with the default store's cookies.
+
+`cookie` operations use the job's store. **HttpOnly cookies are never exposed to scripts**:
+the extension filters them out of lists and refuses to set, overwrite or delete one, and the proxy
+removes any `http_only` entry from results and refuses `http_only: true` writes itself.
+
+### 8.5 Limits
+
+* A document opened before the extension connected, through a normal port, or before the browser
+  switched to the extension listener is not bound: it keeps its in-page button and its scripts use
+  the jar until reloaded. The transparent listener never binds.
+* `@connect *` is not offered for host grants (no blanket logins); a request to a host the
+  extension has no permission for falls back to the jar.
+* The extension listener is the single place that binds. A browser that does not use it (toggle
+  off, a Firefox container the user switched off) is simply unbound.
+* Incognito in Chrome needs the extension to be allowed in incognito windows; without it those
+  windows are unbound (the proxy setting applies to regular windows only) and use the jar.

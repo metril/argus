@@ -9,6 +9,7 @@ use crate::auth::session::SessionManager;
 use crate::auth::tokens::TokenStore;
 use crate::config::ApiConfig;
 use crate::error::{ApiError, ApiResult};
+use api_types::{ExtAuditEvent, ExtError, ExtIdent, ExtOut};
 use chrono::Utc;
 use common::config::ProxyConfig;
 use common::db::redb::{Durability, ReadableTable};
@@ -134,6 +135,41 @@ impl Drop for LogStreamGuard {
     }
 }
 
+/// The browser-extension bridge: live sessions, document binding, menus and job relay.
+/// Implemented by the proxy (`ExtHub`) and attached at startup ([`AppState::ext`]), so this crate
+/// does not depend on it. Without one the channel endpoint answers 503.
+#[async_trait::async_trait]
+pub trait ExtBridge: Send + Sync {
+    /// Register a session. Returns its id, the secret `sid` the extension puts in the
+    /// `ext:<sid>` proxy credentials and the queue of frames to send.
+    fn open(&self, ident: ExtIdent) -> (u64, String, tokio::sync::mpsc::Receiver<ExtOut>);
+    async fn on_text(&self, session: u64, text: &str);
+    async fn on_binary(&self, session: u64, data: Vec<u8>);
+    fn close(&self, session: u64);
+    /// Close every live session of a token (revoked, expired, or its owner disabled/deleted).
+    fn close_token(&self, token_id: &str);
+    /// `{"t":"proxy","host":..,"port":..}` telling the extension where its proxy listener is.
+    fn proxy_msg(&self) -> String;
+    /// The live session whose `sid` is `sid` and that belongs to token `token_id`.
+    fn session_for(&self, sid: &str, token_id: &str) -> Option<u64>;
+    fn menu(
+        &self,
+        session: u64,
+        store: &str,
+        mdoc: &str,
+    ) -> Result<api_types::ExtMenuResponse, ExtError>;
+    fn trigger(
+        &self,
+        session: u64,
+        store: &str,
+        req: &api_types::ExtTriggerRequest,
+    ) -> Result<bool, ExtError>;
+    /// A script approved for browser logins whose last request fell back to the jar.
+    fn browser_fallback(&self, profile: &str, script: &str) -> bool;
+    /// Sink for audit records (installed by [`AppState::ext_audit`] wiring).
+    fn set_audit(&self, sink: Arc<dyn Fn(ExtAuditEvent) + Send + Sync>);
+}
+
 /// Live traffic of one listener.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListenerCounters {
@@ -154,6 +190,10 @@ pub trait RuntimeControl: Send + Sync {
         port: u16,
         transparent_port: Option<u16>,
     ) -> Result<ProxyBind, String>;
+    /// Move the extension-only listener (`None` = off).
+    async fn rebind_ext(&self, _host: &str, _port: Option<u16>) -> Result<(), String> {
+        Ok(())
+    }
     /// Apply the client ACL, TLS passthrough hosts, destination rules, DNS, limits and
     /// per-listener switches, all or nothing.
     async fn apply_access(&self, config: &ProxyConfig) -> Result<(), String>;
@@ -275,6 +315,9 @@ pub struct AppState {
 
     /// Live control of the proxy listeners and access lists (`None` without a proxy).
     pub runtime: OnceLock<Arc<dyn RuntimeControl>>,
+
+    /// The extension bridge (installed by the proxy; absent otherwise).
+    pub ext: OnceLock<Arc<dyn ExtBridge>>,
 
     /// The running web API server, for rebinding its own listener (set by `start_server`).
     pub web_server: OnceLock<Arc<crate::server::WebServer>>,
@@ -842,6 +885,7 @@ pub async fn build_state_full(
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
         timeseries: Default::default(),
         runtime: OnceLock::new(),
+        ext: OnceLock::new(),
         web_server: OnceLock::new(),
         overlay_path: Arc::new(RwLock::new(common::config::default_overlay_path(
             &overlay_dir,

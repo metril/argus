@@ -114,6 +114,10 @@
           "allow_connect_all": {
             "description": "Also approve a newly requested `@connect *`.",
             "type": "boolean"
+          },
+          "browser_cookies": {
+            "description": "Approve browser logins (only while the script is awaiting approval or an update is\npending).",
+            "type": "boolean"
           }
         },
         "type": "object"
@@ -1363,6 +1367,10 @@
             "description": "Approve `@connect *` (rejected if the script does not declare it).",
             "type": "boolean"
           },
+          "browser_cookies": {
+            "description": "Approve browser logins (relay through the connected extension). Needs a network or\ncookie grant.",
+            "type": "boolean"
+          },
           "enable": {
             "type": "boolean"
           }
@@ -2121,6 +2129,9 @@
           "assets": {
             "$ref": "#/components/schemas/ExportedAssets"
           },
+          "browser_cookies": {
+            "type": "boolean"
+          },
           "enabled": {
             "type": "boolean"
           },
@@ -2143,6 +2154,35 @@
         },
         "required": [
           "source"
+        ],
+        "type": "object"
+      },
+      "ExtGrant": {
+        "description": "A script that wants this browser's logins for hosts the extension holds no permission for.",
+        "properties": {
+          "host": {
+            "description": "Host (or `*.host`) shown to the user.",
+            "type": "string"
+          },
+          "patterns": {
+            "description": "Host permission patterns to request, e.g. `*://a.com/*`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "script": {
+            "type": "string"
+          },
+          "script_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script",
+          "script_name",
+          "host",
+          "patterns"
         ],
         "type": "object"
       },
@@ -2212,6 +2252,64 @@
           "unsupported",
           "parse_errors",
           "badfiltered"
+        ],
+        "type": "object"
+      },
+      "ExtMenuCommand": {
+        "description": "One userscript menu command of a document.",
+        "properties": {
+          "access_key": {
+            "type": "string"
+          },
+          "auto_close": {
+            "description": "Close the popup after triggering (default true).",
+            "type": "boolean"
+          },
+          "cmd": {
+            "description": "Command id (opaque, unique within the script).",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "script": {
+            "description": "Script id.",
+            "type": "string"
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script",
+          "script_name",
+          "cmd",
+          "name"
+        ],
+        "type": "object"
+      },
+      "ExtMenuResponse": {
+        "description": "Menu commands of one document plus host grants its scripts are waiting for.",
+        "properties": {
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/ExtMenuCommand"
+            },
+            "type": "array"
+          },
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/ExtGrant"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "commands",
+          "grants"
         ],
         "type": "object"
       },
@@ -2302,6 +2400,38 @@
           "dropped_untrusted_by_list",
           "issues",
           "issues_truncated"
+        ],
+        "type": "object"
+      },
+      "ExtTriggerRequest": {
+        "description": "Trigger one command.",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          },
+          "mdoc": {
+            "type": "string"
+          },
+          "script": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mdoc",
+          "script",
+          "cmd"
+        ],
+        "type": "object"
+      },
+      "ExtTriggerResponse": {
+        "properties": {
+          "delivered": {
+            "description": "The page's runtime was waiting (or the command was queued for it).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "delivered"
         ],
         "type": "object"
       },
@@ -4415,6 +4545,15 @@
             "$ref": "#/components/schemas/ListenerFlagsView",
             "description": "Effective switches of the explicit-proxy listener."
           },
+          "ext_port": {
+            "description": "Port of the extension-only listener (`None` = off): the Argus browser extension sends its\nbrowser through it so documents are bound to the extension session.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "host": {
             "type": "string"
           },
@@ -4905,6 +5044,7 @@
           "CaAdmin",
           "ScriptsRead",
           "ScriptsWrite",
+          "UserscriptsBridge",
           "PolicyRead",
           "PolicyWrite",
           "ProfilesRead",
@@ -6036,6 +6176,15 @@
               }
             ]
           },
+          "ext_port": {
+            "description": "Extension listener port; `0` turns it off. Applied live.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "host": {
             "type": [
               "string",
@@ -6593,6 +6742,14 @@
               "null"
             ]
           },
+          "browser_cookies_approved": {
+            "description": "Browser logins (extension relay of non-anonymous requests and cookies) were approved.",
+            "type": "boolean"
+          },
+          "browser_logins_unavailable": {
+            "description": "Set when the script is approved for browser logins but its last request fell back to the\nproxy's own cookie jar (no connected extension, or no host permission).",
+            "type": "boolean"
+          },
           "connect": {
             "items": {
               "type": "string"
@@ -7119,7 +7276,8 @@
       "tokens:admin": "List and revoke any user's API tokens.",
       "tokens:self": "Create, list and revoke your own API tokens.",
       "users:admin": "Create, update, disable and delete user accounts.",
-      "users:read": "List and view user accounts."
+      "users:read": "List and view user accounts.",
+      "userscripts:bridge": "Connect the browser extension to userscripts: list and trigger a page's menu commands, and let approved scripts use this browser's logins."
     }
   },
   "info": {
@@ -11488,6 +11646,208 @@
         "summary": "Engine build status.",
         "tags": [
           "engine"
+        ]
+      }
+    },
+    "/api/v1/ext/channel": {
+      "get": {
+        "operationId": "channel",
+        "responses": {
+          "101": {
+            "description": "Switching protocols; first frame `{\"t\":\"hello\",\"token\":...,\"v\":1}`"
+          },
+          "403": {
+            "description": "Origin is not an extension"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          },
+          "503": {
+            "description": "No extension bridge in this build"
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "WebSocket channel of the browser extension.",
+        "tags": [
+          "ext"
+        ]
+      }
+    },
+    "/api/v1/ext/menu": {
+      "get": {
+        "operationId": "menu",
+        "parameters": [
+          {
+            "description": "Public document id from the page's `Server-Timing: argus` entry.",
+            "in": "query",
+            "name": "mdoc",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtMenuResponse"
+                }
+              }
+            },
+            "description": "Commands and grants"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "No session, or the document is bound to another one"
+          },
+          "404": {
+            "description": "Unknown document"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "userscripts:bridge"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "userscripts:bridge"
+            ]
+          }
+        ],
+        "summary": "Menu commands the document's userscripts registered, plus host grants they are waiting for.",
+        "tags": [
+          "ext"
+        ]
+      }
+    },
+    "/api/v1/ext/menu/trigger": {
+      "post": {
+        "operationId": "trigger",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtTriggerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtTriggerResponse"
+                }
+              }
+            },
+            "description": "Queued for the page"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "No session, or the document is bound to another one"
+          },
+          "404": {
+            "description": "Unknown document or command"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "userscripts:bridge"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "userscripts:bridge"
+            ]
+          }
+        ],
+        "summary": "Run one menu command in the page.",
+        "tags": [
+          "ext"
         ]
       }
     },
@@ -19890,6 +20250,10 @@
     {
       "description": "Devices and their tokens",
       "name": "devices"
+    },
+    {
+      "description": "Browser extension bridge (channel, userscript menus)",
+      "name": "ext"
     },
     {
       "description": "Audit log",

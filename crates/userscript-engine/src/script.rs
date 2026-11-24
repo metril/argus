@@ -90,6 +90,10 @@ pub struct Userscript {
     /// The user approved `@connect *` for this script at install time.
     #[serde(default)]
     pub allow_connect_all: bool,
+    /// The user approved sending this script's non-anonymous requests and cookie calls through
+    /// the connected browser extension (real browser logins). Granted only during review.
+    #[serde(default)]
+    pub browser_cookies: bool,
     /// Imported from a bundle without approval: stays off until approved.
     #[serde(default)]
     pub pending_approval: bool,
@@ -120,6 +124,7 @@ impl Userscript {
             execution_count: 0,
             assets: ScriptAssets::default(),
             allow_connect_all: false,
+            browser_cookies: false,
             pending_approval: false,
             pending_update: None,
             last_update_check: None,

@@ -148,6 +148,46 @@ jobs:
         env:
           ARGUS_KERNEL_TEST: "1"
 
+  # The real extension in real browsers against a real Argus process (own data dir, ephemeral
+  # ports, stub DNS). One shard per browser.
+  ext-e2e:
+    runs-on: ubuntu-24.04  # Playwright 1.56 has no Chromium build for ubuntu 26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ext-e2e
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: Build the extension for tests (per-host permissions a headless browser cannot be asked for)
+        working-directory: extension
+        run: |
+          npm ci
+          ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*,*://127.0.0.1/*' npx wxt build -b chrome
+          npx wxt build -b firefox
+      - name: Chromium that honours --load-extension (branded Chrome 137+ removed it)
+        if: matrix.browser == 'chromium'
+        run: |
+          npx --yes playwright@1.56.1 install --with-deps chromium
+          echo "ARGUS_EXT_BROWSER=$(ls -d $HOME/.cache/ms-playwright/chromium-*/chrome-linux*/chrome | tail -n1)" >> "$GITHUB_ENV"
+      - run: cargo build -p proxy-core --bin argus --features full
+      - run: cargo nextest run -p e2e-browser --test extension_${{ matrix.browser }} --no-fail-fast --no-capture
+        env:
+          ARGUS_EXT_E2E: "1"
+
   extension:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -177,7 +217,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [fmt, clippy, build, test, e2e, browser, kernel, extension]
+    needs: [fmt, clippy, build, test, e2e, browser, kernel, extension, ext-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeEnv, runScript } from "./harness.mjs";
 
+const guardTest = { on: false };
 let off = 0;
 const realNow = Date.now;
 Date.now = () => realNow() + off;
@@ -55,7 +56,15 @@ class Nd extends ET {
   get parentNode() { return this.pn; }
   get textContent() { return this.tx === undefined ? "" : this.tx; }
   set textContent(v) { this.tx = v; }
-  appendChild(c) { attach(this, c); return c; }
+  // The first time the badge host is attached, time passes (the 300 ms click guard of a fresh
+  // badge is covered by its own test, which turns this off).
+  appendChild(c) {
+    const first = c.shadow && !c.seen && !guardTest.on;
+    if (c.shadow) c.seen = true;
+    attach(this, c);
+    if (first) advance(350);
+    return c;
+  }
   removeChild(c) { detach(this, c); return c; }
   insertBefore(c, ref) {
     if (c.pn) detach(c.pn, c);
@@ -85,6 +94,7 @@ class El extends Nd {
 class N extends El {
   constructor(tag) { super(); this.tag = tag; this.at = nul(); this.sx = new CSD(); this.popped = 0; this.cw = 0; this.chh = 0; }
   get attrs() { return this.at; }
+
   fire(t, ev) { const a = this.l && this.l[t]; if (a) for (let i = 0; i < a.length; i++) a[i](ev); }
 }
 const fire = (n, t, ev) => { const a = n.l && n.l[t]; if (a) for (let i = 0; i < a.length; i++) a[i](ev); };
@@ -125,6 +135,11 @@ function page(mode) {
   const mos = [];
   env.MO = W.MutationObserver = class { constructor(cb) { this.cb = cb; this.targets = []; this.opts = []; mos.push(this); } observe(t, o) { this.targets.push(t); this.opts.push(o); } };
   env.hits = () => [root.ch[0]];
+  W.__syncs = () => env.backend_.syncs;
+  W.__waits = () => env.backend_.waits;
+  W.__waiters = () => env.backend_.waiters;
+  W.__setExt = (v) => { env.backend_.ext = v; };
+  env.backend_ = env.backend;
   env.fireW = (t) => { const a = W.l && W.l[t]; if (a) for (let i = 0; i < a.length; i++) a[i]({}); };
   env.mutate = () => mos.forEach((m) => m.cb([]));
   env.mos = mos;
@@ -502,4 +517,142 @@ test("a visual viewport present at install is a candidate anchor", async () => {
   badge.rect = { width: 28, height: 28, left: 984, top: 700, right: 1012, bottom: 728 };
   badge.fire("click", T());
   assert.equal(badge.at["aria-expanded"], "true");
+});
+
+test("a freshly shown or re-attached badge ignores clicks for 300 ms; fallback mount after ext:false", async () => {
+  guardTest.on = true;
+  try {
+    const env = page("on_demand");
+    const api = await run(env, { grants: GR });
+    api.GM_registerMenuCommand("x", () => {});
+    const badge = kq(hostOf(env).shadow, "badge");
+    badge.fire("click", T());
+    assert.equal(badge.at["aria-expanded"], "false", "immediately after appearing");
+    advance(200);
+    badge.fire("click", T());
+    assert.equal(badge.at["aria-expanded"], "false", "still within 300 ms");
+    advance(150);
+    badge.fire("click", T());
+    assert.equal(badge.at["aria-expanded"], "true", "after 300 ms");
+    badge.fire("click", T()); // closes
+    // the page drops the host; it is put back and the guard starts over
+    const host = hostOf(env);
+    env.root.removeChild(host);
+    env.fireW("popstate");
+    assert.equal(hostOf(env), host);
+    badge.fire("click", T());
+    assert.equal(badge.at["aria-expanded"], "false", "right after re-attaching");
+    advance(350);
+    badge.fire("click", T());
+    assert.equal(badge.at["aria-expanded"], "true");
+  } finally { guardTest.on = false; }
+});
+
+// ---- extension mode: commands sync to the proxy and are triggered from the extension --------------
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(cond, ms = 1000) {
+  const t0 = realNow();
+  while (!cond()) { if (realNow() - t0 > ms) throw new Error("timeout"); await sleepMs(2); }
+}
+const flushTimers = (env) => { const ts = env.timers.splice(0); ts.forEach(([f]) => f()); };
+
+test("ext: commands sync (debounced) with no in-page button; a server fire runs the command from the closure", async () => {
+  const env = page("ext:on_demand");
+  const api = await run(env, { grants: GR, id: "s1", name: "One", mdoc: "md1" });
+  const hits = [];
+  api.GM_registerMenuCommand("A", () => hits.push("a"), { id: "a1", title: "tip", accessKey: "a", autoClose: false });
+  api.GM_registerMenuCommand("B", () => hits.push("b"), { id: "b1" });
+  assert.equal(env.root.ch.length, 0, "no button when the extension serves the page");
+  flushTimers(env);
+  await until(() => env.W.__syncs().length === 1);
+  assert.deepEqual(env.W.__syncs()[0], { mdoc: "md1", cmds: [
+    { id: "a1", name: "A", accessKey: "a", title: "tip", autoClose: false },
+    { id: "b1", name: "B", accessKey: "", title: "", autoClose: true }] });
+  await until(() => env.W.__waits().length === 1);
+  assert.deepEqual(env.W.__waits()[0], { mdoc: "md1" });
+  env.W.__waiters().shift()({ ext: true, fire: [{ script: "s1", cmd: "b1" }, { script: "other", cmd: "a1" }, { script: "s1", cmd: "nope" }] });
+  await until(() => env.W.__waits().length === 2);
+  assert.deepEqual(hits, ["b"], "only this script's real command ran");
+  assert.equal(env.root.ch.length, 0);
+});
+
+test("ext: nothing is synced without a registration or without the document id; page-made entries never sync", async () => {
+  const env = page("ext:on_demand");
+  const api = await run(env, { grants: GR, id: "s1", mdoc: "md1" });
+  // page code defines its own function of the same name and calls it, and hooks Array.prototype
+  let seen = 0;
+  // (the fake backend's own bookkeeping also writes index 0 of its arrays: count only command data)
+  const leak = (v) => v === "real" || v === "fake" || (v && typeof v === "object" && (v.caption === "real" || v.name === "real" || v.caption === "fake"));
+  const trap = () => Object.defineProperty(Array.prototype, 0, { configurable: true, set(v) { if (leak(v)) seen++; }, get() { return undefined; } });
+  trap();
+  try {
+    env.W.GM_registerMenuCommand = () => {};
+    env.W.GM_registerMenuCommand("fake", () => {});
+    flushTimers(env);
+  } finally { delete Array.prototype[0]; }
+  await sleepMs(20);
+  assert.equal(env.W.__syncs().length, 0);
+  assert.equal(env.W.__waits().length, 0);
+  assert.equal(seen, 0);
+  const env2 = page("ext:on_demand");
+  const api2 = await run(env2, { grants: GR, id: "s1" }); // no mdoc: not bound to a document
+  api2.GM_registerMenuCommand("x", () => {});
+  flushTimers(env2);
+  await sleepMs(20);
+  assert.equal(env2.W.__syncs().length, 0);
+  // real registration still syncs, and the hooked prototype saw none of it
+  trap();
+  try {
+    api.GM_registerMenuCommand("real", () => {}, { id: "r1" });
+    flushTimers(env);
+  } finally { delete Array.prototype[0]; }
+  await until(() => env.W.__syncs().length === 1);
+  assert.equal(seen, 0, "the command list never goes through a page-hookable array");
+});
+
+test("ext: ext:false from the proxy mounts the in-page button with the page's mode (fallback)", async () => {
+  const env = page("ext:on_demand");
+  env.W.__setExt(false);
+  const api = await run(env, { grants: GR, id: "s1", mdoc: "md1" });
+  api.GM_registerMenuCommand("A", () => {}, { id: "a1" });
+  assert.equal(env.root.ch.length, 0, "not yet");
+  flushTimers(env);
+  await until(() => env.root.ch.length === 1);
+  assert.match(kq(hostOf(env).shadow, "badge").at["aria-label"], /\(1\)/);
+  // a later wait answered with ext:false falls back too
+  const env2 = page("ext:always");
+  const api2 = await run(env2, { grants: GR, id: "s1", mdoc: "md1" });
+  api2.GM_registerMenuCommand("A", () => {}, { id: "a1" });
+  flushTimers(env2);
+  await until(() => env2.W.__waits().length === 1);
+  assert.equal(env2.root.ch.length, 0);
+  env2.W.__waiters().shift()({ ext: false });
+  await until(() => env2.root.ch.length === 1);
+});
+
+test("ext:off keeps the button unmounted even on fallback", async () => {
+  const env = page("ext:off");
+  env.W.__setExt(false);
+  const api = await run(env, { grants: GR, id: "s1", mdoc: "md1" });
+  api.GM_registerMenuCommand("A", () => {}, { id: "a1" });
+  flushTimers(env);
+  await until(() => env.W.__syncs().length === 1);
+  await sleepMs(10);
+  assert.equal(env.root.ch.length, 0);
+});
+
+test("ext: the wait stops when the script has no commands left", async () => {
+  const env = page("ext:on_demand");
+  const api = await run(env, { grants: GR, id: "s1", mdoc: "md1" });
+  const id = api.GM_registerMenuCommand("A", () => {}, { id: "a1" });
+  flushTimers(env);
+  await until(() => env.W.__waits().length === 1);
+  api.GM_unregisterMenuCommand(id);
+  flushTimers(env);
+  await until(() => env.W.__syncs().length === 2);
+  assert.deepEqual(env.W.__syncs()[1], { mdoc: "md1", cmds: [] });
+  env.W.__waiters().shift()({ ext: true, fire: [] });
+  await sleepMs(20);
+  assert.equal(env.W.__waits().length, 1, "no new poll");
 });

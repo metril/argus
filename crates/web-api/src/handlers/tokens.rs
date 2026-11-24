@@ -115,7 +115,9 @@ pub async fn revoke_token(
     match state.tokens.get(&id) {
         Some(t) if t.stored.created_by == p.user_id => {
             let st = state.clone();
-            blocking(move || st.tokens.revoke(&id)).await?;
+            let tid = id.clone();
+            blocking(move || st.tokens.revoke(&tid)).await?;
+            state.close_ext_tokens(&[id]);
             Ok(Json(MessageResponse {
                 message: "Token revoked".into(),
             }))
@@ -152,7 +154,9 @@ pub async fn admin_revoke_token(
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<MessageResponse>> {
     let st = state.clone();
-    if blocking(move || st.tokens.revoke(&id)).await? {
+    let tid = id.clone();
+    if blocking(move || st.tokens.revoke(&tid)).await? {
+        state.close_ext_tokens(&[id]);
         Ok(Json(MessageResponse {
             message: "Token revoked".into(),
         }))

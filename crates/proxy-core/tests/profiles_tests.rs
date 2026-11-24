@@ -37,6 +37,7 @@ fn config(port: u16, require_token: bool) -> ProxyConfig {
             port,
             enable_http2: false,
             transparent_port: None,
+            ext_port: None,
             tls_passthrough_hosts: Vec::new(),
             block_private_destinations: false,
             allowed_destinations: Vec::new(),
@@ -498,6 +499,7 @@ async fn gm_values_are_namespaced_per_profile() {
             host: "hit.test",
             origin,
             profile,
+            ext: None,
         };
         host.json_call(
             &m,
@@ -526,6 +528,7 @@ async fn gm_values_are_namespaced_per_profile() {
         host: "hit.test",
         origin,
         profile: "p2",
+        ext: None,
     };
     let (st, _) = host.json_call(
         &m,
@@ -566,6 +569,7 @@ async fn userscript_chunks_are_bound_to_the_profile_they_were_planned_for() {
             host: "hit.test",
             origin,
             profile: as_profile,
+            ext: None,
         };
         let rest = planned.srcs[0].strip_prefix("/__adblock__/us/").unwrap();
         host.serve_chunk(&m, &c, &Method::GET, &HeaderMap::new(), rest)

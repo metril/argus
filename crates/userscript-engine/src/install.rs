@@ -80,6 +80,8 @@ pub struct Fetched {
 pub struct Approvals {
     /// The user approved `@connect *`.
     pub allow_connect_all: bool,
+    /// The user approved browser logins (extension relay) for requests and cookies.
+    pub browser_cookies: bool,
 }
 
 fn resolve(base: Option<&Url>, raw: &str) -> std::result::Result<Url, String> {
@@ -305,9 +307,15 @@ pub fn finish_install(
             "@connect * approved but not requested".into(),
         ));
     }
+    if approvals.browser_cookies && !(plan.grants_summary.network || plan.grants_summary.cookies) {
+        return Err(Error::InvalidScript(
+            "browser logins approved but the script has no network or cookie grant".into(),
+        ));
+    }
     let mut s = Userscript::new(plan.source)?;
     s.assets = assets;
     s.allow_connect_all = approvals.allow_connect_all;
+    s.browser_cookies = approvals.browser_cookies;
     Ok(s)
 }
 
@@ -535,6 +543,7 @@ pub fn finish_update(
     fetched: Fetched,
     approved: bool,
     approve_connect_all: bool,
+    approve_browser_cookies: bool,
 ) -> Result<Userscript> {
     if up.diff.needs_reapproval() && !approved {
         return Err(Error::PermissionDenied(
@@ -545,11 +554,13 @@ pub fn finish_update(
     let keep = now_connect_all
         && (approve_connect_all
             || (installed.allow_connect_all && !up.diff.added_connect.iter().any(|c| c == "*")));
+    let wants_net = up.plan.grants_summary.network || up.plan.grants_summary.cookies;
     let mut s = finish_install(
         up.plan,
         fetched,
         Approvals {
             allow_connect_all: keep,
+            browser_cookies: wants_net && (approve_browser_cookies || installed.browser_cookies),
         },
     )?;
     s.id = installed.id.clone();
@@ -796,7 +807,8 @@ mod tests {
             p,
             Fetched::default(),
             Approvals {
-                allow_connect_all: true
+                allow_connect_all: true,
+                ..Default::default()
             }
         )
         .is_err());
@@ -839,9 +851,9 @@ mod tests {
         for extra in ["// @match https://a.com/*\n// @match https://b.com/*\n// @grant GM_getValue\n// @connect a.com", "// @match https://a.com/*\n// @grant GM_getValue\n// @connect a.com\n// @connect evil.com", "// @match https://a.com/*\n// @grant GM_getValue\n// @grant GM_xmlhttpRequest\n// @connect a.com", "// @grant GM_getValue\n// @connect a.com"] {
             let up = plan_update(&old, &src("2", extra), None).unwrap();
             assert!(up.diff.needs_reapproval(), "{extra}");
-            let e = finish_update(&old, up.clone(), Fetched::default(), false, false).unwrap_err();
+            let e = finish_update(&old, up.clone(), Fetched::default(), false, false, false).unwrap_err();
             assert!(matches!(e, Error::PermissionDenied(_)));
-            let s = finish_update(&old, up, Fetched::default(), true, false).unwrap();
+            let s = finish_update(&old, up, Fetched::default(), true, false, false).unwrap();
             assert_eq!(s.id, old.id);
         }
         assert!(plan_update(

@@ -29,6 +29,7 @@ fn config(port: u16) -> ProxyConfig {
             port,
             enable_http2: false,
             transparent_port: None,
+            ext_port: None,
             tls_passthrough_hosts: Vec::new(),
             block_private_destinations: false,
             allowed_destinations: Vec::new(),

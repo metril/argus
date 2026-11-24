@@ -139,6 +139,11 @@ pub struct RequestCtx {
     pub transparent: bool,
     /// Switches of the listener that accepted the connection (`None`: defaults).
     pub listener: Option<Arc<crate::listener_flags::ListenerFlags>>,
+    /// The extension session this connection authenticated as on the extension listener.
+    pub ext: Option<u64>,
+    /// The cookie store (Firefox container, private window) the connection's credentials named;
+    /// empty for the default store and for Chrome.
+    pub ext_store: Option<Arc<str>>,
 }
 
 impl RequestCtx {
@@ -150,6 +155,8 @@ impl RequestCtx {
             epoch: 0,
             transparent: false,
             listener: None,
+            ext: None,
+            ext_store: None,
         }
     }
 
@@ -198,6 +205,13 @@ pub struct ConnCtx {
     transparent: AtomicBool,
     /// Switches of the accepting listener.
     listener: arc_swap::ArcSwapOption<crate::listener_flags::ListenerFlags>,
+    /// Accepted on the extension-only listener.
+    ext_listener: AtomicBool,
+    /// Extension session the connection authenticated as (0: none), and the profile id it pins
+    /// (0: none). Set once, from the CONNECT head or the first plain request.
+    ext_session: std::sync::atomic::AtomicU64,
+    ext_pin: std::sync::atomic::AtomicU64,
+    ext_store: OnceLock<Arc<str>>,
 }
 
 impl ConnCtx {
@@ -213,6 +227,49 @@ impl ConnCtx {
             revoked: AtomicBool::new(false),
             transparent: AtomicBool::new(false),
             listener: arc_swap::ArcSwapOption::empty(),
+            ext_listener: AtomicBool::new(false),
+            ext_session: std::sync::atomic::AtomicU64::new(0),
+            ext_pin: std::sync::atomic::AtomicU64::new(0),
+            ext_store: OnceLock::new(),
+        }
+    }
+
+    /// Mark the connection as accepted on the extension-only listener.
+    pub fn mark_ext_listener(&self) {
+        self.ext_listener.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_ext_listener(&self) -> bool {
+        self.ext_listener.load(Ordering::Relaxed)
+    }
+
+    /// The cookie store the connection's credentials named (empty: default).
+    pub fn ext_store(&self) -> Arc<str> {
+        self.ext_store
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::from(""))
+    }
+
+    /// The extension session this connection authenticated as.
+    pub fn ext_session(&self) -> Option<u64> {
+        match self.ext_session.load(Ordering::Relaxed) {
+            0 => None,
+            s => Some(s),
+        }
+    }
+
+    /// Bind the connection (once) to extension session `session`, optionally pinning it to
+    /// `profile`, and re-resolve. Later calls are ignored: nothing inside a tunnel can rebind.
+    pub fn set_ext(&self, profiles: &Profiles, session: u64, store: &str, profile: Option<u64>) {
+        let _ = self.ext_store.set(Arc::from(store));
+        if self
+            .ext_session
+            .compare_exchange(0, session, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.ext_pin.store(profile.unwrap_or(0), Ordering::Relaxed);
+            self.reresolve(profiles, false);
         }
     }
 
@@ -278,18 +335,25 @@ impl ConnCtx {
 
     fn reresolve(&self, profiles: &Profiles, require_token: bool) {
         let d = self.digest.get();
-        let (slot, epoch) = profiles.resolve_by_digest(self.client_addr.ip(), d);
+        let (mut slot, epoch) = profiles.resolve_by_digest(self.client_addr.ip(), d);
+        let pin = self.ext_pin.load(Ordering::Relaxed);
+        if pin != 0 {
+            if let Some(p) = profiles.table().slot(pin) {
+                slot = p.clone();
+            }
+        }
         if require_token && d.is_some_and(|d| !Self::token_known(profiles, d)) {
             self.revoked.store(true, Ordering::Relaxed);
         }
-        self.cur.store(Arc::new(
-            RequestCtx::new(slot, self.client_addr, None)
-                .at_epoch(epoch)
-                .with_listener(
-                    self.transparent.load(Ordering::Relaxed),
-                    self.listener.load_full(),
-                ),
-        ));
+        let mut ctx = RequestCtx::new(slot, self.client_addr, None)
+            .at_epoch(epoch)
+            .with_listener(
+                self.transparent.load(Ordering::Relaxed),
+                self.listener.load_full(),
+            );
+        ctx.ext = self.ext_session();
+        ctx.ext_store = self.ext_store.get().cloned();
+        self.cur.store(Arc::new(ctx));
     }
 
     /// The context for this request: one epoch load, re-resolved only when it moved.

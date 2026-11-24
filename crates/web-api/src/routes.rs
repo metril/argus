@@ -10,8 +10,8 @@ use utoipa_axum::{
 };
 
 use crate::handlers::{
-    audit, auth, bypass, certificate, certs, devices, downloads, health, lists, policy, profiles,
-    proxy, rules, stats, tokens, users, userscripts, webui_tls,
+    audit, auth, bypass, certificate, certs, devices, downloads, ext, health, lists, policy,
+    profiles, proxy, rules, stats, tokens, users, userscripts, webui_tls,
 };
 use crate::state::AppState;
 
@@ -196,6 +196,10 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             devices::issue_device_token,
             devices::revoke_device_token
         ))
+        // extension bridge
+        .routes(routes!(ext::channel))
+        .routes(routes!(ext::menu))
+        .routes(routes!(ext::trigger))
         // audit
         .routes(routes!(audit::list_audit))
 }

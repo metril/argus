@@ -80,6 +80,10 @@ pub struct ConfirmPlanRequest {
     /// Approve `@connect *` (rejected if the script does not declare it).
     #[serde(default)]
     pub allow_connect_all: bool,
+    /// Approve browser logins (relay through the connected extension). Needs a network or
+    /// cookie grant.
+    #[serde(default)]
+    pub browser_cookies: bool,
     #[serde(default = "yes")]
     pub enable: bool,
 }
@@ -148,6 +152,10 @@ pub struct ApproveUpdateRequest {
     /// Also approve a newly requested `@connect *`.
     #[serde(default)]
     pub allow_connect_all: bool,
+    /// Approve browser logins (only while the script is awaiting approval or an update is
+    /// pending).
+    #[serde(default)]
+    pub browser_cookies: bool,
 }
 
 /// One stored GM value.
@@ -215,6 +223,8 @@ pub struct ExportedUserscript {
     pub enabled: bool,
     #[serde(default)]
     pub allow_connect_all: bool,
+    #[serde(default)]
+    pub browser_cookies: bool,
     #[serde(default)]
     pub assets: ExportedAssets,
     /// GM values (only with `values=true`).

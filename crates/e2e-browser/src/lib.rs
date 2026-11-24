@@ -47,6 +47,9 @@ pub async fn run_known<F: std::future::Future<Output = ()> + Send + 'static>(nam
     }
 }
 
+pub mod argus;
+pub mod marionette;
+
 const BROWSER_NAMES: &[&str] = &[
     "chromium",
     "chromium-browser",

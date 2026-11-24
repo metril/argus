@@ -792,6 +792,29 @@ impl BypassEngine {
         self.set.load().mode_of(host)
     }
 
+    /// Every pattern of the enabled entries and subscriptions as a bare domain (`*.` removed,
+    /// lowercase, sorted, unique): a superset of the hosts Argus passes through, for callers
+    /// that must keep something off such hosts and only match by domain suffix.
+    pub fn domains(&self) -> Vec<String> {
+        let mut out: std::collections::BTreeSet<String> = Default::default();
+        self.read(|s| {
+            for e in &s.entries {
+                out.insert(e.pattern.trim_start_matches("*.").to_ascii_lowercase());
+            }
+            for sub in s.subscriptions.iter().filter(|x| x.enabled) {
+                for p in s
+                    .sub_hosts
+                    .get(&sub.id)
+                    .map(|h| h.as_slice())
+                    .unwrap_or_default()
+                {
+                    out.insert(p.trim_start_matches("*.").to_ascii_lowercase());
+                }
+            }
+        });
+        out.into_iter().collect()
+    }
+
     /// The full match (mode, source, pattern).
     pub fn lookup(&self, host: &str) -> Option<Hit> {
         self.set.load().lookup(host)

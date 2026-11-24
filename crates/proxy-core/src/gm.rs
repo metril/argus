@@ -13,6 +13,7 @@
 //!   under the destination policy, re-checks `@connect` on every redirect hop, streams the
 //!   response, and is not run through the filter engine (script managers do not filter either).
 
+use crate::ext_bridge::{ExtHub, JobEvent, Route, Wait};
 use crate::inject::{full_body, ProxyBody};
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -68,6 +69,8 @@ const JSON_ROUTES: &[&str] = &[
     "values/changes",
     "token/refresh",
     "cookie",
+    "menu/sync",
+    "menu/wait",
 ];
 
 fn now_secs() -> u64 {
@@ -90,6 +93,8 @@ struct Doc {
     origin: String,
     top: bool,
     created: Instant,
+    /// Public document id, when the document is bound to a live extension session.
+    mdoc: Option<String>,
 }
 
 /// What one bundle fetch needs.
@@ -98,6 +103,7 @@ pub struct Chunk {
     pub script_id: String,
     pub origin: String,
     pub top: bool,
+    pub mdoc: Option<String>,
 }
 
 /// Bounded, expiring map of documents that were handed script URLs.
@@ -169,6 +175,7 @@ impl DocStore {
             script_id: d.ids[n].clone(),
             origin: d.origin.clone(),
             top: d.top,
+            mdoc: d.mdoc.clone(),
         };
         if d.fetched.iter().all(|f| *f) {
             map.remove(id);
@@ -185,6 +192,10 @@ pub struct DocPlan {
     pub connect: bool,
     /// Some script adds styles (`GM_addStyle`, `@unwrap`): needs the style nonce.
     pub style: bool,
+    /// Public document id (`Server-Timing: argus;desc="<mdoc>"`).
+    pub mdoc: Option<String>,
+    /// The document is bound to a live extension session: no in-page menu button.
+    pub ext_bound: bool,
 }
 
 fn group(r: RunAt) -> u8 {
@@ -216,6 +227,9 @@ pub struct Caller<'a> {
     pub origin: &'a str,
     /// The requesting profile's name: the namespace of tokens, GM values and cookies.
     pub profile: &'a str,
+    /// The extension session and cookie store the request's connection authenticated as (on
+    /// the extension listener); `None` for every other connection.
+    pub ext: Option<(u64, &'a str)>,
 }
 
 #[derive(Default)]
@@ -281,6 +295,7 @@ pub fn is_privileged(s: &userscript_engine::Userscript) -> bool {
 
 pub struct GmHost {
     sw_policy: std::sync::atomic::AtomicU8,
+    ext: Arc<ExtHub>,
     pub docs: DocStore,
     limits: Mutex<Limits>,
     budget: Arc<Semaphore>,
@@ -298,9 +313,14 @@ struct Authed {
     id: String,
     origin: String,
     page_host: String,
+    /// See [`Caller::ext`].
+    ext: Option<(u64, String)>,
 }
 
 impl Authed {
+    fn conn(&self) -> Option<(u64, &str)> {
+        self.ext.as_ref().map(|(s, st)| (*s, st.as_str()))
+    }
     fn script(&self) -> &userscript_engine::Userscript {
         &self.idx.get(&self.id).expect("authenticated").script
     }
@@ -400,10 +420,52 @@ impl GmHost {
             sw_policy: std::sync::atomic::AtomicU8::new(
                 common::config::ServiceWorkerPolicy::default() as u8,
             ),
+            ext: ExtHub::shared(),
             docs: DocStore::new(DOC_CAP, DOC_TTL),
             limits: Mutex::new(Limits::default()),
             budget: Arc::new(Semaphore::new(BODY_BUDGET)),
         }
+    }
+
+    /// The extension bridge hub.
+    pub fn ext(&self) -> &Arc<ExtHub> {
+        &self.ext
+    }
+
+    /// Where a request or cookie call of `script` goes once its own checks (grant, `@connect`,
+    /// method and header rules, destination policy) have passed: only a non-anonymous call of a
+    /// script approved for browser logins, from a document bound to a live extension session
+    /// that holds a permission for `host`, goes to the browser; everything else uses the
+    /// script's own jar. A fall back of an approved script is remembered for its page.
+    #[allow(clippy::too_many_arguments)]
+    pub fn credentialed_route(
+        &self,
+        script: &userscript_engine::Userscript,
+        profile: &str,
+        origin: &str,
+        anonymous: bool,
+        download: bool,
+        manual_redirect: bool,
+        mdoc: Option<&str>,
+        conn: Option<(u64, &str)>,
+        host: &str,
+        port: u16,
+    ) -> Route {
+        if anonymous || download {
+            return Route::Jar(crate::ext_bridge::Fallback::Anonymous);
+        }
+        if !script.browser_cookies {
+            return Route::Jar(crate::ext_bridge::Fallback::NotApproved);
+        }
+        if manual_redirect {
+            return Route::Jar(crate::ext_bridge::Fallback::ManualRedirect);
+        }
+        let r = self
+            .ext
+            .route(conn, mdoc, profile, origin, &script.id, host, port);
+        self.ext
+            .note_route(profile, &script.id, matches!(r, Route::Jar(_)));
+        r
     }
 
     pub fn set_sw_policy(&self, p: common::config::ServiceWorkerPolicy) {
@@ -477,6 +539,23 @@ impl GmHost {
         origin: &str,
         is_top_frame: bool,
     ) -> Option<DocPlan> {
+        self.plan_document_bound(index, profile, host, url, origin, is_top_frame, None, "")
+    }
+
+    /// [`Self::plan_document_in`] for a document the request header bound to extension session
+    /// `ext_session` (see [`ExtHub::bind`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_document_bound(
+        &self,
+        index: &Arc<ScriptIndex>,
+        profile: &str,
+        host: &str,
+        url: &str,
+        origin: &str,
+        is_top_frame: bool,
+        ext_session: Option<u64>,
+        store: &str,
+    ) -> Option<DocPlan> {
         let guard = index;
         if guard.is_empty() {
             return None;
@@ -497,6 +576,14 @@ impl GmHost {
                 c.script.id.clone()
             })
             .collect();
+        let names: Vec<(String, String)> = cands
+            .iter()
+            .map(|c| (c.script.id.clone(), c.script.metadata.name.clone()))
+            .collect();
+        // Only a document bound to a live extension session gets a record and a public id;
+        // every other page behaves exactly as without the bridge.
+        let mdoc = ext_session.map(|s| self.ext.register_doc(profile, origin, names, s, store));
+        let ext_bound = mdoc.is_some();
         let doc = Doc {
             index: Arc::clone(guard),
             fetched: vec![false; ids.len()],
@@ -506,6 +593,7 @@ impl GmHost {
             origin: origin.to_string(),
             top: is_top_frame,
             created: Instant::now(),
+            mdoc: mdoc.clone(),
         };
         let n = doc.ids.len();
         let id = self.docs.insert(doc);
@@ -516,6 +604,8 @@ impl GmHost {
             srcs,
             connect,
             style,
+            mdoc,
+            ext_bound,
         })
     }
 
@@ -573,6 +663,7 @@ impl GmHost {
             &values,
         );
         opts.shared_runtime = true;
+        opts.mdoc = chunk.mdoc.as_deref();
         let b = bundle::generate(&[cs], &opts);
         Response::builder()
             .status(StatusCode::OK)
@@ -618,6 +709,7 @@ impl GmHost {
             id,
             origin: c.origin.to_string(),
             page_host: c.host.to_ascii_lowercase(),
+            ext: c.ext.map(|(s, st)| (s, st.to_string())),
         })
     }
 
@@ -736,6 +828,43 @@ impl GmHost {
                     serde_json::from_value(req).map_err(|e| bad(&format!("bad cookie op: {e}")))?;
                 gm.cookie_op(&ctx, op, manager.cookies())
             }
+            "menu/sync" => {
+                ctx.require(&["GM_registerMenuCommand"])?;
+                let mdoc = req
+                    .get("mdoc")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| bad("mdoc required"))?;
+                let list = req
+                    .get("cmds")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| bad("cmds must be an array"))?;
+                let s = |c: &Value, k: &str| {
+                    c.get(k)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let cmds = list
+                    .iter()
+                    .map(|c| {
+                        let id = s(c, "id");
+                        if id.is_empty() {
+                            return Err(bad("command id required"));
+                        }
+                        Ok((
+                            id,
+                            s(c, "name"),
+                            s(c, "accessKey"),
+                            s(c, "title"),
+                            c.get("autoClose").and_then(Value::as_bool).unwrap_or(true),
+                        ))
+                    })
+                    .collect::<GmResult<Vec<_>>>()?;
+                let live =
+                    self.ext
+                        .menu_sync(a.conn(), &a.profile, &a.origin, &a.id, mdoc, cmds)?;
+                Ok(json!({"ext": live}))
+            }
             _ => Err(GmError::new(ErrorCode::NotFound, "no such endpoint")),
         }
     }
@@ -819,10 +948,10 @@ impl GmHost {
                 .xhr(manager, c, up, &h, a, req.into_body(), (permit, bytes))
                 .await;
         }
-        let Some(_permit) = self.permit(&a.profile, &a.id, Kind::Json) else {
+        let Some(permit) = self.permit(&a.profile, &a.id, Kind::Json) else {
             return quota();
         };
-        let Some(_bytes) = self.reserve(declared.unwrap_or(JSON_CAP).min(JSON_CAP)) else {
+        let Some(bytes_held) = self.reserve(declared.unwrap_or(JSON_CAP).min(JSON_CAP)) else {
             return quota();
         };
         let limit = declared.unwrap_or(JSON_CAP).min(JSON_CAP);
@@ -839,10 +968,127 @@ impl GmHost {
             }
             Err(_) => return gm_err(&GmError::new(ErrorCode::BadRequest, "body read failed")),
         };
-        match self.json_run(manager, &a, route, &body) {
+        // The slot covers reading the body only; a long poll or a relayed call must not hold it.
+        drop(permit);
+        drop(bytes_held);
+        let res = match route {
+            "menu/wait" => self.menu_wait(&a, &body).await,
+            "cookie" => self.cookie_call(manager, &a, &body).await,
+            _ => self.json_run(manager, &a, route, &body),
+        };
+        match res {
             Ok(v) => gm_json(200, json!({"ok": true, "result": v})),
             Err(e) => gm_err(&e),
         }
+    }
+
+    /// `menu/wait`: long poll for triggers of this script's commands.
+    async fn menu_wait(self: &Arc<Self>, a: &Authed, body: &[u8]) -> GmResult<Value> {
+        let req: Value = serde_json::from_slice(body)
+            .map_err(|e| GmError::new(ErrorCode::BadRequest, format!("bad JSON: {e}")))?;
+        let mdoc = req
+            .get("mdoc")
+            .and_then(Value::as_str)
+            .ok_or_else(|| GmError::new(ErrorCode::BadRequest, "mdoc required"))?;
+        let w = self
+            .ext
+            .menu_wait(
+                a.conn(),
+                &a.profile,
+                &a.origin,
+                &a.id,
+                mdoc,
+                crate::ext_bridge::WAIT,
+            )
+            .await?;
+        Ok(match w {
+            Wait::NoExt => json!({"ext": false}),
+            Wait::Fire(cmds) => json!({
+                "ext": true,
+                "fire": cmds.into_iter().map(|c| json!({"script": a.id, "cmd": c})).collect::<Vec<_>>(),
+            }),
+        })
+    }
+
+    /// `GM_cookie`: the stored script's checks first; then the browser's cookies when the script
+    /// is approved for them and the document is served by a live extension session that holds a
+    /// permission for the host, else the script's own jar. HttpOnly cookies are never exposed
+    /// or written through the browser.
+    async fn cookie_call(
+        self: &Arc<Self>,
+        manager: &Arc<UserscriptManager>,
+        a: &Authed,
+        body: &[u8],
+    ) -> GmResult<Value> {
+        let bad = |m: String| GmError::new(ErrorCode::BadRequest, m);
+        let mut req: Value = if body.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_slice(body).map_err(|e| bad(format!("bad JSON: {e}")))?
+        };
+        let mdoc = req
+            .as_object_mut()
+            .and_then(|o| o.remove("mdoc"))
+            .and_then(|v| v.as_str().map(str::to_string));
+        let op: CookieOp =
+            serde_json::from_value(req.clone()).map_err(|e| bad(format!("bad cookie op: {e}")))?;
+        let gm = manager.gm();
+        let ctx = a.ctx();
+        let url = gm.cookie_authorize(&ctx, &op)?;
+        let s = a.script();
+        {
+            let host = url.host_str().unwrap_or_default().to_string();
+            let route = self.credentialed_route(
+                s,
+                &a.profile,
+                &a.origin,
+                false,
+                false,
+                false,
+                mdoc.as_deref(),
+                a.conn(),
+                &host,
+                url.port_or_known_default().unwrap_or(443),
+            );
+            // A host the Extended Validation setting tunnels is not decrypted: jar.
+            let route = match route {
+                Route::Ext(_)
+                    if !self
+                        .ext
+                        .ev_allows(&host, url.port_or_known_default().unwrap_or(443))
+                        .await
+                        || self
+                            .ext
+                            .is_own_target(&host, url.port_or_known_default().unwrap_or(443))
+                            .await =>
+                {
+                    Route::Jar(crate::ext_bridge::Fallback::Bypassed)
+                }
+                r => r,
+            };
+            match route {
+                Route::Ext(session) => {
+                    if matches!(&op, CookieOp::Set { cookie, .. } if cookie.http_only) {
+                        return Err(bad("httpOnly cookies are not accessible".into()));
+                    }
+                    let connect = connect_spec(s, &a.page_host);
+                    let meta = json!({
+                        "op": "cookie", "script": a.id, "connect": connect, "cookie": req,
+                        "store": self.ext.doc_store(mdoc.as_deref()),
+                    });
+                    self.ext.audit_relay(session, &a.id, &host, "", "cookie");
+                    let mut h = self
+                        .ext
+                        .dispatch(session, meta, &a.profile, &a.id, &a.page_host, None)
+                        .await?;
+                    return relay_result(&mut h).await;
+                }
+                Route::Jar(why) => {
+                    tracing::debug!("GM_cookie of {} used the jar: {why:?}", a.id);
+                }
+            }
+        }
+        gm.cookie_op(&ctx, op, manager.cookies())
     }
 
     /// Reserve `n` bytes of the global request-body budget (released on drop).
@@ -925,6 +1171,111 @@ impl GmHost {
     }
 
     // ---- xmlhttpRequest / download ----------------------------------------------------------
+
+    /// Run a credentialed request through the extension's browser. The extension fetches with
+    /// the browser's cookies and `X-Argus-Relay`; the proxy re-checks every hop of that fetch
+    /// when it arrives (see [`ExtHub::check_relay`]). The answer is piped back as frames.
+    async fn run_relayed(
+        self: &Arc<Self>,
+        a: Authed,
+        out: userscript_engine::backend::OutboundRequest,
+        session: u64,
+        held: Held,
+        upload: Option<Upload>,
+        store: String,
+    ) -> Response<ProxyBody> {
+        let s = a.script();
+        // Headers a page cannot set in a browser fetch (Cookie, Origin, Host) are dropped: the
+        // browser supplies its own.
+        let headers: Vec<[&str; 2]> = out
+            .headers
+            .iter()
+            .filter(|(n, _)| {
+                !matches!(
+                    n.to_ascii_lowercase().as_str(),
+                    "cookie" | "origin" | "host" | "x-argus-relay" | "proxy-authorization"
+                )
+            })
+            .map(|(n, v)| [n.as_str(), v.as_str()])
+            .collect();
+        let redirect = match out.redirect {
+            Redirect::Follow => "follow",
+            Redirect::Error => "error",
+            Redirect::Manual => "manual",
+        };
+        let host = out.url.host_str().unwrap_or_default().to_string();
+        let meta = json!({
+            "op": "xhr",
+            "script": a.id,
+            "connect": connect_spec(s, &a.page_host),
+            "method": out.method,
+            "url": out.url.as_str(),
+            "headers": headers,
+            "redirect": redirect,
+            "timeout": out.timeout.as_millis() as u64,
+            "store": store,
+        });
+        self.ext
+            .audit_relay(session, &a.id, &host, &out.method, "xhr");
+        let rx = upload.map(|u| u.rx);
+        let handle = match self
+            .ext
+            .dispatch(session, meta, &a.profile, &a.id, &a.page_host, rx)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => return single_error_frame("network", "network", &e.message),
+        };
+        let deadline = tokio::time::Instant::now() + out.timeout;
+        let stream = async_stream::stream! {
+            let _permit = held;
+            // The whole handle moves in (not just its receiver): its guard cancels the job when
+            // the page goes away, and must not drop before that.
+            let mut handle = handle;
+            let mut total: u64 = 0;
+            loop {
+                match tokio::time::timeout_at(deadline, handle.rx.recv()).await {
+                    Err(_) => {
+                        yield Ok::<_, std::io::Error>(Frame::data(err_frame("timeout", "timeout", "request timed out")));
+                        return;
+                    }
+                    Ok(None) => {
+                        let why = if handle.overflowed() { "response not read fast enough" } else { "extension disconnected" };
+                        yield Ok(Frame::data(err_frame("network", "network", why)));
+                        return;
+                    }
+                    Ok(Some(JobEvent::Head(b))) => {
+                        let Some(head) = sanitize_head(&b) else {
+                            yield Ok(Frame::data(err_frame("network", "network", "bad response head")));
+                            return;
+                        };
+                        yield Ok(Frame::data(frame(1, head.to_string().as_bytes())));
+                    }
+                    Ok(Some(JobEvent::Data(chunk))) => {
+                        total += chunk.len() as u64;
+                        if total > MAX_RESPONSE {
+                            yield Ok(Frame::data(err_frame("too_large", "too_large", "response too large")));
+                            return;
+                        }
+                        if !chunk.is_empty() {
+                            yield Ok(Frame::data(frame(2, &chunk)));
+                        }
+                    }
+                    Ok(Some(JobEvent::End)) => {
+                        yield Ok(Frame::data(frame(3, b"{}")));
+                        return;
+                    }
+                    Ok(Some(JobEvent::Error(b))) => {
+                        let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                        let t = |k: &str, d: &str| v.get(k).and_then(Value::as_str).unwrap_or(d).chars().take(200).collect::<String>();
+                        yield Ok(Frame::data(err_frame(&t("kind", "network"), &t("code", "network"), &t("message", "request failed"))));
+                        return;
+                    }
+                }
+            }
+        };
+        frames_response(BodyExt::boxed_unsync(StreamBody::new(stream)))
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn xhr(
@@ -1020,8 +1371,164 @@ impl GmHost {
                 .map(|n| n.saturating_sub(head));
             upload = Some(Upload { rx, len, exceeded });
         }
+        // Browser logins: a script approved for them, not anonymous, with a live extension
+        // session bound to this very document and a host permission for the target. The checks
+        // above (grant, `@connect`, method and header rules, destination policy) have passed.
+        {
+            let host = out.url.host_str().unwrap_or_default().to_string();
+            let route = self.credentialed_route(
+                a.script(),
+                &a.profile,
+                &a.origin,
+                meta.anonymous,
+                meta.op == "download",
+                out.redirect == Redirect::Manual,
+                meta.mdoc.as_deref(),
+                a.conn(),
+                &host,
+                out.url.port_or_known_default().unwrap_or(443),
+            );
+            // A host the Extended Validation setting tunnels is not decrypted: jar.
+            let route = match route {
+                Route::Ext(_)
+                    if !self
+                        .ext
+                        .ev_allows(&host, out.url.port_or_known_default().unwrap_or(443))
+                        .await
+                        || self
+                            .ext
+                            .is_own_target(&host, out.url.port_or_known_default().unwrap_or(443))
+                            .await =>
+                {
+                    Route::Jar(crate::ext_bridge::Fallback::Bypassed)
+                }
+                r => r,
+            };
+            match route {
+                Route::Ext(session) => {
+                    return self
+                        .run_relayed(
+                            a,
+                            out,
+                            session,
+                            held,
+                            upload,
+                            self.ext.doc_store(meta.mdoc.as_deref()),
+                        )
+                        .await;
+                }
+                Route::Jar(why) => {
+                    tracing::debug!("xhr of {} used the jar: {why:?}", a.id);
+                }
+            }
+        }
         let default_ua = header(req_headers, "user-agent").map(str::to_string);
         run_outbound(manager.clone(), a, out, up, default_ua, held, upload).await
+    }
+}
+
+/// Validate and normalise the head the extension sent: status, text, header pairs (no
+/// `Set-Cookie`, no hop-by-hop headers), final URL.
+fn sanitize_head(b: &[u8]) -> Option<Value> {
+    let v: Value = serde_json::from_slice(b).ok()?;
+    let status = v
+        .get("status")
+        .and_then(Value::as_u64)
+        .filter(|s| (100..=599).contains(s))?;
+    let headers: Vec<(String, String)> = v
+        .get("headers")
+        .and_then(Value::as_array)
+        .map(|l| {
+            l.iter()
+                .filter_map(|p| {
+                    let p = p.as_array()?;
+                    Some((
+                        p.first()?.as_str()?.to_string(),
+                        p.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .filter(|(n, _)| {
+                    let n = n.to_ascii_lowercase();
+                    !matches!(
+                        n.as_str(),
+                        "set-cookie"
+                            | "set-cookie2"
+                            | "connection"
+                            | "keep-alive"
+                            | "transfer-encoding"
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(json!({
+        "status": status,
+        "statusText": s("statusText"),
+        "headers": headers,
+        "finalUrl": s("finalUrl"),
+        "redirected": v.get("redirected").and_then(Value::as_bool).unwrap_or(false),
+    }))
+}
+
+/// The `@connect` description the extension re-checks (it may only narrow it).
+fn connect_spec(s: &userscript_engine::Userscript, page_host: &str) -> Value {
+    json!({
+        "page": page_host,
+        "list": s.metadata.connect.iter().filter(|c| c.as_str() != "*").collect::<Vec<_>>(),
+        "all": s.allow_connect_all && s.metadata.connect.iter().any(|c| c == "*"),
+    })
+}
+
+/// Wait for the answer of a cookie job: `{"result": ...}`; HttpOnly cookies are dropped from it
+/// whatever the extension sent.
+async fn relay_result(h: &mut crate::ext_bridge::JobHandle) -> GmResult<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut result = None;
+    loop {
+        match tokio::time::timeout_at(deadline, h.rx.recv()).await {
+            Err(_) => {
+                return Err(GmError::new(
+                    ErrorCode::Internal,
+                    "extension did not answer",
+                ))
+            }
+            Ok(None) => return Err(GmError::new(ErrorCode::Internal, "extension disconnected")),
+            Ok(Some(JobEvent::Head(b))) => {
+                let v: Value = serde_json::from_slice(&b)
+                    .map_err(|_| GmError::new(ErrorCode::Internal, "bad answer"))?;
+                result = Some(v.get("result").cloned().unwrap_or(Value::Null));
+            }
+            Ok(Some(JobEvent::Data(_))) => {}
+            Ok(Some(JobEvent::End)) => {
+                let mut r = result.unwrap_or(Value::Null);
+                if let Value::Array(list) = &mut r {
+                    list.retain(|c| !c.get("http_only").and_then(Value::as_bool).unwrap_or(false));
+                }
+                return Ok(r);
+            }
+            Ok(Some(JobEvent::Error(b))) => {
+                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                let msg = v
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("extension error")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                let code = match v.get("code").and_then(Value::as_str) {
+                    Some("connect_denied") | Some("permission") => ErrorCode::ConnectDenied,
+                    Some("bad_request") => ErrorCode::BadRequest,
+                    _ => ErrorCode::Internal,
+                };
+                return Err(GmError::new(code, msg));
+            }
+        }
     }
 }
 
@@ -1373,6 +1880,7 @@ mod tests {
             origin: format!("https://{host}"),
             top: true,
             created: Instant::now(),
+            mdoc: None,
         }
     }
 

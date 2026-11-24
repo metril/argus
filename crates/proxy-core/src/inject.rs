@@ -139,6 +139,9 @@ pub struct PageSpec<'a> {
     /// On-demand menu button for userscript menu commands: `"on_demand"` or `"always"`. Passed to
     /// the runtime script as `data-m`; only meaningful together with `userscripts`.
     pub menu: Option<&'a str>,
+    /// The document is bound to a live browser-extension session: the runtime does not mount
+    /// the in-page button and syncs its menu commands instead (`data-m="ext:<mode>"`).
+    pub ext: bool,
 }
 
 /// The markup for one page, plus what it needs from the page's CSP.
@@ -247,10 +250,13 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
         }
         if !spec.userscripts.is_empty() {
             // The runtime once, before any bundle (bundles carry no runtime of their own).
-            let m = match spec.menu {
-                Some("always") => " data-m=\"always\"",
-                Some(_) => " data-m=\"on_demand\"",
-                None => "",
+            let m = match (spec.ext, spec.menu) {
+                (true, Some("always")) => " data-m=\"ext:always\"",
+                (true, Some(_)) => " data-m=\"ext:on_demand\"",
+                (true, None) => " data-m=\"ext:off\"",
+                (false, Some("always")) => " data-m=\"always\"",
+                (false, Some(_)) => " data-m=\"on_demand\"",
+                (false, None) => "",
             };
             let _ = write!(
                 head.html,
@@ -301,6 +307,34 @@ mod tests {
     }
 
     #[test]
+    fn a_document_bound_to_an_extension_session_is_marked_ext() {
+        let (cos, internal) = (Cosmetics::default(), Internal::default());
+        let srcs = vec!["/__adblock__/gm/u1.js".to_string()];
+        let mut s = spec(&cos, &internal);
+        s.userscripts = &srcs;
+        s.ext = true;
+        s.menu = Some("on_demand");
+        let h = build_head(&s).html;
+        assert!(
+            h.contains("nonce=\"NONCE\" data-m=\"ext:on_demand\""),
+            "{h}"
+        );
+        s.menu = Some("always");
+        assert!(build_head(&s).html.contains("data-m=\"ext:always\""));
+        s.menu = None;
+        assert!(build_head(&s).html.contains("data-m=\"ext:off\""));
+        // the same document without a bound session has none of it
+        s.ext = false;
+        assert!(!build_head(&s).html.contains("ext:"));
+        s.userscripts = &[];
+        s.ext = true;
+        assert!(
+            !build_head(&s).html.contains("data-m"),
+            "never without userscripts"
+        );
+    }
+
+    #[test]
     fn scriptlets_get_a_private_scope_with_scriptlet_globals() {
         let w = wrap_scriptlets("a();");
         assert!(w.starts_with("(function(){"));
@@ -321,6 +355,7 @@ mod tests {
             userscripts: &[],
             panel: None,
             menu: None,
+            ext: false,
         }
     }
 

@@ -11,7 +11,9 @@
    of an object literal that could be missing is read; clicks count only when a saved Event
    isTrusted getter says so; the host has inline !important styles; the badge and open menu are
    re-raised in the top layer before each click; a computed-style, geometry and hit-test check
-   runs before each click; items ignore clicks for 400 ms after the menu opens.
+   runs before each click; items ignore clicks for 400 ms after the menu opens and the badge for 300 ms
+   after it appears or is re-attached (a page cannot make a user click what has just been put under
+   the pointer).
    See docs/SCRIPT-POLICY.md. */
 function (W, reg, mode, nonce) {
   "use strict";
@@ -88,7 +90,7 @@ function (W, reg, mode, nonce) {
     "overflow", "visible", "z-index", "2147483647", "opacity", "1", "visibility", "visible", "pointer-events", "auto", "transform", "none",
     "filter", "none", "clip-path", "none", "mask", "none", "mix-blend-mode", "normal", "contain", "none"];
   var host = null, wrap = null, badge = null, menuEl = null, open = false, vis = false, openedAt = 0;
-  var attachN = 0, attachWin = 0, retry = false, mo = null, moRoot = null;
+  var attachN = 0, attachWin = 0, retry = false, mo = null, moRoot = null, shownAt = 0;
 
   // Positional builder (`attrs`, `evs` are literal arrays, `kids` a literal array or a lst()).
   function h(tag, attrs, text, evs, kids) {
@@ -168,7 +170,7 @@ function (W, reg, mode, nonce) {
     // one converts a sequence through the page-hookable array iterator, which would hand it over.
     append(root, h("style", nonce ? ["nonce", nonce] : [], CSS, [], []));
     badge = h("button", ["type", "button", "class", "b", "data-k", "badge", "aria-haspopup", "true", "aria-expanded", "false"], "A", ["click", function (e) {
-      if (trusted(e) && intact(badge, true)) { setOpen(!open); }
+      if (trusted(e) && now() - shownAt >= 300 && intact(badge, true)) { setOpen(!open); }
     }], []);
     wrap = h("div", fShow ? ["class", "w", "popover", "manual"] : ["class", "w"], null, [], [badge]);
     append(root, wrap);
@@ -192,6 +194,7 @@ function (W, reg, mode, nonce) {
       }
       return;
     }
+    shownAt = now();
     append(r, host);
     pin(); raise();
   }

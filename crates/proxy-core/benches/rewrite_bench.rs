@@ -63,6 +63,7 @@ fn plan(internal: &Internal) -> HtmlPlan {
         userscripts: &[],
         panel: None,
         menu: None,
+        ext: false,
     });
     HtmlPlan {
         head_html: head.html,
@@ -239,6 +240,7 @@ fn benches(c: &mut Criterion) {
                 userscripts: &[],
                 panel: None,
                 menu: None,
+                ext: false,
             })
         })
     });
@@ -275,6 +277,7 @@ fn benches(c: &mut Criterion) {
                 userscripts: &[],
                 panel: None,
                 menu: None,
+                ext: false,
             });
             let p = HtmlPlan {
                 head_html: head.html,

@@ -28,6 +28,9 @@ pub use profiles::*;
 mod userscripts;
 pub use userscripts::*;
 
+mod ext;
+pub use ext::*;
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -213,6 +216,10 @@ pub struct ProxyConfigResponse {
     /// Transparent-gateway listener port (`None` = off).
     #[serde(default)]
     pub transparent_port: Option<u16>,
+    /// Port of the extension-only listener (`None` = off): the Argus browser extension sends its
+    /// browser through it so documents are bound to the extension session.
+    #[serde(default)]
+    pub ext_port: Option<u16>,
     /// TLS hosts never intercepted (exact or `*.suffix`).
     #[serde(default)]
     pub tls_passthrough_hosts: Vec<String>,
@@ -392,6 +399,8 @@ pub struct UpdateProxyConfigRequest {
 
     /// Transparent listener port; `0` turns it off. Applied live (the listener is rebound).
     pub transparent_port: Option<u16>,
+    /// Extension listener port; `0` turns it off. Applied live.
+    pub ext_port: Option<u16>,
     /// Replaces the TLS passthrough host list. Applied live.
     pub tls_passthrough_hosts: Option<Vec<String>>,
     /// Applied live.
@@ -708,6 +717,13 @@ pub struct UserscriptResponse {
     /// `@connect *` was approved at install.
     #[serde(default)]
     pub connect_all_approved: bool,
+    /// Browser logins (extension relay of non-anonymous requests and cookies) were approved.
+    #[serde(default)]
+    pub browser_cookies_approved: bool,
+    /// Set when the script is approved for browser logins but its last request fell back to the
+    /// proxy's own cookie jar (no connected extension, or no host permission).
+    #[serde(default)]
+    pub browser_logins_unavailable: bool,
     #[serde(default)]
     pub unsupported: Vec<String>,
     #[serde(default)]
