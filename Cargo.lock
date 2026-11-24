@@ -1596,6 +1596,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "e2e"
 version = "0.3.5"
 dependencies = [
+ "api-types",
  "async-compression",
  "async-trait",
  "axum-test",
@@ -4192,6 +4193,7 @@ version = "0.3.5"
 dependencies = [
  "adblock",
  "age",
+ "api-types",
  "arc-swap",
  "async-compression",
  "async-stream",

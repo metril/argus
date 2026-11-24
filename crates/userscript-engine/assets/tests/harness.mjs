@@ -78,6 +78,11 @@ export function makeEnv(opts = {}) {
     xhrHandler: opts.xhrHandler || (() => [headFrame(200, [["content-type", "text/plain"]]), dataFrame("hello"), endFrame()]),
     resources: opts.resources || {},
     failValueSet: false,
+    // extension menu: bodies of menu/sync and menu/wait calls, and parked wait resolvers
+    syncs: [],
+    waits: [],
+    waiters: [],
+    ext: true,
   };
   async function fetchImpl(url, init = {}) {
     url = String(url);
@@ -103,6 +108,11 @@ export function makeEnv(opts = {}) {
       return new Response(stream, { headers: { "content-type": "application/x-gm-frames" } });
     }
     const body = init.body ? JSON.parse(init.body) : {};
+    if (path === "menu/sync") { backend.syncs.push(body); return jsonRes({ ext: backend.ext !== false }); }
+    if (path === "menu/wait") {
+      backend.waits.push(body);
+      return jsonRes(await new Promise((res) => backend.waiters.push(res)));
+    }
     if (path === "values/get") {
       const names = body.names || Object.keys(store);
       const r = {};
@@ -173,7 +183,7 @@ export function token(id = "s1") {
 }
 
 /** Run one script `fn(params...)` under the runtime. Resolves with what the script captured. */
-export function runScript(env, { grants = [], runAt = "document-start", id = "s1", name = "Test Script", values, meta = {}, resources, unwrap = false, code, cfg = {} } = {}, fn) {
+export function runScript(env, { grants = [], runAt = "document-start", id = "s1", name = "Test Script", values, meta = {}, resources, unwrap = false, code, cfg = {}, mdoc } = {}, fn) {
   const runtime = loadRuntime(arguments[3]);
   const gm = ["GM_info", "GM"];
   const table = {
@@ -192,6 +202,7 @@ export function runScript(env, { grants = [], runAt = "document-start", id = "s1
     meta: { name, version: "1.0", grants, ...meta }, metaStr: "// ==UserScript==\n// @name " + name + "\n// ==/UserScript==\n",
   };
   if (values) d.values = values;
+  if (mdoc) d.mdoc = mdoc;
   if (resources) d.resources = resources;
   if (unwrap) d.code = code;
   const f = unwrap ? null : function (...args) {

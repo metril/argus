@@ -62,6 +62,9 @@ pub struct Review {
     pub needs_reapproval: bool,
     /// The script declares `@connect *`: the review asks whether to allow it.
     pub wants_any: bool,
+    /// The script can make requests or use cookies: the review asks whether it may use this
+    /// browser's logins through the connected extension.
+    pub wants_browser: bool,
 }
 
 fn warn_from(raw: &str, unsupported: bool) -> Warn {
@@ -186,6 +189,7 @@ impl Review {
             needs_reapproval: p.update.as_ref().is_some_and(|u| u.needs_reapproval),
             diff: p.update.map(|u| u.diff),
             wants_any: p.connect_all,
+            wants_browser: p.network || p.cookies,
         }
     }
 
@@ -271,6 +275,11 @@ impl Review {
             diff: None,
             needs_reapproval: false,
             wants_any: s.connect.iter().any(|c| c == "*"),
+            wants_browser: s
+                .grants
+                .iter()
+                .any(|g| matches!(grant_key(g).as_str(), "xmlhttprequest" | "cookie"))
+                && !s.browser_cookies_approved,
         }
     }
 
@@ -443,9 +452,12 @@ pub fn PlanDrawer(
     let all_pats = RwSignal::new(false);
     // Permission question for `@connect *`; always starts off.
     let allow = RwSignal::new(false);
+    // Permission question for browser logins; always starts off.
+    let allow_browser = RwSignal::new(false);
     Effect::new(move |_| {
         if open.get() {
             allow.set(false);
+            allow_browser.set(false);
             err.set(None);
             all_pats.set(false);
         }
@@ -485,11 +497,19 @@ pub fn PlanDrawer(
             let c = ApiClient::new();
             let res: Result<&str, crate::api::ApiError> = match (&r.kind, discard) {
                 (ReviewKind::Install(pid), _) => c
-                    .confirm_userscript_plan(pid, r.wants_any && allow.get_untracked())
+                    .confirm_userscript_plan(
+                        pid,
+                        r.wants_any && allow.get_untracked(),
+                        r.wants_browser && allow_browser.get_untracked(),
+                    )
                     .await
                     .map(|_| "Userscript installed"),
                 (ReviewKind::Update(id), false) => c
-                    .approve_userscript_update(id, r.wants_any && allow.get_untracked())
+                    .approve_userscript_update(
+                        id,
+                        r.wants_any && allow.get_untracked(),
+                        r.wants_browser && allow_browser.get_untracked(),
+                    )
                     .await
                     .map(|_| "Update applied"),
                 (ReviewKind::Update(id), true) => c
@@ -497,7 +517,11 @@ pub fn PlanDrawer(
                     .await
                     .map(|_| "Update discarded"),
                 (ReviewKind::Approve(id), _) => c
-                    .approve_userscript(id, r.wants_any && allow.get_untracked())
+                    .approve_userscript(
+                        id,
+                        r.wants_any && allow.get_untracked(),
+                        r.wants_browser && allow_browser.get_untracked(),
+                    )
                     .await
                     .map(|_| "Script approved and enabled"),
             };
@@ -536,6 +560,16 @@ pub fn PlanDrawer(
                         </span>
                     </label>
                 }
+            })}
+            {move || review.get().filter(|r| r.wants_browser).map(|_| view! {
+                <label class="ask">
+                    <input type="checkbox" prop:checked=move || allow_browser.get()
+                        on:change=move |ev| allow_browser.set(event_target_checked(&ev)) />
+                    <span>
+                        <b>"Use my browser's logins"</b>
+                        <span class="muted">" With the Argus extension connected, this script's requests and cookie calls go through your browser, with your real logins, instead of its private cookie jar. Off: it keeps using its own jar."</span>
+                    </span>
+                </label>
             })}
             <button type="button" class="btn ghost" on:click=move |_| open.set(false)>"Cancel"</button>
             {move || matches!(review.get().map(|r| r.kind), Some(ReviewKind::Update(_))).then(|| view! {

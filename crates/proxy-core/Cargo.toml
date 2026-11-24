@@ -92,6 +92,7 @@ rust-embed = { version = "8", features = ["debug-embed"] }
 
 # Common utilities
 common = { path = "../common" }
+api-types = { workspace = true }
 
 # WebSocket proxying (optional, feature `websockets`)
 tokio-tungstenite = { workspace = true, optional = true }

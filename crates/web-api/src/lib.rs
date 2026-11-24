@@ -20,12 +20,13 @@ pub mod userscript_ops;
 pub mod webui_tls;
 
 // Re-export commonly used items
+pub use api_types::{ExtAuditEvent, ExtError, ExtIdent, ExtOut};
 pub use config::ApiConfig;
 pub use error::{ApiError, ApiResult};
 pub use list_service::{ListService, ListServiceConfig, ListStatus, ListStore};
 pub use openapi::ApiDoc;
 pub use server::{build_api, create_router, create_router_with, start_server, WebServer};
 pub use state::{
-    build_state, build_state_full, build_state_with_policy, AppState, ListenerCounters,
+    build_state, build_state_full, build_state_with_policy, AppState, ExtBridge, ListenerCounters,
     ProfileBuildInfo, ProfileRuntime, ProxyBind, ProxyState, ProxyStats, RuntimeControl,
 };

@@ -20,6 +20,7 @@ pub mod dns;
 pub mod error;
 pub mod ev;
 pub mod ext;
+pub mod ext_bridge;
 pub mod filtering;
 pub mod gm;
 pub mod http2;

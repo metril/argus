@@ -491,8 +491,15 @@ impl TestProxy {
     ) -> String {
         use userscript_engine::install::{finish_install, plan_install, Approvals};
         let plan = plan_install(source, None).expect("plan");
-        let script =
-            finish_install(plan, fetched, Approvals { allow_connect_all }).expect("finish");
+        let script = finish_install(
+            plan,
+            fetched,
+            Approvals {
+                allow_connect_all,
+                ..Default::default()
+            },
+        )
+        .expect("finish");
         self.userscripts()
             .install_script(ns, script)
             .expect("install")

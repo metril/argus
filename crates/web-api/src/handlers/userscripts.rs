@@ -71,6 +71,8 @@ fn userscript_response(
         grants: m.effective_grants(),
         connect: m.connect.clone(),
         connect_all_approved: script.allow_connect_all,
+        browser_cookies_approved: script.browser_cookies,
+        browser_logins_unavailable: false,
         unsupported: m.unsupported().iter().map(|w| w.message.clone()).collect(),
         warnings: m.warnings.iter().map(|w| w.message.clone()).collect(),
         run_at: serde_json::to_value(m.run_at)
@@ -98,8 +100,23 @@ fn userscript_response(
     }
 }
 
+/// Mark a script approved for browser logins whose last request fell back to the proxy's jar.
+fn flag_fallback(
+    state: &AppState,
+    script: &userscript_engine::Userscript,
+    r: &mut UserscriptResponse,
+) {
+    r.browser_logins_unavailable = script.browser_cookies
+        && state
+            .ext
+            .get()
+            .is_some_and(|e| e.browser_fallback(&script.profile, &script.id));
+}
+
 fn respond(state: &AppState, script: &userscript_engine::Userscript) -> UserscriptResponse {
-    userscript_response(script, storage_bytes_of(state, &script.profile, &script.id))
+    let mut r = userscript_response(script, storage_bytes_of(state, &script.profile, &script.id));
+    flag_fallback(state, script, &mut r);
+    r
 }
 
 fn not_found(id: &str) -> ApiError {
@@ -206,7 +223,9 @@ pub async fn list_userscripts(
         })
         .map(|s| {
             let used = usage.get(&ns(&s.profile, &s.id)).copied().unwrap_or(0);
-            userscript_response(s, used as u64)
+            let mut r = userscript_response(s, used as u64);
+            flag_fallback(&state, s, &mut r);
+            r
         })
         .collect();
     let mut counts = UserscriptCounts {
@@ -429,16 +448,38 @@ pub async fn approve_script(
             "allow_connect_all can only be granted while the script is awaiting approval",
         ));
     }
+    if req.browser_cookies {
+        if !script.pending_approval {
+            return Err(ApiError::conflict(
+                "not_pending_approval",
+                "browser_cookies can only be granted while the script is awaiting approval",
+            ));
+        }
+        let g = script.metadata.effective_grants();
+        if !g
+            .iter()
+            .any(|x| matches!(x.as_str(), "gm_xmlhttprequest" | "gm_cookie"))
+        {
+            return Err(ApiError::ValidationError(
+                "browser_cookies given but the script has no network or cookie grant".into(),
+            ));
+        }
+    }
     state
         .userscript_manager
-        .approve_in(&profile.name, &id, req.allow_connect_all)
+        .approve_in(
+            &profile.name,
+            &id,
+            req.allow_connect_all,
+            req.browser_cookies,
+        )
         .map_err(|e| match e {
             userscript_engine::Error::ScriptNotFound(_) => not_found(&id),
             _ => ApiError::Internal(format!("Failed to approve: {e}")),
         })?;
     info!(
-        "Userscript {id} approved by {} (connect_all={})",
-        p.username, req.allow_connect_all
+        "Userscript {id} approved by {} (connect_all={}, browser_cookies={})",
+        p.username, req.allow_connect_all, req.browser_cookies
     );
     Ok(Json(respond(
         &state,
@@ -643,6 +684,11 @@ pub async fn confirm_plan(
             "allow_connect_all given but the script does not declare @connect *".into(),
         ));
     }
+    if req.browser_cookies && !(sp.plan.grants_summary.network || sp.plan.grants_summary.cookies) {
+        return Err(ApiError::ValidationError(
+            "browser_cookies given but the script has no network or cookie grant".into(),
+        ));
+    }
     let id = sp.plan.metadata.unique_id();
     if let Some(existing) = state.userscript_manager.get_in(&profile.name, &id) {
         // Updating: confirming is the approval of the diff the plan showed, provided the
@@ -663,6 +709,7 @@ pub async fn confirm_plan(
             sp.fetched_clone(),
             true,
             req.allow_connect_all,
+            req.browser_cookies,
         )
         .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
         new.pending_update = None;
@@ -683,6 +730,7 @@ pub async fn confirm_plan(
         sp.fetched_clone(),
         Approvals {
             allow_connect_all: req.allow_connect_all,
+            browser_cookies: req.browser_cookies,
         },
     )
     .map_err(|e| ApiError::ValidationError(format!("Invalid userscript: {e}")))?;
@@ -757,7 +805,13 @@ pub async fn approve_update(
     ApiPath(id): ApiPath<String>,
     ApiJson(req): ApiJson<ApproveUpdateRequest>,
 ) -> ApiResult<Json<UserscriptResponse>> {
-    ops::approve_pending(&state, &profile.name, &id, req.allow_connect_all)?;
+    ops::approve_pending(
+        &state,
+        &profile.name,
+        &id,
+        req.allow_connect_all,
+        req.browser_cookies,
+    )?;
     info!("Userscript {id} update approved by {}", p.username);
     Ok(Json(respond(
         &state,
@@ -988,6 +1042,7 @@ pub async fn export_userscripts(
             source: s.source,
             enabled: s.enabled,
             allow_connect_all: s.allow_connect_all,
+            browser_cookies: s.browser_cookies,
             assets: ExportedAssets {
                 requires: s
                     .assets
@@ -1068,20 +1123,24 @@ pub async fn import_userscripts(
     let quotas = *mgr.gm().quotas();
     let mut results = Vec::new();
     for entry in bundle.scripts {
-        let mut script =
-            match ops::build_from_bundle(&entry.source, &entry.assets, entry.allow_connect_all) {
-                Ok(s) => s,
-                Err(e) => {
-                    results.push(ImportResultDto {
-                        id: None,
-                        name: None,
-                        status: "error".into(),
-                        error: Some(e.to_string()),
-                        pending_approval: false,
-                    });
-                    continue;
-                }
-            };
+        let mut script = match ops::build_from_bundle(
+            &entry.source,
+            &entry.assets,
+            entry.allow_connect_all,
+            entry.browser_cookies,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                results.push(ImportResultDto {
+                    id: None,
+                    name: None,
+                    status: "error".into(),
+                    error: Some(e.to_string()),
+                    pending_approval: false,
+                });
+                continue;
+            }
+        };
         let (id, name) = (script.id.clone(), script.metadata.name.clone());
         let result = |status: &str, error: Option<String>| ImportResultDto {
             id: Some(id.clone()),
@@ -1116,6 +1175,7 @@ pub async fn import_userscripts(
         script.pending_approval = !bundle.approve;
         if !bundle.approve {
             script.allow_connect_all = false;
+            script.browser_cookies = false;
         }
         let status = if let Some(old) = existing {
             script.installed_at = old.installed_at;

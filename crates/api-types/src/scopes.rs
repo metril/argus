@@ -52,6 +52,7 @@ scopes! {
     CaAdmin => "ca:admin", "Manage the CA certificate (reserved).";
     ScriptsRead => "scripts:read", "View userscripts and their source.";
     ScriptsWrite => "scripts:write", "Install, update, enable, disable and remove userscripts; view and clear their stored values.";
+    UserscriptsBridge => "userscripts:bridge", "Connect the browser extension to userscripts: list and trigger a page's menu commands, and let approved scripts use this browser's logins.";
     PolicyRead => "policy:read", "View script policy rules, explanations, temporary permissions and blocked-source reports.";
     PolicyWrite => "policy:write", "Change script policy settings, rules and temporary permissions; import policy.";
     ProfilesRead => "profiles:read", "List and view filtering profiles (lists and overlay rules) the token may access.";
@@ -95,6 +96,7 @@ impl Scope {
                 Scope::ListsWrite
                     | Scope::RulesWrite
                     | Scope::ScriptsWrite
+                    | Scope::UserscriptsBridge
                     | Scope::PolicyWrite
                     | Scope::TokensSelf
                     | Scope::LogsRead

@@ -537,6 +537,11 @@ impl ProxyContext {
         let _ = self.profile_builder.set(builder);
     }
 
+    /// The internal endpoints' state (userscript delivery, panel, extension bridge hub).
+    pub fn internal(&self) -> &Arc<Internal> {
+        &self.internal
+    }
+
     /// The persistent profile and device store, once registered.
     pub fn profile_store(&self) -> Option<&Arc<common::profile_store::ProfileStore>> {
         self.profile_store.get()
@@ -673,6 +678,9 @@ impl ProxyContext {
         // Take the request apart: the header map is moved, not copied, from here on.
         let (parts, body) = req.into_parts();
         let mut headers = parts.headers;
+        // The extension bridge's headers never leave: the session secret and the relay token
+        // are read here and removed from the request.
+        let (ext_sid, relay) = crate::ext_bridge::take_headers(&mut headers);
 
         let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
 
@@ -690,6 +698,25 @@ impl ProxyContext {
             port,
             path_and_query,
         );
+
+        // A fetch the extension relays for a userscript: the job must be live and this hop must
+        // pass the script's stored `@connect` (the browser follows redirects itself, so every
+        // hop arrives here). Like the proxy's own GM requests it is not filtered.
+        let mut bypass_full = bypass_full;
+        if let Some(r) = relay.as_deref() {
+            let allowed =
+                reqwest::Url::parse(&url).is_ok_and(|u| self.internal.gm.ext().check_relay(r, &u));
+            if !allowed {
+                debug!("Refused a relayed request for {host}");
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::FORBIDDEN)
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "relayed request refused")
+                    .body(crate::inject::full_body(bytes::Bytes::new()))
+                    .expect("relay refusal"));
+            }
+            bypass_full = true;
+        }
 
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
@@ -1089,6 +1116,8 @@ impl ProxyContext {
         let mut rewritten = false;
         let mut utf8_charset = false;
         let mut text_changed = false;
+        // Public id of a document that got userscripts (`Server-Timing: argus`).
+        let mut server_timing: Option<String> = None;
         let body: ProxyBody = match (kind, codings) {
             (BodyKind::Html, Ok(codings)) if (enabled || spol.is_some()) && body_allowed => {
                 let origin = csp::PageOrigin::new(
@@ -1129,16 +1158,22 @@ impl ProxyContext {
                         if idx.is_empty() {
                             return None; // zero cost: no allocation, no probe
                         }
-                        self.internal.gm.plan_document_in(
+                        // Bound to the extension session whose secret the browser sent, if any.
+                        let session = ext_sid
+                            .as_deref()
+                            .and_then(|s| self.internal.gm.ext().bind(s, &prof.name));
+                        self.internal.gm.plan_document_bound(
                             &idx,
                             &prof.name,
                             &host,
                             &url,
                             &origin_of(scheme, &url_host, port),
                             rtype != RequestType::Subdocument,
+                            session,
                         )
                     })
                 };
+                server_timing = us.as_ref().map(|p| p.mdoc.clone());
                 let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
                 let panel_key = if enabled && !blocks_scripts {
                     self.internal.panel.hotkey(rctx)
@@ -1163,6 +1198,7 @@ impl ProxyContext {
                         userscripts: us_srcs,
                         panel: panel_key.as_ref(),
                         menu: menu_mode,
+                        ext: us.as_ref().is_some_and(|p| p.ext_bound),
                         ext_script: &ext_script,
                         cosmetics: &cos,
                         internal: &self.internal,
@@ -1268,6 +1304,9 @@ impl ProxyContext {
             _ => passthrough_body(resp),
         };
         let changed = rewritten || text_changed;
+        if !rewritten {
+            server_timing = None;
+        }
 
         let listed_resp = connection_listed(&resp_headers);
         let mut builder = Response::builder().status(status);
@@ -1364,6 +1403,10 @@ impl ProxyContext {
             if let Ok(v) = HeaderValue::from_str(&csp) {
                 builder = builder.header("content-security-policy", v);
             }
+        }
+        if let Some(m) = server_timing {
+            // Appended, so the site's own timing entries survive.
+            builder = builder.header("server-timing", format!("argus;desc=\"{m}\""));
         }
         let mut response = builder
             .body(body)

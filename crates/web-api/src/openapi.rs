@@ -37,6 +37,7 @@ use crate::auth::authz::RouteTable;
         (name = "policy", description = "Script policy (NoScript-style per-site capabilities)"),
         (name = "profiles", description = "Per-device filtering profiles"),
         (name = "devices", description = "Devices and their tokens"),
+        (name = "ext", description = "Browser extension bridge (channel, userscript menus)"),
         (name = "audit", description = "Audit log"),
         (name = "system", description = "Health, status, metrics, this document"),
     )

@@ -102,6 +102,9 @@ pub struct BundleOptions<'a> {
     /// Call the runtime installed once by [`runtime_script`] instead of repeating it in the
     /// bundle (the page must load that script first).
     pub shared_runtime: bool,
+    /// Public id of the document, set only when the document is bound to a live browser
+    /// extension session (menu commands sync to it).
+    pub mdoc: Option<&'a str>,
 }
 
 impl<'a> BundleOptions<'a> {
@@ -124,6 +127,7 @@ impl<'a> BundleOptions<'a> {
             values,
             inline_resource_limit: 256 * 1024,
             shared_runtime: false,
+            mdoc: None,
         }
     }
 }
@@ -298,6 +302,9 @@ pub fn entry_js(cs: &CompiledScript, opts: &BundleOptions<'_>) -> String {
             opts.page_origin
         )),
     );
+    if let Some(md) = opts.mdoc {
+        d.insert("mdoc".into(), json!(md));
+    }
     d.insert("meta".into(), meta_json(m));
     d.insert("metaStr".into(), json!(meta_str(m)));
     d.insert("unwrap".into(), json!(m.unwrap));

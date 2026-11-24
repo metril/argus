@@ -25,7 +25,7 @@ pub mod storage;
 pub mod token;
 
 pub use error::{Error, Result};
-pub use index::{CompiledScript, ScriptIndex};
+pub use index::{CompiledScript, HostPolicy, ScriptIndex};
 pub use manager::{UserscriptManager, UserscriptStats};
 pub use metadata::{RunAt, UserscriptMetadata};
 pub use runtime::{CacheStats, UserscriptRuntime};

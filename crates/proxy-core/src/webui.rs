@@ -38,6 +38,61 @@ impl ProfileRuntime for ProxyProfileRuntime {
     }
 }
 
+#[async_trait::async_trait]
+impl web_api::ExtBridge for crate::ext_bridge::ExtHub {
+    fn open(
+        &self,
+        ident: api_types::ExtIdent,
+    ) -> (u64, String, tokio::sync::mpsc::Receiver<api_types::ExtOut>) {
+        let (id, sid, rx) = crate::ext_bridge::ExtHub::open(self, ident);
+        // The extension gets its host list right after the welcome frame.
+        if let Some(hub) = self.arc() {
+            tokio::spawn(async move { hub.push_hosts(id, true).await });
+        }
+        (id, sid, rx)
+    }
+
+    async fn on_text(&self, session: u64, text: &str) {
+        crate::ext_bridge::ExtHub::on_text(self, session, text).await
+    }
+
+    async fn on_binary(&self, session: u64, data: Vec<u8>) {
+        crate::ext_bridge::ExtHub::on_binary(self, session, &data).await
+    }
+
+    fn close(&self, session: u64) {
+        crate::ext_bridge::ExtHub::close(self, session)
+    }
+
+    fn session_for(&self, sid: &str, token_id: &str) -> Option<u64> {
+        crate::ext_bridge::ExtHub::session_for(self, sid, token_id)
+    }
+
+    fn menu(
+        &self,
+        session: u64,
+        mdoc: &str,
+    ) -> Result<api_types::ExtMenuResponse, api_types::ExtError> {
+        crate::ext_bridge::ExtHub::menu(self, session, mdoc)
+    }
+
+    fn trigger(
+        &self,
+        session: u64,
+        req: &api_types::ExtTriggerRequest,
+    ) -> Result<bool, api_types::ExtError> {
+        crate::ext_bridge::ExtHub::trigger(self, session, req)
+    }
+
+    fn browser_fallback(&self, profile: &str, script: &str) -> bool {
+        crate::ext_bridge::ExtHub::browser_fallback(self, profile, script)
+    }
+
+    fn set_audit(&self, sink: Arc<dyn Fn(api_types::ExtAuditEvent) + Send + Sync>) {
+        self.set_audit_sink(sink);
+    }
+}
+
 /// Everything the API shares with the proxy besides what `ctx` already holds.
 pub struct ApiInputs {
     pub api_config: ApiConfig,
@@ -56,6 +111,13 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
         i.manager.clone(),
         i.manager.storage_arc(),
     ));
+    let hub = ctx.internal().gm.ext().clone();
+    hub.set_ctx(crate::ext_bridge::HubCtx {
+        manager: i.manager.clone(),
+        profiles: ctx.profile_store().cloned(),
+        bypass: ctx.bypass().clone(),
+    });
+    hub.set_auditor(runtime.auditor().clone());
     let state = web_api::build_state_full(
         i.api_config,
         i.proxy_config,
@@ -71,6 +133,20 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
         Some(Arc::new(ProxyProfileRuntime::new(ctx.clone()))),
     )
     .await?;
+    let _ = state.ext.set(hub.clone());
+    {
+        // Weak: the state owns the hub, the hub must not keep the state alive.
+        let weak = Arc::downgrade(&state);
+        web_api::ExtBridge::set_audit(
+            hub.as_ref(),
+            Arc::new(move |ev| {
+                if let Some(s) = weak.upgrade() {
+                    s.record_ext_audit(ev);
+                }
+            }),
+        );
+    }
+    hub.spawn_pusher();
     let _ = state.certs.set(ctx.certs().clone());
     if let Some(r) = ctx.roots() {
         let _ = state.roots.set(r.cell.clone());

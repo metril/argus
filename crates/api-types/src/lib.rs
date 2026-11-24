@@ -28,6 +28,9 @@ pub use profiles::*;
 mod userscripts;
 pub use userscripts::*;
 
+mod ext;
+pub use ext::*;
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -708,6 +711,13 @@ pub struct UserscriptResponse {
     /// `@connect *` was approved at install.
     #[serde(default)]
     pub connect_all_approved: bool,
+    /// Browser logins (extension relay of non-anonymous requests and cookies) were approved.
+    #[serde(default)]
+    pub browser_cookies_approved: bool,
+    /// Set when the script is approved for browser logins but its last request fell back to the
+    /// proxy's own cookie jar (no connected extension, or no host permission).
+    #[serde(default)]
+    pub browser_logins_unavailable: bool,
     #[serde(default)]
     pub unsupported: Vec<String>,
     #[serde(default)]

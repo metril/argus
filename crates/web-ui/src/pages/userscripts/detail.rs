@@ -152,6 +152,17 @@ fn PermsSec(sc: Sc) -> impl IntoView {
                             </div>
                         }
                     })}
+                    {s.browser_cookies_approved.then(|| view! {
+                        <div class="sec">
+                            <h4 class="sec-title">"Browser logins"</h4>
+                            <span class="muted">"You approved using your browser's logins through the Argus extension."</span>
+                            {s.browser_logins_unavailable.then(|| view! {
+                                <div class="callout" role="alert">
+                                    <span>"Browser logins unavailable: the last request used the script's own cookie jar. Connect the Argus extension and grant it access to the site."</span>
+                                </div>
+                            })}
+                        </div>
+                    })}
                     {(!s.match_patterns.is_empty()).then(|| view! {
                         <div class="sec">
                             <h4 class="sec-title">"Runs on"</h4>

@@ -432,6 +432,7 @@ impl UserscriptManager {
         profile: &str,
         script_id: &str,
         allow_connect_all: bool,
+        browser_cookies: bool,
     ) -> Result<()> {
         {
             let mut scripts = self.scripts.write();
@@ -443,6 +444,9 @@ impl UserscriptManager {
             script.pending_approval = false;
             if allow_connect_all {
                 script.allow_connect_all = true;
+            }
+            if browser_cookies {
+                script.browser_cookies = true;
             }
             self.save_script(script, Durability::Immediate)?;
         }
@@ -619,10 +623,14 @@ console.log('test');
         manager.replace_script(DEFAULT_PROFILE, s).unwrap();
         assert!(manager.get(&id).unwrap().pending_approval);
 
-        manager.approve_in(DEFAULT_PROFILE, &id, true).unwrap();
+        manager
+            .approve_in(DEFAULT_PROFILE, &id, true, false)
+            .unwrap();
         let s = manager.get(&id).unwrap();
         assert!(s.enabled && !s.pending_approval && s.allow_connect_all);
-        assert!(manager.approve_in(DEFAULT_PROFILE, "nope", false).is_err());
+        assert!(manager
+            .approve_in(DEFAULT_PROFILE, "nope", false, false)
+            .is_err());
     }
 
     #[test]

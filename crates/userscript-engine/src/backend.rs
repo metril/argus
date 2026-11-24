@@ -87,7 +87,7 @@ pub struct ScriptCtx<'a> {
 }
 
 impl ScriptCtx<'_> {
-    fn require(&self, any_of: &[&str]) -> GmResult<()> {
+    pub fn require(&self, any_of: &[&str]) -> GmResult<()> {
         if !self.script.enabled {
             return Err(GmError::new(ErrorCode::Disabled, "script is disabled"));
         }
@@ -516,6 +516,8 @@ pub struct XhrRequest {
     pub timeout: u64,
     /// `follow` (default), `error`, `manual`.
     pub redirect: String,
+    /// Public id of the page's document (selects the extension session for browser logins).
+    pub mdoc: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,6 +777,21 @@ pub enum CookieOp {
 }
 
 impl GmBackend {
+    /// The checks of [`Self::cookie_op`] without touching a jar: the grant and `@connect`.
+    /// Returns the operation's URL.
+    pub fn cookie_authorize(&self, ctx: &ScriptCtx<'_>, op: &CookieOp) -> GmResult<Url> {
+        ctx.require(&["GM_cookie"])?;
+        let u = match op {
+            CookieOp::List { url, .. }
+            | CookieOp::Set { url, .. }
+            | CookieOp::Delete { url, .. } => url,
+        };
+        let url = Url::parse(u)
+            .map_err(|e| GmError::new(ErrorCode::BadRequest, format!("bad url: {e}")))?;
+        check_connect(ctx.script, ctx.page_host, &url)?;
+        Ok(url)
+    }
+
     /// `GM_cookie.*`: needs `@grant GM_cookie`, and the cookie's URL must pass `@connect`.
     pub fn cookie_op(
         &self,
@@ -834,6 +851,7 @@ mod tests {
             Fetched::default(),
             Approvals {
                 allow_connect_all: connect_all,
+                ..Default::default()
             },
         )
         .unwrap()

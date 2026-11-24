@@ -46,6 +46,7 @@ pub fn source_fingerprint(s: &Userscript) -> String {
         h.update(r.content.as_bytes());
     }
     h.update([s.allow_connect_all as u8]);
+    h.update([s.browser_cookies as u8]);
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -372,7 +373,8 @@ pub fn stage_update(
     let new_version = up.new_version.clone();
     let source = up.plan.source.clone();
     // Built with approval only to verify the dependencies and obtain their stored form.
-    let mut cand = install::finish_update(script, up, fetched, true, false).map_err(invalid)?;
+    let mut cand =
+        install::finish_update(script, up, fetched, true, false, false).map_err(invalid)?;
     cand.last_update_check = Some(now);
     if apply && !needs {
         mgr.replace_script(profile, cand)?;
@@ -400,6 +402,7 @@ pub fn approve_pending(
     profile: &str,
     id: &str,
     allow_connect_all: bool,
+    browser_cookies: bool,
 ) -> ApiResult<()> {
     let mgr = &state.userscript_manager;
     let script = mgr
@@ -425,6 +428,7 @@ pub fn approve_pending(
         fetched_from_assets(&pending.assets),
         true,
         allow_connect_all,
+        browser_cookies,
     )
     .map_err(invalid)?;
     new.last_update_check = script.last_update_check;
@@ -438,6 +442,7 @@ pub fn build_from_bundle(
     source: &str,
     assets: &api_types::ExportedAssets,
     allow_connect_all: bool,
+    browser_cookies: bool,
 ) -> ApiResult<Userscript> {
     let plan = install::plan_install(source, None).map_err(invalid)?;
     if assets.requires.len() > MAX_REQUIRES || assets.resources.len() > MAX_RESOURCES {
@@ -459,11 +464,13 @@ pub fn build_from_bundle(
             .insert(r.name.clone(), (b, Some(r.mime.clone())));
     }
     let allow = allow_connect_all && plan.grants_summary.connect_all;
+    let summary_net = plan.grants_summary.clone();
     install::finish_install(
         plan,
         fetched,
         Approvals {
             allow_connect_all: allow,
+            browser_cookies: browser_cookies && (summary_net.network || summary_net.cookies),
         },
     )
     .map_err(invalid)
