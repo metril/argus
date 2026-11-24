@@ -34,16 +34,37 @@ pub fn is_sensitive_grant(grant: &str) -> bool {
 
 /// Human readable byte size.
 /// What identifies a script URL for "already installed": Greasy Fork scripts by their numeric
-/// id (the mirror host and file name vary), anything else by the URL itself.
+/// id (the mirror host and file name vary), anything else by the URL itself. The host must be
+/// greasyfork.org / sleazyfork.org or a subdomain of one, never a lookalike.
 pub fn url_key(u: &str) -> String {
     let u = u.trim();
-    if let Some(i) = u.find("/scripts/") {
-        let id: String = u[i + 9..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if !id.is_empty() && (u.contains("greasyfork.org") || u.contains("sleazyfork.org")) {
-            return format!("gf:{id}");
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"));
+    if let Some(rest) = rest {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        if !authority.contains(['@', '\\', ' ']) {
+            let host = authority
+                .rsplit_once(':')
+                .map_or(authority, |(h, port)| {
+                    if port.chars().all(|c| c.is_ascii_digit()) {
+                        h
+                    } else {
+                        authority
+                    }
+                })
+                .to_ascii_lowercase();
+            let ours = ["greasyfork.org", "sleazyfork.org"]
+                .iter()
+                .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+            if let (true, Some(tail)) = (ours, path.strip_prefix("/scripts/")) {
+                let id: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let after = &tail[id.len()..];
+                if !id.is_empty() && (after.is_empty() || after.starts_with(['/', '?', '#'])) {
+                    return format!("gf:{id}");
+                }
+            }
         }
     }
     u.to_string()
