@@ -90,6 +90,9 @@ pub struct Userscript {
     /// The user approved `@connect *` for this script at install time.
     #[serde(default)]
     pub allow_connect_all: bool,
+    /// Imported from a bundle without approval: stays off until approved.
+    #[serde(default)]
+    pub pending_approval: bool,
     /// A found update awaiting approval.
     #[serde(default)]
     pub pending_update: Option<PendingUpdate>,
@@ -117,6 +120,7 @@ impl Userscript {
             execution_count: 0,
             assets: ScriptAssets::default(),
             allow_connect_all: false,
+            pending_approval: false,
             pending_update: None,
             last_update_check: None,
         })

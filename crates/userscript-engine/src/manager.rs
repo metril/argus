@@ -418,7 +418,35 @@ impl UserscriptManager {
             script.name()
         );
         script.enabled = enabled;
+        if enabled {
+            script.pending_approval = false;
+        }
         self.save_script(script, Durability::Immediate)?;
+        Ok(())
+    }
+
+    /// Approve an imported script: enable it, optionally grant `@connect *`, clear the pending
+    /// flag. The caller checks that the script declares `@connect *` before passing true.
+    pub fn approve_in(
+        &self,
+        profile: &str,
+        script_id: &str,
+        allow_connect_all: bool,
+    ) -> Result<()> {
+        {
+            let mut scripts = self.scripts.write();
+            let script = scripts
+                .get_mut(&key(profile, script_id))
+                .ok_or_else(|| Error::ScriptNotFound(script_id.to_string()))?;
+            info!("Approving userscript: {}", script.name());
+            script.enabled = true;
+            script.pending_approval = false;
+            if allow_connect_all {
+                script.allow_connect_all = true;
+            }
+            self.save_script(script, Durability::Immediate)?;
+        }
+        self.refresh_index_for(profile);
         Ok(())
     }
 
@@ -578,6 +606,23 @@ console.log('test');
 
         let scripts = manager.get_scripts_for_url("https://other.com/page");
         assert_eq!(scripts.len(), 0);
+    }
+
+    #[test]
+    fn test_approve_clears_pending_and_grants_connect() {
+        let temp_dir = tempdir().unwrap();
+        let manager = UserscriptManager::new(temp_dir.path().to_path_buf()).unwrap();
+        let id = manager.install(TEST_SCRIPT.to_string()).unwrap();
+        let mut s = manager.get(&id).unwrap();
+        s.enabled = false;
+        s.pending_approval = true;
+        manager.replace_script(DEFAULT_PROFILE, s).unwrap();
+        assert!(manager.get(&id).unwrap().pending_approval);
+
+        manager.approve_in(DEFAULT_PROFILE, &id, true).unwrap();
+        let s = manager.get(&id).unwrap();
+        assert!(s.enabled && !s.pending_approval && s.allow_connect_all);
+        assert!(manager.approve_in(DEFAULT_PROFILE, "nope", false).is_err());
     }
 
     #[test]

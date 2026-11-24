@@ -645,6 +645,138 @@ async fn imported_scripts_arrive_disabled_and_unapproved_unless_confirmed() {
     assert_eq!(s["connect_all_approved"], true);
 }
 
+#[tokio::test]
+async fn import_marks_pending_and_approve_clears_it_and_grants_connect() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let bundle = json!({
+        "format": "argus-userscripts-v1",
+        "scripts": [{
+            "source": src("1.0", "// @grant GM_xmlhttpRequest\n// @connect *"),
+            "enabled": true,
+            "allow_connect_all": true,
+            "assets": {"requires": [], "resources": []}
+        }]
+    });
+    let res: Value = admin
+        .post("/api/v1/userscripts/import")
+        .json(&bundle)
+        .await
+        .json();
+    let id = res["results"][0]["id"].as_str().unwrap().to_string();
+    let url = format!("/api/v1/userscripts/{}", enc(&id));
+    let s: Value = admin.get(&url).await.json();
+    assert_eq!(s["pending_approval"], true);
+    let page: Value = admin
+        .get("/api/v1/userscripts?status=attention")
+        .await
+        .json();
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["counts"]["attention"], 1);
+
+    let r = admin
+        .post(&format!("{url}/approve"))
+        .json(&json!({"allow_connect_all": true}))
+        .await;
+    r.assert_status_ok();
+    let s: Value = r.json();
+    assert_eq!(s["pending_approval"], false);
+    assert_eq!(s["enabled"], true);
+    assert_eq!(s["connect_all_approved"], true);
+    let page: Value = admin
+        .get("/api/v1/userscripts?status=attention")
+        .await
+        .json();
+    assert_eq!(page["total"], 0);
+
+    // @connect * cannot be granted to a script that does not declare it.
+    admin.delete(&url).await.assert_status_ok();
+    let other = install_plain(&admin, &src("2.0", "")).await;
+    let r = admin
+        .post(&format!("/api/v1/userscripts/{}/approve", enc(&other)))
+        .json(&json!({"allow_connect_all": true}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+#[tokio::test]
+async fn approve_refuses_connect_all_outside_a_pending_review() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let id = install_plain(
+        &admin,
+        &src("1.0", "// @grant GM_xmlhttpRequest\n// @connect *"),
+    )
+    .await;
+    let url = format!("/api/v1/userscripts/{}/approve", enc(&id));
+    let r = admin
+        .post(&url)
+        .json(&json!({"allow_connect_all": true}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::CONFLICT, "{}", r.text());
+    // A plain approve of a script that is not pending stays a harmless enable.
+    admin
+        .post(&url)
+        .json(&json!({"allow_connect_all": false}))
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn import_into_a_non_default_profile_detects_conflicts() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let prof: Value = admin
+        .post("/api/v1/profiles")
+        .json(&json!({"name": "Kids"}))
+        .await
+        .json();
+    let pid = prof["id"].as_str().unwrap().to_string();
+    let bundle = |v: &str, mode: &str| {
+        json!({
+            "format": "argus-userscripts-v1",
+            "on_conflict": mode,
+            "scripts": [{
+                "source": src(v, ""),
+                "enabled": true,
+                "allow_connect_all": false,
+                "assets": {"requires": [], "resources": []}
+            }]
+        })
+    };
+    let import = |b: Value| {
+        let admin = &admin;
+        let pid = pid.clone();
+        async move {
+            let r = admin
+                .post(&format!("/api/v1/userscripts/import?profile={pid}"))
+                .json(&b)
+                .await;
+            r.assert_status_ok();
+            r.json::<Value>()["results"][0].clone()
+        }
+    };
+    let first = import(bundle("1.0", "skip")).await;
+    assert_eq!(first["status"], "installed", "{first}");
+    // Same script again without replace: skipped, not overwritten.
+    let again = import(bundle("2.0", "skip")).await;
+    assert_eq!(again["status"], "skipped", "{again}");
+    let id = first["id"].as_str().unwrap();
+    let s: Value = admin
+        .get(&format!("/api/v1/userscripts/{}?profile={pid}", enc(id)))
+        .await
+        .json();
+    assert_eq!(s["version"], "1.0");
+    // With replace it is replaced.
+    let rep = import(bundle("3.0", "replace")).await;
+    assert_eq!(rep["status"], "replaced", "{rep}");
+    let s: Value = admin
+        .get(&format!("/api/v1/userscripts/{}?profile={pid}", enc(id)))
+        .await
+        .json();
+    assert_eq!(s["version"], "3.0");
+}
+
 // ---------------------------------------------------------------- signed catalogue
 
 fn catalogue_doc(

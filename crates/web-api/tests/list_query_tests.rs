@@ -388,7 +388,7 @@ async fn userscripts_search_status_sort_cursor_and_counts() {
     );
     assert_eq!(
         all["counts"],
-        json!({"all": 4, "enabled": 3, "disabled": 1, "error": 1, "letters": ["A", "S", "Z"]})
+        json!({"all": 4, "enabled": 3, "disabled": 1, "error": 1, "attention": 1, "updates": 0, "letters": ["A", "S", "Z"]})
     );
     assert_eq!(all["next_cursor"], Value::Null);
     assert_eq!(names(&get("?status=disabled").await), ["Alpha"]);

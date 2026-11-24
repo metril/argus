@@ -29,6 +29,7 @@ pub fn AppRouter() -> impl IntoView {
                 <Route path=path!("/sessions") view=|| view! { <Protected><SessionsPage /></Protected> } />
                 <Route path=path!("/audit") view=|| view! { <Protected><AuditPage /></Protected> } />
                 <Route path=path!("/userscripts") view=|| view! { <Protected><UserscriptsPage /></Protected> } />
+                <Route path=path!("/userscripts/:id") view=|| view! { <Protected><UserscriptDetailPage /></Protected> } />
                 <Route path=path!("/policy") view=|| view! { <Protected><PolicyPage /></Protected> } />
                 <Route path=path!("/profiles") view=|| view! { <Protected><ProfilesPage /></Protected> } />
                 <Route path=path!("/devices") view=|| view! { <Protected><DevicesPage /></Protected> } />

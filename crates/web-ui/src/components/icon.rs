@@ -64,6 +64,18 @@ fn paths(name: &str) -> &'static str {
         "bypass" => {
             r#"<rect x="3" y="7" width="10" height="7" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2M8 10v1.5"/>"#
         }
+        "globe" => {
+            r#"<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2.2 2.4 2.2 9.6 0 12M8 2c-2.2 2.4-2.2 9.6 0 12"/>"#
+        }
+        "bolt" => r#"<path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8z"/>"#,
+        "chev-r" => r#"<path d="m6 3 5 5-5 5"/>"#,
+        "chev-l" => r#"<path d="m10 3-5 5 5 5"/>"#,
+        "alert" => r#"<path d="M8 2 1.5 13.5h13z"/><path d="M8 6.5v3M8 11.5v.5"/>"#,
+        "download" => r#"<path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M2.5 13.5h11"/>"#,
+        "upload" => r#"<path d="M8 10V2M4.5 5.5 8 2l3.5 3.5M2.5 13.5h11"/>"#,
+        "refresh" => {
+            r#"<path d="M13 3v3.5H9.5M3 13V9.5h3.5M12.5 6.5A5 5 0 0 0 3.7 5M3.5 9.5a5 5 0 0 0 8.8 1.5"/>"#
+        }
         _ => "",
     }
 }

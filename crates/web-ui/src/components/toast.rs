@@ -32,7 +32,7 @@ pub fn ToastContainer() -> impl IntoView {
 fn ToastItem(toast: Toast, on_close: Callback<()>) -> impl IntoView {
     view! {
         <div class=format!("toast {}", toast.toast_type.class())>
-            <span>{toast.message}</span>
+            <span>{toast.message}{(toast.count > 1).then(|| format!(" \u{d7}{}", toast.count))}</span>
             <button type="button" class="x" aria-label="Dismiss" on:click=move |_| on_close.run(())>"x"</button>
         </div>
     }
