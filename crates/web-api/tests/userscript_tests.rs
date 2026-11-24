@@ -644,3 +644,116 @@ async fn imported_scripts_arrive_disabled_and_unapproved_unless_confirmed() {
     assert_eq!(s["enabled"], true);
     assert_eq!(s["connect_all_approved"], true);
 }
+
+// ---------------------------------------------------------------- signed catalogue
+
+fn catalogue_doc(
+    ctx: &TestContext,
+    signer: &list_service::testkit::Signer,
+) -> std::sync::Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>> {
+    let doc = list_service::SignedDoc::new(
+        "userscripts",
+        None,
+        list_service::ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: signer.public_key(),
+            cache_dir: None,
+        },
+    );
+    assert!(ctx.state.userscript_catalogue.set(doc.clone()).is_ok());
+    doc
+}
+
+/// A local origin serving one `.user.js`.
+async fn serve_script(body: impl FnOnce(std::net::SocketAddr) -> String) -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let body = body(addr);
+    let app = axum::Router::new().fallback(move || {
+        let b = body.clone();
+        async move { b }
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(l, app).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn the_catalogue_is_empty_until_signed_then_serves_entries_to_readers() {
+    use list_service::testkit::{userscripts_json, Signer};
+    let ctx = TestContext::new().await.unwrap();
+    let signer = Signer::new();
+    let doc = catalogue_doc(&ctx, &signer);
+    let admin = ctx.admin().await;
+    let viewer = ctx.user(&admin, "viewer_user", "viewer").await;
+    let c: Value = viewer.get("/api/v1/userscripts/catalogue").await.json();
+    assert_eq!(c["source"], "unavailable");
+    assert!(c["entries"].as_array().unwrap().is_empty());
+
+    // A bad signature and a filters document under the userscripts name are refused.
+    let text = userscripts_json("https://example.test/a.user.js");
+    let bad = Signer::new().sign(&text, "v2026.11.23", "userscripts.json");
+    assert!(doc.apply(text.clone(), bad, None).await.is_err());
+    let wrong = list_service::testkit::filters_json("abp");
+    let sig = signer.sign(&wrong, "v2026.11.23", "userscripts.json");
+    assert!(doc.apply(wrong, sig, None).await.is_err());
+
+    let sig = signer.sign(&text, "v2026.11.23", "userscripts.json");
+    doc.apply(text, sig, None).await.unwrap();
+    let c: Value = viewer.get("/api/v1/userscripts/catalogue").await.json();
+    assert_eq!(
+        (c["source"].as_str(), c["version"].as_str()),
+        (Some("signed"), Some("v2026.11.23"))
+    );
+    assert_eq!(c["entries"][0]["id"], "us1");
+    assert_eq!(c["entries"][0]["needs_gm"], "none");
+    // Same scope as listing: a token without scripts:read is refused.
+    let tok = ctx.token(&admin, &["lists:read"]).await;
+    ctx.bearer("GET", "/api/v1/userscripts/catalogue", &tok)
+        .await
+        .assert_status_forbidden();
+}
+
+#[tokio::test]
+async fn a_catalogue_script_installs_through_the_existing_plan_and_confirm() {
+    use list_service::testkit::{userscripts_json, Signer};
+    let ctx = TestContext::with_fetch_allowed(&["127.0.0.1"])
+        .await
+        .unwrap();
+    let signer = Signer::new();
+    let doc = catalogue_doc(&ctx, &signer);
+    let addr = serve_script(|a| src("1.0", &format!("// @downloadURL http://{a}/a.user.js"))).await;
+    let url = format!("http://{addr}/a.user.js");
+    let text = userscripts_json(&url);
+    let sig = signer.sign(&text, "v2026.11.23", "userscripts.json");
+    doc.apply(text, sig, None).await.unwrap();
+    let admin = ctx.admin().await;
+
+    let c: Value = admin.get("/api/v1/userscripts/catalogue").await.json();
+    let install_url = c["entries"][0]["install_url"].as_str().unwrap().to_string();
+    let r = admin
+        .post("/api/v1/userscripts/plan")
+        .json(&json!({"url": install_url}))
+        .await;
+    r.assert_status_ok();
+    let p: Value = r.json();
+    let r = admin
+        .post(&format!(
+            "/api/v1/userscripts/plan/{}/confirm",
+            p["plan_id"].as_str().unwrap()
+        ))
+        .json(&json!({}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::CREATED, "{}", r.text());
+    let s: Value = r.json();
+    // The UI matches "Installed" by @downloadURL/@updateURL.
+    let got: Value = admin
+        .get(&format!(
+            "/api/v1/userscripts/{}",
+            enc(s["id"].as_str().unwrap())
+        ))
+        .await
+        .json();
+    assert_eq!(got["update_url"], install_url.as_str());
+}

@@ -5,8 +5,8 @@ use wasm_bindgen::JsCast;
 
 use super::vlist::*;
 use crate::api::userscripts::{
-    ImportUserscriptsResponse, UpdateDiffDto, Userscript, UserscriptBundle, UserscriptCounts,
-    UserscriptPlanResponse,
+    ImportUserscriptsResponse, UpdateDiffDto, Userscript, UserscriptBundle,
+    UserscriptCatalogueEntryDto, UserscriptCounts, UserscriptPlanResponse,
 };
 use crate::api::ApiClient;
 use crate::components::{ConfirmButton, Drawer, Icon, Layout, ProfileSelector, Switch};
@@ -33,6 +33,62 @@ pub fn is_sensitive_grant(grant: &str) -> bool {
 }
 
 /// Human readable byte size.
+/// What identifies a script URL for "already installed": Greasy Fork scripts by their numeric
+/// id (the mirror host and file name vary), anything else by the URL itself. The host must be
+/// greasyfork.org / sleazyfork.org or a subdomain of one, never a lookalike.
+pub fn url_key(u: &str) -> String {
+    let u = u.trim();
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"));
+    if let Some(rest) = rest {
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(end);
+        if !authority.contains(['@', '\\', ' ']) {
+            let host = authority
+                .rsplit_once(':')
+                .map_or(authority, |(h, port)| {
+                    if port.chars().all(|c| c.is_ascii_digit()) {
+                        h
+                    } else {
+                        authority
+                    }
+                })
+                .to_ascii_lowercase();
+            let ours = ["greasyfork.org", "sleazyfork.org"]
+                .iter()
+                .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+            if let (true, Some(tail)) = (ours, path.strip_prefix("/scripts/")) {
+                let id: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let after = &tail[id.len()..];
+                if !id.is_empty() && (after.is_empty() || after.starts_with(['/', '?', '#'])) {
+                    return format!("gf:{id}");
+                }
+            }
+        }
+    }
+    u.to_string()
+}
+
+/// Warnings a catalogue entry shows before the plan review: (text, is_danger).
+pub fn catalogue_badges(e: &UserscriptCatalogueEntryDto) -> Vec<(String, bool)> {
+    let mut v = Vec::new();
+    match e.needs_gm.as_str() {
+        "xhr" => v.push(("uses GM_xmlhttpRequest".to_string(), true)),
+        "basic" => v.push(("uses GM storage".to_string(), false)),
+        _ => v.push(("no GM access".to_string(), false)),
+    }
+    if e.connect.iter().any(|c| c == "*") {
+        v.push(("can contact any site".to_string(), true));
+    } else if !e.connect.is_empty() {
+        v.push((format!("connects to {}", e.connect.join(", ")), false));
+    }
+    if !e.requires.is_empty() {
+        v.push((format!("{} @require", e.requires.len()), false));
+    }
+    v
+}
+
 pub fn fmt_bytes(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -183,6 +239,104 @@ pub fn UserscriptsPage() -> impl IntoView {
     let plan = RwSignal::new(Option::<UserscriptPlanResponse>::None);
     let show_plan = RwSignal::new(false);
     let allow_all = RwSignal::new(false);
+
+    // Browse the signed catalogue
+    let browse = RwSignal::new(false);
+    let cat_entries = RwSignal::new(Vec::<UserscriptCatalogueEntryDto>::new());
+    let cat_meta = RwSignal::new((String::new(), Option::<String>::None));
+    let cat_q = RwSignal::new(String::new());
+    let cat_cat = RwSignal::new(String::new());
+    let installed_keys = RwSignal::new(Vec::<String>::new());
+    let load_installed = move || {
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut keys = Vec::new();
+            let mut cursor: Option<String> = None;
+            // Every installed script, 200 at a time.
+            for _ in 0..50 {
+                match ApiClient::new()
+                    .list_userscripts_paged("", "", "name", cursor.as_deref(), None, 200)
+                    .await
+                {
+                    Ok(r) => {
+                        keys.extend(
+                            r.items
+                                .iter()
+                                .filter_map(|s| s.update_url.as_deref().map(url_key)),
+                        );
+                        cursor = r.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            installed_keys.set(keys);
+        });
+    };
+    let open_browse = move |_| {
+        browse.set(true);
+        load_installed();
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().get_userscript_catalogue().await {
+                Ok(c) => {
+                    cat_meta.set((c.source, c.fetched_at));
+                    cat_entries.set(c.entries);
+                }
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to load catalogue: {e}")),
+            }
+        });
+    };
+    Effect::new(move || {
+        reload.get();
+        if browse.get_untracked() {
+            load_installed();
+        }
+    });
+    let cat_categories = Signal::derive(move || {
+        let mut v: Vec<String> = cat_entries
+            .get()
+            .iter()
+            .map(|e| e.category.clone())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    });
+    let cat_filtered = Signal::derive(move || {
+        let q = cat_q.get().to_lowercase();
+        let c = cat_cat.get();
+        cat_entries
+            .get()
+            .into_iter()
+            .filter(|e| {
+                (c.is_empty() || e.category == c)
+                    && (q.is_empty()
+                        || e.name.to_lowercase().contains(&q)
+                        || e.description.to_lowercase().contains(&q)
+                        || e.sites.iter().any(|s| s.to_lowercase().contains(&q)))
+            })
+            .collect::<Vec<_>>()
+    });
+    // Install from the catalogue: the same plan review as an install by URL.
+    let plan_catalogue = move |url: String| {
+        busy.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().plan_userscript(None, Some(url)).await {
+                Ok(p) => {
+                    allow_all.set(false);
+                    plan.set(Some(p));
+                    show_plan.set(true);
+                }
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Failed to plan install: {}", e)),
+            }
+            busy.set(false);
+        });
+    };
 
     // Details / source / storage
     let show_detail = RwSignal::new(false);
@@ -597,7 +751,87 @@ pub fn UserscriptsPage() -> impl IntoView {
                 </div>
             </div>
 
-            <div class="card">
+            <div class="us-tabs" role="tablist" style="margin-bottom:var(--s3)">
+                <button role="tab" aria-selected=move || (!browse.get()).to_string()
+                    class=move || if browse.get() { "btn ghost" } else { "btn" }
+                    on:click=move |_| browse.set(false)>"Installed"</button>
+                <button role="tab" aria-selected=move || browse.get().to_string()
+                    class=move || if browse.get() { "btn" } else { "btn ghost" }
+                    on:click=open_browse>"Browse"</button>
+            </div>
+
+            <div class="card" hidden=move || !browse.get()>
+                <div class="card-h">
+                    <h3>"Browse userscripts"</h3>
+                    <span class="sub">{move || {
+                        let (src, at) = cat_meta.get();
+                        if src == "signed" {
+                            format!("Signed \u{b7} {}", at.map(|d| d.chars().take(10).collect::<String>()).unwrap_or_default())
+                        } else {
+                            "Catalogue not available yet".to_string()
+                        }
+                    }}</span>
+                </div>
+                <div class="card-b">
+                    <p class="hint">"The catalogue vouches for curation, not code: each script is a third-party program that runs in the pages it matches. Every install shows its plan for your approval first."</p>
+                    <div class="toolbar">
+                        <div class="search grow">
+                            <Icon name="search" />
+                            <label class="sr" for="usCatQ">"Search the catalogue"</label>
+                            <input id="usCatQ" class="input" placeholder="Search by name, description or site" autocomplete="off"
+                                prop:value=move || cat_q.get()
+                                on:input=move |ev| cat_q.set(event_target_value(&ev)) />
+                        </div>
+                    </div>
+                    <div class="chips" style="margin:8px 0">
+                        <button type="button" class="chip" aria-pressed=move || cat_cat.get().is_empty().to_string()
+                            on:click=move |_| cat_cat.set(String::new())>"All"</button>
+                        {move || cat_categories.get().into_iter().map(|c| {
+                            let (c1, c2) = (c.clone(), c.clone());
+                            view! {
+                                <button type="button" class="chip" aria-pressed=move || (cat_cat.get() == c1).to_string()
+                                    on:click=move |_| cat_cat.set(c2.clone())>{c.clone()}</button>
+                            }
+                        }).collect_view()}
+                    </div>
+                    <ul class="flist">
+                        <For
+                            each=move || cat_filtered.get()
+                            key=|e| e.id.clone()
+                            children=move |e| {
+                                let url = e.install_url.clone();
+                                let key = url_key(&url);
+                                let badges = catalogue_badges(&e);
+                                view! {
+                                    <li style="grid-template-columns:minmax(0,1fr) auto">
+                                        <div style="min-width:0">
+                                            <div class="nm">{e.name.clone()}" "<span class="badge">{e.category.clone()}</span></div>
+                                            <div class="url">{e.description.clone()}</div>
+                                            <div class="url">{e.sites.join(", ")}" | "{e.licence.clone()}</div>
+                                            <div class="chips">
+                                                {badges.into_iter().map(|(t, danger)| view! {
+                                                    <span class=if danger { "badge admin" } else { "badge" }>{t}</span>
+                                                }).collect_view()}
+                                            </div>
+                                        </div>
+                                        {move || if installed_keys.with(|k| k.contains(&key)) {
+                                            view! { <span class="pill p-allow">"Installed"</span> }.into_any()
+                                        } else {
+                                            let url = url.clone();
+                                            view! {
+                                                <button type="button" class="btn sm primary" disabled=move || busy.get()
+                                                    on:click=move |_| plan_catalogue(url.clone())>"Install"</button>
+                                            }.into_any()
+                                        }}
+                                    </li>
+                                }
+                            }
+                        />
+                    </ul>
+                </div>
+            </div>
+
+            <div class="card" hidden=move || browse.get()>
                 <div class="card-h">
                     <h3>"Installed userscripts"</h3>
                     <span class="sub">{move || format!("{} scripts", counts.get().map(|c| c.all).unwrap_or(0))}</span>
@@ -1022,6 +1256,42 @@ mod tests {
         assert!(is_sensitive_grant("GM.cookie"));
         assert!(is_sensitive_grant("GM_setClipboard"));
         assert!(!is_sensitive_grant("GM_getValue"));
+    }
+
+    #[test]
+    fn url_keys_and_badges() {
+        assert_eq!(
+            url_key("https://update.greasyfork.org/scripts/584347/Some%20Name.user.js"),
+            url_key("https://greasyfork.org/scripts/584347/code/x.user.js")
+        );
+        assert_eq!(
+            url_key("https://x.test/a.user.js"),
+            "https://x.test/a.user.js"
+        );
+        let mut e = UserscriptCatalogueEntryDto {
+            id: "a".into(),
+            name: "a".into(),
+            description: String::new(),
+            install_url: String::new(),
+            homepage: String::new(),
+            sites: vec![],
+            category: "ads".into(),
+            licence: "MIT".into(),
+            licence_note: None,
+            needs_gm: "xhr".into(),
+            connect: vec!["*".into()],
+            requires: vec!["https://cdn.test/x.js".into()],
+        };
+        let b = catalogue_badges(&e);
+        assert!(b.contains(&("can contact any site".to_string(), true)));
+        assert!(b.contains(&("1 @require".to_string(), false)));
+        e.connect.clear();
+        e.requires.clear();
+        e.needs_gm = "none".into();
+        assert_eq!(
+            catalogue_badges(&e),
+            vec![("no GM access".to_string(), false)]
+        );
     }
 
     #[test]

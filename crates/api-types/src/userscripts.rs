@@ -259,3 +259,45 @@ pub struct ImportResultDto {
 pub struct ImportUserscriptsResponse {
     pub results: Vec<ImportResultDto>,
 }
+
+/// One script of the signed userscript catalogue. The catalogue vouches for curation (a person
+/// chose it and checked its install URL), not for the code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UserscriptCatalogueEntryDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Where the script installs from (the install flow's `url`).
+    pub install_url: String,
+    #[serde(default)]
+    pub homepage: String,
+    /// Sites it runs on (`*` for any).
+    #[serde(default)]
+    pub sites: Vec<String>,
+    pub category: String,
+    pub licence: String,
+    #[serde(default)]
+    pub licence_note: Option<String>,
+    /// `none`, `basic` or `xhr`: which GM APIs it needs.
+    #[serde(default)]
+    pub needs_gm: String,
+    /// `@connect` hosts (`*` means any site).
+    #[serde(default)]
+    pub connect: Vec<String>,
+    /// `@require` URLs.
+    #[serde(default)]
+    pub requires: Vec<String>,
+}
+
+/// The signed userscript catalogue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UserscriptCatalogueResponse {
+    /// `signed`, or `unavailable` while none has verified yet (then `entries` is empty).
+    pub source: String,
+    pub fetched_at: Option<String>,
+    pub version: Option<String>,
+    pub entries: Vec<UserscriptCatalogueEntryDto>,
+}

@@ -32,6 +32,16 @@ impl TestContext {
     }
 
     pub async fn with_config(tweak: impl FnOnce(&mut ApiConfig)) -> ApiResult<Self> {
+        Self::build(tweak, &[]).await
+    }
+
+    /// Like [`Self::new`], with these destinations (CIDRs, IPs, host names) fetchable by the
+    /// control plane (e.g. a loopback origin serving a script).
+    pub async fn with_fetch_allowed(allowed: &[&str]) -> ApiResult<Self> {
+        Self::build(|_| {}, allowed).await
+    }
+
+    async fn build(tweak: impl FnOnce(&mut ApiConfig), allowed: &[&str]) -> ApiResult<Self> {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let temp_path = temp_dir.path();
 
@@ -57,11 +67,16 @@ impl TestContext {
         let filter_store =
             ListStore::open(&temp_path.join("filters")).expect("Failed to open filter store");
         let http_client = reqwest::Client::new();
-        let list_service = ListService::new(
+        let guard = (!allowed.is_empty()).then(|| {
+            let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+            Arc::new(::common::net_policy::NetPolicy::control_plane(&allowed).unwrap())
+        });
+        let list_service = ListService::new_guarded(
             ListServiceConfig::default(),
             filter_store,
             shared_engine.clone(),
             http_client.clone(),
+            guard,
         );
 
         let userscript_manager = Arc::new(
