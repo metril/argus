@@ -1225,6 +1225,20 @@ async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
     );
     assert_eq!(cat["entries"].as_array().unwrap().len(), 1);
 
+    // An entry in a format we cannot add is left out of the listing (and refused when added).
+    let text = filters_json("clash");
+    let sig = signer.sign(&text, "v2026.11.24", "filters.json");
+    doc.apply(text, sig, None).await.unwrap();
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    assert!(cat["entries"].as_array().unwrap().is_empty());
+    admin
+        .post("/api/v1/lists/catalogue/fx")
+        .await
+        .assert_status_bad_request();
+    let text = filters_json("ubo");
+    let sig = signer.sign(&text, "v2026.11.25", "filters.json");
+    doc.apply(text, sig, None).await.unwrap();
+
     let added = admin.post("/api/v1/lists/catalogue/fx").await;
     assert_eq!(added.status_code(), StatusCode::CREATED);
     let a: Value = added.json();

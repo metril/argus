@@ -705,8 +705,7 @@ pub async fn get_catalogue(
             description: String::new(),
             homepage: String::new(),
             region: None,
-            noncommercial: e.licence.to_ascii_lowercase().contains("nc")
-                || e.licence.to_ascii_lowercase().contains("non-commercial"),
+            noncommercial: e.noncommercial,
             licence_note: None,
             source: "builtin".into(),
         })

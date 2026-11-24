@@ -377,6 +377,9 @@ async fn start_webui_server(
     let _ = state.argus.set(argus);
     let _ = state.filter_catalogue.set(catalogues.0);
     let _ = state.userscript_catalogue.set(catalogues.1);
+    // The lists location and key follow the live config (editable in the UI), not the one read at
+    // startup.
+    state.follow_live_catalogue_config();
 
     info!(
         "Web UI API server starting on {}:{}",

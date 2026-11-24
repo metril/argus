@@ -140,7 +140,10 @@ disabled or the password is wrong.
   `unsupported`, `parse_errors`, `badfiltered`; `dropped_untrusted_by_list`; the first parse
   `issues` and how many more were `issues_truncated`.
 - `GET /lists/catalogue`, `POST /lists/catalogue/{id}`: browse the default-disabled catalogue and
-  add an entry as a list.
+  add an entry as a list. The catalogue is the signed argus-lists one once it has verified, else
+  the built-in one. **Breaking change:** the response is now an object `{source, version,
+  fetched_at, entries}` (`source` is `signed` or `builtin`), no longer a bare array; each entry
+  also carries `description`, `homepage`, `region`, `noncommercial`, `licence_note` and `source`.
 - `GET /rules/ext?kind=`: paginated read-only listing of handed-off rules, each with its source
   `list` and `state`: `active`, `dropped_untrusted`, `unsupported` (with `reason`), `invalid`,
   `badfiltered`, `badfilter`, or `unknown` while a rebuild is being installed.

@@ -92,6 +92,8 @@ pub struct CatalogueEntry {
     pub category: &'static str,
     /// Licence / usage note of the list (check before redistributing).
     pub licence: &'static str,
+    /// The licence forbids commercial use.
+    pub noncommercial: bool,
 }
 
 impl CatalogueEntry {
@@ -114,19 +116,24 @@ pub fn catalogue() -> Vec<CatalogueEntry> {
         format,
         category,
         licence,
+        noncommercial: false,
+    };
+    let nc = |mut e: CatalogueEntry| {
+        e.noncommercial = true;
+        e
     };
     vec![
         e("stevenblack-unified", "StevenBlack Unified Hosts", "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", Hosts, "ads+malware", "MIT"),
         e("adaway", "AdAway", "https://adaway.org/hosts.txt", Hosts, "ads", "CC BY 3.0"),
-        e("peter-lowe", "Peter Lowe's Ad and tracking server list", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext", Hosts, "ads+tracking", "free for personal use"),
+        nc(e("peter-lowe", "Peter Lowe's Ad and tracking server list", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext", Hosts, "ads+tracking", "free for personal use")),
         e("blocklistproject-ads", "The Block List Project: Ads", "https://blocklistproject.github.io/Lists/ads.txt", Hosts, "ads", "Unlicense"),
-        e("developerdan-ads", "Developer Dan's Ads and Tracking Extended", "https://www.github.developerdan.com/hosts/lists/ads-and-tracking-extended.txt", Hosts, "ads+tracking", "CC BY-NC-SA 4.0"),
+        nc(e("developerdan-ads", "Developer Dan's Ads and Tracking Extended", "https://www.github.developerdan.com/hosts/lists/ads-and-tracking-extended.txt", Hosts, "ads+tracking", "CC BY-NC-SA 4.0")),
         e("hagezi-light-domains", "HaGeZi Light (domains)", "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt", Domains, "ads+tracking", "GPL-3.0"),
         e("hagezi-pro-domains", "HaGeZi Pro (domains)", "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt", Domains, "ads+tracking+malware", "GPL-3.0"),
         e("hagezi-tif-domains", "HaGeZi Threat Intelligence Feeds (domains)", "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif-onlydomains.txt", Domains, "malware", "GPL-3.0"),
         e("oisd-small", "OISD Small (domains)", "https://small.oisd.nl/domainswild2", Domains, "ads+tracking+malware", "GPL-3.0"),
-        e("phishing-army", "Phishing Army", "https://phishing.army/download/phishing_army_blocklist.txt", Domains, "phishing", "CC BY-NC 4.0"),
-        e("spamhaus-drop", "Spamhaus DROP (IP ranges)", "https://www.spamhaus.org/drop/drop.txt", IpList, "malware", "free for non-commercial use"),
+        nc(e("phishing-army", "Phishing Army", "https://phishing.army/download/phishing_army_blocklist.txt", Domains, "phishing", "CC BY-NC 4.0")),
+        nc(e("spamhaus-drop", "Spamhaus DROP (IP ranges)", "https://www.spamhaus.org/drop/drop.txt", IpList, "malware", "free for non-commercial use")),
         e("feodo-ips", "Feodo Tracker IP Blocklist", "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", IpList, "malware", "CC0"),
     ]
 }
