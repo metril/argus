@@ -427,10 +427,16 @@ impl ConnectionHandler {
         let ctx = &self.shared.ctx;
         // The web UI endpoint is "self" (when this client could reach it directly): handed to the
         // web server, no policy refusal, no interception, no log entry.
-        if let Some(web) = ctx
+        let mut via = ctx
             .web_ui_for(&host, port, self.client_addr.ip(), self.conn.local_ip())
             .await
-        {
+            .map(|w| (w, port));
+        if via.is_none() && !self.conn.is_ext_listener() {
+            via = ctx
+                .web_ui_via_proxy_port(&host, port, self.client_addr.ip(), self.conn.local_ip())
+                .await;
+        }
+        if let Some((web, port)) = via {
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
@@ -1007,6 +1013,40 @@ async fn handle_request(
                 .await
             {
                 return Ok(web.request(req, rctx.client_addr, port).await);
+            }
+        }
+        // The explicit proxy port is not a proxy target: a request naming it (absolute URI at
+        // an own address, or origin-form, which the proxy cannot forward anywhere) is the web
+        // UI. The extension and transparent listeners keep refusing it.
+        if origin.authority.is_none() && !rctx.transparent && !conn.is_ext_listener() {
+            let target = match req.uri().authority() {
+                Some(a) => Some((a.host().to_string(), a.port_u16().unwrap_or(80))),
+                // Origin-form: judged by the address the client arrived on, never by `Host`.
+                None => conn.local_ip().and_then(|ip| {
+                    shared
+                        .ctx
+                        .policy()
+                        .web_ui_alias_any()
+                        .map(|p| (ip.to_string(), p))
+                }),
+            };
+            if let Some((host, port)) = target {
+                let via = if req.uri().authority().is_some() {
+                    shared
+                        .ctx
+                        .web_ui_via_proxy_port(&host, port, rctx.client_addr.ip(), conn.local_ip())
+                        .await
+                } else {
+                    // `port` already is the web UI port here.
+                    shared
+                        .ctx
+                        .web_ui_for(&host, port, rctx.client_addr.ip(), conn.local_ip())
+                        .await
+                        .map(|w| (w, port))
+                };
+                if let Some((web, port)) = via {
+                    return Ok(web.request(req, rctx.client_addr, port).await);
+                }
             }
         }
     }

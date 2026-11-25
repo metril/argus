@@ -94,8 +94,8 @@ export default defineBackground(() => {
       if (sender?.id !== browser.runtime.id) return undefined;
       const m = msg as { type: string; state?: ProxyState; storeId?: string };
       if (m.type === 'store-token') return Promise.resolve(proxy.tokenFor(m.storeId));
-      if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => ({ state: proxy.getState(), active: proxy.active(), firefox }));
-      return Promise.resolve({ state: proxy.getState(), active: proxy.active(), firefox });
+      if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => ({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), firefox }));
+      return Promise.resolve({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), firefox });
     }
     if (msg?.type === 'bridge-reconnect') {
       if (sender?.id !== browser.runtime.id) return undefined;

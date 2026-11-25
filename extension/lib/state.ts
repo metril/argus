@@ -42,7 +42,7 @@ export function bannerCopy(error: ErrorKind, host: string, refused = false): Ban
   switch (error) {
     case 'badCredentials': return { title: 'Wrong username or password' };
     case 'forbidden': return { title: 'No extension access', body: 'Ask an admin.', action: 'switch' };
-    case 'unreachable': return { title: `Can't reach ${host}`, body: refused ? 'Proxy refused it.' : 'Check the address.', action: 'retry' };
+    case 'unreachable': return { title: `Can't reach ${host}`, body: refused ? "That's the proxy port. Use the web UI address." : 'Check the address.', action: 'retry' };
     case 'noHostPermission': return { title: 'Permission needed', body: `Allow access to ${host}.`, action: 'allow' };
     case 'sessionExpired': return { title: 'Signed out', body: 'Sign in again.' };
     case 'rateLimited': return { title: 'Too many tries', body: 'Wait a minute.' };

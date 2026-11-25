@@ -246,16 +246,52 @@ impl TokenStore {
         self.cache.get(id).map(|e| e.clone())
     }
 
-    /// Tokens (including revoked ones), newest first, optionally only one creator's.
-    pub fn list(&self, created_by: Option<&Uuid>) -> Vec<ApiTokenInfo> {
+    /// Tokens, newest first, optionally only one creator's. Revoked ones only with
+    /// `include_revoked`.
+    pub fn list(&self, created_by: Option<&Uuid>, include_revoked: bool) -> Vec<ApiTokenInfo> {
         let mut v: Vec<_> = self
             .cache
             .iter()
+            .filter(|e| include_revoked || e.stored.revoked_at.is_none())
             .filter(|e| created_by.is_none_or(|u| e.stored.created_by == *u))
             .map(|e| (e.stored.created_at, e.info()))
             .collect();
         v.sort_by(|a, b| b.0.cmp(&a.0));
         v.into_iter().map(|(_, i)| i).collect()
+    }
+
+    /// Delete tokens that died (revoked or expired, whichever came first) before `cutoff`, in
+    /// one transaction, then drop them from the cache. Returns the number deleted. The audit
+    /// log keeps their creation and revocation history.
+    pub fn purge_dead(&self, cutoff: DateTime<Utc>) -> ApiResult<usize> {
+        let _g = self.write_lock.lock();
+        let dead: Vec<String> = self
+            .cache
+            .iter()
+            .filter(|e| {
+                let s = &e.stored;
+                [s.revoked_at, s.expires_at]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .is_some_and(|t| t < cutoff)
+            })
+            .map(|e| e.key().clone())
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        self.db.write::<_, ApiError>(Durability::Immediate, |t| {
+            let mut tb = t.open_table(tables::API_TOKENS).map_err(DbError::from)?;
+            for id in &dead {
+                tb.remove(id.as_str()).map_err(DbError::from)?;
+            }
+            Ok(())
+        })?;
+        for id in &dead {
+            self.cache.remove(id);
+        }
+        Ok(dead.len())
     }
 
     /// Revoke `ids` in one transaction, then in the cache. Returns the revoked count.
@@ -367,8 +403,76 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.verify(&secret).err(), Some(TokenReject::Expired));
-        let json = serde_json::to_string(&store.list(None)).unwrap();
+        let json = serde_json::to_string(&store.list(None, true)).unwrap();
         assert!(!json.contains(&secret));
+    }
+
+    #[test]
+    fn list_hides_revoked_unless_asked() {
+        let (store, _d) = store();
+        let (a, _) = make(&store);
+        let (b, _) = make(&store);
+        store.revoke(&a.id).unwrap();
+        let ids = |all| {
+            store
+                .list(None, all)
+                .into_iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(false), vec![b.id.clone()]);
+        assert_eq!(ids(true).len(), 2);
+    }
+
+    /// Rewrite a stored token's dates directly (the store only stamps "now").
+    fn age(store: &TokenStore, id: &str, f: impl FnOnce(&mut StoredToken)) {
+        let mut s = store.get(id).unwrap().stored.clone();
+        f(&mut s);
+        let bytes = json(&s).unwrap();
+        store
+            .db
+            .write::<_, ApiError>(Durability::Immediate, |t| {
+                t.open_table(tables::API_TOKENS)
+                    .map_err(DbError::from)?
+                    .insert(id, bytes.as_slice())
+                    .map_err(DbError::from)?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .cache
+            .insert(id.to_string(), Arc::new(CachedToken::new(s)));
+    }
+
+    #[test]
+    fn purge_dead_removes_only_long_dead_tokens() {
+        let (store, dir) = store();
+        let old = Utc::now() - chrono::Duration::days(100);
+        let cutoff = Utc::now() - chrono::Duration::days(90);
+        let (old_revoked, _) = make(&store);
+        age(&store, &old_revoked.id, |s| s.revoked_at = Some(old));
+        let (recent_revoked, _) = make(&store);
+        store.revoke(&recent_revoked.id).unwrap();
+        let (old_expired, _) = make(&store);
+        age(&store, &old_expired.id, |s| s.expires_at = Some(old));
+        let (recent_expired, _) = make(&store);
+        age(&store, &recent_expired.id, |s| {
+            s.expires_at = Some(Utc::now() - chrono::Duration::days(1))
+        });
+        let (live, live_secret) = make(&store);
+        assert_eq!(store.purge_dead(cutoff).unwrap(), 2);
+        assert!(store.get(&old_revoked.id).is_none());
+        assert!(store.get(&old_expired.id).is_none());
+        assert!(store.get(&recent_revoked.id).is_some());
+        assert!(store.get(&recent_expired.id).is_some());
+        assert!(store.verify(&live_secret).is_ok());
+        assert_eq!(store.purge_dead(cutoff).unwrap(), 0);
+        // Gone from disk too.
+        let db = store.db.clone();
+        drop(store);
+        let again = TokenStore::new(db).unwrap();
+        assert!(again.get(&old_revoked.id).is_none() && again.get(&live.id).is_some());
+        drop(dir);
     }
 
     #[test]

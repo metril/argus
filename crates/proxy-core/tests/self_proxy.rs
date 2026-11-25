@@ -110,13 +110,6 @@ async fn get_via(proxy_port: u16, url: &str) -> reqwest::Response {
         .unwrap()
 }
 
-fn is_refused(r: &reqwest::Response) -> bool {
-    r.status() == 403
-        && r.headers()
-            .get("x-adblock")
-            .is_some_and(|v| v == "destination-refused")
-}
-
 async fn read_some(s: &mut TcpStream) -> String {
     let mut buf = [0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
@@ -174,10 +167,25 @@ async fn websocket_upgrade_is_handed_over() {
 }
 
 #[tokio::test]
-async fn the_proxys_own_port_is_still_refused() {
-    let (p, _) = proxy("0.0.0.0", Arc::new(FakeWeb::default())).await;
-    let r = get_via(p, &format!("http://127.0.0.1:{p}/")).await;
-    assert!(is_refused(&r), "{}", r.status());
+async fn proxy_port_as_the_url_reaches_the_web_ui() {
+    let web = Arc::new(FakeWeb::default());
+    let (p, _) = proxy("0.0.0.0", web.clone()).await;
+    // Direct (origin-form) request.
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{p}/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // Proxied (absolute-URI) request to the proxy's own port.
+    let r = get_via(p, &format!("http://127.0.0.1:{p}/api/v1/health")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(web.peers.lock().len(), 2);
+    // CONNECT to the proxy port is handed over, never looped.
     let mut s = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
     s.write_all(
         format!("CONNECT 127.0.0.1:{p} HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\r\n").as_bytes(),
@@ -185,7 +193,28 @@ async fn the_proxys_own_port_is_still_refused() {
     .await
     .unwrap();
     let head = read_some(&mut s).await;
-    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(web.peers.lock().len(), 3);
+}
+
+#[tokio::test]
+async fn proxy_port_is_refused_when_the_web_ui_is_not_reachable_by_the_client() {
+    // Web UI on loopback only: a client that arrived on a LAN address cannot use it.
+    let Some(lan) = lan_ip() else { return };
+    let web = Arc::new(FakeWeb::default());
+    let (p, _) = proxy("127.0.0.1", web.clone()).await;
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(SocketAddr::new(lan, 0)).unwrap();
+    let mut s = sock.connect(SocketAddr::new(lan, p)).await.unwrap();
+    s.write_all(
+        format!("GET /api/v1/health HTTP/1.1\r\nHost: {lan}:{p}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let head = read_some(&mut s).await;
+    assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(web.peers.lock().is_empty());
 }
 
 #[tokio::test]

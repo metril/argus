@@ -97,6 +97,7 @@ pub fn TokensPage() -> impl IntoView {
     let selected = RwSignal::new(Vec::<Scope>::new());
     let new_secret = RwSignal::new(Option::<String>::None);
     let reload = RwSignal::new(0u32);
+    let show_revoked = RwSignal::new(false);
 
     let held = Memo::new(move |_| user.get().map(|u| u.scopes).unwrap_or_default());
     let template = Signal::derive(move || {
@@ -110,8 +111,9 @@ pub fn TokensPage() -> impl IntoView {
         let app_state = app_state.clone();
         Rc::new(move |cursor, _| {
             let app_state = app_state.clone();
+            let all = show_revoked.get_untracked();
             Box::pin(async move {
-                match ApiClient::new().list_tokens(cursor.as_deref()).await {
+                match ApiClient::new().list_tokens(cursor.as_deref(), all).await {
                     Ok(p) => Ok((p.items, p.next_cursor, p.total)),
                     Err(e) => {
                         app_state.error(format!("Failed to load tokens: {e}"));
@@ -124,6 +126,7 @@ pub fn TokensPage() -> impl IntoView {
     let tokens = Feed::new(fetch);
     Effect::new(move |_| {
         reload.track();
+        show_revoked.track();
         tokens.reload(None, false, None);
     });
 
@@ -286,7 +289,14 @@ pub fn TokensPage() -> impl IntoView {
             </Card>
 
             <div class="card">
-                <div class="card-h"><h3>"Your tokens"</h3></div>
+                <div class="card-h">
+                    <h3>"Your tokens"</h3>
+                    <label class="sub" style="display:flex;gap:6px;align-items:center">
+                        <input type="checkbox" prop:checked=move || show_revoked.get()
+                            on:change=move |ev| show_revoked.set(event_target_checked(&ev)) />
+                        "Show revoked"
+                    </label>
+                </div>
                 <Scroller feed=tokens class="tbl-wrap">
                     <table class="tbl">
                         <thead><tr><th>"Name"</th><th>"Access"</th><th>"Last used"</th><th>"Expires"</th><th></th></tr></thead>

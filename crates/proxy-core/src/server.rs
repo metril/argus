@@ -493,6 +493,9 @@ impl ProxyControl {
             addrs.extend(ip);
         }
         self.ctx.policy().set_web_ui(webui);
+        self.ctx
+            .policy()
+            .set_explicit_port(Some(explicit.addr.port()));
         ports.sort_unstable();
         ports.dedup();
         *self.entry_ports.write() = std::iter::once(explicit)

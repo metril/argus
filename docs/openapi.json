@@ -7578,6 +7578,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Also list revoked tokens (default false).",
+            "in": "query",
+            "name": "include_revoked",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -7644,7 +7653,7 @@
             ]
           }
         ],
-        "summary": "List every user's API tokens.",
+        "summary": "List every user's API tokens. Revoked tokens only with `include_revoked=true`.",
         "tags": [
           "tokens"
         ]
@@ -17675,6 +17684,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Also list revoked tokens (default false).",
+            "in": "query",
+            "name": "include_revoked",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -17741,7 +17759,7 @@
             ]
           }
         ],
-        "summary": "List your own API tokens (never includes secrets).",
+        "summary": "List your own API tokens (never includes secrets). Revoked tokens only with\n`include_revoked=true`.",
         "tags": [
           "tokens"
         ]

@@ -403,6 +403,21 @@ impl ProxyContext {
             .then_some(server)
     }
 
+    /// [`Self::web_ui_for`] for a request on the explicit proxy listener: `host:port` naming
+    /// the proxy's own explicit port is the web UI (same reach rules). Returns the web UI port
+    /// too, the one to hand over.
+    pub(crate) async fn web_ui_via_proxy_port(
+        &self,
+        host: &str,
+        port: u16,
+        client: std::net::IpAddr,
+        client_local: Option<std::net::IpAddr>,
+    ) -> Option<(Arc<dyn crate::self_route::WebUiHandoff>, u16)> {
+        let ui = self.policy.web_ui_alias(port)?;
+        let web = self.web_ui_for(host, ui, client, client_local).await?;
+        Some((web, ui))
+    }
+
     /// The destination policy every upstream dial is checked against.
     pub fn policy(&self) -> &Arc<DestPolicy> {
         &self.policy

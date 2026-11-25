@@ -7,9 +7,21 @@ pub use api_types::{ApiTokenInfo, CreateTokenRequest, CreatedTokenResponse, Page
 
 impl ApiClient {
     /// List the current user's API tokens
-    pub async fn list_tokens(&self, cursor: Option<&str>) -> Result<Page<ApiTokenInfo>, ApiError> {
-        self.get(&format!("/tokens?limit=40{}", super::admin::cur(cursor)))
-            .await
+    pub async fn list_tokens(
+        &self,
+        cursor: Option<&str>,
+        include_revoked: bool,
+    ) -> Result<Page<ApiTokenInfo>, ApiError> {
+        self.get(&format!(
+            "/tokens?limit=40{}{}",
+            super::admin::cur(cursor),
+            if include_revoked {
+                "&include_revoked=true"
+            } else {
+                ""
+            }
+        ))
+        .await
     }
 
     /// Create a token; the returned secret is shown to the user once
