@@ -670,6 +670,17 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
                 Ok(Err(e)) => tracing::warn!("session purge failed: {e}"),
                 Err(e) => tracing::warn!("session purge task failed: {e}"),
             }
+            // Revoked or expired tokens outlive their audit entries by no more than the
+            // audit retention (the first tick runs at startup).
+            let tokens = renew_state.tokens.clone();
+            let days = i64::from(renew_state.api_config.audit.retention_days.max(1));
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+            match tokio::task::spawn_blocking(move || tokens.purge_dead(cutoff)).await {
+                Ok(Ok(0)) => {}
+                Ok(Ok(n)) => tracing::debug!("purged {n} dead API tokens"),
+                Ok(Err(e)) => tracing::warn!("token purge failed: {e}"),
+                Err(e) => tracing::warn!("token purge task failed: {e}"),
+            }
         }
     });
 
