@@ -62,7 +62,7 @@ impl AppState {
     pub fn close_ext_for_user(&self, user: &uuid::Uuid) {
         let ids: Vec<String> = self
             .tokens
-            .list(Some(user))
+            .list(Some(user), true)
             .into_iter()
             .map(|t| t.id.clone())
             .collect();

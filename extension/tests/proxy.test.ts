@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ProxyController, REALM } from '../lib/proxy';
+import { ProxyController, REALM, statusKind } from '../lib/proxy';
 import { parseSetCookie, storeSetCookies } from '../lib/setcookie';
 import { JOB_HEADER, StoreRelay } from '../lib/storerelay';
 import { isBroad } from '../lib/grants';
@@ -193,5 +193,28 @@ describe('grants', () => {
   it('broad patterns are never reported as per-host grants', () => {
     for (const o of ['<all_urls>', '*://*/*', 'https://*/*', 'http://*/*', 'https://a.com/path*']) expect(isBroad(o)).toBe(true);
     for (const o of ['https://a.com/*', '*://*.a.com/*', '*://localhost/*']) expect(isBroad(o)).toBe(false);
+  });
+});
+
+describe('listener status', () => {
+  it('maps enabled, active and listener to the status line', () => {
+    expect(statusKind(false, false, 'none')).toBe('off');
+    expect(statusKind(true, true, 'ready')).toBe('on');
+    expect(statusKind(true, false, 'pending')).toBe('connecting');
+    expect(statusKind(true, false, 'ready')).toBe('connecting');
+    expect(statusKind(true, false, 'none')).toBe('unset');
+  });
+  it('tells a missing listener from one still pending', async () => {
+    const { c } = mk(false);
+    await c.init();
+    expect(c.listener()).toBe('pending');
+    await c.setSid('s'.repeat(32));
+    expect(c.listener()).toBe('pending');
+    await c.setServer(null, null);
+    expect(c.listener()).toBe('none');
+    await c.setServer(null, 3130);
+    expect(c.listener()).toBe('ready');
+    await c.setSid(null);
+    expect(c.listener()).toBe('pending');
   });
 });

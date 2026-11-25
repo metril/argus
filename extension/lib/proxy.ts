@@ -11,6 +11,17 @@ export interface ProxyState {
   stores: Record<string, boolean>;
 }
 
+/** What the server says about its extension listener (`proxy.ext_port`). */
+export type Listener = 'pending' | 'none' | 'ready';
+export type StatusKind = 'on' | 'off' | 'connecting' | 'unset';
+
+/** The status line of the "Use Argus" switch. */
+export function statusKind(enabled: boolean, active: boolean, listener: Listener): StatusKind {
+  if (active) return 'on';
+  if (!enabled) return 'off';
+  return listener === 'none' ? 'unset' : 'connecting';
+}
+
 const KEY = 'argusProxy';
 
 export async function loadProxyState(br: any): Promise<ProxyState> {
@@ -41,6 +52,8 @@ export interface ProxyDeps { browser: any; firefox: boolean; argusHost: () => Pr
 export class ProxyController {
   private sid: string | null = null;
   private server: { host: string | null; port: number } | null = null;
+  /** The server has told this connection whether it has an extension listener. */
+  private serverKnown = false;
   private state: ProxyState = { enabled: false, stores: {} };
   private tokens = new Map<string, string>();
   private byToken = new Map<string, string>();
@@ -70,14 +83,21 @@ export class ProxyController {
 
   /** The channel's session (null on disconnect: a new connection gets a new secret and tokens). */
   async setSid(sid: string | null) {
-    if (sid !== this.sid) { this.tokens.clear(); this.byToken.clear(); this.answered.clear(); }
+    if (sid !== this.sid) { this.tokens.clear(); this.byToken.clear(); this.answered.clear(); this.serverKnown = false; }
     this.sid = sid;
     await this.apply();
   }
 
   async setServer(host: string | null | undefined, port: number | null | undefined) {
     this.server = port && port > 0 && port < 65536 ? { host: host || null, port } : null;
+    this.serverKnown = true;
     await this.apply();
+  }
+
+  /** Whether the server has an extension listener: `pending` until it has said. */
+  listener(): Listener {
+    if (!this.serverKnown) return 'pending';
+    return this.server ? 'ready' : 'none';
   }
 
   active(): boolean { return this.state.enabled && !!this.sid && !!this.server; }

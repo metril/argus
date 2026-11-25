@@ -2,6 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { type ErrorKind, type Interception } from '../lib/api';
 import { bannerCopy, issuerName, daysUntil, invalidReason, type Site } from '../lib/state';
+import { statusKind, type Listener } from '../lib/proxy';
 import { bundledUrl, normalizeUrl, signIn, useToken } from '../lib/auth';
 import { fetchCert } from '../lib/api';
 import type { MenuCommand, MenuGrant } from '../lib/bridge-types';
@@ -180,15 +181,17 @@ export function AccountBar({ user, url, onSignOut }: { user: string; url: string
 }
 
 type PState = { enabled: boolean; stores: Record<string, boolean> };
-type PInfo = { state: PState; active: boolean; firefox: boolean };
+type PInfo = { state: PState; active: boolean; listener?: Listener; firefox: boolean };
 
 /** "Use Argus" switch with a live status line; Firefox also lists containers. */
 export function BrowserCard({ sub }: { sub?: string }) {
   const [info, setInfo] = useState<PInfo>();
   const [names, setNames] = useState<{ id: string; name: string }[]>([]);
+  const [argus, setArgus] = useState('');
   useEffect(() => {
     void (async () => {
       try {
+        setArgus(String((await browser.storage.local.get('argusUrl')).argusUrl ?? '').replace(/\/+$/, ''));
         const r = (await browser.runtime.sendMessage({ type: 'proxy-get' })) as PInfo | undefined;
         if (!r) return;
         setInfo(r);
@@ -205,14 +208,18 @@ export function BrowserCard({ sub }: { sub?: string }) {
     setInfo(n ? { ...info, ...n } : { ...info, state });
   };
   const st = info.state;
-  const line = info.active ? 'On · filtering this browser' : st.enabled ? 'Connecting…' : 'Off';
+  const kind = statusKind(st.enabled, info.active, info.listener ?? 'pending');
+  const line = kind === 'on' ? 'On · filtering this browser' : kind === 'connecting' ? 'Connecting…' : kind === 'unset' ? 'Not set up in Argus' : 'Off';
   return (
     <>
       <div class="sw-row">
         <span>Use Argus{sub && <div class="muted" style="font-size:12px">{sub}</div>}</span>
         <Switch on={st.enabled} label="Use Argus in this browser" onChange={(v) => void save({ ...st, enabled: v })} />
       </div>
-      <div class="note" role="status" aria-live="polite">{line}</div>
+      <div class="note" role="status" aria-live="polite">
+        {line}
+        {kind === 'unset' && argus && <> · <a href={`${argus}/extension`} target="_blank" rel="noreferrer">Set up</a></>}
+      </div>
       {info.firefox && names.length > 0 && (
         <details class="cont">
           <summary>Containers</summary>

@@ -165,6 +165,9 @@ pub struct ProxyControl {
     ext_flags: Arc<crate::listener_flags::ListenerFlags>,
     /// The extension-only listener (see [`Self::rebind_ext`]).
     ext: tokio::sync::Mutex<Option<Listener>>,
+    /// The extension listener's bound address while it runs: an own listener the explicit
+    /// proxy refuses to dial, like its own ports.
+    ext_own: parking_lot::Mutex<Option<std::net::SocketAddr>>,
     /// Live time limits, shared with every connection.
     timeouts: Arc<ArcSwap<Timeouts>>,
     /// Set once the server runs: what a lazy MITM / WebSocket enable installs into.
@@ -485,6 +488,10 @@ impl ProxyControl {
             ports.push(l.addr.port());
             addrs.push(l.addr.ip());
         }
+        if let Some(a) = *self.ext_own.lock() {
+            ports.push(a.port());
+            addrs.push(a.ip());
+        }
         // The web UI endpoint stays an own listener: whatever the in-process handoff did not
         // take (a miss) is refused like a proxy port. The handoff check runs before the policy.
         let webui = *self.webui_own.lock();
@@ -493,6 +500,9 @@ impl ProxyControl {
             addrs.extend(ip);
         }
         self.ctx.policy().set_web_ui(webui);
+        self.ctx
+            .policy()
+            .set_explicit_port(Some(explicit.addr.port()));
         ports.sort_unstable();
         ports.dedup();
         *self.entry_ports.write() = std::iter::once(explicit)
@@ -762,7 +772,9 @@ impl ProxyControl {
         if let Some(o) = old {
             tokio::spawn(o.stop());
         }
+        *self.ext_own.lock() = cur.as_ref().filter(|l| !l.down).map(|l| l.addr);
         drop(cur);
+        self.publish_own(&run.explicit, run.transparent.as_ref());
         hub.set_proxy(adv_host, adv_port);
         info!(
             "Extension listener {}",
@@ -1019,6 +1031,7 @@ impl ProxyServer {
                 config.listener_flags(false),
             )),
             ext: tokio::sync::Mutex::new(None),
+            ext_own: parking_lot::Mutex::new(None),
             timeouts: Arc::new(ArcSwap::from_pointee(Timeouts::from_config(
                 &config.performance,
             ))),
