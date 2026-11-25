@@ -4,7 +4,10 @@
 #         docker buildx build --platform linux/amd64,linux/arm64 -t argus .
 #
 # Uses cargo-chef for dependency caching - incremental builds are ~10x faster.
-# Pure-rustls (no OpenSSL): the build is fully static musl with no system TLS libs.
+# No system TLS libs / OpenSSL: the proxy side uses rustls, the upstream client (vendored wreq)
+# uses BoringSSL compiled from source by btls-sys (needs cmake, a C++ compiler, perl and libclang
+# for bindgen) and linked statically, with libstdc++ linked statically too. CI fails if
+# openssl-sys ever appears in the dependency tree.
 
 # Pinned toolchain version - keep in sync with rust-toolchain.toml
 ARG RUST_VERSION=1.92
@@ -16,8 +19,23 @@ ARG WASM_BINDGEN_VERSION=0.2.125
 # Stage 1: Chef base - stable Rust on musl + cargo-chef
 FROM rust:${RUST_VERSION}-alpine3.21 AS chef
 
-# Build dependencies (ring needs a C toolchain + perl/make; xz unpacks cargo-chef)
-RUN apk add --no-cache musl-dev gcc make perl pkgconfig curl xz
+# Build dependencies (ring needs a C toolchain + perl/make; xz unpacks cargo-chef; BoringSSL via
+# btls-sys needs cmake + g++ + git (it patches BoringSSL), bindgen needs libclang (clang-dev)
+# and the kernel headers).
+RUN apk add --no-cache musl-dev gcc g++ make cmake perl pkgconfig curl xz clang-dev linux-headers git
+
+# bindgen locates libclang here (Alpine 3.21 ships LLVM 19); verified to exist at build time.
+ENV LIBCLANG_PATH=/usr/lib/llvm19/lib
+# Link libstdc++ (needed by BoringSSL's C++ sources) statically so the runtime image stays minimal.
+ENV BORING_BSSL_RUST_CPPLIB=static=stdc++
+RUN test -e "$LIBCLANG_PATH/libclang.so"
+# bindgen (in btls-sys's build script) must dlopen libclang, which a crt-static musl build script
+# cannot do. RUSTFLAGS applies to build scripts too, so crt-static is switched off for the whole
+# build; the final binary is linked fully static again below. Set once so cook and build share
+# fingerprints.
+# rustc does not search /usr/lib for `static=` libraries unless told to (libstdc++.a is there).
+RUN test -e /usr/lib/libstdc++.a
+ENV RUSTFLAGS="-C target-feature=-crt-static -L native=/usr/lib"
 
 # Download the pre-built cargo-chef binary (arch-aware, pinned - much faster than compiling)
 ARG CARGO_CHEF_VERSION
@@ -40,6 +58,7 @@ WORKDIR /build
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 3: Builder - build dependencies (cached) then source
@@ -49,16 +68,22 @@ FROM chef AS builder
 # `full` compiles in the Web UI, ad blocking, userscripts, WebSocket, and HTTP/3 support so they
 # are present in the shipped binary (HTTP/3 still only starts when enabled in config).
 COPY --from=planner /build/recipe.json recipe.json
+# Vendored wreq/wreq-util are [patch.crates-io] path dependencies; cook needs their sources.
+COPY vendor ./vendor
 RUN cargo chef cook --release --recipe-path recipe.json -p proxy-core --features full
 
 # Now copy source and build (only our code compiles; deps are cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN RUSTFLAGS="-C link-arg=-s" cargo build --release -p proxy-core --bin argus --features full
+COPY vendor ./vendor
+# `cargo rustc` passes the extra flags to the final binary only, so build scripts stay dynamic.
+RUN cargo rustc --release -p proxy-core --bin argus --features full -- \
+      -C link-arg=-s -C target-feature=+crt-static
 
 # Copy binary to a known location and verify
 RUN cp /build/target/release/argus /build/argus && \
-    ls -lh /build/argus
+    ls -lh /build/argus && \
+    ! readelf -lW /build/argus | grep -q "INTERP\|Requesting program interpreter"
 
 # Stage 4: WebUI build (WASM is architecture-independent -> always built on the
 # build host's platform via $BUILDPLATFORM for speed)
@@ -85,6 +110,7 @@ WORKDIR /build
 # Copy workspace files (full workspace needed for cargo metadata)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 
 # trunk would download a glibc wasm-bindgen on arm64 (cannot run on musl), so a musl build is
 # installed above and trunk uses it from PATH; fail early if it drifts from Cargo.lock.

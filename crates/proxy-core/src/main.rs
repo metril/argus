@@ -13,6 +13,15 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `argus --version`: lets image builds smoke-test that the binary loads and starts.
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--version" || a == "-V")
+    {
+        println!("argus {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Initialize logging
     // Held to the end of `main` so buffered log lines are flushed on exit.
     let _log_guard = init_logging();

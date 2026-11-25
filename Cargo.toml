@@ -14,6 +14,8 @@ members = [
     "crates/e2e",
     "crates/e2e-browser",
 ]
+# Vendored third-party crates are not workspace members (not linted/formatted); see vendor/README.md.
+exclude = ["vendor/wreq", "vendor/wreq-util"]
 
 [workspace.package]
 version = "0.5.0"
@@ -166,3 +168,8 @@ opt-level = 3
 [profile.dev.package.zstd-sys]
 opt-level = 3
 
+
+# Vendored upstream HTTP client (Apache-2.0) with local patches; see vendor/README.md.
+[patch.crates-io]
+wreq = { path = "vendor/wreq" }
+wreq-util = { path = "vendor/wreq-util" }
