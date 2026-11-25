@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0 — 2026-11-24
+
+* Userscript `@include`/`@exclude` regexes now follow JavaScript semantics (lookaround and
+  backreferences work); a pattern that cannot be compiled fails safe and matches nothing. The
+  userscript UI words external libraries more clearly.
+* Requests addressed to Argus itself now reach its web UI through the proxy instead of a `403`,
+  limited to the bound browser (extension listener) and to permitted clients.
+* Extension sign-in: the extension signs in against Argus and mints its own API token
+  (`POST /api/v1/auth/extension-token`); it revokes it on sign-out (`DELETE /api/v1/tokens/self`).
+  Chrome requests per-host permissions at runtime. Script login consent is derived from the
+  recorded per-host grants.
+* Extension redesign, plus a Browser extension page in the web UI.
+* Tokens: expiry presets or a custom date (`expires_at` in the API) and a compact scope table.
+* "Argus" is capitalized consistently in user-visible text.
+
 ## 0.4.0 — 2026-11-24
 
 * Extension bridge: the Argus extension can connect to the proxy (`GET /api/v1/ext/channel`, token
