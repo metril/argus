@@ -86,6 +86,8 @@ pub struct Stats {
     pub requests: AtomicUsize,
     /// Connections currently open on the server side.
     pub open: AtomicUsize,
+    /// Connections the origin has dropped on a `close_on` signal.
+    pub closed: AtomicUsize,
     /// Streams received per connection, in accept order.
     pub per_conn: Mutex<Vec<usize>>,
 }
@@ -131,12 +133,13 @@ pub async fn h1_closing_origin(chain: Vec<Vec<u8>>, key: KeyPair) -> Origin {
     h1_closing_origin_after(chain, key, None).await
 }
 
-/// Like [`h1_closing_origin`]; with `Some(delay)` the connection closes that long after its
-/// response, and the origin runs on its own thread so a blocked client runtime cannot stall it.
+/// Like [`h1_closing_origin`]; with `Some(signal)` each connection stays open after its response
+/// until the signal turns `true`, then is dropped (counted in `stats.closed`). The origin runs on
+/// its own thread so a blocked client runtime cannot stall it.
 pub async fn h1_closing_origin_after(
     chain: Vec<Vec<u8>>,
     key: KeyPair,
-    delay: Option<Duration>,
+    close_on: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Origin {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -157,13 +160,14 @@ pub async fn h1_closing_origin_after(
     let port = std_listener.local_addr().unwrap().port();
     let stats = Arc::new(Stats::default());
     let st = stats.clone();
+    let threaded = close_on.is_some();
     let serve = async move {
         let listener = TcpListener::from_std(std_listener).unwrap();
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
-            let (acceptor, st) = (acceptor.clone(), st.clone());
+            let (acceptor, st, close_on) = (acceptor.clone(), st.clone(), close_on.clone());
             tokio::spawn(async move {
                 let Ok(mut tls) = acceptor.accept(tcp).await else {
                     return;
@@ -184,14 +188,15 @@ pub async fn h1_closing_origin_after(
                     )
                     .await;
                 // Gone without a close_notify, after promising to keep the connection.
-                if let Some(d) = delay {
-                    tokio::time::sleep(d).await;
+                if let Some(mut rx) = close_on {
+                    let _ = rx.wait_for(|closed| *closed).await;
+                    drop(tls);
+                    st.closed.fetch_add(1, Ordering::SeqCst);
                 }
-                drop(tls);
             });
         }
     };
-    if delay.is_some() {
+    if threaded {
         std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

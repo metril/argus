@@ -1,3 +1,6 @@
+// Modified by Argus: `SocksError::source` exposes the wrapped error, so a destination-policy
+// refusal raised by the DNS resolver stays recognisable through the error chain. The target is
+// resolved before the proxy is dialled.
 use std::{
     borrow::Cow,
     task::{Context, Poll},
@@ -52,7 +55,17 @@ impl std::fmt::Display for SocksError {
     }
 }
 
-impl std::error::Error for SocksError {}
+impl std::error::Error for SocksError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConnectFailed(e) | Self::DnsResolveFailure(e) => Some(&**e as _),
+            Self::Socks(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::Utf8(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for SocksError {
     fn from(err: std::io::Error) -> Self {
@@ -167,13 +180,6 @@ where
             let host = crate::util::strip_ipv6_brackets(host);
             let port = dst.port_or_default();
 
-            // Attempt to tcp connect to the proxy server.
-            // This will return a `tokio::net::TcpStream` if successful.
-            let socket = connecting
-                .await
-                .map_err(Into::into)
-                .map_err(SocksError::ConnectFailed)?;
-
             // Resolve the target address using the provided resolver.
             let target_addr = match dns_resolve {
                 DnsResolve::Local => {
@@ -189,6 +195,13 @@ where
                 }
                 DnsResolve::Remote => TargetAddr::Domain(Cow::Borrowed(host), port),
             };
+
+            // Attempt to tcp connect to the proxy server (after the target is resolved and
+            // vetted, so a refused target never reaches the proxy).
+            let socket = connecting
+                .await
+                .map_err(Into::into)
+                .map_err(SocksError::ConnectFailed)?;
 
             match version {
                 Version::V4 => {

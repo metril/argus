@@ -25,7 +25,8 @@ use crate::rewrite::{
     TransformSource,
 };
 use crate::upstream::{
-    build_strict_upstream_client, build_upstream_client, UpstreamClient, UpstreamOptions,
+    build_strict_upstream_client, build_strict_upstream_client_via, build_upstream_client,
+    build_upstream_client_via, UpstreamClient, UpstreamOptions,
 };
 use crate::{Error, Result};
 use bytes::Bytes;
@@ -189,6 +190,7 @@ pub struct PreparedUpstream {
     client: UpstreamClient,
     strict: UpstreamClient,
     opts: UpstreamOptions,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
 }
 
 /// Shared per-process filtering + forwarding context, cloned (via `Arc`) into every connection.
@@ -197,6 +199,8 @@ pub struct ProxyContext {
     /// The pooled upstream client; replaced when its timeouts change (requests in flight keep
     /// the old one).
     client: ArcSwap<UpstreamClient>,
+    /// The live upstream proxy (empty: connect directly), shared by every dialer.
+    proxy: Arc<crate::upstream_proxy::ProxyHandle>,
     /// The options the clients were built from, for rebuilding.
     upstream_opts: parking_lot::Mutex<Option<UpstreamOptions>>,
     /// The default profile's slot (also held by the profile table).
@@ -255,6 +259,7 @@ impl ProxyContext {
             policy: Arc::default(),
             web_server: parking_lot::RwLock::new(None),
             upstream_opts: parking_lot::Mutex::new(None),
+            proxy: Default::default(),
             client: ArcSwap::from_pointee(client),
             profiles: Profiles::new(default_slot.clone()),
             default_slot,
@@ -346,6 +351,7 @@ impl ProxyContext {
         ctx.roots = Some(roots);
         *ctx.upstream_opts.lock() = Some(opts.clone());
         ctx.policy = opts.policy.clone();
+        ctx.proxy = opts.proxy.clone();
         ctx.resolve_all_to = opts.resolve_all_to;
         ctx.certs = opts.certs.clone();
         ctx.prober = Some(Arc::new(crate::upstream::CertProber::new(opts)?));
@@ -406,6 +412,58 @@ impl ProxyContext {
             .then_some(server)
     }
 
+    /// The live upstream proxy every dial goes through when one is on.
+    pub fn proxy_handle(&self) -> &Arc<crate::upstream_proxy::ProxyHandle> {
+        &self.proxy
+    }
+
+    /// Resolve and check the upstream proxy `cfg` (the fallible half of changing it live); the
+    /// endpoint in force is reused when `cfg` is unchanged. `None`: no proxy.
+    pub async fn prepare_proxy(
+        &self,
+        cfg: &common::config::UpstreamProxy,
+    ) -> Result<Option<Arc<crate::upstream_proxy::ProxyEndpoint>>> {
+        if !cfg.enabled {
+            return Ok(None);
+        }
+        if let Some(cur) = self.proxy.load().filter(|c| c.same_as(cfg)) {
+            return Ok(Some(cur));
+        }
+        let dns = self.dns().unwrap_or_else(|| {
+            Arc::new(crate::dns::CachedResolver::from_settings(
+                &Default::default(),
+            ))
+        });
+        crate::upstream_proxy::ProxyEndpoint::prepare(cfg, self.policy.clone(), dns).await
+    }
+
+    /// Test `cfg` (not necessarily the one in force): connect through it to `host:port`, finish
+    /// a TLS handshake, and report the time taken or why it failed.
+    pub async fn test_upstream_proxy(
+        &self,
+        cfg: &common::config::UpstreamProxy,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<Duration, String> {
+        let mut cfg = cfg.clone();
+        cfg.enabled = true;
+        let ep = self
+            .prepare_proxy(&cfg)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("disabled")?;
+        let roots = self.roots_handle(&[]).map_err(|e| e.to_string())?;
+        let tls = crate::upstream::client_tls_config(roots, self.certs.clone())
+            .map_err(|e| e.to_string())?;
+        ep.test(
+            tokio_rustls::TlsConnector::from(Arc::new(tls)),
+            host,
+            port,
+            Duration::from_secs(10),
+        )
+        .await
+    }
+
     /// The destination policy every upstream dial is checked against.
     pub fn policy(&self) -> &Arc<DestPolicy> {
         &self.policy
@@ -447,7 +505,7 @@ impl ProxyContext {
                     Ok(a) => a,
                     Err(_) => return EvVerdict::Unknown,
                 };
-                match crate::ev::probe(host, addr, limit).await {
+                match crate::ev::probe(host, addr, limit, self.proxy.load().as_deref()).await {
                     Some(true) => EvVerdict::Ev,
                     Some(false) => EvVerdict::NotEv,
                     None => EvVerdict::Unknown,
@@ -487,19 +545,21 @@ impl ProxyContext {
             .lock()
             .as_ref()
             .is_some_and(|o| o.browser_like);
-        let prepared = self.prepare_upstream(connect, read, browser_like)?;
+        let prepared = self.prepare_upstream(connect, read, browser_like, self.proxy.load())?;
         self.commit_upstream(prepared);
         Ok(())
     }
 
     /// Build the replacement clients without installing them (the fallible half of
     /// [`Self::set_upstream_timeouts`]); `None` when nothing changes. `browser_like` picks the
-    /// client: the browser-like one or the previous rustls one.
+    /// client: the browser-like one or the previous rustls one. `proxy` is the upstream proxy
+    /// the new clients (and, once committed, every dialer) use.
     pub fn prepare_upstream(
         &self,
         connect: Duration,
         read: Duration,
         browser_like: bool,
+        proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
     ) -> Result<Option<PreparedUpstream>> {
         let guard = self.upstream_opts.lock();
         let Some(opts) = guard.as_ref() else {
@@ -508,6 +568,11 @@ impl ProxyContext {
         if opts.connect_timeout == Some(connect)
             && opts.read_timeout == Some(read)
             && opts.browser_like == browser_like
+            && match (&proxy, self.proxy.load()) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, &b),
+                _ => false,
+            }
         {
             return Ok(None);
         }
@@ -516,9 +581,10 @@ impl ProxyContext {
         next.connect_timeout = Some(connect);
         next.read_timeout = Some(read);
         Ok(Some(PreparedUpstream {
-            client: build_upstream_client(&next)?,
-            strict: build_strict_upstream_client(&next)?,
+            client: build_upstream_client_via(&next, proxy.clone())?,
+            strict: build_strict_upstream_client_via(&next, proxy.clone())?,
             opts: next,
+            proxy,
         }))
     }
 
@@ -527,6 +593,7 @@ impl ProxyContext {
         if let Some(p) = p {
             self.client.store(Arc::new(p.client));
             self.strict_client.store(Arc::new(p.strict));
+            self.proxy.store(p.proxy);
             if let Some(pr) = &self.prober {
                 pr.set_connect_timeout(p.opts.connect_timeout);
             }

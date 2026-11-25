@@ -240,6 +240,15 @@ impl web_api::RuntimeControl for ProxyRuntime {
         self.0.bind_info().await.map(bind)
     }
 
+    async fn test_upstream_proxy(
+        &self,
+        cfg: &common::config::UpstreamProxy,
+        host: &str,
+        port: u16,
+    ) -> Result<std::time::Duration, String> {
+        self.0.test_upstream_proxy(cfg, host, port).await
+    }
+
     async fn issue_webui_cert(&self, sans: &[String]) -> Result<(String, String), String> {
         self.0
             .issue_webui_cert(sans.to_vec())

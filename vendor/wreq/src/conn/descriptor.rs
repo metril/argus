@@ -1,4 +1,4 @@
-// Modified by Argus: `ConnectionDescriptor::session_id` (per-device TLS session cache, patch 3) and `ConnectionId::in_request_group` (pool eviction, patch 4) and `ConnectionDescriptor::fresh` (patch 6).
+// Modified by Argus: `ConnectionDescriptor::session_id` (per-device TLS session cache, patch 3) and `ConnectionId::in_request_group` (pool eviction, patch 4) and `ConnectionDescriptor::fresh` (patch 6) and `resend_descriptor`.
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     num::NonZeroU64,
@@ -171,5 +171,41 @@ impl ConnectionDescriptor {
     #[inline]
     pub(crate) fn socket_bind_options(&self) -> Option<&SocketBindOptions> {
         self.socket_bind.as_ref()
+    }
+}
+
+/// The descriptor the one internal re-send of a canceled (unstarted) request uses: same target
+/// and TLS session scope, but a pool key no idle connection can be under, so the re-send dials a
+/// new connection instead of taking another (equally dead) idle one.
+pub(crate) fn resend_descriptor(original: &ConnectionDescriptor) -> ConnectionDescriptor {
+    original.fresh()
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use http::Uri;
+
+    use super::*;
+
+    pub(crate) fn descriptor() -> ConnectionDescriptor {
+        ConnectionDescriptor::new(
+            Uri::from_static("https://example.test/"),
+            Group::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn the_resend_descriptor_is_a_new_connection_in_the_same_tls_session_scope() {
+        let original = descriptor();
+        let resend = resend_descriptor(&original);
+        assert_ne!(resend.id(), original.id(), "must not share the pool key");
+        assert_eq!(resend.session_id(), original.session_id(), "TLS resumption kept");
+        assert_eq!(resend.uri(), original.uri());
+        // Each re-send is unique, too.
+        assert_ne!(resend_descriptor(&original).id(), resend.id());
     }
 }
