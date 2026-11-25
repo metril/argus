@@ -2,8 +2,8 @@
 //! the real `407` answered by `onAuthRequired`, document binding, the menu calls the popup makes,
 //! a browser-cookie relay, and the toggle going direct again.
 //!
-//! Needs an unpacked build with test host permissions (`ARGUS_E2E_HOSTS`, see `docs/TESTING.md`):
-//!   cd extension && ARGUS_E2E_HOSTS='*://*.api.test/*,*://*.app.test/*,*://127.0.0.1/*' npx wxt build -b chrome
+//! Needs the unpacked release build (`docs/TESTING.md`):
+//!   cd extension && npx wxt build -b chrome
 //! and a Chromium that honours `--load-extension` (Playwright's, `ARGUS_EXT_BROWSER`); branded
 //! Chrome 137+ removed the switch. Without them the test skips, unless `ARGUS_EXT_E2E=1`.
 
@@ -135,12 +135,6 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
         return;
     }
     let ext_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extension/.output/chrome-mv3");
-    let manifest = std::fs::read_to_string(ext_dir.join("manifest.json")).unwrap_or_default();
-    if !manifest.contains("*://*.api.test/*")
-        && skip("no extension build with ARGUS_E2E_HOSTS (see the test's header)")
-    {
-        return;
-    }
     let Some(bin) = chromium_with_extensions() else {
         if skip("no Chromium that honours --load-extension (set ARGUS_EXT_BROWSER)") {
             return;
@@ -243,7 +237,7 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
     })
     .await;
     let cfg_js = format!(
-        "chrome.storage.local.set({{ argusUrl: {:?}, token: {:?}, argusProxy: {{ enabled: true, stores: {{}} }} }})",
+        "chrome.storage.local.set({{ argusUrl: {:?}, token: {:?}, argusProxy: {{ enabled: true, stores: {{}} }}, granted: [\"*://*.api.test/*\", \"*://*.app.test/*\", \"*://127.0.0.1/*\"] }})",
         argus.web_url(),
         argus.token
     );

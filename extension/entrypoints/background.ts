@@ -1,14 +1,16 @@
 import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
 import { Bridge } from '../lib/bridge';
+import { onStorageChanged } from '../lib/changes';
 import { respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
 import { StoreRelay } from '../lib/storerelay';
 
+/** The toolbar badge is a colored dot for the site state; nothing when there is nothing to say. */
 function badgeFor(v: Lookup): { text: string; color: string } {
   switch (v.kind) {
-    case 'ok': return v.cert.verdict === 'invalid' ? { text: '!', color: '#d93025' } : { text: '', color: '#188038' };
-    case 'unseen': return { text: '–', color: '#80868b' };
-    case 'auth': return { text: '?', color: '#f9ab00' };
+    case 'ok': return v.cert.verdict === 'invalid' ? { text: '!', color: '#f2695f' } : { text: '●', color: '#4fc48d' };
+    case 'unseen': return { text: '●', color: '#4cc2d9' };
+    case 'error': return { text: '?', color: '#e6a94c' };
     default: return { text: '', color: '#80868b' };
   }
 }
@@ -23,6 +25,7 @@ export default defineBackground(() => {
     const b = badgeFor(await cachedLookup(host));
     await action.setBadgeText({ tabId, text: b.text });
     await action.setBadgeBackgroundColor({ tabId, color: b.color });
+    try { await (action as any).setBadgeTextColor?.({ tabId, color: '#0c0f13' }); } catch { /* optional */ }
   }
 
   // Userscript bridge: channel to the proxy for relayed requests, and the proxy settings that
@@ -47,6 +50,10 @@ export default defineBackground(() => {
     { urls: ['<all_urls>'] },
     [firefox ? 'blocking' : 'asyncBlocking'],
   );
+  // First run: open the setup page (sign in, turn on, pin).
+  browser.runtime.onInstalled.addListener((d: { reason?: string }) => {
+    if (d.reason === 'install') void browser.tabs.create({ url: browser.runtime.getURL('/options.html#setup' as any) });
+  });
   const alarms = (browser as any).alarms;
   if (alarms) {
     void alarms.create('argus-bridge', { periodInMinutes: 0.5 });
@@ -54,17 +61,11 @@ export default defineBackground(() => {
       if (a.name === 'argus-bridge' && !bridge.status().connected) void bridge.connect();
     });
   }
-  const perms = (browser as any).permissions;
-  perms?.onAdded?.addListener(() => void bridge.sendPerms());
-  perms?.onRemoved?.addListener(() => void bridge.sendPerms());
 
   browser.tabs.onUpdated.addListener((tabId, info, tab) => {
     if (info.status === 'complete' || info.url) void update(tabId, tab.url);
   });
-  browser.storage.onChanged.addListener((changes: Record<string, unknown>) => {
-    if ('argusUrl' in changes || 'token' in changes) { clearCache(); void bridge.reconnect(); }
-    if ('argusProxy' in changes) void proxy.reload();
-  });
+  browser.storage.onChanged.addListener((changes: Record<string, unknown>) => onStorageChanged(changes, { clearCache, bridge, proxy }));
   browser.tabs.onRemoved.addListener((id) => intercepted.delete(id));
 
   // Firefox only: inspect the certificate the browser actually received.
@@ -95,6 +96,10 @@ export default defineBackground(() => {
       if (m.type === 'store-token') return Promise.resolve(proxy.tokenFor(m.storeId));
       if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => ({ state: proxy.getState(), active: proxy.active(), firefox }));
       return Promise.resolve({ state: proxy.getState(), active: proxy.active(), firefox });
+    }
+    if (msg?.type === 'bridge-reconnect') {
+      if (sender?.id !== browser.runtime.id) return undefined;
+      return bridge.connect().then(() => bridge.status());
     }
     if (msg?.type === 'bridge-status') {
       if (sender?.id !== browser.runtime.id) return undefined;

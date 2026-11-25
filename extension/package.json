@@ -19,5 +19,9 @@
     "typescript": "5.9.3",
     "vitest": "^3.2.7",
     "wxt": "0.21.5"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.3.2",
+    "preact": "^10.27.2"
   }
 }

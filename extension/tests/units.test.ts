@@ -3,8 +3,8 @@ import { fakeBrowser } from 'wxt/testing/fake-browser';
 import { decodeFrame, encodeFrame, payloadJson } from '../lib/frames';
 import { connectAllows } from '../lib/connect';
 import { cookieOp } from '../lib/cookies';
-import { renderMenu } from '../lib/menu';
 import { getSettings } from '../lib/api';
+import { isGranted, patternMatches, recordGrant, revokeGrant } from '../lib/grants';
 
 describe('frames', () => {
   it('round trips', () => {
@@ -77,43 +77,34 @@ describe('cookies', () => {
   });
 });
 
-describe('renderMenu', () => {
-  it('inserts text, not html, and wires handlers', async () => {
-    const root = document.createElement('div');
-    const trigger = vi.fn(async () => true);
-    const grant = vi.fn();
-    const close = vi.fn();
-    renderMenu(root, {
-      commands: [{ script: 's1', scriptName: '<img src=x onerror=1>', cmd: 'c', name: '<b>Go</b>' }],
-      grants: [{ script: 's1', scriptName: '<i>S</i>', host: 'a.com', patterns: ['*://a.com/*'] }],
-    }, { trigger, grant, close });
-    expect(root.querySelector('img,b,i')).toBeNull();
-    expect(root.textContent).toContain('<b>Go</b>');
-    expect(root.textContent).toContain('wants your logins for a.com');
-    (root.querySelector('button.cmd') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(trigger).toHaveBeenCalled();
-    expect(close).toHaveBeenCalled();
-    const gb = Array.from(root.querySelectorAll('button')).find((b) => b.textContent === 'Grant')!;
-    gb.click();
-    expect(grant).toHaveBeenCalled();
-  });
-  it('shows note when not delivered and keeps open', async () => {
-    const root = document.createElement('div');
-    const close = vi.fn();
-    renderMenu(root, { commands: [{ script: 's', scriptName: 'S', cmd: 'c', name: 'N' }], grants: [] },
-      { trigger: async () => false, grant: () => {}, close });
-    (root.querySelector('button') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(root.textContent).toContain('reload the page');
-    expect(close).not.toHaveBeenCalled();
-  });
-});
-
 describe('getSettings with fake browser', () => {
   it('reads storage', async () => {
     (globalThis as any).browser = fakeBrowser;
     await fakeBrowser.storage.local.set({ argusUrl: 'http://a:1/', token: 't' });
     expect(await getSettings()).toEqual({ argusUrl: 'http://a:1', token: 't' });
+  });
+});
+
+describe('grant patterns', () => {
+  const m = (p: string, s: string, h: string, port = '') => patternMatches(p, s, h, port);
+  it('exact host, wildcard covers apex and subdomains, scheme and port', () => {
+    expect(m('https://a.com/*', 'https', 'a.com')).toBe(true);
+    expect(m('https://a.com/*', 'https', 'x.a.com')).toBe(false);
+    expect(m('*://*.a.com/*', 'http', 'x.a.com')).toBe(true);
+    expect(m('*://*.a.com/*', 'https', 'a.com')).toBe(true);
+    expect(m('*://*.a.com/*', 'https', 'evila.com')).toBe(false);
+    expect(m('https://a.com/*', 'http', 'a.com')).toBe(false);
+    expect(m('https://a.com:8443/*', 'https', 'a.com', '8443')).toBe(true);
+    expect(m('https://a.com:8443/*', 'https', 'a.com', '')).toBe(false);
+    expect(m('https://a.com/*', 'https', 'a.com', '8443')).toBe(true);
+  });
+  it('allow records, revoke removes', async () => {
+    const store: Record<string, unknown> = {};
+    const br: any = { storage: { local: { get: async () => store, set: async (o: object) => { Object.assign(store, o); } } } };
+    expect(await isGranted(br, 'https', 'a.com')).toBe(false);
+    await recordGrant(br, ['https://a.com/*']);
+    expect(await isGranted(br, 'https', 'a.com')).toBe(true);
+    await revokeGrant(br, 'https://a.com/*');
+    expect(await isGranted(br, 'https', 'a.com')).toBe(false);
   });
 });
