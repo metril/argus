@@ -75,17 +75,30 @@ impl WebUiHandoff for FakeWeb {
 
 /// Proxy on 127.0.0.1 that knows `webui` as the web UI endpoint (bound to `bind`).
 async fn proxy(bind: &str, web: Arc<FakeWeb>) -> (u16, u16) {
-    let ui = {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        l.local_addr().unwrap().port()
-    };
+    proxy_with(bind, web, |_| {}).await
+}
+
+async fn free_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// [`proxy`] with extra settings applied to the config.
+async fn proxy_with(
+    bind: &str,
+    web: Arc<FakeWeb>,
+    tweak: impl FnOnce(&mut ProxyConfig),
+) -> (u16, u16) {
+    let ui = free_port().await;
     let mut config = ProxyConfig::default();
     config.proxy.host = "127.0.0.1".into();
     config.mitm.enabled = false;
+    tweak(&mut config);
     let engine = Arc::new(SharedEngine::new());
     let ctx = Arc::new(
         ProxyContext::with_upstream(engine, &UpstreamOptions::from_config(&config), false).unwrap(),
     );
+    ctx.set_require_device_token(config.proxy.require_device_token);
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = ProxyServer::new(config, ctx).unwrap();
@@ -270,4 +283,129 @@ async fn remote_style_client_is_routed_only_to_the_address_it_arrived_on() {
     let (head, _) = connect(format!("169.254.1.1:{ui}")).await;
     assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(web.peers.lock().len(), 1);
+}
+
+/// A LAN-side client of a proxy whose web UI is loopback-only.
+async fn lan_client(lan: std::net::IpAddr, p: u16) -> TcpStream {
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(SocketAddr::new(lan, 0)).unwrap();
+    sock.connect(SocketAddr::new(lan, p)).await.unwrap()
+}
+
+#[tokio::test]
+async fn loops_onto_the_proxy_port_stay_refused_with_a_web_ui_configured() {
+    let Some(lan) = lan_ip() else { return };
+    let web = Arc::new(FakeWeb::default());
+    let (p, _) = proxy("127.0.0.1", web.clone()).await;
+    // CONNECT to the proxy port: refused, not handed over and not dialled.
+    for target in [format!("127.0.0.1:{p}"), format!("{lan}:{p}")] {
+        let mut s = lan_client(lan, p).await;
+        s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_some(&mut s).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "CONNECT {target}: {head}");
+    }
+    // Absolute URIs naming the proxy port: refused, never forwarded.
+    for target in [format!("127.0.0.1:{p}"), format!("{lan}:{p}")] {
+        let mut s = lan_client(lan, p).await;
+        s.write_all(
+            format!("GET http://{target}/ HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let head = read_some(&mut s).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "GET {target}: {head}");
+    }
+    assert!(web.peers.lock().is_empty());
+}
+
+#[tokio::test]
+async fn socks_on_the_extension_listener_never_reaches_the_proxy_port() {
+    let web = Arc::new(FakeWeb::default());
+    let ext = free_port().await;
+    let (p, _) = proxy_with("127.0.0.1", web.clone(), |c| c.proxy.ext_port = Some(ext)).await;
+    // The extension listener comes up after the explicit one.
+    let mut s = None;
+    for _ in 0..50 {
+        if let Ok(c) = TcpStream::connect(("127.0.0.1", ext)).await {
+            s = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut s = s.expect("extension listener");
+    // Greeting offering username/password, then made-up credentials, then CONNECT to the
+    // proxy port.
+    s.write_all(&[5, 1, 2]).await.unwrap();
+    let mut b = [0u8; 2];
+    s.read_exact(&mut b).await.unwrap();
+    let mut out = Vec::new();
+    if b == [5, 2] {
+        let (u, pw) = (b"ext:bogus", b"x");
+        s.write_all(&[&[1, u.len() as u8][..], u, &[pw.len() as u8], pw].concat())
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+        let mut req = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        req.extend_from_slice(&p.to_be_bytes());
+        let _ = s.write_all(&req).await;
+    }
+    // Whatever the reply, the web UI never sees it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(web.peers.lock().is_empty());
+}
+
+#[tokio::test]
+async fn proxy_port_opened_directly_skips_the_device_token_for_the_web_ui() {
+    let web = Arc::new(FakeWeb::default());
+    let (p, _) = proxy_with("0.0.0.0", web.clone(), |c| {
+        c.proxy.require_device_token = true
+    })
+    .await;
+    // A browser opening the proxy port directly reaches the web UI (its own login applies).
+    let r = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .get(format!("http://127.0.0.1:{p}/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    // Proxying anything else still needs the token.
+    let r = get_via(p, "http://203.0.113.1/").await;
+    assert_eq!(r.status(), 407);
+    assert_eq!(web.peers.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn explicit_proxy_refuses_to_dial_the_extension_listener() {
+    // On a LAN address (private destinations are allowed by default), so only the own-listener
+    // rule can refuse it; loopback would be refused anyway.
+    let Some(lan) = lan_ip() else { return };
+    let web = Arc::new(FakeWeb::default());
+    let ext = free_port().await;
+    let (p, _) = proxy_with("127.0.0.1", web.clone(), |c| {
+        c.proxy.host = "0.0.0.0".into();
+        c.proxy.ext_port = Some(ext);
+    })
+    .await;
+    let mut ok = false;
+    for _ in 0..50 {
+        if TcpStream::connect(("127.0.0.1", ext)).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ok, "extension listener");
+    let mut s = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+    s.write_all(format!("CONNECT {lan}:{ext} HTTP/1.1\r\nHost: {lan}:{ext}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let head = read_some(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
 }

@@ -948,6 +948,26 @@ async fn handle_request(
         }
         if require && !digest.is_some_and(|d| ConnCtx::token_known(profiles, &d)) {
             conn.await_token();
+            // A browser opening the explicit proxy port directly (origin-form) is opening Argus
+            // itself: browsers never answer a `407` on a direct connection, and the web UI has
+            // its own login. Only a request the web UI handoff accepts skips the token.
+            if origin.authority.is_none() && req.uri().authority().is_none() {
+                let rctx = conn.current(profiles, require);
+                if let (false, Some(port), Some(ip)) = (
+                    rctx.transparent,
+                    shared.ctx.policy().web_ui_alias_any(),
+                    conn.local_ip(),
+                ) {
+                    if let Some(web) = shared
+                        .ctx
+                        .web_ui_for(&ip.to_string(), port, rctx.client_addr.ip(), Some(ip))
+                        .await
+                    {
+                        req.headers_mut().remove(hyper::header::PROXY_AUTHORIZATION);
+                        return Ok(web.request(req, rctx.client_addr, port).await);
+                    }
+                }
+            }
             return Ok(proxy_auth_required());
         }
     }
