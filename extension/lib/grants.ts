@@ -30,3 +30,17 @@ export async function reportedOrigins(browser: any): Promise<string[]> {
   } catch { /* ignore */ }
   return [...out];
 }
+
+/** Recorded script-login grants, for the options page. */
+export async function listGrants(browser: any): Promise<string[]> {
+  try { return (((await browser.storage.local.get(KEY))?.[KEY] ?? []) as string[]).filter((o) => !isBroad(o)); } catch { return []; }
+}
+
+/** Forgets a grant (and drops the permission where the browser allows it). */
+export async function revokeGrant(browser: any, pattern: string): Promise<void> {
+  try { await browser.permissions.remove({ origins: [pattern] }); } catch { /* required host access cannot be removed */ }
+  try {
+    const cur = ((await browser.storage.local.get(KEY))?.[KEY] ?? []) as string[];
+    await browser.storage.local.set({ [KEY]: cur.filter((p) => p !== pattern) });
+  } catch { /* ignore */ }
+}

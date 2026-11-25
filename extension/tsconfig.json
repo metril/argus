@@ -1,5 +1,5 @@
 {
   "extends": "./.wxt/tsconfig.json",
-  "compilerOptions": { "strict": true, "skipLibCheck": true, "noUncheckedIndexedAccess": true },
-  "include": ["entrypoints", "lib", "tests", "vitest.config.ts", "wxt.config.ts", ".wxt/wxt.d.ts"]
+  "compilerOptions": { "strict": true, "jsx": "react-jsx", "jsxImportSource": "preact", "skipLibCheck": true, "noUncheckedIndexedAccess": true },
+  "include": ["entrypoints", "lib", "ui", "tests", "vitest.config.ts", "wxt.config.ts", ".wxt/wxt.d.ts"]
 }

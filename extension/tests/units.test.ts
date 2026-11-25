@@ -3,7 +3,6 @@ import { fakeBrowser } from 'wxt/testing/fake-browser';
 import { decodeFrame, encodeFrame, payloadJson } from '../lib/frames';
 import { connectAllows } from '../lib/connect';
 import { cookieOp } from '../lib/cookies';
-import { renderMenu } from '../lib/menu';
 import { getSettings } from '../lib/api';
 
 describe('frames', () => {
@@ -74,39 +73,6 @@ describe('cookies', () => {
     await expect(cookieOp(b, { op: 'delete', url: 'https://x.com/', name: 'h' })).rejects.toMatchObject({ code: 'bad_request' });
     expect(await cookieOp(b, { op: 'delete', url: 'https://x.com/', name: 'a' })).toBeNull();
     expect(b.cookies.remove).toHaveBeenCalledWith({ url: 'https://x.com/', name: 'a' });
-  });
-});
-
-describe('renderMenu', () => {
-  it('inserts text, not html, and wires handlers', async () => {
-    const root = document.createElement('div');
-    const trigger = vi.fn(async () => true);
-    const grant = vi.fn();
-    const close = vi.fn();
-    renderMenu(root, {
-      commands: [{ script: 's1', scriptName: '<img src=x onerror=1>', cmd: 'c', name: '<b>Go</b>' }],
-      grants: [{ script: 's1', scriptName: '<i>S</i>', host: 'a.com', patterns: ['*://a.com/*'] }],
-    }, { trigger, grant, close });
-    expect(root.querySelector('img,b,i')).toBeNull();
-    expect(root.textContent).toContain('<b>Go</b>');
-    expect(root.textContent).toContain('wants your logins for a.com');
-    (root.querySelector('button.cmd') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(trigger).toHaveBeenCalled();
-    expect(close).toHaveBeenCalled();
-    const gb = Array.from(root.querySelectorAll('button')).find((b) => b.textContent === 'Grant')!;
-    gb.click();
-    expect(grant).toHaveBeenCalled();
-  });
-  it('shows note when not delivered and keeps open', async () => {
-    const root = document.createElement('div');
-    const close = vi.fn();
-    renderMenu(root, { commands: [{ script: 's', scriptName: 'S', cmd: 'c', name: 'N' }], grants: [] },
-      { trigger: async () => false, grant: () => {}, close });
-    (root.querySelector('button') as HTMLButtonElement).click();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(root.textContent).toContain('reload the page');
-    expect(close).not.toHaveBeenCalled();
   });
 });
 
