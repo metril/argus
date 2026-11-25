@@ -100,21 +100,47 @@ fn token_rows(all: Vec<ApiTokenInfo>) -> Vec<Keyed<ApiTokenInfo>> {
         .collect()
 }
 
-/// List your own API tokens (never includes secrets).
+/// Paging plus the revoked-token switch.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TokensQuery {
+    /// Deprecated: use `cursor`.
+    pub page: Option<u32>,
+    /// Items per page, 1..=200 (default 50).
+    pub limit: Option<u32>,
+    /// `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+    /// Also list revoked tokens (default false).
+    #[serde(default)]
+    pub include_revoked: bool,
+}
+
+impl TokensQuery {
+    fn cursor(&self) -> CursorQuery {
+        CursorQuery {
+            page: self.page,
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+        }
+    }
+}
+
+/// List your own API tokens (never includes secrets). Revoked tokens only with
+/// `include_revoked=true`.
 #[utoipa::path(
     get, path = "/tokens", tag = "tokens",
     security(("bearer_auth" = ["tokens:self"])),
-    params(CursorQuery),
+    params(TokensQuery),
     responses((status = 200, description = "Your tokens", body = Page<ApiTokenInfo>))
 )]
 pub async fn list_tokens(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
-    ApiQuery(q): ApiQuery<CursorQuery>,
+    ApiQuery(q): ApiQuery<TokensQuery>,
 ) -> ApiResult<Json<Page<ApiTokenInfo>>> {
-    let (st, uid) = (state.clone(), p.user_id);
-    let tokens = blocking(move || Ok(st.tokens.list(Some(&uid)))).await?;
-    Ok(Json(page_of(token_rows(tokens), &q)?))
+    let (st, uid, all) = (state.clone(), p.user_id, q.include_revoked);
+    let tokens = blocking(move || Ok(st.tokens.list(Some(&uid), all))).await?;
+    Ok(Json(page_of(token_rows(tokens), &q.cursor())?))
 }
 
 /// Revoke one of your own tokens; it stops working immediately.
@@ -170,20 +196,20 @@ pub async fn revoke_self(
     }))
 }
 
-/// List every user's API tokens.
+/// List every user's API tokens. Revoked tokens only with `include_revoked=true`.
 #[utoipa::path(
     get, path = "/admin/tokens", tag = "tokens",
     security(("bearer_auth" = ["tokens:admin"])),
-    params(CursorQuery),
+    params(TokensQuery),
     responses((status = 200, description = "All tokens", body = Page<ApiTokenInfo>))
 )]
 pub async fn admin_list_tokens(
     State(state): State<Arc<AppState>>,
-    ApiQuery(q): ApiQuery<CursorQuery>,
+    ApiQuery(q): ApiQuery<TokensQuery>,
 ) -> ApiResult<Json<Page<ApiTokenInfo>>> {
-    let st = state.clone();
-    let tokens = blocking(move || Ok(st.tokens.list(None))).await?;
-    Ok(Json(page_of(token_rows(tokens), &q)?))
+    let (st, all) = (state.clone(), q.include_revoked);
+    let tokens = blocking(move || Ok(st.tokens.list(None, all))).await?;
+    Ok(Json(page_of(token_rows(tokens), &q.cursor())?))
 }
 
 /// Revoke any user's token.

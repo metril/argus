@@ -31,7 +31,7 @@ describe('copy', () => {
       expect(JSON.stringify(c)).not.toMatch(/HTTP|\b40\d\b/);
     }
     expect(bannerCopy('unreachable', 'argus.lan').title).toBe("Can't reach argus.lan");
-    expect(bannerCopy('unreachable', 'argus.lan', true).body).toBe('Proxy refused it.');
+    expect(bannerCopy('unreachable', 'argus.lan', true).body).toBe("That's the proxy port. Use the web UI address.");
   });
   it('helpers', () => {
     expect(issuerName('C=US, CN=Sectigo ECC DV CA')).toBe('Sectigo ECC DV CA');

@@ -234,6 +234,12 @@ impl ConnectionHandler {
     /// Whether a host-level rule of the connection's profile blocks `target` (recorded as a
     /// blocked event). Used for `no_decrypt` bypass, where only the host is visible.
     fn host_blocked(&self, target: &ConnectionTarget) -> bool {
+        self.host_block_check(target, true)
+    }
+
+    /// `host_blocked`, optionally without recording an event (the request that follows
+    /// interception is recorded on its own).
+    fn host_block_check(&self, target: &ConnectionTarget, record: bool) -> bool {
         let rctx = self.conn.current(
             self.shared.ctx.profiles(),
             self.shared.ctx.require_device_token(),
@@ -248,6 +254,9 @@ impl ConnectionHandler {
             .check_deferred_q(&filter_engine::Query::new(&url, "", "other"));
         if !verdict.blocked {
             return false;
+        }
+        if !record {
+            return true;
         }
         profile.engine.record_verdict_meta(
             verdict,
@@ -429,10 +438,16 @@ impl ConnectionHandler {
         let ctx = &self.shared.ctx;
         // The web UI endpoint is "self" (when this client could reach it directly): handed to the
         // web server, no policy refusal, no interception, no log entry.
-        if let Some(web) = ctx
+        let mut via = ctx
             .web_ui_for(&host, port, self.client_addr.ip(), self.conn.local_ip())
             .await
-        {
+            .map(|w| (w, port));
+        if via.is_none() && !self.conn.is_ext_listener() {
+            via = ctx
+                .web_ui_via_proxy_port(&host, port, self.client_addr.ip(), self.conn.local_ip())
+                .await;
+        }
+        if let Some((web, port)) = via {
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
@@ -646,7 +661,12 @@ impl ConnectionHandler {
         // assurance the site paid for. The verdict is cached per host.
         let ctx = &self.shared.ctx;
         // (The reserved panel host is answered by the proxy itself and cannot be probed.)
-        if ctx.bypass().ev_no_decrypt() && !ctx.is_panel_host(&target.host) {
+        // A host the filter blocks outright is answered with the block page, so there is nothing
+        // to protect and no upstream to probe (its DNS may be sinkholed).
+        if ctx.bypass().ev_no_decrypt()
+            && !ctx.is_panel_host(&target.host)
+            && !self.host_block_check(&target, false)
+        {
             use crate::ev::EvVerdict;
             match ctx
                 .ev_verdict(
@@ -947,6 +967,26 @@ async fn handle_request(
         }
         if require && !digest.is_some_and(|d| ConnCtx::token_known(profiles, &d)) {
             conn.await_token();
+            // A browser opening the explicit proxy port directly (origin-form) is opening Argus
+            // itself: browsers never answer a `407` on a direct connection, and the web UI has
+            // its own login. Only a request the web UI handoff accepts skips the token.
+            if origin.authority.is_none() && req.uri().authority().is_none() {
+                let rctx = conn.current(profiles, require);
+                if let (false, Some(port), Some(ip)) = (
+                    rctx.transparent,
+                    shared.ctx.policy().web_ui_alias_any(),
+                    conn.local_ip(),
+                ) {
+                    if let Some(web) = shared
+                        .ctx
+                        .web_ui_for(&ip.to_string(), port, rctx.client_addr.ip(), Some(ip))
+                        .await
+                    {
+                        req.headers_mut().remove(hyper::header::PROXY_AUTHORIZATION);
+                        return Ok(web.request(req, rctx.client_addr, port).await);
+                    }
+                }
+            }
             return Ok(proxy_auth_required());
         }
     }
@@ -1012,6 +1052,40 @@ async fn handle_request(
                 .await
             {
                 return Ok(web.request(req, rctx.client_addr, port).await);
+            }
+        }
+        // The explicit proxy port is not a proxy target: a request naming it (absolute URI at
+        // an own address, or origin-form, which the proxy cannot forward anywhere) is the web
+        // UI. The extension and transparent listeners keep refusing it.
+        if origin.authority.is_none() && !rctx.transparent && !conn.is_ext_listener() {
+            let target = match req.uri().authority() {
+                Some(a) => Some((a.host().to_string(), a.port_u16().unwrap_or(80))),
+                // Origin-form: judged by the address the client arrived on, never by `Host`.
+                None => conn.local_ip().and_then(|ip| {
+                    shared
+                        .ctx
+                        .policy()
+                        .web_ui_alias_any()
+                        .map(|p| (ip.to_string(), p))
+                }),
+            };
+            if let Some((host, port)) = target {
+                let via = if req.uri().authority().is_some() {
+                    shared
+                        .ctx
+                        .web_ui_via_proxy_port(&host, port, rctx.client_addr.ip(), conn.local_ip())
+                        .await
+                } else {
+                    // `port` already is the web UI port here.
+                    shared
+                        .ctx
+                        .web_ui_for(&host, port, rctx.client_addr.ip(), conn.local_ip())
+                        .await
+                        .map(|w| (w, port))
+                };
+                if let Some((web, port)) = via {
+                    return Ok(web.request(req, rctx.client_addr, port).await);
+                }
             }
         }
     }

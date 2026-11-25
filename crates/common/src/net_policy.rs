@@ -212,6 +212,9 @@ pub struct NetPolicy {
     /// The web UI endpoint `(port, bound address)`. Not an own listener: the proxy routes
     /// requests to it straight to that listener (see [`Self::web_ui_addr`]).
     web_ui: RwLock<Option<(u16, Option<IpAddr>)>>,
+    /// The explicit proxy port: a request naming it is handed to the web UI (a user who typed
+    /// the proxy port as the Argus address still lands in the UI).
+    explicit_port: RwLock<Option<u16>>,
 }
 
 impl fmt::Debug for NetPolicy {
@@ -263,6 +266,7 @@ impl NetPolicy {
             allowed_hosts: Vec::new(),
             own: RwLock::default(),
             web_ui: RwLock::default(),
+            explicit_port: RwLock::default(),
             resolver: None,
         })
     }
@@ -297,6 +301,23 @@ impl NetPolicy {
     /// Record where the web UI listens (`None` bound address: any, reached on loopback).
     pub fn set_web_ui(&self, endpoint: Option<(u16, Option<IpAddr>)>) {
         *self.web_ui.write() = endpoint.map(|(p, ip)| (p, ip.map(canonical)));
+    }
+
+    /// Record the explicit proxy listener's port.
+    pub fn set_explicit_port(&self, port: Option<u16>) {
+        *self.explicit_port.write() = port;
+    }
+
+    /// The web UI port, when `port` is the explicit proxy port (and a web UI is known).
+    pub fn web_ui_alias(&self, port: u16) -> Option<u16> {
+        let (wp, _) = (*self.web_ui.read())?;
+        (*self.explicit_port.read() == Some(port) && wp != port).then_some(wp)
+    }
+
+    /// The web UI port, when an explicit proxy port is known.
+    pub fn web_ui_alias_any(&self) -> Option<u16> {
+        let port = (*self.explicit_port.read())?;
+        self.web_ui_alias(port)
     }
 
     /// Whether `host:port` names the web UI endpoint AND `client` could reach it directly, so
@@ -894,6 +915,16 @@ mod tests {
         assert_eq!(p.check(ip("10.0.0.8"), 8080), Ok(()));
         assert_eq!(p.check_ip_strict(ip("10.0.0.7")), Err(Refusal::OwnListener));
         assert_eq!(p.check_ip(ip("10.0.0.7")), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn explicit_port_aliases_the_web_ui() {
+        let p = NetPolicy::new(true, &[]).unwrap();
+        assert_eq!(p.web_ui_alias(9090), None);
+        p.set_web_ui(Some((3000, None)));
+        p.set_explicit_port(Some(9090));
+        assert_eq!(p.web_ui_alias(9090), Some(3000));
+        assert_eq!(p.web_ui_alias(8080), None);
     }
 
     #[tokio::test]

@@ -41,7 +41,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1), plus framing headers we
 /// reconstruct ourselves.
@@ -462,6 +462,21 @@ impl ProxyContext {
             Duration::from_secs(10),
         )
         .await
+    }
+
+    /// [`Self::web_ui_for`] for a request on the explicit proxy listener: `host:port` naming
+    /// the proxy's own explicit port is the web UI (same reach rules). Returns the web UI port
+    /// too, the one to hand over.
+    pub(crate) async fn web_ui_via_proxy_port(
+        &self,
+        host: &str,
+        port: u16,
+        client: std::net::IpAddr,
+        client_local: Option<std::net::IpAddr>,
+    ) -> Option<(Arc<dyn crate::self_route::WebUiHandoff>, u16)> {
+        let ui = self.policy.web_ui_alias(port)?;
+        let web = self.web_ui_for(host, ui, client, client_local).await?;
+        Some((web, ui))
     }
 
     /// The destination policy every upstream dial is checked against.
@@ -1100,7 +1115,7 @@ impl ProxyContext {
             }
             Err(e) => {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
-                debug!("Upstream error for {}: {}", url, e);
+                warn!("Upstream error for {url}: {}", error_chain(&e));
                 let kind = e.kind();
                 let hostport = common::certstore::hostport(&url_host, port);
                 // A certificate failure: one cached, single-flight probe handshake tells which
@@ -1959,4 +1974,44 @@ fn log_request(
         error_kind,
         cert_fp,
     });
+}
+
+/// An error with its whole `source()` chain, so a transport failure names its real cause.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = format!("{e}");
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        out.push_str(&format!(": {s}"));
+        cur = s.source();
+    }
+    out
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::error_chain;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<dyn std::error::Error + 'static>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref()
+        }
+    }
+
+    #[test]
+    fn upstream_error_log_names_the_root_cause() {
+        let root = Layer("connection reset", None);
+        let mid = Layer("connection error", Some(Box::new(root)));
+        let top = Layer("error sending request", Some(Box::new(mid)));
+        assert_eq!(
+            error_chain(&top),
+            "error sending request: connection error: connection reset"
+        );
+    }
 }

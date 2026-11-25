@@ -813,10 +813,29 @@ async fn revoked_and_expired_tokens_fail_immediately() {
         .assert_status_ok();
     let r = ctx.bearer("GET", "/api/v1/lists", &secret).await;
     r.assert_status_unauthorized();
-    assert_eq!(
-        admin.get("/api/v1/tokens").await.json::<Value>()["items"][0]["revoked"],
-        true
-    );
+    // Revoked tokens are hidden unless asked for (own list and admin list).
+    for base in ["/api/v1/tokens", "/api/v1/admin/tokens"] {
+        let hidden: Value = admin.get(base).await.json();
+        assert!(
+            !hidden["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == id.as_str()),
+            "{base}"
+        );
+        let all: Value = admin
+            .get(&format!("{base}?include_revoked=true"))
+            .await
+            .json();
+        let row = all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == id.as_str())
+            .unwrap_or_else(|| panic!("{base}"));
+        assert_eq!(row["revoked"], true);
+    }
 
     // Expired (created directly with a past expiry).
     let user = ctx

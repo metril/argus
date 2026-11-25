@@ -233,3 +233,46 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     );
     assert_eq!(blocked.headers().get("x-adblock").unwrap(), "blocked");
 }
+
+/// With EV tunnelling on, a CONNECT to a host-blocked name must be intercepted and answered
+/// with the block response, not probed upstream (its DNS is sinkholed: the probe would fail
+/// and the fallback tunnel would reset the connection).
+#[tokio::test]
+async fn blocked_host_with_unresolvable_dns_is_blocked_not_reset_when_ev_tunnelling_is_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = Arc::new(SharedEngine::new());
+    engine.install(compile_engine(&["||blocked.invalid^\n".to_string()]));
+    let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut config = test_config(port);
+    config.mitm.enabled = true;
+    config.mitm.ca_cert_path = tmp.path().join("ca.crt");
+    config.mitm.ca_key_path = tmp.path().join("ca.key");
+    let ca_pem = {
+        let server = ProxyServer::new(config, ctx.clone()).unwrap();
+        assert!(
+            ctx.bypass().ev_no_decrypt(),
+            "EV tunnelling is on by default"
+        );
+        let (tx, _) = tokio::sync::broadcast::channel(1);
+        tokio::spawn(async move {
+            let _ = server.serve(listener, tx).await;
+        });
+        std::fs::read(tmp.path().join("ca.crt")).unwrap()
+    };
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::https(format!("http://127.0.0.1:{port}")).unwrap())
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let r = client
+        .get("https://blocked.invalid/ads.js")
+        .send()
+        .await
+        .expect("the blocked host gets the block response, not a reset");
+    assert_eq!(r.headers().get("x-adblock").unwrap(), "blocked");
+}

@@ -51,13 +51,50 @@ async fn all_tokens() -> Result<Vec<ApiTokenInfo>, crate::api::ApiError> {
     let client = ApiClient::new();
     let (mut out, mut cursor) = (Vec::new(), None::<String>);
     loop {
-        let page = client.list_tokens(cursor.as_deref()).await?;
+        let page = client.list_tokens(cursor.as_deref(), false).await?;
         out.extend(page.items);
         match page.next_cursor {
             Some(c) => cursor = Some(c),
             None => return Ok(out),
         }
     }
+}
+
+/// Default extension listener ports to try in order, skipping ports Argus already uses.
+fn ext_port_candidates(used: &[u16]) -> Vec<u16> {
+    (3130u16..3140).filter(|p| !used.contains(p)).collect()
+}
+
+/// Status line of the extension listener.
+fn listener_line(port: Option<Option<u16>>) -> String {
+    match port {
+        None => "Checking…".into(),
+        Some(None) => "Off".into(),
+        Some(Some(p)) => format!("On, port {p}"),
+    }
+}
+
+/// Turn the extension listener on at the first free default port, applied live.
+async fn enable_listener() -> Result<u16, String> {
+    let client = ApiClient::new();
+    let cfg = client.get_proxy_config().await.map_err(|e| e.to_string())?;
+    let used = [Some(cfg.port), cfg.transparent_port, Some(cfg.webui_port)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut last = String::from("No free port.");
+    for port in ext_port_candidates(&used) {
+        let req = api_types::UpdateProxyConfigRequest {
+            ext_port: Some(port),
+            ..Default::default()
+        };
+        match client.update_proxy_config_full(&req).await {
+            Ok(r) if r.config.ext_port == Some(port) => return Ok(port),
+            Ok(_) => last = "Argus didn't apply it.".into(),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
 }
 
 /// Fetch an extension build (cookie session, with a refresh on `401`) and hand it to the
@@ -111,6 +148,32 @@ pub fn ExtensionPage() -> impl IntoView {
     let signed_in = RwSignal::new(Vec::<ApiTokenInfo>::new());
     let reload = RwSignal::new(0u32);
     let origin = get_origin();
+    // `None`: not loaded yet; `Some(None)`: no extension listener.
+    let listener = RwSignal::new(Option::<Option<u16>>::None);
+    let listener_busy = RwSignal::new(false);
+    let listener_err = RwSignal::new(Option::<String>::None);
+    let can_enable = move || {
+        user.get()
+            .is_some_and(|u| u.scopes.contains(&api_types::Scope::ConfigWrite))
+    };
+    Effect::new(move |_| {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(c) = ApiClient::new().get_proxy_config().await {
+                listener.set(Some(c.ext_port));
+            }
+        });
+    });
+    let turn_on = move |_| {
+        listener_busy.set(true);
+        listener_err.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            match enable_listener().await {
+                Ok(p) => listener.set(Some(Some(p))),
+                Err(e) => listener_err.set(Some(format!("Couldn't turn it on: {e}"))),
+            }
+            listener_busy.set(false);
+        });
+    };
 
     Effect::new(move |_| {
         reload.track();
@@ -192,6 +255,19 @@ pub fn ExtensionPage() -> impl IntoView {
                         <li>
                             <b>"Open it"</b>
                             <p class="form-help">"Click the Argus icon in the toolbar."</p>
+                        </li>
+                        <li>
+                            <b>"Turn on the extension listener"</b>
+                            <p class="form-help" role="status">{move || listener_line(listener.get())}</p>
+                            <Show when=move || listener.get() == Some(None)>
+                                <Show
+                                    when=can_enable
+                                    fallback=|| view! { <p class="form-help">"Ask an admin to turn on the extension listener."</p> }
+                                >
+                                    <button class="btn btn-primary" disabled=move || listener_busy.get() on:click=turn_on>"Turn on"</button>
+                                </Show>
+                            </Show>
+                            {move || listener_err.get().map(|m| view! { <p class="form-help" role="alert" style="color:var(--danger, #c0392b)">{m}</p> })}
                         </li>
                         <li>
                             <b>"Sign in"</b>
@@ -293,6 +369,16 @@ mod tests {
             last_used_at: used.then(|| "2026-01-01T00:00:00Z".to_string()),
             revoked,
         }
+    }
+
+    #[test]
+    fn listener_ports_skip_used_ones_and_lines_read_plainly() {
+        assert_eq!(ext_port_candidates(&[]).first(), Some(&3130));
+        assert_eq!(ext_port_candidates(&[3130, 3131]).first(), Some(&3132));
+        assert!(!ext_port_candidates(&[3135]).contains(&3135));
+        assert_eq!(listener_line(None), "Checking…");
+        assert_eq!(listener_line(Some(None)), "Off");
+        assert_eq!(listener_line(Some(Some(3130))), "On, port 3130");
     }
 
     #[test]
