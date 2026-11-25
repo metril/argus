@@ -375,10 +375,16 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 .trow.gone,.siterow.gone{opacity:0;transition:opacity .25s}
 
 /* tokens */
-.scopegrp{display:grid;grid-template-columns:110px minmax(0,1fr);gap:var(--s3);align-items:start;padding:8px 0;border-top:1px solid var(--line)}
-.scopegrp:first-child{border-top:0}
-.scopegrp>.gname{font-weight:500;padding-top:4px;display:flex;flex-direction:column;gap:2px}
-.scopegrp>.gname button{border:0;background:none;padding:0;color:var(--accent);font-size:var(--fs-11);text-align:left;width:max-content}
+.accgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--s2) var(--s4)}
+.accrow{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);padding:4px 0;border-top:1px solid var(--line);min-width:0}
+.accname{font-weight:500;cursor:help}
+.accadmin{margin-top:var(--s3)}
+.accadmin>summary{cursor:pointer;font-weight:500;color:var(--text-2)}
+.exprow{display:flex;gap:var(--s2);flex-wrap:wrap}
+.hint.warn{color:var(--error)}
+.extsteps{margin:0;padding-left:var(--s5);display:flex;flex-direction:column;gap:var(--s3)}
+.extbanner{display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;padding:var(--s2) var(--s3);margin-bottom:var(--s3);border:1px solid var(--line-strong);background:var(--accent-soft);border-radius:var(--r-ctl)}
+.extbanner b{flex:1 1 200px}
 .newtoken{display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap;padding:var(--s3);border:1px solid var(--allow);background:var(--allow-soft);border-radius:var(--r-ctl)}
 .newtoken code{flex:1 1 220px;font:12px var(--font-mono);overflow-wrap:anywhere}
 
@@ -489,8 +495,7 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
   .lr{grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"pill time mode" "u u u" "c c m";row-gap:4px;padding:8px var(--s3)}
   .lr .pill{grid-area:pill}.lr .t{grid-area:time}.lr .mode{grid-area:mode;justify-self:end}.lr .u{grid-area:u;white-space:normal;overflow-wrap:anywhere}
   .lr .c{grid-area:c;align-self:baseline}.lr .m{grid-area:m;justify-self:end;align-self:baseline}
-  .scopegrp{grid-template-columns:minmax(0,1fr)}
-  .scopegrp>.gname{flex-direction:row;gap:var(--s3);align-items:baseline}
+  .accgrid{grid-template-columns:minmax(0,1fr)}
   .minis{grid-template-columns:repeat(3,minmax(0,1fr))}
   .frow{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"l r" "c c"}
   .frow .fl{grid-area:l}.frow .fc{grid-area:c}.frow .freset{grid-area:r}

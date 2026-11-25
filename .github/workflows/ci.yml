@@ -25,6 +25,14 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo fmt --all --check
+      - name: Product name is capitalized in user-visible text
+        run: |
+          # Identifiers (realm, server-timing, crate and image names, paths) stay lowercase;
+          # only view strings and log/API prose are checked.
+          if grep -rnE '>"argus"<|"argus (proxy|server|web)' crates/web-ui/src crates/web-api/src crates/proxy-core/src; then
+            echo 'Write "Argus" with a capital A in user-visible text' >&2
+            exit 1
+          fi
 
   clippy:
     runs-on: ubuntu-latest

@@ -54,6 +54,8 @@ dashmap = "5.5"
 cookie = { version = "0.18", features = ["percent-encode"] }
 parking_lot = { workspace = true }
 base64 = "0.22"
+# Adds argus.json to the downloaded Chrome extension
+zip = { version = "3", default-features = false, features = ["deflate"] }
 url = "2.5"
 ipnet = "2.9"
 

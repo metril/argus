@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     // Emits the one-time deprecation warning now that logging is up.
     let _ = common::env::var_os("LOG_VERBOSE");
 
-    info!("Starting argus proxy server v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting Argus proxy server v{}", env!("CARGO_PKG_VERSION"));
 
     // Load configuration
     let config_path =

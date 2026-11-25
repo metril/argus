@@ -18,7 +18,7 @@ use crate::state::AppState;
 fn is_credential_endpoint(path: &str) -> bool {
     matches!(
         path.rsplit_once("/auth/"),
-        Some((_, "login" | "register" | "refresh"))
+        Some((_, "login" | "register" | "refresh" | "extension-token"))
     )
 }
 
@@ -53,6 +53,7 @@ mod tests {
     #[test]
     fn credential_endpoints_are_stricter() {
         assert!(is_credential_endpoint("/api/v1/auth/login"));
+        assert!(is_credential_endpoint("/api/v1/auth/extension-token"));
         assert!(!is_credential_endpoint("/api/v1/auth/me"));
         let l = RateLimiters::new(1000, 1000, 1000, 2);
         let ip = "127.0.0.1".parse().unwrap();

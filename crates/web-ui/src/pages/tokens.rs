@@ -1,37 +1,89 @@
-//! API tokens page: create (scope chips grouped by resource), show the secret once, list, revoke.
-
-use std::collections::BTreeMap;
+//! API tokens page: create (templates, access table, expiry), show the secret once, list, revoke.
 
 use std::rc::Rc;
 
+use api_types::scopes::Resource;
 use leptos::prelude::*;
 
+use super::token_form::{
+    add_days, expiry_line, fmt_ymd, resolve_expiry, rows, set_level, summarize, template_of,
+    Expiry, Template, Ymd, EXPIRY_OPTIONS,
+};
 use super::vlist::{Feed, Fetcher, Scroller};
 use crate::api::tokens::{ApiTokenInfo, Scope};
 use crate::api::ApiClient;
-use crate::components::{Card, ChipSelect, ConfirmButton, Icon, Layout, Segmented};
+use crate::components::{Card, ConfirmButton, Icon, Layout, Segmented};
 use crate::state::{use_app_state, use_auth_state};
 use crate::utils::{copy_text, fmt_ago, fmt_datetime};
 
-/// Scopes grouped by resource, in declaration order within each group.
-fn grouped(scopes: &[Scope]) -> Vec<(&'static str, Vec<Scope>)> {
-    let mut map: BTreeMap<&'static str, Vec<Scope>> = BTreeMap::new();
-    for s in scopes {
-        map.entry(s.resource()).or_default().push(*s);
-    }
-    map.into_iter().collect()
+/// Local calendar date today.
+fn today() -> Ymd {
+    let d = js_sys::Date::new_0();
+    (d.get_full_year() as i32, d.get_month() + 1, d.get_date())
 }
 
-fn is_admin_scope(s: &Scope) -> bool {
-    s.action() == "admin"
+/// RFC 3339 instant for the end of local day `d`.
+fn end_of_day_iso(d: Ymd) -> String {
+    js_sys::Date::new_with_year_month_day_hr_min_sec(
+        d.0 as u32,
+        d.1 as i32 - 1,
+        d.2 as i32,
+        23,
+        59,
+        59,
+    )
+    .to_iso_string()
+    .as_string()
+    .unwrap_or_default()
 }
 
-/// Scope tags for a token row.
+/// Scopes of a token row: a short summary with the full list on hover.
 pub fn scope_tags(scopes: &[Scope]) -> impl IntoView {
-    scopes
+    let (short, full) = summarize(scopes);
+    view! { <span title=full>{short}</span> }
+}
+
+/// One row of the access table: the resource and a control for the levels the user holds.
+fn access_row(
+    r: &'static Resource,
+    held: Vec<Scope>,
+    selected: RwSignal<Vec<Scope>>,
+) -> impl IntoView {
+    let avail = r.available(&held);
+    let mut options = vec![("0".to_string(), "No access".to_string())];
+    options.extend(
+        r.levels
+            .iter()
+            .take(avail)
+            .enumerate()
+            .map(|(i, l)| ((i + 1).to_string(), l.label.to_string())),
+    );
+    let tip = r
+        .levels
         .iter()
-        .map(|s| view! { <span class="tag">{s.as_str()}</span>" " })
-        .collect_view()
+        .take(avail)
+        .flat_map(|l| {
+            l.scopes
+                .iter()
+                .map(|s| format!("{}: {}", s.as_str(), s.description()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value = Signal::derive(move || r.level_of(&selected.read()).min(avail).to_string());
+    view! {
+        <div class="accrow">
+            <span class="accname" title=tip>{r.label}</span>
+            <Segmented
+                label=r.label
+                options=options
+                value=value
+                on_change=Callback::new(move |v: String| {
+                    let n = v.parse().unwrap_or(0);
+                    selected.update(|sel| set_level(sel, r, n));
+                })
+            />
+        </div>
+    }
 }
 
 #[component]
@@ -41,11 +93,18 @@ pub fn TokensPage() -> impl IntoView {
 
     let name = RwSignal::new(String::new());
     let expiry = RwSignal::new("90".to_string());
+    let custom_date = RwSignal::new(String::new());
     let selected = RwSignal::new(Vec::<Scope>::new());
     let new_secret = RwSignal::new(Option::<String>::None);
     let reload = RwSignal::new(0u32);
 
-    let available = Memo::new(move |_| user.get().map(|u| grouped(&u.scopes)).unwrap_or_default());
+    let held = Memo::new(move |_| user.get().map(|u| u.scopes).unwrap_or_default());
+    let template = Signal::derive(move || {
+        held.with(|h| selected.with(|s| template_of(s, h)))
+            .key()
+            .to_string()
+    });
+    let resolved = Memo::new(move |_| resolve_expiry(&expiry.get(), &custom_date.get(), today()));
 
     let fetch: Fetcher<ApiTokenInfo> = {
         let app_state = app_state.clone();
@@ -74,14 +133,22 @@ pub fn TokensPage() -> impl IntoView {
             let scopes = selected.get_untracked();
             let token_name = name.get_untracked();
             if token_name.trim().is_empty() || scopes.is_empty() {
-                app_state.error("Give the token a name and select at least one scope");
+                app_state.error("Name the token and choose some access");
                 return;
             }
-            let days = expiry.get_untracked().parse::<u32>().ok();
+            let (days, at) = match resolved.get_untracked() {
+                Expiry::Days(n) => (Some(n), None),
+                Expiry::On(d) => (None, Some(end_of_day_iso(d))),
+                Expiry::Never => (None, None),
+                Expiry::Invalid => {
+                    app_state.error("Pick an expiry date after today");
+                    return;
+                }
+            };
             let app_state = app_state.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match ApiClient::new()
-                    .create_token(&token_name, scopes, days)
+                    .create_token(&token_name, scopes, days, at)
                     .await
                 {
                     Ok(created) => {
@@ -114,6 +181,11 @@ pub fn TokensPage() -> impl IntoView {
 
     let app_copy = app_state.clone();
     let scope_count = move || selected.read().len();
+    let template_options: Vec<(String, String)> = Template::ALL
+        .iter()
+        .map(|t| (t.key().to_string(), t.label().to_string()))
+        .collect();
+    let expiry_options = EXPIRY_OPTIONS;
 
     view! {
         <Layout>
@@ -133,7 +205,7 @@ pub fn TokensPage() -> impl IntoView {
                 </div>
             </Show>
 
-            <Card title="Create token" sub="For scripts and integrations. Shown once.">
+            <Card title="New token" sub="For scripts and integrations. Shown once.">
                 <div class="grid2" style="gap:var(--s3)">
                     <div class="field">
                         <label for="tkName">"Name"</label>
@@ -145,59 +217,71 @@ pub fn TokensPage() -> impl IntoView {
                         />
                     </div>
                     <div class="field">
-                        <span class="lbl">"Expires"</span>
-                        <Segmented
-                            label="Expires"
-                            options=vec![
-                                ("7".into(), "7 days".into()),
-                                ("30".into(), "30 days".into()),
-                                ("90".into(), "90 days".into()),
-                                ("".into(), "Never".into()),
-                            ]
-                            value=expiry
-                            on_change=Callback::new(move |v| expiry.set(v))
-                        />
+                        <label for="tkExp">"Expires"</label>
+                        <div class="exprow">
+                            <select
+                                class="input"
+                                id="tkExp"
+                                prop:value=move || expiry.get()
+                                on:change=move |ev| expiry.set(event_target_value(&ev))
+                            >
+                                {expiry_options.iter().map(|(v, l)| view! { <option value=*v>{*l}</option> }).collect_view()}
+                            </select>
+                            <Show when=move || expiry.get() == "custom">
+                                <input
+                                    class="input"
+                                    type="date"
+                                    aria-label="Expiry date"
+                                    min=fmt_ymd(add_days(today(), 1))
+                                    prop:value=move || custom_date.get()
+                                    on:input=move |ev| custom_date.set(event_target_value(&ev))
+                                />
+                            </Show>
+                        </div>
+                        <span class=move || if resolved.get() == Expiry::Never { "hint warn" } else { "hint" }>
+                            {move || expiry_line(&resolved.get(), today())}
+                            {move || (resolved.get() == Expiry::Never).then_some(". Revoke it when you're done.")}
+                        </span>
                     </div>
                 </div>
                 <div class="field">
-                    <span class="lbl">"Scopes "<span class="dim">{move || format!("({} selected)", scope_count())}</span></span>
-                    {move || available.get().into_iter().map(|(resource, scopes)| {
-                        let group_scopes = scopes.clone();
-                        view! {
-                            <div class="scopegrp">
-                                <div class="gname">
-                                    {resource}
-                                    <button type="button" on:click=move |_| selected.update(|v| {
-                                        let all = group_scopes.iter().all(|s| v.contains(s));
-                                        v.retain(|s| !group_scopes.contains(s));
-                                        if !all { v.extend(group_scopes.iter().copied()); }
-                                    })>"toggle all"</button>
+                    <span class="lbl">"Template"</span>
+                    <Segmented
+                        label="Template"
+                        options=template_options
+                        value=template
+                        on_change=Callback::new(move |k: String| {
+                            let held = held.get_untracked();
+                            if let Some(s) = Template::from_key(&k).scopes(&held) {
+                                selected.set(s);
+                            }
+                        })
+                    />
+                </div>
+                <div class="field">
+                    <span class="lbl">"Access "<span class="dim">{move || format!("({} selected)", scope_count())}</span></span>
+                    <div class="accgrid">
+                        {move || {
+                            let h = held.get();
+                            rows(&h, false).into_iter().map(|r| access_row(r, h.clone(), selected)).collect_view()
+                        }}
+                    </div>
+                    {move || {
+                        let h = held.get();
+                        let admin = rows(&h, true);
+                        (!admin.is_empty()).then(|| view! {
+                            <details class="accadmin">
+                                <summary>"Admin access"</summary>
+                                <span class="hint">"Reaches other users' data."</span>
+                                <div class="accgrid">
+                                    {admin.into_iter().map(|r| access_row(r, h.clone(), selected)).collect_view()}
                                 </div>
-                                <div class="chips">
-                                    {scopes.into_iter().map(|scope| view! {
-                                        <ChipSelect
-                                            class=if is_admin_scope(&scope) { "mono adminscope" } else { "mono" }
-                                            title=scope.description()
-                                            pressed=Signal::derive(move || selected.read().contains(&scope))
-                                            on_toggle=Callback::new(move |on: bool| selected.update(|v| {
-                                                v.retain(|s| *s != scope);
-                                                if on { v.push(scope); }
-                                            }))
-                                        >{scope.action()}</ChipSelect>
-                                    }).collect_view()}
-                                </div>
-                            </div>
-                        }
-                    }).collect_view()}
-                    <span class="hint">"Dashed chips are admin scopes. They grant access to other users' data."</span>
+                            </details>
+                        })
+                    }}
                 </div>
                 <div class="toolbar">
                     <button class="btn primary" type="button" on:click=create>"Create token"</button>
-                    <button class="btn ghost" type="button" on:click=move |_| {
-                        let ro: Vec<Scope> = user.get_untracked().map(|u| u.scopes).unwrap_or_default()
-                            .into_iter().filter(|s| s.action() == "read").collect();
-                        selected.set(ro);
-                    }>"Read-only preset"</button>
                 </div>
             </Card>
 
@@ -205,7 +289,7 @@ pub fn TokensPage() -> impl IntoView {
                 <div class="card-h"><h3>"Your tokens"</h3></div>
                 <Scroller feed=tokens class="tbl-wrap">
                     <table class="tbl">
-                        <thead><tr><th>"Name"</th><th>"Scopes"</th><th>"Last used"</th><th>"Expires"</th><th></th></tr></thead>
+                        <thead><tr><th>"Name"</th><th>"Access"</th><th>"Last used"</th><th>"Expires"</th><th></th></tr></thead>
                         <tbody>
                             <For
                                 each=move || tokens.items.get()

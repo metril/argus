@@ -96,9 +96,47 @@ pub struct CreateTokenRequest {
     /// Lifetime in days; omit for a token that never expires.
     #[cfg_attr(feature = "server", validate(range(min = 1, max = 3650)))]
     pub expires_in_days: Option<u32>,
+    /// Absolute expiry (RFC 3339, must be in the future). Exclusive with `expires_in_days`.
+    #[serde(default)]
+    pub expires_at: Option<String>,
     /// Restrict the token to these profile ids (enforced once profiles exist).
     #[serde(default)]
     pub profiles: Option<Vec<String>>,
+}
+
+/// Sign in from the browser extension: checks the credentials like a login, but starts no session
+/// and mints a token named `Extension · {browser}` with just the scopes the extension needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
+pub struct ExtensionTokenRequest {
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 3, max = 50, message = "Username must be 3-50 characters"))
+    )]
+    pub username: String,
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 8, max = 128, message = "Password must be 8-128 characters"))
+    )]
+    pub password: String,
+    /// Browser name for the token label, e.g. `Chrome`.
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 1, max = 30, message = "Browser must be 1-30 characters"))
+    )]
+    pub browser: String,
+    /// An earlier extension token of the same user to revoke (ignored if it is not theirs).
+    #[serde(default)]
+    pub replace_token_id: Option<String>,
+}
+
+/// The new extension token; `token` is shown only here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtensionTokenResponse {
+    pub token: String,
+    pub token_id: String,
+    pub user: crate::UserInfo,
 }
 
 /// Token metadata. The secret is never part of this type.

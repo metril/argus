@@ -959,7 +959,7 @@ with a log line when the database is loaded.
 
 ## Browser extension
 
-An optional extension shows the real upstream certificate Argus saw for the current site and flags invalid ones. It needs an Argus API token with the `logs:read` scope (Settings, API tokens) and the Argus URL, entered in the extension's options.
+An optional extension shows the real upstream certificate Argus saw for the current site and flags invalid ones. Sign in from the extension with your Argus username and password; it creates its own token (`logs:read` and `userscripts:bridge`) and never stores the password. The **Browser extension** page in the web UI has the download, the steps and the Argus address, and lists the browsers you signed in from so you can sign them out.
 
 - Download `argus-extension-<version>-chrome.zip` or `-firefox` from the [Releases](https://github.com/metril/argus/releases) page (checksums in `SHA256SUMS`).
 - **Chrome/Chromium**: unzip, open `chrome://extensions`, enable Developer mode, "Load unpacked", select the folder.

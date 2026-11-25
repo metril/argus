@@ -2,6 +2,7 @@
 
 use leptos::prelude::*;
 
+use super::extension::ExtensionBanner;
 use crate::api::ApiClient;
 use crate::components::{Layout, Pill, Segmented, Tile};
 use crate::utils::format_number;
@@ -199,6 +200,7 @@ pub fn DashboardPage() -> impl IntoView {
 
     view! {
         <Layout>
+            <ExtensionBanner />
             <div class="tiles">
                 <Tile label="Requests" value=Signal::derive(move || format_number(total.get())) detail="since engine start" />
                 <Tile label="Blocked" value=Signal::derive(move || format_number(blocked.get())) color="color:var(--block)" detail="matched a rule" />

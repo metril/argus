@@ -1075,6 +1075,13 @@ where
 /// Path prefix whose responses browser extensions may read cross-origin.
 const EXTENSION_CORS_PREFIX: &str = "/api/v1/certs/";
 
+/// Exact paths extensions may also call cross-origin: sign in, and sign out (token self-revoke).
+const EXTENSION_CORS_PATHS: [&str; 2] = ["/api/v1/auth/extension-token", "/api/v1/tokens/self"];
+
+fn extension_may_read(path: &str) -> bool {
+    path.starts_with(EXTENSION_CORS_PREFIX) || EXTENSION_CORS_PATHS.contains(&path)
+}
+
 /// Whether `origin` is a browser-extension origin.
 fn is_extension_origin(origin: &HeaderValue) -> bool {
     origin
@@ -1084,7 +1091,7 @@ fn is_extension_origin(origin: &HeaderValue) -> bool {
 
 /// CORS: same-origin only unless origins are allowlisted (then credentials are allowed for
 /// exactly those origins). Browser extensions (`chrome-extension://*`, `moz-extension://*`) are
-/// additionally allowed, but only on `/api/v1/certs/*`.
+/// additionally allowed, but only on `/api/v1/certs/*` and the two extension sign-in/out routes.
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
     use tower_http::cors::AllowOrigin;
 
@@ -1096,8 +1103,7 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
         CorsLayer::new()
             .allow_origin(AllowOrigin::predicate(move |origin, parts| {
                 allowed.contains(origin)
-                    || (is_extension_origin(origin)
-                        && parts.uri.path().starts_with(EXTENSION_CORS_PREFIX))
+                    || (is_extension_origin(origin) && extension_may_read(parts.uri.path()))
             }))
             .allow_methods([
                 Method::GET,
