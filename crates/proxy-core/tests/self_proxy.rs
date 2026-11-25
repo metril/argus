@@ -86,7 +86,7 @@ async fn proxy(bind: &str, web: Arc<FakeWeb>) -> (u16, u16) {
     let ctx = Arc::new(
         ProxyContext::with_upstream(engine, &UpstreamOptions::from_config(&config), false).unwrap(),
     );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = ProxyServer::new(config, ctx).unwrap();
     server.control().set_webui_listener(bind, ui).await;
@@ -205,4 +205,40 @@ async fn a_host_header_cannot_name_the_web_ui_on_a_known_destination() {
     .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(3), read_some(&mut s)).await;
     assert!(web.peers.lock().is_empty());
+}
+
+/// A non-loopback address of this host, if it has one (no packet is sent).
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+#[tokio::test]
+async fn remote_style_client_is_routed_only_to_the_address_it_arrived_on() {
+    let Some(lan) = lan_ip() else { return };
+    let web = Arc::new(FakeWeb::default());
+    let (p, ui) = proxy("0.0.0.0", web.clone()).await;
+    let connect = |target: String| async move {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind(SocketAddr::new(lan, 0)).unwrap();
+        let mut s = sock.connect(SocketAddr::new(lan, p)).await.unwrap();
+        s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_some(&mut s).await;
+        (head, s.local_addr().unwrap())
+    };
+    // The address it arrived on: handed over, with its real (non-loopback) address.
+    let (head, me) = connect(format!("{lan}:{ui}")).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(web.peers.lock().as_slice(), &[me]);
+    // Loopback is not reachable for it; the miss is refused, never dialled or handed over.
+    let (head, _) = connect(format!("127.0.0.1:{ui}")).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    // Another address of this host (a different interface) is not self either.
+    let (head, _) = connect(format!("169.254.1.1:{ui}")).await;
+    assert!(!head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(web.peers.lock().len(), 1);
 }

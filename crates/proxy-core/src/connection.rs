@@ -131,6 +131,12 @@ impl ConnectionHandler {
         }
     }
 
+    /// Record the local address this connection was accepted on.
+    pub fn with_local_ip(self, ip: std::net::IpAddr) -> Self {
+        self.conn.set_local_ip(ip);
+        self
+    }
+
     /// Mark the connection as accepted on the extension-only listener: it must authenticate as a
     /// live extension session (`407` otherwise) and is bound to that session.
     pub fn on_ext_listener(self) -> Self {
@@ -421,7 +427,10 @@ impl ConnectionHandler {
         let ctx = &self.shared.ctx;
         // The web UI endpoint is "self" (when this client could reach it directly): handed to the
         // web server, no policy refusal, no interception, no log entry.
-        if let Some(web) = ctx.web_ui_for(&host, port, self.client_addr.ip()).await {
+        if let Some(web) = ctx
+            .web_ui_for(&host, port, self.client_addr.ip(), self.conn.local_ip())
+            .await
+        {
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
@@ -560,7 +569,10 @@ impl ConnectionHandler {
         debug!("SOCKS5 CONNECT {host}:{port} from {}", self.client_addr);
         let intercept_tls = self.intercepts(&host);
         let ctx = &self.shared.ctx;
-        if let Some(web) = ctx.web_ui_for(&host, port, self.client_addr.ip()).await {
+        if let Some(web) = ctx
+            .web_ui_for(&host, port, self.client_addr.ip(), self.conn.local_ip())
+            .await
+        {
             stream.write_all(&reply(0)).await?;
             return Ok(Entry::WebUi(Prefixed::new(leftover, stream), web, port));
         }
@@ -991,7 +1003,7 @@ async fn handle_request(
         if let Some((host, port)) = dest {
             if let Some(web) = shared
                 .ctx
-                .web_ui_for(&host, port, rctx.client_addr.ip())
+                .web_ui_for(&host, port, rctx.client_addr.ip(), conn.local_ip())
                 .await
             {
                 return Ok(web.request(req, rctx.client_addr, port).await);

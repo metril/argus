@@ -485,8 +485,14 @@ impl ProxyControl {
             ports.push(l.addr.port());
             addrs.push(l.addr.ip());
         }
-        // The web UI endpoint is not an own listener: requests to it are routed to it directly.
-        self.ctx.policy().set_web_ui(*self.webui_own.lock());
+        // The web UI endpoint stays an own listener: whatever the in-process handoff did not
+        // take (a miss) is refused like a proxy port. The handoff check runs before the policy.
+        let webui = *self.webui_own.lock();
+        if let Some((port, ip)) = webui {
+            ports.push(port);
+            addrs.extend(ip);
+        }
+        self.ctx.policy().set_web_ui(webui);
         ports.sort_unstable();
         ports.dedup();
         *self.entry_ports.write() = std::iter::once(explicit)
@@ -859,6 +865,7 @@ impl ProxyControl {
                             let shared = shared.clone();
                             let entry = entry.clone();
                             let flags = flags.clone();
+                            let local_ip = stream.local_addr().ok().map(|a| a.ip());
                             let active = flags.open(client_addr.ip());
                             let mut shutdown_rx = shutdown_tx.subscribe();
                             // Spawn a new task to handle this connection; admission already
@@ -866,6 +873,9 @@ impl ProxyControl {
                             spawn_admitted(&self.load_manager, async move {
                                 let _active = active;
                                 let mut handler = ConnectionHandler::with_listener(client_addr, shared, flags, transparent);
+                                if let Some(ip) = local_ip {
+                                    handler = handler.with_local_ip(ip);
+                                }
                                 if ext {
                                     handler = handler.on_ext_listener();
                                 }

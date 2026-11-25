@@ -394,10 +394,11 @@ impl ProxyContext {
         host: &str,
         port: u16,
         client: std::net::IpAddr,
+        client_local: Option<std::net::IpAddr>,
     ) -> Option<Arc<dyn crate::self_route::WebUiHandoff>> {
         let server = self.web_server.read().clone()?;
         self.policy
-            .is_web_ui(host, port, self.resolve_all_to(), client)
+            .is_web_ui(host, port, self.resolve_all_to(), client, client_local)
             .await
             .then_some(server)
     }

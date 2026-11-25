@@ -159,6 +159,10 @@ const OLD_LISTENER_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// The web API's listener, replaceable at runtime.
 pub struct WebServer {
     router: Router,
+    /// Connection slots shared by the listener and in-process handoffs.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Fires when the current listener is told to stop (closes handed-off connections too).
+    handoff_sd: parking_lot::Mutex<tokio::sync::watch::Receiver<bool>>,
     /// TLS configuration read by every new connection (swappable without rebinding).
     tls: Arc<TlsShared>,
     /// Where the bound port is recorded for tooling (`.webui_port`).
@@ -287,15 +291,19 @@ impl WebServer {
     {
         use tokio::io::AsyncReadExt;
         let (router, tls) = (self.router.clone(), self.tls.clone());
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            tracing::warn!("web listener at its connection limit; dropping handoff from {peer}");
+            return;
+        };
+        let sd = self.handoff_sd.lock().clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let mut stream = stream;
             let mut b = [0u8; 1];
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read(&mut b)).await {
                 Ok(Ok(1)) => {}
                 _ => return,
             }
-            // The sender lives as long as the connection: it is never signalled.
-            let (_keep, sd) = tokio::sync::watch::channel(false);
             let io = Rewind {
                 first: Some(b[0]),
                 inner: stream,
@@ -346,6 +354,8 @@ impl WebServer {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let srv = Arc::new(Self {
             router,
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            handoff_sd: parking_lot::Mutex::new(tokio::sync::watch::channel(false).1),
             tls,
             port_file: parking_lot::Mutex::new(None),
             current: tokio::sync::Mutex::new(Current {
@@ -391,11 +401,15 @@ impl WebServer {
     ) -> tokio::sync::oneshot::Sender<()> {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (router, tls) = (self.router.clone(), self.tls.clone());
+        let permits = self.permits.clone();
         let done = self.done_tx.clone();
+        let (hs_tx, hs_rx) = tokio::sync::watch::channel(false);
+        *self.handoff_sd.lock() = hs_rx;
         tokio::spawn(async move {
             let (grace_tx, grace_rx) = tokio::sync::oneshot::channel::<()>();
-            let serve = serve_loop(listener, router, tls, async move {
+            let serve = serve_loop(listener, router, tls, permits, async move {
                 let _ = stop_rx.await;
+                let _ = hs_tx.send(true);
                 let _ = grace_tx.send(());
             });
             let result = tokio::select! {
@@ -799,10 +813,10 @@ async fn serve_loop(
     listener: tokio::net::TcpListener,
     router: Router,
     tls: Arc<TlsShared>,
+    permits: Arc<tokio::sync::Semaphore>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
     let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut conns = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
     loop {

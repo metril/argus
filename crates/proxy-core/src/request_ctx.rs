@@ -212,6 +212,8 @@ pub struct ConnCtx {
     ext_session: std::sync::atomic::AtomicU64,
     ext_pin: std::sync::atomic::AtomicU64,
     ext_store: OnceLock<Arc<str>>,
+    /// Local address the connection was accepted on.
+    local_ip: OnceLock<std::net::IpAddr>,
 }
 
 impl ConnCtx {
@@ -231,6 +233,7 @@ impl ConnCtx {
             ext_session: std::sync::atomic::AtomicU64::new(0),
             ext_pin: std::sync::atomic::AtomicU64::new(0),
             ext_store: OnceLock::new(),
+            local_ip: OnceLock::new(),
         }
     }
 
@@ -300,6 +303,16 @@ impl ConnCtx {
     /// Whether HTTP/2 is on for this connection's listener (default on).
     pub fn http2_on(&self) -> bool {
         self.listener.load().as_ref().is_none_or(|l| l.http2())
+    }
+
+    /// Record the local address the connection arrived on.
+    pub fn set_local_ip(&self, ip: std::net::IpAddr) {
+        let _ = self.local_ip.set(ip);
+    }
+
+    /// The local address the connection arrived on.
+    pub fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.local_ip.get().copied()
     }
 
     pub fn client_addr(&self) -> SocketAddr {
