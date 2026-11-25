@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use api_types::{
     BindResult, DnsDto, ListenerFlagsView, MessageResponse, ProxyConfigResponse,
-    UpdateProxyConfigRequest, UpdateProxyConfigResponse,
+    UpdateProxyConfigRequest, UpdateProxyConfigResponse, UpstreamProxyDto, UpstreamProxyTestResult,
+    UpstreamProxyUpdate,
 };
 use axum::{
     extract::State,
@@ -44,6 +45,7 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         tls_passthrough_hosts: config.proxy.tls_passthrough_hosts.clone(),
         block_private_destinations: config.proxy.block_private_destinations,
         browser_like_upstream: config.proxy.upstream.browser_like,
+        upstream_proxy: upstream_proxy_dto(&config.proxy.upstream.proxy),
         allowed_destinations: config.proxy.allowed_destinations.clone(),
         allowed_clients: config.proxy.allowed_clients.clone(),
         dns: DnsDto {
@@ -63,6 +65,101 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         },
         bind: None,
     }
+}
+
+fn kind_dto(k: common::config::UpstreamProxyKind) -> api_types::UpstreamProxyKind {
+    match k {
+        common::config::UpstreamProxyKind::Http => api_types::UpstreamProxyKind::Http,
+        common::config::UpstreamProxyKind::Socks5 => api_types::UpstreamProxyKind::Socks5,
+    }
+}
+
+/// The upstream proxy for the API: the password is reported as `set` / `unset`, never its value.
+fn upstream_proxy_dto(p: &common::config::UpstreamProxy) -> UpstreamProxyDto {
+    UpstreamProxyDto {
+        enabled: p.enabled,
+        kind: kind_dto(p.kind),
+        host: p.host.clone(),
+        port: p.port,
+        username: p.username.clone(),
+        password: if p.password.is_empty() {
+            "unset"
+        } else {
+            "set"
+        }
+        .into(),
+    }
+}
+
+/// `cur` with the fields `u` sets. The saved username and password are reused only while the
+/// type, host and port are the saved ones: sent to another address they would reach whoever
+/// runs it, so then they must be supplied again. An empty password keeps the saved one; an
+/// emptied username drops the password with it.
+fn merge_upstream_proxy(
+    cur: &common::config::UpstreamProxy,
+    u: &UpstreamProxyUpdate,
+) -> common::config::UpstreamProxy {
+    let mut n = cur.clone();
+    if let Some(v) = u.enabled {
+        n.enabled = v;
+    }
+    if let Some(k) = u.kind {
+        n.kind = match k {
+            api_types::UpstreamProxyKind::Http => common::config::UpstreamProxyKind::Http,
+            api_types::UpstreamProxyKind::Socks5 => common::config::UpstreamProxyKind::Socks5,
+        };
+    }
+    if let Some(h) = &u.host {
+        n.host = h.trim().to_string();
+    }
+    if let Some(p) = u.port {
+        n.port = p;
+    }
+    if n.kind != cur.kind || n.host != cur.host || n.port != cur.port {
+        n.username.clear();
+        n.password.clear();
+    }
+    if let Some(name) = &u.username {
+        n.username = name.trim().to_string();
+        if n.username.is_empty() {
+            n.password.clear();
+        }
+    }
+    if let Some(p) = u.password.as_ref().filter(|p| !p.is_empty()) {
+        n.password = p.clone();
+    }
+    n
+}
+
+/// Whether the upstream proxy points at one of Argus's own listeners (known from the settings
+/// alone; the running proxy also checks the machine's real addresses).
+fn upstream_proxy_is_own(config: &ProxyConfig) -> bool {
+    let p = &config.proxy.upstream.proxy;
+    if !p.enabled {
+        return false;
+    }
+    let host = p.bare_host();
+    let ports = [
+        Some(config.proxy.port),
+        config.proxy.transparent_port,
+        config.proxy.ext_port,
+        Some(config.webui.port),
+    ];
+    if !ports.contains(&Some(p.port)) {
+        return false;
+    }
+    let same_host = |other: &str| {
+        other
+            .trim()
+            .trim_matches(['[', ']'])
+            .eq_ignore_ascii_case(host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+        || same_host(&config.proxy.host)
+        || same_host(&config.webui.host)
 }
 
 fn flags_view(config: &ProxyConfig, transparent: bool) -> ListenerFlagsView {
@@ -217,6 +314,50 @@ fn audit_lists_source(
     }
 }
 
+/// Record a change of the upstream proxy as its own audit entry. Never the password.
+fn audit_upstream_proxy(
+    state: &AppState,
+    who: &str,
+    old: &common::config::UpstreamProxy,
+    new: &common::config::UpstreamProxy,
+) {
+    let show = |p: &common::config::UpstreamProxy| {
+        if p.enabled {
+            format!("{:?} {}:{}", p.kind, p.host, p.port)
+        } else {
+            "off".to_string()
+        }
+    };
+    let entry = api_types::AuditEntry {
+        id: String::new(),
+        at: chrono::Utc::now().to_rfc3339(),
+        actor_type: "user".into(),
+        actor_id: None,
+        actor_name: Some(who.to_string()),
+        method: "PUT".into(),
+        route: "/api/v1/config#proxy.upstream.proxy".into(),
+        scope: "config:write".into(),
+        target: Some(format!(
+            "{} -> {}; credentials {}",
+            show(old),
+            show(new),
+            if (&old.username, &old.password) == (&new.username, &new.password) {
+                "unchanged"
+            } else {
+                "changed"
+            }
+        )),
+        status: 200,
+        outcome: "success".into(),
+        ip: None,
+        user_agent: None,
+        request_id: None,
+    };
+    if let Err(e) = state.audit.append(entry) {
+        tracing::error!("Failed to write audit entry: {e}");
+    }
+}
+
 /// Apply a partial update: validate, move listeners and apply access lists live, persist the
 /// changes to the settings overlay and apply live settings. `applied` lists settings in effect
 /// now; `restart_required` those needing a restart.
@@ -322,6 +463,19 @@ async fn apply_update_locked(
         req.browser_like_upstream,
         can_proxy
     );
+    if let Some(u) = &req.upstream_proxy {
+        let next = merge_upstream_proxy(&config.proxy.upstream.proxy, u);
+        next.validate().map_err(ApiError::ValidationError)?;
+        let changed = next != config.proxy.upstream.proxy;
+        config.proxy.upstream.proxy = next;
+        if upstream_proxy_is_own(&config) {
+            return Err(ApiError::ValidationError(
+                "upstream proxy: that is one of Argus's own listeners; Argus never chains to itself"
+                    .into(),
+            ));
+        }
+        live("upstream_proxy", changed, can_proxy, &mut applied);
+    }
     field!(
         "allowed_destinations",
         config.proxy.allowed_destinations,
@@ -530,6 +684,14 @@ async fn apply_update_locked(
     }
 
     info!("Proxy configuration updated by {who}");
+    if old.proxy.upstream.proxy != config.proxy.upstream.proxy {
+        audit_upstream_proxy(
+            state,
+            who,
+            &old.proxy.upstream.proxy,
+            &config.proxy.upstream.proxy,
+        );
+    }
     apply_live(state, &config);
     let mut response = proxy_config_response(&config);
     let lists_changed = old.bypass != config.bypass;
@@ -670,6 +832,60 @@ pub async fn update_config(
     check_if_match(&headers, &current)?;
     let r = apply_update_locked(&state, req, &p.username).await?;
     Ok(([(ETAG, config_etag(&r.config))], Json(r)))
+}
+
+/// The HTTPS host the upstream proxy test connects to.
+const PROXY_TEST_HOST: &str = "www.cloudflare.com";
+
+/// Connect through an upstream proxy (the saved one with the given fields applied; nothing is
+/// saved) to a well-known HTTPS host. Argus resolves the host itself, as it does for any
+/// upstream connection.
+#[utoipa::path(
+    post, path = "/config/upstream-proxy/test", tag = "config",
+    security(("bearer_auth" = ["config:write"])),
+    request_body = UpstreamProxyUpdate,
+    responses((status = 200, description = "Outcome of the test", body = UpstreamProxyTestResult))
+)]
+pub async fn test_upstream_proxy(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    ApiJson(req): ApiJson<UpstreamProxyUpdate>,
+) -> ApiResult<Json<UpstreamProxyTestResult>> {
+    // At most one test at a time and a few a minute per caller: each one makes Argus connect
+    // out, so this is not a port scanner.
+    let _slot = state.upstream_tests.admit(&p)?;
+    let mut cfg = merge_upstream_proxy(&state.proxy_state.config.read().proxy.upstream.proxy, &req);
+    cfg.enabled = true;
+    cfg.validate().map_err(ApiError::ValidationError)?;
+    let fail = |e: String| {
+        Json(UpstreamProxyTestResult {
+            ok: false,
+            latency_ms: None,
+            error: Some(e),
+            target: PROXY_TEST_HOST.into(),
+        })
+    };
+    let Some(rt) = state.runtime.get() else {
+        return Ok(fail(
+            "Argus is not running its proxy, so there is nothing to test with".into(),
+        ));
+    };
+    Ok(
+        match rt.test_upstream_proxy(&cfg, PROXY_TEST_HOST, 443).await {
+            Ok(d) => Json(UpstreamProxyTestResult {
+                ok: true,
+                latency_ms: Some(d.as_millis() as u64),
+                error: None,
+                target: PROXY_TEST_HOST.into(),
+            }),
+            Err(e) => {
+                // The detail (refused, timed out, bad credentials...) stays in the log: the
+                // caller must not be able to map what the server can reach.
+                tracing::warn!("upstream proxy test failed: {e}");
+                fail("Could not connect through the proxy. See the server log for why.".into())
+            }
+        },
+    )
 }
 
 /// The built-in default of every setting, in the shape of `GET /config` (what "reset to

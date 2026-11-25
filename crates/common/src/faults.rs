@@ -22,14 +22,16 @@ pub enum Fault {
     UpstreamError,
     DnsFailure,
     PolicyRefusal,
+    UpstreamRetry,
 }
 
 impl Fault {
-    const ALL: [Fault; 4] = [
+    const ALL: [Fault; 5] = [
         Fault::UpstreamTimeout,
         Fault::UpstreamError,
         Fault::DnsFailure,
         Fault::PolicyRefusal,
+        Fault::UpstreamRetry,
     ];
     fn label(self) -> &'static str {
         match self {
@@ -37,6 +39,7 @@ impl Fault {
             Fault::UpstreamError => "upstream errors",
             Fault::DnsFailure => "DNS failures",
             Fault::PolicyRefusal => "destination refusals",
+            Fault::UpstreamRetry => "upstream retries",
         }
     }
 }
@@ -48,18 +51,19 @@ pub struct FaultSnapshot {
     pub upstream_errors: u64,
     pub dns_failures: u64,
     pub policy_refusals: u64,
+    pub upstream_retries: u64,
 }
 
 #[derive(Default)]
 struct Window {
     last_summary: Option<Instant>,
     per_host: HashMap<(Fault, String), u64>,
-    counts: [u64; 4],
+    counts: [u64; 5],
 }
 
 pub struct FaultTracker {
     interval: Duration,
-    totals: [AtomicU64; 4],
+    totals: [AtomicU64; 5],
     window: Mutex<Window>,
 }
 
@@ -118,6 +122,7 @@ impl FaultTracker {
             upstream_errors: t(Fault::UpstreamError),
             dns_failures: t(Fault::DnsFailure),
             policy_refusals: t(Fault::PolicyRefusal),
+            upstream_retries: t(Fault::UpstreamRetry),
         }
     }
 }

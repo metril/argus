@@ -390,6 +390,16 @@ impl NetPolicy {
         self.decide(ip, own)
     }
 
+    /// Check for the address of the configured upstream proxy. The administrator chose it, so
+    /// private and reserved ranges are fine, but Argus never chains to its own listener.
+    pub fn check_proxy_endpoint(&self, ip: IpAddr, port: u16) -> std::result::Result<(), Refusal> {
+        if self.is_own_port(port) && self.is_own_ip(ip) {
+            Err(Refusal::OwnListener)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Address-only check for DNS answers of a general destination (port not known to the
     /// resolver).
     pub fn check_ip(&self, ip: IpAddr) -> std::result::Result<(), Refusal> {
@@ -437,6 +447,35 @@ impl NetPolicy {
         let mut denied = None;
         for addr in self.lookup(bare, port).await.map_err(ResolveError::Io)? {
             match self.check(addr.ip(), port) {
+                Ok(()) => return Ok(addr),
+                Err(r) => {
+                    denied.get_or_insert(r);
+                }
+            }
+        }
+        Err(match denied {
+            Some(r) => ResolveError::Refused(r),
+            None => ResolveError::NoAddresses(bare.to_string()),
+        })
+    }
+}
+
+impl NetPolicy {
+    /// Resolve `host:port` for a control-plane fetch and return the one address to connect to,
+    /// judged as the control-plane resolver judges it (a host on the allowlist may be private).
+    pub async fn resolve_control(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<SocketAddr, ResolveError> {
+        let bare = unbracket(host);
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            self.check_ip(ip).map_err(ResolveError::Refused)?;
+            return Ok(SocketAddr::new(ip, port));
+        }
+        let mut denied = None;
+        for addr in self.lookup(bare, port).await.map_err(ResolveError::Io)? {
+            match self.check_resolved(bare, addr.ip()) {
                 Ok(()) => return Ok(addr),
                 Err(r) => {
                     denied.get_or_insert(r);
@@ -687,10 +726,26 @@ pub fn control_plane_redirects(policy: Arc<NetPolicy>) -> reqwest::redirect::Pol
 }
 
 /// A client builder wired to the control-plane policy: guarded DNS, bounded checked redirects,
-/// no environment proxy.
+/// no environment proxy. While the upstream proxy is on its requests go through it (see
+/// [`crate::control_bridge`]); the destination checks are the same either way.
 pub fn control_plane_client(policy: Arc<NetPolicy>) -> reqwest::ClientBuilder {
+    control_plane_client_with(policy, None)
+}
+
+/// [`control_plane_client`] with an explicit upstream dialer instead of the process-wide one.
+/// No connection is kept idle: whether a request goes through the upstream proxy is decided
+/// when a connection is opened, so a pooled one would skip a changed setting.
+pub fn control_plane_client_with(
+    policy: Arc<NetPolicy>,
+    dialer: Option<Arc<dyn crate::control_bridge::UpstreamDialer>>,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
+        .pool_max_idle_per_host(0)
+        .proxy(crate::control_bridge::proxy_rule_with(
+            policy.clone(),
+            dialer,
+        ))
         .dns_resolver(Arc::new(GuardedResolver::control_plane(policy.clone())))
         .redirect(control_plane_redirects(policy))
 }

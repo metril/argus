@@ -10,7 +10,7 @@ starts with a `// Modified by Argus: <why>` header, as Apache-2.0 section 4 requ
 
 | Crate | Upstream | Version | Local patches |
 |---|---|---|---|
-| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2 |
+| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2, 3, 4, 5, 6, 7 |
 | `wreq-util` | <https://github.com/0x676e67/wreq-util> | 3.0.0-rc.14 | none (vendored so the pair is updated together) |
 
 Only `src/`, `Cargo.toml`, `LICENSE` and `README.md` are kept; tests, examples and lockfiles
@@ -38,6 +38,33 @@ were dropped.
    effect on SOCKS or Unix-socket proxies. Files: `src/proxy.rs`, `src/proxy/matcher.rs`,
    `src/conn/connector.rs` (the connector's resolver field is no longer gated on the `socks`
    feature).
+
+3. **Per-scope TLS session cache key.** `Group::session(scope)` tags a request group with a
+   session scope. The session cache key (`ConnectionDescriptor::session_id`) is the pool key with
+   the request group replaced by that scope, so connections of different request groups but one
+   scope resume each other's TLS sessions and never another scope's. Without a scope the key is the
+   pool key as before. Files: `src/group.rs`, `src/conn/descriptor.rs`, `src/tls/conn.rs`.
+4. **Evict a request group's pooled connections.** `Client::evict_group(&Group)` drops the idle
+   pooled connections opened for requests of a group (matched by the group's name). Busy
+   connections finish their request and age out with the idle timeout. Files: `src/client.rs`,
+   `src/client/layer/client.rs`, `src/client/layer/client/pool.rs`, `src/group.rs`,
+   `src/conn/descriptor.rs`. `pool_max_size` now bounds the idle connections over all keys
+   (the oldest idle connection of the least recently used key is dropped first), not the keys.
+5. **At most one internal re-send of an unstarted request.** The pooled client re-sends a request
+   whose reused connection was closed before it started (the request is handed back unsent, so
+   even a streamed body is safe) at most once, and an error returned after that re-send answers
+   `Error::is_retried()`, so Argus does not stack its own retry on top. Files:
+   `src/client/layer/client.rs`, `src/error.rs`.
+6. **The internal re-send takes a fresh connection.** The re-send of patch 5 used to check out
+   another idle pooled connection, which may be just as stale. It now runs under a unique pool key
+   (`Group::fresh`, `ConnectionDescriptor::fresh`), so it dials; the TLS session cache key is
+   unchanged, so resumption still works. Files: `src/client/layer/client.rs`, `src/group.rs`,
+   `src/conn/descriptor.rs`.
+
+7. **SOCKS: resolve first, errors expose their cause.** The target is resolved (and vetted by
+   the client's resolver) before the proxy is dialled. `SocksError::source` returns the wrapped error, so a
+   destination-policy refusal raised by the client's DNS resolver (`DnsResolveFailure`) is still
+   found by walking the error chain. File: `src/conn/proxy/socks.rs`.
 
 ## Updating
 

@@ -4657,6 +4657,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "upstream_proxy": {
+            "$ref": "#/components/schemas/UpstreamProxyDto",
+            "description": "Another proxy Argus's own upstream traffic goes through."
+          },
           "webui_host": {
             "description": "Address the web API listens on.",
             "type": "string"
@@ -6318,6 +6322,17 @@
               "null"
             ]
           },
+          "upstream_proxy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpstreamProxyUpdate",
+                "description": "Upstream proxy settings; applied live (new connections go through the proxy at once)."
+              }
+            ]
+          },
           "webui_host": {
             "description": "Web API listen address; the listener is rebound live.",
             "type": [
@@ -6410,6 +6425,122 @@
               {
                 "$ref": "#/components/schemas/UserRole"
               }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpstreamProxyDto": {
+        "description": "The upstream proxy as read. The password is never returned: `password` is `\"set\"` or `\"unset\"`.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/UpstreamProxyKind"
+          },
+          "password": {
+            "description": "`\"set\"` or `\"unset\"`.",
+            "type": "string"
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "UpstreamProxyKind": {
+        "description": "Protocol spoken to the upstream proxy.",
+        "enum": [
+          "http",
+          "socks5"
+        ],
+        "type": "string"
+      },
+      "UpstreamProxyTestResult": {
+        "description": "Outcome of testing the upstream proxy.",
+        "properties": {
+          "error": {
+            "description": "Why it failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latency_ms": {
+            "description": "Time to connect through the proxy and finish a TLS handshake.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "target": {
+            "description": "The host the test connected to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "target"
+        ],
+        "type": "object"
+      },
+      "UpstreamProxyUpdate": {
+        "description": "Partial update of the upstream proxy; omitted fields keep their value. An empty or omitted\n`password` keeps the saved one; clearing `username` also clears the password.",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UpstreamProxyKind"
+              }
+            ]
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         },
@@ -10820,6 +10951,89 @@
           }
         ],
         "summary": "Reload the configuration from its file.",
+        "tags": [
+          "config"
+        ]
+      }
+    },
+    "/api/v1/config/upstream-proxy/test": {
+      "post": {
+        "operationId": "test_upstream_proxy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamProxyUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamProxyTestResult"
+                }
+              }
+            },
+            "description": "Outcome of the test"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Connect through an upstream proxy (the saved one with the given fields applied; nothing is\nsaved) to a well-known HTTPS host. Argus resolves the host itself, as it does for any\nupstream connection.",
         "tags": [
           "config"
         ]

@@ -1,3 +1,4 @@
+// Modified by Argus: `Group::session` / `Group::session_scope` (per-device TLS session cache, patch 3) and `Group::in_request_group` (pool eviction, patch 4) and `Group::fresh` (fresh connection for a re-send, patch 6).
 //! # Request Grouping Mechanism
 //!
 //! This module provides the [`Group`] structure, which defines the logical boundaries
@@ -40,6 +41,7 @@ macro_rules! impl_group_variants {
 }
 
 impl_group_variants! {
+    Session(GroupId),
     Request(Group),
     Emulate(Group),
     Named(GroupId),
@@ -47,6 +49,7 @@ impl_group_variants! {
     Version(Version),
     Proxy(Matcher),
     SocketBind(Option<SocketBindOptions>),
+    Fresh(u64),
 }
 
 /// A logical identifier for request grouping.
@@ -66,6 +69,50 @@ impl Group {
             GroupKey::Named,
             GroupVariant::Named(name.into()),
         )]))
+    }
+
+    /// Tags this group with a TLS session scope. Connections of different request groups that
+    /// carry the same scope share TLS session resumption (the session cache key drops the
+    /// request group and keeps the scope); connections never share sessions across scopes.
+    #[inline]
+    pub fn session<N: Into<GroupId>>(mut self, scope: N) -> Self {
+        self.0
+            .insert(GroupKey::Session, GroupVariant::Session(scope.into()));
+        self
+    }
+
+    /// The key of the TLS session cache entry for connections of this group: the group itself,
+    /// with its request group replaced by the request group's session scope when it has one.
+    pub(crate) fn session_scope(&self) -> Group {
+        let mut out = self.clone();
+        if let Some(GroupVariant::Request(inner)) = self.0.get(&GroupKey::Request) {
+            if let Some(scope) = inner.0.get(&GroupKey::Session) {
+                out.0.remove(&GroupKey::Request);
+                out.0.insert(GroupKey::Session, scope.clone());
+            }
+        }
+        out
+    }
+
+    /// Whether this (connection) group was made by a request in a group that carries the same
+    /// name as `target` (the session scope and other criteria of `target` are ignored).
+    pub(crate) fn in_request_group(&self, target: &Group) -> bool {
+        let Some(want) = target.0.get(&GroupKey::Named) else {
+            return false;
+        };
+        matches!(
+            self.0.get(&GroupKey::Request),
+            Some(GroupVariant::Request(inner)) if inner.0.get(&GroupKey::Named) == Some(want)
+        )
+    }
+
+    /// Makes this group unique, so a pool never has an idle connection under its key.
+    pub(crate) fn fresh(&mut self) -> &mut Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.extend(
+            GroupKey::Fresh,
+            GroupVariant::Fresh(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+        )
     }
 
     /// Groups the request by a specific target [`Uri`].

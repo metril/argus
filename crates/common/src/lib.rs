@@ -3,6 +3,7 @@
 pub mod bypass;
 pub mod certstore;
 pub mod config;
+pub mod control_bridge;
 pub mod db;
 pub mod env;
 pub mod error;

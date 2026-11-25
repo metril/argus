@@ -211,7 +211,7 @@ impl TlsConnector {
         let host = Self::normalize_host(host);
 
         if let Some(ref cache) = self.cache {
-            let key = Key(descriptor.id());
+            let key = Key(descriptor.session_id());
 
             // If the session cache is enabled, we try to retrieve the session
             // associated with the key. If it exists, we set it in the SSL configuration.

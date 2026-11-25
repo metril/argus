@@ -216,6 +216,8 @@ pub struct Upstream<'a> {
     pub policy: &'a crate::policy::DestPolicy,
     /// Code-only dial override (tests); IP-literal hosts are aimed at it explicitly.
     pub resolve_all_to: Option<std::net::IpAddr>,
+    /// The originating page's connection group (pool and TLS session scope).
+    pub scope: Option<crate::upstream::UpstreamScope>,
 }
 
 /// Where a request to `/__adblock__/gm|us/…` came from.
@@ -1659,6 +1661,9 @@ async fn run_outbound(
             }
         }
         let mut rb = client.request(method, dial);
+        if let Some(s) = &up.scope {
+            rb = rb.scope(s.clone());
+        }
         if let Some(h) = host_hdr {
             rb = rb.header("host", h);
         }
