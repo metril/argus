@@ -127,14 +127,34 @@ fn with_argus_json(zip: &[u8], origin: &str) -> Result<Vec<u8>, String> {
     Ok(out.finish().map_err(|e| e.to_string())?.into_inner())
 }
 
-/// This server's origin as the client reached it (`scheme://host`), from the `Host` header.
-fn request_origin(headers: &HeaderMap, https: bool) -> Option<String> {
-    let host = headers.get(header::HOST)?.to_str().ok()?;
-    let ok = !host.is_empty()
-        && host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
-    ok.then(|| format!("{}://{host}", if https { "https" } else { "http" }))
+/// A `Host`-style value: letters, digits and `. - : [ ]` only.
+fn sane_host(h: &str) -> Option<&str> {
+    let h = h.trim();
+    (!h.is_empty()
+        && h.len() <= 255
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')))
+    .then_some(h)
+}
+
+/// This server's origin as the client reached it (`scheme://host`). Behind a trusted proxy the
+/// host is its `X-Forwarded-Host` (first entry), matching how the scheme is decided.
+fn request_origin(
+    headers: &HeaderMap,
+    https: bool,
+    peer: Option<std::net::IpAddr>,
+    trusted: &[std::net::IpAddr],
+) -> Option<String> {
+    let forwarded = peer
+        .filter(|p| trusted.contains(p))
+        .and_then(|_| headers.get("x-forwarded-host"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| sane_host(v.split(',').next().unwrap_or("")));
+    let host = match forwarded {
+        Some(h) => h,
+        None => sane_host(headers.get(header::HOST)?.to_str().ok()?)?,
+    };
+    Some(format!("{}://{host}", if https { "https" } else { "http" }))
 }
 
 /// Download the browser extension build matching this Argus version.
@@ -151,6 +171,7 @@ fn request_origin(headers: &HeaderMap, https: bool) -> Option<String> {
 pub async fn download_extension(
     State(state): State<Arc<AppState>>,
     axum::Extension(info): axum::Extension<ClientInfo>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     ApiPath(browser): ApiPath<String>,
 ) -> ApiResult<Response> {
@@ -170,7 +191,12 @@ pub async fn download_extension(
     )
     .await?;
     // Zips (the Chrome build) carry this server's address so the extension needs no URL typed.
-    let bytes = match request_origin(&headers, info.https) {
+    let bytes = match request_origin(
+        &headers,
+        info.https,
+        peer.map(|p| p.0 .0.ip()),
+        &state.api_config.network.trusted_proxies,
+    ) {
         Some(origin) if name.ends_with(".zip") => match with_argus_json(&bytes, &origin) {
             Ok(b) => b,
             Err(e) => {
@@ -225,20 +251,32 @@ mod tests {
     }
 
     #[test]
-    fn origin_comes_from_a_sane_host_header() {
+    fn origin_trusts_forwarded_host_only_from_a_trusted_proxy() {
+        let proxy: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        let other: std::net::IpAddr = "10.0.0.9".parse().unwrap();
         let mut h = HeaderMap::new();
-        h.insert(header::HOST, "argus.lan:8080".parse().unwrap());
+        h.insert(header::HOST, "argus:8080".parse().unwrap());
         assert_eq!(
-            request_origin(&h, false).as_deref(),
-            Some("http://argus.lan:8080")
+            request_origin(&h, false, Some(other), &[proxy]).as_deref(),
+            Some("http://argus:8080")
+        );
+        h.insert("x-forwarded-host", "argus.lan, inner".parse().unwrap());
+        assert_eq!(
+            request_origin(&h, true, Some(other), &[proxy]).as_deref(),
+            Some("https://argus:8080")
         );
         assert_eq!(
-            request_origin(&h, true).as_deref(),
-            Some("https://argus.lan:8080")
+            request_origin(&h, true, Some(proxy), &[proxy]).as_deref(),
+            Some("https://argus.lan")
+        );
+        h.insert("x-forwarded-host", "a/b".parse().unwrap());
+        assert_eq!(
+            request_origin(&h, true, Some(proxy), &[proxy]).as_deref(),
+            Some("https://argus:8080")
         );
         h.insert(header::HOST, "a/b".parse().unwrap());
-        assert!(request_origin(&h, false).is_none());
-        assert!(request_origin(&HeaderMap::new(), false).is_none());
+        assert!(request_origin(&h, false, None, &[]).is_none());
+        assert!(request_origin(&HeaderMap::new(), false, None, &[]).is_none());
     }
 
     /// 1.2.3: zips only. 1.2.4: xpi and zip. 1.2.5: HTTP 500. 1.2.6: oversized zip.

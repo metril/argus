@@ -343,18 +343,7 @@ pub async fn extension_token(
     let (st, uid, uname) = (state.clone(), user.id, user.username.clone());
     let replace = req.replace_token_id.clone();
     let (info, secret, replaced) = blocking(move || {
-        let replaced = match replace {
-            Some(id)
-                if st
-                    .tokens
-                    .get(&id)
-                    .is_some_and(|t| t.stored.created_by == uid) =>
-            {
-                st.tokens.revoke(&id)?;
-                Some(id)
-            }
-            _ => None,
-        };
+        // Create first, so a failure never leaves the user without a token.
         let (info, secret) = st.tokens.create(
             format!("Extension · {browser}"),
             EXTENSION_SCOPES.to_vec(),
@@ -363,6 +352,24 @@ pub async fn extension_token(
             uname,
             None,
         )?;
+        // Only the caller's own extension tokens may be replaced.
+        let mut want = EXTENSION_SCOPES.to_vec();
+        want.sort();
+        let replaced = match replace {
+            Some(id)
+                if st.tokens.get(&id).is_some_and(|t| {
+                    let mut have = t.stored.scopes.clone();
+                    have.sort();
+                    t.stored.created_by == uid
+                        && t.stored.name.starts_with("Extension · ")
+                        && have == want
+                }) =>
+            {
+                st.tokens.revoke(&id)?;
+                Some(id)
+            }
+            _ => None,
+        };
         Ok((info, secret, replaced))
     })
     .await?;

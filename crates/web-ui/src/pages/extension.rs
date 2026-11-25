@@ -46,6 +46,20 @@ fn can_use_extension(user: &Option<api_types::UserInfo>) -> bool {
     })
 }
 
+/// Every token of this user, following the paging cursor.
+async fn all_tokens() -> Result<Vec<ApiTokenInfo>, crate::api::ApiError> {
+    let client = ApiClient::new();
+    let (mut out, mut cursor) = (Vec::new(), None::<String>);
+    loop {
+        let page = client.list_tokens(cursor.as_deref()).await?;
+        out.extend(page.items);
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => return Ok(out),
+        }
+    }
+}
+
 /// Fetch an extension build (cookie session, with a refresh on `401`) and hand it to the
 /// browser as a file. A 404 means no release asset is published for this version.
 async fn download_extension(browser: &'static str) -> Result<(), String> {
@@ -101,8 +115,8 @@ pub fn ExtensionPage() -> impl IntoView {
     Effect::new(move |_| {
         reload.track();
         wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(p) = ApiClient::new().list_tokens(None).await {
-                signed_in.set(extension_tokens(p.items));
+            if let Ok(all) = all_tokens().await {
+                signed_in.set(extension_tokens(all));
             }
         });
     });
@@ -242,8 +256,8 @@ pub fn ExtensionBanner() -> impl IntoView {
         RwSignal::new(gloo_storage::LocalStorage::get::<bool>(BANNER_KEY).unwrap_or(false));
     let connected = RwSignal::new(true); // assume yes until the token list says otherwise
     wasm_bindgen_futures::spawn_local(async move {
-        if let Ok(p) = ApiClient::new().list_tokens(None).await {
-            connected.set(extension_connected(&p.items));
+        if let Ok(all) = all_tokens().await {
+            connected.set(extension_connected(&all));
         }
     });
     let show = move || !dismissed.get() && !connected.get() && can_use_extension(&user.get());
