@@ -206,6 +206,9 @@ pub struct NetPolicy {
     /// Host names whose private (but never reserved) resolved addresses are accepted.
     allowed_hosts: Vec<String>,
     own: RwLock<Own>,
+    /// The web UI endpoint `(port, bound address)`. Not an own listener: the proxy routes
+    /// requests to it straight to that listener (see [`Self::web_ui_addr`]).
+    web_ui: RwLock<Option<(u16, Option<IpAddr>)>>,
 }
 
 impl fmt::Debug for NetPolicy {
@@ -256,6 +259,7 @@ impl NetPolicy {
             rules: RwLock::new((block_private, parse_nets(allowed_destinations)?)),
             allowed_hosts: Vec::new(),
             own: RwLock::default(),
+            web_ui: RwLock::default(),
             resolver: None,
         })
     }
@@ -285,6 +289,43 @@ impl NetPolicy {
             .map(|a| canonical(*a))
             .filter(|a| !a.is_unspecified())
             .collect();
+    }
+
+    /// Record where the web UI listens (`None` bound address: any, reached on loopback).
+    pub fn set_web_ui(&self, endpoint: Option<(u16, Option<IpAddr>)>) {
+        *self.web_ui.write() = endpoint.map(|(p, ip)| (p, ip.map(canonical)));
+    }
+
+    /// If `host:port` names the web UI endpoint (an address of this host on the web UI port),
+    /// the loopback (or bound) address to dial instead. Names are resolved here, so DNS decides
+    /// as it would for any destination. `None` for everything else, including proxy ports.
+    pub async fn web_ui_addr(
+        &self,
+        host: &str,
+        port: u16,
+        override_ip: Option<IpAddr>,
+    ) -> Option<SocketAddr> {
+        let (wp, bound) = (*self.web_ui.read())?;
+        if wp != port {
+            return None;
+        }
+        let bound = bound.filter(|ip| !ip.is_unspecified());
+        let is_web_ui = |ip: IpAddr| match bound {
+            Some(b) => canonical(ip) == b,
+            None => self.is_own_ip(ip),
+        };
+        let bare = unbracket(host);
+        let hit = match bare.parse::<IpAddr>() {
+            Ok(ip) => is_web_ui(ip),
+            Err(_) if override_ip.is_some() => false,
+            Err(_) => self
+                .lookup(bare, port)
+                .await
+                .ok()?
+                .iter()
+                .any(|a| is_web_ui(a.ip())),
+        };
+        hit.then(|| SocketAddr::new(bound.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), port))
     }
 
     /// Whether `port` is one of the proxy's own listening ports.
@@ -771,6 +812,32 @@ mod tests {
         assert_eq!(p.check(ip("10.0.0.8"), 8080), Ok(()));
         assert_eq!(p.check_ip_strict(ip("10.0.0.7")), Err(Refusal::OwnListener));
         assert_eq!(p.check_ip(ip("10.0.0.7")), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn web_ui_port_is_self_but_proxy_ports_stay_refused() {
+        let p = NetPolicy::new(false, &[]).unwrap();
+        p.set_own_listeners(&[8080], &[]);
+        p.set_web_ui(Some((3000, None)));
+        let lo: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        assert_eq!(p.web_ui_addr("127.0.0.1", 3000, None).await, Some(lo));
+        assert_eq!(p.web_ui_addr("localhost", 3000, None).await, Some(lo));
+        assert_eq!(p.web_ui_addr("[::1]", 3000, None).await, Some(lo));
+        // Other ports and other hosts are not the web UI.
+        assert_eq!(p.web_ui_addr("127.0.0.1", 8080, None).await, None);
+        assert_eq!(p.web_ui_addr("93.184.216.34", 3000, None).await, None);
+        // A proxy port is still refused, the web UI port is no longer an own listener.
+        assert_eq!(p.check(ip("127.0.0.1"), 8080), Err(Refusal::OwnListener));
+        assert_eq!(p.check(ip("127.0.0.1"), 3000), Err(Refusal::Reserved));
+        // Bound to one address: only that address is the web UI.
+        p.set_web_ui(Some((3000, Some(ip("10.0.0.7")))));
+        assert_eq!(
+            p.web_ui_addr("10.0.0.7", 3000, None).await,
+            Some("10.0.0.7:3000".parse().unwrap())
+        );
+        assert_eq!(p.web_ui_addr("127.0.0.1", 3000, None).await, None);
+        p.set_web_ui(None);
+        assert_eq!(p.web_ui_addr("127.0.0.1", 3000, None).await, None);
     }
 
     #[tokio::test]

@@ -110,6 +110,8 @@ pub enum Entry<IO> {
     PlainTo(IO, String, u16),
     /// Plain proxy-style HTTP; the stream replays the bytes already read.
     PlainHttp(IO),
+    /// A CONNECT to the web UI endpoint, already dialled: tunnelled opaquely, never logged.
+    WebUi(IO, TcpStream),
 }
 
 pub struct ConnectionHandler {
@@ -310,6 +312,12 @@ impl ConnectionHandler {
         match self.resolve_entry(stream).await? {
             Entry::Target(target, io) => self.intercept_and_serve(io, target).await,
             Entry::PlainHttp(io) => self.serve_http(io, plain_origin()).await,
+            Entry::WebUi(io, mut server) => {
+                let mut client = IdleIo::new(io, self.shared.timeouts.load().tunnel_idle);
+                let _ = server.set_nodelay(true);
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                Ok(())
+            }
             Entry::PlainTo(io, host, port) => {
                 self.serve_http(
                     io,
@@ -413,6 +421,26 @@ impl ConnectionHandler {
         // connections only need the literal check here (every request is checked again when it
         // is forwarded); opaque tunnels resolve now. The dial itself re-resolves and re-checks.
         let ctx = &self.shared.ctx;
+        // The web UI endpoint is "self": tunnelled opaquely to its listener, no policy refusal,
+        // no interception, no log entry.
+        if let Some(addr) = ctx
+            .policy()
+            .web_ui_addr(&host, port, ctx.resolve_all_to())
+            .await
+        {
+            let dialled = tokio::time::timeout(limit, TcpStream::connect(addr)).await;
+            let Ok(Ok(server)) = dialled else {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                return Err(Error::Connection(format!("web UI {addr} unreachable")));
+            };
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
+            return Ok(Entry::WebUi(Prefixed::new(leftover, stream), server));
+        }
         let refused = if intercept_tls {
             ctx.policy().check_literal(&host, port).is_err()
         } else {
@@ -955,6 +983,27 @@ async fn handle_request(
                     .status(StatusCode::MISDIRECTED_REQUEST)
                     .body(full_body(Bytes::from_static(b"Misdirected Request")))
                     .expect("static response"));
+            }
+        }
+    }
+
+    // Plain HTTP (or a WebSocket upgrade) to the web UI endpoint is routed straight to it.
+    if origin.scheme == "http" && !origin.strict_host {
+        let named = authority::of_request(req.uri(), req.headers());
+        let (host, port) = match (named, &origin.authority) {
+            (Some((h, p)), fb) => (h, p.or(fb.as_ref().map(|(_, p)| *p)).unwrap_or(80)),
+            (None, Some((h, p))) => (h.clone(), *p),
+            (None, None) => (String::new(), 80),
+        };
+        if !host.is_empty() {
+            let ctx = &shared.ctx;
+            if let Some(addr) = ctx
+                .policy()
+                .web_ui_addr(&host, port, ctx.resolve_all_to())
+                .await
+            {
+                let dial = shared.timeouts.load().handshake;
+                return crate::self_route::forward(addr, req, dial).await;
             }
         }
     }

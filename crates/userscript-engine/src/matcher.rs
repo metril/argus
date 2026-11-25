@@ -17,6 +17,8 @@
 use crate::metadata::UserscriptMetadata;
 use regex::{Regex, RegexBuilder};
 
+const BACKTRACK_LIMIT: usize = 1_000_000;
+
 /// Compile options.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -341,12 +343,16 @@ enum IncKind {
         path: Glob,
     },
     Regex(Regex),
+    /// Needs look-around, backreferences or atomic groups.
+    Fancy(fancy_regex::Regex),
 }
 
 #[derive(Debug, Clone)]
 pub struct IncludeRule {
     kind: IncKind,
     key: HostKey,
+    /// An `@exclude`: a regex match error counts as a match (fail safe, the script is held back).
+    exclude: bool,
 }
 
 /// The literal host of a regex anchored like `^https?:\/\/host\.tld\/...`, so the rule can be
@@ -378,6 +384,98 @@ fn regex_host(body: &str) -> Option<String> {
         .then_some(host)
 }
 
+/// Rewrite a JavaScript regex body (no `u` flag) into syntax Rust's engines accept.
+pub(crate) fn js_to_rust(body: &str) -> String {
+    let c: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 8);
+    let (mut i, mut class) = (0, false);
+    while i < c.len() {
+        let ch = c[i];
+        i += 1;
+        match ch {
+            '\\' if i < c.len() => {
+                let e = c[i];
+                i += 1;
+                match e {
+                    'd' => out.push_str(if class { "0-9" } else { "[0-9]" }),
+                    'w' => out.push_str(if class { "0-9A-Za-z_" } else { "[0-9A-Za-z_]" }),
+                    'D' if !class => out.push_str("[^0-9]"),
+                    'W' if !class => out.push_str("[^0-9A-Za-z_]"),
+                    'b' if class => out.push_str("\\x08"),
+                    'b' => out.push_str("(?-u:\\b)"),
+                    'B' => out.push_str("(?-u:\\B)"),
+                    'c' if c.get(i).is_some_and(char::is_ascii_alphabetic) => {
+                        out.push_str(&format!("\\x{:02x}", c[i] as u32 & 31));
+                        i += 1;
+                    }
+                    'u' if i + 4 <= c.len() && c[i..i + 4].iter().all(char::is_ascii_hexdigit) => {
+                        out.push_str("\\x{");
+                        out.extend(&c[i..i + 4]);
+                        out.push('}');
+                        i += 4;
+                    }
+                    // Identity escapes of letters with no JS meaning (Rust gives some of them one).
+                    e if e.is_ascii_alphabetic() && !"dDwWsSbBfnrtv0cxukpPDK".contains(e) => {
+                        out.push(e)
+                    }
+                    e => {
+                        out.push('\\');
+                        out.push(e);
+                    }
+                }
+            }
+            '[' if class => out.push_str("\\["),
+            '&' | '~' if class => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '[' => {
+                if c.get(i) == Some(&']') {
+                    out.push_str("[^\\s\\S]");
+                    i += 1;
+                } else if c.get(i) == Some(&'^') && c.get(i + 1) == Some(&']') {
+                    out.push_str("[\\s\\S]");
+                    i += 2;
+                } else {
+                    class = true;
+                    out.push('[');
+                    if c.get(i) == Some(&'^') {
+                        out.push('^');
+                        i += 1;
+                    }
+                }
+            }
+            ']' if class => {
+                class = false;
+                out.push(']');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Compile `/body/flags`: Rust's `regex` first, `fancy-regex` for look-around and backreferences.
+fn compile_js_regex(body: &str, flags: &str) -> Result<IncKind, String> {
+    let inline: String = ['i', 'm', 's']
+        .into_iter()
+        .filter(|f| flags.contains(*f))
+        .collect();
+    let mut pat = js_to_rust(body);
+    if !inline.is_empty() {
+        pat = format!("(?{inline}){pat}");
+    }
+    match RegexBuilder::new(&pat).size_limit(1 << 20).build() {
+        Ok(re) => Ok(IncKind::Regex(re)),
+        Err(first) => fancy_regex::RegexBuilder::new(&pat)
+            .backtrack_limit(BACKTRACK_LIMIT)
+            .delegate_size_limit(1 << 20)
+            .build()
+            .map(IncKind::Fancy)
+            .map_err(|_| format!("bad regex: {first}")),
+    }
+}
+
 impl IncludeRule {
     pub fn parse(p: &str) -> Result<Self, String> {
         let p = p.trim();
@@ -385,29 +483,14 @@ impl IncludeRule {
             return Ok(Self {
                 kind: IncKind::All,
                 key: HostKey::Any,
+                exclude: false,
             });
         }
         if p.len() >= 2 && p.starts_with('/') {
             if let Some(close) = p.rfind('/').filter(|&i| i > 0) {
                 let (body, flags) = (&p[1..close], &p[close + 1..]);
                 if flags.bytes().all(|c| c.is_ascii_alphabetic()) {
-                    let mut b = RegexBuilder::new(body);
-                    b.size_limit(1 << 20);
-                    for f in flags.chars() {
-                        match f {
-                            'i' => {
-                                b.case_insensitive(true);
-                            }
-                            'm' => {
-                                b.multi_line(true);
-                            }
-                            's' => {
-                                b.dot_matches_new_line(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    let re = b.build().map_err(|e| format!("bad regex: {e}"))?;
+                    let re = compile_js_regex(body, flags)?;
                     let key = if flags.contains('i') || flags.contains('m') {
                         // Case-folding / multiline change what the anchors mean: stay safe.
                         HostKey::Any
@@ -415,8 +498,9 @@ impl IncludeRule {
                         regex_host(body).map_or(HostKey::Any, HostKey::Exact)
                     };
                     return Ok(Self {
-                        kind: IncKind::Regex(re),
+                        kind: re,
                         key,
+                        exclude: false,
                     });
                 }
             }
@@ -440,6 +524,7 @@ impl IncludeRule {
                         path: Glob::new(path, true),
                     },
                     key: HostKey::Any,
+                    exclude: false,
                 });
             }
             let key = if host_l.is_empty() || host_l.contains('*') {
@@ -453,12 +538,19 @@ impl IncludeRule {
             return Ok(Self {
                 kind: IncKind::Glob(Glob::new(p, true)),
                 key,
+                exclude: false,
             });
         }
         Ok(Self {
             kind: IncKind::Glob(Glob::new(p, true)),
             key: HostKey::Any,
+            exclude: false,
         })
+    }
+
+    fn into_exclude(mut self) -> Self {
+        self.exclude = true;
+        self
     }
 
     pub fn is_match(&self, u: &UrlParts<'_>) -> bool {
@@ -466,6 +558,7 @@ impl IncludeRule {
             IncKind::All => true,
             IncKind::Glob(g) => g.is_match(u.full),
             IncKind::Regex(r) => r.is_match(u.full),
+            IncKind::Fancy(r) => r.is_match(u.full).unwrap_or(self.exclude),
             IncKind::TldGlob { scheme, stem, path } => {
                 scheme.is_match(u.scheme) && tld_match(stem, u.host) && path.is_match(u.path_query)
             }
@@ -525,7 +618,7 @@ impl Rules {
         }
         for m in &meta.excludes {
             match IncludeRule::parse(m) {
-                Ok(p) => excludes.push(Matcher::Include(p)),
+                Ok(p) => excludes.push(Matcher::Include(p.into_exclude())),
                 Err(e) => errs.push(format!("@exclude {m}: {e}")),
             }
         }
@@ -547,8 +640,7 @@ impl Rules {
         )
     }
 
-    /// `@exclude` / `@exclude-match` patterns that cannot be compiled (for example regexes with
-    /// look-around). Such a rule is skipped, so the script also runs where the author excluded it.
+    /// `@exclude` / `@exclude-match` patterns that cannot be compiled (true syntax errors). Such a rule is skipped, so the script also runs where the author excluded it.
     pub fn dropped_excludes(meta: &UserscriptMetadata) -> Vec<String> {
         let mut v: Vec<String> = meta
             .excludes
@@ -752,7 +844,7 @@ mod tests {
         ));
         assert!(inc(r"/FOO\.com/i", "https://foo.com/"));
         assert!(!inc(r"/FOO\.com/", "https://foo.com/"));
-        assert!(IncludeRule::parse("/(?<=a)b/").is_err()); // look-behind unsupported
+        assert!(IncludeRule::parse("/(?<=a)b/").is_ok()); // look-behind via fancy-regex
     }
 
     #[test]
@@ -832,5 +924,59 @@ mod tests {
         let u = UrlParts::parse("http://h").unwrap();
         assert_eq!(u.path_query, "/");
         assert!(UrlParts::parse("nonsense").is_none());
+    }
+
+    #[test]
+    fn bypass_all_shortlinks_excludes_compile_and_match() {
+        let src = include_str!("../tests/fixtures/bypass_all_shortlinks.meta.js");
+        let r = rules(src);
+        assert!(r.is_match_url("https://example.org/page"));
+        assert!(!r.is_match_url("https://www.google.com/search?q=x"));
+        assert!(!r.is_match_url("https://google.com/search"));
+        assert!(r.is_match_url("https://www.google.com/recaptcha/api2/anchor"));
+        assert!(!r.is_match_url("https://www.facebook.com/home"));
+        assert!(r.is_match_url("https://www.facebook.com/flx/warn/?u=x"));
+        assert!(!r.is_match_url("https://www.instagram.com/p/x"));
+    }
+
+    #[test]
+    fn lookbehind_and_backreference() {
+        assert!(inc(r"/(?<=a\.)b\.com/", "https://a.b.com/"));
+        assert!(!inc(r"/(?<=a\.)b\.com/", "https://x.b.com/"));
+        assert!(inc(r"/^https:\/\/(\w+)\.\1\.com\//", "https://ab.ab.com/"));
+        assert!(!inc(r"/^https:\/\/(\w+)\.\1\.com\//", "https://ab.cd.com/"));
+    }
+
+    #[test]
+    fn js_translation() {
+        let t = |body: &str, hay: &str| inc(&format!("/{body}/"), hay);
+        assert!(t(r"^https://x/[^]+$", "https://x/a\nb"));
+        assert!(!t(r"a[]b", "https://ab/"));
+        assert!(t(r"\d+$", "https://a/123"));
+        assert!(!t(r"^https://a/\d$", "https://a/\u{663}"));
+        assert!(!t(r"^https://a/\w$", "https://a/\u{e9}"));
+        assert!(t(r"\bfoo\b", "https://a/foo"));
+        assert!(t(r"a\cJb", "https://a\nb/"));
+        assert!(t(r"a\ab", "https://aab/"));
+        assert!(t(r"x\e", "https://xe/"));
+        assert!(t(r"https:\/\/a", "https://a/"));
+        assert!(t(r"[\d\w]+$", "https://a/a1"));
+        assert!(t(r"[[]", "https://a/[x"));
+        assert!(IncludeRule::parse("/a/gimsuyd").is_ok());
+        assert!(IncludeRule::parse("/(/").is_err());
+    }
+
+    #[test]
+    fn backtracking_blowup_fails_safe() {
+        let pat = r"/^http:\/\/h\/(a+)+\1b/";
+        let url = format!("http://h/{}c", "a".repeat(40));
+        let inc_r = rules(&format!(
+            "// ==UserScript==\n// @include {pat}\n// ==/UserScript=="
+        ));
+        assert!(!inc_r.is_match_url(&url));
+        let exc = rules(&format!(
+            "// ==UserScript==\n// @match http://h/*\n// @exclude {pat}\n// ==/UserScript=="
+        ));
+        assert!(!exc.is_match_url(&url));
     }
 }

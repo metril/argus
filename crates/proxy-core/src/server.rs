@@ -471,10 +471,8 @@ impl ProxyControl {
             ports.push(l.addr.port());
             addrs.push(l.addr.ip());
         }
-        if let Some((port, ip)) = *self.webui_own.lock() {
-            ports.push(port);
-            addrs.extend(ip);
-        }
+        // The web UI endpoint is not an own listener: requests to it are routed to it directly.
+        self.ctx.policy().set_web_ui(*self.webui_own.lock());
         ports.sort_unstable();
         ports.dedup();
         *self.entry_ports.write() = std::iter::once(explicit)

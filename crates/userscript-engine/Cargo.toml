@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 # Utilities
 url = { workspace = true }
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }

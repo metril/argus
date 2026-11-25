@@ -146,7 +146,7 @@ impl Review {
                     "No integrity hash for {unhashed} external file{}",
                     if unhashed == 1 { "" } else { "s" }
                 ),
-                detail: "The files are fetched once at install time; nothing proves they match what the author published.".into(),
+                detail: "Argus can't verify these are the files the author published. They run with this script's full access.".into(),
                 error: true,
             });
         }
