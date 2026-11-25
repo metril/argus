@@ -835,6 +835,8 @@ fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
         .pool_max_idle_per_host(opts.pool_max_idle_per_host.unwrap_or(32))
         .pool_idle_timeout(Duration::from_secs(60))
         .tls_custom_verify(verify)
+        // Sessions kept per host for resumption (the default keeps 8).
+        .tls_session_cache(Arc::new(wreq::tls::session::LruTlsSessionCache::new(256)))
         .dns_resolver(Arc::new(resolver_of(opts, strict)));
     if let Some(t) = opts.connect_timeout {
         b = b.connect_timeout(t);
@@ -1044,17 +1046,33 @@ pub fn classify_reqwest(e: &reqwest::Error) -> filter_engine::ErrorKind {
     }
 }
 
-/// Error kind of a failed browser-like upstream request (see [`classify_reqwest`]).
+/// Error kind of a failed browser-like upstream request (see [`classify_reqwest`]). Decided from
+/// the typed source chain only, never from the top error's text: that carries the request URI,
+/// which can contain any word.
 pub fn classify_wreq(e: &wreq::Error) -> filter_engine::ErrorKind {
     use filter_engine::ErrorKind as K;
+    use std::error::Error as _;
     if e.is_timeout() {
         return K::UpstreamTimeout;
     }
-    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = e.source();
     let mut io_kind = None;
     while let Some(err) = cur {
-        if err.is::<rustls::Error>() {
+        if err.is::<rustls::Error>() || err.is::<btls::error::ErrorStack>() {
             return K::UpstreamTls;
+        }
+        if let Some(ssl) = err.downcast_ref::<btls::ssl::Error>() {
+            // A BoringSSL protocol failure with no I/O cause is the handshake being refused
+            // (our verify hook, or the server's alert); SYSCALL is the transport going away.
+            if let Some(io) = ssl.io_error() {
+                io_kind = io_kind.or(Some(classify_io(io)));
+            } else if ssl.code() == btls::ssl::ErrorCode::SSL {
+                return K::UpstreamTls;
+            } else if ssl.code() == btls::ssl::ErrorCode::SYSCALL
+                || ssl.code() == btls::ssl::ErrorCode::ZERO_RETURN
+            {
+                io_kind = io_kind.or(Some(K::UpstreamReset));
+            }
         }
         if let Some(io) = err.downcast_ref::<std::io::Error>() {
             match classify_io(io) {
@@ -1065,25 +1083,25 @@ pub fn classify_wreq(e: &wreq::Error) -> filter_engine::ErrorKind {
         }
         cur = err.source();
     }
-    // BoringSSL reports a certificate our hook rejected as a failed TLS handshake.
-    let text = format!("{e:?}").to_ascii_lowercase();
-    if text.contains("certificate")
-        || text.contains("handshake")
-        || text.contains("ssl")
-        || text.contains("alert")
-    {
-        K::UpstreamTls
-    } else if let Some(k) = io_kind {
-        k
-    } else if e.is_connection_reset()
-        || text.contains("incompletemessage")
-        || text.contains("connection closed")
-        || text.contains("connection reset")
-    {
-        K::UpstreamReset
-    } else {
-        K::Other
+    if let Some(k) = io_kind {
+        return k;
     }
+    if e.is_connection_reset() {
+        return K::UpstreamReset;
+    }
+    // Message text of the sources only (not the URI-bearing top error).
+    let mut cur = e.source();
+    while let Some(err) = cur {
+        let t = err.to_string().to_ascii_lowercase();
+        if t.contains("incomplete message")
+            || t.contains("connection closed")
+            || t.contains("connection reset")
+        {
+            return K::UpstreamReset;
+        }
+        cur = err.source();
+    }
+    K::Other
 }
 
 #[cfg(test)]

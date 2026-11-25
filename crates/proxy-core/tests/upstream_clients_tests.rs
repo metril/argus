@@ -364,13 +364,15 @@ async fn an_unreachable_origin_is_not_a_tls_error() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         drop(l);
-        let e = r
-            .client
-            .get(format!("https://good.test:{port}/"))
-            .send()
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::UpstreamReset, "bl={bl}: {e:?}");
+        // Words the old text heuristic matched must not matter in the host or the path.
+        for url in [
+            format!("https://good.test:{port}/"),
+            format!("https://ssl.good.test:{port}/"),
+            format!("https://good.test:{port}/alerts/certificate/handshake"),
+        ] {
+            let e = r.client.get(&url).send().await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::UpstreamReset, "bl={bl} {url}: {e:?}");
+        }
     }
 }
 
@@ -496,4 +498,105 @@ async fn chrome_ja4_fingerprint_is_presented_to_a_real_server() {
     println!("ja4 = {ja4}");
     let head = ja4.split('_').next().unwrap();
     assert!(head.starts_with("t13d15") && head.ends_with("h2"), "{ja4}");
+}
+
+/// One kind of failure per client, for the parity table.
+async fn failure_kinds(bl: bool) -> Vec<(&'static str, ErrorKind, bool)> {
+    let mut out = Vec::new();
+    let mk = |read: Option<Duration>, resolve: bool| {
+        let trusted = ca("trusted");
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_pem(&dir, "ca.pem", &trusted.pem);
+        let roots = RootsHandle::floor(&[path]).unwrap();
+        let client = build_upstream_client(&UpstreamOptions {
+            roots: Some(roots),
+            resolve_all_to: resolve.then_some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            pool_max_idle_per_host: Some(0),
+            connect_timeout: Some(Duration::from_secs(5)),
+            read_timeout: read,
+            browser_like: bl,
+            ..Default::default()
+        })
+        .unwrap();
+        (client, trusted, dir)
+    };
+    let mut record = |what, e: proxy_core::upstream::UpstreamError| {
+        out.push((what, e.kind(), proxy_core::policy::is_refusal(&e)));
+    };
+
+    // Refused: nothing listening.
+    let (c, _, _d) = mk(Some(Duration::from_secs(5)), true);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    drop(l);
+    record(
+        "refused",
+        c.get(format!("https://ssl.test:{port}/alerts"))
+            .send()
+            .await
+            .unwrap_err(),
+    );
+
+    // Reset: accepts and hangs up without a word.
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((s, _)) = l.accept().await else { return };
+            drop(s);
+        }
+    });
+    record(
+        "reset",
+        c.get(format!("https://ssl.test:{port}/"))
+            .send()
+            .await
+            .unwrap_err(),
+    );
+
+    // Timeout: accepts a plain request and never answers.
+    let (c, _, _d2) = mk(Some(Duration::from_millis(200)), true);
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let Ok((s, _)) = l.accept().await else { return };
+            held.push(s);
+        }
+    });
+    record(
+        "timeout",
+        c.get(format!("http://ssl.test:{port}/"))
+            .send()
+            .await
+            .unwrap_err(),
+    );
+
+    // Certificate rejected: a stranger's certificate.
+    let (c, _, _d3) = mk(Some(Duration::from_secs(5)), true);
+    let stranger = ca("stranger");
+    let (der, key) = leaf(&stranger, "good.test", |_| {});
+    let o = origin(vec![der, stranger.der.clone()], key).await;
+    record("cert", c.get(o.url("good.test")).send().await.unwrap_err());
+
+    // DNS refused: the destination policy refuses the resolved loopback address.
+    let (c, _, _d4) = mk(Some(Duration::from_secs(5)), false);
+    record(
+        "dns-refused",
+        c.get("https://localhost:9/").send().await.unwrap_err(),
+    );
+    out
+}
+
+#[tokio::test]
+async fn both_clients_classify_failures_alike() {
+    let (rustls, wreq) = (failure_kinds(false).await, failure_kinds(true).await);
+    assert_eq!(rustls, wreq, "rustls {rustls:?} vs wreq {wreq:?}");
+    let kinds: Vec<_> = wreq.iter().map(|(w, k, r)| (*w, *k, *r)).collect();
+    assert_eq!(kinds[0].1, ErrorKind::UpstreamReset);
+    assert_eq!(kinds[1].1, ErrorKind::UpstreamReset);
+    assert_eq!(kinds[2].1, ErrorKind::UpstreamTimeout);
+    assert_eq!(kinds[3].1, ErrorKind::UpstreamTls);
+    assert!(kinds[4].2, "the policy refusal is recognised: {kinds:?}");
 }

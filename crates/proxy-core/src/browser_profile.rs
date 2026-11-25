@@ -264,13 +264,42 @@ impl BrowserProfile {
     }
 
     /// The transport emulation of the profile with its default headers removed: the browser's
-    /// own headers are forwarded as they came.
+    /// own headers are forwarded as they came. Built once per profile.
     pub fn emulation(&self) -> wreq::Emulation {
-        let mut e = wreq::IntoEmulation::into_emulation(self.profile);
-        e.headers.clear();
-        e.orig_headers = OrigHeaderMap::new();
-        e
+        cached(self.profile).emulation.clone()
     }
+}
+
+/// A profile's emulation (headers stripped) and its header spellings, built once.
+struct Cached {
+    emulation: wreq::Emulation,
+    spellings: std::collections::HashMap<HeaderName, String>,
+}
+
+fn cached(profile: Profile) -> std::sync::Arc<Cached> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<Profile, Arc<Cached>>>> =
+        OnceLock::new();
+    let mut map = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(profile)
+        .or_insert_with(|| {
+            let mut e = wreq::IntoEmulation::into_emulation(profile);
+            let spellings = e
+                .orig_headers
+                .iter()
+                .map(|(n, c)| (n.clone(), String::from_utf8_lossy(c.as_ref()).into_owned()))
+                .collect();
+            e.headers.clear();
+            e.orig_headers = OrigHeaderMap::new();
+            Arc::new(Cached {
+                emulation: e,
+                spellings,
+            })
+        })
+        .clone()
 }
 
 /// How browsers spell a header on HTTP/1: Title-Case, except the client hints, which Chrome
@@ -294,15 +323,15 @@ pub fn orig_headers<'a>(
     profile: &BrowserProfile,
     names: impl Iterator<Item = &'a HeaderName>,
 ) -> OrigHeaderMap {
-    let full = wreq::IntoEmulation::into_emulation(profile.profile);
+    let full = cached(profile.profile);
     let mut seen = std::collections::HashSet::new();
     let mut out = OrigHeaderMap::new();
     for n in names {
         if !seen.insert(n.clone()) {
             continue;
         }
-        match full.orig_headers.iter().find(|(k, _)| *k == n) {
-            Some((_, c)) => out.insert(String::from_utf8_lossy(c.as_ref()).into_owned()),
+        match full.spellings.get(n) {
+            Some(c) => out.insert(c.clone()),
             None => out.insert(title_case(n.as_str())),
         };
     }
