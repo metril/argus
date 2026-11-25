@@ -9,7 +9,6 @@ use std::time::Duration;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 /// Policy OIDs that mark an EV certificate: the CA/Browser Forum one (2.23.140.1.1) and the
@@ -92,7 +91,12 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Handshake with `addr` as `host` and read its leaf certificate. `None` when the probe could
 /// not tell (connect or handshake failed, or timed out).
-pub async fn probe(host: &str, addr: SocketAddr, limit: Duration) -> Option<bool> {
+pub async fn probe(
+    host: &str,
+    addr: SocketAddr,
+    limit: Duration,
+    proxy: Option<&crate::upstream_proxy::ProxyEndpoint>,
+) -> Option<bool> {
     let name = ServerName::try_from(host.to_string()).ok()?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -104,7 +108,9 @@ pub async fn probe(host: &str, addr: SocketAddr, limit: Duration) -> Option<bool
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
     let run = async {
-        let tcp = TcpStream::connect(addr).await.ok()?;
+        let tcp = crate::upstream_proxy::connect_vetted(proxy, addr)
+            .await
+            .ok()?;
         let tls = connector.connect(name, tcp).await.ok()?;
         let (_, conn) = tls.get_ref();
         Some(is_ev_der(conn.peer_certificates()?.first()?.as_ref()))
@@ -309,7 +315,7 @@ mod tests {
         let t = std::time::Instant::now();
         // Even with a long overall budget the probe is capped (here by the passed, shorter limit).
         assert_eq!(
-            probe("dead.test", addr, Duration::from_millis(300)).await,
+            probe("dead.test", addr, Duration::from_millis(300), None).await,
             None
         );
         assert!(t.elapsed() < Duration::from_secs(2));
@@ -318,7 +324,8 @@ mod tests {
             probe(
                 "dead.test",
                 "127.0.0.1:1".parse().unwrap(),
-                Duration::from_secs(5)
+                Duration::from_secs(5),
+                None
             )
             .await,
             None

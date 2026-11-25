@@ -1,3 +1,4 @@
+// Modified by Argus: `Error::is_retried` (patch 5).
 use std::{error::Error as StdError, fmt, io};
 
 use http::Uri;
@@ -216,6 +217,26 @@ impl Error {
         while let Some(err) = source {
             if let Some(err) = err.downcast_ref::<Error>() {
                 if err.is_connect() {
+                    return true;
+                }
+            }
+
+            source = err.source();
+        }
+
+        false
+    }
+
+    /// Returns true if the error came after the client already re-sent the request once because
+    /// its reused connection was closed before the request started.
+    pub fn is_retried(&self) -> bool {
+        use crate::client::layer::client::Error;
+
+        let mut source = self.source();
+
+        while let Some(err) = source {
+            if let Some(err) = err.downcast_ref::<Error>() {
+                if err.is_retried() {
                     return true;
                 }
             }

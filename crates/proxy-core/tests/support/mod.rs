@@ -61,6 +61,8 @@ pub enum Act {
     Ok,
     /// Send GOAWAY (`ENHANCE_YOUR_CALM`) and close, answering nothing.
     Goaway,
+    /// Send GOAWAY (`REFUSED_STREAM`, last stream id covering this request) and close.
+    GoawayRefused,
     /// Reset the stream with `REFUSED_STREAM`.
     Refuse,
     /// Close the TCP connection without a word.
@@ -84,6 +86,8 @@ pub struct Stats {
     pub requests: AtomicUsize,
     /// Connections currently open on the server side.
     pub open: AtomicUsize,
+    /// Connections the origin has dropped on a `close_on` signal.
+    pub closed: AtomicUsize,
     /// Streams received per connection, in accept order.
     pub per_conn: Mutex<Vec<usize>>,
 }
@@ -121,6 +125,98 @@ pub fn ok_script() -> Script {
 }
 
 pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Origin {
+    h2_origin_with(chain, key, script, Arc::new(|_| false)).await
+}
+
+/// An HTTP/1.1 origin that says keep-alive and then closes the connection after each response.
+pub async fn h1_closing_origin(chain: Vec<Vec<u8>>, key: KeyPair) -> Origin {
+    h1_closing_origin_after(chain, key, None).await
+}
+
+/// Like [`h1_closing_origin`]; with `Some(signal)` each connection stays open after its response
+/// until the signal turns `true`, then is dropped (counted in `stats.closed`). The origin runs on
+/// its own thread so a blocked client runtime cannot stall it.
+pub async fn h1_closing_origin_after(
+    chain: Vec<Vec<u8>>,
+    key: KeyPair,
+    close_on: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Origin {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        chain.into_iter().map(CertificateDer::from).collect(),
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+    )
+    .unwrap();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let port = std_listener.local_addr().unwrap().port();
+    let stats = Arc::new(Stats::default());
+    let st = stats.clone();
+    let threaded = close_on.is_some();
+    let serve = async move {
+        let listener = TcpListener::from_std(std_listener).unwrap();
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (acceptor, st, close_on) = (acceptor.clone(), st.clone(), close_on.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                st.conns.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&chunk[..k]),
+                    }
+                }
+                st.requests.fetch_add(1, Ordering::SeqCst);
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok",
+                    )
+                    .await;
+                // Gone without a close_notify, after promising to keep the connection.
+                if let Some(mut rx) = close_on {
+                    let _ = rx.wait_for(|closed| *closed).await;
+                    drop(tls);
+                    st.closed.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    };
+    if threaded {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(serve)
+        });
+    } else {
+        tokio::spawn(serve);
+    }
+    Origin { port, stats }
+}
+
+/// Like [`h2_origin`]; `early(conn)` makes that connection send GOAWAY before any stream.
+pub async fn h2_origin_with(
+    chain: Vec<Vec<u8>>,
+    key: KeyPair,
+    script: Script,
+    early: Arc<dyn Fn(usize) -> bool + Send + Sync>,
+) -> Origin {
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -143,7 +239,8 @@ pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Ori
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
-            let (acceptor, st, script) = (acceptor.clone(), st.clone(), script.clone());
+            let (acceptor, st, script, early) =
+                (acceptor.clone(), st.clone(), script.clone(), early.clone());
             st.tcp.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
@@ -158,7 +255,7 @@ pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Ori
                     st.resumed.fetch_add(1, Ordering::SeqCst);
                 }
                 st.open.fetch_add(1, Ordering::SeqCst);
-                serve(tls, idx, st.clone(), script).await;
+                serve(tls, idx, st.clone(), script, early(idx)).await;
                 st.open.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -171,10 +268,16 @@ async fn serve(
     idx: usize,
     st: Arc<Stats>,
     script: Script,
+    early_goaway: bool,
 ) {
     let Ok(mut conn) = h2::server::handshake(tls).await else {
         return;
     };
+    if early_goaway {
+        conn.abrupt_shutdown(h2::Reason::NO_ERROR);
+        while conn.accept().await.is_some() {}
+        return;
+    }
     while let Some(Ok((_req, mut respond))) = conn.accept().await {
         st.requests.fetch_add(1, Ordering::SeqCst);
         let n = {
@@ -197,6 +300,11 @@ async fn serve(
                 while conn.accept().await.is_some() {}
                 return;
             }
+            Act::GoawayRefused => {
+                conn.abrupt_shutdown(h2::Reason::REFUSED_STREAM);
+                while conn.accept().await.is_some() {}
+                return;
+            }
             Act::Drop => return,
             Act::Hang => {
                 tokio::spawn(async move {
@@ -215,6 +323,11 @@ pub struct Rig {
 
 /// A browser-like client trusting `trusted`, dialling every name to loopback.
 pub fn rig(trusted: &Ca, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
+    rig_with(trusted, true, tweak)
+}
+
+/// Like [`rig`], for the browser-like (wreq) or the plain (reqwest) client.
+pub fn rig_with(trusted: &Ca, browser_like: bool, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join("ca.pem");
     std::fs::write(&path, &trusted.pem).unwrap();
@@ -224,11 +337,11 @@ pub fn rig(trusted: &Ca, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
         resolve_all_to: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         connect_timeout: Some(Duration::from_secs(5)),
         read_timeout: Some(Duration::from_secs(5)),
-        browser_like: true,
+        browser_like,
         ..Default::default()
     };
     tweak(&mut opts);
     let client = build_upstream_client(&opts).unwrap();
-    assert!(client.is_browser_like());
+    assert_eq!(client.is_browser_like(), browser_like);
     Rig { client, _dir: dir }
 }

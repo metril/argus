@@ -239,9 +239,30 @@ jobs:
           name: argus-extension
           path: extension/.output/*.zip
 
+  wreq-patches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: ./.github/actions/build-deps
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: wreq-patches
+          workspaces: vendor/wreq
+      - name: Unit tests of the Argus patches in vendored wreq
+        working-directory: vendor/wreq
+        run: |
+          # The vendored crate is outside the workspace; its benchmark/compio/HTTP-client
+          # dev-dependencies need a newer rustc than the pinned one and the lib tests don't use them.
+          for d in compio cyper criterion sysinfo; do sed -i "/^\[dev-dependencies.$d\]/,/^$/d" Cargo.toml; done
+          sed -i '/^\[dev-dependencies.wreq-rt\]/,/^$/{/"compio-rt",/d}' Cargo.toml
+          cargo test --lib
+
   ci-ok:
     if: always()
-    needs: [fmt, clippy, build, test, e2e, browser, kernel, extension, ext-e2e]
+    needs: [fmt, clippy, build, test, wreq-patches, e2e, browser, kernel, extension, ext-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

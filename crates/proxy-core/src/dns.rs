@@ -174,6 +174,12 @@ impl CachedResolver {
         (l.saturating_sub(m), m)
     }
 
+    /// Drop the cached answer for `name`, so the next lookup asks again.
+    pub async fn forget(&self, name: &str) {
+        let key: Arc<str> = name.trim_end_matches('.').to_ascii_lowercase().into();
+        self.inner.load_full().cache.invalidate(&key).await;
+    }
+
     /// Addresses for `name` (cached). Policy is the caller's job.
     pub async fn resolve(&self, name: &str) -> Result<Arc<[IpAddr]>, String> {
         self.lookups.fetch_add(1, Ordering::Relaxed);

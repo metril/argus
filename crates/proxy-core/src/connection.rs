@@ -780,11 +780,14 @@ impl ConnectionHandler {
         // address (DNS rebinding cannot swap it afterwards).
         let ctx = &self.shared.ctx;
         let dial = async {
-            let addr = ctx
-                .policy()
-                .resolve(&target.host, target.port, ctx.resolve_all_to())
-                .await?;
-            TcpStream::connect(addr).await.map_err(Error::from)
+            crate::upstream_proxy::dial(
+                ctx.policy(),
+                ctx.proxy_handle().load().as_deref(),
+                &target.host,
+                target.port,
+                ctx.resolve_all_to(),
+            )
+            .await
         };
         let mut server = match tokio::time::timeout(t.handshake, dial).await {
             Ok(Ok(s)) => s,
