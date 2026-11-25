@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use api_types::{
-    ChangePasswordRequest, LoginRequest, LoginResponse, MessageResponse, Page, RegisterRequest,
-    RegistrationStatus, SessionInfo, UserInfo, UserRole,
+    ChangePasswordRequest, ExtensionTokenRequest, ExtensionTokenResponse, LoginRequest,
+    LoginResponse, MessageResponse, Page, RegisterRequest, RegistrationStatus, SessionInfo,
+    UserInfo, UserRole,
 };
 use axum::{
     extract::State,
@@ -280,6 +281,105 @@ pub async fn login(
             user: UserInfo::from(&user),
             expires_in,
             message: "Login successful".into(),
+        }),
+    ))
+}
+
+/// Scopes of an extension token: what the popup and the userscript bridge need, nothing else.
+const EXTENSION_SCOPES: [api_types::Scope; 2] = [
+    api_types::Scope::LogsRead,
+    api_types::Scope::UserscriptsBridge,
+];
+
+/// Sign in from the browser extension: the same credential check and rate limit as login, but no
+/// session or cookies. Mints a token named `Extension · {browser}` (no expiry) with just the
+/// scopes the extension needs, and revokes `replace_token_id` if it is the caller's own.
+#[utoipa::path(
+    post, path = "/auth/extension-token", tag = "auth",
+    security(()),
+    request_body = ExtensionTokenRequest,
+    responses(
+        (status = 200, description = "Token minted; `token` is shown only here", body = ExtensionTokenResponse),
+        (status = 403, description = "Code `insufficient_role`: the account's role cannot use the extension. Wrong credentials answer 401 like login.")
+    )
+)]
+pub async fn extension_token(
+    State(state): State<Arc<AppState>>,
+    ApiJson(req): ApiJson<ExtensionTokenRequest>,
+) -> ApiResult<(Extension<AuditActor>, axum::Json<ExtensionTokenResponse>)> {
+    req.validate()?;
+    let browser = req.browser.trim().to_string();
+    if browser.is_empty()
+        || !browser
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_'))
+    {
+        return Err(ApiError::ValidationError(
+            "Browser may only contain letters, digits, spaces, . - and _".into(),
+        ));
+    }
+    let (st, name) = (state.clone(), req.username.clone());
+    let found = blocking(move || st.session_store.get_user_by_username(&name)).await?;
+    // Same constant-work credential check as `login`.
+    let user = found.filter(|u| u.enabled);
+    let hash = user
+        .as_ref()
+        .map_or_else(|| state.dummy_hash.clone(), |u| u.password_hash.clone());
+    let ok = verify_blocking(req.password.clone(), hash).await?;
+    let Some(user) = user.filter(|_| ok) else {
+        warn!("Failed extension sign-in attempt");
+        return Err(ApiError::AuthenticationFailed(
+            "Invalid username or password".into(),
+        ));
+    };
+    let held = user.role.scopes();
+    if EXTENSION_SCOPES.iter().any(|s| !held.contains(s)) {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "insufficient_role",
+            "Your role can't use the browser extension. Ask an admin for the User role.",
+        ));
+    }
+    let (st, uid, uname) = (state.clone(), user.id, user.username.clone());
+    let replace = req.replace_token_id.clone();
+    let (info, secret, replaced) = blocking(move || {
+        let replaced = match replace {
+            Some(id)
+                if st
+                    .tokens
+                    .get(&id)
+                    .is_some_and(|t| t.stored.created_by == uid) =>
+            {
+                st.tokens.revoke(&id)?;
+                Some(id)
+            }
+            _ => None,
+        };
+        let (info, secret) = st.tokens.create(
+            format!("Extension · {browser}"),
+            EXTENSION_SCOPES.to_vec(),
+            None,
+            uid,
+            uname,
+            None,
+        )?;
+        Ok((info, secret, replaced))
+    })
+    .await?;
+    if let Some(id) = replaced {
+        state.close_ext_tokens(&[id]);
+    }
+    state.session_store.update_last_login(&user.id)?;
+    info!("Extension token {} created for {}", info.id, user.username);
+    Ok((
+        Extension(AuditActor {
+            id: Some(user.id.to_string()),
+            name: user.username.clone(),
+        }),
+        axum::Json(ExtensionTokenResponse {
+            token: secret,
+            token_id: info.id,
+            user: UserInfo::from(&user),
         }),
     ))
 }

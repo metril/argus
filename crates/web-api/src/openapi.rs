@@ -16,7 +16,7 @@ use crate::auth::authz::RouteTable;
     info(
         title = "Argus Proxy API",
         version = "1.0.0",
-        description = "Control-plane API of the argus proxy. Authenticate with a session cookie or \
+        description = "Control-plane API of the Argus proxy. Authenticate with a session cookie or \
 `Authorization: Bearer abk_<id>_<secret>`. Every operation lists the scope it requires.",
         license(name = "Proprietary"),
     ),

@@ -119,7 +119,7 @@ pub fn AuthLayout(children: Children) -> impl IntoView {
             <div class="reg-card">
                 <div class="brand">
                     <span class="brand-mark"><super::icon::Icon name="adblock" /></span>
-                    <span><b>"argus"</b></span>
+                    <span><b>"Argus"</b></span>
                 </div>
                 {children_view}
             </div>

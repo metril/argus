@@ -314,9 +314,11 @@ This means the CA isn't installed or trusted. Follow installation instructions f
 
 The extension shows the real upstream certificate Argus saw for the current site, flags invalid ones with a badge, and marks hosts Argus has not seen as "not filtered". On Firefox it also reports whether the page was "Intercepted by Argus" or "Direct".
 
-### Create a token
+### Sign in
 
-In the Argus web UI, open Settings, create an API token with the `logs:read` scope, and copy it.
+Open the extension from the toolbar and sign in with your Argus username and password. It creates
+its own API token, so there is nothing to copy. The **Browser extension** page in the web UI lists
+signed-in browsers and can sign them out.
 
 ### Build and load unpacked
 

@@ -29,6 +29,20 @@ scope its creator lacks, and its power shrinks if the creator is demoted or disa
 (`DELETE /tokens/{id}`) takes effect on the next request. Optional `profiles` restricts a token to
 the given profile ids (see "Profiles, devices and restricted tokens").
 
+Expiry: `expires_in_days` (1 to 3650) or `expires_at` (RFC 3339, must be in the future), not both;
+omit both for a token that never expires.
+
+### Browser extension sign-in
+
+`POST /auth/extension-token` `{username, password, browser, replace_token_id?}` checks the
+credentials like login (same rate limit, no session, no cookies) and returns
+`{token, token_id, user}`: a never-expiring token named `Extension · {browser}` with exactly
+`logs:read` and `userscripts:bridge`. 401 for wrong credentials, 403 `insufficient_role` when the
+role lacks either scope. `replace_token_id` revokes that token if it is the caller's own (anyone
+else's id is ignored). `DELETE /tokens/self` lets any API token revoke itself (400 for a cookie
+session). Both routes accept extension origins (CORS); `GET /downloads/extension/chrome` adds an
+`argus.json` with this server's address to the zip.
+
 ## Scopes
 
 Every route declares the one scope it requires; routes without a declaration are denied. Roles are

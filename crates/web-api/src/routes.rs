@@ -39,6 +39,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(auth::register))
         .routes(routes!(auth::registration_status))
         .routes(routes!(auth::login))
+        .routes(routes!(auth::extension_token))
         .routes(routes!(auth::refresh))
         .routes(routes!(auth::logout))
         .routes(routes!(auth::me))
@@ -57,6 +58,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         // tokens
         .routes(routes!(tokens::list_tokens, tokens::create_token))
         .routes(routes!(tokens::revoke_token))
+        .routes(routes!(tokens::revoke_self))
         .routes(routes!(tokens::admin_list_tokens))
         .routes(routes!(tokens::admin_revoke_token))
         // lists
