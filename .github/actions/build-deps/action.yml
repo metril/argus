@@ -1,0 +1,14 @@
+name: Native build dependencies
+description: Tools needed to compile BoringSSL (btls-sys via the vendored wreq) and its bindgen bindings.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # GitHub-hosted Ubuntu images normally ship all of these; install only what is missing.
+        missing=()
+        for t in cmake perl g++ make; do command -v "$t" >/dev/null || missing+=("$t"); done
+        ldconfig -p | grep -q 'libclang\(-[0-9.]*\)\?\.so' || missing+=(libclang-dev)
+        if [ "${#missing[@]}" -gt 0 ]; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}"
+        fi

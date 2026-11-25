@@ -63,6 +63,20 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.pair }}
           cache-to: type=gha,scope=${{ matrix.pair }},mode=max
 
+      # Natively on each arch: proves the binary links (BoringSSL, static libstdc++) and starts.
+      # Everything is already in the layer cache from the build above, so this is quick.
+      - name: Load image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: argus-smoke:${{ matrix.pair }}
+          cache-from: type=gha,scope=${{ matrix.pair }}
+
+      - name: Smoke test (argus --version)
+        run: docker run --rm argus-smoke:${{ matrix.pair }} --version
+
       - name: Export digest
         if: github.event_name != 'pull_request'
         run: |
