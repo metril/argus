@@ -232,6 +232,12 @@ impl ConnectionHandler {
     /// Whether a host-level rule of the connection's profile blocks `target` (recorded as a
     /// blocked event). Used for `no_decrypt` bypass, where only the host is visible.
     fn host_blocked(&self, target: &ConnectionTarget) -> bool {
+        self.host_block_check(target, true)
+    }
+
+    /// `host_blocked`, optionally without recording an event (the request that follows
+    /// interception is recorded on its own).
+    fn host_block_check(&self, target: &ConnectionTarget, record: bool) -> bool {
         let rctx = self.conn.current(
             self.shared.ctx.profiles(),
             self.shared.ctx.require_device_token(),
@@ -246,6 +252,9 @@ impl ConnectionHandler {
             .check_deferred_q(&filter_engine::Query::new(&url, "", "other"));
         if !verdict.blocked {
             return false;
+        }
+        if !record {
+            return true;
         }
         profile.engine.record_verdict_meta(
             verdict,
@@ -650,7 +659,12 @@ impl ConnectionHandler {
         // assurance the site paid for. The verdict is cached per host.
         let ctx = &self.shared.ctx;
         // (The reserved panel host is answered by the proxy itself and cannot be probed.)
-        if ctx.bypass().ev_no_decrypt() && !ctx.is_panel_host(&target.host) {
+        // A host the filter blocks outright is answered with the block page, so there is nothing
+        // to protect and no upstream to probe (its DNS may be sinkholed).
+        if ctx.bypass().ev_no_decrypt()
+            && !ctx.is_panel_host(&target.host)
+            && !self.host_block_check(&target, false)
+        {
             use crate::ev::EvVerdict;
             match ctx
                 .ev_verdict(
