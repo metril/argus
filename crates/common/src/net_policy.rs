@@ -729,9 +729,23 @@ pub fn control_plane_redirects(policy: Arc<NetPolicy>) -> reqwest::redirect::Pol
 /// no environment proxy. While the upstream proxy is on its requests go through it (see
 /// [`crate::control_bridge`]); the destination checks are the same either way.
 pub fn control_plane_client(policy: Arc<NetPolicy>) -> reqwest::ClientBuilder {
+    control_plane_client_with(policy, None)
+}
+
+/// [`control_plane_client`] with an explicit upstream dialer instead of the process-wide one.
+/// No connection is kept idle: whether a request goes through the upstream proxy is decided
+/// when a connection is opened, so a pooled one would skip a changed setting.
+pub fn control_plane_client_with(
+    policy: Arc<NetPolicy>,
+    dialer: Option<Arc<dyn crate::control_bridge::UpstreamDialer>>,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
-        .proxy(crate::control_bridge::proxy_rule(policy.clone()))
+        .pool_max_idle_per_host(0)
+        .proxy(crate::control_bridge::proxy_rule_with(
+            policy.clone(),
+            dialer,
+        ))
         .dns_resolver(Arc::new(GuardedResolver::control_plane(policy.clone())))
         .redirect(control_plane_redirects(policy))
 }

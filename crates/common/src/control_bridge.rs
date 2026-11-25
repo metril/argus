@@ -13,13 +13,13 @@
 use crate::net_policy::{NetPolicy, ResolveError};
 use base64::Engine;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -43,9 +43,39 @@ fn active_dialer() -> Option<Arc<dyn UpstreamDialer>> {
     DIALER.read().clone().filter(|d| d.active())
 }
 
+/// What a registered credential stands for: the client's policy and, when not the process-wide
+/// one, the dialer it uses.
+#[derive(Clone)]
+struct RouteEntry {
+    policy: Arc<NetPolicy>,
+    dialer: Option<Arc<dyn UpstreamDialer>>,
+}
+
+impl RouteEntry {
+    fn active_dialer(&self) -> Option<Arc<dyn UpstreamDialer>> {
+        match &self.dialer {
+            Some(d) => Some(d.clone()).filter(|d| d.active()),
+            None => active_dialer(),
+        }
+    }
+}
+
 struct Bridge {
     addr: SocketAddr,
-    routes: Mutex<HashMap<String, Arc<NetPolicy>>>,
+    routes: Mutex<Vec<(String, RouteEntry)>>,
+}
+
+impl Bridge {
+    /// The route for a presented credential, compared in constant time over every route.
+    fn lookup(&self, token: &str) -> Option<RouteEntry> {
+        let mut found = None;
+        for (t, e) in self.routes.lock().iter() {
+            if bool::from(t.as_bytes().ct_eq(token.as_bytes())) {
+                found = Some(e.clone());
+            }
+        }
+        found
+    }
 }
 
 static BRIDGE: OnceLock<Option<Arc<Bridge>>> = OnceLock::new();
@@ -96,7 +126,7 @@ fn start() -> Option<Arc<Bridge>> {
 /// removed when the client is dropped.
 struct Route {
     token: String,
-    policy: Arc<NetPolicy>,
+    entry: RouteEntry,
     registered: OnceLock<()>,
 }
 
@@ -109,7 +139,7 @@ impl Route {
         self.registered.get_or_init(|| {
             b.routes
                 .lock()
-                .insert(self.token.clone(), self.policy.clone());
+                .push((self.token.clone(), self.entry.clone()));
         });
         format!("http://argus:{}@{}", self.token, b.addr)
     }
@@ -119,7 +149,7 @@ impl Drop for Route {
     fn drop(&mut self) {
         if self.registered.get().is_some() {
             if let Some(Some(b)) = BRIDGE.get() {
-                b.routes.lock().remove(&self.token);
+                b.routes.lock().retain(|(t, _)| *t != self.token);
             }
         }
     }
@@ -128,15 +158,23 @@ impl Drop for Route {
 /// The `reqwest` proxy rule for a control-plane client: the bridge while the upstream proxy is
 /// on, none (a direct, guarded connection) while it is off.
 pub fn proxy_rule(policy: Arc<NetPolicy>) -> reqwest::Proxy {
+    proxy_rule_with(policy, None)
+}
+
+/// [`proxy_rule`] with an explicit dialer instead of the process-wide one.
+pub fn proxy_rule_with(
+    policy: Arc<NetPolicy>,
+    dialer: Option<Arc<dyn UpstreamDialer>>,
+) -> reqwest::Proxy {
     use rand::RngCore;
     let mut raw = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut raw);
     let route = Route {
         token: raw.iter().map(|b| format!("{b:02x}")).collect(),
-        policy,
+        entry: RouteEntry { policy, dialer },
         registered: OnceLock::new(),
     };
-    reqwest::Proxy::custom(move |_| active_dialer().map(|_| route.url()))
+    reqwest::Proxy::custom(move |_| route.entry.active_dialer().map(|_| route.url()))
 }
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -149,6 +187,7 @@ async fn serve(b: &Bridge, mut s: TcpStream) -> io::Result<()> {
     let request = lines.next().unwrap_or_default().to_string();
     let mut token = None;
     let mut kept = String::new();
+    let mut body_len = 0usize;
     for l in lines.filter(|l| !l.is_empty()) {
         let lower = l.to_ascii_lowercase();
         if let Some(v) = lower.strip_prefix("proxy-authorization:") {
@@ -163,13 +202,17 @@ async fn serve(b: &Bridge, mut s: TcpStream) -> io::Result<()> {
                 })
                 .and_then(|d| String::from_utf8(d).ok())
                 .and_then(|d| d.split_once(':').map(|(_, t)| t.to_string()));
-        } else if !lower.starts_with("proxy-connection:") {
+        } else if let Some(v) = lower.strip_prefix("content-length:") {
+            body_len = v.trim().parse().unwrap_or(0);
+            kept.push_str(l);
+            kept.push_str("\r\n");
+        } else if !lower.starts_with("proxy-connection:") && !lower.starts_with("connection:") {
             kept.push_str(l);
             kept.push_str("\r\n");
         }
     }
-    let policy = token.and_then(|t| b.routes.lock().get(&t).cloned());
-    let Some(policy) = policy else {
+    let route = token.and_then(|t| b.lookup(&t));
+    let Some(route) = route else {
         return reply(&mut s, "407 Proxy Authentication Required").await;
     };
     let mut parts = request.split(' ');
@@ -205,7 +248,7 @@ async fn serve(b: &Bridge, mut s: TcpStream) -> io::Result<()> {
             _ => return reply(&mut s, "400 Bad Request").await,
         }
     };
-    let addr = match policy.resolve_control(&host, port).await {
+    let addr = match route.policy.resolve_control(&host, port).await {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!("control-plane fetch to {host}:{port} refused: {e}");
@@ -216,7 +259,7 @@ async fn serve(b: &Bridge, mut s: TcpStream) -> io::Result<()> {
             return reply(&mut s, status).await;
         }
     };
-    let Some(d) = active_dialer() else {
+    let Some(d) = route.active_dialer() else {
         return reply(&mut s, "503 Service Unavailable").await;
     };
     let mut up = match tokio::time::timeout(DIAL_TIMEOUT, d.dial(addr)).await {
@@ -231,11 +274,23 @@ async fn serve(b: &Bridge, mut s: TcpStream) -> io::Result<()> {
         s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
     } else {
-        up.write_all(format!("{method} {origin_form} {version}\r\n{kept}\r\n").as_bytes())
-            .await?;
+        // One request per connection: only the first request of a keep-alive connection would be
+        // rewritten (absolute to origin form, credential stripped), so later ones must not exist.
+        up.write_all(
+            format!("{method} {origin_form} {version}\r\n{kept}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
     }
+    // Past a plain request's own body, nothing more is relayed (later requests would skip the
+    // rewrite above).
+    let rest = if connect {
+        &rest[..]
+    } else {
+        &rest[..rest.len().min(body_len)]
+    };
     if !rest.is_empty() {
-        up.write_all(&rest).await?;
+        up.write_all(rest).await?;
     }
     tokio::io::copy_bidirectional(&mut s, &mut up).await?;
     Ok(())
@@ -302,53 +357,85 @@ mod tests {
         }
     }
 
-    async fn origin() -> SocketAddr {
+    type Heads = Arc<Mutex<Vec<String>>>;
+
+    /// A local origin that records each request head and answers with its request line. With
+    /// `honor_close` it ends a connection on `Connection: close`; otherwise it keeps serving it.
+    async fn origin(honor_close: bool) -> (SocketAddr, Heads) {
+        let heads = Heads::default();
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = l.local_addr().unwrap();
+        let rec = heads.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((mut s, _)) = l.accept().await else {
                     return;
                 };
+                let rec = rec.clone();
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = s.read(&mut buf).await.unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    // Echo the request line so the test sees the rewritten target.
-                    let line = req.lines().next().unwrap_or_default().to_string();
-                    let _ = s
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{line}",
-                                line.len()
-                            )
-                            .as_bytes(),
-                        )
-                        .await;
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        while let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..i]).to_string();
+                            buf.drain(..i + 4);
+                            let line = head.lines().next().unwrap_or_default().to_string();
+                            let close = head.to_ascii_lowercase().contains("connection: close");
+                            rec.lock().push(head);
+                            let _ = s
+                                .write_all(
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{line}",
+                                        line.len()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                            if close && honor_close {
+                                return;
+                            }
+                        }
+                        match s.read(&mut chunk).await {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
                 });
             }
         });
-        a
+        (a, heads)
+    }
+
+    fn client_for(ans: &'static str, dial: &Arc<Local>) -> reqwest::Client {
+        let policy = Arc::new(
+            NetPolicy::control_plane(&[])
+                .unwrap()
+                .with_resolver(Arc::new(Answer(ans))),
+        );
+        let d: Arc<dyn UpstreamDialer> = dial.clone();
+        crate::net_policy::control_plane_client_with(policy, Some(d))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    fn heads_now(h: &Heads) -> usize {
+        h.lock().len()
+    }
+
+    fn local(on: bool, target: SocketAddr) -> Arc<Local> {
+        Arc::new(Local {
+            on: AtomicBool::new(on),
+            target,
+            seen: Mutex::default(),
+        })
     }
 
     #[tokio::test]
     async fn fetches_use_the_proxy_with_the_vetted_address_only_while_it_is_on() {
-        let target = origin().await;
-        let dial = Arc::new(Local {
-            on: AtomicBool::new(true),
-            target,
-            seen: Mutex::default(),
-        });
-        set_upstream_dialer(dial.clone());
-        let policy = Arc::new(
-            NetPolicy::control_plane(&[])
-                .unwrap()
-                .with_resolver(Arc::new(Answer("93.184.216.34"))),
-        );
-        let client = crate::net_policy::control_plane_client(policy)
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+        let (target, _) = origin(true).await;
+        let dial = local(true, target);
+        let client = client_for("93.184.216.34", &dial);
         let body = client
             .get("http://lists.example/a/b.txt?x=1")
             .send()
@@ -372,23 +459,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_bridge_refuses_refused_destinations_and_unknown_credentials() {
-        let target = origin().await;
-        let dial = Arc::new(Local {
-            on: AtomicBool::new(true),
-            target,
-            seen: Mutex::default(),
-        });
-        set_upstream_dialer(dial.clone());
-        let policy = Arc::new(
-            NetPolicy::control_plane(&[])
-                .unwrap()
-                .with_resolver(Arc::new(Answer("10.1.2.3"))),
+    async fn toggling_the_proxy_applies_to_the_next_fetch_despite_a_live_origin_connection() {
+        // The origin keeps connections open, so a pooled one would be reused.
+        let (target, _) = origin(false).await;
+        let dial = local(true, target);
+        let client = client_for("93.184.216.34", &dial);
+        let get = || client.get("http://lists.example/").send();
+        assert_eq!(get().await.unwrap().status(), 200);
+        assert_eq!(dial.seen.lock().len(), 1);
+        // Off: the next fetch must go the direct way (to an unreachable address here), not
+        // down the old bridge connection.
+        dial.on.store(false, Ordering::SeqCst);
+        assert!(get().await.is_err(), "the old bridge connection was reused");
+        assert_eq!(dial.seen.lock().len(), 1);
+        // On again: through the bridge, a fresh dial.
+        dial.on.store(true, Ordering::SeqCst);
+        assert_eq!(get().await.unwrap().status(), 200);
+        assert_eq!(dial.seen.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn every_plain_http_request_reaches_the_origin_rewritten_and_without_the_credential() {
+        let (target, heads) = origin(true).await;
+        let dial = local(true, target);
+        let client = client_for("93.184.216.34", &dial);
+        for p in ["/one", "/two", "/three"] {
+            let url = format!("http://lists.example{p}");
+            let r = client.get(url).send().await.unwrap();
+            assert_eq!(r.text().await.unwrap(), format!("GET {p} HTTP/1.1"));
+        }
+        let heads_ref = heads;
+        let heads = heads_ref.lock().clone();
+        assert_eq!(heads.len(), 3);
+        for h in &heads {
+            let l = h.to_ascii_lowercase();
+            assert!(!l.contains("proxy-authorization"), "{h}");
+            assert!(l.contains("connection: close"), "{h}");
+        }
+
+        // A client that keeps one connection and pipelines a second request gets no second
+        // answer: the bridge relays a single request.
+        let b = bridge().unwrap();
+        let me = Arc::as_ptr(&dial) as *const ();
+        let token = {
+            let routes = b.routes.lock();
+            let (t, _) = routes
+                .iter()
+                .find(|(_, e)| {
+                    e.dialer
+                        .as_ref()
+                        .is_some_and(|d| Arc::as_ptr(d) as *const () == me)
+                })
+                .unwrap();
+            t.clone()
+        };
+        let cred = base64::engine::general_purpose::STANDARD.encode(format!("argus:{token}"));
+        let mut s = TcpStream::connect(b.addr).await.unwrap();
+        let req = format!(
+            "GET http://lists.example/a HTTP/1.1\r\nHost: lists.example\r\nProxy-Authorization: Basic {cred}\r\n\r\n"
         );
-        let client = crate::net_policy::control_plane_client(policy)
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
+        s.write_all(format!("{req}{req}").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_string(&mut out)).await;
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 1, "{out}");
+        assert_eq!(
+            heads_now(&heads_ref),
+            4,
+            "the pipelined request was forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bridge_refuses_refused_destinations_and_unknown_credentials() {
+        let (target, _) = origin(true).await;
+        let dial = local(true, target);
+        let client = client_for("10.1.2.3", &dial);
         let r = client.get("http://nas.example/").send().await;
         assert!(
             r.map(|r| r.status() != 200).unwrap_or(true),
