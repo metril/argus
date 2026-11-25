@@ -91,8 +91,10 @@ fn upstream_proxy_dto(p: &common::config::UpstreamProxy) -> UpstreamProxyDto {
     }
 }
 
-/// `cur` with the fields `u` sets. An empty password keeps the saved one; an emptied username
-/// drops the password with it.
+/// `cur` with the fields `u` sets. The saved username and password are reused only while the
+/// type, host and port are the saved ones: sent to another address they would reach whoever
+/// runs it, so then they must be supplied again. An empty password keeps the saved one; an
+/// emptied username drops the password with it.
 fn merge_upstream_proxy(
     cur: &common::config::UpstreamProxy,
     u: &UpstreamProxyUpdate,
@@ -112,6 +114,10 @@ fn merge_upstream_proxy(
     }
     if let Some(p) = u.port {
         n.port = p;
+    }
+    if n.kind != cur.kind || n.host != cur.host || n.port != cur.port {
+        n.username.clear();
+        n.password.clear();
     }
     if let Some(name) = &u.username {
         n.username = name.trim().to_string();
@@ -842,8 +848,12 @@ const PROXY_TEST_HOST: &str = "www.cloudflare.com";
 )]
 pub async fn test_upstream_proxy(
     State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
     ApiJson(req): ApiJson<UpstreamProxyUpdate>,
 ) -> ApiResult<Json<UpstreamProxyTestResult>> {
+    // At most one test at a time and a few a minute per caller: each one makes Argus connect
+    // out, so this is not a port scanner.
+    let _slot = state.upstream_tests.admit(&p)?;
     let mut cfg = merge_upstream_proxy(&state.proxy_state.config.read().proxy.upstream.proxy, &req);
     cfg.enabled = true;
     cfg.validate().map_err(ApiError::ValidationError)?;
@@ -868,7 +878,12 @@ pub async fn test_upstream_proxy(
                 error: None,
                 target: PROXY_TEST_HOST.into(),
             }),
-            Err(e) => fail(e),
+            Err(e) => {
+                // The detail (refused, timed out, bad credentials...) stays in the log: the
+                // caller must not be able to map what the server can reach.
+                tracing::warn!("upstream proxy test failed: {e}");
+                fail("Could not connect through the proxy. See the server log for why.".into())
+            }
         },
     )
 }

@@ -168,7 +168,7 @@ async fn an_empty_password_keeps_the_saved_one_and_an_emptied_username_drops_it(
 
     put(
         &admin,
-        json!({"upstream_proxy": {"port": 1081, "password": ""}}),
+        json!({"upstream_proxy": {"enabled": true, "password": ""}}),
     )
     .await
     .assert_status_ok();
@@ -181,7 +181,7 @@ async fn an_empty_password_keeps_the_saved_one_and_an_emptied_username_drops_it(
         .upstream
         .proxy
         .clone();
-    assert_eq!((cfg.port, cfg.password.as_str()), (1081, "hunter2"));
+    assert_eq!((cfg.port, cfg.password.as_str()), (1080, "hunter2"));
 
     put(&admin, json!({"upstream_proxy": {"password": "new-pass"}}))
         .await
@@ -321,7 +321,7 @@ async fn the_test_endpoint_reports_latency_or_the_error_and_needs_config_write()
         .assert_status_ok();
 
     *fake.test_result.lock().unwrap() = Some(Ok(42));
-    // Unsaved values are tested; the saved password fills in an empty one.
+    // Unsaved values are tested. The saved credentials are not sent to another address.
     let r = admin
         .post("/api/v1/config/upstream-proxy/test")
         .json(&json!({"host": "10.7.7.7", "port": 3128, "kind": "http", "password": ""}))
@@ -335,8 +335,24 @@ async fn the_test_endpoint_reports_latency_or_the_error_and_needs_config_write()
     assert_eq!(v["target"], "www.cloudflare.com");
     let t = fake.tested.lock().unwrap().last().unwrap().clone();
     assert_eq!(
-        (t.host.as_str(), t.port, t.password.as_str()),
-        ("10.7.7.7", 3128, "hunter2")
+        (
+            t.host.as_str(),
+            t.port,
+            t.username.as_str(),
+            t.password.as_str()
+        ),
+        ("10.7.7.7", 3128, "", "")
+    );
+    // The same address keeps them.
+    admin
+        .post("/api/v1/config/upstream-proxy/test")
+        .json(&json!({"host": "10.1.2.3", "port": 1080, "kind": "socks5", "password": ""}))
+        .await
+        .assert_status_ok();
+    let t = fake.tested.lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        (t.username.as_str(), t.password.as_str()),
+        ("alice", "hunter2")
     );
     assert!(t.enabled, "the test runs even while the setting is off");
     assert!(
@@ -359,7 +375,9 @@ async fn the_test_endpoint_reports_latency_or_the_error_and_needs_config_write()
         .await
         .json();
     assert_eq!(v["ok"], false);
-    assert!(v["error"].as_str().unwrap().contains("407"), "{v}");
+    // The reason stays in the server log; the caller gets one message for every failure.
+    let msg = v["error"].as_str().unwrap();
+    assert!(!msg.contains("407") && !msg.contains("password"), "{v}");
 
     // Read-only roles cannot use it.
     let viewer = ctx.user(&admin, "vera", "viewer").await;
@@ -374,4 +392,98 @@ async fn the_test_endpoint_reports_latency_or_the_error_and_needs_config_write()
         .json(&json!({"host": ""}))
         .await;
     assert_eq!(r.status_code(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn saved_credentials_are_never_sent_to_another_address() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    put(&admin, proxy(json!({}))).await.assert_status_ok();
+    let saved = |ctx: &TestContext| {
+        ctx.state
+            .proxy_state
+            .config
+            .read()
+            .proxy
+            .upstream
+            .proxy
+            .clone()
+    };
+
+    // Host, port or type changed with an empty password: credentials dropped, not reused.
+    for change in [
+        json!({"host": "198.51.100.9"}),
+        json!({"port": 1081}),
+        json!({"kind": "http"}),
+    ] {
+        let mut body = change.clone();
+        body["password"] = json!("");
+        put(&admin, json!({"upstream_proxy": body}))
+            .await
+            .assert_status_ok();
+        let c = saved(&ctx);
+        assert_eq!(
+            (c.username.as_str(), c.password.as_str()),
+            ("", ""),
+            "{change}"
+        );
+        put(&admin, proxy(json!({}))).await.assert_status_ok();
+    }
+
+    // Supplying both again with the change is honoured.
+    put(
+        &admin,
+        json!({"upstream_proxy": {"host": "198.51.100.9", "username": "bob", "password": "pw"}}),
+    )
+    .await
+    .assert_status_ok();
+    let c = saved(&ctx);
+    assert_eq!((c.username.as_str(), c.password.as_str()), ("bob", "pw"));
+}
+
+#[tokio::test]
+async fn the_test_endpoint_is_limited_to_one_at_a_time_and_a_few_a_minute() {
+    use web_api::auth::authz::{Actor, Principal};
+    let gate = web_api::state::UpstreamTestGate::new(3, std::time::Duration::from_secs(60));
+    let who = |id: &str| Principal {
+        user_id: uuid::Uuid::nil(),
+        username: "u".into(),
+        role: api_types::UserRole::Admin,
+        scopes: Default::default(),
+        actor: Actor::Token {
+            token_id: id.into(),
+        },
+        profiles: None,
+    };
+    let a = who("a");
+    // One in flight: a second is refused until the first finishes.
+    let held = gate.admit(&a).unwrap();
+    assert!(matches!(
+        gate.admit(&a),
+        Err(web_api::error::ApiError::RateLimitExceeded(_))
+    ));
+    drop(held);
+    // The refused try still counted; the rate limit (3) is per token.
+    drop(gate.admit(&a).unwrap());
+    assert!(gate.admit(&a).is_err());
+    drop(gate.admit(&who("b")).unwrap());
+}
+
+#[tokio::test]
+async fn the_test_endpoint_answers_429_when_limited() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    assert!(ctx.state.runtime.set(Arc::new(Fake::default())).is_ok());
+    put(&admin, proxy(json!({"enabled": false})))
+        .await
+        .assert_status_ok();
+    let mut last = StatusCode::OK;
+    for _ in 0..12 {
+        last = admin
+            .post("/api/v1/config/upstream-proxy/test")
+            .json(&json!({}))
+            .await
+            .status_code();
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
 }

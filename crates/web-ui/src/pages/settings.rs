@@ -317,7 +317,7 @@ const SECTIONS: &[Section] = &[
             Def {
                 key: "up_pass",
                 label: "Password",
-                desc: "Write-only. Leave empty to keep the saved password.",
+                desc: "Write-only. Leave empty to keep the saved password. Changing the type, host or port drops it: enter it again.",
                 kind: Kind::Secret,
                 dep: Some("up_on"),
             },
@@ -524,12 +524,29 @@ fn upstream_error(key: &str, get: &dyn Fn(&str) -> String) -> Option<String> {
         "up_pass" if get("up_user").trim().is_empty() && !get("up_pass").is_empty() => {
             Some("A password needs a username.".into())
         }
+        // The server never sends the saved password to another address.
+        "up_pass"
+            if get("up_ep_changed") == "true"
+                && !get("up_user").trim().is_empty()
+                && get("up_pass").is_empty() =>
+        {
+            Some("The address changed: enter the password again, or clear the username.".into())
+        }
         _ => None,
     }
 }
 
+/// Whether the proxy's type, host or port differ from the saved ones.
+fn endpoint_changed(all: &[F]) -> bool {
+    all.iter().any(|f| {
+        matches!(f.def.key, "up_kind" | "up_host" | "up_port")
+            && f.cur.get_untracked() != f.saved.get_untracked()
+    })
+}
+
 /// The upstream proxy part of a save (`None` when nothing of it changed). `dirty` says whether
-/// a field changed; an empty password is left out, so the saved one is kept.
+/// a field changed; an empty password is left out, so the saved one is kept (the server drops it
+/// when the type, host or port changed, so then the username is sent along too).
 fn upstream_update(
     get: &dyn Fn(&str) -> String,
     dirty: &dyn Fn(&str) -> bool,
@@ -540,16 +557,17 @@ fn upstream_update(
     if !keys.iter().any(|k| dirty(k)) {
         return None;
     }
+    let ep = dirty("up_kind") || dirty("up_host") || dirty("up_port");
     Some(api_types::UpstreamProxyUpdate {
         enabled: dirty("up_on").then(|| get("up_on") == "true"),
-        kind: dirty("up_kind").then(|| match get("up_kind").as_str() {
+        kind: (ep || dirty("up_kind")).then(|| match get("up_kind").as_str() {
             "socks5" => api_types::UpstreamProxyKind::Socks5,
             _ => api_types::UpstreamProxyKind::Http,
         }),
-        host: dirty("up_host").then(|| get("up_host").trim().to_string()),
-        port: dirty("up_port").then(|| get("up_port").trim().parse().unwrap_or(0)),
-        username: dirty("up_user").then(|| get("up_user").trim().to_string()),
-        password: Some(get("up_pass")).filter(|p| dirty("up_pass") && !p.is_empty()),
+        host: (ep || dirty("up_host")).then(|| get("up_host").trim().to_string()),
+        port: (ep || dirty("up_port")).then(|| get("up_port").trim().parse().unwrap_or(0)),
+        username: (ep || dirty("up_user")).then(|| get("up_user").trim().to_string()),
+        password: Some(get("up_pass")).filter(|p| (dirty("up_pass") || ep) && !p.is_empty()),
     })
 }
 
@@ -569,6 +587,9 @@ fn error_of(f: &F, all: &[F]) -> Option<String> {
     }
     let v = f.cur.read();
     let get = |k: &str| {
+        if k == "up_ep_changed" {
+            return endpoint_changed(all).to_string();
+        }
         all.iter()
             .find(|x| x.def.key == k)
             .map(|x| x.cur.read().s())
@@ -1131,6 +1152,9 @@ fn UpstreamTest(all: Vec<F>) -> impl IntoView {
     let busy = RwSignal::new(false);
     let on_click = move |_| {
         let get = |k: &str| {
+            if k == "up_ep_changed" {
+                return endpoint_changed(&all).to_string();
+            }
             all.iter()
                 .find(|f| f.def.key == k)
                 .map(|f| f.cur.get_untracked().s())
@@ -1360,14 +1384,13 @@ mod tests {
             ("up_pass", ""),
         ]);
         assert!(upstream_update(&get, &|_| false).is_none());
-        let u = upstream_update(&get, &|k| {
-            k == "up_kind" || k == "up_host" || k == "up_pass"
-        })
-        .unwrap();
+        let u = upstream_update(&get, &|k| k == "up_on" || k == "up_pass").unwrap();
+        assert_eq!(u.enabled, Some(true));
+        assert_eq!((u.kind, u.host.as_deref(), u.port), (None, None, None));
+        let u = upstream_update(&get, &|k| k == "up_kind" || k == "up_host").unwrap();
         assert_eq!(u.kind, Some(UpstreamProxyKind::Socks5));
         assert_eq!(u.host.as_deref(), Some("proxy.lan"));
         assert_eq!(u.enabled, None);
-        assert_eq!(u.port, None);
         assert_eq!(u.password, None, "empty keeps the saved password");
 
         let typed = vals(&[("up_pass", "s3cret")]);
@@ -1377,5 +1400,24 @@ mod tests {
         let u = upstream_update(&get, &|_| true).unwrap();
         assert_eq!(u.port, Some(1080));
         assert_eq!(u.username.as_deref(), Some("alice"));
+        // A changed address sends type, host, port and username so the server can tell.
+        let u = upstream_update(&get, &|k| k == "up_host").unwrap();
+        assert_eq!(u.kind, Some(UpstreamProxyKind::Socks5));
+        assert_eq!(u.port, Some(1080));
+        assert_eq!(u.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_changed_address_asks_for_the_password_again() {
+        let ask = vals(&[("up_ep_changed", "true"), ("up_user", "a"), ("up_pass", "")]);
+        assert!(upstream_error("up_pass", &ask).unwrap().contains("again"));
+        let same = vals(&[
+            ("up_ep_changed", "false"),
+            ("up_user", "a"),
+            ("up_pass", ""),
+        ]);
+        assert_eq!(upstream_error("up_pass", &same), None);
+        let anon = vals(&[("up_ep_changed", "true"), ("up_user", ""), ("up_pass", "")]);
+        assert_eq!(upstream_error("up_pass", &anon), None);
     }
 }

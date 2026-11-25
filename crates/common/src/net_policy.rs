@@ -460,6 +460,35 @@ impl NetPolicy {
     }
 }
 
+impl NetPolicy {
+    /// Resolve `host:port` for a control-plane fetch and return the one address to connect to,
+    /// judged as the control-plane resolver judges it (a host on the allowlist may be private).
+    pub async fn resolve_control(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<SocketAddr, ResolveError> {
+        let bare = unbracket(host);
+        if let Ok(ip) = bare.parse::<IpAddr>() {
+            self.check_ip(ip).map_err(ResolveError::Refused)?;
+            return Ok(SocketAddr::new(ip, port));
+        }
+        let mut denied = None;
+        for addr in self.lookup(bare, port).await.map_err(ResolveError::Io)? {
+            match self.check_resolved(bare, addr.ip()) {
+                Ok(()) => return Ok(addr),
+                Err(r) => {
+                    denied.get_or_insert(r);
+                }
+            }
+        }
+        Err(match denied {
+            Some(r) => ResolveError::Refused(r),
+            None => ResolveError::NoAddresses(bare.to_string()),
+        })
+    }
+}
+
 /// Strip the brackets of an IPv6 literal.
 pub fn unbracket(host: &str) -> &str {
     host.strip_prefix('[')
@@ -697,10 +726,12 @@ pub fn control_plane_redirects(policy: Arc<NetPolicy>) -> reqwest::redirect::Pol
 }
 
 /// A client builder wired to the control-plane policy: guarded DNS, bounded checked redirects,
-/// no environment proxy.
+/// no environment proxy. While the upstream proxy is on its requests go through it (see
+/// [`crate::control_bridge`]); the destination checks are the same either way.
 pub fn control_plane_client(policy: Arc<NetPolicy>) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
+        .proxy(crate::control_bridge::proxy_rule(policy.clone()))
         .dns_resolver(Arc::new(GuardedResolver::control_plane(policy.clone())))
         .redirect(control_plane_redirects(policy))
 }

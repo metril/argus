@@ -78,6 +78,8 @@ impl UpstreamOptions {
         // An enabled upstream proxy is in force from the first connection (never fall back to
         // direct): an unusable one makes every dial fail until it is fixed.
         let proxy = Arc::new(crate::upstream_proxy::ProxyHandle::default());
+        // Control-plane fetches (lists, roots) follow the same live proxy.
+        common::control_bridge::set_upstream_dialer(proxy.clone());
         let cfg = &config.proxy.upstream.proxy;
         if cfg.enabled {
             if let Err(e) = cfg.validate() {

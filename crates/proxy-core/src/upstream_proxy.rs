@@ -39,6 +39,22 @@ impl ProxyHandle {
     }
 }
 
+/// Control-plane fetches (lists, roots) dial through the live proxy.
+impl common::control_bridge::UpstreamDialer for ProxyHandle {
+    fn active(&self) -> bool {
+        self.load().is_some()
+    }
+
+    fn dial(&self, addr: SocketAddr) -> common::control_bridge::DialFuture<'_> {
+        Box::pin(async move {
+            match self.load() {
+                Some(p) => p.connect(addr).await,
+                None => Err(io::Error::other("upstream proxy is off")),
+            }
+        })
+    }
+}
+
 impl std::fmt::Debug for ProxyHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(if self.load().is_some() {

@@ -319,6 +319,9 @@ pub struct AppState {
     /// Serialises config updates and reloads (ETag check through save and commit).
     pub config_lock: tokio::sync::Mutex<()>,
 
+    /// Admission control for the upstream proxy connection test.
+    pub upstream_tests: UpstreamTestGate,
+
     /// Caps on concurrent live-log streams (5 per user, 64 in all).
     pub log_streams: Arc<LogStreamLimits>,
 
@@ -894,6 +897,7 @@ pub async fn build_state_full(
         lists_hooks: Default::default(),
         ext_totals: Default::default(),
         config_lock: tokio::sync::Mutex::new(()),
+        upstream_tests: UpstreamTestGate::new(10, std::time::Duration::from_secs(60)),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
         timeseries: Default::default(),
         runtime: OnceLock::new(),
@@ -1048,6 +1052,64 @@ impl AppState {
                 .parent()
                 .map_or_else(|| "bypass.json".into(), |p| p.join("bypass.json"));
             Arc::new(common::bypass::BypassEngine::load(path))
+        })
+    }
+}
+
+/// One upstream-proxy test in flight at a time, and at most `max` per `window` for each caller
+/// (token or session).
+pub struct UpstreamTestGate {
+    busy: Arc<tokio::sync::Semaphore>,
+    hits: parking_lot::Mutex<
+        std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    >,
+    max: usize,
+    window: std::time::Duration,
+}
+
+impl UpstreamTestGate {
+    pub fn new(max: usize, window: std::time::Duration) -> Self {
+        Self {
+            busy: Arc::new(tokio::sync::Semaphore::new(1)),
+            hits: Default::default(),
+            max,
+            window,
+        }
+    }
+
+    /// A slot for one test, or 429. Held until dropped.
+    pub fn admit(
+        &self,
+        p: &crate::auth::authz::Principal,
+    ) -> crate::error::ApiResult<tokio::sync::OwnedSemaphorePermit> {
+        use crate::auth::authz::Actor;
+        let key = match &p.actor {
+            Actor::Token { token_id } => format!("t:{token_id}"),
+            Actor::Session { session_id } => format!("s:{session_id}"),
+        };
+        let now = std::time::Instant::now();
+        {
+            let mut hits = self.hits.lock();
+            hits.retain(|_, q| {
+                q.back()
+                    .is_some_and(|t| now.duration_since(*t) < self.window)
+            });
+            let q = hits.entry(key).or_default();
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= self.window)
+            {
+                q.pop_front();
+            }
+            if q.len() >= self.max {
+                return Err(crate::error::ApiError::RateLimitExceeded(
+                    "too many proxy tests; wait a minute".into(),
+                ));
+            }
+            q.push_back(now);
+        }
+        self.busy.clone().try_acquire_owned().map_err(|_| {
+            crate::error::ApiError::RateLimitExceeded("a proxy test is already running".into())
         })
     }
 }
