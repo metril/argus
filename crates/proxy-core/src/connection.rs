@@ -124,6 +124,8 @@ pub struct ConnectionHandler {
 impl ConnectionHandler {
     pub fn new(client_addr: SocketAddr, shared: Arc<ConnectionShared>) -> Self {
         let conn = Arc::new(ConnCtx::new(shared.ctx.profiles(), client_addr));
+        let ctx = shared.ctx.clone();
+        conn.set_on_close(Box::new(move |id| ctx.evict_conn(id)));
         Self {
             client_addr,
             shared,

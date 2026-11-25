@@ -1,3 +1,4 @@
+// Modified by Argus: `ConnectionDescriptor::session_id` (per-device TLS session cache, patch 3) and `ConnectionId::in_request_group` (pool eviction, patch 4).
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     num::NonZeroU64,
@@ -20,6 +21,13 @@ use crate::{conn::net::SocketBindOptions, group::Group, proxy::Matcher, tls::Tls
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionId(Arc<(Group, AtomicU64)>);
 
+impl ConnectionId {
+    /// Whether the connection was opened for requests of `target`'s request group.
+    pub(crate) fn in_request_group(&self, target: &Group) -> bool {
+        self.0.0.in_request_group(target)
+    }
+}
+
 /// A blueprint for creating a new client connection, containing all necessary parameters.
 ///
 /// This descriptor bundles the target `Uri`, HTTP version, `TlsOptions`, proxy settings,
@@ -33,6 +41,7 @@ pub(crate) struct ConnectionDescriptor {
     tls_options: Option<TlsOptions>,
     socket_bind: Option<SocketBindOptions>,
     connection_id: ConnectionId,
+    session_id: ConnectionId,
 }
 
 // ===== impl ConnectionId =====
@@ -81,13 +90,17 @@ impl ConnectionDescriptor {
         tls_options: Option<TlsOptions>,
         socket_bind: Option<SocketBindOptions>,
     ) -> ConnectionDescriptor {
-        let connection_id = {
+        let (connection_id, session_id) = {
             group
                 .uri(uri.clone())
                 .version(version)
                 .proxy(proxy.clone())
                 .socket_bind(socket_bind.clone());
-            ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
+            let session = group.session_scope();
+            (
+                ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN)))),
+                ConnectionId(Arc::new((session, AtomicU64::new(u64::MIN)))),
+            )
         };
 
         ConnectionDescriptor {
@@ -97,7 +110,15 @@ impl ConnectionDescriptor {
             tls_options,
             socket_bind,
             connection_id,
+            session_id,
         }
+    }
+
+    /// The TLS session cache key: the pool key, except that connections of one session scope
+    /// share it (see [`Group::session`]).
+    #[inline]
+    pub(crate) fn session_id(&self) -> ConnectionId {
+        self.session_id.clone()
     }
 
     /// Returns a [`ConnectionId`] group ID for this descriptor.

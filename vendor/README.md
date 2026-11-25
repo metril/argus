@@ -10,7 +10,7 @@ starts with a `// Modified by Argus: <why>` header, as Apache-2.0 section 4 requ
 
 | Crate | Upstream | Version | Local patches |
 |---|---|---|---|
-| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2 |
+| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2, 3, 4 |
 | `wreq-util` | <https://github.com/0x676e67/wreq-util> | 3.0.0-rc.14 | none (vendored so the pair is updated together) |
 
 Only `src/`, `Cargo.toml`, `LICENSE` and `README.md` are kept; tests, examples and lockfiles
@@ -38,6 +38,17 @@ were dropped.
    effect on SOCKS or Unix-socket proxies. Files: `src/proxy.rs`, `src/proxy/matcher.rs`,
    `src/conn/connector.rs` (the connector's resolver field is no longer gated on the `socks`
    feature).
+
+3. **Per-scope TLS session cache key.** `Group::session(scope)` tags a request group with a
+   session scope. The session cache key (`ConnectionDescriptor::session_id`) is the pool key with
+   the request group replaced by that scope, so connections of different request groups but one
+   scope resume each other's TLS sessions and never another scope's. Without a scope the key is the
+   pool key as before. Files: `src/group.rs`, `src/conn/descriptor.rs`, `src/tls/conn.rs`.
+4. **Evict a request group's pooled connections.** `Client::evict_group(&Group)` drops the idle
+   pooled connections opened for requests of a group (matched by the group's name). Busy
+   connections finish their request and age out with the idle timeout. Files: `src/client.rs`,
+   `src/client/layer/client.rs`, `src/client/layer/client/pool.rs`, `src/group.rs`,
+   `src/conn/descriptor.rs`.
 
 ## Updating
 

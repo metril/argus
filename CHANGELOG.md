@@ -8,6 +8,9 @@
   browser's headers untouched and in order. Certificates are still verified against Argus's
   trusted roots inside the handshake. Switching it off uses the previous client, kept for one
   release. WebSockets still use the previous client.
+* Upstream connections of the browser-like client are now pooled per downstream connection (and
+  closed with it), so many browsers no longer share one connection to a site. TLS sessions are
+  resumed per device, never across devices.
 
 ## 0.5.0 — 2026-11-24
 

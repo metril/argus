@@ -1,3 +1,4 @@
+// Modified by Argus: `HttpClient::group_evictor` (patch 4).
 //! Much of this codebase is adapted and refined from [hyper](https://github.com/hyperium/hyper-util),
 
 mod lazy;
@@ -126,6 +127,17 @@ macro_rules! e {
 }
 
 // ===== impl HttpClient =====
+
+impl<C, B> HttpClient<C, B>
+where
+    B: Send + 'static,
+{
+    /// A handle that drops the idle pooled connections opened for one request group.
+    pub(crate) fn group_evictor(&self) -> std::sync::Arc<dyn Fn(&crate::group::Group) + Send + Sync> {
+        let pool = self.pool.clone();
+        std::sync::Arc::new(move |g| pool.evict_where(|k: &ConnectionId| k.in_request_group(g)))
+    }
+}
 
 impl HttpClient<(), ()> {
     /// Create a builder to configure a new [`HttpClient`].

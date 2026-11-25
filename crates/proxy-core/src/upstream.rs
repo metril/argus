@@ -28,6 +28,9 @@ pub struct UpstreamOptions {
     pub dns: Option<Arc<CachedResolver>>,
     /// Idle pooled connections kept per origin; `None` keeps the default of 32.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Bound on the idle pool entries (connection group x origin) of the browser-like client;
+    /// `None`: unbounded.
+    pub pool_max_size: Option<usize>,
     /// Where the certificates upstream servers present are recorded (shared with the web API).
     pub certs: Arc<common::certstore::CertStore>,
     /// The live trusted root set; built from `extra_ca_paths` over the compiled-in floor when
@@ -54,6 +57,10 @@ impl UpstreamOptions {
         // One caching resolver for every dial: the HTTP client, CONNECT and transparent
         // tunnels and WebSocket (through the policy) share it.
         let dns = Arc::new(CachedResolver::from_settings(&config.dns));
+        let max_connections = match config.performance.max_connections {
+            0 => common::config::derive_max_connections(),
+            n => n,
+        };
         Self {
             extra_ca_paths: config.proxy.extra_upstream_ca_paths.clone(),
             resolve_all_to: None,
@@ -67,12 +74,8 @@ impl UpstreamOptions {
             roots: None,
             browser_like: config.proxy.upstream.browser_like,
             dns: Some(dns.clone()),
-            pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
-                match config.performance.max_connections {
-                    0 => common::config::derive_max_connections(),
-                    n => n,
-                },
-            )),
+            pool_max_idle_per_host: Some(common::config::pool_idle_per_host(max_connections)),
+            pool_max_size: Some(common::config::pool_total_idle(max_connections)),
             policy: Arc::new(
                 DestPolicy::from_config(config)
                     .unwrap_or_else(|e| {
@@ -620,6 +623,7 @@ pub struct UpstreamRequest {
     headers: hyper::HeaderMap,
     bad_header: Option<String>,
     body: Option<UpstreamBody>,
+    scope: Option<UpstreamScope>,
 }
 
 enum UpstreamBody {
@@ -636,11 +640,20 @@ impl UpstreamClient {
             headers: Default::default(),
             bad_header: None,
             body: None,
+            scope: None,
         }
     }
 
     pub fn get(&self, url: impl AsRef<str>) -> UpstreamRequest {
         self.request(hyper::Method::GET, url)
+    }
+
+    /// Drop the idle upstream connections pooled for downstream connection `conn_id`.
+    pub fn evict_conn(&self, conn_id: u64) {
+        if let Self::Wreq(c) = self {
+            c.evict_group(&wreq::Group::new(conn_id));
+            c.evict_group(&wreq::Group::new(format!("{conn_id}{RETRY_SUFFIX}")));
+        }
     }
 
     /// Whether this is the browser-like client.
@@ -662,6 +675,13 @@ impl UpstreamRequest {
             }
             _ => self.bad_header = Some("invalid header name or value".into()),
         }
+        self
+    }
+
+    /// Pool this request's upstream connection with its downstream connection's other requests
+    /// (browser-like client only).
+    pub fn scope(mut self, scope: UpstreamScope) -> Self {
+        self.scope = Some(scope);
         self
     }
 
@@ -716,8 +736,11 @@ impl UpstreamRequest {
                 // through as they came, in their order.
                 let profile = crate::browser_profile::BrowserProfile::classify(&self.headers);
                 let orig = crate::browser_profile::orig_headers(&profile, self.headers.keys());
-                let mut rb = c
-                    .request(self.method, &self.url)
+                let mut rb = c.request(self.method, &self.url);
+                if let Some(s) = &self.scope {
+                    rb = rb.group(s.group(""));
+                }
+                let mut rb = rb
                     .emulation(profile.emulation())
                     .default_headers(false)
                     .headers(self.headers)
@@ -819,6 +842,31 @@ fn resolver_of(opts: &UpstreamOptions, strict: bool) -> PolicyResolver {
     }
 }
 
+/// Group suffix of the retry of a failed request: a fresh connection, never the failed one.
+const RETRY_SUFFIX: &str = "#r";
+
+/// Idle upstream connections kept per (downstream connection, origin) by the browser-like client.
+const WREQ_IDLE_PER_HOST: usize = 6;
+
+/// Where a request's upstream connection lives: the pool group of its downstream connection, and
+/// the device whose TLS sessions it may resume (the browser-like client only).
+#[derive(Debug, Clone)]
+pub struct UpstreamScope {
+    pub conn_id: u64,
+    pub device: Arc<str>,
+}
+
+impl UpstreamScope {
+    fn group(&self, suffix: &str) -> wreq::Group {
+        if suffix.is_empty() {
+            wreq::Group::new(self.conn_id)
+        } else {
+            wreq::Group::new(format!("{}{suffix}", self.conn_id))
+        }
+        .session(self.device.to_string())
+    }
+}
+
 /// The browser-like client: BoringSSL with the shared root set verified in the handshake. The
 /// browser profile (TLS and HTTP/2 fingerprint) is chosen per request.
 fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
@@ -832,11 +880,19 @@ fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
         .redirect(wreq::redirect::Policy::none())
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(60)))
-        .pool_max_idle_per_host(opts.pool_max_idle_per_host.unwrap_or(32))
-        .pool_idle_timeout(Duration::from_secs(60))
+        // Connections are pooled per downstream connection (and origin), so a few idle ones
+        // each are plenty; the whole pool is bounded by `pool_max_size`. A group's connections
+        // are evicted when its downstream connection closes; the idle timeout is the backstop.
+        .pool_max_idle_per_host(
+            opts.pool_max_idle_per_host
+                .unwrap_or(32)
+                .min(WREQ_IDLE_PER_HOST),
+        )
+        .pool_max_size(opts.pool_max_size.unwrap_or(0))
+        .pool_idle_timeout(Duration::from_secs(30))
         .tls_custom_verify(verify)
-        // Sessions kept per host for resumption (the default keeps 8).
-        .tls_session_cache(Arc::new(wreq::tls::session::LruTlsSessionCache::new(256)))
+        // Sessions kept per device and host for resumption (the default keeps 8).
+        .tls_session_cache(Arc::new(wreq::tls::session::LruTlsSessionCache::new(32)))
         .dns_resolver(Arc::new(resolver_of(opts, strict)));
     if let Some(t) = opts.connect_timeout {
         b = b.connect_timeout(t);

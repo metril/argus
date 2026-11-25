@@ -467,6 +467,12 @@ impl ProxyContext {
         let _ = self.bypass.set(engine);
     }
 
+    /// Close the idle upstream connections that served downstream connection `conn_id`.
+    pub fn evict_conn(&self, conn_id: u64) {
+        self.client.load().evict_conn(conn_id);
+        self.strict_client.load().evict_conn(conn_id);
+    }
+
     /// The shared pooled upstream client.
     pub fn client(&self) -> UpstreamClient {
         (**self.client.load()).clone()
@@ -688,6 +694,7 @@ impl ProxyContext {
                 strict_client: &self.strict_client.load(),
                 policy: &self.policy,
                 resolve_all_to: self.resolve_all_to,
+                scope: rctx.upstream_scope(),
             };
             return Ok(self.internal.handle(req, &host, &origin, rctx, &up).await);
         }
@@ -923,6 +930,9 @@ impl ProxyContext {
             }
         }
         let mut rb = client.request(method.clone(), &dial_url);
+        if let Some(s) = rctx.upstream_scope() {
+            rb = rb.scope(s);
+        }
         if let Some(h) = host_override {
             rb = rb.header(HOST, h);
         }

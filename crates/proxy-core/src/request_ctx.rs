@@ -144,9 +144,23 @@ pub struct RequestCtx {
     /// The cookie store (Firefox container, private window) the connection's credentials named;
     /// empty for the default store and for Chrome.
     pub ext_store: Option<Arc<str>>,
+    /// Identity of the downstream connection (0: none), the pool group of its upstream
+    /// connections.
+    pub conn_id: u64,
+    /// The device this connection belongs to (token device, else extension session, else client
+    /// IP): the scope within which TLS sessions are resumed.
+    pub device: Option<Arc<str>>,
 }
 
 impl RequestCtx {
+    /// Where this request's upstream connections are pooled and its TLS sessions resumed.
+    pub fn upstream_scope(&self) -> Option<crate::upstream::UpstreamScope> {
+        (self.conn_id != 0).then(|| crate::upstream::UpstreamScope {
+            conn_id: self.conn_id,
+            device: self.device.clone().unwrap_or_else(|| Arc::from("")),
+        })
+    }
+
     pub fn new(profile: ProfileSlot, client_addr: SocketAddr, auth_user: Option<Arc<str>>) -> Self {
         Self {
             profile,
@@ -157,7 +171,15 @@ impl RequestCtx {
             listener: None,
             ext: None,
             ext_store: None,
+            conn_id: 0,
+            device: None,
         }
+    }
+
+    fn with_conn(mut self, conn_id: u64, device: Arc<str>) -> Self {
+        self.conn_id = conn_id;
+        self.device = Some(device);
+        self
     }
 
     fn with_listener(
@@ -214,6 +236,20 @@ pub struct ConnCtx {
     ext_store: OnceLock<Arc<str>>,
     /// Local address the connection was accepted on.
     local_ip: OnceLock<std::net::IpAddr>,
+    /// Process-unique id of this connection.
+    id: u64,
+    /// Called with `id` when the connection is gone (drops its upstream connections).
+    on_close: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+}
+
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Drop for ConnCtx {
+    fn drop(&mut self) {
+        if let Some(f) = self.on_close.get() {
+            f(self.id);
+        }
+    }
 }
 
 impl ConnCtx {
@@ -221,10 +257,18 @@ impl ConnCtx {
     /// explicit connection).
     pub fn new(profiles: &Profiles, client_addr: SocketAddr) -> Self {
         let (slot, epoch) = profiles.resolve_by_digest(client_addr.ip(), None);
+        let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+        let device: Arc<str> = Arc::from(format!("i:{}", client_addr.ip()));
         Self {
             client_addr,
             digest: OnceLock::new(),
-            cur: ArcSwap::from_pointee(RequestCtx::new(slot, client_addr, None).at_epoch(epoch)),
+            cur: ArcSwap::from_pointee(
+                RequestCtx::new(slot, client_addr, None)
+                    .at_epoch(epoch)
+                    .with_conn(id, device),
+            ),
+            id,
+            on_close: OnceLock::new(),
             awaiting_token: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
             transparent: AtomicBool::new(false),
@@ -235,6 +279,29 @@ impl ConnCtx {
             ext_store: OnceLock::new(),
             local_ip: OnceLock::new(),
         }
+    }
+
+    /// This connection's id.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Register what runs (once, with the id) when the connection ends.
+    pub fn set_on_close(&self, f: Box<dyn Fn(u64) + Send + Sync>) {
+        let _ = self.on_close.set(f);
+    }
+
+    /// The device identity: the device token when known, else the extension session, else the
+    /// client address.
+    fn device_key(&self) -> Arc<str> {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        if let Some(d) = self.digest.get() {
+            return Arc::from(format!("t:{}", hex(d)));
+        }
+        if let Some(s) = self.ext_session() {
+            return Arc::from(format!("x:{s}"));
+        }
+        Arc::from(format!("i:{}", self.client_addr.ip()))
     }
 
     /// Mark the connection as accepted on the extension-only listener.
@@ -360,6 +427,7 @@ impl ConnCtx {
         }
         let mut ctx = RequestCtx::new(slot, self.client_addr, None)
             .at_epoch(epoch)
+            .with_conn(self.id, self.device_key())
             .with_listener(
                 self.transparent.load(Ordering::Relaxed),
                 self.listener.load_full(),
@@ -394,6 +462,33 @@ mod tests {
         let engine = ctx.profile.load().engine.clone();
         slot.store(Arc::new(Profile::new(DEFAULT_PROFILE_ID, 1, engine)));
         assert_eq!(ctx.profile.load().generation, 1);
+    }
+
+    #[test]
+    fn connections_have_distinct_ids_a_device_scope_and_a_close_hook() {
+        let default = default_profile_slot(Arc::new(SharedEngine::new()));
+        let profiles = Profiles::new(default);
+        let a = ConnCtx::new(&profiles, "10.0.0.5:4000".parse().unwrap());
+        let b = ConnCtx::new(&profiles, "10.0.0.5:4001".parse().unwrap());
+        assert_ne!(a.id(), b.id());
+        let (sa, sb) = (
+            a.current(&profiles, false).upstream_scope().unwrap(),
+            b.current(&profiles, false).upstream_scope().unwrap(),
+        );
+        assert_eq!((sa.conn_id, sb.conn_id), (a.id(), b.id()));
+        // Same client IP: same device; a token makes it another one.
+        assert_eq!(sa.device, sb.device);
+        b.set_token(&profiles, [7; 32]);
+        assert_ne!(
+            b.current(&profiles, false).upstream_scope().unwrap().device,
+            sa.device
+        );
+        let closed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let c = closed.clone();
+        let id = a.id();
+        a.set_on_close(Box::new(move |i| c.store(i, Ordering::SeqCst)));
+        drop(a);
+        assert_eq!(closed.load(Ordering::SeqCst), id);
     }
 
     fn table_for(ip: &str, id: u64, default: &ProfileSlot) -> crate::profiles::ProfileTable {

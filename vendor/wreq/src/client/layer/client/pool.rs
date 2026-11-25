@@ -1,3 +1,4 @@
+// Modified by Argus: `Pool::evict_where` (evict one downstream connection's upstream connections, patch 4).
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -143,6 +144,26 @@ impl<T, K: Key> Pool<T, K> {
 }
 
 impl<T: Poolable, K: Key> Pool<T, K> {
+    /// Drop every idle connection (and parked waiter) whose key `matches`.
+    pub fn evict_where(&self, matches: impl Fn(&K) -> bool) {
+        let Some(ref enabled) = self.inner else {
+            return;
+        };
+        let mut inner = enabled.lock();
+        let keys: Vec<K> = inner
+            .idle
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| matches(k))
+            .cloned()
+            .collect();
+        let evicted: Vec<_> = keys.iter().filter_map(|k| inner.idle.pop(k)).collect();
+        inner.waiters.retain(|k, _| !matches(k));
+        // Dropped outside the lock: closing a connection can run arbitrary drop code.
+        drop(inner);
+        drop(evicted);
+    }
+
     /// Returns a `Checkout` which is a future that resolves if an idle
     /// connection becomes available.
     pub fn checkout(&self, key: K) -> Checkout<T, K> {

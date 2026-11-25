@@ -1,4 +1,4 @@
-// Modified by Argus: add `ClientBuilder::tls_custom_verify` (patch 1).
+// Modified by Argus: add `ClientBuilder::tls_custom_verify` (patch 1) and `Client::evict_group` (patch 4).
 pub(super) mod body;
 pub(super) mod emulate;
 pub(super) mod future;
@@ -66,6 +66,7 @@ use crate::{
     },
     dns::{DnsResolverWithOverrides, DynResolver, GaiResolver, IntoResolve, Resolve},
     error::{self, Error},
+    group::Group,
     header::OrigHeaderMap,
     http1::Http1Options,
     http2::Http2Options,
@@ -150,7 +151,10 @@ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
 ///
 /// [`Rc`]: std::rc::Rc
 #[derive(Clone)]
-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
+pub struct Client(
+    Arc<Either<ClientService, BoxedClientService>>,
+    Arc<dyn Fn(&Group) + Send + Sync>,
+);
 
 /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
 #[must_use]
@@ -237,6 +241,13 @@ impl Default for Client {
 }
 
 impl Client {
+    /// Drops the idle pooled connections that were opened for requests of `group` (see
+    /// [`RequestBuilder::group`]; groups match by their name). Connections serving a request
+    /// right now finish it, and are dropped when they next go idle only by the idle timeout.
+    pub fn evict_group(&self, group: &Group) {
+        (self.1)(group)
+    }
+
     /// Constructs a new [`Client`].
     ///
     /// # Panics
@@ -487,7 +498,7 @@ impl ClientBuilder {
         }
 
         // Create base client service
-        let service = {
+        let (service, evictor) = {
             let resolver = {
                 let mut resolver: Arc<dyn Resolve> = match config.dns_resolver {
                     Some(dns_resolver) => dns_resolver,
@@ -574,7 +585,7 @@ impl ClientBuilder {
                 builder = builder.cookie_store(config.cookie_store);
             }
 
-            builder
+            let http = builder
                 .http1_options(config.http1_options)
                 .http2_options(config.http2_options)
                 .http2_only(matches!(config.http_version_pref, HttpVersionPref::Http2))
@@ -583,7 +594,9 @@ impl ClientBuilder {
                 .pool_idle_timeout(config.pool_idle_timeout)
                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
                 .pool_max_size(config.pool_max_size)
-                .build(connector)
+                .build(connector);
+            let evictor = http.group_evictor();
+            (http, evictor)
         };
 
         // Configured client service with layers
@@ -639,7 +652,7 @@ impl ClientBuilder {
             }
         };
 
-        Ok(Client(Arc::new(client)))
+        Ok(Client(Arc::new(client), evictor))
     }
 
     // Runtime options

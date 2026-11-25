@@ -824,6 +824,12 @@ pub fn pool_idle_per_host(max_connections: usize) -> usize {
     (max_connections / 16).clamp(1, 32)
 }
 
+/// Upper bound on the (connection group, origin) entries the browser-like upstream client keeps
+/// idle: a quarter of the connection budget, so the pool never holds more descriptors than that.
+pub fn pool_total_idle(max_connections: usize) -> usize {
+    (max_connections / 4).max(16)
+}
+
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit (once per process) and return the limit now
 /// in force; `u64::MAX` means unlimited. `None` when it cannot be read.
 pub fn raise_nofile_limit() -> Option<u64> {
