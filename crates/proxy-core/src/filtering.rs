@@ -1019,6 +1019,9 @@ impl ProxyContext {
             }
             rb = rb.header(name, value);
         }
+        // One deadline for the whole request: reading a held body and sending it.
+        let started = std::time::Instant::now();
+        let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);
         if has_body {
             // A small body (declared length) is held, so a request that fails on a stale
             // upstream connection can be sent again; anything else streams, and is never replayed.
@@ -1028,8 +1031,11 @@ impl ProxyContext {
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .is_some_and(|n| n <= crate::upstream::MAX_REPLAY_BODY);
             if small {
-                let ms = self.request_timeout_ms.load(Ordering::Relaxed);
-                let limit = Duration::from_millis(if ms == 0 { u64::MAX / 4 } else { ms });
+                let limit = Duration::from_millis(if timeout_ms == 0 {
+                    u64::MAX / 4
+                } else {
+                    timeout_ms
+                });
                 match tokio::time::timeout(limit, body.collect()).await {
                     Ok(Ok(c)) => rb = rb.body(c.to_bytes()),
                     Ok(Err(_)) => {
@@ -1053,11 +1059,15 @@ impl ProxyContext {
             }
         }
 
-        let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);
         let sent = if timeout_ms == 0 {
             rb.send().await
         } else {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), rb.send()).await {
+            match tokio::time::timeout(
+                Duration::from_millis(timeout_ms).saturating_sub(started.elapsed()),
+                rb.send(),
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(_) => {
                     common::faults::note(common::faults::Fault::UpstreamTimeout, &host);

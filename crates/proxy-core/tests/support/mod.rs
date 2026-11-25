@@ -121,6 +121,69 @@ pub fn ok_script() -> Script {
 }
 
 pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Origin {
+    h2_origin_with(chain, key, script, Arc::new(|_| false)).await
+}
+
+/// An HTTP/1.1 origin that says keep-alive and then closes the connection after each response.
+pub async fn h1_closing_origin(chain: Vec<Vec<u8>>, key: KeyPair) -> Origin {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        chain.into_iter().map(CertificateDer::from).collect(),
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+    )
+    .unwrap();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stats = Arc::new(Stats::default());
+    let st = stats.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let (acceptor, st) = (acceptor.clone(), st.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                st.conns.fetch_add(1, Ordering::SeqCst);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => buf.extend_from_slice(&chunk[..k]),
+                    }
+                }
+                st.requests.fetch_add(1, Ordering::SeqCst);
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok",
+                    )
+                    .await;
+                // Gone without a close_notify, right after promising to keep the connection.
+                drop(tls);
+            });
+        }
+    });
+    Origin { port, stats }
+}
+
+/// Like [`h2_origin`]; `early(conn)` makes that connection send GOAWAY before any stream.
+pub async fn h2_origin_with(
+    chain: Vec<Vec<u8>>,
+    key: KeyPair,
+    script: Script,
+    early: Arc<dyn Fn(usize) -> bool + Send + Sync>,
+) -> Origin {
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -143,7 +206,8 @@ pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Ori
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
-            let (acceptor, st, script) = (acceptor.clone(), st.clone(), script.clone());
+            let (acceptor, st, script, early) =
+                (acceptor.clone(), st.clone(), script.clone(), early.clone());
             st.tcp.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
@@ -158,7 +222,7 @@ pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Ori
                     st.resumed.fetch_add(1, Ordering::SeqCst);
                 }
                 st.open.fetch_add(1, Ordering::SeqCst);
-                serve(tls, idx, st.clone(), script).await;
+                serve(tls, idx, st.clone(), script, early(idx)).await;
                 st.open.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -171,10 +235,16 @@ async fn serve(
     idx: usize,
     st: Arc<Stats>,
     script: Script,
+    early_goaway: bool,
 ) {
     let Ok(mut conn) = h2::server::handshake(tls).await else {
         return;
     };
+    if early_goaway {
+        conn.abrupt_shutdown(h2::Reason::NO_ERROR);
+        while conn.accept().await.is_some() {}
+        return;
+    }
     while let Some(Ok((_req, mut respond))) = conn.accept().await {
         st.requests.fetch_add(1, Ordering::SeqCst);
         let n = {

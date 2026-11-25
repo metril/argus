@@ -31,6 +31,8 @@ pub struct UpstreamOptions {
     /// Bound on the idle pool entries (connection group x origin) of the browser-like client;
     /// `None`: unbounded.
     pub pool_max_size: Option<usize>,
+    /// Cap on the TLS sessions kept for resumption, over all devices and hosts; `None`: 4096.
+    pub tls_session_cap: Option<usize>,
     /// Where the certificates upstream servers present are recorded (shared with the web API).
     pub certs: Arc<common::certstore::CertStore>,
     /// The live trusted root set; built from `extra_ca_paths` over the compiled-in floor when
@@ -103,6 +105,7 @@ impl UpstreamOptions {
             dns: Some(dns),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(max_connections)),
             pool_max_size: Some(common::config::pool_total_idle(max_connections)),
+            tls_session_cap: None,
             policy,
         }
     }
@@ -709,7 +712,13 @@ impl UpstreamClient {
     pub fn evict_conn(&self, conn_id: u64) {
         if let Self::Wreq(c) | Self::WreqPlain(c) = self {
             c.evict_group(&wreq::Group::new(conn_id));
-            c.evict_group(&wreq::Group::new(format!("{conn_id}{RETRY_SUFFIX}")));
+        }
+    }
+
+    /// Drop the idle connections of the retry group `name` (see [`RETRY_SEQ`]).
+    fn evict_named(&self, name: String) {
+        if let Self::Wreq(c) | Self::WreqPlain(c) = self {
+            c.evict_group(&wreq::Group::new(name));
         }
     }
 
@@ -774,34 +783,45 @@ impl UpstreamRequest {
             scope,
             ..
         } = self;
-        // Replayable: no body, or one fully buffered (and small); never a stream. A method that
-        // is not idempotent is only replayed with a buffered body, which the caller chose to
-        // hold for exactly this.
+        // Replayable: no body, or one fully buffered (and small); never a stream. Being
+        // replayable allows a retry, it never justifies one: see `UpstreamError::never_ran`.
         let replay = match &body {
-            None => idempotent(&method).then_some(None),
+            None => Some(None),
             Some(UpstreamBody::Bytes(b)) if b.len() <= MAX_REPLAY_BODY => Some(Some(b.clone())),
             Some(_) => None,
         }
         .map(|b| (headers.clone(), b));
         let first = send_once(&client, &method, &url, headers, body, scope.as_ref(), "").await;
         match (first, replay) {
-            (Err(e), Some((headers, body))) if e.is_retryable() => {
+            (Err(e), Some((headers, body)))
+                if e.never_ran() || (idempotent(&method) && e.is_retryable()) =>
+            {
                 let host = url::Url::parse(&url)
                     .ok()
                     .and_then(|u| u.host_str().map(str::to_string))
                     .unwrap_or_default();
                 common::faults::note(common::faults::Fault::UpstreamRetry, &host);
                 tracing::debug!("Retrying {url} on a new connection after: {e}");
-                send_once(
+                let suffix = format!(
+                    "#r{}",
+                    RETRY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                let r = send_once(
                     &client,
                     &method,
                     &url,
                     headers,
                     body.map(UpstreamBody::Bytes),
                     scope.as_ref(),
-                    RETRY_SUFFIX,
+                    &suffix,
                 )
-                .await
+                .await;
+                // Used once: its connection serves this response and is not pooled for others.
+                client.evict_named(match &scope {
+                    Some(s) => format!("{}{suffix}", s.conn_id),
+                    None => suffix,
+                });
+                r
             }
             (r, _) => r,
         }
@@ -862,7 +882,7 @@ async fn send_once(
             let mut rb = c.request(method.clone(), url);
             match scope {
                 Some(s) => rb = rb.group(s.group(suffix)),
-                None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(RETRY_SUFFIX)),
+                None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(suffix.to_string())),
                 None => {}
             }
             if browser {
@@ -898,6 +918,27 @@ async fn send_once(
 }
 
 impl UpstreamError {
+    /// Whether the request provably never ran at the origin: the stream was refused
+    /// (REFUSED_STREAM), so any method may be sent again. A reset, EOF or GOAWAY says nothing
+    /// about whether the origin processed the request; those only justify a retry of an
+    /// idempotent method ([`Self::is_retryable`]).
+    pub fn never_ran(&self) -> bool {
+        match self {
+            Self::Wreq(e) => {
+                !e.is_retried()
+                    && chain_has(std::error::Error::source(e), |err| {
+                        err.downcast_ref::<http2::Error>()
+                            .is_some_and(|h| h.reason() == Some(http2::Reason::REFUSED_STREAM))
+                    })
+            }
+            Self::Reqwest(e) => chain_has(std::error::Error::source(e), |err| {
+                err.downcast_ref::<h2::Error>()
+                    .is_some_and(|h| h.reason() == Some(h2::Reason::REFUSED_STREAM))
+            }),
+            Self::Invalid(_) => false,
+        }
+    }
+
     /// Whether the failure says the connection was at fault before any response head arrived,
     /// so one more try on a fresh connection is sound: a connection reset, an HTTP/2 GOAWAY or
     /// REFUSED_STREAM, or a TLS stream that ended without a close (on an established
@@ -909,7 +950,9 @@ impl UpstreamError {
         }
         match self {
             Self::Wreq(e) => {
-                !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
+                !e.is_timeout()
+                    && !e.is_retried()
+                    && retryable_chain(std::error::Error::source(e), e.is_connect())
             }
             Self::Reqwest(e) => {
                 !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
@@ -917,6 +960,20 @@ impl UpstreamError {
             Self::Invalid(_) => false,
         }
     }
+}
+
+fn chain_has(
+    first: Option<&(dyn std::error::Error + 'static)>,
+    f: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    let mut cur = first;
+    while let Some(err) = cur {
+        if f(err) {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 /// Walk the typed source chain for a failure of the connection itself. `connecting`: the error
@@ -1065,8 +1122,82 @@ fn resolver_of(
     }
 }
 
-/// Group suffix of the retry of a failed request: a fresh connection, never the failed one.
-const RETRY_SUFFIX: &str = "#r";
+/// Counter that makes the group of every retry unique, so a retry never finds the idle
+/// connection of an earlier one.
+static RETRY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+const DEFAULT_TLS_SESSIONS: usize = 4096;
+/// Sessions older than this are not offered (also bounded by the ticket's own lifetime).
+const SESSION_TTL: Duration = Duration::from_secs(2 * 3600);
+/// Sessions kept per (device, origin).
+const SESSIONS_PER_KEY: usize = 8;
+
+/// TLS session cache with a global cap and a lifetime: the oldest session goes first when full,
+/// and a session past its TTL (or its ticket's lifetime) is never offered. TLS 1.3 sessions are
+/// single use.
+pub struct BoundedSessionCache {
+    cap: usize,
+    ttl: Duration,
+    entries: parking_lot::Mutex<
+        std::collections::VecDeque<(
+            wreq::tls::session::Key,
+            wreq::tls::session::TlsSession,
+            std::time::Instant,
+        )>,
+    >,
+}
+
+impl BoundedSessionCache {
+    pub fn new(cap: usize, ttl: Duration) -> Self {
+        Self {
+            cap: cap.max(1),
+            ttl,
+            entries: Default::default(),
+        }
+    }
+
+    fn expired(&self, s: &wreq::tls::session::TlsSession, at: std::time::Instant) -> bool {
+        let life = self.ttl.min(Duration::from_secs(u64::from(s.timeout())));
+        at.elapsed() > life
+    }
+}
+
+impl wreq::tls::session::TlsSessionCache for BoundedSessionCache {
+    fn put(&self, key: wreq::tls::session::Key, session: wreq::tls::session::TlsSession) {
+        let mut e = self.entries.lock();
+        e.push_back((key.clone(), session, std::time::Instant::now()));
+        // Oldest first, so expired ones are at the front.
+        while e.front().is_some_and(|(_, s, at)| self.expired(s, *at)) {
+            e.pop_front();
+        }
+        while e.len() > self.cap {
+            e.pop_front();
+        }
+        let same: Vec<usize> = e
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _, _))| *k == key)
+            .map(|(i, _)| i)
+            .collect();
+        if same.len() > SESSIONS_PER_KEY {
+            e.remove(same[0]);
+        }
+    }
+
+    fn pop(&self, key: &wreq::tls::session::Key) -> Option<wreq::tls::session::TlsSession> {
+        let mut e = self.entries.lock();
+        let i = e
+            .iter()
+            .rposition(|(k, s, at)| k == key && !self.expired(s, *at))?;
+        let (_, s, at) = e.get(i)?.clone();
+        // A TLS 1.3 ticket must not be used twice.
+        if s.protocol_version() == wreq::tls::TlsVersion::TLS_1_3 {
+            e.remove(i);
+        }
+        let _ = at;
+        Some(s)
+    }
+}
 
 /// Idle upstream connections kept per (downstream connection, origin) by the browser-like client.
 const WREQ_IDLE_PER_HOST: usize = 6;
@@ -1119,8 +1250,11 @@ fn build_wreq(
         .pool_max_size(opts.pool_max_size.unwrap_or(0))
         .pool_idle_timeout(Duration::from_secs(30))
         .tls_custom_verify(verify)
-        // Sessions kept per device and host for resumption (the default keeps 8).
-        .tls_session_cache(Arc::new(wreq::tls::session::LruTlsSessionCache::new(32)))
+        // Sessions kept per device and host for resumption, bounded overall and in age.
+        .tls_session_cache(Arc::new(BoundedSessionCache::new(
+            opts.tls_session_cap.unwrap_or(DEFAULT_TLS_SESSIONS),
+            SESSION_TTL,
+        )))
         .dns_resolver(Arc::new(resolver_of(opts, strict, proxy.clone())));
     // Never the environment's proxy: it would bypass the destination policy.
     b = match &proxy {

@@ -941,7 +941,7 @@ pub fn pool_idle_per_host(max_connections: usize) -> usize {
     (max_connections / 16).clamp(1, 32)
 }
 
-/// Upper bound on the (connection group, origin) entries the browser-like upstream client keeps
+/// Upper bound on the idle connections (over all groups and origins) the browser-like upstream client keeps
 /// idle: a quarter of the connection budget, so the pool never holds more descriptors than that.
 pub fn pool_total_idle(max_connections: usize) -> usize {
     (max_connections / 4).max(16)
