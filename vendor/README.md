@@ -48,7 +48,8 @@ were dropped.
    pooled connections opened for requests of a group (matched by the group's name). Busy
    connections finish their request and age out with the idle timeout. Files: `src/client.rs`,
    `src/client/layer/client.rs`, `src/client/layer/client/pool.rs`, `src/group.rs`,
-   `src/conn/descriptor.rs`.
+   `src/conn/descriptor.rs`. `pool_max_size` now bounds the idle connections over all keys
+   (the oldest idle connection of the least recently used key is dropped first), not the keys.
 
 ## Updating
 
