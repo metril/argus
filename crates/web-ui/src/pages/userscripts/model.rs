@@ -344,8 +344,13 @@ pub fn perm_items(
         v.push((
             "code",
             format!(
-                "Uses {n_require} external librar{}",
-                if n_require == 1 { "y" } else { "ies" }
+                "Uses {n_require} external librar{}. Runs third-party code fetched at install time with this script's full access.{}",
+                if n_require == 1 { "y" } else { "ies" },
+                if unhashed {
+                    " No integrity hash, so Argus can't verify it's the file the author published."
+                } else {
+                    ""
+                }
             ),
             unhashed,
         ));
@@ -504,7 +509,16 @@ mod tests {
         // The catalogue and the review use the same phrase for the same facts.
         let any = perm_summary(&entry("xhr", &["*"], &["https://cdn.test/x.js"]));
         assert!(any.contains(&("bolt", "Can contact any site".to_string(), true)));
-        assert!(any.contains(&("code", "Uses 1 external library".to_string(), true)));
+        assert!(any.contains(&(
+            "code",
+            "Uses 1 external library. Runs third-party code fetched at install time with this script's full access. No integrity hash, so Argus can't verify it's the file the author published.".to_string(),
+            true
+        )));
+        let hashed = perm_items(&[], &[], 2, false);
+        assert_eq!(
+            hashed[0].1,
+            "Uses 2 external libraries. Runs third-party code fetched at install time with this script's full access."
+        );
         let none = perm_items(&["GM_xmlhttpRequest".into()], &[], 0, false);
         assert_eq!(
             none[0].1,

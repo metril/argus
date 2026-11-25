@@ -197,6 +197,9 @@ pub fn install_shared_resolver(resolver: Arc<dyn NameResolver>) -> bool {
     SHARED_RESOLVER.set(resolver).is_ok()
 }
 
+/// How long a name is resolved to decide whether it is the web UI endpoint.
+const WEB_UI_LOOKUP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Which upstream addresses the proxy may connect to.
 #[derive(Default)]
 pub struct NetPolicy {
@@ -206,6 +209,9 @@ pub struct NetPolicy {
     /// Host names whose private (but never reserved) resolved addresses are accepted.
     allowed_hosts: Vec<String>,
     own: RwLock<Own>,
+    /// The web UI endpoint `(port, bound address)`. Not an own listener: the proxy routes
+    /// requests to it straight to that listener (see [`Self::web_ui_addr`]).
+    web_ui: RwLock<Option<(u16, Option<IpAddr>)>>,
 }
 
 impl fmt::Debug for NetPolicy {
@@ -256,6 +262,7 @@ impl NetPolicy {
             rules: RwLock::new((block_private, parse_nets(allowed_destinations)?)),
             allowed_hosts: Vec::new(),
             own: RwLock::default(),
+            web_ui: RwLock::default(),
             resolver: None,
         })
     }
@@ -285,6 +292,67 @@ impl NetPolicy {
             .map(|a| canonical(*a))
             .filter(|a| !a.is_unspecified())
             .collect();
+    }
+
+    /// Record where the web UI listens (`None` bound address: any, reached on loopback).
+    pub fn set_web_ui(&self, endpoint: Option<(u16, Option<IpAddr>)>) {
+        *self.web_ui.write() = endpoint.map(|(p, ip)| (p, ip.map(canonical)));
+    }
+
+    /// Whether `host:port` names the web UI endpoint AND `client` could reach it directly, so
+    /// that routing it there widens nothing: an unparseable or loopback bind is reachable only
+    /// by loopback clients, a specific bind only at that address, a wildcard bind at any
+    /// address the client's proxy connection arrived on (`client_local`; loopback names only
+    /// for loopback clients). Names must
+    /// resolve (within a short timeout) to at least one address that satisfies this.
+    pub async fn is_web_ui(
+        &self,
+        host: &str,
+        port: u16,
+        override_ip: Option<IpAddr>,
+        client: IpAddr,
+        client_local: Option<IpAddr>,
+    ) -> bool {
+        let Some((wp, bound)) = *self.web_ui.read() else {
+            return false;
+        };
+        if wp != port {
+            return false;
+        }
+        // Fail closed: an unknown bind address counts as loopback.
+        let bound = bound.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let client_loopback = canonical(client).is_loopback();
+        let client_local = client_local.map(canonical);
+        let reach = |ip: IpAddr| {
+            let ip = canonical(ip);
+            if bound.is_unspecified() {
+                // A v4 wildcard listener cannot serve a v6 address.
+                if bound.is_ipv4() && ip.is_ipv6() {
+                    return false;
+                }
+                if ip.is_loopback() || ip.is_unspecified() {
+                    client_loopback
+                } else {
+                    // Only the address this client's proxy connection arrived on: the client
+                    // reached the proxy there, so it could reach the web UI there too.
+                    client_local == Some(ip)
+                }
+            } else {
+                ip == bound && (!bound.is_loopback() || client_loopback)
+            }
+        };
+        let bare = unbracket(host);
+        match bare.parse::<IpAddr>() {
+            Ok(ip) => reach(ip),
+            Err(_) if override_ip.is_some() => false,
+            Err(_) => {
+                let looked = tokio::time::timeout(WEB_UI_LOOKUP, self.lookup(bare, port)).await;
+                match looked {
+                    Ok(Ok(addrs)) => addrs.iter().any(|a| reach(a.ip())),
+                    _ => false,
+                }
+            }
+        }
     }
 
     /// Whether `port` is one of the proxy's own listening ports.
@@ -771,6 +839,69 @@ mod tests {
         assert_eq!(p.check(ip("10.0.0.8"), 8080), Ok(()));
         assert_eq!(p.check_ip_strict(ip("10.0.0.7")), Err(Refusal::OwnListener));
         assert_eq!(p.check_ip(ip("10.0.0.7")), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn web_ui_port_is_self_but_proxy_ports_stay_refused() {
+        let p = NetPolicy::new(false, &[]).unwrap();
+        p.set_own_listeners(&[8080], &[]);
+        let (lo, remote) = (ip("127.0.0.1"), ip("203.0.113.9"));
+        // Wildcard bind: loopback names only for loopback clients.
+        p.set_web_ui(Some((3000, Some(ip("0.0.0.0")))));
+        assert!(p.is_web_ui("127.0.0.1", 3000, None, lo, Some(lo)).await);
+        assert!(p.is_web_ui("localhost", 3000, None, lo, Some(lo)).await);
+        assert!(!p.is_web_ui("[::1]", 3000, None, lo, Some(lo)).await);
+        assert!(
+            !p.is_web_ui("127.0.0.1", 3000, None, remote, Some(ip("10.8.0.1")))
+                .await
+        );
+        assert!(
+            !p.is_web_ui("localhost", 3000, None, remote, Some(ip("10.8.0.1")))
+                .await
+        );
+        // Only the address the client's proxy connection arrived on: a VPN-side client asking
+        // for the LAN address is not self.
+        let (vpn, lan) = (ip("10.8.0.1"), ip("192.168.1.5"));
+        assert!(p.is_web_ui("10.8.0.1", 3000, None, remote, Some(vpn)).await);
+        assert!(
+            !p.is_web_ui("192.168.1.5", 3000, None, remote, Some(vpn))
+                .await
+        );
+        assert!(
+            p.is_web_ui("192.168.1.5", 3000, None, remote, Some(lan))
+                .await
+        );
+        assert!(!p.is_web_ui("192.168.1.5", 3000, None, remote, None).await);
+        // `::` serves both families.
+        p.set_web_ui(Some((3000, Some(ip("::")))));
+        assert!(p.is_web_ui("[::1]", 3000, None, lo, Some(lo)).await);
+        assert!(p.is_web_ui("10.8.0.1", 3000, None, remote, Some(vpn)).await);
+        p.set_web_ui(Some((3000, Some(ip("0.0.0.0")))));
+        // Other ports and other hosts are not the web UI.
+        assert!(!p.is_web_ui("127.0.0.1", 8080, None, lo, Some(lo)).await);
+        assert!(!p.is_web_ui("93.184.216.34", 3000, None, lo, Some(lo)).await);
+        // Whatever misses the handoff is refused: the web UI port stays an own listener.
+        p.set_own_listeners(&[8080, 3000], &[]);
+        assert_eq!(p.check(ip("127.0.0.1"), 8080), Err(Refusal::OwnListener));
+        assert_eq!(p.check(ip("127.0.0.1"), 3000), Err(Refusal::OwnListener));
+        // Loopback bind (or unknown): loopback clients only.
+        p.set_web_ui(Some((3000, Some(ip("127.0.0.1")))));
+        assert!(p.is_web_ui("127.0.0.1", 3000, None, lo, Some(lo)).await);
+        assert!(
+            !p.is_web_ui("127.0.0.1", 3000, None, remote, Some(vpn))
+                .await
+        );
+        p.set_web_ui(Some((3000, None)));
+        assert!(
+            !p.is_web_ui("127.0.0.1", 3000, None, remote, Some(vpn))
+                .await
+        );
+        // Bound to one address: only that address.
+        p.set_web_ui(Some((3000, Some(ip("10.0.0.7")))));
+        assert!(p.is_web_ui("10.0.0.7", 3000, None, remote, None).await);
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, lo, Some(lo)).await);
+        p.set_web_ui(None);
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, lo, Some(lo)).await);
     }
 
     #[tokio::test]

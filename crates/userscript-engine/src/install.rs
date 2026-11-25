@@ -759,11 +759,25 @@ mod tests {
     }
 
     #[test]
+    fn real_bypass_all_shortlinks_header_has_no_compile_warning() {
+        let src = include_str!("../tests/fixtures/bypass_all_shortlinks.meta.js");
+        let p = plan_install(src, None).unwrap();
+        assert!(p.high_warnings.is_empty(), "{:?}", p.high_warnings);
+        assert!(
+            !p.warnings
+                .iter()
+                .any(|w| w.contains("compile") || w.contains("@exclude")),
+            "{:?}",
+            p.warnings
+        );
+    }
+
+    #[test]
     fn dropped_excludes_are_a_high_warning() {
         let p = plan_install(
             &src(
                 "1",
-                "// @match https://a.com/*\n// @exclude /^https:\\/\\/a\\.com\\/(?!ok)/\n// @exclude https://a.com/x*\n// @exclude-match not-a-pattern",
+                "// @match https://a.com/*\n// @exclude /^https:\\/\\/a\\.com\\/(ok/\n// @exclude https://a.com/x*\n// @exclude-match not-a-pattern",
             ),
             None,
         )
@@ -775,7 +789,7 @@ mod tests {
             "{w}"
         );
         assert!(
-            w.contains("(?!ok)") && w.contains("not-a-pattern") && !w.contains("/x*"),
+            w.contains("(ok") && w.contains("not-a-pattern") && !w.contains("/x*"),
             "{w}"
         );
         assert!(p.warnings.contains(w));

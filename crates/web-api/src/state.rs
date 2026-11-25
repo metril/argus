@@ -203,6 +203,8 @@ pub trait RuntimeControl: Send + Sync {
     async fn proxy_bind(&self) -> Option<ProxyBind>;
     /// Tell the proxy where the web API listens (loop protection).
     async fn note_webui(&self, host: &str, port: u16);
+    /// The web server, for in-process handoff of requests the proxy routes to it.
+    fn webui_handoff(&self, _server: Arc<crate::server::WebServer>) {}
     /// Issue the web UI's HTTPS certificate from the Argus CA for `sans` (DNS names and IP
     /// literals). Returns `(certificate PEM, key PEM)`.
     async fn issue_webui_cert(&self, _sans: &[String]) -> Result<(String, String), String> {

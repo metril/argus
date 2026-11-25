@@ -257,7 +257,16 @@ impl ProxyControl {
 
     /// Note where the web API listens (own-listener loop protection); call after it rebinds.
     pub async fn set_webui_listener(&self, host: &str, port: u16) {
-        *self.webui_own.lock() = Some((port, host.parse().ok()));
+        // A name resolves to what it names (`localhost` is loopback, not "any address").
+        let ip = match host.parse().ok() {
+            Some(ip) => Some(ip),
+            None => tokio::net::lookup_host((host, port))
+                .await
+                .ok()
+                .and_then(|mut it| it.next())
+                .map(|a| a.ip()),
+        };
+        *self.webui_own.lock() = Some((port, ip));
         let guard = self.running.lock().await;
         if let Some(r) = guard.as_ref() {
             self.publish_own(&r.explicit, r.transparent.as_ref());
@@ -464,6 +473,11 @@ impl ProxyControl {
     }
 
     /// Tell the destination policy which listeners are the proxy's own (loop protection).
+    /// Register the web server for in-process handoff of requests to the web UI endpoint.
+    pub fn set_web_server(&self, server: Arc<dyn crate::self_route::WebUiHandoff>) {
+        self.ctx.set_web_server(server);
+    }
+
     fn publish_own(&self, explicit: &Listener, transparent: Option<&Listener>) {
         let mut ports: Vec<u16> = Vec::new();
         let mut addrs: Vec<IpAddr> = Vec::new();
@@ -471,10 +485,14 @@ impl ProxyControl {
             ports.push(l.addr.port());
             addrs.push(l.addr.ip());
         }
-        if let Some((port, ip)) = *self.webui_own.lock() {
+        // The web UI endpoint stays an own listener: whatever the in-process handoff did not
+        // take (a miss) is refused like a proxy port. The handoff check runs before the policy.
+        let webui = *self.webui_own.lock();
+        if let Some((port, ip)) = webui {
             ports.push(port);
             addrs.extend(ip);
         }
+        self.ctx.policy().set_web_ui(webui);
         ports.sort_unstable();
         ports.dedup();
         *self.entry_ports.write() = std::iter::once(explicit)
@@ -847,6 +865,7 @@ impl ProxyControl {
                             let shared = shared.clone();
                             let entry = entry.clone();
                             let flags = flags.clone();
+                            let local_ip = stream.local_addr().ok().map(|a| a.ip());
                             let active = flags.open(client_addr.ip());
                             let mut shutdown_rx = shutdown_tx.subscribe();
                             // Spawn a new task to handle this connection; admission already
@@ -854,6 +873,9 @@ impl ProxyControl {
                             spawn_admitted(&self.load_manager, async move {
                                 let _active = active;
                                 let mut handler = ConnectionHandler::with_listener(client_addr, shared, flags, transparent);
+                                if let Some(ip) = local_ip {
+                                    handler = handler.with_local_ip(ip);
+                                }
                                 if ext {
                                     handler = handler.on_ext_listener();
                                 }

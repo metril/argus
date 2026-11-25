@@ -41,6 +41,7 @@ pub mod rewrite;
 pub mod roots;
 pub mod scriptctl;
 pub mod sct;
+pub mod self_route;
 pub mod server;
 pub mod tls;
 pub mod transparent;

@@ -159,6 +159,10 @@ const OLD_LISTENER_GRACE: std::time::Duration = std::time::Duration::from_secs(3
 /// The web API's listener, replaceable at runtime.
 pub struct WebServer {
     router: Router,
+    /// Connection slots shared by the listener and in-process handoffs.
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Fires when the current listener is told to stop (closes handed-off connections too).
+    handoff_sd: parking_lot::Mutex<tokio::sync::watch::Receiver<bool>>,
     /// TLS configuration read by every new connection (swappable without rebinding).
     tls: Arc<TlsShared>,
     /// Where the bound port is recorded for tooling (`.webui_port`).
@@ -236,7 +240,111 @@ async fn bind_retry(addr: &str, retry_in_use: bool) -> std::io::Result<tokio::ne
     bound
 }
 
+/// A stream with one already-read byte put back in front.
+struct Rewind<S> {
+    first: Option<u8>,
+    inner: S,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(b) = self.first.take() {
+            buf.put_slice(&[b]);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewind<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 impl WebServer {
+    /// In-process handoff of a stream the proxy accepted for the web UI endpoint: served exactly
+    /// like a connection to the listener, with `peer` (the real client) as its address.
+    pub fn handoff_stream<S>(self: &Arc<Self>, stream: S, peer: SocketAddr, local_port: u16)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        let (router, tls) = (self.router.clone(), self.tls.clone());
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            tracing::warn!("web listener at its connection limit; dropping handoff from {peer}");
+            return;
+        };
+        let sd = self.handoff_sd.lock().clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let mut stream = stream;
+            let mut b = [0u8; 1];
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read(&mut b)).await {
+                Ok(Ok(1)) => {}
+                _ => return,
+            }
+            let io = Rewind {
+                first: Some(b[0]),
+                inner: stream,
+            };
+            serve_conn(io, b[0], local_port, peer, router, tls, sd).await;
+        });
+    }
+
+    /// In-process handoff of one plain-HTTP request the proxy received for the web UI endpoint.
+    pub async fn handoff_request(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+        peer: SocketAddr,
+        local_port: u16,
+    ) -> Resp {
+        use tower::ServiceExt;
+        let mut req = req;
+        let (cfg, redirect) = self.tls.snapshot();
+        if cfg.is_some() && redirect {
+            let proxied_https = crate::middleware::request_id::request_is_https(
+                req.headers(),
+                Some(peer.ip()),
+                self.tls.trusted(),
+            );
+            if !proxied_https && !PLAIN_PATHS.contains(&req.uri().path()) {
+                return redirect_response(&req, local_port);
+            }
+        }
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        match self
+            .router
+            .clone()
+            .oneshot(req.map(axum::body::Body::new))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
+    }
+
     fn new(
         router: Router,
         listener: tokio::net::TcpListener,
@@ -246,6 +354,8 @@ impl WebServer {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         let srv = Arc::new(Self {
             router,
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            handoff_sd: parking_lot::Mutex::new(tokio::sync::watch::channel(false).1),
             tls,
             port_file: parking_lot::Mutex::new(None),
             current: tokio::sync::Mutex::new(Current {
@@ -291,11 +401,15 @@ impl WebServer {
     ) -> tokio::sync::oneshot::Sender<()> {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (router, tls) = (self.router.clone(), self.tls.clone());
+        let permits = self.permits.clone();
         let done = self.done_tx.clone();
+        let (hs_tx, hs_rx) = tokio::sync::watch::channel(false);
+        *self.handoff_sd.lock() = hs_rx;
         tokio::spawn(async move {
             let (grace_tx, grace_rx) = tokio::sync::oneshot::channel::<()>();
-            let serve = serve_loop(listener, router, tls, async move {
+            let serve = serve_loop(listener, router, tls, permits, async move {
                 let _ = stop_rx.await;
+                let _ = hs_tx.send(true);
                 let _ = grace_tx.send(());
             });
             let result = tokio::select! {
@@ -581,6 +695,9 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         rt.note_webui(&host, bound_port).await;
     }
     let _ = state.web_server.set(server.clone());
+    if let Some(rt) = state.runtime.get() {
+        rt.webui_handoff(server.clone());
+    }
     // HTTPS configured but not served at startup (certificate not ready, runtime late): retry
     // soon instead of waiting for the hourly tick.
     let retry = state.clone();
@@ -696,10 +813,10 @@ async fn serve_loop(
     listener: tokio::net::TcpListener,
     router: Router,
     tls: Arc<TlsShared>,
+    permits: Arc<tokio::sync::Semaphore>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
     let (sd_tx, sd_rx) = tokio::sync::watch::channel(false);
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut conns = tokio::task::JoinSet::new();
     tokio::pin!(shutdown);
     loop {
@@ -744,20 +861,36 @@ async fn handle_conn(
     sd: tokio::sync::watch::Receiver<bool>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let mut epoch = tls.subscribe();
-    epoch.mark_unchanged();
     let mut first = [0u8; 1];
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
         Ok(Ok(1)) => {}
         _ => return,
     }
+    let local = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+    serve_conn(stream, first[0], local, peer, router, tls, sd).await;
+}
+
+/// Serve one accepted byte stream (`first` is its first byte, still unread): TLS or plain HTTP.
+async fn serve_conn<S>(
+    stream: S,
+    first: u8,
+    local: u16,
+    peer: SocketAddr,
+    router: Router,
+    tls: Arc<TlsShared>,
+    sd: tokio::sync::watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut epoch = tls.subscribe();
+    epoch.mark_unchanged();
     let (cfg, redirect) = tls.snapshot();
     let ctl = Ctl {
         sd,
         epoch,
         header_timeout: tls.header_timeout(),
     };
-    if first[0] == 0x16 {
+    if first == 0x16 {
         let Some(cfg) = cfg else { return };
         let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
         let tls_stream =
@@ -767,7 +900,6 @@ async fn handle_conn(
             };
         serve_io(tls_stream, app_service(router, peer, true), ctl).await;
     } else if cfg.is_some() && redirect {
-        let local = stream.local_addr().map(|a| a.port()).unwrap_or(0);
         serve_io(
             stream,
             redirect_service(router, peer, local, tls.trusted().to_vec()),
