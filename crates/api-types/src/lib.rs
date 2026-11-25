@@ -226,6 +226,9 @@ pub struct ProxyConfigResponse {
     /// Also refuse private-range destinations.
     #[serde(default)]
     pub block_private_destinations: bool,
+    /// Connect to origins with the requesting browser's TLS/HTTP2 fingerprint.
+    #[serde(default)]
+    pub browser_like_upstream: bool,
     /// CIDR exceptions to the destination refusals.
     #[serde(default)]
     pub allowed_destinations: Vec<String>,
@@ -405,6 +408,7 @@ pub struct UpdateProxyConfigRequest {
     pub tls_passthrough_hosts: Option<Vec<String>>,
     /// Applied live.
     pub block_private_destinations: Option<bool>,
+    pub browser_like_upstream: Option<bool>,
     /// CIDR list; replaces the current one. Applied live.
     pub allowed_destinations: Option<Vec<String>>,
     /// CIDR list; replaces the current one. Applied live.

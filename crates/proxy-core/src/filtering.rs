@@ -24,7 +24,9 @@ use crate::rewrite::{
     classify_body, media_type, BodyKind, HeaderEdit, HtmlPlan, ResponseInfo, ResponseTransforms,
     TransformSource,
 };
-use crate::upstream::{build_strict_upstream_client, build_upstream_client, UpstreamOptions};
+use crate::upstream::{
+    build_strict_upstream_client, build_upstream_client, UpstreamClient, UpstreamOptions,
+};
 use crate::{Error, Result};
 use bytes::Bytes;
 use filter_engine::ArcSwap;
@@ -184,8 +186,8 @@ pub(crate) fn dynamic_selectors(
 
 /// Replacement upstream clients, built but not yet installed.
 pub struct PreparedUpstream {
-    client: reqwest::Client,
-    strict: reqwest::Client,
+    client: UpstreamClient,
+    strict: UpstreamClient,
     opts: UpstreamOptions,
 }
 
@@ -194,7 +196,7 @@ pub struct ProxyContext {
     engine: Arc<SharedEngine>,
     /// The pooled upstream client; replaced when its timeouts change (requests in flight keep
     /// the old one).
-    client: ArcSwap<reqwest::Client>,
+    client: ArcSwap<UpstreamClient>,
     /// The options the clients were built from, for rebuilding.
     upstream_opts: parking_lot::Mutex<Option<UpstreamOptions>>,
     /// The default profile's slot (also held by the profile table).
@@ -221,7 +223,7 @@ pub struct ProxyContext {
     /// The web server, for in-process handoff of requests to the web UI endpoint.
     web_server: parking_lot::RwLock<Option<Arc<dyn crate::self_route::WebUiHandoff>>>,
     /// Client for requests aimed at the proxy's own ports (see [`build_strict_upstream_client`]).
-    strict_client: ArcSwap<reqwest::Client>,
+    strict_client: ArcSwap<UpstreamClient>,
     /// The `/__adblock__/` endpoints and their state.
     internal: Arc<Internal>,
     /// Optional per-response transforms (extended rules), see [`crate::rewrite`].
@@ -246,6 +248,7 @@ impl ProxyContext {
             engine.set_enabled(false);
         }
         let default_slot = default_profile_slot(engine.clone());
+        let client = UpstreamClient::from(client);
         Self {
             engine,
             strict_client: ArcSwap::from_pointee(client.clone()),
@@ -337,8 +340,8 @@ impl ProxyContext {
         let roots = opts.roots_handle()?;
         opts.roots = Some(roots.clone());
         let opts = &opts;
-        let client = build_upstream_client(opts)?;
-        let mut ctx = Self::new(engine, client, adblock_enabled);
+        let mut ctx = Self::new(engine, reqwest::Client::new(), adblock_enabled);
+        ctx.client = ArcSwap::from_pointee(build_upstream_client(opts)?);
         ctx.strict_client = ArcSwap::from_pointee(build_strict_upstream_client(opts)?);
         ctx.roots = Some(roots);
         *ctx.upstream_opts.lock() = Some(opts.clone());
@@ -465,7 +468,7 @@ impl ProxyContext {
     }
 
     /// The shared pooled upstream client.
-    pub fn client(&self) -> reqwest::Client {
+    pub fn client(&self) -> UpstreamClient {
         (**self.client.load()).clone()
     }
 
@@ -473,26 +476,37 @@ impl ProxyContext {
     /// in flight finish on the old clients. A no-op when the timeouts are unchanged or the
     /// context was built from a ready-made client.
     pub fn set_upstream_timeouts(&self, connect: Duration, read: Duration) -> Result<()> {
-        let prepared = self.prepare_upstream_timeouts(connect, read)?;
+        let browser_like = self
+            .upstream_opts
+            .lock()
+            .as_ref()
+            .is_some_and(|o| o.browser_like);
+        let prepared = self.prepare_upstream(connect, read, browser_like)?;
         self.commit_upstream(prepared);
         Ok(())
     }
 
     /// Build the replacement clients without installing them (the fallible half of
-    /// [`Self::set_upstream_timeouts`]); `None` when nothing changes.
-    pub fn prepare_upstream_timeouts(
+    /// [`Self::set_upstream_timeouts`]); `None` when nothing changes. `browser_like` picks the
+    /// client: the browser-like one or the previous rustls one.
+    pub fn prepare_upstream(
         &self,
         connect: Duration,
         read: Duration,
+        browser_like: bool,
     ) -> Result<Option<PreparedUpstream>> {
         let guard = self.upstream_opts.lock();
         let Some(opts) = guard.as_ref() else {
             return Ok(None);
         };
-        if opts.connect_timeout == Some(connect) && opts.read_timeout == Some(read) {
+        if opts.connect_timeout == Some(connect)
+            && opts.read_timeout == Some(read)
+            && opts.browser_like == browser_like
+        {
             return Ok(None);
         }
         let mut next = opts.clone();
+        next.browser_like = browser_like;
         next.connect_timeout = Some(connect);
         next.read_timeout = Some(read);
         Ok(Some(PreparedUpstream {
@@ -932,7 +946,7 @@ impl ProxyContext {
             let stream = body
                 .into_data_stream()
                 .map_err(|e| std::io::Error::other(e.to_string()));
-            rb = rb.body(reqwest::Body::wrap_stream(stream));
+            rb = rb.body_stream(stream);
         }
 
         let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);
@@ -973,7 +987,7 @@ impl ProxyContext {
             Err(e) => {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
                 debug!("Upstream error for {}: {}", url, e);
-                let kind = crate::upstream::classify_reqwest(&e);
+                let kind = e.kind();
                 let hostport = common::certstore::hostport(&url_host, port);
                 // A certificate failure: one cached, single-flight probe handshake tells which
                 // certificate was presented and why it was rejected.
@@ -1016,19 +1030,15 @@ impl ProxyContext {
         let status = resp.status();
         if !bypass_full {
             // The certificate of the connection that served this very response.
-            let cert_fp = resp
-                .extensions()
-                .get::<reqwest::tls::TlsInfo>()
-                .and_then(|t| t.peer_certificate())
-                .and_then(|der| {
-                    // A completed response proves the chain verified for this host and port.
-                    let hostport = common::certstore::hostport(&url_host, port);
-                    let fp = self
-                        .certs
-                        .record_ok(&hostport, der, &|| crate::ev::is_ev_der(der))?;
-                    self.certs.note_seen(&hostport, &rctx.profile.load().label);
-                    Some(fp)
-                });
+            let cert_fp = resp.peer_certificate().and_then(|der| {
+                // A completed response proves the chain verified for this host and port.
+                let hostport = common::certstore::hostport(&url_host, port);
+                let fp = self
+                    .certs
+                    .record_ok(&hostport, der, &|| crate::ev::is_ev_der(der))?;
+                self.certs.note_seen(&hostport, &rctx.profile.load().label);
+                Some(fp)
+            });
             log_request(
                 cert_fp.as_deref(),
                 rctx,

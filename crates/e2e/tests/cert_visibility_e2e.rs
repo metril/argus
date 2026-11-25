@@ -142,9 +142,7 @@ async fn tls_info_is_present_on_every_response_even_when_sessions_resume() {
     for _ in 0..3 {
         let r = client.get(&url).send().await.unwrap();
         let der = r
-            .extensions()
-            .get::<reqwest::tls::TlsInfo>()
-            .and_then(|t| t.peer_certificate())
+            .peer_certificate()
             .expect("peer certificate on every response")
             .to_vec();
         fps.push(common::certstore::fingerprint(&der));

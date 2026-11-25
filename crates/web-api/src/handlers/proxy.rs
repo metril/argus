@@ -43,6 +43,7 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         ext_port: config.proxy.ext_port,
         tls_passthrough_hosts: config.proxy.tls_passthrough_hosts.clone(),
         block_private_destinations: config.proxy.block_private_destinations,
+        browser_like_upstream: config.proxy.upstream.browser_like,
         allowed_destinations: config.proxy.allowed_destinations.clone(),
         allowed_clients: config.proxy.allowed_clients.clone(),
         dns: DnsDto {
@@ -313,6 +314,12 @@ async fn apply_update_locked(
         "block_private_destinations",
         config.proxy.block_private_destinations,
         req.block_private_destinations,
+        can_proxy
+    );
+    field!(
+        "browser_like_upstream",
+        config.proxy.upstream.browser_like,
+        req.browser_like_upstream,
         can_proxy
     );
     field!(

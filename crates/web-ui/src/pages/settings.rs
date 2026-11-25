@@ -251,6 +251,13 @@ const SECTIONS: &[Section] = &[
                 dep: None,
             },
             Def {
+                key: "browser_like",
+                label: "Browser-like connections",
+                desc: "Connect to sites the way your browser does (same TLS and HTTP/2 fingerprint).",
+                kind: Kind::Switch,
+                dep: None,
+            },
+            Def {
                 key: "max_conns",
                 label: "Max connections",
                 desc: "Across both listeners. 0 means automatic.",
@@ -345,6 +352,7 @@ fn defaults(key: &str) -> Val {
         ),
         "allow_dest" => Val::T(Vec::new()),
         "block_private" => Val::B(false),
+        "browser_like" => Val::B(true),
         "auto_update" => Val::B(true),
         "lists_url" | "lists_key" => Val::S(String::new()),
         "dns_servers" => Val::T(Vec::new()),
@@ -375,6 +383,7 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("allow_clients", Val::T(c.allowed_clients.clone())),
         ("allow_dest", Val::T(c.allowed_destinations.clone())),
         ("block_private", Val::B(c.block_private_destinations)),
+        ("browser_like", Val::B(c.browser_like_upstream)),
         ("auto_update", Val::B(c.auto_update)),
         ("update_every", Val::S(c.update_interval_hours.to_string())),
         ("lists_url", Val::S(c.bypass.lists_base_url.clone())),
@@ -402,6 +411,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "allow_clients" => &["allowed_clients"],
         "allow_dest" => &["allowed_destinations"],
         "block_private" => &["block_private_destinations"],
+        "browser_like" => &["browser_like_upstream"],
         "auto_update" => &["auto_update"],
         "lists_url" | "lists_key" => &["bypass"],
         "dns_servers" | "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => &["dns"],
@@ -561,6 +571,9 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("block_private") {
         r.block_private_destinations = Some(val("block_private").b());
+    }
+    if dirty("browser_like") {
+        r.browser_like_upstream = Some(val("browser_like").b());
     }
     if dirty("auto_update") {
         r.auto_update = Some(val("auto_update").b());

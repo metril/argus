@@ -757,6 +757,94 @@ impl LiveVerifier {
     }
 }
 
+/// The verification of every upstream handshake, whichever TLS stack runs it: the chain against
+/// the live set (path, name, the anchor's own rules), then the verified chain recorded for
+/// display (with its Extended Validation verdict).
+fn verify_recorded(
+    handle: &RootsHandle,
+    store: Option<&common::certstore::CertStore>,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+    now: UnixTime,
+) -> std::result::Result<(), rustls::Error> {
+    // One atomic load per handshake; a swap mid-flight cannot tear it.
+    let active = handle.load();
+    let path = active.verify(end_entity, intermediates, server_name, now)?;
+    if let Some(store) = store {
+        if store.wants_chain(end_entity.as_ref(), 1 + intermediates.len()) {
+            store.record_chain(&path, &|| crate::ev::is_ev_der(end_entity.as_ref()));
+        }
+    }
+    Ok(())
+}
+
+/// Verify a peer chain (DER, leaf first) presented for `host` exactly as [`LiveVerifier`] does.
+/// An empty host (no identity to check) or an empty chain is refused.
+pub fn verify_chain_der(
+    handle: &RootsHandle,
+    store: Option<&common::certstore::CertStore>,
+    chain: &[Vec<u8>],
+    host: &str,
+) -> std::result::Result<(), rustls::Error> {
+    use rustls::CertificateError as C;
+    let name = match ServerName::try_from(host.to_string()) {
+        Ok(n) if !host.is_empty() => n,
+        _ => return Err(rustls::Error::InvalidCertificate(C::NotValidForName)),
+    };
+    let Some((leaf, rest)) = chain.split_first() else {
+        return Err(rustls::Error::NoCertificatesPresented);
+    };
+    let leaf = CertificateDer::from(leaf.as_slice());
+    let inter: Vec<CertificateDer<'_>> = rest
+        .iter()
+        .map(|d| CertificateDer::from(d.as_slice()))
+        .collect();
+    verify_recorded(handle, store, &leaf, &inter, &name, UnixTime::now())
+}
+
+/// The failure of the last certificate check on a connection, kept in the connection's
+/// `ex_data` so what reads the connection afterwards sees the same error as the rustls path.
+fn failure_index() -> Option<btls::ex_data::Index<btls::ssl::Ssl, rustls::Error>> {
+    use std::sync::OnceLock;
+    static IDX: OnceLock<Option<btls::ex_data::Index<btls::ssl::Ssl, rustls::Error>>> =
+        OnceLock::new();
+    *IDX.get_or_init(|| btls::ssl::Ssl::new_ex_index::<rustls::Error>().ok())
+}
+
+/// The alert a failed check is reported with.
+fn alert_for(e: &rustls::Error) -> wreq::tls::SslAlert {
+    use common::certstore::FailReason as R;
+    use wreq::tls::SslAlert as A;
+    match crate::upstream::fail_reason(e) {
+        R::Expired | R::NotYetValid => A::CERTIFICATE_EXPIRED,
+        R::UnknownIssuer => A::UNKNOWN_CA,
+        _ => A::BAD_CERTIFICATE,
+    }
+}
+
+/// The in-handshake verify hook of the browser-like client: [`LiveVerifier`]'s verification on
+/// the chain BoringSSL received, for the host the connection was made to. A rejection aborts the
+/// handshake before any request bytes are sent, on resumed sessions too.
+pub fn verify_btls(
+    handle: &RootsHandle,
+    store: Option<&common::certstore::CertStore>,
+    ssl: &mut wreq::tls::SslRef,
+    host: &str,
+) -> std::result::Result<(), wreq::tls::SslAlert> {
+    let chain: Vec<Vec<u8>> = ssl
+        .peer_cert_chain()
+        .map(|c| c.iter().filter_map(|x| x.to_der().ok()).collect())
+        .unwrap_or_default();
+    verify_chain_der(handle, store, &chain, host).map_err(|e| {
+        let alert = alert_for(&e);
+        if let Some(idx) = failure_index() {
+            ssl.set_ex_data(idx, e);
+        }
+        alert
+    })
+}
+
 impl rustls::client::danger::ServerCertVerifier for LiveVerifier {
     fn verify_server_cert(
         &self,
@@ -766,14 +854,14 @@ impl rustls::client::danger::ServerCertVerifier for LiveVerifier {
         _ocsp_response: &[u8],
         now: UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // One atomic load per handshake; a swap mid-flight cannot tear it.
-        let active = self.handle.load();
-        let path = active.verify(end_entity, intermediates, server_name, now)?;
-        if let Some(store) = &self.store {
-            if store.wants_chain(end_entity.as_ref(), 1 + intermediates.len()) {
-                store.record_chain(&path, &|| crate::ev::is_ev_der(end_entity.as_ref()));
-            }
-        }
+        verify_recorded(
+            &self.handle,
+            self.store.as_deref(),
+            end_entity,
+            intermediates,
+            server_name,
+            now,
+        )?;
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 

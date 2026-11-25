@@ -211,8 +211,8 @@ fn group(r: RunAt) -> u8 {
 
 /// Outbound pieces the xhr executor borrows from the proxy context.
 pub struct Upstream<'a> {
-    pub client: &'a reqwest::Client,
-    pub strict_client: &'a reqwest::Client,
+    pub client: &'a crate::upstream::UpstreamClient,
+    pub strict_client: &'a crate::upstream::UpstreamClient,
     pub policy: &'a crate::policy::DestPolicy,
     /// Code-only dial override (tests); IP-literal hosts are aimed at it explicitly.
     pub resolve_all_to: Option<std::net::IpAddr>,
@@ -1699,7 +1699,7 @@ async fn run_outbound(
                 rb = rb.header("content-length", n);
             }
             let stream = tokio_stream_from(u.rx);
-            rb = rb.body(reqwest::Body::wrap_stream(stream));
+            rb = rb.body_stream(stream);
             exceeded = Some(u.exceeded);
             streamed = true;
         } else if !cur.body.is_empty() {

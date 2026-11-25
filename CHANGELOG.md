@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+* Browser-like upstream connections (Settings, on by default; `proxy.upstream.browser_like`):
+  Argus connects to sites with the TLS and HTTP/2 fingerprint of the browser behind each request
+  (Chrome, Edge, Firefox or Safari, chosen from its client hints and User-Agent) and forwards the
+  browser's headers untouched and in order. Certificates are still verified against Argus's
+  trusted roots inside the handshake. Switching it off uses the previous client, kept for one
+  release. WebSockets still use the previous client.
+
 ## 0.5.0 — 2026-11-24
 
 * Userscript `@include`/`@exclude` regexes now follow JavaScript semantics (lookaround and

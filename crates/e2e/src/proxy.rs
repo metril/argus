@@ -267,6 +267,7 @@ impl TestProxy {
                 enable_websockets: true,
                 extra_upstream_ca_paths: vec![origin_ca_path],
                 require_device_token: false,
+                upstream: Default::default(),
                 explicit: Default::default(),
                 transparent: Default::default(),
             },

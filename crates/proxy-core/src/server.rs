@@ -337,9 +337,11 @@ impl ProxyControl {
                 .map_err(|e| Error::Internal(e.to_string()))??,
             ));
         }
-        let upstream = self
-            .ctx
-            .prepare_upstream_timeouts(t.handshake, t.header_read)?;
+        let upstream = self.ctx.prepare_upstream(
+            t.handshake,
+            t.header_read,
+            config.proxy.upstream.browser_like,
+        )?;
         // The old `tls_passthrough_hosts` setting lives on as `migrated` bypass entries. Last
         // fallible step: the commit below cannot fail.
         {

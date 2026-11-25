@@ -7,7 +7,7 @@ use super::{BodyTransform, HtmlPlan};
 use crate::inject::{full_body, ProxyBody};
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
-use futures_util::{FutureExt, Stream, StreamExt, TryStreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
 use parking_lot::Mutex;
@@ -137,13 +137,13 @@ pub enum Outcome {
 }
 
 fn open(
-    resp: reqwest::Response,
+    resp: crate::upstream::UpstreamResponse,
     codings: &[Coding],
 ) -> (
     SharedRaw,
     impl std::future::Future<Output = io::Result<DynBufRead>> + '_,
 ) {
-    let raw = SharedRaw::new(resp.bytes_stream().map_err(io::Error::other).boxed());
+    let raw = SharedRaw::new(resp.bytes_stream());
     let input: DynBufRead = Box::pin(StreamReader::new(raw.clone()));
     (raw, decode_chain(input, codings))
 }
@@ -197,7 +197,7 @@ fn utf8_prefix(det: &Detected, peek: &[u8]) -> Vec<u8> {
 /// the document buffered, up to [`MAX_HTML_BUFFER`] and the transform's own cap; a larger one is
 /// streamed through the HTML stages without them and counted ([`over_cap_total`]).
 pub async fn transform_html(
-    resp: reqwest::Response,
+    resp: crate::upstream::UpstreamResponse,
     codings: Vec<Coding>,
     out_coding: Option<Coding>,
     content_type: Option<String>,
@@ -396,7 +396,7 @@ where
 
 /// Buffer a decoded non-HTML body (up to the transform's cap) and apply `transform`.
 pub async fn transform_text(
-    resp: reqwest::Response,
+    resp: crate::upstream::UpstreamResponse,
     codings: Vec<Coding>,
     out_coding: Option<Coding>,
     transform: Arc<dyn BodyTransform>,

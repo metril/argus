@@ -41,10 +41,8 @@ pub fn full_body(bytes: Bytes) -> ProxyBody {
 }
 
 /// Stream a reqwest response body straight through (no buffering, original encoding preserved).
-pub fn passthrough_body(resp: reqwest::Response) -> ProxyBody {
-    let stream = resp
-        .bytes_stream()
-        .map(|res| res.map(Frame::data).map_err(io::Error::other));
+pub fn passthrough_body(resp: crate::upstream::UpstreamResponse) -> ProxyBody {
+    let stream = resp.bytes_stream().map(|res| res.map(Frame::data));
     BodyExt::boxed_unsync(StreamBody::new(stream))
 }
 

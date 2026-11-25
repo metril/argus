@@ -10,6 +10,7 @@
 //! - CA private key encryption at rest
 
 pub mod authority;
+pub mod browser_profile;
 pub mod ca;
 pub mod ca_encryption;
 pub mod circuit_breaker;

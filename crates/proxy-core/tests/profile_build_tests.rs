@@ -37,6 +37,7 @@ fn config(port: u16) -> ProxyConfig {
             enable_websockets: false,
             extra_upstream_ca_paths: Vec::new(),
             require_device_token: false,
+            upstream: Default::default(),
             explicit: Default::default(),
             transparent: Default::default(),
         },

@@ -181,6 +181,25 @@ pub struct ProxySettings {
     /// Basic`, password = token); others get `407`. Off: unknown devices fall back to their IP.
     #[serde(default)]
     pub require_device_token: bool,
+    /// How the proxy connects to origin servers (`[proxy.upstream]`).
+    #[serde(default)]
+    pub upstream: UpstreamSettings,
+}
+
+/// Upstream connection behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamSettings {
+    /// Connect to origins the way the browser behind the request would (its TLS and HTTP/2
+    /// fingerprint, header order), so sites that reject non-browser clients accept the proxy. Off
+    /// uses the previous rustls client, kept for one release.
+    #[serde(default = "default_true")]
+    pub browser_like: bool,
+}
+
+impl Default for UpstreamSettings {
+    fn default() -> Self {
+        Self { browser_like: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +536,7 @@ impl Default for ProxyConfig {
                 enable_websockets: true,
                 extra_upstream_ca_paths: Vec::new(),
                 require_device_token: false,
+                upstream: Default::default(),
             },
             mitm: MitmSettings {
                 enabled: true,

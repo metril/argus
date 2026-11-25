@@ -4571,6 +4571,10 @@
             "description": "Also refuse private-range destinations.",
             "type": "boolean"
           },
+          "browser_like_upstream": {
+            "description": "Connect to origins with the requesting browser's TLS/HTTP2 fingerprint.",
+            "type": "boolean"
+          },
           "bypass": {
             "$ref": "#/components/schemas/BypassSourceDto",
             "description": "Source of the signed first-party lists."
@@ -6161,6 +6165,12 @@
           },
           "block_private_destinations": {
             "description": "Applied live.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "browser_like_upstream": {
             "type": [
               "boolean",
               "null"
