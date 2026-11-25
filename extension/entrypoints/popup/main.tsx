@@ -4,11 +4,10 @@ import '../../ui/tokens.css';
 import '../../ui/ui.css';
 import { cachedLookup, clearCache, hostOf, type Interception, type Lookup } from '../../lib/api';
 import { signOut } from '../../lib/auth';
-import type { MenuGrant } from '../../lib/bridge-types';
-import { recordGrant } from '../../lib/grants';
 import { loadMenu, type MenuState } from '../../lib/menudata';
+import { Scripts } from '../../ui/scripts';
 import { resolveState } from '../../lib/state';
-import { AccountBar, Banner, BrowserCard, CommandList, ErrorBanner, GrantRow, Header, Icon, SignInForm, SiteCard, Skeleton } from '../../ui/components';
+import { AccountBar, Banner, BrowserCard, ErrorBanner, Header, Icon, SignInForm, SiteCard, Skeleton } from '../../ui/components';
 import { hostLabel, isSignedIn, settings, watchSettings } from '../../ui/store';
 
 type Tab = { id?: number; url?: string; cookieStoreId?: string };
@@ -18,32 +17,6 @@ function Menu({ onSettings }: { onSettings: () => void }) {
     <div class="menu" role="menu">
       <button type="button" role="menuitem" class="row" onClick={onSettings}>Settings</button>
     </div>
-  );
-}
-
-function Scripts({ state, tab, reload }: { state: MenuState; tab?: Tab; reload: () => void }) {
-  const [miss, setMiss] = useState(false);
-  const [grants, setGrants] = useState<MenuGrant[]>(state.kind === 'ok' ? state.grants : []);
-  if (state.kind === 'none') return null;
-  if (state.kind === 'offline') {
-    return <Banner tone="warn" slim title="Offline" body="Commands unavailable." action="Reconnect" onAction={() => { void browser.runtime.sendMessage({ type: 'bridge-reconnect' }).finally(reload); }} />;
-  }
-  if (state.kind === 'note') return <div class="note">{state.text}</div>;
-  if (!state.commands.length && !grants.length) return null;
-  void tab;
-  return (
-    <section class="sec">
-      <div class="lbl">Userscripts</div>
-      <CommandList commands={state.commands} onTrigger={async (c) => {
-        if (await state.call.trigger(c)) { if (c.autoClose !== false) window.close(); } else setMiss(true);
-      }} />
-      {miss && <div class="note" role="status">Not delivered. Reload the page.</div>}
-      {grants.map((g) => (
-        <GrantRow key={g.script + g.host} grant={g} onAllow={(x) => {
-          void recordGrant(browser, x.patterns).then(() => setGrants((cur) => cur.filter((y) => y !== x)));
-        }} />
-      ))}
-    </section>
   );
 }
 
@@ -99,7 +72,7 @@ function App() {
           }} />
         )}
         <SiteCard host={host} site={r.site} interception={inter} />
-        <Scripts state={menu} {...(tab ? { tab } : {})} reload={() => setN(n + 1)} />
+        <Scripts state={menu} reload={() => setN(n + 1)} />
         <section class="sec">
           <div class="lbl">This browser</div>
           <BrowserCard />

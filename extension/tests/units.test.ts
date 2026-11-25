@@ -87,11 +87,11 @@ describe('getSettings with fake browser', () => {
 
 describe('grant patterns', () => {
   const m = (p: string, s: string, h: string, port = '') => patternMatches(p, s, h, port);
-  it('exact host, wildcard subdomains (not the apex), scheme and port', () => {
+  it('exact host, wildcard covers apex and subdomains, scheme and port', () => {
     expect(m('https://a.com/*', 'https', 'a.com')).toBe(true);
     expect(m('https://a.com/*', 'https', 'x.a.com')).toBe(false);
     expect(m('*://*.a.com/*', 'http', 'x.a.com')).toBe(true);
-    expect(m('*://*.a.com/*', 'https', 'a.com')).toBe(false);
+    expect(m('*://*.a.com/*', 'https', 'a.com')).toBe(true);
     expect(m('*://*.a.com/*', 'https', 'evila.com')).toBe(false);
     expect(m('https://a.com/*', 'http', 'a.com')).toBe(false);
     expect(m('https://a.com:8443/*', 'https', 'a.com', '8443')).toBe(true);

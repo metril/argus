@@ -23,7 +23,7 @@ export async function reportedOrigins(browser: any): Promise<string[]> {
   return listGrants(browser);
 }
 
-/** Chrome match-pattern semantics for a recorded grant: scheme, host (`*.x` = subdomains only), optional port. */
+/** Chrome match-pattern semantics for a recorded grant: scheme, host (`*.x` = x and its subdomains), optional port. */
 export function patternMatches(pattern: string, scheme: string, host: string, port = ''): boolean {
   const m = /^(\*|https?):\/\/([^/]*)\/(.*)$/.exec(pattern);
   if (!m || (m[1] !== '*' && m[1] !== scheme)) return false;
@@ -32,7 +32,7 @@ export function patternMatches(pattern: string, scheme: string, host: string, po
   if (pm[2] && pm[2] !== port) return false;
   const h = host.toLowerCase();
   if (ph === '*') return true;
-  if (ph.startsWith('*.')) return h.endsWith(ph.slice(1)) && h.length > ph.length - 1;
+  if (ph.startsWith('*.')) return h === ph.slice(2) || h.endsWith(ph.slice(1));
   return ph === h;
 }
 

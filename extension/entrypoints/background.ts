@@ -1,5 +1,6 @@
 import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
 import { Bridge } from '../lib/bridge';
+import { onStorageChanged } from '../lib/changes';
 import { respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
 import { StoreRelay } from '../lib/storerelay';
@@ -60,17 +61,11 @@ export default defineBackground(() => {
       if (a.name === 'argus-bridge' && !bridge.status().connected) void bridge.connect();
     });
   }
-  const perms = (browser as any).permissions;
-  perms?.onAdded?.addListener(() => void bridge.sendPerms());
-  perms?.onRemoved?.addListener(() => void bridge.sendPerms());
 
   browser.tabs.onUpdated.addListener((tabId, info, tab) => {
     if (info.status === 'complete' || info.url) void update(tabId, tab.url);
   });
-  browser.storage.onChanged.addListener((changes: Record<string, unknown>) => {
-    if ('argusUrl' in changes || 'token' in changes) { clearCache(); void bridge.reconnect(); }
-    if ('argusProxy' in changes) void proxy.reload();
-  });
+  browser.storage.onChanged.addListener((changes: Record<string, unknown>) => onStorageChanged(changes, { clearCache, bridge, proxy }));
   browser.tabs.onRemoved.addListener((id) => intercepted.delete(id));
 
   // Firefox only: inspect the certificate the browser actually received.
