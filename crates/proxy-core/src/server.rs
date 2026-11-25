@@ -257,7 +257,16 @@ impl ProxyControl {
 
     /// Note where the web API listens (own-listener loop protection); call after it rebinds.
     pub async fn set_webui_listener(&self, host: &str, port: u16) {
-        *self.webui_own.lock() = Some((port, host.parse().ok()));
+        // A name resolves to what it names (`localhost` is loopback, not "any address").
+        let ip = match host.parse().ok() {
+            Some(ip) => Some(ip),
+            None => tokio::net::lookup_host((host, port))
+                .await
+                .ok()
+                .and_then(|mut it| it.next())
+                .map(|a| a.ip()),
+        };
+        *self.webui_own.lock() = Some((port, ip));
         let guard = self.running.lock().await;
         if let Some(r) = guard.as_ref() {
             self.publish_own(&r.explicit, r.transparent.as_ref());
@@ -464,6 +473,11 @@ impl ProxyControl {
     }
 
     /// Tell the destination policy which listeners are the proxy's own (loop protection).
+    /// Register the web server for in-process handoff of requests to the web UI endpoint.
+    pub fn set_web_server(&self, server: Arc<dyn crate::self_route::WebUiHandoff>) {
+        self.ctx.set_web_server(server);
+    }
+
     fn publish_own(&self, explicit: &Listener, transparent: Option<&Listener>) {
         let mut ports: Vec<u16> = Vec::new();
         let mut addrs: Vec<IpAddr> = Vec::new();

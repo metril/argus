@@ -218,6 +218,8 @@ pub struct ProxyContext {
     resolve_all_to: Option<IpAddr>,
     /// Destination policy for every upstream dial.
     policy: Arc<DestPolicy>,
+    /// The web server, for in-process handoff of requests to the web UI endpoint.
+    web_server: parking_lot::RwLock<Option<Arc<dyn crate::self_route::WebUiHandoff>>>,
     /// Client for requests aimed at the proxy's own ports (see [`build_strict_upstream_client`]).
     strict_client: ArcSwap<reqwest::Client>,
     /// The `/__adblock__/` endpoints and their state.
@@ -248,6 +250,7 @@ impl ProxyContext {
             engine,
             strict_client: ArcSwap::from_pointee(client.clone()),
             policy: Arc::default(),
+            web_server: parking_lot::RwLock::new(None),
             upstream_opts: parking_lot::Mutex::new(None),
             client: ArcSwap::from_pointee(client),
             profiles: Profiles::new(default_slot.clone()),
@@ -377,6 +380,26 @@ impl ProxyContext {
     pub fn with_policy(mut self, policy: Arc<DestPolicy>) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Register the web server that requests to the web UI endpoint are handed to.
+    pub fn set_web_server(&self, server: Arc<dyn crate::self_route::WebUiHandoff>) {
+        *self.web_server.write() = Some(server);
+    }
+
+    /// The web server and whether `host:port` names the web UI endpoint such that `client` could
+    /// reach it directly (see [`DestPolicy::is_web_ui`]).
+    pub(crate) async fn web_ui_for(
+        &self,
+        host: &str,
+        port: u16,
+        client: std::net::IpAddr,
+    ) -> Option<Arc<dyn crate::self_route::WebUiHandoff>> {
+        let server = self.web_server.read().clone()?;
+        self.policy
+            .is_web_ui(host, port, self.resolve_all_to(), client)
+            .await
+            .then_some(server)
     }
 
     /// The destination policy every upstream dial is checked against.

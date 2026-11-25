@@ -355,10 +355,31 @@ pub struct IncludeRule {
     exclude: bool,
 }
 
+/// Whether `body` has a `|` outside any group or class (`^a|b` is two anchors, not one).
+fn has_top_level_alternation(body: &str) -> bool {
+    let (mut depth, mut class, mut esc) = (0usize, false, false);
+    for c in body.chars() {
+        match (esc, c) {
+            (true, _) => esc = false,
+            (_, '\\') => esc = true,
+            (_, '[') if !class => class = true,
+            (_, ']') if class => class = false,
+            (_, '(') if !class => depth += 1,
+            (_, ')') if !class => depth = depth.saturating_sub(1),
+            (_, '|') if !class && depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// The literal host of a regex anchored like `^https?:\/\/host\.tld\/...`, so the rule can be
 /// bucketed by host. Anything more elaborate (groups, classes, alternation before the first
 /// `/` after the host) returns `None` and the rule stays in the any-host bucket.
 fn regex_host(body: &str) -> Option<String> {
+    if has_top_level_alternation(body) {
+        return None;
+    }
     let mut s = body.strip_prefix('^')?;
     s = s
         .strip_prefix("https?:")
@@ -378,6 +399,10 @@ fn regex_host(body: &str) -> Option<String> {
             c if c.is_ascii_alphanumeric() || c == '-' => host.push(c.to_ascii_lowercase()),
             _ => return None,
         }
+    }
+    // A quantifier on the terminating `/` or `$` (`\/?`, `$*`) makes it optional.
+    if matches!(it.peek(), Some('?' | '*' | '+' | '{')) {
+        return None;
     }
     // The host must end here, not continue into a quantified/grouped tail like `\.com?`.
     (!host.is_empty() && !host.starts_with('.') && !host.ends_with('.') && !host.ends_with('-'))
@@ -402,8 +427,9 @@ pub(crate) fn js_to_rust(body: &str) -> String {
                     'D' if !class => out.push_str("[^0-9]"),
                     'W' if !class => out.push_str("[^0-9A-Za-z_]"),
                     'b' if class => out.push_str("\\x08"),
-                    'b' => out.push_str("(?-u:\\b)"),
-                    'B' => out.push_str("(?-u:\\B)"),
+                    // The haystack is an ASCII URL, so Unicode word boundaries are the same.
+                    'b' => out.push_str("\\b"),
+                    'B' => out.push_str("\\B"),
                     'c' if c.get(i).is_some_and(char::is_ascii_alphabetic) => {
                         out.push_str(&format!("\\x{:02x}", c[i] as u32 & 31));
                         i += 1;
@@ -978,5 +1004,28 @@ mod tests {
             "// ==UserScript==\n// @match http://h/*\n// @exclude {pat}\n// ==/UserScript=="
         ));
         assert!(!exc.is_match_url(&url));
+    }
+
+    #[test]
+    fn word_boundary_with_lookahead_compiles() {
+        assert!(inc(r"/\bfoo\b(?!bar)/", "https://a/foo"));
+        assert!(!inc(r"/\bfoo\b(?!\/bar)/", "https://a/foo/bar"));
+    }
+
+    #[test]
+    fn regex_host_bucketing_is_conservative() {
+        assert_eq!(regex_host(r"^https?:\/\/a\.com\/x"), Some("a.com".into()));
+        assert_eq!(
+            regex_host(r"^https?:\/\/a\.com\/x|^https?:\/\/b\.com\/"),
+            None
+        );
+        assert_eq!(regex_host(r"^https?:\/\/a\.com\/?"), None);
+        assert_eq!(regex_host(r"^https?:\/\/a\.com$?"), None);
+        assert_eq!(regex_host(r"^https?:\/\/(a|b)\.com\/"), None);
+        // The alternation matches a host the bucket would hide.
+        assert!(inc(
+            r"/^https:\/\/a\.com\/|^https:\/\/b\.com\//",
+            "https://b.com/x"
+        ));
     }
 }

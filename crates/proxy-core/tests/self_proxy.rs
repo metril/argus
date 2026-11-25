@@ -1,56 +1,84 @@
-//! Requests that name the web UI endpoint are routed to it (unfiltered, not intercepted, not
-//! logged); the proxy's own ports stay refused.
+//! Requests that name the web UI endpoint are handed to the web server in-process with the real
+//! client address (unfiltered, not intercepted, not logged); the proxy's own ports stay refused.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use filter_engine::SharedEngine;
+use hyper::body::Incoming;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use proxy_core::config::ProxyConfig;
+use proxy_core::inject::{full_body, ProxyBody};
+use proxy_core::self_route::{Io, WebUiHandoff};
 use proxy_core::upstream::UpstreamOptions;
 use proxy_core::{ProxyContext, ProxyServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Stand-in web UI: plain answer, or a 101 followed by an echo for upgrade requests.
-async fn web_ui() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut s, _)) = l.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
-                if head.contains("upgrade: websocket") {
-                    let _ = s
-                        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n")
-                        .await;
-                    while let Ok(n) = s.read(&mut buf).await {
-                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
-                            return;
-                        }
-                    }
-                } else if head.starts_with("connect ") || !head.starts_with("get ") {
-                    // Raw tunnel check: echo the bytes.
-                    let _ = s.write_all(&buf[..n]).await;
-                } else {
-                    let _ = s
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
-                        )
-                        .await;
-                }
-            });
-        }
-    });
-    port
+/// Stand-in web server: records the peer of every handoff and echoes.
+#[derive(Default)]
+struct FakeWeb {
+    peers: parking_lot::Mutex<Vec<SocketAddr>>,
 }
 
-/// Proxy on 127.0.0.1 that knows `webui` as the web UI endpoint.
-async fn proxy(webui: u16) -> u16 {
+impl WebUiHandoff for FakeWeb {
+    fn stream(&self, mut io: Box<dyn Io>, peer: SocketAddr, _port: u16) {
+        self.peers.lock().push(peer);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = io.read(&mut buf).await {
+                if n == 0 || io.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn request(
+        &self,
+        mut req: Request<Incoming>,
+        peer: SocketAddr,
+        _port: u16,
+    ) -> futures_util::future::BoxFuture<'static, Response<ProxyBody>> {
+        self.peers.lock().push(peer);
+        let upgrade = req
+            .headers()
+            .contains_key(hyper::header::UPGRADE)
+            .then(|| hyper::upgrade::on(&mut req));
+        Box::pin(async move {
+            if let Some(up) = upgrade {
+                tokio::spawn(async move {
+                    if let Ok(u) = up.await {
+                        let mut u = TokioIo::new(u);
+                        let mut buf = [0u8; 64];
+                        while let Ok(n) = u.read(&mut buf).await {
+                            if n == 0 || u.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+                return Response::builder()
+                    .status(101)
+                    .header("upgrade", "websocket")
+                    .header("connection", "Upgrade")
+                    .body(full_body(Bytes::new()))
+                    .unwrap();
+            }
+            Response::new(full_body(Bytes::from(format!("peer={}", peer.ip()))))
+        })
+    }
+}
+
+/// Proxy on 127.0.0.1 that knows `webui` as the web UI endpoint (bound to `bind`).
+async fn proxy(bind: &str, web: Arc<FakeWeb>) -> (u16, u16) {
+    let ui = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
     let mut config = ProxyConfig::default();
     config.proxy.host = "127.0.0.1".into();
     config.mitm.enabled = false;
@@ -61,15 +89,13 @@ async fn proxy(webui: u16) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = ProxyServer::new(config, ctx).unwrap();
-    server
-        .control()
-        .set_webui_listener("127.0.0.1", webui)
-        .await;
+    server.control().set_webui_listener(bind, ui).await;
+    server.control().set_web_server(web);
     let (tx, _) = tokio::sync::broadcast::channel(1);
     tokio::spawn(async move {
         let _ = server.serve(listener, tx).await;
     });
-    port
+    (port, ui)
 }
 
 async fn get_via(proxy_port: u16, url: &str) -> reqwest::Response {
@@ -101,21 +127,26 @@ async fn read_some(s: &mut TcpStream) -> String {
 }
 
 #[tokio::test]
-async fn plain_get_to_the_web_ui_endpoint_is_routed() {
-    let ui = web_ui().await;
-    let p = proxy(ui).await;
+async fn plain_get_reaches_the_web_server_with_the_real_client_address() {
+    let web = Arc::new(FakeWeb::default());
+    let (p, ui) = proxy("0.0.0.0", web.clone()).await;
     let r = get_via(p, &format!("http://127.0.0.1:{ui}/api/v1/health")).await;
     assert_eq!(r.status(), 200);
-    assert_eq!(r.text().await.unwrap(), "ok");
+    assert_eq!(r.text().await.unwrap(), "peer=127.0.0.1");
     let r = get_via(p, &format!("http://localhost:{ui}/api/v1/health")).await;
     assert_eq!(r.status(), 200);
+    let peers = web.peers.lock().clone();
+    assert_eq!(peers.len(), 2);
+    // The peer is the client's own socket, not the proxy's dial.
+    assert!(peers.iter().all(|a| a.ip().is_loopback() && a.port() != ui));
 }
 
 #[tokio::test]
-async fn connect_to_the_web_ui_endpoint_tunnels() {
-    let ui = web_ui().await;
-    let p = proxy(ui).await;
+async fn connect_hands_the_stream_over_with_the_real_peer() {
+    let web = Arc::new(FakeWeb::default());
+    let (p, ui) = proxy("127.0.0.1", web.clone()).await;
     let mut s = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+    let me = s.local_addr().unwrap();
     s.write_all(
         format!("CONNECT 127.0.0.1:{ui} HTTP/1.1\r\nHost: 127.0.0.1:{ui}\r\n\r\n").as_bytes(),
     )
@@ -124,12 +155,13 @@ async fn connect_to_the_web_ui_endpoint_tunnels() {
     assert!(read_some(&mut s).await.starts_with("HTTP/1.1 200"));
     s.write_all(b"hello-tunnel").await.unwrap();
     assert_eq!(read_some(&mut s).await, "hello-tunnel");
+    assert_eq!(web.peers.lock().as_slice(), &[me]);
 }
 
 #[tokio::test]
-async fn websocket_upgrade_to_the_web_ui_endpoint_is_routed() {
-    let ui = web_ui().await;
-    let p = proxy(ui).await;
+async fn websocket_upgrade_is_handed_over() {
+    let web = Arc::new(FakeWeb::default());
+    let (p, ui) = proxy("0.0.0.0", web).await;
     let mut s = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
     s.write_all(
         format!("GET http://127.0.0.1:{ui}/ext/channel HTTP/1.1\r\nHost: 127.0.0.1:{ui}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").as_bytes(),
@@ -143,8 +175,7 @@ async fn websocket_upgrade_to_the_web_ui_endpoint_is_routed() {
 
 #[tokio::test]
 async fn the_proxys_own_port_is_still_refused() {
-    let ui = web_ui().await;
-    let p = proxy(ui).await;
+    let (p, _) = proxy("0.0.0.0", Arc::new(FakeWeb::default())).await;
     let r = get_via(p, &format!("http://127.0.0.1:{p}/")).await;
     assert!(is_refused(&r), "{}", r.status());
     let mut s = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
@@ -155,4 +186,23 @@ async fn the_proxys_own_port_is_still_refused() {
     .unwrap();
     let head = read_some(&mut s).await;
     assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+}
+
+#[tokio::test]
+async fn a_host_header_cannot_name_the_web_ui_on_a_known_destination() {
+    // Plain request to the proxy port itself carrying a web UI `Host`: not self-routed on its
+    // own say-so when the connection's destination is known (SOCKS/transparent use Origin
+    // authority); in explicit mode the absolute URI names the destination, so a mismatching
+    // Host header is ignored.
+    let web = Arc::new(FakeWeb::default());
+    let (p, ui) = proxy("0.0.0.0", web.clone()).await;
+    let mut s = TcpStream::connect(("127.0.0.1", p)).await.unwrap();
+    s.write_all(
+        format!("GET http://203.0.113.1:80/ HTTP/1.1\r\nHost: 127.0.0.1:{ui}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(3), read_some(&mut s)).await;
+    assert!(web.peers.lock().is_empty());
 }

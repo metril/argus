@@ -236,7 +236,107 @@ async fn bind_retry(addr: &str, retry_in_use: bool) -> std::io::Result<tokio::ne
     bound
 }
 
+/// A stream with one already-read byte put back in front.
+struct Rewind<S> {
+    first: Option<u8>,
+    inner: S,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(b) = self.first.take() {
+            buf.put_slice(&[b]);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewind<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        b: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, b)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 impl WebServer {
+    /// In-process handoff of a stream the proxy accepted for the web UI endpoint: served exactly
+    /// like a connection to the listener, with `peer` (the real client) as its address.
+    pub fn handoff_stream<S>(self: &Arc<Self>, stream: S, peer: SocketAddr, local_port: u16)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        use tokio::io::AsyncReadExt;
+        let (router, tls) = (self.router.clone(), self.tls.clone());
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let mut b = [0u8; 1];
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read(&mut b)).await {
+                Ok(Ok(1)) => {}
+                _ => return,
+            }
+            // The sender lives as long as the connection: it is never signalled.
+            let (_keep, sd) = tokio::sync::watch::channel(false);
+            let io = Rewind {
+                first: Some(b[0]),
+                inner: stream,
+            };
+            serve_conn(io, b[0], local_port, peer, router, tls, sd).await;
+        });
+    }
+
+    /// In-process handoff of one plain-HTTP request the proxy received for the web UI endpoint.
+    pub async fn handoff_request(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+        peer: SocketAddr,
+        local_port: u16,
+    ) -> Resp {
+        use tower::ServiceExt;
+        let mut req = req;
+        let (cfg, redirect) = self.tls.snapshot();
+        if cfg.is_some() && redirect {
+            let proxied_https = crate::middleware::request_id::request_is_https(
+                req.headers(),
+                Some(peer.ip()),
+                self.tls.trusted(),
+            );
+            if !proxied_https && !PLAIN_PATHS.contains(&req.uri().path()) {
+                return redirect_response(&req, local_port);
+            }
+        }
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        match self
+            .router
+            .clone()
+            .oneshot(req.map(axum::body::Body::new))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
+    }
+
     fn new(
         router: Router,
         listener: tokio::net::TcpListener,
@@ -581,6 +681,9 @@ pub async fn start_server(state: Arc<AppState>, config: ApiConfig) -> crate::err
         rt.note_webui(&host, bound_port).await;
     }
     let _ = state.web_server.set(server.clone());
+    if let Some(rt) = state.runtime.get() {
+        rt.webui_handoff(server.clone());
+    }
     // HTTPS configured but not served at startup (certificate not ready, runtime late): retry
     // soon instead of waiting for the hourly tick.
     let retry = state.clone();
@@ -744,20 +847,36 @@ async fn handle_conn(
     sd: tokio::sync::watch::Receiver<bool>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let mut epoch = tls.subscribe();
-    epoch.mark_unchanged();
     let mut first = [0u8; 1];
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
         Ok(Ok(1)) => {}
         _ => return,
     }
+    let local = stream.local_addr().map(|a| a.port()).unwrap_or(0);
+    serve_conn(stream, first[0], local, peer, router, tls, sd).await;
+}
+
+/// Serve one accepted byte stream (`first` is its first byte, still unread): TLS or plain HTTP.
+async fn serve_conn<S>(
+    stream: S,
+    first: u8,
+    local: u16,
+    peer: SocketAddr,
+    router: Router,
+    tls: Arc<TlsShared>,
+    sd: tokio::sync::watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut epoch = tls.subscribe();
+    epoch.mark_unchanged();
     let (cfg, redirect) = tls.snapshot();
     let ctl = Ctl {
         sd,
         epoch,
         header_timeout: tls.header_timeout(),
     };
-    if first[0] == 0x16 {
+    if first == 0x16 {
         let Some(cfg) = cfg else { return };
         let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
         let tls_stream =
@@ -767,7 +886,6 @@ async fn handle_conn(
             };
         serve_io(tls_stream, app_service(router, peer, true), ctl).await;
     } else if cfg.is_some() && redirect {
-        let local = stream.local_addr().map(|a| a.port()).unwrap_or(0);
         serve_io(
             stream,
             redirect_service(router, peer, local, tls.trusted().to_vec()),

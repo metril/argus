@@ -197,6 +197,9 @@ pub fn install_shared_resolver(resolver: Arc<dyn NameResolver>) -> bool {
     SHARED_RESOLVER.set(resolver).is_ok()
 }
 
+/// How long a name is resolved to decide whether it is the web UI endpoint.
+const WEB_UI_LOOKUP: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Which upstream addresses the proxy may connect to.
 #[derive(Default)]
 pub struct NetPolicy {
@@ -296,36 +299,51 @@ impl NetPolicy {
         *self.web_ui.write() = endpoint.map(|(p, ip)| (p, ip.map(canonical)));
     }
 
-    /// If `host:port` names the web UI endpoint (an address of this host on the web UI port),
-    /// the loopback (or bound) address to dial instead. Names are resolved here, so DNS decides
-    /// as it would for any destination. `None` for everything else, including proxy ports.
-    pub async fn web_ui_addr(
+    /// Whether `host:port` names the web UI endpoint AND `client` could reach it directly, so
+    /// that routing it there widens nothing: an unparseable or loopback bind is reachable only
+    /// by loopback clients, a specific bind only at that address, a wildcard bind at any
+    /// address of this host (loopback names again only for loopback clients). Names must
+    /// resolve (within a short timeout) to addresses that all satisfy this.
+    pub async fn is_web_ui(
         &self,
         host: &str,
         port: u16,
         override_ip: Option<IpAddr>,
-    ) -> Option<SocketAddr> {
-        let (wp, bound) = (*self.web_ui.read())?;
+        client: IpAddr,
+    ) -> bool {
+        let Some((wp, bound)) = *self.web_ui.read() else {
+            return false;
+        };
         if wp != port {
-            return None;
+            return false;
         }
-        let bound = bound.filter(|ip| !ip.is_unspecified());
-        let is_web_ui = |ip: IpAddr| match bound {
-            Some(b) => canonical(ip) == b,
-            None => self.is_own_ip(ip),
+        // Fail closed: an unknown bind address counts as loopback.
+        let bound = bound.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let client_loopback = canonical(client).is_loopback();
+        let reach = |ip: IpAddr| {
+            let ip = canonical(ip);
+            if bound.is_unspecified() {
+                if ip.is_loopback() || ip.is_unspecified() {
+                    client_loopback
+                } else {
+                    self.is_own_ip(ip)
+                }
+            } else {
+                ip == bound && (!bound.is_loopback() || client_loopback)
+            }
         };
         let bare = unbracket(host);
-        let hit = match bare.parse::<IpAddr>() {
-            Ok(ip) => is_web_ui(ip),
+        match bare.parse::<IpAddr>() {
+            Ok(ip) => reach(ip),
             Err(_) if override_ip.is_some() => false,
-            Err(_) => self
-                .lookup(bare, port)
-                .await
-                .ok()?
-                .iter()
-                .any(|a| is_web_ui(a.ip())),
-        };
-        hit.then(|| SocketAddr::new(bound.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)), port))
+            Err(_) => {
+                let looked = tokio::time::timeout(WEB_UI_LOOKUP, self.lookup(bare, port)).await;
+                match looked {
+                    Ok(Ok(addrs)) => !addrs.is_empty() && addrs.iter().all(|a| reach(a.ip())),
+                    _ => false,
+                }
+            }
+        }
     }
 
     /// Whether `port` is one of the proxy's own listening ports.
@@ -818,26 +836,32 @@ mod tests {
     async fn web_ui_port_is_self_but_proxy_ports_stay_refused() {
         let p = NetPolicy::new(false, &[]).unwrap();
         p.set_own_listeners(&[8080], &[]);
-        p.set_web_ui(Some((3000, None)));
-        let lo: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        assert_eq!(p.web_ui_addr("127.0.0.1", 3000, None).await, Some(lo));
-        assert_eq!(p.web_ui_addr("localhost", 3000, None).await, Some(lo));
-        assert_eq!(p.web_ui_addr("[::1]", 3000, None).await, Some(lo));
+        let (lo, remote) = (ip("127.0.0.1"), ip("203.0.113.9"));
+        // Wildcard bind: loopback names only for loopback clients.
+        p.set_web_ui(Some((3000, Some(ip("0.0.0.0")))));
+        assert!(p.is_web_ui("127.0.0.1", 3000, None, lo).await);
+        assert!(p.is_web_ui("localhost", 3000, None, lo).await);
+        assert!(p.is_web_ui("[::1]", 3000, None, lo).await);
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, remote).await);
+        assert!(!p.is_web_ui("localhost", 3000, None, remote).await);
         // Other ports and other hosts are not the web UI.
-        assert_eq!(p.web_ui_addr("127.0.0.1", 8080, None).await, None);
-        assert_eq!(p.web_ui_addr("93.184.216.34", 3000, None).await, None);
+        assert!(!p.is_web_ui("127.0.0.1", 8080, None, lo).await);
+        assert!(!p.is_web_ui("93.184.216.34", 3000, None, lo).await);
         // A proxy port is still refused, the web UI port is no longer an own listener.
         assert_eq!(p.check(ip("127.0.0.1"), 8080), Err(Refusal::OwnListener));
         assert_eq!(p.check(ip("127.0.0.1"), 3000), Err(Refusal::Reserved));
-        // Bound to one address: only that address is the web UI.
+        // Loopback bind (or unknown): loopback clients only.
+        p.set_web_ui(Some((3000, Some(ip("127.0.0.1")))));
+        assert!(p.is_web_ui("127.0.0.1", 3000, None, lo).await);
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, remote).await);
+        p.set_web_ui(Some((3000, None)));
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, remote).await);
+        // Bound to one address: only that address.
         p.set_web_ui(Some((3000, Some(ip("10.0.0.7")))));
-        assert_eq!(
-            p.web_ui_addr("10.0.0.7", 3000, None).await,
-            Some("10.0.0.7:3000".parse().unwrap())
-        );
-        assert_eq!(p.web_ui_addr("127.0.0.1", 3000, None).await, None);
+        assert!(p.is_web_ui("10.0.0.7", 3000, None, remote).await);
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, lo).await);
         p.set_web_ui(None);
-        assert_eq!(p.web_ui_addr("127.0.0.1", 3000, None).await, None);
+        assert!(!p.is_web_ui("127.0.0.1", 3000, None, lo).await);
     }
 
     #[tokio::test]

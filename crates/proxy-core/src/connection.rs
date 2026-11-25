@@ -110,8 +110,8 @@ pub enum Entry<IO> {
     PlainTo(IO, String, u16),
     /// Plain proxy-style HTTP; the stream replays the bytes already read.
     PlainHttp(IO),
-    /// A CONNECT to the web UI endpoint, already dialled: tunnelled opaquely, never logged.
-    WebUi(IO, TcpStream),
+    /// A CONNECT to the web UI endpoint: handed to the web server, never logged.
+    WebUi(IO, Arc<dyn crate::self_route::WebUiHandoff>, u16),
 }
 
 pub struct ConnectionHandler {
@@ -312,10 +312,8 @@ impl ConnectionHandler {
         match self.resolve_entry(stream).await? {
             Entry::Target(target, io) => self.intercept_and_serve(io, target).await,
             Entry::PlainHttp(io) => self.serve_http(io, plain_origin()).await,
-            Entry::WebUi(io, mut server) => {
-                let mut client = IdleIo::new(io, self.shared.timeouts.load().tunnel_idle);
-                let _ = server.set_nodelay(true);
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            Entry::WebUi(io, web, port) => {
+                web.stream(Box::new(io), self.client_addr, port);
                 Ok(())
             }
             Entry::PlainTo(io, host, port) => {
@@ -421,25 +419,14 @@ impl ConnectionHandler {
         // connections only need the literal check here (every request is checked again when it
         // is forwarded); opaque tunnels resolve now. The dial itself re-resolves and re-checks.
         let ctx = &self.shared.ctx;
-        // The web UI endpoint is "self": tunnelled opaquely to its listener, no policy refusal,
-        // no interception, no log entry.
-        if let Some(addr) = ctx
-            .policy()
-            .web_ui_addr(&host, port, ctx.resolve_all_to())
-            .await
-        {
-            let dialled = tokio::time::timeout(limit, TcpStream::connect(addr)).await;
-            let Ok(Ok(server)) = dialled else {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
-                    .await;
-                return Err(Error::Connection(format!("web UI {addr} unreachable")));
-            };
+        // The web UI endpoint is "self" (when this client could reach it directly): handed to the
+        // web server, no policy refusal, no interception, no log entry.
+        if let Some(web) = ctx.web_ui_for(&host, port, self.client_addr.ip()).await {
             stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await
                 .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
-            return Ok(Entry::WebUi(Prefixed::new(leftover, stream), server));
+            return Ok(Entry::WebUi(Prefixed::new(leftover, stream), web, port));
         }
         let refused = if intercept_tls {
             ctx.policy().check_literal(&host, port).is_err()
@@ -573,6 +560,10 @@ impl ConnectionHandler {
         debug!("SOCKS5 CONNECT {host}:{port} from {}", self.client_addr);
         let intercept_tls = self.intercepts(&host);
         let ctx = &self.shared.ctx;
+        if let Some(web) = ctx.web_ui_for(&host, port, self.client_addr.ip()).await {
+            stream.write_all(&reply(0)).await?;
+            return Ok(Entry::WebUi(Prefixed::new(leftover, stream), web, port));
+        }
         let refused = if intercept_tls {
             ctx.policy().check_literal(&host, port).is_err()
         } else {
@@ -987,23 +978,23 @@ async fn handle_request(
         }
     }
 
-    // Plain HTTP (or a WebSocket upgrade) to the web UI endpoint is routed straight to it.
+    // Plain HTTP (or a WebSocket upgrade) to the web UI endpoint goes to the web server. A
+    // connection with a known destination (transparent, SOCKS) is judged by that destination,
+    // never by the request's `Host`; only an explicit-proxy request names its own.
     if origin.scheme == "http" && !origin.strict_host {
-        let named = authority::of_request(req.uri(), req.headers());
-        let (host, port) = match (named, &origin.authority) {
-            (Some((h, p)), fb) => (h, p.or(fb.as_ref().map(|(_, p)| *p)).unwrap_or(80)),
-            (None, Some((h, p))) => (h.clone(), *p),
-            (None, None) => (String::new(), 80),
+        let dest = match &origin.authority {
+            Some(a) => Some(a.clone()),
+            None => {
+                authority::of_request(req.uri(), req.headers()).map(|(h, p)| (h, p.unwrap_or(80)))
+            }
         };
-        if !host.is_empty() {
-            let ctx = &shared.ctx;
-            if let Some(addr) = ctx
-                .policy()
-                .web_ui_addr(&host, port, ctx.resolve_all_to())
+        if let Some((host, port)) = dest {
+            if let Some(web) = shared
+                .ctx
+                .web_ui_for(&host, port, rctx.client_addr.ip())
                 .await
             {
-                let dial = shared.timeouts.load().handshake;
-                return crate::self_route::forward(addr, req, dial).await;
+                return Ok(web.request(req, rctx.client_addr, port).await);
             }
         }
     }
