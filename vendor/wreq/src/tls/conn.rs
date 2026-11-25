@@ -19,7 +19,7 @@ use btls::{
     error::ErrorStack,
     ex_data::Index,
     ssl::{
-        Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode, SslVerifyError,
+        Ssl, SslAlert, SslConnector, SslMethod, SslOptions, SslSessionCacheMode, SslVerifyError,
         SslVerifyMode,
     },
 };
@@ -39,6 +39,12 @@ use crate::{
         trust::{CertStore, Identity},
     },
 };
+
+fn host_index() -> Result<Index<Ssl, String>, ErrorStack> {
+    static IDX: LazyLock<Result<Index<Ssl, String>, ErrorStack>> =
+        LazyLock::new(Ssl::new_ex_index);
+    IDX.clone()
+}
 
 fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, Key>, ErrorStack>> = LazyLock::new(Ssl::new_ex_index);
@@ -136,7 +142,8 @@ impl TlsConnector {
         let cfg = self.ssl.configure()?;
         let host = uri.host().ok_or("URI missing host")?;
         let host = Self::normalize_host(host);
-        let ssl = cfg.into_ssl(host)?;
+        let mut ssl = cfg.into_ssl(host)?;
+        ssl.set_ex_data(host_index()?, host.to_string());
         Ok(ssl)
     }
 
@@ -221,7 +228,10 @@ impl TlsConnector {
             cfg.set_ex_data(idx, key);
         }
 
-        Ok(cfg.into_ssl(host)?)
+        // Remember the expected identity for the custom verify hook.
+        let mut ssl = cfg.into_ssl(host)?;
+        ssl.set_ex_data(host_index()?, host.to_string());
+        Ok(ssl)
     }
 
     /// If `host` is an IPv6 address, we must strip away the square brackets that surround
@@ -447,8 +457,22 @@ impl TlsConnectorBuilder {
         // Set the in-handshake certificate verification hook.
         if let Some(verify) = self.custom_verify.clone() {
             connector.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
-                verify(ssl).map_err(SslVerifyError::Invalid)
+                let host = host_index()
+                    .ok()
+                    .and_then(|idx| ssl.ex_data(idx).cloned())
+                    .unwrap_or_default();
+                // A panic must not unwind through BoringSSL's C frames.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(ssl, &host)))
+                {
+                    Ok(res) => res.map_err(SslVerifyError::Invalid),
+                    Err(_) => Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR)),
+                }
             });
+            // BoringSSL skips the verify callback on resumed sessions unless told otherwise.
+            #[allow(unsafe_code)]
+            unsafe {
+                btls_sys::SSL_CTX_set_reverify_on_resume(connector.as_ptr(), 1);
+            }
         }
 
         // Set TLS keylog handler.

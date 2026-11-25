@@ -28,8 +28,9 @@ jobs:
       - name: No OpenSSL in the dependency tree
         run: |
           # Upstream TLS is BoringSSL (vendored wreq) plus rustls; a native OpenSSL dependency would
-          # break the static musl image. `cargo tree -i` exits non-zero when the package is absent.
-          if cargo tree --workspace --all-features --target all -i openssl-sys; then
+          # break the static musl image. Fails closed: Cargo.lock must exist and list packages.
+          grep -q '^name = "' Cargo.lock
+          if grep -qx 'name = "openssl-sys"' Cargo.lock; then
             echo 'openssl-sys is in the dependency tree' >&2
             exit 1
           fi

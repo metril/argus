@@ -19,13 +19,18 @@ were dropped.
 ## Local patches
 
 1. **In-handshake certificate verify hook.** `wreq::tls::CustomVerify`
-   (`Arc<dyn Fn(&mut SslRef) -> Result<(), SslAlert> + Send + Sync>`),
+   (`Arc<dyn Fn(&mut SslRef, &str) -> Result<(), SslAlert> + Send + Sync>`),
    `ClientBuilder::tls_custom_verify(CustomVerify)` and
    `TlsConnectorBuilder::custom_verify(Option<CustomVerify>)`. Installed with BoringSSL
    `set_custom_verify_callback(SslVerifyMode::PEER, ..)`, so it runs inside the handshake and a
    failure aborts it before any request bytes are sent. It replaces the built-in chain and hostname
-   verification; the hook reads the chain from `SslRef::peer_cert_chain()` and the SNI from
-   `SslRef::servername()`. Files: `src/tls.rs`, `src/tls/conn.rs`, `src/client.rs`.
+   verification, so it must check the identity: it gets the peer chain from
+   `SslRef::peer_cert_chain()` and the normalized expected host (name or IP literal, no IPv6
+   brackets; stored in `Ssl` ex_data by `setup_ssl`/`setup_ssl2`) as the `&str`, which is set even
+   when there is no SNI (IP literals, `tls_sni(false)`). A panic in the hook is caught and becomes
+   an `INTERNAL_ERROR` alert. `SSL_CTX_set_reverify_on_resume(1)` (raw `btls_sys` call, btls has no
+   wrapper) makes the hook run on resumed sessions too. Files: `src/tls.rs`, `src/tls/conn.rs`,
+   `src/client.rs`.
 2. **Proxy CONNECT to a locally resolved IP.** `Proxy::resolve_locally(bool)`. For HTTP proxies the
    target host is resolved through the client's `dns_resolver` and the CONNECT line carries the
    first resolved `ip:port`; SNI, certificate verification and the `Host` header keep the

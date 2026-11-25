@@ -84,6 +84,7 @@ mod tests {
         handshakes_ok: AtomicUsize,
         handshakes_failed: AtomicUsize,
         requests: Mutex<Vec<String>>,
+        resumed: AtomicUsize,
         sni: Mutex<Vec<Option<String>>>,
     }
 
@@ -131,6 +132,9 @@ mod tests {
                         return;
                     };
                     seen.handshakes_ok.fetch_add(1, Ordering::SeqCst);
+                    if tls.get_ref().1.handshake_kind() == Some(rustls::HandshakeKind::Resumed) {
+                        seen.resumed.fetch_add(1, Ordering::SeqCst);
+                    }
                     seen.sni
                         .lock()
                         .unwrap()
@@ -208,13 +212,13 @@ mod tests {
         (addr, heads)
     }
 
-    type HookLog = Arc<Mutex<Vec<(Option<String>, Vec<Vec<u8>>)>>>;
+    type HookLog = Arc<Mutex<Vec<(Option<String>, Vec<Vec<u8>>, String)>>>;
 
-    /// A hook that records (SNI, peer chain DER) and returns `result`.
+    /// A hook that records (SNI, peer chain DER, expected host) and returns `result`.
     fn recording_hook(result: Result<(), SslAlert>) -> (CustomVerify, HookLog) {
         let log: HookLog = Arc::default();
         let task_log = log.clone();
-        let hook: CustomVerify = Arc::new(move |ssl: &mut SslRef| {
+        let hook: CustomVerify = Arc::new(move |ssl: &mut SslRef, host: &str| {
             let sni = ssl
                 .servername(wreq::tls::NameType::HOST_NAME)
                 .map(str::to_string);
@@ -222,7 +226,10 @@ mod tests {
                 .peer_cert_chain()
                 .map(|c| c.iter().map(|x| x.to_der().unwrap()).collect())
                 .unwrap_or_default();
-            task_log.lock().unwrap().push((sni, chain));
+            task_log
+                .lock()
+                .unwrap()
+                .push((sni, chain, host.to_string()));
             result
         });
         (hook, log)
@@ -247,6 +254,7 @@ mod tests {
             assert_eq!(log.len(), 1);
             assert_eq!(log[0].0.as_deref(), Some(NAME));
             assert_eq!(log[0].1.first(), Some(&server.cert_der));
+            assert_eq!(log[0].2, NAME);
         }
 
         // Let the server finish processing the aborted connection, then check it got no request.
@@ -380,5 +388,120 @@ mod tests {
         let req = origin_seen.lock().unwrap()[0].clone();
         assert_eq!(req.lines().next().unwrap(), "GET /path HTTP/1.1");
         assert!(req.to_lowercase().contains(&format!("host: {NAME}:{port}")));
+    }
+
+    #[tokio::test]
+    async fn hook_runs_again_on_resumed_sessions() {
+        let server = tls_server().await;
+        let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (r, c) = (reject.clone(), calls.clone());
+        let hook: CustomVerify = Arc::new(move |_: &mut SslRef, _: &str| {
+            c.fetch_add(1, Ordering::SeqCst);
+            if r.load(Ordering::SeqCst) {
+                Err(SslAlert::BAD_CERTIFICATE)
+            } else {
+                Ok(())
+            }
+        });
+        let client = build_wreq_client(
+            Some(Emulation::builder().profile(Emulation::Chrome147).build()),
+            Some(hook),
+            Some(Arc::new(StubResolver::default())),
+            None,
+        )
+        .unwrap();
+        let url = format!("https://{NAME}:{}/", server.addr.port());
+
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status().as_u16(),
+            200
+        );
+        // Let the ticket arrive and the first connection go away.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status().as_u16(),
+            200
+        );
+        assert_eq!(
+            server.seen.resumed.load(Ordering::SeqCst),
+            1,
+            "2nd must resume"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "hook must run on resumption"
+        );
+
+        // A hook that starts rejecting also stops resumed connections.
+        reject.store(true, Ordering::SeqCst);
+        assert!(client.get(&url).send().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn hook_gets_the_ip_literal_as_expected_host() {
+        let server = tls_server().await;
+        let (hook, log) = recording_hook(Ok(()));
+        let client = build_wreq_client(None, Some(hook), None, None).unwrap();
+        let res = client
+            .get(format!("https://127.0.0.1:{}/", server.addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        let log = log.lock().unwrap();
+        assert_eq!(log[0].2, "127.0.0.1");
+        assert_eq!(log[0].0, None, "no SNI for IP literals");
+    }
+
+    #[tokio::test]
+    async fn panicking_hook_fails_the_request_without_aborting() {
+        let server = tls_server().await;
+        let hook: CustomVerify = Arc::new(|_: &mut SslRef, _: &str| panic!("boom"));
+        let client = build_wreq_client(
+            None,
+            Some(hook),
+            Some(Arc::new(StubResolver::default())),
+            None,
+        )
+        .unwrap();
+        let res = client
+            .get(format!("https://{NAME}:{}/", server.addr.port()))
+            .send()
+            .await;
+        assert!(res.is_err());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(server.seen.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejecting_hook_through_resolve_locally_proxy_reaches_no_request() {
+        let server = tls_server().await;
+        let (proxy_addr, heads) = connect_proxy().await;
+        let (hook, log) = recording_hook(Err(SslAlert::BAD_CERTIFICATE));
+        let proxy = Proxy::all(format!("http://{proxy_addr}"))
+            .unwrap()
+            .resolve_locally(true);
+        let client = build_wreq_client(
+            None,
+            Some(hook),
+            Some(Arc::new(StubResolver::default())),
+            Some(proxy),
+        )
+        .unwrap();
+        let port = server.addr.port();
+
+        assert!(client
+            .get(format!("https://{NAME}:{port}/"))
+            .send()
+            .await
+            .is_err());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(heads.lock().unwrap().len(), 1, "tunnel was established");
+        assert_eq!(log.lock().unwrap().len(), 1);
+        assert_eq!(server.seen.handshakes_ok.load(Ordering::SeqCst), 0);
+        assert!(server.seen.requests.lock().unwrap().is_empty());
     }
 }

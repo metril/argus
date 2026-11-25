@@ -17,9 +17,14 @@ pub use btls::ssl::{ExtensionType, KeyShare, NameType, SslAlert, SslRef};
 
 /// In-handshake certificate verification hook (see `ClientBuilder::tls_custom_verify`).
 ///
-/// Receives the connection's `SslRef` (peer chain via `peer_cert_chain()`, SNI via
-/// `servername()`); `Err(alert)` aborts the handshake with that alert.
-pub type CustomVerify = std::sync::Arc<dyn Fn(&mut SslRef) -> Result<(), SslAlert> + Send + Sync>;
+/// Receives the connection's `SslRef` (peer chain via `peer_cert_chain()`) and the normalized
+/// expected host (DNS name or IP literal, without IPv6 brackets) the connection was made for.
+/// The expected host is always set, unlike the SNI (absent for IP literals and with
+/// `tls_sni(false)`), so the hook **must** check the peer certificate against it.
+/// `Err(alert)` aborts the handshake with that alert; a panic is mapped to `INTERNAL_ERROR`.
+/// Runs on resumed sessions too.
+pub type CustomVerify =
+    std::sync::Arc<dyn Fn(&mut SslRef, &str) -> Result<(), SslAlert> + Send + Sync>;
 use bytes::{BufMut, Bytes, BytesMut};
 use compress::CertificateCompressor;
 
