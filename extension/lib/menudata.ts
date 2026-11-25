@@ -1,4 +1,5 @@
 import { getSettings } from './api';
+import { allGranted } from './grants';
 import type { MenuCommand, MenuData, MenuGrant } from './bridge-types';
 
 export interface Caller { trigger(c: MenuCommand): Promise<boolean> }
@@ -50,9 +51,7 @@ export async function loadMenu(tab: { id?: number; url?: string; cookieStoreId?:
   } catch { return { kind: 'offline' }; }
   const grants: MenuGrant[] = [];
   for (const g of data.grants ?? []) {
-    let all = false;
-    try { all = await browser.permissions.contains({ origins: g.patterns }); } catch { /* treat as missing */ }
-    if (!all) grants.push(g);
+    if (!(await allGranted(browser, g.patterns))) grants.push(g);
   }
   return {
     kind: 'ok', commands: data.commands ?? [], grants,

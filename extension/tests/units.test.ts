@@ -4,6 +4,7 @@ import { decodeFrame, encodeFrame, payloadJson } from '../lib/frames';
 import { connectAllows } from '../lib/connect';
 import { cookieOp } from '../lib/cookies';
 import { getSettings } from '../lib/api';
+import { isGranted, patternMatches, recordGrant, revokeGrant } from '../lib/grants';
 
 describe('frames', () => {
   it('round trips', () => {
@@ -81,5 +82,29 @@ describe('getSettings with fake browser', () => {
     (globalThis as any).browser = fakeBrowser;
     await fakeBrowser.storage.local.set({ argusUrl: 'http://a:1/', token: 't' });
     expect(await getSettings()).toEqual({ argusUrl: 'http://a:1', token: 't' });
+  });
+});
+
+describe('grant patterns', () => {
+  const m = (p: string, s: string, h: string, port = '') => patternMatches(p, s, h, port);
+  it('exact host, wildcard subdomains (not the apex), scheme and port', () => {
+    expect(m('https://a.com/*', 'https', 'a.com')).toBe(true);
+    expect(m('https://a.com/*', 'https', 'x.a.com')).toBe(false);
+    expect(m('*://*.a.com/*', 'http', 'x.a.com')).toBe(true);
+    expect(m('*://*.a.com/*', 'https', 'a.com')).toBe(false);
+    expect(m('*://*.a.com/*', 'https', 'evila.com')).toBe(false);
+    expect(m('https://a.com/*', 'http', 'a.com')).toBe(false);
+    expect(m('https://a.com:8443/*', 'https', 'a.com', '8443')).toBe(true);
+    expect(m('https://a.com:8443/*', 'https', 'a.com', '')).toBe(false);
+    expect(m('https://a.com/*', 'https', 'a.com', '8443')).toBe(true);
+  });
+  it('allow records, revoke removes', async () => {
+    const store: Record<string, unknown> = {};
+    const br: any = { storage: { local: { get: async () => store, set: async (o: object) => { Object.assign(store, o); } } } };
+    expect(await isGranted(br, 'https', 'a.com')).toBe(false);
+    await recordGrant(br, ['https://a.com/*']);
+    expect(await isGranted(br, 'https', 'a.com')).toBe(true);
+    await revokeGrant(br, 'https://a.com/*');
+    expect(await isGranted(br, 'https', 'a.com')).toBe(false);
   });
 });

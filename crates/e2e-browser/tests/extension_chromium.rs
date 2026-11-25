@@ -237,7 +237,7 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
     })
     .await;
     let cfg_js = format!(
-        "chrome.storage.local.set({{ argusUrl: {:?}, token: {:?}, argusProxy: {{ enabled: true, stores: {{}} }} }})",
+        "chrome.storage.local.set({{ argusUrl: {:?}, token: {:?}, argusProxy: {{ enabled: true, stores: {{}} }}, granted: [\"*://*.api.test/*\", \"*://*.app.test/*\", \"*://127.0.0.1/*\"] }})",
         argus.web_url(),
         argus.token
     );

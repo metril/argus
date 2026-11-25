@@ -18,17 +18,31 @@ export async function recordGrant(browser: any, patterns: string[]): Promise<voi
   } catch { /* ignore */ }
 }
 
-/** Per-host origins to report: the browser's narrow grants plus the recorded ones it still holds. */
+/** Recorded per-host grants: the only consent for script logins (browser permissions are broad). */
 export async function reportedOrigins(browser: any): Promise<string[]> {
-  const p = await browser.permissions.getAll();
-  const out = new Set<string>(((p?.origins ?? []) as string[]).filter((o) => /^(https?|\*):\/\//.test(o) && !isBroad(o)));
-  try {
-    const rec = ((await browser.storage.local.get(KEY))?.[KEY] ?? []) as string[];
-    for (const o of rec) {
-      if (!isBroad(o) && (await browser.permissions.contains({ origins: [o] }))) out.add(o);
-    }
-  } catch { /* ignore */ }
-  return [...out];
+  return listGrants(browser);
+}
+
+/** Chrome match-pattern semantics for a recorded grant: scheme, host (`*.x` = subdomains only), optional port. */
+export function patternMatches(pattern: string, scheme: string, host: string, port = ''): boolean {
+  const m = /^(\*|https?):\/\/([^/]*)\/(.*)$/.exec(pattern);
+  if (!m || (m[1] !== '*' && m[1] !== scheme)) return false;
+  const pm = /^(.*?)(?::(\d+))?$/.exec(m[2]!.toLowerCase())!;
+  const ph = pm[1]!;
+  if (pm[2] && pm[2] !== port) return false;
+  const h = host.toLowerCase();
+  if (ph === '*') return true;
+  if (ph.startsWith('*.')) return h.endsWith(ph.slice(1)) && h.length > ph.length - 1;
+  return ph === h;
+}
+
+export async function isGranted(browser: any, scheme: string, host: string, port = ''): Promise<boolean> {
+  return (await listGrants(browser)).some((p) => patternMatches(p, scheme, host, port));
+}
+
+export async function allGranted(browser: any, patterns: string[]): Promise<boolean> {
+  const cur = await listGrants(browser);
+  return patterns.every((p) => cur.includes(p));
 }
 
 /** Recorded script-login grants, for the options page. */
@@ -36,9 +50,8 @@ export async function listGrants(browser: any): Promise<string[]> {
   try { return (((await browser.storage.local.get(KEY))?.[KEY] ?? []) as string[]).filter((o) => !isBroad(o)); } catch { return []; }
 }
 
-/** Forgets a grant (and drops the permission where the browser allows it). */
+/** Forgets a grant. */
 export async function revokeGrant(browser: any, pattern: string): Promise<void> {
-  try { await browser.permissions.remove({ origins: [pattern] }); } catch { /* required host access cannot be removed */ }
   try {
     const cur = ((await browser.storage.local.get(KEY))?.[KEY] ?? []) as string[];
     await browser.storage.local.set({ [KEY]: cur.filter((p) => p !== pattern) });

@@ -2,7 +2,7 @@ import { BridgeError, T, type ErrBody, type JobMeta, type ProxyMsg, type XhrMeta
 import { connectAllows, httpHost, isLocalTarget } from './connect';
 import { cookieOp } from './cookies';
 import { decodeFrame, encodeFrame, payloadJson } from './frames';
-import { reportedOrigins } from './grants';
+import { isGranted, reportedOrigins } from './grants';
 import type { ProxyController } from './proxy';
 import { JOB_HEADER, StoreRelay } from './storerelay';
 
@@ -185,8 +185,8 @@ export class Bridge {
     if (!h) throw new BridgeError('denied', 'bad_request', 'only http and https URLs are allowed');
     if (isLocalTarget(h.host)) throw new BridgeError('denied', 'connect_denied', 'local and private targets are not relayed');
     if (!connectAllows(meta.connect, h.host)) throw new BridgeError('denied', 'connect_denied', 'host not allowed by @connect');
-    const host = h.host.includes(':') ? `[${h.host}]` : h.host;
-    const ok = await this.d.browser.permissions.contains({ origins: [`${h.scheme}://${host}/*`] });
+    // Consent is the user's recorded per-host grant; the browser-level host access covers all sites.
+    const ok = await isGranted(this.d.browser, h.scheme, h.host, new URL(url).port);
     if (!ok) throw new BridgeError('denied', 'permission', 'extension lacks host permission');
   }
 

@@ -40,10 +40,7 @@ function Scripts({ state, tab, reload }: { state: MenuState; tab?: Tab; reload: 
       {miss && <div class="note" role="status">Not delivered. Reload the page.</div>}
       {grants.map((g) => (
         <GrantRow key={g.script + g.host} grant={g} onAllow={(x) => {
-          // Called straight from the click so the permission prompt keeps its user gesture.
-          void browser.permissions.request({ origins: x.patterns }).then(async (ok) => {
-            if (ok) { await recordGrant(browser, x.patterns); setGrants((cur) => cur.filter((y) => y !== x)); }
-          });
+          void recordGrant(browser, x.patterns).then(() => setGrants((cur) => cur.filter((y) => y !== x)));
         }} />
       ))}
     </section>
