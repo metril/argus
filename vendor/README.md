@@ -48,11 +48,13 @@ were dropped.
    pooled connections opened for requests of a group (matched by the group's name). Busy
    connections finish their request and age out with the idle timeout. Files: `src/client.rs`,
    `src/client/layer/client.rs`, `src/client/layer/client/pool.rs`, `src/group.rs`,
-   `src/conn/descriptor.rs`.
-5. **No internal retry of unstarted requests.** The pooled client no longer re-sends a request
-   whose reused connection was closed before it started (`retry_canceled_requests` is `false`):
-   Argus does one deterministic retry itself, on a fresh connection group. File:
-   `src/client/layer/client.rs`.
+   `src/conn/descriptor.rs`. `pool_max_size` now bounds the idle connections over all keys
+   (the oldest idle connection of the least recently used key is dropped first), not the keys.
+5. **At most one internal re-send of an unstarted request.** The pooled client re-sends a request
+   whose reused connection was closed before it started (the request is handed back unsent, so
+   even a streamed body is safe) at most once, and an error returned after that re-send answers
+   `Error::is_retried()`, so Argus does not stack its own retry on top. Files:
+   `src/client/layer/client.rs`, `src/error.rs`.
 
 ## Updating
 

@@ -108,3 +108,15 @@ async fn the_whole_pool_is_bounded() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(o.stats.open.load(Ordering::SeqCst) <= 3);
 }
+
+#[tokio::test]
+async fn the_tls_session_cache_is_bounded() {
+    // Room for one session: another device's connection pushes this device's out.
+    let (r, o) = setup(|opts| opts.tls_session_cap = Some(1)).await;
+    get(&r.client, &o, scope(1, "dev-a")).await;
+    get(&r.client, &o, scope(2, "dev-b")).await;
+    get(&r.client, &o, scope(3, "dev-a")).await;
+    assert_eq!(o.stats.resumed.load(Ordering::SeqCst), 0, "evicted session");
+    get(&r.client, &o, scope(4, "dev-a")).await;
+    assert_eq!(o.stats.resumed.load(Ordering::SeqCst), 1, "kept session");
+}

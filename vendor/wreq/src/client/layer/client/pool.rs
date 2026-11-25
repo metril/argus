@@ -81,6 +81,9 @@ struct PoolInner<T, K: Eq + Hash> {
     // state, waiting to receive a new Request to send on the socket.
     idle: LruCache<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
+    // Bound on idle connections over all keys (Argus: counts connections, not keys; the
+    // oldest idle connection of the least recently used key goes first).
+    max_total_idle: Option<usize>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -121,9 +124,8 @@ impl<T, K: Key> Pool<T, K> {
         let inner = if config.is_enabled() {
             Some(Arc::new(Mutex::new(PoolInner {
                 connecting: HashSet::default(),
-                idle: config
-                    .max_pool_size
-                    .map_or_else(LruCache::unbounded, LruCache::new),
+                idle: LruCache::unbounded(),
+                max_total_idle: config.max_pool_size.map(NonZeroUsize::get),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
                 waiters: HashMap::default(),
@@ -383,10 +385,35 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                     idle_at: now,
                 });
             }
+            self.trim_idle();
 
             self.spawn_idle_interval(__pool_ref);
         } else {
             trace!("put; found waiter for {:?}", key)
+        }
+    }
+
+    /// Drop idle connections (oldest of the least recently used key first) until at most
+    /// `max_total_idle` remain.
+    fn trim_idle(&mut self) {
+        let Some(max) = self.max_total_idle else {
+            return;
+        };
+        let mut total: usize = self.idle.iter().map(|(_, v)| v.len()).sum();
+        while total > max {
+            let Some(key) = self.idle.peek_lru().map(|(k, _)| k.clone()) else {
+                break;
+            };
+            if let Some(list) = self.idle.peek_mut(&key) {
+                if !list.is_empty() {
+                    drop(list.remove(0));
+                    total -= 1;
+                }
+                if !list.is_empty() {
+                    continue;
+                }
+            }
+            self.idle.pop(&key);
         }
     }
 

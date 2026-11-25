@@ -31,6 +31,8 @@ pub struct UpstreamOptions {
     /// Bound on the idle pool entries (connection group x origin) of the browser-like client;
     /// `None`: unbounded.
     pub pool_max_size: Option<usize>,
+    /// Cap on the TLS sessions kept for resumption, over all devices and hosts; `None`: 4096.
+    pub tls_session_cap: Option<usize>,
     /// Where the certificates upstream servers present are recorded (shared with the web API).
     pub certs: Arc<common::certstore::CertStore>,
     /// The live trusted root set; built from `extra_ca_paths` over the compiled-in floor when
@@ -76,6 +78,7 @@ impl UpstreamOptions {
             dns: Some(dns.clone()),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(max_connections)),
             pool_max_size: Some(common::config::pool_total_idle(max_connections)),
+            tls_session_cap: None,
             policy: Arc::new(
                 DestPolicy::from_config(config)
                     .unwrap_or_else(|e| {
@@ -982,6 +985,79 @@ fn resolver_of(opts: &UpstreamOptions, strict: bool) -> PolicyResolver {
 /// Group suffix of the retry of a failed request: a fresh connection, never the failed one.
 const RETRY_SUFFIX: &str = "#r";
 
+const DEFAULT_TLS_SESSIONS: usize = 4096;
+/// Sessions older than this are not offered (also bounded by the ticket's own lifetime).
+const SESSION_TTL: Duration = Duration::from_secs(2 * 3600);
+/// Sessions kept per (device, origin).
+const SESSIONS_PER_KEY: usize = 8;
+
+/// TLS session cache with a global cap and a lifetime: the oldest session goes first when full,
+/// and a session past its TTL (or its ticket's lifetime) is never offered. TLS 1.3 sessions are
+/// single use.
+pub struct BoundedSessionCache {
+    cap: usize,
+    ttl: Duration,
+    entries: parking_lot::Mutex<
+        std::collections::VecDeque<(
+            wreq::tls::session::Key,
+            wreq::tls::session::TlsSession,
+            std::time::Instant,
+        )>,
+    >,
+}
+
+impl BoundedSessionCache {
+    pub fn new(cap: usize, ttl: Duration) -> Self {
+        Self {
+            cap: cap.max(1),
+            ttl,
+            entries: Default::default(),
+        }
+    }
+
+    fn expired(&self, s: &wreq::tls::session::TlsSession, at: std::time::Instant) -> bool {
+        let life = self.ttl.min(Duration::from_secs(u64::from(s.timeout())));
+        at.elapsed() > life
+    }
+}
+
+impl wreq::tls::session::TlsSessionCache for BoundedSessionCache {
+    fn put(&self, key: wreq::tls::session::Key, session: wreq::tls::session::TlsSession) {
+        let mut e = self.entries.lock();
+        e.push_back((key.clone(), session, std::time::Instant::now()));
+        // Oldest first, so expired ones are at the front.
+        while e.front().is_some_and(|(_, s, at)| self.expired(s, *at)) {
+            e.pop_front();
+        }
+        while e.len() > self.cap {
+            e.pop_front();
+        }
+        let same: Vec<usize> = e
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _, _))| *k == key)
+            .map(|(i, _)| i)
+            .collect();
+        if same.len() > SESSIONS_PER_KEY {
+            e.remove(same[0]);
+        }
+    }
+
+    fn pop(&self, key: &wreq::tls::session::Key) -> Option<wreq::tls::session::TlsSession> {
+        let mut e = self.entries.lock();
+        let i = e
+            .iter()
+            .rposition(|(k, s, at)| k == key && !self.expired(s, *at))?;
+        let (_, s, at) = e.get(i)?.clone();
+        // A TLS 1.3 ticket must not be used twice.
+        if s.protocol_version() == wreq::tls::TlsVersion::TLS_1_3 {
+            e.remove(i);
+        }
+        let _ = at;
+        Some(s)
+    }
+}
+
 /// Idle upstream connections kept per (downstream connection, origin) by the browser-like client.
 const WREQ_IDLE_PER_HOST: usize = 6;
 
@@ -1030,8 +1106,11 @@ fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
         .pool_max_size(opts.pool_max_size.unwrap_or(0))
         .pool_idle_timeout(Duration::from_secs(30))
         .tls_custom_verify(verify)
-        // Sessions kept per device and host for resumption (the default keeps 8).
-        .tls_session_cache(Arc::new(wreq::tls::session::LruTlsSessionCache::new(32)))
+        // Sessions kept per device and host for resumption, bounded overall and in age.
+        .tls_session_cache(Arc::new(BoundedSessionCache::new(
+            opts.tls_session_cap.unwrap_or(DEFAULT_TLS_SESSIONS),
+            SESSION_TTL,
+        )))
         .dns_resolver(Arc::new(resolver_of(opts, strict)));
     if let Some(t) = opts.connect_timeout {
         b = b.connect_timeout(t);
