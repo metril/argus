@@ -61,6 +61,8 @@ pub enum Act {
     Ok,
     /// Send GOAWAY (`ENHANCE_YOUR_CALM`) and close, answering nothing.
     Goaway,
+    /// Send GOAWAY (`REFUSED_STREAM`, last stream id covering this request) and close.
+    GoawayRefused,
     /// Reset the stream with `REFUSED_STREAM`.
     Refuse,
     /// Close the TCP connection without a word.
@@ -267,6 +269,11 @@ async fn serve(
                 while conn.accept().await.is_some() {}
                 return;
             }
+            Act::GoawayRefused => {
+                conn.abrupt_shutdown(h2::Reason::REFUSED_STREAM);
+                while conn.accept().await.is_some() {}
+                return;
+            }
             Act::Drop => return,
             Act::Hang => {
                 tokio::spawn(async move {
@@ -285,6 +292,11 @@ pub struct Rig {
 
 /// A browser-like client trusting `trusted`, dialling every name to loopback.
 pub fn rig(trusted: &Ca, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
+    rig_with(trusted, true, tweak)
+}
+
+/// Like [`rig`], for the browser-like (wreq) or the plain (reqwest) client.
+pub fn rig_with(trusted: &Ca, browser_like: bool, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join("ca.pem");
     std::fs::write(&path, &trusted.pem).unwrap();
@@ -294,11 +306,11 @@ pub fn rig(trusted: &Ca, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
         resolve_all_to: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         connect_timeout: Some(Duration::from_secs(5)),
         read_timeout: Some(Duration::from_secs(5)),
-        browser_like: true,
+        browser_like,
         ..Default::default()
     };
     tweak(&mut opts);
     let client = build_upstream_client(&opts).unwrap();
-    assert!(client.is_browser_like());
+    assert_eq!(client.is_browser_like(), browser_like);
     Rig { client, _dir: dir }
 }

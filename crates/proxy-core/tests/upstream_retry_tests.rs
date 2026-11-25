@@ -249,3 +249,89 @@ async fn a_timeout_is_not_retried() {
     assert_eq!(o.stats.requests.load(Ordering::SeqCst), 1);
     assert_eq!(retries(), 0);
 }
+
+async fn setup_with(browser_like: bool, script: Script) -> (Rig, Origin) {
+    let trusted = ca("trusted");
+    let (der, key) = leaf(&trusted, HOST);
+    let o = h2_origin(vec![der, trusted.der.clone()], key, script).await;
+    (rig_with(&trusted, browser_like, |_| {}), o)
+}
+
+#[tokio::test]
+async fn a_post_is_sent_at_most_twice_when_refused_stream_repeats() {
+    for browser_like in [false, true] {
+        let (r, o) = setup_with(browser_like, Arc::new(|_, _| Act::Refuse)).await;
+        let err = base(&r.client, hyper::Method::POST, &o)
+            .body(bytes::Bytes::from_static(b"small"))
+            .send()
+            .await;
+        assert!(err.is_err(), "browser_like={browser_like}");
+        assert_eq!(
+            o.stats.requests.load(Ordering::SeqCst),
+            2,
+            "browser_like={browser_like}: one attempt and one retry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_goaway_refused_stream_is_not_retried_for_a_post() {
+    // The stream is at or below the GOAWAY's last stream id: the origin may have run it.
+    for browser_like in [false, true] {
+        let (r, o) = setup_with(browser_like, Arc::new(|_, _| Act::GoawayRefused)).await;
+        let err = base(&r.client, hyper::Method::POST, &o)
+            .body(bytes::Bytes::from_static(b"small"))
+            .send()
+            .await;
+        assert!(err.is_err(), "browser_like={browser_like}");
+        assert_eq!(
+            o.stats.requests.load(Ordering::SeqCst),
+            1,
+            "browser_like={browser_like}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_reqwest_retry_uses_a_new_connection_not_an_idle_one() {
+    // Connection 0 serves the first request and stays idle in the pool, then refuses the second.
+    let script: Script = Arc::new(|c, n| {
+        if c == 0 && n == 1 {
+            Act::Refuse
+        } else {
+            Act::Ok
+        }
+    });
+    let (r, o) = setup_with(false, script).await;
+    let first = base(&r.client, hyper::Method::GET, &o)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let second = base(&r.client, hyper::Method::GET, &o)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(o.stats.conns.load(Ordering::SeqCst), 2, "retry dialled");
+    assert_eq!(retries(), 1);
+}
+
+#[tokio::test]
+async fn the_wreq_resend_of_an_unstarted_request_dials_a_new_connection() {
+    // Two idle pooled connections die; the re-send must not pick the second dead one.
+    let script: Script = Arc::new(|c, n| if c < 2 && n == 1 { Act::Drop } else { Act::Ok });
+    let (r, o) = setup_with(true, script).await;
+    let (a, b) = tokio::join!(
+        base(&r.client, hyper::Method::GET, &o).send(),
+        base(&r.client, hyper::Method::GET, &o).send()
+    );
+    assert_eq!(a.unwrap().status(), 200);
+    assert_eq!(b.unwrap().status(), 200);
+    let (a, b) = tokio::join!(
+        base(&r.client, hyper::Method::GET, &o).send(),
+        base(&r.client, hyper::Method::GET, &o).send()
+    );
+    assert_eq!(a.unwrap().status(), 200);
+    assert_eq!(b.unwrap().status(), 200);
+}

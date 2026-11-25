@@ -1,4 +1,4 @@
-// Modified by Argus: `Group::session` / `Group::session_scope` (per-device TLS session cache, patch 3) and `Group::in_request_group` (pool eviction, patch 4).
+// Modified by Argus: `Group::session` / `Group::session_scope` (per-device TLS session cache, patch 3) and `Group::in_request_group` (pool eviction, patch 4) and `Group::fresh` (fresh connection for a re-send, patch 6).
 //! # Request Grouping Mechanism
 //!
 //! This module provides the [`Group`] structure, which defines the logical boundaries
@@ -49,6 +49,7 @@ impl_group_variants! {
     Version(Version),
     Proxy(Matcher),
     SocketBind(Option<SocketBindOptions>),
+    Fresh(u64),
 }
 
 /// A logical identifier for request grouping.
@@ -102,6 +103,15 @@ impl Group {
         matches!(
             self.0.get(&GroupKey::Request),
             Some(GroupVariant::Request(inner)) if inner.0.get(&GroupKey::Named) == Some(want)
+        )
+    }
+
+    /// Makes this group unique, so a pool never has an idle connection under its key.
+    pub(crate) fn fresh(&mut self) -> &mut Self {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.extend(
+            GroupKey::Fresh,
+            GroupVariant::Fresh(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
         )
     }
 

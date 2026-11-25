@@ -1,4 +1,4 @@
-// Modified by Argus: `ConnectionDescriptor::session_id` (per-device TLS session cache, patch 3) and `ConnectionId::in_request_group` (pool eviction, patch 4).
+// Modified by Argus: `ConnectionDescriptor::session_id` (per-device TLS session cache, patch 3) and `ConnectionId::in_request_group` (pool eviction, patch 4) and `ConnectionDescriptor::fresh` (patch 6).
 use std::{
     hash::{BuildHasher, Hash, Hasher},
     num::NonZeroU64,
@@ -111,6 +111,17 @@ impl ConnectionDescriptor {
             socket_bind,
             connection_id,
             session_id,
+        }
+    }
+
+    /// The same descriptor under a unique pool key: its connection is a new one, never an idle
+    /// pooled connection. TLS session resumption is unaffected.
+    pub(crate) fn fresh(&self) -> ConnectionDescriptor {
+        let mut group = self.connection_id.0.0.clone();
+        group.fresh();
+        ConnectionDescriptor {
+            connection_id: ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN)))),
+            ..self.clone()
         }
     }
 
