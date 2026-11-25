@@ -12,6 +12,31 @@ use std::sync::Arc;
 use userscript_engine::{UserscriptManager, UserscriptRuntime};
 use web_api::{ApiConfig, ApiResult, AppState, ProfileBuildInfo, ProfileRuntime};
 
+/// The web server as the proxy's in-process target for requests to the web UI endpoint.
+struct WebHandoff(Arc<web_api::WebServer>);
+
+impl crate::self_route::WebUiHandoff for WebHandoff {
+    fn stream(&self, io: Box<dyn crate::self_route::Io>, peer: std::net::SocketAddr, port: u16) {
+        self.0.handoff_stream(io, peer, port);
+    }
+
+    fn request(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+        peer: std::net::SocketAddr,
+        port: u16,
+    ) -> futures_util::future::BoxFuture<'static, hyper::Response<crate::inject::ProxyBody>> {
+        let server = self.0.clone();
+        Box::pin(async move {
+            use http_body_util::BodyExt;
+            server
+                .handoff_request(req, peer, port)
+                .await
+                .map(|b| b.map_err(std::io::Error::other).boxed_unsync())
+        })
+    }
+}
+
 /// Build status and device activity of a running proxy, for the API.
 pub struct ProxyProfileRuntime {
     ctx: Arc<ProxyContext>,
@@ -220,6 +245,10 @@ impl web_api::RuntimeControl for ProxyRuntime {
             .issue_webui_cert(sans.to_vec())
             .await
             .map_err(|e| e.to_string())
+    }
+
+    fn webui_handoff(&self, server: Arc<web_api::WebServer>) {
+        self.0.set_web_server(Arc::new(WebHandoff(server)));
     }
 
     async fn note_webui(&self, host: &str, port: u16) {

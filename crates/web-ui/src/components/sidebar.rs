@@ -91,6 +91,13 @@ pub const ACCOUNT: &[NavItem] = &[
         scope: None,
     },
     NavItem {
+        path: "/extension",
+        label: "Browser extension",
+        icon: "download",
+        sub: "Install and sign in",
+        scope: None,
+    },
+    NavItem {
         path: "/tokens",
         label: "API tokens",
         icon: "key",
@@ -206,7 +213,7 @@ pub fn Sidebar() -> impl IntoView {
         <aside class="side" id="side" aria-label="Main navigation">
             <div class="brand">
                 <span class="brand-mark"><Icon name="adblock" /></span>
-                <span class="brand-text"><b>"argus"</b></span>
+                <span class="brand-text"><b>"Argus"</b></span>
             </div>
             <nav class="nav" id="nav">
                 {group("Overview", OVERVIEW, false, pathname, scopes)}

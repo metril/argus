@@ -104,6 +104,189 @@ impl Scope {
     }
 }
 
+/// One access level of a [`Resource`]: the scopes it adds on top of the levels before it.
+#[derive(Debug, Clone, Copy)]
+pub struct Level {
+    pub label: &'static str,
+    pub scopes: &'static [Scope],
+}
+
+/// A row of the token form: a resource with ordered access levels (none, then each level here).
+/// Choosing level `n` grants every scope of levels `1..=n`.
+#[derive(Debug, Clone, Copy)]
+pub struct Resource {
+    pub label: &'static str,
+    /// Shown in the collapsed "Admin access" section.
+    pub admin: bool,
+    pub levels: &'static [Level],
+}
+
+const fn lv(label: &'static str, scopes: &'static [Scope]) -> Level {
+    Level { label, scopes }
+}
+
+/// Every scope appears in exactly one level of exactly one resource (enforced by a test), so a
+/// new scope cannot be forgotten by the token form.
+pub const RESOURCES: &[Resource] = &[
+    Resource {
+        label: "Lists",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::ListsRead]),
+            lv("Read & write", &[Scope::ListsWrite]),
+        ],
+    },
+    Resource {
+        label: "Rules",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::RulesRead]),
+            lv("Read & write", &[Scope::RulesWrite]),
+        ],
+    },
+    Resource {
+        label: "Engine",
+        admin: false,
+        levels: &[lv("Reload", &[Scope::EngineReload])],
+    },
+    Resource {
+        label: "Stats",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::StatsRead]),
+            lv("Read + reset", &[Scope::StatsReset]),
+        ],
+    },
+    Resource {
+        label: "Logs",
+        admin: false,
+        levels: &[lv("Read", &[Scope::LogsRead])],
+    },
+    Resource {
+        label: "Config",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::ConfigRead]),
+            lv("Read & write", &[Scope::ConfigWrite]),
+        ],
+    },
+    Resource {
+        label: "Certificate",
+        admin: false,
+        levels: &[lv("Read", &[Scope::CaRead])],
+    },
+    Resource {
+        label: "Userscripts",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::ScriptsRead]),
+            lv("Read & write", &[Scope::ScriptsWrite]),
+        ],
+    },
+    Resource {
+        label: "Extension",
+        admin: false,
+        levels: &[lv("Connect", &[Scope::UserscriptsBridge])],
+    },
+    Resource {
+        label: "Policy",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::PolicyRead]),
+            lv("Read & write", &[Scope::PolicyWrite]),
+        ],
+    },
+    Resource {
+        label: "Profiles",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::ProfilesRead]),
+            lv("Read & write", &[Scope::ProfilesWrite]),
+        ],
+    },
+    Resource {
+        label: "Devices",
+        admin: false,
+        levels: &[
+            lv("Read", &[Scope::DevicesRead]),
+            lv("Read & write", &[Scope::DevicesWrite]),
+        ],
+    },
+    Resource {
+        label: "Own tokens",
+        admin: false,
+        levels: &[lv("Manage", &[Scope::TokensSelf])],
+    },
+    Resource {
+        label: "Own sessions",
+        admin: false,
+        levels: &[lv("Manage", &[Scope::SessionsSelf])],
+    },
+    Resource {
+        label: "System",
+        admin: false,
+        levels: &[lv("Read", &[Scope::SystemRead])],
+    },
+    Resource {
+        label: "Users",
+        admin: true,
+        levels: &[
+            lv("Read", &[Scope::UsersRead]),
+            lv("Manage", &[Scope::UsersAdmin]),
+        ],
+    },
+    Resource {
+        label: "All tokens",
+        admin: true,
+        levels: &[lv("Manage", &[Scope::TokensAdmin])],
+    },
+    Resource {
+        label: "All sessions",
+        admin: true,
+        levels: &[lv("Manage", &[Scope::SessionsAdmin])],
+    },
+    Resource {
+        label: "Certificate admin",
+        admin: true,
+        levels: &[lv("Manage", &[Scope::CaAdmin])],
+    },
+    Resource {
+        label: "Audit log",
+        admin: true,
+        levels: &[lv("Read", &[Scope::AuditRead])],
+    },
+];
+
+impl Resource {
+    /// Scopes granted by level `n` (`0` = none): the union of levels `1..=n`.
+    pub fn scopes_at(&self, n: usize) -> Vec<Scope> {
+        self.levels
+            .iter()
+            .take(n)
+            .flat_map(|l| l.scopes.iter().copied())
+            .collect()
+    }
+
+    /// The highest level (`0` = none) that has any scope in `selected`.
+    pub fn level_of(&self, selected: &[Scope]) -> usize {
+        self.levels
+            .iter()
+            .rposition(|l| l.scopes.iter().any(|s| selected.contains(s)))
+            .map_or(0, |i| i + 1)
+    }
+
+    /// Whether the holder of `held` can grant at least the first level.
+    pub fn available(&self, held: &[Scope]) -> usize {
+        (1..=self.levels.len())
+            .take_while(|n| self.scopes_at(*n).iter().all(|s| held.contains(s)))
+            .count()
+    }
+}
+
+/// Template: scopes for a one-click preset.
+pub const TEMPLATE_BROWSER_EXTENSION: &[Scope] = &[Scope::LogsRead, Scope::UserscriptsBridge];
+pub const TEMPLATE_MONITORING: &[Scope] = &[Scope::StatsRead, Scope::SystemRead];
+
 impl fmt::Display for Scope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -173,5 +356,33 @@ mod tests {
         assert_eq!(UserRole::Admin.scopes().len(), Scope::ALL.len());
         assert!(!v.contains(&Scope::UsersRead) && !v.contains(&Scope::AuditRead));
         assert!(u.contains(&Scope::ListsWrite) && !u.contains(&Scope::ConfigWrite));
+    }
+
+    #[test]
+    fn every_scope_is_in_exactly_one_level() {
+        for s in Scope::ALL {
+            let n = RESOURCES
+                .iter()
+                .flat_map(|r| r.levels)
+                .filter(|l| l.scopes.contains(s))
+                .count();
+            assert_eq!(n, 1, "{s} appears in {n} levels");
+        }
+    }
+
+    #[test]
+    fn levels_round_trip() {
+        for r in RESOURCES {
+            for n in 0..=r.levels.len() {
+                assert_eq!(r.level_of(&r.scopes_at(n)), n, "{}", r.label);
+            }
+        }
+        let lists = &RESOURCES[0];
+        assert_eq!(
+            lists.scopes_at(2),
+            vec![Scope::ListsRead, Scope::ListsWrite]
+        );
+        assert_eq!(lists.available(&[Scope::ListsRead]), 1);
+        assert_eq!(lists.available(&[]), 0);
     }
 }

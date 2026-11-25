@@ -1514,6 +1514,13 @@
       },
       "CreateTokenRequest": {
         "properties": {
+          "expires_at": {
+            "description": "Absolute expiry (RFC 3339, must be in the future). Exclusive with `expires_in_days`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "expires_in_days": {
             "description": "Lifetime in days; omit for a token that never expires.",
             "format": "int32",
@@ -2432,6 +2439,54 @@
         },
         "required": [
           "delivered"
+        ],
+        "type": "object"
+      },
+      "ExtensionTokenRequest": {
+        "description": "Sign in from the browser extension: checks the credentials like a login, but starts no session\nand mints a token named `Extension · {browser}` with just the scopes the extension needs.",
+        "properties": {
+          "browser": {
+            "description": "Browser name for the token label, e.g. `Chrome`.",
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "replace_token_id": {
+            "description": "An earlier extension token of the same user to revoke (ignored if it is not theirs).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password",
+          "browser"
+        ],
+        "type": "object"
+      },
+      "ExtensionTokenResponse": {
+        "description": "The new extension token; `token` is shown only here.",
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "token_id": {
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserInfo"
+          }
+        },
+        "required": [
+          "token",
+          "token_id",
+          "user"
         ],
         "type": "object"
       },
@@ -7284,7 +7339,7 @@
     "contact": {
       "name": "Argus Contributors"
     },
-    "description": "Control-plane API of the argus proxy. Authenticate with a session cookie or `Authorization: Bearer abk_<id>_<secret>`. Every operation lists the scope it requires.",
+    "description": "Control-plane API of the Argus proxy. Authenticate with a session cookie or `Authorization: Bearer abk_<id>_<secret>`. Every operation lists the scope it requires.",
     "license": {
       "name": "Proprietary"
     },
@@ -7862,6 +7917,63 @@
         "summary": "Read the audit log, newest first. `total` on the first page is exact for an unfiltered\nquery and otherwise a lower bound; later pages (with `cursor`) repeat that first-page value.",
         "tags": [
           "audit"
+        ]
+      }
+    },
+    "/api/v1/auth/extension-token": {
+      "post": {
+        "operationId": "extension_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtensionTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtensionTokenResponse"
+                }
+              }
+            },
+            "description": "Token minted; `token` is shown only here"
+          },
+          "403": {
+            "description": "Code `insufficient_role`: the account's role cannot use the extension. Wrong credentials answer 401 like login."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {}
+        ],
+        "summary": "Sign in from the browser extension: the same credential check and rate limit as login, but no\nsession or cookies. Mints a token named `Extension · {browser}` (no expiry) with just the\nscopes the extension needs, and revokes `replace_token_id` if it is the caller's own.",
+        "tags": [
+          "auth"
         ]
       }
     },
@@ -17711,6 +17823,78 @@
           }
         ],
         "summary": "Create an API token. The secret is returned once and cannot be retrieved again. Requested\nscopes must all be held by the caller (a token can never mint more than it has).",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
+    "/api/v1/tokens/self": {
+      "delete": {
+        "operationId": "revoke_self",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Revoked; the token stops working at once"
+          },
+          "400": {
+            "description": "The caller is a cookie session, not an API token"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "cookie_auth": []
+          }
+        ],
+        "summary": "Revoke the token making this request (the extension's sign out). Cookie sessions have no\ntoken to revoke; they use `/auth/logout`.",
         "tags": [
           "tokens"
         ]

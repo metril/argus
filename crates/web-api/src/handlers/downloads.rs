@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use common::net_policy::control_plane_client;
 
 use crate::error::{ApiError, ApiPath, ApiResult};
+use crate::middleware::ClientInfo;
 use crate::state::AppState;
 
 /// Where release assets live. Not user-configurable; tests inject a local server.
@@ -106,6 +107,56 @@ async fn fetch_cached(
     )))
 }
 
+/// Copy `zip` with an `argus.json` (`{"argusUrl": origin}`) at its root, so the extension can
+/// prefill this server's address. An existing `argus.json` is replaced.
+fn with_argus_json(zip: &[u8], origin: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Cursor, Write};
+    let mut src = zip::ZipArchive::new(Cursor::new(zip)).map_err(|e| e.to_string())?;
+    let mut out = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..src.len() {
+        let f = src.by_index_raw(i).map_err(|e| e.to_string())?;
+        if f.name() != "argus.json" {
+            out.raw_copy_file(f).map_err(|e| e.to_string())?;
+        }
+    }
+    out.start_file("argus.json", zip::write::SimpleFileOptions::default())
+        .map_err(|e| e.to_string())?;
+    let body = serde_json::json!({ "argusUrl": origin });
+    out.write_all(body.to_string().as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(out.finish().map_err(|e| e.to_string())?.into_inner())
+}
+
+/// A `Host`-style value: letters, digits and `. - : [ ]` only.
+fn sane_host(h: &str) -> Option<&str> {
+    let h = h.trim();
+    (!h.is_empty()
+        && h.len() <= 255
+        && h.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')))
+    .then_some(h)
+}
+
+/// This server's origin as the client reached it (`scheme://host`). Behind a trusted proxy the
+/// host is its `X-Forwarded-Host` (first entry), matching how the scheme is decided.
+fn request_origin(
+    headers: &HeaderMap,
+    https: bool,
+    peer: Option<std::net::IpAddr>,
+    trusted: &[std::net::IpAddr],
+) -> Option<String> {
+    let forwarded = peer
+        .filter(|p| trusted.contains(p))
+        .and_then(|_| headers.get("x-forwarded-host"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| sane_host(v.split(',').next().unwrap_or("")));
+    let host = match forwarded {
+        Some(h) => h,
+        None => sane_host(headers.get(header::HOST)?.to_str().ok()?)?,
+    };
+    Some(format!("{}://{host}", if https { "https" } else { "http" }))
+}
+
 /// Download the browser extension build matching this Argus version.
 #[utoipa::path(
     get, path = "/downloads/extension/{browser}", tag = "ca",
@@ -119,6 +170,9 @@ async fn fetch_cached(
 )]
 pub async fn download_extension(
     State(state): State<Arc<AppState>>,
+    axum::Extension(info): axum::Extension<ClientInfo>,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    headers: HeaderMap,
     ApiPath(browser): ApiPath<String>,
 ) -> ApiResult<Response> {
     let data_dir = state.proxy_state.config.read().adblock.data_dir.clone();
@@ -136,6 +190,22 @@ pub async fn download_extension(
         MAX_ASSET_BYTES,
     )
     .await?;
+    // Zips (the Chrome build) carry this server's address so the extension needs no URL typed.
+    let bytes = match request_origin(
+        &headers,
+        info.https,
+        peer.map(|p| p.0 .0.ip()),
+        &state.api_config.network.trusted_proxies,
+    ) {
+        Some(origin) if name.ends_with(".zip") => match with_argus_json(&bytes, &origin) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("could not add argus.json to {name}: {e}");
+                bytes
+            }
+        },
+        _ => bytes,
+    };
     Ok((
         [
             (header::CONTENT_TYPE, content_type(&name).to_string()),
@@ -156,6 +226,58 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const MAX: usize = 1024;
+
+    #[test]
+    fn argus_json_is_added_and_the_rest_kept() {
+        use std::io::{Cursor, Read, Write};
+        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        w.start_file("manifest.json", o).unwrap();
+        w.write_all(b"{}").unwrap();
+        w.start_file("argus.json", o).unwrap();
+        w.write_all(b"old").unwrap();
+        let zip = w.finish().unwrap().into_inner();
+        let out = with_argus_json(&zip, "https://argus.lan:8443").unwrap();
+        let mut a = zip::ZipArchive::new(Cursor::new(out)).unwrap();
+        assert_eq!(a.len(), 2);
+        let mut s = String::new();
+        a.by_name("argus.json")
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        assert_eq!(s, r#"{"argusUrl":"https://argus.lan:8443"}"#);
+        assert!(a.by_name("manifest.json").is_ok());
+        assert!(with_argus_json(b"nope", "x").is_err());
+    }
+
+    #[test]
+    fn origin_trusts_forwarded_host_only_from_a_trusted_proxy() {
+        let proxy: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        let other: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "argus:8080".parse().unwrap());
+        assert_eq!(
+            request_origin(&h, false, Some(other), &[proxy]).as_deref(),
+            Some("http://argus:8080")
+        );
+        h.insert("x-forwarded-host", "argus.lan, inner".parse().unwrap());
+        assert_eq!(
+            request_origin(&h, true, Some(other), &[proxy]).as_deref(),
+            Some("https://argus:8080")
+        );
+        assert_eq!(
+            request_origin(&h, true, Some(proxy), &[proxy]).as_deref(),
+            Some("https://argus.lan")
+        );
+        h.insert("x-forwarded-host", "a/b".parse().unwrap());
+        assert_eq!(
+            request_origin(&h, true, Some(proxy), &[proxy]).as_deref(),
+            Some("https://argus:8080")
+        );
+        h.insert(header::HOST, "a/b".parse().unwrap());
+        assert!(request_origin(&h, false, None, &[]).is_none());
+        assert!(request_origin(&HeaderMap::new(), false, None, &[]).is_none());
+    }
 
     /// 1.2.3: zips only. 1.2.4: xpi and zip. 1.2.5: HTTP 500. 1.2.6: oversized zip.
     async fn mock() -> (String, Arc<AtomicUsize>) {

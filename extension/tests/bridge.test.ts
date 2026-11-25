@@ -22,14 +22,14 @@ class FakeWS {
 const tick = () => new Promise((r) => setTimeout(r, 5));
 const SID = 'a'.repeat(32);
 
-function setup(opts: { perm?: boolean; fetch?: any; proxy?: any; storeRelay?: any } = {}) {
+function setup(opts: { perm?: boolean; grants?: string[]; fetch?: any; proxy?: any; storeRelay?: any } = {}) {
   const br = {
     permissions: {
       contains: vi.fn(async () => opts.perm ?? true),
       getAll: vi.fn(async () => ({ origins: ['https://a.com/*', 'chrome://x/*', '<all_urls>'] })),
     },
     cookies: { getAll: vi.fn(async () => []), set: vi.fn(), remove: vi.fn() },
-    storage: { local: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}) } },
+    storage: { local: { get: vi.fn(async () => ({ granted: opts.perm === false ? [] : (opts.grants ?? ['https://a.com/*']) })), set: vi.fn(async () => {}) } },
   };
   const b = new Bridge({
     WebSocketCtor: FakeWS as any, browser: br, fetch: opts.fetch, proxy: opts.proxy, storeRelay: opts.storeRelay,
@@ -158,11 +158,21 @@ describe('Bridge', () => {
     await b.stop();
   });
 
-  it('reports only per-host permissions: broad patterns and <all_urls> are left out', async () => {
-    const { b, br } = setup();
-    br.permissions.getAll.mockResolvedValue({ origins: ['<all_urls>', '*://*/*', 'https://*/*', 'http://*/*', 'https://a.com/*', '*://*.b.com/*'] } as any);
+  it('reports recorded grants only, ignoring browser permissions', async () => {
+    const { b, br } = setup({ grants: ['https://a.com/*', '*://*.b.com/*', '<all_urls>', 'https://*/*'] });
+    br.permissions.getAll.mockResolvedValue({ origins: ['<all_urls>', 'https://z.com/*'] } as any);
     const ws = await welcome(b);
     expect(ws.texts()[1]).toEqual({ t: 'perms', origins: ['https://a.com/*', '*://*.b.com/*'] });
+    await b.stop();
+  });
+
+  it('denies without a recorded grant even when the browser says it has access', async () => {
+    const { b, br } = setup({ grants: [] });
+    br.permissions.contains.mockResolvedValue(true);
+    const ws = await welcome(b);
+    ws.recv(encodeFrame(0, 5, meta({})));
+    await tick(); await tick();
+    expect(payloadJson<any>(ws.frames().at(-1)!.payload).code).toBe('permission');
     await b.stop();
   });
 

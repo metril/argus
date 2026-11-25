@@ -18,11 +18,13 @@ impl ApiClient {
         name: &str,
         scopes: Vec<Scope>,
         expires_in_days: Option<u32>,
+        expires_at: Option<String>,
     ) -> Result<CreatedTokenResponse, ApiError> {
         let req = CreateTokenRequest {
             name: name.to_string(),
             scopes,
             expires_in_days,
+            expires_at,
             profiles: None,
         };
         self.post("/tokens", &req).await

@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use api_types::{ApiTokenInfo, CreateTokenRequest, CreatedTokenResponse, MessageResponse, Page};
 use axum::{extract::State, http::StatusCode, Extension, Json};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use tracing::info;
 use validator::Validate;
 
 use super::paging::{page_of, ts_key_desc, Keyed};
 use super::CursorQuery;
-use crate::auth::authz::Principal;
+use crate::auth::authz::{Actor, Principal};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::{blocking, AppState};
 
@@ -54,9 +54,26 @@ pub async fn create_token(
         }
     }
     let profiles = req.profiles.or_else(|| p.profiles.clone());
-    let expires = req
-        .expires_in_days
-        .map(|d| Utc::now() + Duration::days(d as i64));
+    let expires = match (req.expires_in_days, req.expires_at.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::ValidationError(
+                "Give either expires_in_days or expires_at, not both".into(),
+            ))
+        }
+        (Some(d), None) => Some(Utc::now() + Duration::days(d as i64)),
+        (None, Some(at)) => {
+            let at = DateTime::parse_from_rfc3339(at)
+                .map_err(|_| ApiError::ValidationError("expires_at must be RFC 3339".into()))?
+                .with_timezone(&Utc);
+            if at <= Utc::now() {
+                return Err(ApiError::ValidationError(
+                    "expires_at must be in the future".into(),
+                ));
+            }
+            Some(at)
+        }
+        (None, None) => None,
+    };
     let st = state.clone();
     let (user_id, username) = (p.user_id, p.username.clone());
     let (token, secret) = blocking(move || {
@@ -124,6 +141,33 @@ pub async fn revoke_token(
         }
         _ => Err(ApiError::NotFound("Token not found".into())),
     }
+}
+
+/// Revoke the token making this request (the extension's sign out). Cookie sessions have no
+/// token to revoke; they use `/auth/logout`.
+#[utoipa::path(
+    delete, path = "/tokens/self", tag = "tokens",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Revoked; the token stops working at once", body = MessageResponse),
+        (status = 400, description = "The caller is a cookie session, not an API token")
+    )
+)]
+pub async fn revoke_self(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<MessageResponse>> {
+    let Actor::Token { token_id } = p.actor else {
+        return Err(ApiError::bad_request(
+            "Only an API token can revoke itself; use /auth/logout for a session",
+        ));
+    };
+    let (st, id) = (state.clone(), token_id.clone());
+    blocking(move || st.tokens.revoke(&id)).await?;
+    state.close_ext_tokens(&[token_id]);
+    Ok(Json(MessageResponse {
+        message: "Token revoked".into(),
+    }))
 }
 
 /// List every user's API tokens.

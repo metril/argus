@@ -193,6 +193,22 @@ impl TransparentEntry {
             .await
             .map_err(|e| Error::Connection(format!("original destination unavailable: {e}")))?;
         let local = stream.local_addr()?;
+        // The web UI endpoint as the real destination: handed to the web server, whatever the
+        // protocol (never intercepted, never logged).
+        if let Some(web) = h
+            .shared
+            .ctx
+            .web_ui_for(
+                &dst.ip().to_string(),
+                dst.port(),
+                h.client_addr.ip(),
+                Some(local.ip()),
+            )
+            .await
+        {
+            web.stream(Box::new(stream), h.client_addr, dst.port());
+            return Ok(());
+        }
         if is_self(dst, local, &self.own_ports.read()) {
             return Err(Error::Connection(format!(
                 "refusing connection from {} whose destination {dst} is the proxy itself",
