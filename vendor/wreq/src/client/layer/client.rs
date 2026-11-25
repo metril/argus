@@ -44,7 +44,7 @@ use crate::{
     config::RequestConfig,
     conn::{
         Connected, Connection,
-        descriptor::{ConnectionDescriptor, ConnectionId},
+        descriptor::{ConnectionDescriptor, ConnectionId, resend_descriptor},
         proxy,
     },
     error::ProxyConnect,
@@ -241,7 +241,7 @@ where
                     }
                     retried = true;
                     // Argus: the re-send takes a fresh connection, never another idle one.
-                    descriptor = descriptor.fresh();
+                    descriptor = resend_descriptor(&descriptor);
 
                     trace!(
                         "unstarted request canceled, trying again (reason={:?})",

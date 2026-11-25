@@ -1155,4 +1155,26 @@ mod tests {
         assert!(pool.locked().idle.get(&key2).is_some());
         assert!(pool.locked().idle.get(&key3).is_some());
     }
+
+    /// Argus patch 6: the re-send of an unstarted request must not take an idle connection.
+    #[tokio::test]
+    async fn an_idle_connection_is_not_handed_to_the_resend_key() {
+        use crate::conn::descriptor::{resend_descriptor, tests::descriptor};
+
+        let original = descriptor();
+        let (key, resend_key) = (original.id(), resend_descriptor(&original).id());
+        let pool = pool_no_timer();
+        drop(pool.pooled(c(key.clone()), Uniq(7)));
+
+        let mut resend = pool.checkout(resend_key);
+        assert!(
+            PollOnce(&mut resend).await.is_none(),
+            "the re-send took an idle connection"
+        );
+        // The idle connection is still there for ordinary requests.
+        match pool.checkout(key).await {
+            Ok(pooled) => assert_eq!(*pooled, Uniq(7)),
+            Err(_) => panic!("not ready"),
+        }
+    }
 }
