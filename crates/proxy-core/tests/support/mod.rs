@@ -128,6 +128,16 @@ pub async fn h2_origin(chain: Vec<Vec<u8>>, key: KeyPair, script: Script) -> Ori
 
 /// An HTTP/1.1 origin that says keep-alive and then closes the connection after each response.
 pub async fn h1_closing_origin(chain: Vec<Vec<u8>>, key: KeyPair) -> Origin {
+    h1_closing_origin_after(chain, key, None).await
+}
+
+/// Like [`h1_closing_origin`]; with `Some(delay)` the connection closes that long after its
+/// response, and the origin runs on its own thread so a blocked client runtime cannot stall it.
+pub async fn h1_closing_origin_after(
+    chain: Vec<Vec<u8>>,
+    key: KeyPair,
+    delay: Option<Duration>,
+) -> Origin {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -142,11 +152,13 @@ pub async fn h1_closing_origin(chain: Vec<Vec<u8>>, key: KeyPair) -> Origin {
     .unwrap();
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std_listener.set_nonblocking(true).unwrap();
+    let port = std_listener.local_addr().unwrap().port();
     let stats = Arc::new(Stats::default());
     let st = stats.clone();
-    tokio::spawn(async move {
+    let serve = async move {
+        let listener = TcpListener::from_std(std_listener).unwrap();
         loop {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
@@ -171,11 +183,25 @@ pub async fn h1_closing_origin(chain: Vec<Vec<u8>>, key: KeyPair) -> Origin {
                         b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok",
                     )
                     .await;
-                // Gone without a close_notify, right after promising to keep the connection.
+                // Gone without a close_notify, after promising to keep the connection.
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
                 drop(tls);
             });
         }
-    });
+    };
+    if delay.is_some() {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(serve)
+        });
+    } else {
+        tokio::spawn(serve);
+    }
     Origin { port, stats }
 }
 
