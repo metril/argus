@@ -1,4 +1,4 @@
-// Modified by Argus: `HttpClient::group_evictor` (patch 4); no internal retry of unstarted requests (patch 5).
+// Modified by Argus: `HttpClient::group_evictor` (patch 4); one internal re-send of unstarted requests, flagged (patch 5).
 //! Much of this codebase is adapted and refined from [hyper](https://github.com/hyperium/hyper-util),
 
 mod lazy;
@@ -80,6 +80,8 @@ pub struct Error {
     source: Option<BoxError>,
     #[allow(unused)]
     connect_info: Option<Connected>,
+    /// Returned after the one internal re-send of an unstarted request.
+    retried: bool,
 }
 
 #[derive(Debug)]
@@ -115,6 +117,7 @@ macro_rules! e {
             kind: ErrorKind::$kind,
             source: None,
             connect_info: None,
+            retried: false,
         }
     };
     ($kind:ident, $src:expr) => {
@@ -122,6 +125,7 @@ macro_rules! e {
             kind: ErrorKind::$kind,
             source: Some($src.into()),
             connect_info: None,
+            retried: false,
         }
     };
 }
@@ -218,20 +222,23 @@ where
     ) -> Result<Response<Incoming>, Error> {
         let uri = req.uri().clone();
 
+        let mut retried = false;
         loop {
             req = match self.try_send_request(req, descriptor.clone()).await {
                 Ok(resp) => return Ok(resp),
-                Err(TrySendError::Nope(err)) => return Err(err),
+                Err(TrySendError::Nope(err)) => return Err(err.retried(retried)),
                 Err(TrySendError::Retryable {
                     mut req,
                     error,
                     connection_reused,
                 }) => {
-                    if !self.config.retry_canceled_requests || !connection_reused {
+                    if !self.config.retry_canceled_requests || !connection_reused || retried {
                         // if client disabled, don't retry
                         // a fresh connection means we definitely can't retry
-                        return Err(error);
+                        // (Argus: and one re-send at most)
+                        return Err(error.retried(retried));
                     }
+                    retried = true;
 
                     trace!(
                         "unstarted request canceled, trying again (reason={:?})",
@@ -835,7 +842,7 @@ impl Builder {
     pub fn new(exec: Executor) -> Self {
         Self {
             config: Config {
-                retry_canceled_requests: false,
+                retry_canceled_requests: true,
                 set_host: true,
                 ver: Ver::Auto,
             },
@@ -1018,6 +1025,7 @@ impl Error {
             kind,
             source: Some(error),
             connect_info: None,
+            retried: false,
         }
     }
 
@@ -1031,6 +1039,17 @@ impl Error {
     #[inline]
     pub fn is_proxy_connect(&self) -> bool {
         matches!(self.kind, ErrorKind::ProxyConnect)
+    }
+
+    #[inline]
+    fn retried(self, retried: bool) -> Self {
+        Self { retried, ..self }
+    }
+
+    /// Whether this error came after the one internal re-send.
+    #[inline]
+    pub(crate) fn is_retried(&self) -> bool {
+        self.retried
     }
 
     #[inline]

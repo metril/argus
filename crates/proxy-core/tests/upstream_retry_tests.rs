@@ -108,6 +108,59 @@ async fn a_buffered_post_is_replayed() {
 }
 
 #[tokio::test]
+async fn a_buffered_post_after_a_reset_or_goaway_is_not_replayed() {
+    // The origin may already have processed it: a buffered body allows a replay, never justifies one.
+    for act in [Act::Drop, Act::Goaway] {
+        let (r, o) = setup(first_on(0, act), |_| {}).await;
+        let err = base(&r.client, hyper::Method::POST, &o)
+            .body(bytes::Bytes::from_static(b"small"))
+            .send()
+            .await;
+        assert!(err.is_err(), "{act:?}");
+        assert_eq!(o.stats.requests.load(Ordering::SeqCst), 1, "{act:?}");
+    }
+    assert_eq!(retries(), 0);
+}
+
+#[tokio::test]
+async fn a_request_unsent_on_a_closed_http1_keepalive_connection_is_sent_again() {
+    let trusted = ca("trusted");
+    let (der, key) = leaf(&trusted, HOST);
+    let o = h1_closing_origin(vec![der, trusted.der.clone()], key).await;
+    let r = rig(&trusted, |_| {});
+    for _ in 0..2 {
+        let resp = base(&r.client, hyper::Method::GET, &o)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    // A streamed POST on a fresh connection each time still works: nothing to re-send.
+    assert_eq!(o.stats.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_waiter_on_an_http2_connection_that_sends_goaway_first_succeeds() {
+    let trusted = ca("trusted");
+    let (der, key) = leaf(&trusted, HOST);
+    let o = h2_origin_with(
+        vec![der, trusted.der.clone()],
+        key,
+        ok_script(),
+        Arc::new(|c| c == 0),
+    )
+    .await;
+    let r = rig(&trusted, |_| {});
+    let (a, b) = tokio::join!(
+        base(&r.client, hyper::Method::GET, &o).send(),
+        base(&r.client, hyper::Method::GET, &o).send()
+    );
+    assert_eq!(a.unwrap().status(), 200);
+    assert_eq!(b.unwrap().status(), 200);
+    assert!(o.stats.conns.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
 async fn a_streamed_post_is_not_retried() {
     // A streamed body cannot be sent twice: one attempt, then the error.
     let (r, o) = setup(Arc::new(|_, _| Act::Refuse), |_| {}).await;
@@ -125,8 +178,8 @@ async fn a_streamed_post_is_not_retried() {
 }
 
 #[tokio::test]
-async fn a_post_without_a_buffered_body_is_not_retried() {
-    let (r, o) = setup(Arc::new(|_, _| Act::Refuse), |_| {}).await;
+async fn a_post_is_not_retried_after_a_goaway() {
+    let (r, o) = setup(Arc::new(|_, _| Act::Goaway), |_| {}).await;
     assert!(base(&r.client, hyper::Method::POST, &o)
         .send()
         .await

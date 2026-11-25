@@ -655,7 +655,13 @@ impl UpstreamClient {
     pub fn evict_conn(&self, conn_id: u64) {
         if let Self::Wreq(c) = self {
             c.evict_group(&wreq::Group::new(conn_id));
-            c.evict_group(&wreq::Group::new(format!("{conn_id}{RETRY_SUFFIX}")));
+        }
+    }
+
+    /// Drop the idle connections of the retry group `name` (see [`RETRY_SEQ`]).
+    fn evict_named(&self, name: String) {
+        if let Self::Wreq(c) = self {
+            c.evict_group(&wreq::Group::new(name));
         }
     }
 
@@ -720,34 +726,45 @@ impl UpstreamRequest {
             scope,
             ..
         } = self;
-        // Replayable: no body, or one fully buffered (and small); never a stream. A method that
-        // is not idempotent is only replayed with a buffered body, which the caller chose to
-        // hold for exactly this.
+        // Replayable: no body, or one fully buffered (and small); never a stream. Being
+        // replayable allows a retry, it never justifies one: see `UpstreamError::never_ran`.
         let replay = match &body {
-            None => idempotent(&method).then_some(None),
+            None => Some(None),
             Some(UpstreamBody::Bytes(b)) if b.len() <= MAX_REPLAY_BODY => Some(Some(b.clone())),
             Some(_) => None,
         }
         .map(|b| (headers.clone(), b));
         let first = send_once(&client, &method, &url, headers, body, scope.as_ref(), "").await;
         match (first, replay) {
-            (Err(e), Some((headers, body))) if e.is_retryable() => {
+            (Err(e), Some((headers, body)))
+                if e.never_ran() || (idempotent(&method) && e.is_retryable()) =>
+            {
                 let host = url::Url::parse(&url)
                     .ok()
                     .and_then(|u| u.host_str().map(str::to_string))
                     .unwrap_or_default();
                 common::faults::note(common::faults::Fault::UpstreamRetry, &host);
                 tracing::debug!("Retrying {url} on a new connection after: {e}");
-                send_once(
+                let suffix = format!(
+                    "#r{}",
+                    RETRY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                let r = send_once(
                     &client,
                     &method,
                     &url,
                     headers,
                     body.map(UpstreamBody::Bytes),
                     scope.as_ref(),
-                    RETRY_SUFFIX,
+                    &suffix,
                 )
-                .await
+                .await;
+                // Used once: its connection serves this response and is not pooled for others.
+                client.evict_named(match &scope {
+                    Some(s) => format!("{}{suffix}", s.conn_id),
+                    None => suffix,
+                });
+                r
             }
             (r, _) => r,
         }
@@ -807,7 +824,7 @@ async fn send_once(
             let mut rb = c.request(method.clone(), url);
             match scope {
                 Some(s) => rb = rb.group(s.group(suffix)),
-                None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(RETRY_SUFFIX)),
+                None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(suffix.to_string())),
                 None => {}
             }
             let mut rb = rb
@@ -841,6 +858,27 @@ async fn send_once(
 }
 
 impl UpstreamError {
+    /// Whether the request provably never ran at the origin: the stream was refused
+    /// (REFUSED_STREAM), so any method may be sent again. A reset, EOF or GOAWAY says nothing
+    /// about whether the origin processed the request; those only justify a retry of an
+    /// idempotent method ([`Self::is_retryable`]).
+    pub fn never_ran(&self) -> bool {
+        match self {
+            Self::Wreq(e) => {
+                !e.is_retried()
+                    && chain_has(std::error::Error::source(e), |err| {
+                        err.downcast_ref::<http2::Error>()
+                            .is_some_and(|h| h.reason() == Some(http2::Reason::REFUSED_STREAM))
+                    })
+            }
+            Self::Reqwest(e) => chain_has(std::error::Error::source(e), |err| {
+                err.downcast_ref::<h2::Error>()
+                    .is_some_and(|h| h.reason() == Some(h2::Reason::REFUSED_STREAM))
+            }),
+            Self::Invalid(_) => false,
+        }
+    }
+
     /// Whether the failure says the connection was at fault before any response head arrived,
     /// so one more try on a fresh connection is sound: a connection reset, an HTTP/2 GOAWAY or
     /// REFUSED_STREAM, or a TLS stream that ended without a close (on an established
@@ -852,7 +890,9 @@ impl UpstreamError {
         }
         match self {
             Self::Wreq(e) => {
-                !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
+                !e.is_timeout()
+                    && !e.is_retried()
+                    && retryable_chain(std::error::Error::source(e), e.is_connect())
             }
             Self::Reqwest(e) => {
                 !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
@@ -860,6 +900,20 @@ impl UpstreamError {
             Self::Invalid(_) => false,
         }
     }
+}
+
+fn chain_has(
+    first: Option<&(dyn std::error::Error + 'static)>,
+    f: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    let mut cur = first;
+    while let Some(err) = cur {
+        if f(err) {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 /// Walk the typed source chain for a failure of the connection itself. `connecting`: the error
@@ -982,8 +1036,9 @@ fn resolver_of(opts: &UpstreamOptions, strict: bool) -> PolicyResolver {
     }
 }
 
-/// Group suffix of the retry of a failed request: a fresh connection, never the failed one.
-const RETRY_SUFFIX: &str = "#r";
+/// Counter that makes the group of every retry unique, so a retry never finds the idle
+/// connection of an earlier one.
+static RETRY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 const DEFAULT_TLS_SESSIONS: usize = 4096;
 /// Sessions older than this are not offered (also bounded by the ticket's own lifetime).
