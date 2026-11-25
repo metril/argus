@@ -10,7 +10,7 @@ starts with a `// Modified by Argus: <why>` header, as Apache-2.0 section 4 requ
 
 | Crate | Upstream | Version | Local patches |
 |---|---|---|---|
-| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2, 3, 4 |
+| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2, 3, 4, 5 |
 | `wreq-util` | <https://github.com/0x676e67/wreq-util> | 3.0.0-rc.14 | none (vendored so the pair is updated together) |
 
 Only `src/`, `Cargo.toml`, `LICENSE` and `README.md` are kept; tests, examples and lockfiles
@@ -49,6 +49,10 @@ were dropped.
    connections finish their request and age out with the idle timeout. Files: `src/client.rs`,
    `src/client/layer/client.rs`, `src/client/layer/client/pool.rs`, `src/group.rs`,
    `src/conn/descriptor.rs`.
+5. **No internal retry of unstarted requests.** The pooled client no longer re-sends a request
+   whose reused connection was closed before it started (`retry_canceled_requests` is `false`):
+   Argus does one deterministic retry itself, on a fresh connection group. File:
+   `src/client/layer/client.rs`.
 
 ## Updating
 

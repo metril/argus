@@ -1,4 +1,4 @@
-// Modified by Argus: `HttpClient::group_evictor` (patch 4).
+// Modified by Argus: `HttpClient::group_evictor` (patch 4); no internal retry of unstarted requests (patch 5).
 //! Much of this codebase is adapted and refined from [hyper](https://github.com/hyperium/hyper-util),
 
 mod lazy;
@@ -835,7 +835,7 @@ impl Builder {
     pub fn new(exec: Executor) -> Self {
         Self {
             config: Config {
-                retry_canceled_requests: true,
+                retry_canceled_requests: false,
                 set_host: true,
                 ver: Ver::Auto,
             },

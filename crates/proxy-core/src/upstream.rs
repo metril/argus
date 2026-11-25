@@ -700,75 +700,212 @@ impl UpstreamRequest {
         self
     }
 
+    /// Send the request. A request that failed before any response head arrived is retried
+    /// exactly once on a fresh connection when the failure says the connection (not the
+    /// request) was at fault and the request can be sent again: see [`UpstreamError::is_retryable`]
+    /// for what counts, and the rules on bodies and methods below.
     pub async fn send(self) -> std::result::Result<UpstreamResponse, UpstreamError> {
-        use futures_util::StreamExt;
         if let Some(m) = self.bad_header {
             return Err(UpstreamError::Invalid(m));
         }
-        match self.client {
-            UpstreamClient::Reqwest(c) => {
-                let mut rb = c.request(self.method, &self.url).headers(self.headers);
-                rb = match self.body {
-                    Some(UpstreamBody::Bytes(b)) => rb.body(b),
-                    Some(UpstreamBody::Stream(s)) => rb.body(reqwest::Body::wrap_stream(s)),
-                    None => rb,
-                };
-                let r = rb.send().await.map_err(UpstreamError::Reqwest)?;
-                let peer_cert = r
-                    .extensions()
-                    .get::<reqwest::tls::TlsInfo>()
-                    .and_then(|t| t.peer_certificate())
-                    .map(<[u8]>::to_vec);
-                let (status, headers) = (r.status(), r.headers().clone());
-                Ok(UpstreamResponse {
-                    status,
+        let Self {
+            client,
+            method,
+            url,
+            headers,
+            body,
+            scope,
+            ..
+        } = self;
+        // Replayable: no body, or one fully buffered (and small); never a stream. A method that
+        // is not idempotent is only replayed with a buffered body, which the caller chose to
+        // hold for exactly this.
+        let replay = match &body {
+            None => idempotent(&method).then_some(None),
+            Some(UpstreamBody::Bytes(b)) if b.len() <= MAX_REPLAY_BODY => Some(Some(b.clone())),
+            Some(_) => None,
+        }
+        .map(|b| (headers.clone(), b));
+        let first = send_once(&client, &method, &url, headers, body, scope.as_ref(), "").await;
+        match (first, replay) {
+            (Err(e), Some((headers, body))) if e.is_retryable() => {
+                let host = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_default();
+                common::faults::note(common::faults::Fault::UpstreamRetry, &host);
+                tracing::debug!("Retrying {url} on a new connection after: {e}");
+                send_once(
+                    &client,
+                    &method,
+                    &url,
                     headers,
-                    peer_cert,
-                    body: r
-                        .bytes_stream()
-                        .map(|c| c.map_err(std::io::Error::other))
-                        .boxed(),
-                })
+                    body.map(UpstreamBody::Bytes),
+                    scope.as_ref(),
+                    RETRY_SUFFIX,
+                )
+                .await
             }
-            UpstreamClient::Wreq(c) => {
-                // The profile is the browser's own (client hints, then User-Agent); its
-                // transport fingerprint is used, but none of its headers: the browser's go
-                // through as they came, in their order.
-                let profile = crate::browser_profile::BrowserProfile::classify(&self.headers);
-                let orig = crate::browser_profile::orig_headers(&profile, self.headers.keys());
-                let mut rb = c.request(self.method, &self.url);
-                if let Some(s) = &self.scope {
-                    rb = rb.group(s.group(""));
-                }
-                let mut rb = rb
-                    .emulation(profile.emulation())
-                    .default_headers(false)
-                    .headers(self.headers)
-                    .orig_headers(orig);
-                rb = match self.body {
-                    Some(UpstreamBody::Bytes(b)) => rb.body(b),
-                    Some(UpstreamBody::Stream(s)) => rb.body(wreq::Body::wrap_stream(s)),
-                    None => rb,
-                };
-                let mut r = rb.send().await.map_err(UpstreamError::Wreq)?;
-                let peer_cert = r
-                    .extensions()
-                    .get::<wreq::tls::TlsInfo>()
-                    .and_then(|t| t.peer_certificate())
-                    .map(<[u8]>::to_vec);
-                let (status, headers) = (r.status(), std::mem::take(r.headers_mut()));
-                Ok(UpstreamResponse {
-                    status,
-                    headers,
-                    peer_cert,
-                    body: r
-                        .bytes_stream()
-                        .map(|c| c.map_err(std::io::Error::other))
-                        .boxed(),
-                })
-            }
+            (r, _) => r,
         }
     }
+}
+
+/// Largest fully buffered request body kept to replay it.
+pub const MAX_REPLAY_BODY: usize = 64 * 1024;
+
+fn idempotent(m: &hyper::Method) -> bool {
+    use hyper::Method as M;
+    matches!(*m, M::GET | M::HEAD | M::OPTIONS | M::PUT | M::DELETE)
+}
+
+/// One attempt. `suffix` names the connection group of a retry (never the failed connection's).
+async fn send_once(
+    client: &UpstreamClient,
+    method: &hyper::Method,
+    url: &str,
+    headers: hyper::HeaderMap,
+    body: Option<UpstreamBody>,
+    scope: Option<&UpstreamScope>,
+    suffix: &str,
+) -> std::result::Result<UpstreamResponse, UpstreamError> {
+    use futures_util::StreamExt;
+    match client {
+        UpstreamClient::Reqwest(c) => {
+            let mut rb = c.request(method.clone(), url).headers(headers);
+            rb = match body {
+                Some(UpstreamBody::Bytes(b)) => rb.body(b),
+                Some(UpstreamBody::Stream(s)) => rb.body(reqwest::Body::wrap_stream(s)),
+                None => rb,
+            };
+            let r = rb.send().await.map_err(UpstreamError::Reqwest)?;
+            let peer_cert = r
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(|t| t.peer_certificate())
+                .map(<[u8]>::to_vec);
+            let (status, headers) = (r.status(), r.headers().clone());
+            Ok(UpstreamResponse {
+                status,
+                headers,
+                peer_cert,
+                body: r
+                    .bytes_stream()
+                    .map(|c| c.map_err(std::io::Error::other))
+                    .boxed(),
+            })
+        }
+        UpstreamClient::Wreq(c) => {
+            // The profile is the browser's own (client hints, then User-Agent); its
+            // transport fingerprint is used, but none of its headers: the browser's go
+            // through as they came, in their order.
+            let profile = crate::browser_profile::BrowserProfile::classify(&headers);
+            let orig = crate::browser_profile::orig_headers(&profile, headers.keys());
+            let mut rb = c.request(method.clone(), url);
+            match scope {
+                Some(s) => rb = rb.group(s.group(suffix)),
+                None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(RETRY_SUFFIX)),
+                None => {}
+            }
+            let mut rb = rb
+                .emulation(profile.emulation())
+                .default_headers(false)
+                .headers(headers)
+                .orig_headers(orig);
+            rb = match body {
+                Some(UpstreamBody::Bytes(b)) => rb.body(b),
+                Some(UpstreamBody::Stream(s)) => rb.body(wreq::Body::wrap_stream(s)),
+                None => rb,
+            };
+            let mut r = rb.send().await.map_err(UpstreamError::Wreq)?;
+            let peer_cert = r
+                .extensions()
+                .get::<wreq::tls::TlsInfo>()
+                .and_then(|t| t.peer_certificate())
+                .map(<[u8]>::to_vec);
+            let (status, headers) = (r.status(), std::mem::take(r.headers_mut()));
+            Ok(UpstreamResponse {
+                status,
+                headers,
+                peer_cert,
+                body: r
+                    .bytes_stream()
+                    .map(|c| c.map_err(std::io::Error::other))
+                    .boxed(),
+            })
+        }
+    }
+}
+
+impl UpstreamError {
+    /// Whether the failure says the connection was at fault before any response head arrived,
+    /// so one more try on a fresh connection is sound: a connection reset, an HTTP/2 GOAWAY or
+    /// REFUSED_STREAM, or a TLS stream that ended without a close (on an established
+    /// connection). Never a policy refusal, a timeout, or a TLS handshake or certificate
+    /// failure.
+    pub fn is_retryable(&self) -> bool {
+        if crate::policy::is_refusal(self) {
+            return false;
+        }
+        match self {
+            Self::Wreq(e) => {
+                !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
+            }
+            Self::Reqwest(e) => {
+                !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
+            }
+            Self::Invalid(_) => false,
+        }
+    }
+}
+
+/// Walk the typed source chain for a failure of the connection itself. `connecting`: the error
+/// came while dialling (a handshake), where a TLS failure is a verdict on the server, not a
+/// stale connection.
+fn retryable_chain(first: Option<&(dyn std::error::Error + 'static)>, connecting: bool) -> bool {
+    use std::io::ErrorKind as I;
+    let mut cur = first;
+    while let Some(err) = cur {
+        if let Some(h) = err.downcast_ref::<http2::Error>() {
+            if h.is_go_away() || h.reason() == Some(http2::Reason::REFUSED_STREAM) {
+                return true;
+            }
+        }
+        if let Some(h) = err.downcast_ref::<h2::Error>() {
+            if h.is_go_away() || h.reason() == Some(h2::Reason::REFUSED_STREAM) {
+                return true;
+            }
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                I::ConnectionReset | I::ConnectionAborted | I::BrokenPipe | I::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        if !connecting {
+            if let Some(ssl) = err.downcast_ref::<btls::ssl::Error>() {
+                if matches!(
+                    ssl.code(),
+                    btls::ssl::ErrorCode::SYSCALL | btls::ssl::ErrorCode::ZERO_RETURN
+                ) {
+                    return true;
+                }
+            }
+            if let Some(stack) = err.downcast_ref::<btls::error::ErrorStack>() {
+                if stack
+                    .errors()
+                    .iter()
+                    .any(|e| e.reason().is_some_and(|r| r.contains("UNEXPECTED_EOF")))
+                {
+                    return true;
+                }
+            }
+        }
+        cur = err.source();
+    }
+    false
 }
 
 /// The head of an upstream response and its body stream.
@@ -878,6 +1015,8 @@ fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
         .no_proxy()
         .tls_info(true)
         .redirect(wreq::redirect::Policy::none())
+        // Argus retries itself (once, on a fresh connection group, see `UpstreamRequest::send`).
+        .retry(wreq::retry::Policy::never())
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(60)))
         // Connections are pooled per downstream connection (and origin), so a few idle ones

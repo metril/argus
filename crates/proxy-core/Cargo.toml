@@ -36,6 +36,8 @@ wreq = { version = "6.0.0-rc.31", features = ["stream"] }
 wreq-util = "3.0.0-rc.14"
 # Peer-chain access and ex_data in the in-handshake verify hook (already in the graph via wreq).
 btls = "0.5.6"
+# Typed HTTP/2 errors (GOAWAY, REFUSED_STREAM) of the wreq client, for the retry decision.
+http2 = "0.5"
 
 # TLS
 rustls = { workspace = true }

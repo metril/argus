@@ -953,10 +953,37 @@ impl ProxyContext {
             rb = rb.header(name, value);
         }
         if has_body {
-            let stream = body
-                .into_data_stream()
-                .map_err(|e| std::io::Error::other(e.to_string()));
-            rb = rb.body_stream(stream);
+            // A small body (declared length) is held, so a request that fails on a stale
+            // upstream connection can be sent again; anything else streams, and is never replayed.
+            let small = headers
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .is_some_and(|n| n <= crate::upstream::MAX_REPLAY_BODY);
+            if small {
+                let ms = self.request_timeout_ms.load(Ordering::Relaxed);
+                let limit = Duration::from_millis(if ms == 0 { u64::MAX / 4 } else { ms });
+                match tokio::time::timeout(limit, body.collect()).await {
+                    Ok(Ok(c)) => rb = rb.body(c.to_bytes()),
+                    Ok(Err(_)) => {
+                        return Ok(status_response(
+                            StatusCode::BAD_REQUEST,
+                            "Request body unreadable",
+                        ))
+                    }
+                    Err(_) => {
+                        return Ok(status_response(
+                            StatusCode::REQUEST_TIMEOUT,
+                            "Request body timeout",
+                        ))
+                    }
+                }
+            } else {
+                let stream = body
+                    .into_data_stream()
+                    .map_err(|e| std::io::Error::other(e.to_string()));
+                rb = rb.body_stream(stream);
+            }
         }
 
         let timeout_ms = self.request_timeout_ms.load(Ordering::Relaxed);

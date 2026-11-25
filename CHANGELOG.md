@@ -11,6 +11,10 @@
 * Upstream connections of the browser-like client are now pooled per downstream connection (and
   closed with it), so many browsers no longer share one connection to a site. TLS sessions are
   resumed per device, never across devices.
+* A request that fails before any response arrives on a stale upstream connection (reset, HTTP/2
+  GOAWAY or REFUSED_STREAM, TLS closed without notice) is retried once on a fresh connection, for
+  GET, HEAD, OPTIONS, PUT, DELETE and bodies of up to 64 KiB; streamed bodies, timeouts and
+  certificate errors are never retried.
 
 ## 0.5.0 — 2026-11-24
 
