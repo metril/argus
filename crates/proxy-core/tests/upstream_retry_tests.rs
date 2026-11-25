@@ -210,7 +210,7 @@ async fn a_certificate_error_is_not_retried() {
         .await
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::UpstreamTls);
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
     assert_eq!(o.stats.tcp.load(Ordering::SeqCst), 1, "one dial, no retry");
     assert_eq!(retries(), 0);
 }
@@ -248,4 +248,111 @@ async fn a_timeout_is_not_retried() {
     }
     assert_eq!(o.stats.requests.load(Ordering::SeqCst), 1);
     assert_eq!(retries(), 0);
+}
+
+async fn setup_with(browser_like: bool, script: Script) -> (Rig, Origin) {
+    let trusted = ca("trusted");
+    let (der, key) = leaf(&trusted, HOST);
+    let o = h2_origin(vec![der, trusted.der.clone()], key, script).await;
+    (rig_with(&trusted, browser_like, |_| {}), o)
+}
+
+#[tokio::test]
+async fn a_post_is_sent_at_most_twice_when_refused_stream_repeats() {
+    for browser_like in [false, true] {
+        let (r, o) = setup_with(browser_like, Arc::new(|_, _| Act::Refuse)).await;
+        let err = base(&r.client, hyper::Method::POST, &o)
+            .body(bytes::Bytes::from_static(b"small"))
+            .send()
+            .await;
+        assert!(err.is_err(), "browser_like={browser_like}");
+        assert_eq!(
+            o.stats.requests.load(Ordering::SeqCst),
+            2,
+            "browser_like={browser_like}: one attempt and one retry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_goaway_refused_stream_is_not_retried_for_a_post() {
+    // The stream is at or below the GOAWAY's last stream id: the origin may have run it.
+    for browser_like in [false, true] {
+        let (r, o) = setup_with(browser_like, Arc::new(|_, _| Act::GoawayRefused)).await;
+        let err = base(&r.client, hyper::Method::POST, &o)
+            .body(bytes::Bytes::from_static(b"small"))
+            .send()
+            .await;
+        assert!(err.is_err(), "browser_like={browser_like}");
+        assert_eq!(
+            o.stats.requests.load(Ordering::SeqCst),
+            1,
+            "browser_like={browser_like}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_reqwest_retry_uses_a_new_connection_not_an_idle_one() {
+    // Connection 0 serves the first request and stays idle in the pool, then refuses the second.
+    let script: Script = Arc::new(|c, n| {
+        if c == 0 && n == 1 {
+            Act::Refuse
+        } else {
+            Act::Ok
+        }
+    });
+    let (r, o) = setup_with(false, script).await;
+    let first = base(&r.client, hyper::Method::GET, &o)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let second = base(&r.client, hyper::Method::GET, &o)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(o.stats.conns.load(Ordering::SeqCst), 2, "retry dialled");
+    assert_eq!(retries(), 1);
+}
+
+#[tokio::test]
+async fn the_wreq_resend_of_an_unstarted_request_dials_a_new_connection() {
+    // The origin closes each idle HTTP/1.1 connection shortly after its response. While the
+    // client runtime is blocked, the FINs arrive but the pooled connections still look open, so
+    // a request checked out onto one is handed back unsent. The one re-send must dial a new
+    // connection, not take another (equally dead) idle one from the pool.
+    let trusted = ca("trusted");
+    let (der, key) = leaf(&trusted, HOST);
+    let o = h1_closing_origin_after(
+        vec![der, trusted.der.clone()],
+        key,
+        Some(Duration::from_millis(20)),
+    )
+    .await;
+    let r = rig(&trusted, |_| {});
+    let mut sent = 0;
+    for round in 0..30 {
+        // Fill the pool with several idle connections.
+        let mut calls = Vec::new();
+        for _ in 0..8 {
+            calls.push(base(&r.client, hyper::Method::GET, &o).send());
+        }
+        for resp in futures_util::future::join_all(calls).await {
+            assert_eq!(resp.unwrap().status(), 200, "round {round}");
+            sent += 1;
+        }
+        // Let the origin close them, without the client runtime noticing.
+        std::thread::sleep(Duration::from_millis(60));
+        tokio::task::yield_now().await;
+        let resp = base(&r.client, hyper::Method::GET, &o).send().await;
+        assert_eq!(resp.unwrap().status(), 200, "round {round}");
+        sent += 1;
+    }
+    // Every request was served on its own new connection, none went to a dead one, and the
+    // recovery was wreq's re-send rather than an Argus retry.
+    assert_eq!(o.stats.requests.load(Ordering::SeqCst), sent);
+    assert_eq!(o.stats.conns.load(Ordering::SeqCst), sent);
+    assert_eq!(retries(), 0, "no Argus-level retry was needed");
 }

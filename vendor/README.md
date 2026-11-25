@@ -10,7 +10,7 @@ starts with a `// Modified by Argus: <why>` header, as Apache-2.0 section 4 requ
 
 | Crate | Upstream | Version | Local patches |
 |---|---|---|---|
-| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2, 3, 4, 5, 6 |
+| `wreq` | <https://github.com/0x676e67/wreq> | 6.0.0-rc.31 | 1, 2, 3, 4, 5, 6, 7 |
 | `wreq-util` | <https://github.com/0x676e67/wreq-util> | 3.0.0-rc.14 | none (vendored so the pair is updated together) |
 
 Only `src/`, `Cargo.toml`, `LICENSE` and `README.md` are kept; tests, examples and lockfiles
@@ -55,8 +55,13 @@ were dropped.
    even a streamed body is safe) at most once, and an error returned after that re-send answers
    `Error::is_retried()`, so Argus does not stack its own retry on top. Files:
    `src/client/layer/client.rs`, `src/error.rs`.
+6. **The internal re-send takes a fresh connection.** The re-send of patch 5 used to check out
+   another idle pooled connection, which may be just as stale. It now runs under a unique pool key
+   (`Group::fresh`, `ConnectionDescriptor::fresh`), so it dials; the TLS session cache key is
+   unchanged, so resumption still works. Files: `src/client/layer/client.rs`, `src/group.rs`,
+   `src/conn/descriptor.rs`.
 
-6. **SOCKS: resolve first, errors expose their cause.** The target is resolved (and vetted by
+7. **SOCKS: resolve first, errors expose their cause.** The target is resolved (and vetted by
    the client's resolver) before the proxy is dialled. `SocksError::source` returns the wrapped error, so a
    destination-policy refusal raised by the client's DNS resolver (`DnsResolveFailure`) is still
    found by walking the error chain. File: `src/conn/proxy/socks.rs`.

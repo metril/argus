@@ -615,7 +615,9 @@ pub enum UpstreamClient {
     /// The wreq client without a browser fingerprint: used instead of the rustls client while an
     /// upstream proxy is on, because only wreq resolves names locally before tunnelling.
     WreqPlain(wreq::Client),
-    Reqwest(reqwest::Client),
+    /// The shared client, and one that keeps no idle connection: the retry's, which must dial
+    /// (`None` for a client supplied ready-made, whose retry then shares its pool).
+    Reqwest(reqwest::Client, Option<reqwest::Client>),
 }
 
 impl std::fmt::Debug for UpstreamClient {
@@ -623,14 +625,14 @@ impl std::fmt::Debug for UpstreamClient {
         f.write_str(match self {
             Self::Wreq(_) => "UpstreamClient::Wreq",
             Self::WreqPlain(_) => "UpstreamClient::WreqPlain",
-            Self::Reqwest(_) => "UpstreamClient::Reqwest",
+            Self::Reqwest(..) => "UpstreamClient::Reqwest",
         })
     }
 }
 
 impl From<reqwest::Client> for UpstreamClient {
     fn from(c: reqwest::Client) -> Self {
-        Self::Reqwest(c)
+        Self::Reqwest(c, None)
     }
 }
 
@@ -850,7 +852,12 @@ async fn send_once(
 ) -> std::result::Result<UpstreamResponse, UpstreamError> {
     use futures_util::StreamExt;
     match client {
-        UpstreamClient::Reqwest(c) => {
+        UpstreamClient::Reqwest(shared, fresh) => {
+            // A retry (non-empty suffix) takes the client that never reuses a connection.
+            let c = match fresh {
+                Some(f) if !suffix.is_empty() => f,
+                _ => shared,
+            };
             let mut rb = c.request(method.clone(), url).headers(headers);
             rb = match body {
                 Some(UpstreamBody::Bytes(b)) => rb.body(b),
@@ -930,12 +937,12 @@ impl UpstreamError {
                 !e.is_retried()
                     && chain_has(std::error::Error::source(e), |err| {
                         err.downcast_ref::<http2::Error>()
-                            .is_some_and(|h| h.reason() == Some(http2::Reason::REFUSED_STREAM))
+                            .is_some_and(refused_stream_http2)
                     })
             }
             Self::Reqwest(e) => chain_has(std::error::Error::source(e), |err| {
                 err.downcast_ref::<h2::Error>()
-                    .is_some_and(|h| h.reason() == Some(h2::Reason::REFUSED_STREAM))
+                    .is_some_and(refused_stream_h2)
             }),
             Self::Invalid(_) => false,
         }
@@ -962,6 +969,22 @@ impl UpstreamError {
             Self::Invalid(_) => false,
         }
     }
+}
+
+/// The origin itself reset the stream with REFUSED_STREAM. A GOAWAY carrying that code is not
+/// proof the stream was never processed (it may be at or below the last stream id).
+fn refused_stream_http2(h: &http2::Error) -> bool {
+    h.is_reset()
+        && h.is_remote()
+        && !h.is_go_away()
+        && h.reason() == Some(http2::Reason::REFUSED_STREAM)
+}
+
+fn refused_stream_h2(h: &h2::Error) -> bool {
+    h.is_reset()
+        && h.is_remote()
+        && !h.is_go_away()
+        && h.reason() == Some(h2::Reason::REFUSED_STREAM)
 }
 
 fn chain_has(
@@ -1103,7 +1126,12 @@ fn build_client(
     match (opts.browser_like, proxy.is_some()) {
         (true, _) => build_wreq(opts, strict, proxy).map(UpstreamClient::Wreq),
         (false, true) => build_wreq(opts, strict, proxy).map(UpstreamClient::WreqPlain),
-        (false, false) => build_reqwest(opts, strict).map(UpstreamClient::Reqwest),
+        // The reqwest path has no upstream proxy support (a proxy selects WreqPlain above), so
+        // its fresh retry client needs none either.
+        (false, false) => Ok(UpstreamClient::Reqwest(
+            build_reqwest(opts, strict, false)?,
+            Some(build_reqwest(opts, strict, true)?),
+        )),
     }
 }
 
@@ -1276,11 +1304,14 @@ fn build_wreq(
         .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))
 }
 
-fn build_reqwest(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client> {
+/// `fresh`: keep no idle connection, so every request dials (the retry's client).
+fn build_reqwest(opts: &UpstreamOptions, strict: bool, fresh: bool) -> Result<reqwest::Client> {
     // `no_proxy`: never route through an environment-configured proxy, which would bypass the
     // destination policy.
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        // Argus makes the one retry itself (on a fresh connection, and only when sound).
+        .retry(reqwest::retry::never())
         // Each response carries the certificate of the connection that served it.
         .tls_info(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -1293,7 +1324,11 @@ fn build_reqwest(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client
         // Bound idle descriptors per origin (scaled to the descriptor budget); connections
         // beyond this are closed when idle. reqwest has no total cap, so the budget also
         // reserves one descriptor per connection slot for the pool.
-        .pool_max_idle_per_host(opts.pool_max_idle_per_host.unwrap_or(32))
+        .pool_max_idle_per_host(if fresh {
+            0
+        } else {
+            opts.pool_max_idle_per_host.unwrap_or(32)
+        })
         .pool_idle_timeout(Duration::from_secs(60))
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.

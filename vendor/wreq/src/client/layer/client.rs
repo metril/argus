@@ -1,4 +1,4 @@
-// Modified by Argus: `HttpClient::group_evictor` (patch 4); one internal re-send of unstarted requests, flagged (patch 5).
+// Modified by Argus: `HttpClient::group_evictor` (patch 4); one internal re-send of unstarted requests, flagged (patch 5), on a fresh connection (patch 6).
 //! Much of this codebase is adapted and refined from [hyper](https://github.com/hyperium/hyper-util),
 
 mod lazy;
@@ -223,6 +223,7 @@ where
         let uri = req.uri().clone();
 
         let mut retried = false;
+        let mut descriptor = descriptor;
         loop {
             req = match self.try_send_request(req, descriptor.clone()).await {
                 Ok(resp) => return Ok(resp),
@@ -239,6 +240,8 @@ where
                         return Err(error.retried(retried));
                     }
                     retried = true;
+                    // Argus: the re-send takes a fresh connection, never another idle one.
+                    descriptor = descriptor.fresh();
 
                     trace!(
                         "unstarted request canceled, trying again (reason={:?})",
