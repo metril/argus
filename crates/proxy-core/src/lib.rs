@@ -47,6 +47,7 @@ pub mod server;
 pub mod tls;
 pub mod transparent;
 pub mod upstream;
+pub mod upstream_proxy;
 pub mod upstream_wreq;
 #[cfg(feature = "websockets")]
 pub mod websocket;

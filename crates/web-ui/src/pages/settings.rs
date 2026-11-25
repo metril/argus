@@ -50,6 +50,8 @@ enum Kind {
     Ip,
     /// Free text, not validated here (the server checks it).
     Free,
+    /// Write-only text: shown masked, never filled in from the server.
+    Secret,
     Seg(&'static [(&'static str, &'static str)]),
 }
 
@@ -70,6 +72,8 @@ struct F {
     default: RwSignal<Val>,
     msg: RwSignal<Option<(bool, String)>>,
 }
+
+const UPSTREAM_KINDS: &[(&str, &str)] = &[("http", "HTTP"), ("socks5", "SOCKS5")];
 
 const HOURS: &[(&str, &str)] = &[("6", "6 h"), ("12", "12 h"), ("24", "24 h"), ("168", "7 d")];
 
@@ -271,6 +275,55 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        id: "upstream",
+        title: "Upstream proxy",
+        sub: "Send everything Argus connects to through another proxy. DNS lookups stay on Argus: it resolves and vets each address itself and gives the proxy only that address.",
+        fields: &[
+            Def {
+                key: "up_on",
+                label: "Enabled",
+                desc: "When on, no connection leaves Argus directly. If the proxy is unreachable, connections fail.",
+                kind: Kind::Switch,
+                dep: None,
+            },
+            Def {
+                key: "up_kind",
+                label: "Type",
+                desc: "HTTP uses CONNECT. SOCKS5 is sent the address, never a name.",
+                kind: Kind::Seg(UPSTREAM_KINDS),
+                dep: Some("up_on"),
+            },
+            Def {
+                key: "up_host",
+                label: "Host",
+                desc: "Name or IP of the proxy. It may be on a private network, but never one of Argus's own listeners.",
+                kind: Kind::Free,
+                dep: Some("up_on"),
+            },
+            Def {
+                key: "up_port",
+                label: "Port",
+                desc: "Port the proxy listens on.",
+                kind: Kind::Port,
+                dep: Some("up_on"),
+            },
+            Def {
+                key: "up_user",
+                label: "Username",
+                desc: "Optional. Clearing it also clears the password.",
+                kind: Kind::Free,
+                dep: Some("up_on"),
+            },
+            Def {
+                key: "up_pass",
+                label: "Password",
+                desc: "Write-only. Leave empty to keep the saved password.",
+                kind: Kind::Secret,
+                dep: Some("up_on"),
+            },
+        ],
+    },
+    Section {
         id: "access",
         title: "Network access",
         sub: "Who may use the proxy, and where it may connect.",
@@ -353,6 +406,10 @@ fn defaults(key: &str) -> Val {
         "allow_dest" => Val::T(Vec::new()),
         "block_private" => Val::B(false),
         "browser_like" => Val::B(true),
+        "up_on" => Val::B(false),
+        "up_kind" => Val::S("http".into()),
+        "up_host" | "up_user" | "up_pass" => Val::S(String::new()),
+        "up_port" => Val::S("8080".into()),
         "auto_update" => Val::B(true),
         "lists_url" | "lists_key" => Val::S(String::new()),
         "dns_servers" => Val::T(Vec::new()),
@@ -384,6 +441,22 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("allow_dest", Val::T(c.allowed_destinations.clone())),
         ("block_private", Val::B(c.block_private_destinations)),
         ("browser_like", Val::B(c.browser_like_upstream)),
+        ("up_on", Val::B(c.upstream_proxy.enabled)),
+        (
+            "up_kind",
+            Val::S(
+                match c.upstream_proxy.kind {
+                    api_types::UpstreamProxyKind::Http => "http",
+                    api_types::UpstreamProxyKind::Socks5 => "socks5",
+                }
+                .into(),
+            ),
+        ),
+        ("up_host", Val::S(c.upstream_proxy.host.clone())),
+        ("up_port", Val::S(c.upstream_proxy.port.to_string())),
+        ("up_user", Val::S(c.upstream_proxy.username.clone())),
+        // Never filled in: the server does not send it.
+        ("up_pass", Val::S(String::new())),
         ("auto_update", Val::B(c.auto_update)),
         ("update_every", Val::S(c.update_interval_hours.to_string())),
         ("lists_url", Val::S(c.bypass.lists_base_url.clone())),
@@ -412,6 +485,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "allow_dest" => &["allowed_destinations"],
         "block_private" => &["block_private_destinations"],
         "browser_like" => &["browser_like_upstream"],
+        "up_on" | "up_kind" | "up_host" | "up_port" | "up_user" | "up_pass" => &["upstream_proxy"],
         "auto_update" => &["auto_update"],
         "lists_url" | "lists_key" => &["bypass"],
         "dns_servers" | "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => &["dns"],
@@ -438,6 +512,47 @@ fn cidr_ok(s: &str) -> bool {
     }
 }
 
+/// Validation of the upstream proxy fields (`get` reads the current value of a field).
+fn upstream_error(key: &str, get: &dyn Fn(&str) -> String) -> Option<String> {
+    match key {
+        "up_host" if get("up_host").trim().is_empty() => {
+            Some("Enter the proxy's host name or IP.".into())
+        }
+        "up_host" if get("up_host").trim().contains(char::is_whitespace) => {
+            Some("A host has no spaces.".into())
+        }
+        "up_pass" if get("up_user").trim().is_empty() && !get("up_pass").is_empty() => {
+            Some("A password needs a username.".into())
+        }
+        _ => None,
+    }
+}
+
+/// The upstream proxy part of a save (`None` when nothing of it changed). `dirty` says whether
+/// a field changed; an empty password is left out, so the saved one is kept.
+fn upstream_update(
+    get: &dyn Fn(&str) -> String,
+    dirty: &dyn Fn(&str) -> bool,
+) -> Option<api_types::UpstreamProxyUpdate> {
+    let keys = [
+        "up_on", "up_kind", "up_host", "up_port", "up_user", "up_pass",
+    ];
+    if !keys.iter().any(|k| dirty(k)) {
+        return None;
+    }
+    Some(api_types::UpstreamProxyUpdate {
+        enabled: dirty("up_on").then(|| get("up_on") == "true"),
+        kind: dirty("up_kind").then(|| match get("up_kind").as_str() {
+            "socks5" => api_types::UpstreamProxyKind::Socks5,
+            _ => api_types::UpstreamProxyKind::Http,
+        }),
+        host: dirty("up_host").then(|| get("up_host").trim().to_string()),
+        port: dirty("up_port").then(|| get("up_port").trim().parse().unwrap_or(0)),
+        username: dirty("up_user").then(|| get("up_user").trim().to_string()),
+        password: Some(get("up_pass")).filter(|p| dirty("up_pass") && !p.is_empty()),
+    })
+}
+
 fn is_on(all: &[F], key: &str) -> bool {
     all.iter()
         .find(|f| f.def.key == key)
@@ -459,6 +574,11 @@ fn error_of(f: &F, all: &[F]) -> Option<String> {
             .map(|x| x.cur.read().s())
             .unwrap_or_default()
     };
+    if f.def.key.starts_with("up_") {
+        if let Some(e) = upstream_error(f.def.key, &get) {
+            return Some(e);
+        }
+    }
     match f.def.kind {
         Kind::Port | Kind::Num { .. } => {
             let s = v.s();
@@ -477,6 +597,10 @@ fn error_of(f: &F, all: &[F]) -> Option<String> {
             } else {
                 if !(1..=65535).contains(&n) {
                     return Some("Use a port from 1 to 65535.".into());
+                }
+                // The upstream proxy is another machine's port, not one of ours.
+                if f.def.key == "up_port" {
+                    return None;
                 }
                 let others = [
                     ("explicit_port", "explicit proxy"),
@@ -575,6 +699,7 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     if dirty("browser_like") {
         r.browser_like_upstream = Some(val("browser_like").b());
     }
+    r.upstream_proxy = upstream_update(&|k| val(k).s(), &dirty);
     if dirty("auto_update") {
         r.auto_update = Some(val("auto_update").b());
     }
@@ -908,6 +1033,7 @@ fn SettingsInner() -> impl IntoView {
     };
 
     let dirty_n = dirty_fields.clone();
+    let all_t = all.clone();
     view! {
         <div class="set-intro">
             <p class="muted">"Every setting lives here. Changes apply live when you save, with no restart and no config file to edit."</p>
@@ -924,6 +1050,7 @@ fn SettingsInner() -> impl IntoView {
                     <div class="card" id=format!("set-{}", s.id)>
                         <div class="card-h"><h3>{s.title}</h3><span class="sub">{s.sub}</span></div>
                         <div>{rows_for(s)}</div>
+                        {(s.id == "upstream").then(|| view! { <UpstreamTest all=all_t.clone() /> })}
                     </div>
                 }).collect_view()}
                 <super::settings_https::HttpsCard />
@@ -997,6 +1124,69 @@ fn SettingsInner() -> impl IntoView {
     }
 }
 
+/// Tests the upstream proxy with the values on screen (saved or not).
+#[component]
+fn UpstreamTest(all: Vec<F>) -> impl IntoView {
+    let result = RwSignal::new(Option::<(bool, String)>::None);
+    let busy = RwSignal::new(false);
+    let on_click = move |_| {
+        let get = |k: &str| {
+            all.iter()
+                .find(|f| f.def.key == k)
+                .map(|f| f.cur.get_untracked().s())
+                .unwrap_or_default()
+        };
+        if let Some(e) = ["up_host", "up_pass"]
+            .iter()
+            .find_map(|k| upstream_error(k, &get))
+        {
+            result.set(Some((true, e)));
+            return;
+        }
+        let req = upstream_update(&get, &|_| true).unwrap_or_default();
+        busy.set(true);
+        result.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            let r = ApiClient::new()
+                .post::<api_types::UpstreamProxyTestResult, _>("/config/upstream-proxy/test", &req)
+                .await;
+            result.set(Some(match r {
+                Ok(v) if v.ok => (
+                    false,
+                    format!(
+                        "Reached {} through the proxy in {} ms.",
+                        v.target,
+                        v.latency_ms.unwrap_or(0)
+                    ),
+                ),
+                Ok(v) => (true, v.error.unwrap_or_else(|| "The test failed.".into())),
+                Err(e) => (true, e.to_string()),
+            }));
+            busy.set(false);
+        });
+    };
+    view! {
+        <div class="frow">
+            <div class="fl">
+                <span class="lname">"Test"</span>
+                <small>"Argus connects to a well-known HTTPS site through the proxy. Uses the values above, saved or not."</small>
+            </div>
+            <div class="fc">
+                <button class="btn" type="button" disabled=move || busy.get() on:click=on_click>
+                    {move || if busy.get() { "Testing…" } else { "Test proxy" }}
+                </button>
+                <span
+                    class=move || match result.get() { Some((true, _)) => "fmsg bad", Some((false, _)) => "fmsg ok", None => "fmsg" }
+                    role="status"
+                    aria-live="polite"
+                >
+                    {move || result.get().map(|(_, m)| m).unwrap_or_default()}
+                </span>
+            </div>
+        </div>
+    }
+}
+
 fn row(f: F, all: Vec<F>) -> impl IntoView {
     let id = format!("set-f-{}", f.def.key);
     let label_id = format!("{id}-l");
@@ -1010,7 +1200,7 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
     let err = Signal::derive(move || error_of(&f, &all_e));
     let is_label = matches!(
         d.kind,
-        Kind::Text | Kind::Free | Kind::Port | Kind::Num { .. }
+        Kind::Text | Kind::Free | Kind::Secret | Kind::Port | Kind::Num { .. }
     );
     let default_txt = move || {
         let v = f.default.get();
@@ -1063,15 +1253,17 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 {move || terr.get().map(|e| view! { <span class="fmsg bad" role="alert">{e}</span> })}
             }.into_any()
         }
-        Kind::Text | Kind::Free | Kind::Port | Kind::Num { .. } => {
+        Kind::Text | Kind::Free | Kind::Secret | Kind::Port | Kind::Num { .. } => {
             let unit = if let Kind::Num { unit, .. } = d.kind { Some(unit) } else { None };
-            let cls = match d.kind { Kind::Text | Kind::Free => "input mono mid", _ => "input mono short num" };
+            let cls = match d.kind { Kind::Text | Kind::Free | Kind::Secret => "input mono mid", _ => "input mono short num" };
+            let secret = d.kind == Kind::Secret;
             let input = view! {
                 <input
                     class=cls
                     id=id.clone()
-                    inputmode=if matches!(d.kind, Kind::Text | Kind::Free) { "text" } else { "numeric" }
-                    autocomplete="off"
+                    type=if secret { "password" } else { "text" }
+                    inputmode=if matches!(d.kind, Kind::Text | Kind::Free | Kind::Secret) { "text" } else { "numeric" }
+                    autocomplete=if secret { "new-password" } else { "off" }
                     aria-describedby=msg_id.clone()
                     aria-invalid=move || if err.get().is_some() { "true" } else { "false" }
                     disabled=move || off.get()
@@ -1125,5 +1317,65 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 <Icon name="reset" />"Reset"
             </button>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_types::UpstreamProxyKind;
+
+    fn vals(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> String {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn upstream_proxy_fields_are_validated() {
+        let get = vals(&[("up_host", " "), ("up_user", ""), ("up_pass", "x")]);
+        assert!(upstream_error("up_host", &get).unwrap().contains("host"));
+        assert!(upstream_error("up_pass", &get)
+            .unwrap()
+            .contains("needs a username"));
+        let ok = vals(&[("up_host", "proxy.lan"), ("up_user", "a"), ("up_pass", "x")]);
+        assert_eq!(upstream_error("up_host", &ok), None);
+        assert_eq!(upstream_error("up_pass", &ok), None);
+        let spaced = vals(&[("up_host", "a b")]);
+        assert!(upstream_error("up_host", &spaced).is_some());
+    }
+
+    #[test]
+    fn only_changed_fields_are_sent_and_an_empty_password_is_left_out() {
+        let get = vals(&[
+            ("up_on", "true"),
+            ("up_kind", "socks5"),
+            ("up_host", " proxy.lan "),
+            ("up_port", "1080"),
+            ("up_user", "alice"),
+            ("up_pass", ""),
+        ]);
+        assert!(upstream_update(&get, &|_| false).is_none());
+        let u = upstream_update(&get, &|k| {
+            k == "up_kind" || k == "up_host" || k == "up_pass"
+        })
+        .unwrap();
+        assert_eq!(u.kind, Some(UpstreamProxyKind::Socks5));
+        assert_eq!(u.host.as_deref(), Some("proxy.lan"));
+        assert_eq!(u.enabled, None);
+        assert_eq!(u.port, None);
+        assert_eq!(u.password, None, "empty keeps the saved password");
+
+        let typed = vals(&[("up_pass", "s3cret")]);
+        let u = upstream_update(&typed, &|k| k == "up_pass").unwrap();
+        assert_eq!(u.password.as_deref(), Some("s3cret"));
+        // The test button sends everything on screen.
+        let u = upstream_update(&get, &|_| true).unwrap();
+        assert_eq!(u.port, Some(1080));
+        assert_eq!(u.username.as_deref(), Some("alice"));
     }
 }

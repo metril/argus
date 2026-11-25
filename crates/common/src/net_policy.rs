@@ -390,6 +390,16 @@ impl NetPolicy {
         self.decide(ip, own)
     }
 
+    /// Check for the address of the configured upstream proxy. The administrator chose it, so
+    /// private and reserved ranges are fine, but Argus never chains to its own listener.
+    pub fn check_proxy_endpoint(&self, ip: IpAddr, port: u16) -> std::result::Result<(), Refusal> {
+        if self.is_own_port(port) && self.is_own_ip(ip) {
+            Err(Refusal::OwnListener)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Address-only check for DNS answers of a general destination (port not known to the
     /// resolver).
     pub fn check_ip(&self, ip: IpAddr) -> std::result::Result<(), Refusal> {

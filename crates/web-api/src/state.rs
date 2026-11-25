@@ -205,6 +205,16 @@ pub trait RuntimeControl: Send + Sync {
     async fn note_webui(&self, host: &str, port: u16);
     /// The web server, for in-process handoff of requests the proxy routes to it.
     fn webui_handoff(&self, _server: Arc<crate::server::WebServer>) {}
+    /// Connect through the upstream proxy `cfg` (not necessarily the saved one) to `host:port`,
+    /// finish a TLS handshake, and report the time taken.
+    async fn test_upstream_proxy(
+        &self,
+        _cfg: &common::config::UpstreamProxy,
+        _host: &str,
+        _port: u16,
+    ) -> Result<std::time::Duration, String> {
+        Err("this build cannot test the upstream proxy".into())
+    }
     /// Issue the web UI's HTTPS certificate from the Argus CA for `sans` (DNS names and IP
     /// literals). Returns `(certificate PEM, key PEM)`.
     async fn issue_webui_cert(&self, _sans: &[String]) -> Result<(String, String), String> {

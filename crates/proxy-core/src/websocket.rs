@@ -22,7 +22,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_rustls::TlsConnector;
 use tracing::debug;
@@ -80,6 +79,8 @@ pub struct WsUpstream {
     idle_timeout: std::sync::atomic::AtomicU64,
     /// Spliced connections end when the proxy shuts down.
     shutdown: Option<broadcast::Sender<()>>,
+    /// The upstream proxy upgrades are dialled through, when on.
+    proxy: Arc<crate::upstream_proxy::ProxyHandle>,
 }
 
 impl WsUpstream {
@@ -105,7 +106,14 @@ impl WsUpstream {
             dial_timeout,
             idle_timeout: std::sync::atomic::AtomicU64::new(300_000),
             shutdown: None,
+            proxy: Default::default(),
         })
+    }
+
+    /// Dial through the live upstream proxy `proxy` holds.
+    pub fn with_proxy(mut self, proxy: Arc<crate::upstream_proxy::ProxyHandle>) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     /// Idle timeout for spliced connections, and the proxy shutdown signal that ends them.
@@ -128,11 +136,17 @@ impl WsUpstream {
         Duration::from_millis(self.idle_timeout.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    async fn dial(&self, host: &str, port: u16, tls: bool) -> Result<Box<dyn WsIo>> {
+    pub(crate) async fn dial(&self, host: &str, port: u16, tls: bool) -> Result<Box<dyn WsIo>> {
         let connect = async {
             // Resolve once, check the policy on the resolved address, connect to exactly that.
-            let addr = self.policy.resolve(host, port, self.resolve_all_to).await?;
-            let tcp = TcpStream::connect(addr).await.map_err(Error::Io)?;
+            let tcp = crate::upstream_proxy::dial(
+                &self.policy,
+                self.proxy.load().as_deref(),
+                host,
+                port,
+                self.resolve_all_to,
+            )
+            .await?;
             let _ = tcp.set_nodelay(true);
             if !tls {
                 return Ok::<Box<dyn WsIo>, Error>(Box::new(tcp));

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+* Upstream proxy (Settings, off by default; `proxy.upstream.proxy`): Argus can send everything it
+  connects to through another proxy, HTTP `CONNECT` or SOCKS5, with an optional username and
+  password. DNS lookups stay on Argus: it resolves and vets each target itself (private, reserved
+  and its own addresses are still refused) and sends the proxy only that IP, never a name. TLS
+  and `Host` still use the name. Web requests, WebSockets, userscript requests, certificate and
+  EV probes, and passthrough tunnels all go through it, and nothing connects directly while it
+  is on. The proxy itself may be on a private network but never one of Argus's own listeners.
+  A Test button checks it. The password is write-only (the API reports `set` or `unset`).
+  While it is on and browser-like connections are off, the plain wreq client replaces the
+  rustls one (only wreq resolves names locally before tunnelling).
 * Browser-like upstream connections (Settings, on by default; `proxy.upstream.browser_like`):
   Argus connects to sites with the TLS and HTTP/2 fingerprint of the browser behind each request
   (Chrome, Edge, Firefox or Safari, chosen from its client hints and User-Agent) and forwards the

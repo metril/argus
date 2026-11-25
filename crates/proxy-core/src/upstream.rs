@@ -39,6 +39,9 @@ pub struct UpstreamOptions {
     /// Connect with the requesting browser's TLS/HTTP2 fingerprint (the wreq client); off uses
     /// the rustls client.
     pub browser_like: bool,
+    /// The live upstream proxy (shared with every other dialer). The clients are built for the
+    /// proxy it holds when they are built.
+    pub proxy: Arc<crate::upstream_proxy::ProxyHandle>,
 }
 
 impl UpstreamOptions {
@@ -61,6 +64,29 @@ impl UpstreamOptions {
             0 => common::config::derive_max_connections(),
             n => n,
         };
+        let policy = Arc::new(
+            DestPolicy::from_config(config)
+                .unwrap_or_else(|e| {
+                    // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
+                    tracing::warn!("destination policy config invalid: {e}");
+                    DestPolicy::default()
+                })
+                .with_resolver(Arc::new(crate::dns::DnsHandle(dns.clone()))),
+        );
+        // An enabled upstream proxy is in force from the first connection (never fall back to
+        // direct): an unusable one makes every dial fail until it is fixed.
+        let proxy = Arc::new(crate::upstream_proxy::ProxyHandle::default());
+        let cfg = &config.proxy.upstream.proxy;
+        if cfg.enabled {
+            if let Err(e) = cfg.validate() {
+                tracing::warn!("{e}; upstream connections fail until it is fixed");
+            }
+            proxy.store(Some(Arc::new(crate::upstream_proxy::ProxyEndpoint::new(
+                cfg.clone(),
+                policy.clone(),
+                dns.clone(),
+            ))));
+        }
         Self {
             extra_ca_paths: config.proxy.extra_upstream_ca_paths.clone(),
             resolve_all_to: None,
@@ -73,18 +99,11 @@ impl UpstreamOptions {
             certs: Default::default(),
             roots: None,
             browser_like: config.proxy.upstream.browser_like,
-            dns: Some(dns.clone()),
+            proxy,
+            dns: Some(dns),
             pool_max_idle_per_host: Some(common::config::pool_idle_per_host(max_connections)),
             pool_max_size: Some(common::config::pool_total_idle(max_connections)),
-            policy: Arc::new(
-                DestPolicy::from_config(config)
-                    .unwrap_or_else(|e| {
-                        // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
-                        tracing::warn!("destination policy config invalid: {e}");
-                        DestPolicy::default()
-                    })
-                    .with_resolver(Arc::new(crate::dns::DnsHandle(dns))),
-            ),
+            policy,
         }
     }
 }
@@ -228,6 +247,7 @@ const PROBE_BACKGROUND: usize = 16;
 struct Busy;
 
 struct ProbeInner {
+    proxy: Arc<crate::upstream_proxy::ProxyHandle>,
     store: Arc<common::certstore::CertStore>,
     roots: Arc<crate::roots::RootsHandle>,
     resolver: PolicyResolver,
@@ -290,12 +310,14 @@ impl CertProber {
         background: usize,
     ) -> Result<Self> {
         Ok(Self(Arc::new(ProbeInner {
+            proxy: opts.proxy.clone(),
             store: opts.certs.clone(),
             roots: opts.roots_handle()?,
             resolver: PolicyResolver {
                 policy: opts.policy.clone(),
                 override_ip: opts.resolve_all_to,
                 strict: false,
+                proxy: None,
                 dns: opts.dns.clone().unwrap_or_else(|| {
                     Arc::new(CachedResolver::from_settings(&Default::default()))
                 }),
@@ -452,7 +474,9 @@ impl ProbeInner {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
         let mut completed = None;
         for addr in addrs {
-            let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
+            let Ok(tcp) =
+                crate::upstream_proxy::connect_vetted(self.proxy.load().as_deref(), addr).await
+            else {
                 continue;
             };
             completed = Some(connector.connect(name.clone(), tcp).await.is_ok());
@@ -480,9 +504,22 @@ struct PolicyResolver {
     /// Also refuse every address of this host (client used for the proxy's own ports).
     strict: bool,
     dns: Arc<CachedResolver>,
+    /// The upstream proxy of the client this resolver serves: its alias resolves to the proxy's
+    /// own (loop-checked) addresses instead of going through the destination policy.
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
 }
 
 impl PolicyResolver {
+    fn copy(&self) -> PolicyResolver {
+        PolicyResolver {
+            policy: self.policy.clone(),
+            override_ip: self.override_ip,
+            strict: self.strict,
+            dns: self.dns.clone(),
+            proxy: self.proxy.clone(),
+        }
+    }
+
     /// Resolve (cached) and apply the destination policy to every address, on every call. The
     /// returned addresses are exactly what the connector dials; nothing is resolved again.
     async fn resolve_checked(
@@ -491,6 +528,32 @@ impl PolicyResolver {
     ) -> std::result::Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ip) = self.override_ip {
             return Ok(vec![SocketAddr::new(ip, 0)]);
+        }
+        if let Some(p) = &self.proxy {
+            if name.eq_ignore_ascii_case(p.alias()) {
+                let addrs = p.addrs().await?;
+                // The port comes from the proxy URL.
+                return Ok(addrs
+                    .into_iter()
+                    .map(|a| SocketAddr::new(a.ip(), 0))
+                    .collect());
+            }
+        }
+        // SOCKS connectors resolve IP literals through the resolver too: vet them the same way.
+        if let Ok(ip) = name
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            let verdict = if self.strict {
+                self.policy.check_ip_strict(ip)
+            } else {
+                self.policy.check_ip(ip)
+            };
+            return match verdict {
+                Ok(()) => Ok(vec![SocketAddr::new(ip, 0)]),
+                Err(r) => Err(Box::new(PolicyRefused(r))),
+            };
         }
         let addrs = self.dns.resolve(name).await.map_err(|e| {
             Box::new(std::io::Error::other(format!("dns lookup failed: {e}")))
@@ -522,12 +585,7 @@ impl PolicyResolver {
 
 impl reqwest::dns::Resolve for PolicyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let this = PolicyResolver {
-            policy: self.policy.clone(),
-            override_ip: self.override_ip,
-            strict: self.strict,
-            dns: self.dns.clone(),
-        };
+        let this = self.copy();
         Box::pin(async move {
             let v = this.resolve_checked(name.as_str()).await?;
             Ok(Box::new(v.into_iter()) as reqwest::dns::Addrs)
@@ -537,12 +595,7 @@ impl reqwest::dns::Resolve for PolicyResolver {
 
 impl wreq::dns::Resolve for PolicyResolver {
     fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
-        let this = PolicyResolver {
-            policy: self.policy.clone(),
-            override_ip: self.override_ip,
-            strict: self.strict,
-            dns: self.dns.clone(),
-        };
+        let this = self.copy();
         Box::pin(async move {
             let v = this.resolve_checked(name.as_str()).await?;
             Ok(Box::new(v.into_iter()) as wreq::dns::Addrs)
@@ -554,6 +607,9 @@ impl wreq::dns::Resolve for PolicyResolver {
 #[derive(Clone)]
 pub enum UpstreamClient {
     Wreq(wreq::Client),
+    /// The wreq client without a browser fingerprint: used instead of the rustls client while an
+    /// upstream proxy is on, because only wreq resolves names locally before tunnelling.
+    WreqPlain(wreq::Client),
     Reqwest(reqwest::Client),
 }
 
@@ -561,6 +617,7 @@ impl std::fmt::Debug for UpstreamClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Wreq(_) => "UpstreamClient::Wreq",
+            Self::WreqPlain(_) => "UpstreamClient::WreqPlain",
             Self::Reqwest(_) => "UpstreamClient::Reqwest",
         })
     }
@@ -650,7 +707,7 @@ impl UpstreamClient {
 
     /// Drop the idle upstream connections pooled for downstream connection `conn_id`.
     pub fn evict_conn(&self, conn_id: u64) {
-        if let Self::Wreq(c) = self {
+        if let Self::Wreq(c) | Self::WreqPlain(c) = self {
             c.evict_group(&wreq::Group::new(conn_id));
             c.evict_group(&wreq::Group::new(format!("{conn_id}{RETRY_SUFFIX}")));
         }
@@ -795,10 +852,11 @@ async fn send_once(
                     .boxed(),
             })
         }
-        UpstreamClient::Wreq(c) => {
+        UpstreamClient::Wreq(c) | UpstreamClient::WreqPlain(c) => {
             // The profile is the browser's own (client hints, then User-Agent); its
             // transport fingerprint is used, but none of its headers: the browser's go
-            // through as they came, in their order.
+            // through as they came, in their order. The plain client has no fingerprint.
+            let browser = matches!(client, UpstreamClient::Wreq(_));
             let profile = crate::browser_profile::BrowserProfile::classify(&headers);
             let orig = crate::browser_profile::orig_headers(&profile, headers.keys());
             let mut rb = c.request(method.clone(), url);
@@ -807,11 +865,13 @@ async fn send_once(
                 None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(RETRY_SUFFIX)),
                 None => {}
             }
-            let mut rb = rb
-                .emulation(profile.emulation())
-                .default_headers(false)
-                .headers(headers)
-                .orig_headers(orig);
+            if browser {
+                rb = rb.emulation(profile.emulation());
+            }
+            let mut rb = rb.default_headers(false).headers(headers);
+            if browser {
+                rb = rb.orig_headers(orig);
+            }
             rb = match body {
                 Some(UpstreamBody::Bytes(b)) => rb.body(b),
                 Some(UpstreamBody::Stream(s)) => rb.body(wreq::Body::wrap_stream(s)),
@@ -950,28 +1010,54 @@ impl UpstreamResponse {
 /// Build the shared upstream client (browser-like when `opts.browser_like`). Redirects are
 /// passed through to the downstream client (the proxy must not follow them itself).
 pub fn build_upstream_client(opts: &UpstreamOptions) -> Result<UpstreamClient> {
-    build_client(opts, false)
+    build_client(opts, false, opts.proxy.load())
+}
+
+/// [`build_upstream_client`] for `proxy` instead of the live one (so a replacement can be built
+/// before it is installed).
+pub fn build_upstream_client_via(
+    opts: &UpstreamOptions,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<UpstreamClient> {
+    build_client(opts, false, proxy)
 }
 
 /// Like [`build_upstream_client`], for requests aimed at the proxy's own ports: its resolver
 /// refuses every address of this host, since the resolver cannot see the port.
 pub fn build_strict_upstream_client(opts: &UpstreamOptions) -> Result<UpstreamClient> {
-    build_client(opts, true)
+    build_client(opts, true, opts.proxy.load())
 }
 
-fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<UpstreamClient> {
-    if opts.browser_like {
-        build_wreq(opts, strict).map(UpstreamClient::Wreq)
-    } else {
-        build_reqwest(opts, strict).map(UpstreamClient::Reqwest)
+/// [`build_strict_upstream_client`] for `proxy` instead of the live one.
+pub fn build_strict_upstream_client_via(
+    opts: &UpstreamOptions,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<UpstreamClient> {
+    build_client(opts, true, proxy)
+}
+
+fn build_client(
+    opts: &UpstreamOptions,
+    strict: bool,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<UpstreamClient> {
+    match (opts.browser_like, proxy.is_some()) {
+        (true, _) => build_wreq(opts, strict, proxy).map(UpstreamClient::Wreq),
+        (false, true) => build_wreq(opts, strict, proxy).map(UpstreamClient::WreqPlain),
+        (false, false) => build_reqwest(opts, strict).map(UpstreamClient::Reqwest),
     }
 }
 
-fn resolver_of(opts: &UpstreamOptions, strict: bool) -> PolicyResolver {
+fn resolver_of(
+    opts: &UpstreamOptions,
+    strict: bool,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> PolicyResolver {
     PolicyResolver {
         policy: opts.policy.clone(),
         override_ip: opts.resolve_all_to,
         strict,
+        proxy,
         dns: opts
             .dns
             .clone()
@@ -1006,13 +1092,16 @@ impl UpstreamScope {
 
 /// The browser-like client: BoringSSL with the shared root set verified in the handshake. The
 /// browser profile (TLS and HTTP/2 fingerprint) is chosen per request.
-fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
+fn build_wreq(
+    opts: &UpstreamOptions,
+    strict: bool,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<wreq::Client> {
     let roots = opts.roots_handle()?;
     let certs = opts.certs.clone();
     let verify: wreq::tls::CustomVerify =
         Arc::new(move |ssl, host| crate::roots::verify_btls(&roots, Some(&certs), ssl, host));
     let mut b = wreq::Client::builder()
-        .no_proxy()
         .tls_info(true)
         .redirect(wreq::redirect::Policy::none())
         // Argus retries itself (once, on a fresh connection group, see `UpstreamRequest::send`).
@@ -1032,7 +1121,15 @@ fn build_wreq(opts: &UpstreamOptions, strict: bool) -> Result<wreq::Client> {
         .tls_custom_verify(verify)
         // Sessions kept per device and host for resumption (the default keeps 8).
         .tls_session_cache(Arc::new(wreq::tls::session::LruTlsSessionCache::new(32)))
-        .dns_resolver(Arc::new(resolver_of(opts, strict)));
+        .dns_resolver(Arc::new(resolver_of(opts, strict, proxy.clone())));
+    // Never the environment's proxy: it would bypass the destination policy.
+    b = match &proxy {
+        Some(p) => b.proxy(
+            p.wreq_proxy()
+                .map_err(|e| Error::Config(format!("Invalid upstream proxy: {e}")))?,
+        ),
+        None => b.no_proxy(),
+    };
     if let Some(t) = opts.connect_timeout {
         b = b.connect_timeout(t);
     }
@@ -1073,7 +1170,7 @@ fn build_reqwest(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client
     if let Some(t) = opts.read_timeout {
         builder = builder.read_timeout(t);
     }
-    builder = builder.dns_resolver(Arc::new(resolver_of(opts, strict)));
+    builder = builder.dns_resolver(Arc::new(resolver_of(opts, strict, None)));
     builder
         .build()
         .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))
@@ -1143,6 +1240,7 @@ mod tests {
             policy: Arc::new(DestPolicy::default()),
             override_ip: None,
             strict: false,
+            proxy: None,
             dns: dns.clone(),
         };
         for _ in 0..3 {

@@ -194,11 +194,123 @@ pub struct UpstreamSettings {
     /// uses the previous rustls client, kept for one release.
     #[serde(default = "default_true")]
     pub browser_like: bool,
+    /// Send Argus's own upstream traffic through another proxy (`[proxy.upstream.proxy]`).
+    #[serde(default)]
+    pub proxy: UpstreamProxy,
 }
 
 impl Default for UpstreamSettings {
     fn default() -> Self {
-        Self { browser_like: true }
+        Self {
+            browser_like: true,
+            proxy: UpstreamProxy::default(),
+        }
+    }
+}
+
+/// Protocol spoken to the upstream proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProxyKind {
+    /// HTTP `CONNECT`.
+    #[default]
+    Http,
+    /// SOCKS5 (no remote DNS: Argus always sends the address it resolved and vetted).
+    Socks5,
+}
+
+/// An upstream proxy Argus connects through. DNS lookups stay on Argus: the destination policy
+/// is applied to the address Argus resolved, and only that address is sent to the proxy.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamProxy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub kind: UpstreamProxyKind,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_upstream_proxy_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+fn default_upstream_proxy_port() -> u16 {
+    8080
+}
+
+impl Default for UpstreamProxy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kind: UpstreamProxyKind::Http,
+            host: String::new(),
+            port: default_upstream_proxy_port(),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for UpstreamProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamProxy")
+            .field("enabled", &self.enabled)
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &if self.password.is_empty() {
+                    "unset"
+                } else {
+                    "set"
+                },
+            )
+            .finish()
+    }
+}
+
+impl UpstreamProxy {
+    /// The host without IPv6 brackets, whitespace or a trailing dot.
+    pub fn bare_host(&self) -> &str {
+        self.host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+    }
+
+    /// Check the fields of an enabled proxy.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let host = self.bare_host();
+        if host.is_empty() {
+            return Err("upstream proxy: host is required".into());
+        }
+        if host.parse::<std::net::IpAddr>().is_err()
+            && !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+        {
+            return Err(format!("upstream proxy: {host:?} is not a host name or IP"));
+        }
+        if self.port == 0 {
+            return Err("upstream proxy: port must be 1-65535".into());
+        }
+        // RFC 1929 length-prefixed fields.
+        if self.username.len() > 255 || self.password.len() > 255 {
+            return Err("upstream proxy: username and password are limited to 255 bytes".into());
+        }
+        if self.username.is_empty() && !self.password.is_empty() {
+            return Err("upstream proxy: a password needs a username".into());
+        }
+        Ok(())
     }
 }
 
@@ -765,7 +877,12 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), ConfigEr
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // Owner-only: the settings overlay can hold the upstream proxy password.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)

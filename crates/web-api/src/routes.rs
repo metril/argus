@@ -101,6 +101,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         // config
         .routes(routes!(proxy::get_config, proxy::update_config))
         .routes(routes!(proxy::get_config_defaults))
+        .routes(routes!(proxy::test_upstream_proxy))
         // bypass
         .routes(routes!(bypass::list_categories))
         .routes(routes!(bypass::update_category))
