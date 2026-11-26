@@ -288,6 +288,7 @@ async fn main() -> Result<()> {
 
     // Commit queued background writes and fsync before exiting; do not rely on the drop order
     // of `Arc`s held by aborted tasks.
+    ctx.internal().gm.ext().persist_now();
     common::db::Db::sync_all();
 
     proxy_result.map_err(|e| {

@@ -61,10 +61,10 @@ async function revoke(argusUrl?: string, token?: string) {
  * Background side of sign-out: the token goes first (so nothing can reconnect with it), then the
  * channel stops and the proxy clears, then the captured token is revoked (best effort, bounded).
  */
-export async function signOutInBackground(d: { bridge: { stop(): Promise<void> }; proxy: { apply(): Promise<void> } }): Promise<void> {
+export async function signOutInBackground(d: { bridge: { stop(): Promise<void> }; proxy: { release(): Promise<void> } }): Promise<void> {
   const s = await getSettings();
   await browser.storage.local.remove(TOKEN_KEYS);
-  try { await d.bridge.stop(); await d.proxy.apply(); } catch { /* ignore */ }
+  try { await d.bridge.stop(); await d.proxy.release(); } catch { /* ignore */ }
   await revoke(s.argusUrl, s.token);
 }
 

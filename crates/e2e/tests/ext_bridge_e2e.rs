@@ -393,6 +393,39 @@ e2e_test!(
 );
 
 e2e_test!(
+    a_bound_connection_whose_session_ended_is_closed_without_a_407,
+    rules = [],
+    explicit_only,
+    |env| {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let h = hub(&env);
+        let (sess, sid, _rx) = session(&h, "tok-n");
+        let addr = env.proxy.ext_addr().await;
+        env.origin.route("/bound", MockResponse::ok("x"));
+        let url = env.origin.http_url("app.test", "/bound");
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {url} HTTP/1.1\r\nHost: app.test\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            b64(format!("ext:{sid}").as_bytes())
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut head = [0u8; 12];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        // the session really ends; the next request on the bound connection gets no 407
+        h.close(sess);
+        let _ = sock
+            .write_all(format!("GET {url} HTTP/1.1\r\nHost: app.test\r\n\r\n").as_bytes())
+            .await;
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut rest)).await;
+        assert!(ended.is_ok(), "the connection is closed");
+        let text = String::from_utf8_lossy(&rest);
+        assert!(!text.contains("407"), "no 407 mid-stream: {text}");
+    }
+);
+
+e2e_test!(
     revoking_a_token_drops_the_sessions_proxy_connections,
     rules = [],
     explicit_only,

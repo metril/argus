@@ -102,3 +102,5 @@ details.cont label{display:flex;gap:8px;align-items:center;min-height:28px}
 .perms{display:grid;grid-template-columns:1fr auto;gap:10px 12px;align-items:center}
 .opts .card .form{padding:0}
 @media (max-width:560px){.opts{padding:16px}.steps{grid-template-columns:1fr}}
+
+button.link{background:none;border:0;padding:0;font:inherit;color:inherit;text-decoration:underline;cursor:pointer}

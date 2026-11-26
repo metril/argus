@@ -336,7 +336,11 @@ The extension's background script opens a WebSocket `GET /api/v1/ext/channel` on
   disabled owner), `4403` token without the scope `userscripts:bridge`.
 * The server answers `{"t":"welcome","sid":"<32 hex>","v":1}` and then
   `{"t":"proxy","host":<string|null>,"port":<int|null>}`. `sid` is a random 128-bit secret generated
-  for this connection (every reconnect gets a new one) and shown to nobody but the extension.
+  for the session and shown to nobody but the extension. When the channel drops, the session
+  stays valid for 120 seconds (the extension listener keeps accepting its `sid`); a hello with
+  `"resume":"<sid>"` from the same token reattaches it (same `sid`, `"resumed":true` in the
+  welcome); an unknown, expired or foreign `resume` just opens a new session. Token revocation,
+  sign-out and `{"t":"bye"}` end it at once.
   `proxy` says where the extension listener (8.2) is (`port` null: it is off; `host` null: the host
   of the Argus URL the extension was configured with). The same message is sent again when the
   setting changes.
@@ -354,7 +358,7 @@ The extension's background script opens a WebSocket `GET /api/v1/ext/channel` on
   32 answers fills up) is removed, the extension gets a cancel frame and the page gets an error; a
   chunk is never dropped and followed by a normal end.
 * Audit: session open and close, every `perms` report and every relayed request are written to the
-  audit log (`ext/session_open`, `ext/session_close`, `ext/perms`, `ext/relay`; the relay entry names
+  audit log (`ext/session_open`, `ext/session_resume`, `ext/session_detach`, `ext/session_expire`, `ext/session_close`, `ext/perms`, `ext/relay`; the relay entry names
   the script, operation, method and host, never URLs, bodies or cookies); changes of the
   `browser_cookies` approval are audited as the approve and confirm calls they are, and each
   relayed request is also logged to the script's security audit.

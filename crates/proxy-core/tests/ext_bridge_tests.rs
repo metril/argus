@@ -1214,3 +1214,149 @@ async fn a_relay_records_the_store_of_its_job_for_audit() {
         "the default store"
     );
 }
+
+#[tokio::test]
+async fn a_dropped_channel_keeps_its_session_for_the_grace_and_resume_keeps_the_sid() {
+    let f = fx(true);
+    let hub = f.gm.ext();
+    let (s, sid, rx) = hub.open(ident("t1"));
+    // channel drops: the session stays valid for the listener
+    drop(rx);
+    hub.detach(s);
+    assert!(hub.is_live(s));
+    assert_eq!(hub.authenticate(&sid), Some(s));
+    // another token cannot take it over; a wrong sid cannot either
+    assert!(hub.resume(&ident("t2"), &sid).is_none());
+    assert!(hub.resume(&ident("t1"), "nope").is_none());
+    // the same token resumes it, same id and sid
+    let (s2, sid2, _rx2) = hub.resume(&ident("t1"), &sid).expect("resume");
+    assert_eq!((s2, sid2.as_str()), (s, sid.as_str()));
+    assert!(hub.is_live(s));
+    assert_eq!(hub.session_count(), 1);
+}
+
+#[tokio::test]
+async fn resume_over_a_still_live_channel_is_not_undone_by_the_old_channels_detach() {
+    let f = fx(true);
+    let hub = f.gm.ext();
+    let (s, sid, old_rx) = hub.open(ident("t1"));
+    let (_, _, _new_rx) = hub.resume(&ident("t1"), &sid).expect("resume");
+    drop(old_rx);
+    hub.detach(s); // the old channel's exit: must not start a grace on the resumed session
+    assert!(hub.is_live(s));
+    // no grace was started: a route to the session is still possible (dispatch refuses grace)
+    let r = hub
+        .dispatch(s, json!({"op":"xhr"}), "default", "sc", "hit.test", None)
+        .await;
+    assert!(r.is_ok());
+}
+
+#[tokio::test]
+async fn grace_expiry_revoke_and_bye_end_the_session() {
+    let f = fx(true);
+    let hub = f.gm.ext();
+    let (s, sid, rx) = hub.open(ident("t1"));
+    drop(rx);
+    hub.detach(s);
+    hub.expire_grace_for_test(s);
+    assert!(!hub.is_live(s));
+    assert!(hub.authenticate(&sid).is_none());
+    assert!(hub.resume(&ident("t1"), &sid).is_none());
+    // revoking the token ends a grace session at once
+    let (s, sid, rx) = hub.open(ident("t1"));
+    drop(rx);
+    hub.detach(s);
+    hub.close_token("t1");
+    assert!(!hub.is_live(s) && hub.resume(&ident("t1"), &sid).is_none());
+    // an explicit close (bye) ends it immediately
+    let (s, sid, _rx) = hub.open(ident("t1"));
+    hub.close(s);
+    assert!(hub.authenticate(&sid).is_none());
+}
+
+#[tokio::test]
+async fn a_session_in_grace_is_not_routed_to_and_fails_its_jobs() {
+    let f = fx(true);
+    let hub = f.gm.ext();
+    let (s, _sid, rx) = hub.open(ident("t1"));
+    drop(rx);
+    hub.detach(s);
+    let r = hub
+        .dispatch(s, json!({"op":"xhr"}), "default", "sc", "hit.test", None)
+        .await;
+    assert!(r.is_err());
+}
+
+#[tokio::test]
+async fn sessions_survive_a_restart_as_hashes_and_the_old_sid_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ext-sessions.json");
+    let a = ExtHub::new();
+    a.set_persist_path(path.clone());
+    let (_s, sid, _rx) = a.open(ident("t1"));
+    let (_s2, sid_revoked, _rx2) = a.open(ident("gone"));
+    a.persist_now();
+    // the file never holds the raw sid, and is private
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains(&sid) && !text.contains(&sid_revoked));
+    assert!(text.contains("sid_sha256"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // restart: a new hub restores them as grace sessions; revoked tokens are not restored
+    let b = ExtHub::new();
+    b.set_persist_path(path);
+    assert_eq!(b.restore(&|t| t != "gone"), 1);
+    let id = b
+        .authenticate(&sid)
+        .expect("old sid accepted at the listener");
+    assert!(b.authenticate(&sid_revoked).is_none());
+    assert!(b.authenticate("0000").is_none());
+    assert!(b.is_live(id));
+    // another token cannot resume it; the same one reattaches with the same sid
+    assert!(b.resume(&ident("t2"), &sid).is_none());
+    let (id2, sid2, _rx) = b.resume(&ident("t1"), &sid).expect("resume after restart");
+    assert_eq!((id2, sid2.as_str()), (id, sid.as_str()));
+    // an expired file entry is not restored
+    let c = ExtHub::new();
+    c.set_persist_path(dir.path().join("missing.json"));
+    assert_eq!(c.restore(&|_| true), 0);
+}
+
+#[tokio::test]
+async fn a_restore_skips_expired_rows_and_never_extends_an_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ext-sessions.json");
+    let a = ExtHub::new();
+    a.set_persist_path(path.clone());
+    let (dead, sid_dead, rx1) = a.open(ident("t1"));
+    let (_live, sid_live, _rx2) = a.open(ident("t1"));
+    drop(rx1);
+    a.detach(dead);
+    a.expire_grace_for_test(dead); // expired before the restart
+    a.persist_now();
+    let b = ExtHub::new();
+    b.set_persist_path(path.clone());
+    assert_eq!(b.restore(&|_| true), 1);
+    assert!(b.authenticate(&sid_dead).is_none());
+    assert!(b.authenticate(&sid_live).is_some());
+    // a row with a short remaining time is not stretched to a full grace
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["sessions"][0]["expires"] = json!(now + 1);
+    std::fs::write(&path, v.to_string()).unwrap();
+    let c = ExtHub::new();
+    c.set_persist_path(path);
+    assert_eq!(c.restore(&|_| true), 1);
+    let id = c.session_count();
+    assert_eq!(id, 1);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(c.session_count(), 0, "expired on the file's schedule");
+}
