@@ -29,6 +29,7 @@ mod permissions;
 pub use permissions::merge as merge_permissions_policy;
 mod removeparam;
 mod replace;
+pub mod stealth;
 mod style;
 mod types;
 mod util;

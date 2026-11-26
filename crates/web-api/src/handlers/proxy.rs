@@ -65,7 +65,105 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
             lists_base_url: config.bypass.lists_base_url.clone(),
             lists_public_key: config.bypass.lists_public_key.clone(),
         },
+        stealth: stealth_dto(&config.stealth),
         bind: None,
+    }
+}
+
+fn stealth_dto(s: &common::config::StealthSettings) -> api_types::StealthDto {
+    api_types::StealthDto {
+        enabled: s.enabled,
+        hide_search_queries: s.hide_search_queries,
+        send_dnt: s.send_dnt,
+        strip_tracking_params: s.strip_tracking_params,
+        hide_referer: s.hide_referer,
+        referer_custom: s.referer_custom.clone(),
+        hide_user_agent: s.hide_user_agent,
+        user_agent_custom: s.user_agent_custom.clone(),
+        mask_ip: s.mask_ip,
+        mask_ip_address: s.mask_ip_address.clone(),
+        remove_x_client_data: s.remove_x_client_data,
+        third_party_cookies: s.third_party_cookies,
+        third_party_cookie_minutes: s.third_party_cookie_minutes,
+        first_party_cookies: s.first_party_cookies,
+        first_party_cookie_minutes: s.first_party_cookie_minutes,
+        block_etag: s.block_etag,
+        block_third_party_auth: s.block_third_party_auth,
+        block_webrtc: s.block_webrtc,
+        block_push: s.block_push,
+        block_location: s.block_location,
+        block_flash: s.block_flash,
+        block_java: s.block_java,
+    }
+}
+
+/// Merge an update into the settings; the result is validated by the caller.
+fn merge_stealth(s: &mut common::config::StealthSettings, u: api_types::StealthUpdate) {
+    if let Some(v) = u.enabled {
+        s.enabled = v;
+    }
+    if let Some(v) = u.hide_search_queries {
+        s.hide_search_queries = v;
+    }
+    if let Some(v) = u.send_dnt {
+        s.send_dnt = v;
+    }
+    if let Some(v) = u.strip_tracking_params {
+        s.strip_tracking_params = v;
+    }
+    if let Some(v) = u.hide_referer {
+        s.hide_referer = v;
+    }
+    if let Some(v) = u.referer_custom {
+        s.referer_custom = v;
+    }
+    if let Some(v) = u.hide_user_agent {
+        s.hide_user_agent = v;
+    }
+    if let Some(v) = u.user_agent_custom {
+        s.user_agent_custom = v;
+    }
+    if let Some(v) = u.mask_ip {
+        s.mask_ip = v;
+    }
+    if let Some(v) = u.mask_ip_address {
+        s.mask_ip_address = v;
+    }
+    if let Some(v) = u.remove_x_client_data {
+        s.remove_x_client_data = v;
+    }
+    if let Some(v) = u.third_party_cookies {
+        s.third_party_cookies = v;
+    }
+    if let Some(v) = u.third_party_cookie_minutes {
+        s.third_party_cookie_minutes = v;
+    }
+    if let Some(v) = u.first_party_cookies {
+        s.first_party_cookies = v;
+    }
+    if let Some(v) = u.first_party_cookie_minutes {
+        s.first_party_cookie_minutes = v;
+    }
+    if let Some(v) = u.block_etag {
+        s.block_etag = v;
+    }
+    if let Some(v) = u.block_third_party_auth {
+        s.block_third_party_auth = v;
+    }
+    if let Some(v) = u.block_webrtc {
+        s.block_webrtc = v;
+    }
+    if let Some(v) = u.block_push {
+        s.block_push = v;
+    }
+    if let Some(v) = u.block_location {
+        s.block_location = v;
+    }
+    if let Some(v) = u.block_flash {
+        s.block_flash = v;
+    }
+    if let Some(v) = u.block_java {
+        s.block_java = v;
     }
 }
 
@@ -236,6 +334,9 @@ fn apply_live(state: &AppState, config: &ProxyConfig) {
         config.performance.request_timeout_secs.saturating_mul(1000),
         Ordering::Relaxed,
     );
+    if let Some(h) = state.stealth.get() {
+        h.store(Arc::new(config.stealth.clone()));
+    }
     state.list_service.set_schedule(
         config.adblock.auto_update,
         Duration::from_secs(config.adblock.update_interval_hours.max(1) * 3600),
@@ -528,6 +629,16 @@ async fn apply_update_locked(
         can_web
     );
     field!("webui_port", config.webui.port, req.webui_port, can_web);
+    if let Some(u) = req.stealth {
+        let mut next = config.stealth.clone();
+        merge_stealth(&mut next, u);
+        next.validate()
+            .map_err(|e| ApiError::ValidationError(format!("stealth: {e}")))?;
+        if next != config.stealth {
+            config.stealth = next;
+            applied.push("stealth".into());
+        }
+    }
     if let Some(b) = req.bypass {
         if let Some(u) = b.lists_base_url {
             let u = u.trim().trim_end_matches('/').to_string();

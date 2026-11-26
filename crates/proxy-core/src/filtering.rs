@@ -24,6 +24,7 @@ use crate::rewrite::{
     classify_body, media_type, BodyKind, HeaderEdit, HtmlPlan, ResponseInfo, ResponseTransforms,
     TransformSource,
 };
+use crate::stealth;
 use crate::upstream::{
     build_strict_upstream_client, build_strict_upstream_client_via, build_upstream_client,
     build_upstream_client_via, UpstreamClient, UpstreamOptions,
@@ -87,6 +88,20 @@ pub fn refused_response() -> Response<ProxyBody> {
 }
 
 /// `Origin`-header form of an authority: scheme, host, and the port unless it is the default.
+/// The page a request came from, for logs: the Referer as the browser sent it, even when
+/// Stealth Mode replaced it on the way out.
+fn src_of<'a>(
+    orig_referer: &'a Option<String>,
+    headers: &'a hyper::HeaderMap,
+    url: &'a str,
+    rtype: RequestType,
+) -> &'a str {
+    orig_referer
+        .as_deref()
+        .filter(|_| rtype != RequestType::Document)
+        .unwrap_or_else(|| source_url(headers, url, rtype))
+}
+
 fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
     let scheme = if scheme == "http" { "http" } else { "https" };
     let default = if scheme == "http" { 80 } else { 443 };
@@ -297,6 +312,8 @@ pub struct ProxyContext {
     guard_service_workers: std::sync::atomic::AtomicBool,
     /// Hosts the guard leaves alone (exact or `*.suffix`).
     guard_exempt: ArcSwap<Vec<String>>,
+    /// Live Stealth Mode settings (shared with the web API, which swaps them on save).
+    stealth: Arc<ArcSwap<common::config::StealthSettings>>,
     /// Upstream certificates seen by the upstream clients (shared with the web API).
     certs: Arc<common::certstore::CertStore>,
     /// Probe handshakes to learn why an upstream certificate was rejected (when built from
@@ -348,6 +365,7 @@ impl ProxyContext {
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
             guard_service_workers: std::sync::atomic::AtomicBool::new(false),
             guard_exempt: ArcSwap::from_pointee(Vec::new()),
+            stealth: Arc::default(),
             certs: Default::default(),
             prober: None,
             roots: None,
@@ -445,6 +463,16 @@ impl ProxyContext {
             info.source_url = None;
             idx.page_exempt(&info)
         })
+    }
+
+    /// Replace the Stealth Mode settings; the next request uses them.
+    pub fn set_stealth(&self, s: common::config::StealthSettings) {
+        self.stealth.store(Arc::new(s));
+    }
+
+    /// The live settings cell, for the web API to swap on save.
+    pub fn stealth_handle(&self) -> Arc<ArcSwap<common::config::StealthSettings>> {
+        self.stealth.clone()
     }
 
     pub fn set_respect_no_transform(&self, respect: bool) {
@@ -1173,6 +1201,62 @@ impl ProxyContext {
 
         ext::apply_request_edits(&mut headers, &request_edits);
 
+        // Stealth Mode: header, URL and cookie edits, decided once per request. Off for hosts in
+        // full bypass, pages with ad blocking switched off, and options a `$stealth` exception
+        // turns off for the page.
+        let st = self.stealth.load_full();
+        let mut stealth_mask = 0u32;
+        let mut stealth_third = false;
+        let mut orig_referer: Option<String> = None;
+        if st.enabled && !bypass_full {
+            let src = source_url(&headers, &url, rtype).to_string();
+            stealth_third = rtype != RequestType::Document && stealth::is_third_party(&host, &src);
+            let page = if rtype == RequestType::Document || src.is_empty() {
+                url.clone()
+            } else {
+                src.clone()
+            };
+            let mut m = stealth::mask(&st);
+            if m != 0 {
+                let profile = rctx.profile.load();
+                let probe = SharedEngine::site_probe(&page);
+                if profile.engine.site_off_with(&probe)
+                    || profile
+                        .overlay
+                        .as_ref()
+                        .is_some_and(|o| o.site_off_with(&probe))
+                {
+                    m = 0;
+                } else if let Some(idx) = profile.generation().aux::<ext_rules::ExtIndex>() {
+                    m &= !ext::stealth_off(idx, &url, &src, rtype);
+                }
+            }
+            if m & ext_rules::stealth::TRACKING_PARAMS != 0 {
+                if let Some(new_url) = stealth::strip_tracking(&url) {
+                    if rtype == RequestType::Document && (method == hyper::Method::GET || is_head) {
+                        return Ok(rewrite_redirect(&new_url));
+                    }
+                    url = new_url;
+                }
+            }
+            if m != 0 {
+                let kind = stealth::ReqKind {
+                    document: rtype == RequestType::Document,
+                    unsafe_method: matches!(
+                        method,
+                        hyper::Method::POST
+                            | hyper::Method::PUT
+                            | hyper::Method::PATCH
+                            | hyper::Method::DELETE
+                    ),
+                };
+                orig_referer =
+                    stealth::apply_request(&st, m, &mut headers, &url, stealth_third, kind)
+                        .orig_referer;
+            }
+            stealth_mask = m;
+        }
+
         // Stream the request body upstream; nothing is buffered.
         let has_body = !body.is_end_stream();
 
@@ -1286,7 +1370,7 @@ impl ProxyContext {
                             filter_engine::EventAction::Error,
                             method.as_str(),
                             &url,
-                            source_url(&headers, &url, rtype),
+                            src_of(&orig_referer, &headers, &url, rtype),
                             rtype,
                             Some(504),
                             Some(filter_engine::ErrorKind::UpstreamTimeout),
@@ -1329,7 +1413,7 @@ impl ProxyContext {
                         filter_engine::EventAction::Error,
                         method.as_str(),
                         &url,
-                        source_url(&headers, &url, rtype),
+                        src_of(&orig_referer, &headers, &url, rtype),
                         rtype,
                         Some(502),
                         Some(kind),
@@ -1367,7 +1451,7 @@ impl ProxyContext {
                 filter_engine::EventAction::Allowed,
                 method.as_str(),
                 &url,
-                source_url(&headers, &url, rtype),
+                src_of(&orig_referer, &headers, &url, rtype),
                 rtype,
                 Some(status.as_u16()),
                 None,
@@ -1375,7 +1459,8 @@ impl ProxyContext {
         }
         // Moved out of the response (the body stream does not need them): no header-map copy.
         let mut resp = resp;
-        let resp_headers = std::mem::take(resp.headers_mut());
+        let mut resp_headers = std::mem::take(resp.headers_mut());
+        stealth::apply_response(&st, stealth_mask, &mut resp_headers, stealth_third);
         // A relayed response that redirects: the hop it names is checked here, before the
         // browser can follow it (Argus decrypted this hop, so it sees every one). Together with
         // the check of the first hop (`route`) this makes every hop the browser follows one the
@@ -1421,6 +1506,12 @@ impl ProxyContext {
             } else {
                 None
             };
+        // The in-page shim (WebRTC, Push, Location, DNT/GPC properties) goes into frames only.
+        let stealth_js = if rtype.is_frame() && kind == BodyKind::Html {
+            stealth::script(&st, stealth_mask)
+        } else {
+            None
+        };
         let policy_nonce = spol.as_ref().map(|_| crate::inject::new_nonce());
         // `Cache-Control: no-transform`: no body rewriting at all (header edits still apply).
         if self.respect_no_transform.load(Ordering::Relaxed)
@@ -1466,7 +1557,7 @@ impl ProxyContext {
                     s.transforms_for(&ResponseInfo {
                         generation: generation.as_ref(),
                         method: method.as_str(),
-                        source_url: source_url(&headers, &url, rtype),
+                        source_url: src_of(&orig_referer, &headers, &url, rtype),
                         url: &url,
                         request_type: rtype,
                         status,
@@ -1511,7 +1602,9 @@ impl ProxyContext {
         // Public id of a document that got userscripts (`Server-Timing: argus`).
         let mut server_timing: Option<String> = None;
         let body: ProxyBody = match (kind, codings) {
-            (BodyKind::Html, Ok(codings)) if (enabled || spol.is_some()) && body_allowed => {
+            (BodyKind::Html, Ok(codings))
+                if (enabled || spol.is_some() || stealth_js.is_some()) && body_allowed =>
+            {
                 let origin = csp::PageOrigin::new(
                     if scheme == "http" { "http" } else { "https" },
                     &url_host,
@@ -1554,6 +1647,10 @@ impl ProxyContext {
                     != 0
                 {
                     transforms.scripts.clear();
+                }
+                if let Some(js) = &stealth_js {
+                    // Runs first, before any page script (the scriptlet slot).
+                    cos.injected_script = format!("{js}\n{}", cos.injected_script);
                 }
                 // Extended CSS the engine rejected goes to the in-page procedural evaluator.
                 for (selector, style) in &transforms.procedural {
@@ -1620,7 +1717,7 @@ impl ProxyContext {
                                 .blocks_service_workers_in(&ix.load(), &host)
                         }))
                         || sw_guard);
-                let head = if enabled {
+                let head = if enabled || stealth_js.is_some() {
                     build_head(&PageSpec {
                         unregister_sw,
                         sw_guard: sw_guard && !blocks_scripts,

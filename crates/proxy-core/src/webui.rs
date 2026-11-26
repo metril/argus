@@ -197,6 +197,7 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
             tracing::info!("restored {n} extension session(s)");
         }
     }
+    let _ = state.stealth.set(ctx.stealth_handle());
     let _ = state.certs.set(ctx.certs().clone());
     if let Some(r) = ctx.roots() {
         let _ = state.roots.set(r.cell.clone());

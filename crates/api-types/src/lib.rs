@@ -262,6 +262,9 @@ pub struct ProxyConfigResponse {
     /// Hosts (exact or `*.suffix`) the guard leaves alone.
     #[serde(default)]
     pub guard_service_workers_exempt: Vec<String>,
+    /// Stealth Mode.
+    #[serde(default)]
+    pub stealth: StealthDto,
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
@@ -386,6 +389,63 @@ pub struct BypassSourceDto {
 pub struct BypassSourceUpdate {
     pub lists_base_url: Option<String>,
     pub lists_public_key: Option<String>,
+}
+
+/// Stealth Mode settings (AdGuard parity). Off as a whole until `enabled`; each option then
+/// follows its own switch. See the Settings page for what each one does and may break.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct StealthDto {
+    pub enabled: bool,
+    pub hide_search_queries: bool,
+    pub send_dnt: bool,
+    pub strip_tracking_params: bool,
+    pub hide_referer: bool,
+    pub referer_custom: String,
+    pub hide_user_agent: bool,
+    pub user_agent_custom: String,
+    pub mask_ip: bool,
+    pub mask_ip_address: String,
+    pub remove_x_client_data: bool,
+    pub third_party_cookies: bool,
+    pub third_party_cookie_minutes: u32,
+    pub first_party_cookies: bool,
+    pub first_party_cookie_minutes: u32,
+    pub block_etag: bool,
+    pub block_third_party_auth: bool,
+    pub block_webrtc: bool,
+    pub block_push: bool,
+    pub block_location: bool,
+    pub block_flash: bool,
+    pub block_java: bool,
+}
+
+/// Partial update of [`StealthDto`]; omitted fields keep their value. Applied live.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct StealthUpdate {
+    pub enabled: Option<bool>,
+    pub hide_search_queries: Option<bool>,
+    pub send_dnt: Option<bool>,
+    pub strip_tracking_params: Option<bool>,
+    pub hide_referer: Option<bool>,
+    pub referer_custom: Option<String>,
+    pub hide_user_agent: Option<bool>,
+    pub user_agent_custom: Option<String>,
+    pub mask_ip: Option<bool>,
+    pub mask_ip_address: Option<String>,
+    pub remove_x_client_data: Option<bool>,
+    pub third_party_cookies: Option<bool>,
+    pub third_party_cookie_minutes: Option<u32>,
+    pub first_party_cookies: Option<bool>,
+    pub first_party_cookie_minutes: Option<u32>,
+    pub block_etag: Option<bool>,
+    pub block_third_party_auth: Option<bool>,
+    pub block_webrtc: Option<bool>,
+    pub block_push: Option<bool>,
+    pub block_location: Option<bool>,
+    pub block_flash: Option<bool>,
+    pub block_java: Option<bool>,
 }
 
 /// A listener's effective switches (its own setting, else the global one).
@@ -517,6 +577,8 @@ pub struct UpdateProxyConfigRequest {
     pub guard_service_workers: Option<bool>,
     /// Replaces the guard's exempt host list; applied live.
     pub guard_service_workers_exempt: Option<Vec<String>>,
+    /// Stealth Mode settings; applied live.
+    pub stealth: Option<StealthUpdate>,
 }
 
 /// Connection statistics.
