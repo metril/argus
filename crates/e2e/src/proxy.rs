@@ -296,12 +296,14 @@ impl TestProxy {
             webui: WebUiSettings::default(),
             dns: Default::default(),
             bypass: Default::default(),
+            stealth: Default::default(),
         };
 
         tweak(&mut config);
 
         let engine = Arc::new(SharedEngine::new());
         engine.set_enabled(true);
+        engine.set_event_capacity(config.adblock.request_log_capacity);
         install_rules(&engine, rules);
 
         let ctx = Arc::new(
@@ -316,6 +318,9 @@ impl TestProxy {
             .map_err(|e| e.to_string())?,
         );
         ctx.set_respect_no_transform(config.adblock.respect_no_transform);
+        ctx.set_guard_service_workers(config.adblock.guard_service_workers);
+        ctx.set_guard_service_workers_exempt(config.adblock.guard_service_workers_exempt.clone());
+        ctx.set_stealth(config.stealth.clone());
         // A public-looking address (TEST-NET-3): the destination policy refuses loopback, and the
         // dial is redirected to the origin by the resolve override anyway.
         let fake = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));

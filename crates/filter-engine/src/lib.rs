@@ -22,11 +22,15 @@ pub mod redirect_resources;
 pub mod scriptlet_resources;
 pub mod shared;
 pub mod stats;
+pub mod ubo_redirects;
 
 pub use arc_swap::{self, ArcSwap};
-pub use bundled::{BUNDLED_AVAILABLE, BUNDLED_RESOURCES_COMMIT, BUNDLED_RESOURCES_JSON};
+pub use bundled::{
+    BUNDLED_AVAILABLE, BUNDLED_REDIRECTS_JSON, BUNDLED_RESOURCES_COMMIT, BUNDLED_RESOURCES_JSON,
+};
 pub use compile::{
-    compile_lists, compile_lists_with, route_domain_rules, Compiled, DomainRouted, ListCompileStats,
+    compile_lists, compile_lists_checked, compile_lists_with, route_domain_rules, Compiled,
+    DomainRouted, ListCompileStats,
 };
 pub use domainset::{DomainHit, DomainSet, DomainSetBuilder, Scheme};
 pub use error::{Error, Result};
@@ -39,7 +43,7 @@ pub use formats::{
 };
 pub use list::{catalogue, default_filter_lists, CatalogueEntry, FilterList};
 pub use matcher::{MatchResult, RedirectResource, RequestMatcher};
-pub use pipeline::{build_set, BuiltSet, ListInput, ListReport, ReportIssue};
+pub use pipeline::{build_set, build_set_checked, BuiltSet, ListInput, ListReport, ReportIssue};
 pub use redirect_resources::builtin_redirect_resources;
 pub use scriptlet_resources::{
     convert_ubo_scriptlets, convert_ubo_sources, ubo_scriptlets_to_json, ubo_sources_to_json,
@@ -50,3 +54,8 @@ pub use shared::{
     Cosmetics, Generation, IpFilter, Query, ResourceReport, SharedEngine,
 };
 pub use stats::{BlockingStats, FilterStats};
+pub use ubo_redirects::{
+    convert_adguard_redirects, convert_ubo_redirects, known_redirect_names, looks_like_scriptlet,
+    merge_resources_json, parse_redirect_map, redirect_file_names, ubo_redirects_to_json,
+    with_adguard_redirects, RedirectEntry, ADGUARD_REDIRECT_ALIASES,
+};

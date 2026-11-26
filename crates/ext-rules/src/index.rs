@@ -526,6 +526,23 @@ impl ExtIndex {
             .collect()
     }
 
+    /// Stealth options turned off for a request by `$stealth` exceptions (a [`crate::stealth`]
+    /// bit set; 0 when none match). Judged like any network rule: the request's URL and type, and
+    /// `$domain=` against the page that issued it.
+    pub fn stealth_off(&self, req: &RequestInfo<'_>) -> u32 {
+        if self.present & target::STEALTH == 0 || self.req.len == 0 {
+            return 0;
+        }
+        let Some(ctx) = Ctx::new(req) else { return 0 };
+        self.net_ids(&self.req, &ctx)
+            .into_iter()
+            .map(|i| &self.rules[i as usize])
+            .filter(|r| r.exception && r.target_mask() & target::STEALTH != 0)
+            .fold(0, |m, r| {
+                m | crate::stealth::parse_value(&r.value).unwrap_or(0)
+            })
+    }
+
     /// Extra network verdict for a request. Pure; allocation-free when no rule matches.
     pub fn request_decision(&self, req: &RequestInfo<'_>) -> RequestDecision {
         let mut d = RequestDecision::default();
@@ -539,9 +556,30 @@ impl ExtIndex {
         }
         let live = self.survivors(
             &ids,
-            target::BLOCK | target::URLTRANSFORM | target::COOKIE | target::REMOVEHEADER,
+            target::BLOCK
+                | target::URLTRANSFORM
+                | target::COOKIE
+                | target::REMOVEHEADER
+                | target::REMOVEPARAM,
         );
         let mut cur: Cow<'_, str> = Cow::Borrowed(req.url);
+        // `$removeparam` first (so `$urltransform` sees the cleaned URL); all rules in one pass.
+        let rp: Vec<(u32, &crate::RemoveParam)> = live
+            .iter()
+            .filter_map(|&id| match &self.rules[id as usize].action {
+                Action::RemoveParam(s) => Some((id, s)),
+                _ => None,
+            })
+            .collect();
+        if !rp.is_empty() {
+            let specs: Vec<&crate::RemoveParam> = rp.iter().map(|(_, s)| *s).collect();
+            if let Some(n) = crate::removeparam::apply(&cur, &specs) {
+                d.cleaned_url = Some((n.clone(), rp[0].0));
+                d.rewrite_url = Some((n.clone(), rp[0].0));
+                d.matched.extend(rp.iter().map(|(i, _)| *i));
+                cur = Cow::Owned(n);
+            }
+        }
         let mut cookies: Vec<&CookieSpec> = Vec::new();
         for id in live {
             match &self.rules[id as usize].action {
@@ -583,6 +621,44 @@ impl ExtIndex {
             }
         }
         d
+    }
+
+    /// What request-side `$removeparam` exceptions matching `req` exempt from the network
+    /// engine's own (plain-name) removal: `(all, names)`. `None` when no exception matches.
+    pub fn removeparam_exemption(&self, req: &RequestInfo<'_>) -> Option<(bool, Vec<String>)> {
+        if self.present & target::REMOVEPARAM == 0 {
+            return None;
+        }
+        let ctx = Ctx::new(req)?;
+        let mut out: Option<(bool, Vec<String>)> = None;
+        for id in self.net_ids(&self.req, &ctx) {
+            let r = &self.rules[id as usize];
+            if r.exception && r.target_mask() & target::REMOVEPARAM != 0 {
+                let o = out.get_or_insert((false, Vec::new()));
+                if r.value.is_empty() {
+                    o.0 = true;
+                } else {
+                    o.1.push(r.value.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Does a bare exception that switches off page-level behaviour (`@@||host^$document`,
+    /// `$elemhide`, `$jsinject`) match `req`?
+    pub fn page_exempt(&self, req: &RequestInfo<'_>) -> bool {
+        let mask = target::PCSS | target::JS;
+        if self.present & mask == 0 {
+            return false;
+        }
+        let Some(ctx) = Ctx::new(req) else {
+            return false;
+        };
+        self.net_ids(&self.req, &ctx).into_iter().any(|id| {
+            let r = &self.rules[id as usize];
+            r.exception && r.value.is_empty() && r.target_mask() & mask != 0
+        })
     }
 
     /// The body transforms among `ids` (rule ids from [`ResponsePlan::matched`]), grouped like
@@ -660,6 +736,12 @@ impl ExtIndex {
             && (mime_raw.eq_ignore_ascii_case("text/html")
                 || mime_raw.eq_ignore_ascii_case("application/xhtml+xml"));
         let mut ids = self.net_ids(&self.resp, &ctx);
+        plan.disabled = ids
+            .iter()
+            .map(|&i| &self.rules[i as usize])
+            .filter(|r| r.exception && r.value.is_empty())
+            .filter(|r| matches!(r.action, Action::Disable { .. }))
+            .fold(0, |m, r| m | r.target_mask());
         if is_html {
             ids.extend(self.dom_ids(&ctx.host));
         }

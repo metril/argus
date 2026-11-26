@@ -164,13 +164,15 @@ pub fn try_build_engine(
 
 fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Arc<AdblockEngine> {
     let mut all: Vec<Resource> = user_resources.to_vec();
-    for b in builtin_redirect_resources() {
-        let taken = all
-            .iter()
-            .any(|r| r.name == b.name || r.aliases.contains(&b.name));
-        if !taken {
-            all.push(b);
+    for mut b in builtin_redirect_resources() {
+        // The library wins by name and alias; a built-in only loses the aliases it clashes
+        // with (a name clash would make the engine reject the whole resource).
+        let taken = |id: &String| all.iter().any(|r| r.name == *id || r.aliases.contains(id));
+        if taken(&b.name) {
+            continue;
         }
+        b.aliases.retain(|a| !taken(a));
+        all.push(b);
     }
     engine.use_resources(all);
     Arc::new(engine)
@@ -407,6 +409,11 @@ impl SharedEngine {
         self.block_log.set_keep_query(keep);
     }
 
+    /// Resize the request log's rings live (newest entries kept when shrinking).
+    pub fn set_event_capacity(&self, capacity: usize) {
+        self.block_log.set_capacity(capacity);
+    }
+
     /// Capacity of the recent-blocked ring.
     pub fn recent_blocked_capacity(&self) -> usize {
         self.block_log.capacity()
@@ -563,6 +570,23 @@ impl SharedEngine {
     /// nothing. One engine lookup; call it for documents only.
     pub fn site_off(&self, page_url: &str) -> bool {
         self.site_off_with(&Self::site_probe(page_url))
+    }
+
+    /// Does a `@@...$document` exception (the option itself; a plain `@@||host^` does not count)
+    /// cover the document at `url`? Also returns the generation judged, so a caller can consult
+    /// its ext index without a race.
+    pub fn document_excepted(&self, url: &str) -> (bool, Arc<Generation>) {
+        let guard = self.engine.load();
+        let hit = self.enabled.load(Ordering::Relaxed)
+            && adblock::request::Request::new(url, url, "document").is_ok_and(|r| {
+                guard
+                    .engine
+                    .check_network_request_subset(&r, true, true)
+                    .exception
+                    .as_deref()
+                    .is_some_and(rule_has_document_option)
+            });
+        (hit, arc_swap::Guard::into_inner(guard))
     }
 
     /// The probe [`Self::site_off_with`] takes; one probe serves several engines.
@@ -968,6 +992,15 @@ pub fn compile_engine(list_contents: &[String]) -> Vec<u8> {
     compile_lists(&refs).blob
 }
 
+/// Does the exception rule carry the `$document` / `$doc` option?
+pub fn rule_has_document_option(rule: &str) -> bool {
+    let Some((_, opts)) = rule.rsplit_once('$') else {
+        return false;
+    };
+    opts.split(',')
+        .any(|o| matches!(o.trim(), "document" | "doc"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1238,6 +1271,25 @@ mod tests {
         let res = r.redirect_resource().expect("redirect resource");
         assert_eq!(res.mime, "image/gif");
         assert!(res.body.starts_with(b"GIF8"));
+    }
+
+    #[test]
+    fn builtin_keeps_its_name_when_the_library_takes_its_aliases() {
+        let s = SharedEngine::new();
+        let lib = serde_json::json!([{
+            "name": "2x2.png", "aliases": ["32x32.png"], "kind": {"mime": "image/png"},
+            "content": "AAAA"
+        }]);
+        s.set_resources_from_json(&lib.to_string()).unwrap();
+        s.install(compile_engine(&[
+            "||ads.test/p.png$redirect=1x1.png\n".to_string()
+        ]));
+        let r = s.check("https://ads.test/p.png", "https://site.test/", "image");
+        let res = r
+            .redirect_resource()
+            .expect("built-in 1x1.png still served");
+        assert_eq!(res.mime, "image/png");
+        assert_eq!(&res.body[1..4], b"PNG");
     }
 
     #[test]

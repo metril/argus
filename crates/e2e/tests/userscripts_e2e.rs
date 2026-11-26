@@ -8,6 +8,16 @@ use e2e::{e2e_test, EntryMode, HttpVersion, MockResponse, TestClient, TestEnv};
 use serde_json::{json, Value};
 use userscript_engine::token::{self, TokenClaims};
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 const PAGE: &str = "<!doctype html><html><head><title>t</title></head><body>hi</body></html>";
 
 fn script(name: &str, extra: &str) -> String {
@@ -1142,6 +1152,9 @@ e2e_test!(
         };
         // Default: a privileged script applies on app.test: refused, and the page unregisters.
         assert_eq!(sw_fetch("/sw.js").await, 403);
+        let ev = logged_with(&env, "/sw.js", "service worker refused");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].status, Some(403));
         assert!(load_page(&env, &c, "app.test", "/p")
             .await
             .contains("\"sw\":1"));

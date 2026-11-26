@@ -46,8 +46,9 @@ pub fn passthrough_body(resp: crate::upstream::UpstreamResponse) -> ProxyBody {
     BodyExt::boxed_unsync(StreamBody::new(stream))
 }
 
-/// Procedural pseudo-classes that aren't valid CSS and must be evaluated in JS. Note `:has()` is
-/// deliberately excluded: modern browsers support it natively, so it stays in the stylesheet.
+/// Procedural pseudo-classes that aren't valid CSS and must be evaluated in JS. Note `:has()` and
+/// `:not()` are deliberately excluded: a plain one stays in the stylesheet (browsers support it
+/// natively), and one that nests a procedural operator contains that operator's marker anyway.
 const PROC_MARKERS: &[&str] = &[
     ":has-text(",
     ":matches-css(",
@@ -60,11 +61,98 @@ const PROC_MARKERS: &[&str] = &[
     ":xpath(",
     ":-abp-contains(",
     ":contains(",
+    ":-abp-has(",
+    ":-abp-properties(",
+    ":properties(",
+    ":matches-prop(",
+    ":matches-property(",
+    ":matches-media(",
+    ":nth-ancestor(",
+    ":if(",
+    ":if-not(",
+    ":shadow(",
+    ":spath(",
+    ":others(",
+    ":watch-attr(",
+    ":remove(",
+    ":style(",
+    ":remove-attr(",
+    ":remove-class(",
 ];
 
 /// Whether a selector contains a procedural pseudo-class (needs JS, not CSS).
 fn is_procedural(sel: &str) -> bool {
     PROC_MARKERS.iter().any(|m| sel.contains(m))
+}
+
+/// Cheap sanity check of a plain selector before it is emitted as a CSS rule: brackets and
+/// parentheses balanced (quotes and escapes honoured) and no `{`, `}` or `;` outside a string, so it
+/// cannot end its own rule early. A selector the browser still rejects voids only its own rule.
+fn selector_shape_ok(sel: &str) -> bool {
+    let (mut paren, mut bracket) = (0i32, 0i32);
+    let mut quote: Option<char> = None;
+    let mut chars = sel.chars();
+    if sel.trim().is_empty() || sel.contains("/*") || sel.contains("*/") {
+        return false;
+    }
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if chars.next().is_none() {
+                return false; // a trailing escape would eat the rule's `{`
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '(' => paren += 1,
+            ')' => paren -= 1,
+            '[' => bracket += 1,
+            ']' => bracket -= 1,
+            '{' | '}' | ';' => return false,
+            _ => {}
+        }
+        if paren < 0 || bracket < 0 {
+            return false;
+        }
+    }
+    quote.is_none() && paren == 0 && bracket == 0
+}
+
+/// Every `:style(...)` argument embedded in selector text passes the style safety policy.
+fn embedded_styles_safe(sel: &str) -> bool {
+    let mut rest = sel;
+    while let Some(i) = rest.find(":style(") {
+        let body = &rest[i + ":style(".len()..];
+        let mut depth = 1;
+        let mut end = body.len();
+        let mut esc = false;
+        for (k, c) in body.char_indices() {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end = k;
+                    break;
+                }
+            }
+        }
+        if !ext_rules::is_safe_style(&body[..end]) {
+            return false;
+        }
+        rest = &body[end..];
+    }
+    true
 }
 
 /// CSS text restricted to ASCII: anything else becomes a CSS escape (`\XX `), `<` included so the
@@ -115,6 +203,9 @@ pub fn unsafe_styles_dropped() -> u64 {
 pub struct PageSpec<'a> {
     /// Unregister the page's service workers at document start (see [`crate::gm`]).
     pub unregister_sw: bool,
+    /// The service-worker guard applies to this document: the boot script carries `sw` even
+    /// when nothing else needs it.
+    pub sw_guard: bool,
     pub cosmetics: &'a Cosmetics,
     pub internal: &'a Internal,
     /// Host name the beacon token is bound to.
@@ -171,24 +262,57 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             head.html,
             "<style id=\"__adblock_cosmetic\" nonce=\"{nonce}\">"
         );
+        let valid: Vec<&str> = plain
+            .iter()
+            .copied()
+            .filter(|s| selector_shape_ok(s))
+            .collect();
         let mut css = String::new();
-        css_ascii(&plain.join(","), &mut css);
+        // One rule per selector: the browser drops a whole rule when any selector in its list
+        // fails to parse. (Measured in Chrome: no slower than batches up to 10k selectors.)
+        for sel in valid {
+            css_ascii(sel, &mut css);
+            css.push_str("{display:none!important}");
+        }
         head.html.push_str(&css);
-        head.html.push_str("{display:none!important}</style>");
+        head.html.push_str("</style>");
     }
 
     if spec.script_ok {
         let mut proc_items: Vec<serde_json::Value> = Vec::new();
-        for sel in cos.hide_selectors.iter().filter(|s| is_procedural(s)) {
+        for sel in cos
+            .hide_selectors
+            .iter()
+            .filter(|s| is_procedural(s) && embedded_styles_safe(s))
+        {
             proc_items.push(serde_json::json!({ "s": sel, "a": "hide" }));
         }
         for raw in &cos.procedural_actions {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                let sel = v["selector"]
-                    .get(0)
-                    .and_then(|s| s["arg"].as_str())
-                    .unwrap_or("");
-                if sel.is_empty() {
+                // The whole operator array goes to the in-page engine, which applies the
+                // operators in order, with the action last.
+                let ops: Vec<serde_json::Value> = v["selector"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter(|o| o["type"].is_string())
+                            .map(|o| {
+                                serde_json::json!({
+                                    "type": o["type"],
+                                    "arg": o.get("arg").cloned().unwrap_or_default(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if ops.is_empty()
+                    || ops
+                        .iter()
+                        .any(|o| o["arg"].as_str().is_some_and(|a| !embedded_styles_safe(a)))
+                {
+                    if !ops.is_empty() {
+                        note_unsafe_style();
+                    }
                     continue;
                 }
                 let act = v["action"]["type"].as_str().unwrap_or("hide");
@@ -198,7 +322,7 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                     note_unsafe_style();
                     continue;
                 }
-                proc_items.push(serde_json::json!({ "s": sel, "a": act, "g": arg }));
+                proc_items.push(serde_json::json!({ "o": ops, "a": act, "g": arg }));
             }
         }
         let observer = spec.observer_ok && !cos.generichide;
@@ -215,7 +339,11 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
-        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() || spec.panel.is_some()
+        if observer
+            || !proc_items.is_empty()
+            || !spec.ext_script.is_empty()
+            || spec.panel.is_some()
+            || spec.sw_guard
         {
             let mut cfg = serde_json::json!({
                 "p": proc_items,
@@ -343,6 +471,7 @@ mod tests {
     fn spec<'a>(cos: &'a Cosmetics, internal: &'a Internal) -> PageSpec<'a> {
         PageSpec {
             unregister_sw: false,
+            sw_guard: false,
             cosmetics: cos,
             internal,
             host: "example.test",
@@ -365,7 +494,9 @@ mod tests {
             ..Default::default()
         };
         let h = build_head(&spec(&cos, &i));
-        assert!(h.html.contains(".ad,#banner{display:none!important}"));
+        assert!(h
+            .html
+            .contains(".ad{display:none!important}#banner{display:none!important}"));
         assert!(h
             .html
             .contains("<style id=\"__adblock_cosmetic\" nonce=\"NONCE\">"));
@@ -429,8 +560,209 @@ mod tests {
             ..Default::default()
         };
         let h = build_head(&spec(&cos, &i)).html;
-        assert!(h.contains(r#""s":".ad:has-text(Ad)""#));
+        assert!(
+            h.contains(r#""o":[{"arg":".ad:has-text(Ad)","type":"css-selector"}]"#),
+            "{h}"
+        );
         assert!(h.contains(r#""a":"remove""#));
+    }
+
+    #[test]
+    fn every_operator_reaches_the_engine_and_the_base_css_is_not_hidden() {
+        let i = Internal::new();
+        let act = |ty: &str, arg: &str| {
+            serde_json::json!({"selector":[
+                {"type":"css-selector","arg":".ad"},
+                {"type":"has-text","arg":"Sponsored"},
+                {"type":"upward","arg":"2"}],
+                "action":{"type":ty,"arg":arg}})
+            .to_string()
+        };
+        for (ty, arg) in [("remove", ""), ("style", "color: red")] {
+            let cos = Cosmetics {
+                procedural_actions: vec![act(ty, arg)],
+                generichide: true,
+                ..Default::default()
+            };
+            let h = build_head(&spec(&cos, &i)).html;
+            // All three operators and the action are in the config, in order...
+            let cfg = h
+                .split("id=\"__ab_cfg\">")
+                .nth(1)
+                .and_then(|r| r.split("</script>").next())
+                .expect("cfg block");
+            let v: serde_json::Value = serde_json::from_str(cfg).unwrap();
+            let it = &v["p"][0];
+            let types: Vec<&str> = it["o"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(types, ["css-selector", "has-text", "upward"], "{h}");
+            assert_eq!(it["a"], ty);
+            // ...and the base selector is never emitted as a stylesheet hide.
+            assert!(
+                !h.contains("<style"),
+                "base CSS must not hide every .ad: {h}"
+            );
+            assert!(!h.contains("display:none"), "{h}");
+        }
+    }
+
+    #[test]
+    fn nested_and_extended_operators_are_routed_to_the_engine_not_to_css() {
+        let i = Internal::new();
+        let sels = [
+            "div:has(> a:has-text(X))",
+            ".a:not(:has-text(Y))",
+            ".b:matches-prop(x=1)",
+            ".c:others()",
+            ".d:watch-attr(class)",
+            ".e:matches-media(print)",
+            ".f:nth-ancestor(2)",
+            ".g:remove()",
+            ".h:style(color: red)",
+            ".k:remove-attr(x)",
+            ".l:shadow(.x)",
+            ".m:spath(> b)",
+            ".n:-abp-has(.z)",
+        ];
+        let cos = Cosmetics {
+            hide_selectors: sels
+                .iter()
+                .map(|s| s.to_string())
+                .chain([".plain".to_string(), "a:has(.ok)".to_string()])
+                .collect(),
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        let style = h.split("</style>").next().unwrap();
+        assert_eq!(
+            style.matches("{display:none!important}").count(),
+            2,
+            "only the two plain selectors are CSS: {style}"
+        );
+        assert!(style.contains(".plain{") && style.contains("a:has(.ok){"));
+        assert_eq!(h.matches("\"a\":\"hide\"").count(), sels.len(), "{h}");
+    }
+
+    #[test]
+    fn one_bad_selector_voids_only_its_own_rule() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: vec![
+                ".a".into(),
+                "div[unclosed".into(),
+                ".b{color:red}".into(),
+                ".c(".into(),
+                "".into(),
+                "[title=\"a]b\"]".into(),
+                ".d".into(),
+            ],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        // one rule per selector, so a selector the browser rejects cannot take the others down
+        assert!(h.contains(".a{display:none!important}"), "{h}");
+        assert!(h.contains(".d{display:none!important}"), "{h}");
+        assert!(h.contains("[title=\"a]b\"]{display:none!important}"), "{h}");
+        assert!(
+            !h.contains("unclosed") && !h.contains("color:red") && !h.contains(".c("),
+            "{h}"
+        );
+        assert!(!h.contains(".a,"), "selectors must not share a rule: {h}");
+    }
+
+    #[test]
+    fn hostile_selector_shapes_are_dropped() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: vec![
+                ".ok".into(),
+                ".a/*".into(),
+                "*/.b".into(),
+                ".c\\".into(),
+                ".d".into(),
+            ],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(h.contains(".ok{") && h.contains(".d{"), "{h}");
+        assert!(
+            !h.contains("/*") && !h.contains("*/") && !h.contains(".c"),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn embedded_unsafe_styles_never_reach_the_page() {
+        let i = Internal::new();
+        let act = |sel: &str| {
+            serde_json::json!({"selector":[{"type":"css-selector","arg":sel}],"action":{"type":"hide"}})
+                .to_string()
+        };
+        let cos = Cosmetics {
+            hide_selectors: vec![
+                "a:style(background: url(http://evil.test/1))".into(),
+                "b:style(color: red; /*)".into(),
+                "u:style(color: red)".into(),
+            ],
+            procedural_actions: vec![
+                act("i:style(background:image-set('http://evil.test/2' 1x))"),
+                act("s:has-text(x):style(@import 'z')"),
+                act("q:style(margin: 0)"),
+            ],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(
+            !h.contains("evil.test") && !h.contains("/*") && !h.contains("@import"),
+            "{h}"
+        );
+        assert!(
+            h.contains("u:style(color: red)") && h.contains("q:style(margin: 0)"),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn one_rule_per_selector_stays_bounded_at_50k_selectors() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: (0..50_000)
+                .map(|n| format!(".ad-c{n}-x .item_{}>a[href*=\"t{n}\"]", n % 97))
+                .collect(),
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert_eq!(h.matches("{display:none!important}").count(), 50_000);
+        assert!(h.len() < 4 << 20, "{}", h.len());
+    }
+
+    #[test]
+    fn engine_and_config_run_synchronously_with_the_nonce_before_page_scripts() {
+        let i = Internal::new();
+        let cos = Cosmetics {
+            hide_selectors: vec![".x:has-text(Ad)".into()],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        // a classic, non-async, nonce-carrying external script: it runs when parsed, before any
+        // later page script, and a strict `script-src 'nonce-..'` admits it
+        let tag = h.split("<script src=").nth(1).expect("boot tag");
+        assert!(tag.contains("nonce=\"NONCE\""), "{h}");
+        assert!(
+            !tag.contains("async") && !tag.contains("defer") && !tag.contains("type=\"module\"")
+        );
+        assert!(h.find("__ab_cfg").unwrap() < h.find("<script src=").unwrap());
+        assert!(crate::internal::boot_script().contains("function argusProceduralEngine"));
     }
 
     #[test]

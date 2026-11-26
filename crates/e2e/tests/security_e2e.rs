@@ -11,6 +11,16 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 const DOC_HEADERS: [(&str, &str); 2] = [("sec-fetch-dest", "document"), ("accept", "text/html")];
 
 /// One raw HTTP/1.1 exchange with the proxy for `host_port`, shaped for the entry mode (absolute
@@ -60,6 +70,9 @@ e2e_test!(
             );
             assert!(!out.contains("internal"), "{host}: {out}");
         }
+        let ev = logged_with(&env, "/secret", "destination policy");
+        assert_eq!(ev.len(), 5, "one event per refused request: {ev:?}");
+        assert!(ev.iter().all(|e| e.status == Some(403)));
         assert!(
             env.origin.requests().is_empty(),
             "nothing reached the origin"

@@ -72,6 +72,18 @@ impl web_api::ExtBridge for crate::ext_bridge::ExtHub {
         crate::ext_bridge::ExtHub::open(self, ident)
     }
 
+    fn resume(
+        &self,
+        ident: &api_types::ExtIdent,
+        sid: &str,
+    ) -> Option<(u64, String, tokio::sync::mpsc::Receiver<api_types::ExtOut>)> {
+        crate::ext_bridge::ExtHub::resume(self, ident, sid)
+    }
+
+    fn detach(&self, session: u64) {
+        crate::ext_bridge::ExtHub::detach(self, session)
+    }
+
     async fn on_text(&self, session: u64, text: &str) {
         crate::ext_bridge::ExtHub::on_text(self, session, text).await
     }
@@ -176,6 +188,16 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
             }),
         );
     }
+    // Sessions survive a restart (hashes only): the browser's sid keeps working at once.
+    if let Some(dir) = ctx.bypass().data_dir() {
+        hub.set_persist_path(dir.join("ext-sessions.json"));
+        let st = state.clone();
+        let n = hub.restore(&move |id| st.ext_token_ok(id));
+        if n > 0 {
+            tracing::info!("restored {n} extension session(s)");
+        }
+    }
+    let _ = state.stealth.set(ctx.stealth_handle());
     let _ = state.certs.set(ctx.certs().clone());
     if let Some(r) = ctx.roots() {
         let _ = state.roots.set(r.cell.clone());

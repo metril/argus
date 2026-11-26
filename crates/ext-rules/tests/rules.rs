@@ -803,3 +803,129 @@ fn untrusted_cookie_rules_cannot_weaken_a_cookie() {
         "{out:?}"
     );
 }
+
+// ---- page-scoped cosmetic exceptions ------------------------------------------------------------
+
+#[test]
+fn page_scoped_exceptions_report_what_they_switch_off() {
+    use ext_rules::target::{JS, PCSS, SCRIPTLET, SNIPPET, SPECIFICHIDE};
+    let r = get("https://site.example/page", ResourceType::Document);
+    let disabled = |rule: &str| plan(&idx(&[rule]), &r, "text/html", &[]).disabled;
+    let d = disabled("@@||site.example^$elemhide");
+    assert!(
+        d & PCSS != 0 && d & SPECIFICHIDE != 0 && d & JS == 0,
+        "{d:#b}"
+    );
+    let d = disabled("@@||site.example^$specifichide");
+    assert!(d & SPECIFICHIDE != 0 && d & PCSS == 0, "{d:#b}");
+    let d = disabled("@@||site.example^$jsinject");
+    assert!(d & (JS | SCRIPTLET | SNIPPET) == (JS | SCRIPTLET | SNIPPET) && d & PCSS == 0);
+    assert_eq!(
+        disabled("@@||site.example^$document") & (PCSS | JS),
+        PCSS | JS
+    );
+    // another site, and a rule scoped to a cosmetic selector, switch nothing off
+    assert_eq!(disabled("@@||other.example^$elemhide"), 0);
+    assert_eq!(disabled("site.example#@#.ad"), 0);
+}
+
+#[test]
+fn removeparam_forms_and_exceptions() {
+    let url = "https://s.example/p?a=1&utm_x=2&keep=3&utm_y=4#h";
+    let clean = |rules: &[&str], rt| {
+        idx(rules)
+            .request_decision(&get(url, rt))
+            .cleaned_url
+            .map(|x| x.0)
+    };
+    for rt in [ResourceType::Document, ResourceType::Image] {
+        assert_eq!(
+            clean(&["||s.example^$removeparam=/^utm_/"], rt).as_deref(),
+            Some("https://s.example/p?a=1&keep=3#h")
+        );
+        assert_eq!(
+            clean(&["||s.example^$removeparam=~keep"], rt).as_deref(),
+            Some("https://s.example/p?keep=3#h")
+        );
+        assert_eq!(
+            clean(&["||s.example^$removeparam"], rt).as_deref(),
+            Some("https://s.example/p#h")
+        );
+    }
+    // exceptions: by value, bare, and `$important` beats a plain exception
+    let r = "||s.example^$removeparam=/^utm_/";
+    assert_eq!(
+        clean(
+            &[r, "@@||s.example^$removeparam=/^utm_/"],
+            ResourceType::Document
+        ),
+        None
+    );
+    assert_eq!(
+        clean(&[r, "@@||s.example^$removeparam"], ResourceType::Document),
+        None
+    );
+    assert!(clean(
+        &[r, "@@||s.example^$removeparam=other"],
+        ResourceType::Document
+    )
+    .is_some());
+    // no query / nothing matched: no decision at all
+    let i = idx(&[r]);
+    assert!(i
+        .request_decision(&get("https://s.example/p", ResourceType::Document))
+        .is_noop());
+    // the cleaned URL is a fixpoint (no redirect loop)
+    let d = i.request_decision(&get(url, ResourceType::Document));
+    let c = d.cleaned_url.unwrap().0;
+    assert!(i
+        .request_decision(&get(&c, ResourceType::Document))
+        .is_noop());
+    // $urltransform sees the cleaned URL; cleaned_url stays removeparam-only
+    let i = idx(&[r, "||s.example^$urltransform=/keep=3/keep=4/"]);
+    let d = i.request_decision(&get(url, ResourceType::Document));
+    assert_eq!(d.cleaned_url.unwrap().0, "https://s.example/p?a=1&keep=3#h");
+    assert_eq!(d.rewrite_url.unwrap().0, "https://s.example/p?a=1&keep=4#h");
+}
+
+#[test]
+fn removeparam_exemption_reports_exceptions() {
+    let i = idx(&[
+        "@@||s.example^$removeparam=utm",
+        "@@||t.example^$removeparam",
+    ]);
+    let e = i
+        .removeparam_exemption(&get("https://s.example/p?utm=1", ResourceType::Document))
+        .unwrap();
+    assert_eq!(e, (false, vec!["utm".to_string()]));
+    assert!(
+        i.removeparam_exemption(&get("https://t.example/p?utm=1", ResourceType::Image))
+            .unwrap()
+            .0
+    );
+    assert!(i
+        .removeparam_exemption(&get("https://u.example/p", ResourceType::Image))
+        .is_none());
+}
+
+#[test]
+fn page_exempt_by_document_elemhide_jsinject() {
+    for r in [
+        "@@||d.example^$document",
+        "@@||d.example^$elemhide",
+        "@@||d.example^$jsinject",
+    ] {
+        let i = idx(&[r]);
+        let q = RequestInfo::new("https://d.example/", "GET", ResourceType::Document);
+        assert!(i.page_exempt(&q), "{r}");
+        let q = RequestInfo::new("https://o.example/", "GET", ResourceType::Document);
+        assert!(!i.page_exempt(&q), "{r}");
+    }
+    assert!(
+        !idx(&["@@||d.example^$script"]).page_exempt(&RequestInfo::new(
+            "https://d.example/",
+            "GET",
+            ResourceType::Document
+        ))
+    );
+}

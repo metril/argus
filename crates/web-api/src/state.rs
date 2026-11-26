@@ -143,6 +143,19 @@ pub trait ExtBridge: Send + Sync {
     /// Register a session. Returns its id, the secret `sid` the extension puts in the
     /// `ext:<sid>` proxy credentials and the queue of frames to send.
     fn open(&self, ident: ExtIdent) -> (u64, String, tokio::sync::mpsc::Receiver<ExtOut>);
+    /// Reattach a channel to the live or grace session `sid` of the same token, keeping its
+    /// `sid`. `None`: unknown, expired, or another token's.
+    fn resume(
+        &self,
+        _ident: &ExtIdent,
+        _sid: &str,
+    ) -> Option<(u64, String, tokio::sync::mpsc::Receiver<ExtOut>)> {
+        None
+    }
+    /// The channel of `session` dropped: keep the session for a grace period (default: close).
+    fn detach(&self, session: u64) {
+        self.close(session);
+    }
     async fn on_text(&self, session: u64, text: &str);
     async fn on_binary(&self, session: u64, data: Vec<u8>);
     fn close(&self, session: u64);
@@ -295,6 +308,9 @@ pub struct AppState {
 
     /// Upstream certificates the proxy has seen (installed by the proxy; empty otherwise).
     pub certs: OnceLock<Arc<common::certstore::CertStore>>,
+
+    /// The proxy's live Stealth Mode settings; saved changes are swapped in here.
+    pub stealth: OnceLock<Arc<arc_swap::ArcSwap<common::config::StealthSettings>>>,
 
     /// Status of the trusted root set (installed by the proxy; absent otherwise).
     pub roots: OnceLock<Arc<common::certstore::RootsStatusCell>>,
@@ -889,6 +905,7 @@ pub async fn build_state_full(
         started_at: Instant::now(),
         bypass: OnceLock::new(),
         certs: OnceLock::new(),
+        stealth: OnceLock::new(),
         roots: OnceLock::new(),
         chain_probe: OnceLock::new(),
         argus: OnceLock::new(),

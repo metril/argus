@@ -62,7 +62,43 @@ pub(crate) fn normalize_resources_url(url: &str) -> String {
     url.to_string()
 }
 
+/// `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<path>` -> its four parts.
+fn split_raw_github(url: &str) -> Option<(&str, &str, &str, &str)> {
+    let rest = url.strip_prefix("https://raw.githubusercontent.com/")?;
+    let mut p = rest.splitn(4, '/');
+    Some((p.next()?, p.next()?, p.next()?, p.next()?))
+}
+
+fn is_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl ListService {
+    /// Pin a raw GitHub base URL (branch or `HEAD`) to the commit it points at now, so the
+    /// scriptlets, the redirect map and the redirect files all come from one commit. Other URLs
+    /// (and ones already naming a commit) are returned unchanged.
+    async fn pin_commit(&self, url: &str) -> Result<String, String> {
+        let Some((owner, repo, gitref, path)) = split_raw_github(url) else {
+            return Ok(url.to_string());
+        };
+        if is_commit_sha(gitref) {
+            return Ok(url.to_string());
+        }
+        let api = format!("https://api.github.com/repos/{owner}/{repo}/commits/{gitref}");
+        let sha = self
+            .get_text_accept(&api, "application/vnd.github.sha")
+            .await
+            .map_err(|e| format!("cannot resolve `{gitref}` to a commit: {e}"))?;
+        let sha = sha.trim();
+        if !is_commit_sha(sha) {
+            return Err(format!("`{gitref}` resolved to an invalid commit id"));
+        }
+        info!("Resource source pinned to {owner}/{repo}@{}", &sha[..8]);
+        Ok(format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}"
+        ))
+    }
+
     /// Load scriptlet resources, retrying with exponential backoff until they load (or forever
     /// failing quietly in the background). No-op if the URL is empty. A valid cached
     /// `<data_dir>/resources.json` short-circuits the network.
@@ -100,14 +136,16 @@ impl ListService {
             if *fetched {
                 return Ok(None);
             }
-            engine
-                .set_resources_from_json(filter_engine::BUNDLED_RESOURCES_JSON)
-                .map(Some)
+            let json = filter_engine::merge_resources_json(
+                filter_engine::BUNDLED_RESOURCES_JSON,
+                filter_engine::BUNDLED_REDIRECTS_JSON,
+            )?;
+            engine.set_resources_from_json(&json).map(Some)
         })
         .await;
         match res {
             Ok(Ok(Some(n))) => info!(
-                "Loaded {n} bundled scriptlet resources (uBlock Origin {})",
+                "Loaded {n} bundled scriptlet and redirect resources (uBlock Origin {})",
                 &filter_engine::BUNDLED_RESOURCES_COMMIT[..8]
             ),
             Ok(Ok(None)) => {}
@@ -136,10 +174,16 @@ impl ListService {
         let cache = self.cfg.data_dir.join("resources.json");
         let mut cached = false;
         if let Ok(json) = tokio::fs::read_to_string(&cache).await {
+            // A cache written before redirect resources were fetched has none: fill the gap
+            // from the bundled snapshot now and refresh from the source below.
+            let has_redirects = json.contains("googlesyndication_adsbygoogle.js");
+            let json =
+                filter_engine::merge_resources_json(&json, filter_engine::BUNDLED_REDIRECTS_JSON)
+                    .unwrap_or(json);
             match self.set_resources(json).await {
                 Ok(n) => {
                     info!("Loaded {n} scriptlet resources from cache");
-                    if self.engine.resource_report().dropped.is_empty() {
+                    if has_redirects && self.engine.resource_report().dropped.is_empty() {
                         return Ok(());
                     }
                     // The cache (e.g. written by an older converter) held resources that fail
@@ -161,6 +205,10 @@ impl ListService {
             }
             Err(e) => return Err(e),
         };
+        // Gaps (a redirect fetch that failed, a custom `.json`) come from the bundled snapshot.
+        let json =
+            filter_engine::merge_resources_json(&json, filter_engine::BUNDLED_REDIRECTS_JSON)
+                .unwrap_or(json);
         let n = self
             .set_resources(json.clone())
             .await
@@ -182,6 +230,7 @@ impl ListService {
         if url.ends_with(".json") {
             return self.get_text(&url).await;
         }
+        let url = self.pin_commit(&url).await?;
         let sources: Vec<String> = if url.ends_with(".js") {
             vec![self.get_text(&url).await?]
         } else {
@@ -224,6 +273,54 @@ impl ListService {
         for d in &dropped {
             warn!("Scriptlet `{}` not converted: {}", d.name, d.reason);
         }
+        // The `$redirect` resources live next to the scriptlets (`src/js/redirect-resources.js`
+        // and `src/web_accessible_resources/`); only a raw-file base URL can address them.
+        if !url.ends_with(".js") {
+            if let Some(js_dir) = url.trim_end_matches('/').strip_suffix("/resources") {
+                match self.fetch_redirects_json(js_dir).await {
+                    Ok(redirects) => {
+                        return filter_engine::merge_resources_json(&json, &redirects)
+                            .map_err(|e| e.to_string())
+                    }
+                    Err(e) => warn!("Redirect resources not fetched ({e}); using the bundled set"),
+                }
+            }
+        }
+        Ok(json)
+    }
+
+    /// Fetch uBO's redirect map and every file it names, and convert them. `js_dir` is the raw
+    /// URL of `src/js`.
+    async fn fetch_redirects_json(&self, js_dir: &str) -> Result<String, String> {
+        let map = self
+            .get_text(format!("{js_dir}/redirect-resources.js"))
+            .await?;
+        let names = filter_engine::redirect_file_names(&map)?;
+        let wa = js_dir
+            .strip_suffix("/js")
+            .map(|src| format!("{src}/web_accessible_resources"))
+            .ok_or("unexpected resources URL layout")?;
+        let fetches: Vec<_> = names
+            .iter()
+            .map(|n| self.get_bytes(format!("{wa}/{n}")))
+            .collect();
+        let mut files = std::collections::HashMap::new();
+        for (name, res) in names
+            .iter()
+            .zip(futures_util::future::join_all(fetches).await)
+        {
+            // All or nothing: a half-fetched set must never replace a complete one.
+            files.insert(name.clone(), res.map_err(|e| format!("{name}: {e}"))?);
+        }
+        let (json, dropped) = filter_engine::ubo_redirects_to_json(&map, &files)?;
+        if let Some(d) = dropped.first() {
+            return Err(format!(
+                "redirect resource `{}` is invalid: {} ({} invalid in total)",
+                d.name,
+                d.reason,
+                dropped.len()
+            ));
+        }
         Ok(json)
     }
 }
@@ -244,6 +341,18 @@ mod tests {
             normalize_resources_url("http://127.0.0.1:1/x.json"),
             "http://127.0.0.1:1/x.json"
         );
+    }
+
+    #[test]
+    fn github_raw_urls_split_and_shas_are_recognised() {
+        let u = "https://raw.githubusercontent.com/gorhill/uBlock/master/src/js/resources";
+        assert_eq!(
+            split_raw_github(u),
+            Some(("gorhill", "uBlock", "master", "src/js/resources"))
+        );
+        assert_eq!(split_raw_github("http://127.0.0.1:1/res"), None);
+        assert!(is_commit_sha("5934db2a0437a50182c4a8f3da2e0941cf806253"));
+        assert!(!is_commit_sha("master") && !is_commit_sha("HEAD"));
     }
 
     #[test]

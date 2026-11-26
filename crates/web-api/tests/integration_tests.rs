@@ -454,6 +454,71 @@ async fn config_get_update_with_etag() {
     assert_eq!(again.status_code(), StatusCode::PRECONDITION_FAILED);
 }
 
+/// A config PUT resizes the request log at once (newest kept), rejects out-of-range sizes and
+/// persists the value.
+#[tokio::test]
+async fn request_log_capacity_changes_live_via_config_put() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let e = &ctx.state.shared_engine;
+    assert_eq!(e.recent_blocked_capacity(), 1000);
+    assert_eq!(
+        admin.get("/api/v1/config").await.json::<Value>()["request_log_capacity"],
+        1000
+    );
+    for i in 0..150 {
+        e.record_block(&filter_engine::RequestEvent {
+            ts: chrono::Utc::now(),
+            action: filter_engine::EventAction::Blocked,
+            method: String::new(),
+            url: format!("https://ads.test/{i}"),
+            source_host: String::new(),
+            client: None,
+            request_type: "script".into(),
+            rule: Some("||ads.test^".into()),
+            list_id: None,
+            status: None,
+            mode: filter_engine::EventMode::Explicit,
+            error_kind: None,
+            cert_fp: None,
+        });
+    }
+    assert_eq!(e.recent_blocked(1000).len(), 150);
+
+    for bad in [99, 500_001] {
+        let r = put_config(&admin, json!({"request_log_capacity": bad})).await;
+        assert_eq!(r.status_code(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert_eq!(e.recent_blocked_capacity(), 1000);
+
+    let r = put_config(&admin, json!({"request_log_capacity": 100})).await;
+    r.assert_status_ok();
+    let body = r.json::<Value>();
+    assert_eq!(body["request_log_capacity"], 100);
+    assert!(body["applied"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "request_log_capacity")));
+    assert_eq!(e.recent_blocked_capacity(), 100);
+    let kept = e.recent_blocked(1000);
+    assert_eq!(kept.len(), 100);
+    assert_eq!(kept[0].url, "https://ads.test/149");
+    assert_eq!(
+        ctx.state
+            .proxy_state
+            .config
+            .read()
+            .adblock
+            .request_log_capacity,
+        100
+    );
+
+    put_config(&admin, json!({"request_log_capacity": 5000}))
+        .await
+        .assert_status_ok();
+    assert_eq!(e.recent_blocked_capacity(), 5000);
+    assert_eq!(e.recent_blocked(1000).len(), 100);
+}
+
 /// `max_connections = 0` (auto) reports the derived number; saving the echoed value back leaves
 /// the stored setting at 0, while a different value pins it.
 #[tokio::test]

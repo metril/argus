@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
     // per worker; this handle shares the compiled rules as bytes between the proxy and the web API.
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
+    shared_engine.set_event_capacity(config.adblock.request_log_capacity);
     shared_engine.set_recent_keep_query(config.adblock.recent_blocked_keep_query);
 
     // One pooled upstream client (connect/read timeouts from config, no redirect following).
@@ -75,6 +76,9 @@ async fn main() -> Result<()> {
     )?);
 
     ctx.set_respect_no_transform(config.adblock.respect_no_transform);
+    ctx.set_guard_service_workers(config.adblock.guard_service_workers);
+    ctx.set_guard_service_workers_exempt(config.adblock.guard_service_workers_exempt.clone());
+    ctx.set_stealth(config.stealth.clone());
 
     // Hosts excluded from interception / filtering: built-in categories plus the user's own
     // entries and subscriptions, persisted next to the settings overlay.
@@ -286,6 +290,7 @@ async fn main() -> Result<()> {
 
     // Commit queued background writes and fsync before exiting; do not rely on the drop order
     // of `Arc`s held by aborted tasks.
+    ctx.internal().gm.ext().persist_now();
     common::db::Db::sync_all();
 
     proxy_result.map_err(|e| {

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ProxyController, REALM, statusKind } from '../lib/proxy';
+import { ProxyController, REALM, sessionKey, statusKind } from '../lib/proxy';
 import { parseSetCookie, storeSetCookies } from '../lib/setcookie';
 import { JOB_HEADER, StoreRelay } from '../lib/storerelay';
 import { isBroad } from '../lib/grants';
@@ -86,11 +86,11 @@ describe('ProxyController (Chrome)', () => {
     expect(v.value.mode).toBe('fixed_servers');
     expect(v.value.rules.singleProxy).toEqual({ scheme: 'http', host: 'argus.local', port: 3130 });
     expect(v.value.rules.bypassList).toContain('argus.local');
-    await c.setSid(null);
-    expect((settings.clear.mock.calls.at(-1) as any)[0]).toEqual({ scope: 'regular' });
+    await c.setSid(null); // channel lost: fail closed, the setting stays
+    expect(settings.clear).not.toHaveBeenCalled();
     await c.setSid('s'.repeat(32));
     await c.setState({ enabled: false, stores: {} });
-    expect(settings.clear.mock.calls.length).toBeGreaterThan(1);
+    expect((settings.clear.mock.calls.at(-1) as any)[0]).toEqual({ scope: 'regular' });
     expect(c.active()).toBe(false);
   });
   it('answers only its own realm, host and port, once per request', async () => {
@@ -113,8 +113,8 @@ describe('ProxyController (Chrome)', () => {
     await c.setSid('a'.repeat(32));
     expect(await c.auth(ch())).toEqual({ cancel: true }); // ours, but off: ended, not prompted
     await c.setState({ enabled: true, stores: {} });
-    await c.setSid(null);
-    c['d'].readyWaitMs = 20; // disconnected while on: cancelled after a bounded wait, never answered
+    await c.release(); // signed out: nothing left to answer with
+    c['d'].readyWaitMs = 20;
     expect(await c.auth(ch())).toEqual({ cancel: true });
   });
 });
@@ -132,7 +132,7 @@ describe('ProxyController (Firefox containers)', () => {
     expect(await c.route({ cookieStoreId: 'firefox-container-2', url: 'https://x.test/' })).toEqual({ type: 'direct' });
     expect(await c.route({ cookieStoreId: 'firefox-private', url: 'https://x.test/' })).toEqual({ type: 'direct' });
     expect(await c.route({ cookieStoreId: 'firefox-default', url: 'https://argus.local/api' })).toEqual({ type: 'direct' });
-    await c.setSid(null);
+    await c.release();
     expect(await c.route({ cookieStoreId: 'firefox-default', url: 'https://x.test/' })).toEqual({ type: 'direct' });
   });
   it('routes through SOCKS5 with per-request credentials: the session, plus the store token for a container', async () => {
@@ -273,7 +273,159 @@ describe('listener status', () => {
     expect(c.listener()).toBe('none');
     await c.setServer(null, 3130);
     expect(c.listener()).toBe('ready');
-    await c.setSid(null);
+    await c.release();
     expect(c.listener()).toBe('pending');
+  });
+});
+
+describe('ProxyController (fresh start, nothing persisted)', () => {
+  function rig2(firefox: boolean, ms = 40) {
+    const settings = { set: vi.fn(async () => {}), clear: vi.fn(async () => {}), get: vi.fn(async () => ({ value: undefined })) };
+    const br = { proxy: { settings }, storage: { local: { get: vi.fn(async (k: string) => ({ [k]: { enabled: true, stores: {} } })), set: vi.fn() }, session: { get: vi.fn(async () => ({})), set: vi.fn(), remove: vi.fn() } } };
+    return new ProxyController({ browser: br, firefox, argusHost: async () => 'argus.local', readyWaitMs: ms });
+  }
+  it('Firefox: waits for the welcome then routes to the listener, never direct', async () => {
+    const c = rig2(true, 2000);
+    await c.init();
+    const p = c.route({ cookieStoreId: 'firefox-default', url: 'https://x.test/' });
+    await new Promise((r) => setTimeout(r, 20));
+    await c.setServer(null, 3130);
+    await c.setSid('a'.repeat(32));
+    expect(await p).toMatchObject({ type: 'socks', port: 3130 });
+  });
+  it('Firefox: no welcome in time fails closed (dead local port), Argus itself stays direct, sign-out is direct', async () => {
+    const c = rig2(true);
+    await c.init();
+    expect(await c.route({ cookieStoreId: 'firefox-default', url: 'https://x.test/' })).toMatchObject({ type: 'socks', host: '127.0.0.1', port: 1 });
+    expect(await c.route({ cookieStoreId: 'firefox-default', url: 'https://argus.local/api' })).toEqual({ type: 'direct' });
+    await c.release();
+    expect(await c.route({ cookieStoreId: 'firefox-default', url: 'https://x.test/' })).toEqual({ type: 'direct' });
+  });
+  it('is reported unreachable (popup and badge) 3s after a fresh start with no session, in both browsers', async () => {
+    vi.useFakeTimers();
+    try {
+      for (const ff of [false, true]) {
+        const c = rig2(ff);
+        await c.init();
+        expect(c.unreachable()).toBe(false);
+        await vi.advanceTimersByTimeAsync(3500);
+        expect(c.unreachable()).toBe(true);
+        expect(statusKind(true, c.active(), c.listener(), c.unreachable())).toBe('blocked');
+        await c.release();
+        expect(c.unreachable()).toBe(false);
+      }
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('ProxyController (fail closed, persisted session)', () => {
+  function rig(opts: { enabled?: boolean; persisted?: unknown } = {}) {
+    const settings = { set: vi.fn(async () => {}), clear: vi.fn(async () => {}), get: vi.fn(async () => ({ value: undefined })) };
+    const local: Record<string, unknown> = { argusProxy: { enabled: opts.enabled ?? true, stores: {} } };
+    const sess: Record<string, unknown> = opts.persisted ? { argusSession: opts.persisted } : {};
+    const br = {
+      proxy: { settings },
+      storage: {
+        local: { get: vi.fn(async (k: string) => ({ [k]: local[k] })), set: vi.fn(async (o: object) => { Object.assign(local, o); }) },
+        session: { get: vi.fn(async (k: string) => ({ [k]: sess[k] })), set: vi.fn(async (o: object) => { Object.assign(sess, o); }), remove: vi.fn(async (k: string) => { delete sess[k]; }) },
+      },
+    };
+    const onStatus = vi.fn();
+    const c = new ProxyController({ browser: br, firefox: false, argusHost: async () => 'argus.local', readyWaitMs: 50, onStatus });
+    return { c, settings, sess, onStatus };
+  }
+  const SID = 'a'.repeat(32);
+  const persisted = { sid: SID, server: { host: null, port: 3130 } };
+
+  it('persists the sid and server so a restarted worker has them', async () => {
+    const { c, sess } = rig();
+    await c.init();
+    await c.setServer(null, 3130);
+    await c.setSid(SID);
+    expect(sess.argusSession).toEqual(persisted);
+  });
+  it('a worker start with a persisted session never clears the proxy, sets it, and answers at once', async () => {
+    const { c, settings } = rig({ persisted });
+    await c.init();
+    expect(settings.clear).not.toHaveBeenCalled();
+    expect((settings.set.mock.calls.at(-1) as any)[0].value.rules.singleProxy).toEqual({ scheme: 'http', host: 'argus.local', port: 3130 });
+    expect(c.resumeSid()).toBe(SID);
+    const t0 = Date.now();
+    expect(await c.auth(ch())).toEqual({ authCredentials: { username: 'ext', password: SID } });
+    expect(Date.now() - t0).toBeLessThan(40);
+  });
+  it('a worker start with nothing persisted and the toggle on leaves the proxy setting alone', async () => {
+    const { c, settings } = rig();
+    await c.init();
+    expect(settings.clear).not.toHaveBeenCalled();
+    expect(settings.set).not.toHaveBeenCalled();
+  });
+  it('does not rewrite an identical setting', async () => {
+    const { c, settings } = rig({ persisted });
+    settings.get.mockResolvedValue({ value: { mode: 'fixed_servers', rules: { singleProxy: { scheme: 'http', host: 'argus.local', port: 3130 }, bypassList: ['<local>', 'argus.local'] } } } as any);
+    await c.init();
+    expect(settings.set).not.toHaveBeenCalled();
+  });
+  it('a refused resume (new sid) replaces the sid; the next 407 is answered with it', async () => {
+    const { c, sess } = rig({ persisted });
+    await c.init();
+    const first = ch();
+    expect(await c.auth(first)).toMatchObject({ authCredentials: { password: SID } });
+    expect(await c.auth(first)).toEqual({ cancel: true }); // once per request
+    await c.setSid('b'.repeat(32));
+    await c.setServer(null, 3130);
+    expect((sess.argusSession as any).sid).toBe('b'.repeat(32));
+    expect(await c.auth(first)).toEqual({ authCredentials: { username: 'ext', password: 'b'.repeat(32) } });
+  });
+  it('a resumed session (same sid) keeps the answered state and cookie-store tokens', async () => {
+    const { c } = rig({ persisted });
+    await c.init();
+    const t = c.tokenFor('firefox-container-1');
+    await c.setSid(SID);
+    expect(c.storeForToken(t)).toBe('firefox-container-1');
+  });
+  it('a lost channel keeps the proxy, keeps answering with the grace sid, and reports unreachable after a while', async () => {
+    vi.useFakeTimers();
+    try {
+      const { c, settings, onStatus } = rig();
+      await c.init();
+      await c.setServer(null, 3130);
+      await c.setSid(SID);
+      expect(c.unreachable()).toBe(false);
+      await c.setSid(null);
+      expect(settings.clear).not.toHaveBeenCalled();
+      expect(c.active()).toBe(true);
+      expect(c.unreachable()).toBe(false); // a worker restart gap is not shown
+      expect(await c.auth(ch())).toEqual({ authCredentials: { username: 'ext', password: SID } });
+      await vi.advanceTimersByTimeAsync(3500);
+      expect(c.unreachable()).toBe(true);
+      expect(onStatus).toHaveBeenCalled();
+      expect(statusKind(true, c.active(), c.listener(), c.unreachable())).toBe('blocked');
+      await c.setSid(SID); // back
+      expect(c.unreachable()).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+  it('turning the toggle off clears the proxy; so does release (sign-out) and a server with no listener', async () => {
+    const a = rig({ persisted });
+    await a.c.init();
+    await a.c.setState({ enabled: false, stores: {} });
+    expect(a.settings.clear).toHaveBeenCalledTimes(1);
+    const b = rig({ persisted });
+    await b.c.init();
+    await b.c.release();
+    expect(b.settings.clear).toHaveBeenCalled();
+    expect(b.sess.argusSession).toBeUndefined();
+    expect(b.c.resumeSid()).toBeNull();
+    const d = rig({ persisted });
+    await d.c.init();
+    await d.c.setServer(null, 0);
+    expect(d.settings.clear).toHaveBeenCalled();
+  });
+});
+
+describe('session storage key', () => {
+  it('keeps a split-incognito instance off the regular instance\'s sid', () => {
+    expect(sessionKey({ extension: { inIncognitoContext: true } })).not.toBe(sessionKey({ extension: { inIncognitoContext: false } }));
+    expect(sessionKey({})).toBe(sessionKey(undefined));
   });
 });

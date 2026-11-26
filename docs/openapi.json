@@ -4613,6 +4613,17 @@
               "null"
             ]
           },
+          "guard_service_workers": {
+            "description": "Opt in: keep service workers from bypassing the injection on filtered sites (replaces\ntheir script with a self-unregistering no-op worker; offline apps and push stop working).",
+            "type": "boolean"
+          },
+          "guard_service_workers_exempt": {
+            "description": "Hosts (exact or `*.suffix`) the guard leaves alone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "host": {
             "type": "string"
           },
@@ -4626,10 +4637,20 @@
             "minimum": 0,
             "type": "integer"
           },
+          "request_log_capacity": {
+            "description": "Entries kept by the request log (per ring, about 1 KB each).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "request_timeout_secs": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "stealth": {
+            "$ref": "#/components/schemas/StealthDto",
+            "description": "Stealth Mode."
           },
           "tls_passthrough_hosts": {
             "description": "TLS hosts never intercepted (exact or `*.suffix`).",
@@ -5448,6 +5469,248 @@
         ],
         "type": "object"
       },
+      "StealthDto": {
+        "description": "Stealth Mode settings (AdGuard parity). Off as a whole until `enabled`; each option then\nfollows its own switch. See the Settings page for what each one does and may break.",
+        "properties": {
+          "block_etag": {
+            "type": "boolean"
+          },
+          "block_flash": {
+            "type": "boolean"
+          },
+          "block_java": {
+            "type": "boolean"
+          },
+          "block_location": {
+            "type": "boolean"
+          },
+          "block_push": {
+            "type": "boolean"
+          },
+          "block_third_party_auth": {
+            "type": "boolean"
+          },
+          "block_webrtc": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "first_party_cookie_minutes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "first_party_cookies": {
+            "type": "boolean"
+          },
+          "hide_referer": {
+            "type": "boolean"
+          },
+          "hide_search_queries": {
+            "type": "boolean"
+          },
+          "hide_user_agent": {
+            "type": "boolean"
+          },
+          "mask_ip": {
+            "type": "boolean"
+          },
+          "mask_ip_address": {
+            "type": "string"
+          },
+          "referer_custom": {
+            "type": "string"
+          },
+          "remove_x_client_data": {
+            "type": "boolean"
+          },
+          "send_dnt": {
+            "type": "boolean"
+          },
+          "strip_tracking_params": {
+            "type": "boolean"
+          },
+          "third_party_cookie_minutes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "third_party_cookies": {
+            "type": "boolean"
+          },
+          "user_agent_custom": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "hide_search_queries",
+          "send_dnt",
+          "strip_tracking_params",
+          "hide_referer",
+          "referer_custom",
+          "hide_user_agent",
+          "user_agent_custom",
+          "mask_ip",
+          "mask_ip_address",
+          "remove_x_client_data",
+          "third_party_cookies",
+          "third_party_cookie_minutes",
+          "first_party_cookies",
+          "first_party_cookie_minutes",
+          "block_etag",
+          "block_third_party_auth",
+          "block_webrtc",
+          "block_push",
+          "block_location",
+          "block_flash",
+          "block_java"
+        ],
+        "type": "object"
+      },
+      "StealthUpdate": {
+        "description": "Partial update of [`StealthDto`]; omitted fields keep their value. Applied live.",
+        "properties": {
+          "block_etag": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_flash": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_java": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_location": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_push": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_third_party_auth": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "block_webrtc": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "first_party_cookie_minutes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "first_party_cookies": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "hide_referer": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "hide_search_queries": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "hide_user_agent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mask_ip": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "mask_ip_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "referer_custom": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remove_x_client_data": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "send_dnt": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "strip_tracking_params": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "third_party_cookie_minutes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "third_party_cookies": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "user_agent_custom": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "StorageMetrics": {
         "description": "Health of the deferred (background) database writes.",
         "properties": {
@@ -6254,6 +6517,23 @@
               "null"
             ]
           },
+          "guard_service_workers": {
+            "description": "Neutralise service workers on filtered sites; applied live.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "guard_service_workers_exempt": {
+            "description": "Replaces the guard's exempt host list; applied live.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "host": {
             "type": [
               "string",
@@ -6276,12 +6556,32 @@
               "null"
             ]
           },
+          "request_log_capacity": {
+            "description": "Entries kept by the request log (100 to 500000); applied live, keeping the newest when\nit shrinks.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "request_timeout_secs": {
             "format": "int64",
             "minimum": 0,
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "stealth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StealthUpdate",
+                "description": "Stealth Mode settings; applied live."
+              }
             ]
           },
           "tls_passthrough_hosts": {

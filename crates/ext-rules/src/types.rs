@@ -119,6 +119,9 @@ pub struct RequestDecision {
     pub block: Option<RuleId>,
     /// Send the request to this URL instead (`$urltransform`; same origin, path/query only).
     pub rewrite_url: Option<(String, RuleId)>,
+    /// The URL after `$removeparam` alone (before any `$urltransform`): what a top-level
+    /// navigation is redirected to. Set only when a `$removeparam` rule changed the URL.
+    pub cleaned_url: Option<(String, RuleId)>,
     /// Edits to the *request* headers (`$cookie`, `$removeheader=request:`).
     pub header_edits: Vec<HeaderEdit>,
     /// Every rule that took part (for logging).
@@ -127,7 +130,10 @@ pub struct RequestDecision {
 
 impl RequestDecision {
     pub fn is_noop(&self) -> bool {
-        self.block.is_none() && self.rewrite_url.is_none() && self.header_edits.is_empty()
+        self.block.is_none()
+            && self.rewrite_url.is_none()
+            && self.cleaned_url.is_none()
+            && self.header_edits.is_empty()
     }
 }
 
@@ -178,6 +184,10 @@ pub struct ResponsePlan<'a> {
     pub injections: Vec<&'a Injection>,
     /// Every rule that took part (for logging).
     pub matched: Vec<RuleId>,
+    /// [`crate::target`] bits switched off for this page by matching URL-scoped exceptions
+    /// (`@@||x^$elemhide`, `$specifichide`, `$jsinject`, `$content`, `$document`...). Besides
+    /// masking this index's own rules, a caller applies them to other engines' output.
+    pub disabled: u32,
 }
 
 impl ResponsePlan<'_> {

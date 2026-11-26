@@ -14,6 +14,16 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use userscript_engine::install::{finish_install, plan_install, Approvals, Fetched};
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 const PAGE: &str = "<!doctype html><html><head><title>t</title></head><body>hi</body></html>";
 
 fn script(extra: &str, browser: bool) -> userscript_engine::Userscript {
@@ -393,6 +403,39 @@ e2e_test!(
 );
 
 e2e_test!(
+    a_bound_connection_whose_session_ended_is_closed_without_a_407,
+    rules = [],
+    explicit_only,
+    |env| {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let h = hub(&env);
+        let (sess, sid, _rx) = session(&h, "tok-n");
+        let addr = env.proxy.ext_addr().await;
+        env.origin.route("/bound", MockResponse::ok("x"));
+        let url = env.origin.http_url("app.test", "/bound");
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {url} HTTP/1.1\r\nHost: app.test\r\nProxy-Authorization: Basic {}\r\n\r\n",
+            b64(format!("ext:{sid}").as_bytes())
+        );
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut head = [0u8; 12];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        // the session really ends; the next request on the bound connection gets no 407
+        h.close(sess);
+        let _ = sock
+            .write_all(format!("GET {url} HTTP/1.1\r\nHost: app.test\r\n\r\n").as_bytes())
+            .await;
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut rest)).await;
+        assert!(ended.is_ok(), "the connection is closed");
+        let text = String::from_utf8_lossy(&rest);
+        assert!(!text.contains("407"), "no 407 mid-stream: {text}");
+    }
+);
+
+e2e_test!(
     revoking_a_token_drops_the_sessions_proxy_connections,
     rules = [],
     explicit_only,
@@ -461,6 +504,8 @@ e2e_test!(
         // a redirect hop to a host outside @connect is refused before it is fetched
         let r = get("evil.test", "/bad", relay.clone()).await;
         assert_eq!(r.status(), 403);
+        let ev = logged_with(&env, "/bad", "relayed request refused");
+        assert_eq!(ev.len(), 1, "{ev:?}");
         // so is one from a connection of another session, or of a container store
         let (_o, osid, _orx) = session(&h, "t9");
         let other = ext_client(&env, &osid, "").await;
@@ -495,6 +540,12 @@ e2e_test!(
         );
         let r = get("api.test", "/ok", "unknown".into()).await;
         assert_eq!(r.status(), 403);
+        let ev = logged_with(&env, "/ok", "relayed request refused");
+        assert_eq!(
+            ev.len(),
+            3,
+            "other session, container store, unknown: {ev:?}"
+        );
         assert!(env.origin.requests().iter().all(|r| r.path() != "/bad"));
         assert!(env.origin.requests().iter().all(|r| {
             r.headers
@@ -754,6 +805,8 @@ e2e_test!(
             assert!(r.headers().get("location").is_none());
             assert!(r.headers().get("set-cookie").is_none());
         }
+        let ev = logged_with(&env, "/r-", "relayed redirect refused");
+        assert_eq!(ev.len(), 5, "one event per refused hop: {ev:?}");
         // a Location that cannot be checked is refused too: empty, doubled, or UTF-8 that points
         // at a bypassed host
         env.origin.route(

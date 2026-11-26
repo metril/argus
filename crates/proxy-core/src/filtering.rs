@@ -24,6 +24,7 @@ use crate::rewrite::{
     classify_body, media_type, BodyKind, HeaderEdit, HtmlPlan, ResponseInfo, ResponseTransforms,
     TransformSource,
 };
+use crate::stealth;
 use crate::upstream::{
     build_strict_upstream_client, build_strict_upstream_client_via, build_upstream_client,
     build_upstream_client_via, UpstreamClient, UpstreamOptions,
@@ -87,6 +88,20 @@ pub fn refused_response() -> Response<ProxyBody> {
 }
 
 /// `Origin`-header form of an authority: scheme, host, and the port unless it is the default.
+/// The page a request came from, for logs: the Referer as the browser sent it, even when
+/// Stealth Mode replaced it on the way out.
+fn src_of<'a>(
+    orig_referer: &'a Option<String>,
+    headers: &'a hyper::HeaderMap,
+    url: &'a str,
+    rtype: RequestType,
+) -> &'a str {
+    orig_referer
+        .as_deref()
+        .filter(|_| rtype != RequestType::Document)
+        .unwrap_or_else(|| source_url(headers, url, rtype))
+}
+
 fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
     let scheme = if scheme == "http" { "http" } else { "https" };
     let default = if scheme == "http" { 80 } else { 443 };
@@ -139,7 +154,8 @@ fn apply_overlay(
 /// overlay exceptions are visible here (a bare `#@#.x` is resolved inside the overlay engine
 /// alone), an overlay exception cannot cancel a base *procedural* filter, and `$generichide`
 /// cannot strip the non-class/id "misc" generic selectors already in the base's static list;
-/// `$elemhide` is not understood by the engine at all (base or overlay).
+/// `$elemhide`, `$specifichide` and `$jsinject` are not understood by the engine at all (base or
+/// overlay); the caller applies them to the merged result with [`mask_cosmetics`].
 fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosmetics) {
     if !ov.exceptions.is_empty() {
         base.hide_selectors.retain(|s| !ov.exceptions.contains(s));
@@ -154,6 +170,63 @@ fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosme
     }
     base.generichide |= ov.generichide;
     base.exceptions.extend(ov.exceptions);
+}
+
+/// Apply the page-scoped exception bits (`ext_rules::target`) to the cosmetic engine's output:
+/// `$elemhide` drops every hide and the observer; `$specifichide` keeps only the generic hides
+/// (`generic`, evaluated lazily: the selectors a host without rules gets); `$jsinject` drops the
+/// scriptlets. (`$content` is HTML filtering and `$replace`, not scriptlets, as in AdGuard.)
+pub(crate) fn mask_cosmetics(
+    cos: &mut filter_engine::Cosmetics,
+    disabled: u32,
+    generic: impl FnOnce() -> Vec<String>,
+) {
+    use ext_rules::target::{JS, PCSS, SCRIPTLET, SNIPPET, SPECIFICHIDE};
+    if disabled & PCSS != 0 {
+        cos.hide_selectors.clear();
+        cos.procedural_actions.clear();
+        cos.generichide = true;
+    } else if disabled & SPECIFICHIDE != 0 {
+        cos.hide_selectors = if cos.generichide {
+            Vec::new()
+        } else {
+            let mut g = generic();
+            // the page's own `#@#` exceptions still cancel generic hides
+            g.retain(|s| !cos.exceptions.contains(s));
+            g
+        };
+        cos.procedural_actions.clear();
+    }
+    if disabled & (JS | SCRIPTLET | SNIPPET) != 0 {
+        cos.injected_script.clear();
+    }
+}
+
+/// The hides a host with no rules of its own gets from both of the profile's engines (the generic
+/// ones): what `$specifichide` leaves.
+fn generic_hides(
+    engine: &filter_engine::SharedEngine,
+    overlay: Option<&filter_engine::SharedEngine>,
+) -> Vec<String> {
+    const NO_RULES: &str = "https://argus-generic-hide.invalid/";
+    let mut c = engine.cosmetic_for(NO_RULES);
+    if let Some(ov) = overlay.filter(|o| o.is_enabled()) {
+        merge_cosmetics(&mut c, ov.cosmetic_for(NO_RULES));
+    }
+    c.hide_selectors
+}
+
+fn document_excepted(engine: &filter_engine::SharedEngine, url: &str) -> bool {
+    engine.document_excepted(url).0
+}
+
+/// AdGuard's `#$?#sel { remove: true }`: the style block that means "remove the element".
+fn is_remove_style(style: &str) -> bool {
+    let n: String = style
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ';')
+        .collect();
+    n.eq_ignore_ascii_case("remove:true")
 }
 
 /// Generic hide selectors for the classes and ids a page reports, from both of the profile's
@@ -235,6 +308,12 @@ pub struct ProxyContext {
     /// Leave bodies alone when the origin says `Cache-Control: no-transform` (header-only edits
     /// still apply). Many CDNs set it on everything, hence the switch.
     respect_no_transform: std::sync::atomic::AtomicBool,
+    /// Neutralise service workers on filtered sites (see `AdblockSettings::guard_service_workers`).
+    guard_service_workers: std::sync::atomic::AtomicBool,
+    /// Hosts the guard leaves alone (exact or `*.suffix`).
+    guard_exempt: ArcSwap<Vec<String>>,
+    /// Live Stealth Mode settings (shared with the web API, which swaps them on save).
+    stealth: Arc<ArcSwap<common::config::StealthSettings>>,
     /// Upstream certificates seen by the upstream clients (shared with the web API).
     certs: Arc<common::certstore::CertStore>,
     /// Probe handshakes to learn why an upstream certificate was rejected (when built from
@@ -284,6 +363,9 @@ impl ProxyContext {
             internal: Arc::new(Internal::new()),
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
+            guard_service_workers: std::sync::atomic::AtomicBool::new(false),
+            guard_exempt: ArcSwap::from_pointee(Vec::new()),
+            stealth: Arc::default(),
             certs: Default::default(),
             prober: None,
             roots: None,
@@ -334,6 +416,65 @@ impl ProxyContext {
     }
 
     /// Honour `Cache-Control: no-transform` on responses (default on).
+    /// Live switch for the service-worker guard.
+    pub fn set_guard_service_workers(&self, on: bool) {
+        self.guard_service_workers.store(on, Ordering::Relaxed);
+    }
+
+    /// Live exempt-host list of the service-worker guard.
+    pub fn set_guard_service_workers_exempt(&self, hosts: Vec<String>) {
+        self.guard_exempt.store(Arc::new(hosts));
+    }
+
+    /// Is the service-worker guard off for `host` / `url`: listed host, per-site blocking off, or
+    /// a `@@$document` / `$elemhide` / `$jsinject` exception?
+    fn sw_guard_exempt(&self, rctx: &RequestCtx, host: &str, url: &str) -> bool {
+        let h = host.to_ascii_lowercase();
+        if self
+            .guard_exempt
+            .load()
+            .iter()
+            .any(|e| match e.strip_prefix("*.") {
+                Some(s) => {
+                    h.len() > s.len() && h.ends_with(s) && h[..h.len() - s.len()].ends_with('.')
+                }
+                None => *e == h,
+            })
+        {
+            return true;
+        }
+        let profile = rctx.profile.load();
+        let probe = SharedEngine::site_probe(url);
+        if profile.engine.site_off_with(&probe)
+            || profile
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.site_off_with(&probe))
+        {
+            return true;
+        }
+        let (excepted, gen_) = profile.engine.document_excepted(url);
+        if excepted {
+            return true;
+        }
+        gen_.aux::<ext_rules::ExtIndex>().is_some_and(|idx| {
+            let mut info =
+                ext_rules::RequestInfo::new(url, "GET", ext_rules::ResourceType::Document);
+            info.source_url = None;
+            idx.page_exempt(&info)
+        })
+    }
+
+    /// Replace the Stealth Mode settings; the next request uses them.
+    pub fn set_stealth(&self, s: common::config::StealthSettings) {
+        self.stealth.store(Arc::new(s));
+    }
+
+    /// The live settings cell, for the web API to swap on save.
+    pub fn stealth_handle(&self) -> Arc<ArcSwap<common::config::StealthSettings>> {
+        self.stealth.clone()
+    }
+
     pub fn set_respect_no_transform(&self, respect: bool) {
         self.respect_no_transform.store(respect, Ordering::Relaxed);
     }
@@ -781,15 +922,32 @@ impl ProxyContext {
             self.bypass().note_bypassed();
         }
 
+        let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let local_url = || format!("{}{pq}", origin_of(scheme, &url_host, port));
+        let hdr_type = |h: &hyper::HeaderMap| classify(&method, h, pq);
+
         // The reserved confirmation host is answered by the proxy alone: never filtered, never
         // forwarded, whatever the entry mode.
         if self.internal.panel.is_panel_host(&host) {
             let origin = origin_of(scheme, &url_host, port);
-            return Ok(self
+            let resp = self
                 .internal
                 .panel
                 .handle(&self.internal, req, rctx, &origin)
-                .await);
+                .await;
+            if !bypass_full {
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Allowed,
+                    method.as_str(),
+                    &local_url(),
+                    "",
+                    INTERNAL_TYPE,
+                    resp.status().as_u16(),
+                    "",
+                );
+            }
+            return Ok(resp);
         }
 
         // Internal endpoints are answered locally for every host: never filtered, never
@@ -803,7 +961,26 @@ impl ProxyContext {
                 resolve_all_to: self.resolve_all_to,
                 scope: rctx.upstream_scope(),
             };
-            return Ok(self.internal.handle(req, &host, &origin, rctx, &up).await);
+            let src = req
+                .headers()
+                .get(hyper::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let resp = self.internal.handle(req, &host, &origin, rctx, &up).await;
+            if !bypass_full {
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Allowed,
+                    method.as_str(),
+                    &local_url(),
+                    &src,
+                    INTERNAL_TYPE,
+                    resp.status().as_u16(),
+                    "",
+                );
+            }
+            return Ok(resp);
         }
 
         // A service-worker script fetch (also `importScripts` inside one) on a host where a
@@ -818,12 +995,60 @@ impl ProxyContext {
             });
             if refuse {
                 debug!("Refused a service worker script fetch for {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &local_url(),
+                    "",
+                    hdr_type(req.headers()).as_str(),
+                    403,
+                    "service worker refused",
+                );
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::FORBIDDEN)
                     .header("cache-control", "no-store")
                     .header("x-adblock-note", "service workers are blocked on this site")
                     .body(crate::inject::full_body(bytes::Bytes::new()))
                     .expect("sw refusal"));
+            }
+        }
+
+        // Service-worker guard: a worker would answer navigations from its cache, so the page
+        // never reaches the proxy and gets no injection. On filtered sites its script is replaced
+        // by a worker that unregisters itself and never handles fetches (registration still
+        // "succeeds", so apps do not error). Full-bypass hosts are left alone.
+        if !bypass_full
+            && self.guard_service_workers.load(Ordering::Relaxed)
+            && req.method() == hyper::Method::GET
+            && is_service_worker_fetch(req.headers())
+        {
+            let prof = rctx.profile.load();
+            let site = format!("{scheme}://{host}/");
+            if prof.engine.is_enabled()
+                && rctx.adblock_on()
+                && !self.sw_guard_exempt(rctx, &host, &site)
+            {
+                debug!("Replaced a service worker script for {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Allowed,
+                    method.as_str(),
+                    &local_url(),
+                    "",
+                    hdr_type(req.headers()).as_str(),
+                    200,
+                    "service worker neutralised",
+                );
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::OK)
+                    .header("content-type", "application/javascript; charset=utf-8")
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "service worker neutralised")
+                    .body(crate::inject::full_body(bytes::Bytes::from_static(
+                        SW_NOOP.as_bytes(),
+                    )))
+                    .expect("sw shim"));
             }
         }
 
@@ -866,6 +1091,16 @@ impl ProxyContext {
             });
             if !allowed {
                 debug!("Refused a relayed request for {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &url,
+                    "",
+                    RequestType::Other.as_str(),
+                    403,
+                    "relayed request refused",
+                );
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::FORBIDDEN)
                     .header("cache-control", "no-store")
@@ -910,7 +1145,10 @@ impl ProxyContext {
                         count_page_block(sc, source_url(&headers, &url, rtype));
                     }
                     if let Some(res) = verdict.redirect_resource() {
-                        return Ok(redirect_response(res));
+                        let origin = headers
+                            .get(hyper::header::ORIGIN)
+                            .and_then(|v| v.to_str().ok());
+                        return Ok(redirect_response(res, origin));
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
@@ -924,20 +1162,45 @@ impl ProxyContext {
                             .as_ref()
                             .is_some_and(|o| o.site_off_with(&probe))
                 };
-                if let Some(new_url) = verdict.rewritten_url {
-                    let navigation =
-                        rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
-                    if navigation {
-                        return Ok(rewrite_redirect(&new_url));
+                let navigation =
+                    rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
+                let ext_idx = generation
+                    .as_ref()
+                    .and_then(|g| g.aux::<ext_rules::ExtIndex>());
+                if let Some(mut new_url) = verdict.rewritten_url {
+                    // `@@$removeparam` exceptions (the engine cannot parse them) restore the
+                    // parameters they exempt.
+                    if let Some(idx) = ext_idx {
+                        let source = source_url(&headers, &url, rtype);
+                        new_url = ext::exempt_engine_rewrite(
+                            idx,
+                            &url,
+                            new_url,
+                            method.as_str(),
+                            source,
+                            rtype,
+                        );
                     }
-                    // Subresource: fetch the cleaned URL transparently.
-                    url = new_url;
+                    if new_url != url {
+                        if navigation {
+                            log_local(
+                                rctx,
+                                filter_engine::EventAction::Allowed,
+                                method.as_str(),
+                                &url,
+                                "",
+                                rtype.as_str(),
+                                307,
+                                "url rewritten",
+                            );
+                            return Ok(rewrite_redirect(&new_url));
+                        }
+                        // Subresource: fetch the cleaned URL transparently.
+                        url = new_url;
+                    }
                 }
                 // Extended rules run after the engine verdict (see `crate::ext` for precedence).
-                if let Some(idx) = generation
-                    .as_ref()
-                    .and_then(|g| g.aux::<ext_rules::ExtIndex>())
-                {
+                if let Some(idx) = ext_idx {
                     let source = source_url(&headers, &url, rtype);
                     if let Some(d) =
                         ext::request_decision(idx, &url, method.as_str(), source, rtype, &headers)
@@ -970,6 +1233,25 @@ impl ProxyContext {
                             let v = filter_engine::MatchResult::blocked(rule);
                             return Ok(block_response(rtype, &v, &url));
                         }
+                        // `$removeparam` is idempotent: a navigation is redirected to the cleaned
+                        // URL (never to a no-op target, so it cannot loop).
+                        if navigation {
+                            if let Some((cleaned, _)) = d.cleaned_url {
+                                if cleaned != url {
+                                    log_local(
+                                        rctx,
+                                        filter_engine::EventAction::Allowed,
+                                        method.as_str(),
+                                        &url,
+                                        "",
+                                        rtype.as_str(),
+                                        307,
+                                        "url rewritten",
+                                    );
+                                    return Ok(rewrite_redirect(&cleaned));
+                                }
+                            }
+                        }
                         // Fetched transparently, never answered with a redirect: a URL
                         // transform need not be idempotent, so a redirect could loop.
                         if let Some((new_url, _)) = d.rewrite_url {
@@ -998,12 +1280,88 @@ impl ProxyContext {
                     .is_some()
                 {
                     debug!("Blocked {} by script policy", url);
+                    log_local(
+                        rctx,
+                        filter_engine::EventAction::Blocked,
+                        method.as_str(),
+                        &url,
+                        "",
+                        rtype.as_str(),
+                        403,
+                        "script policy",
+                    );
                     return Ok(policy_block_response(rtype, &url));
                 }
             }
         }
 
         ext::apply_request_edits(&mut headers, &request_edits);
+
+        // Stealth Mode: header, URL and cookie edits, decided once per request. Off for hosts in
+        // full bypass, pages with ad blocking switched off, and options a `$stealth` exception
+        // turns off for the page.
+        let st = self.stealth.load_full();
+        let mut stealth_mask = 0u32;
+        let mut stealth_third = false;
+        let mut orig_referer: Option<String> = None;
+        if st.enabled && !bypass_full {
+            let src = source_url(&headers, &url, rtype).to_string();
+            stealth_third = rtype != RequestType::Document && stealth::is_third_party(&host, &src);
+            let page = if rtype == RequestType::Document || src.is_empty() {
+                url.clone()
+            } else {
+                src.clone()
+            };
+            let mut m = stealth::mask(&st);
+            if m != 0 {
+                let profile = rctx.profile.load();
+                let probe = SharedEngine::site_probe(&page);
+                if profile.engine.site_off_with(&probe)
+                    || profile
+                        .overlay
+                        .as_ref()
+                        .is_some_and(|o| o.site_off_with(&probe))
+                {
+                    m = 0;
+                } else if let Some(idx) = profile.generation().aux::<ext_rules::ExtIndex>() {
+                    m &= !ext::stealth_off(idx, &url, &src, rtype);
+                }
+            }
+            if m & ext_rules::stealth::TRACKING_PARAMS != 0 {
+                if let Some(new_url) = stealth::strip_tracking(&url) {
+                    if rtype == RequestType::Document && (method == hyper::Method::GET || is_head) {
+                        log_local(
+                            rctx,
+                            filter_engine::EventAction::Allowed,
+                            method.as_str(),
+                            &url,
+                            "",
+                            rtype.as_str(),
+                            307,
+                            "tracking parameters stripped",
+                        );
+                        return Ok(rewrite_redirect(&new_url));
+                    }
+                    url = new_url;
+                }
+            }
+            if m != 0 {
+                let kind = stealth::ReqKind {
+                    document: rtype == RequestType::Document,
+                    unsafe_method: matches!(
+                        method,
+                        hyper::Method::POST
+                            | hyper::Method::PUT
+                            | hyper::Method::PATCH
+                            | hyper::Method::DELETE
+                    ),
+                };
+                orig_referer =
+                    stealth::apply_request(&st, m, &mut headers, &url, stealth_third, kind)
+                        .orig_referer;
+            }
+            stealth_mask = m;
+        }
 
         // Stream the request body upstream; nothing is buffered.
         let has_body = !body.is_end_stream();
@@ -1013,6 +1371,18 @@ impl ProxyContext {
         if let Err(r) = self.policy.check_literal(&host, port) {
             common::faults::note(common::faults::Fault::PolicyRefusal, &host);
             debug!("Refused destination {host}:{port}: {r}");
+            if !bypass_full {
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &url,
+                    "",
+                    rtype.as_str(),
+                    403,
+                    "destination policy",
+                );
+            }
             return Ok(refused_response());
         }
         let client = if self.policy.is_own_port(port) {
@@ -1118,7 +1488,7 @@ impl ProxyContext {
                             filter_engine::EventAction::Error,
                             method.as_str(),
                             &url,
-                            source_url(&headers, &url, rtype),
+                            src_of(&orig_referer, &headers, &url, rtype),
                             rtype,
                             Some(504),
                             Some(filter_engine::ErrorKind::UpstreamTimeout),
@@ -1136,6 +1506,18 @@ impl ProxyContext {
             Err(e) if is_refusal(&e) => {
                 common::faults::note(common::faults::Fault::PolicyRefusal, &host);
                 debug!("Refused destination {host}:{port} (resolved): {e}");
+                if !bypass_full {
+                    log_local(
+                        rctx,
+                        filter_engine::EventAction::Blocked,
+                        method.as_str(),
+                        &url,
+                        "",
+                        rtype.as_str(),
+                        403,
+                        "destination policy",
+                    );
+                }
                 return Ok(refused_response());
             }
             Err(e) => {
@@ -1161,7 +1543,7 @@ impl ProxyContext {
                         filter_engine::EventAction::Error,
                         method.as_str(),
                         &url,
-                        source_url(&headers, &url, rtype),
+                        src_of(&orig_referer, &headers, &url, rtype),
                         rtype,
                         Some(502),
                         Some(kind),
@@ -1199,7 +1581,7 @@ impl ProxyContext {
                 filter_engine::EventAction::Allowed,
                 method.as_str(),
                 &url,
-                source_url(&headers, &url, rtype),
+                src_of(&orig_referer, &headers, &url, rtype),
                 rtype,
                 Some(status.as_u16()),
                 None,
@@ -1207,7 +1589,8 @@ impl ProxyContext {
         }
         // Moved out of the response (the body stream does not need them): no header-map copy.
         let mut resp = resp;
-        let resp_headers = std::mem::take(resp.headers_mut());
+        let mut resp_headers = std::mem::take(resp.headers_mut());
+        stealth::apply_response(&st, stealth_mask, &mut resp_headers, stealth_third);
         // A relayed response that redirects: the hop it names is checked here, before the
         // browser can follow it (Argus decrypted this hop, so it sees every one). Together with
         // the check of the first hop (`route`) this makes every hop the browser follows one the
@@ -1229,6 +1612,16 @@ impl ProxyContext {
             };
             if !ok {
                 debug!("Refused a relayed redirect from {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &url,
+                    "",
+                    rtype.as_str(),
+                    502,
+                    "relayed redirect refused",
+                );
                 // No Set-Cookie, no Location: only the refusal.
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::BAD_GATEWAY)
@@ -1253,6 +1646,12 @@ impl ProxyContext {
             } else {
                 None
             };
+        // The in-page shim (WebRTC, Push, Location, DNT/GPC properties) goes into frames only.
+        let stealth_js = if rtype.is_frame() && kind == BodyKind::Html {
+            stealth::script(&st, stealth_mask)
+        } else {
+            None
+        };
         let policy_nonce = spol.as_ref().map(|_| crate::inject::new_nonce());
         // `Cache-Control: no-transform`: no body rewriting at all (header edits still apply).
         if self.respect_no_transform.load(Ordering::Relaxed)
@@ -1298,7 +1697,7 @@ impl ProxyContext {
                     s.transforms_for(&ResponseInfo {
                         generation: generation.as_ref(),
                         method: method.as_str(),
-                        source_url: source_url(&headers, &url, rtype),
+                        source_url: src_of(&orig_referer, &headers, &url, rtype),
                         url: &url,
                         request_type: rtype,
                         status,
@@ -1343,7 +1742,9 @@ impl ProxyContext {
         // Public id of a document that got userscripts (`Server-Timing: argus`).
         let mut server_timing: Option<String> = None;
         let body: ProxyBody = match (kind, codings) {
-            (BodyKind::Html, Ok(codings)) if (enabled || spol.is_some()) && body_allowed => {
+            (BodyKind::Html, Ok(codings))
+                if (enabled || spol.is_some() || stealth_js.is_some()) && body_allowed =>
+            {
                 let origin = csp::PageOrigin::new(
                     if scheme == "http" { "http" } else { "https" },
                     &url_host,
@@ -1359,9 +1760,42 @@ impl ProxyContext {
                     .collect();
                 let (blocks_scripts, opaque) = csp::sandbox_facts(&csp_headers);
                 let mut cos = cosmetics.unwrap_or_default();
+                // `$elemhide` / `$specifichide` / `$jsinject` exceptions (seen by the ext index) and
+                // `@@...$document` exceptions (accepted by adblock-rust itself, so the ext index
+                // never sees them) mask what the cosmetic engine produced too: it implements
+                // none of them.
+                let disabled = {
+                    let prof = rctx.profile.load();
+                    let doc = document_excepted(&prof.engine, &url)
+                        || prof
+                            .overlay
+                            .as_ref()
+                            .is_some_and(|ov| ov.is_enabled() && document_excepted(ov, &url));
+                    transforms.disabled | if doc { ext_rules::target::ALL } else { 0 }
+                };
+                mask_cosmetics(&mut cos, disabled, || {
+                    let prof = rctx.profile.load();
+                    generic_hides(&prof.engine, prof.overlay.as_deref())
+                });
+                if disabled & (ext_rules::target::PCSS | ext_rules::target::SPECIFICHIDE) != 0 {
+                    transforms.procedural.clear();
+                }
+                if disabled
+                    & (ext_rules::target::JS
+                        | ext_rules::target::SCRIPTLET
+                        | ext_rules::target::SNIPPET)
+                    != 0
+                {
+                    transforms.scripts.clear();
+                }
+                if let Some(js) = &stealth_js {
+                    // Runs first, before any page script (the scriptlet slot).
+                    cos.injected_script = format!("{js}\n{}", cos.injected_script);
+                }
                 // Extended CSS the engine rejected goes to the in-page procedural evaluator.
                 for (selector, style) in &transforms.procedural {
                     let action = match style {
+                        Some(s) if is_remove_style(s) => serde_json::json!({"type": "remove"}),
                         Some(s) => serde_json::json!({"type": "style", "arg": s}),
                         None => serde_json::json!({"type": "hide"}),
                     };
@@ -1412,16 +1846,22 @@ impl ProxyContext {
                 } else {
                     None
                 };
+                let sw_guard = self.guard_service_workers.load(Ordering::Relaxed)
+                    && enabled
+                    && !page_off
+                    && !self.sw_guard_exempt(rctx, &host, &url);
                 let unregister_sw = !blocks_scripts
-                    && us.is_some()
-                    && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
-                        self.internal
-                            .gm
-                            .blocks_service_workers_in(&ix.load(), &host)
-                    });
-                let head = if enabled {
+                    && ((us.is_some()
+                        && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
+                            self.internal
+                                .gm
+                                .blocks_service_workers_in(&ix.load(), &host)
+                        }))
+                        || sw_guard);
+                let head = if enabled || stealth_js.is_some() {
                     build_head(&PageSpec {
                         unregister_sw,
+                        sw_guard: sw_guard && !blocks_scripts,
                         userscripts: us_srcs,
                         panel: panel_key.as_ref(),
                         menu: menu_mode,
@@ -1432,7 +1872,7 @@ impl ProxyContext {
                         host: &host,
                         nonce: &nonce,
                         script_ok: !blocks_scripts,
-                        observer_ok: !opaque,
+                        observer_ok: !opaque && enabled,
                     })
                 } else {
                     Default::default()
@@ -1774,6 +2214,11 @@ fn bad_gateway(msg: &str) -> Response<ProxyBody> {
     status_response(StatusCode::BAD_GATEWAY, msg)
 }
 
+/// A service worker that takes over, never handles a fetch and unregisters itself (open tabs
+/// are not reloaded; their next navigation goes through the proxy).
+const SW_NOOP: &str = "self.addEventListener('install',function(){self.skipWaiting();});\
+self.addEventListener('activate',function(e){e.waitUntil(self.registration.unregister().catch(function(){}));});\n";
+
 /// A request that fetches a service worker's script: `Service-Worker: script` (set by the browser
 /// for the main script and its updates) or `Sec-Fetch-Dest: serviceworker`.
 fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
@@ -1910,6 +2355,134 @@ mod url_tests {
 }
 
 #[cfg(test)]
+mod cosmetic_mask_tests {
+    use super::{is_remove_style, mask_cosmetics};
+    use ext_rules::target::{JS, PCSS, SPECIFICHIDE};
+    use filter_engine::{compile_engine, Cosmetics, SharedEngine};
+
+    fn cos() -> Cosmetics {
+        Cosmetics {
+            hide_selectors: vec![".specific".into(), ".generic-misc".into()],
+            procedural_actions: vec!["{}".into()],
+            injected_script: "scriptlet();".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn elemhide_drops_every_hide_and_the_observer() {
+        let mut c = cos();
+        mask_cosmetics(&mut c, PCSS, || panic!("not needed"));
+        assert!(c.hide_selectors.is_empty() && c.procedural_actions.is_empty());
+        assert!(c.generichide, "no class/id observer either");
+        assert_eq!(
+            c.injected_script, "scriptlet();",
+            "scriptlets are not element hiding"
+        );
+    }
+
+    #[test]
+    fn specifichide_keeps_only_the_generic_hides() {
+        let mut c = cos();
+        mask_cosmetics(&mut c, SPECIFICHIDE, || vec![".generic-misc".into()]);
+        assert_eq!(c.hide_selectors, [".generic-misc"]);
+        assert!(c.procedural_actions.is_empty() && !c.generichide);
+        let mut g = cos();
+        g.generichide = true;
+        mask_cosmetics(&mut g, SPECIFICHIDE, || vec![".generic-misc".into()]);
+        assert!(g.hide_selectors.is_empty());
+    }
+
+    #[test]
+    fn jsinject_stops_scriptlets_only() {
+        let mut c = cos();
+        mask_cosmetics(&mut c, JS, Vec::new);
+        assert!(c.injected_script.is_empty());
+        assert_eq!(c.hide_selectors.len(), 2);
+        let mut n = cos();
+        mask_cosmetics(&mut n, 0, Vec::new);
+        assert_eq!(n.injected_script, "scriptlet();");
+        assert_eq!(n.hide_selectors.len(), 2);
+    }
+
+    #[test]
+    fn masking_an_engines_real_output() {
+        let e = SharedEngine::new();
+        e.install(compile_engine(&["example.com##.ad
+example.com##.box:has-text(X)
+"
+        .to_string()]));
+        let mut c = e.cosmetic_for("https://example.com/");
+        assert!(!c.hide_selectors.is_empty());
+        mask_cosmetics(&mut c, PCSS, Vec::new);
+        assert!(c.hide_selectors.is_empty() && c.generichide);
+    }
+
+    #[test]
+    fn a_document_exception_is_found_through_adblock_rust() {
+        use super::document_excepted;
+        use filter_engine::shared::rule_has_document_option;
+        let e = |rule: &str| {
+            let s = SharedEngine::new();
+            s.install(compile_engine(&[format!("example.com##.ad\n{rule}\n")]));
+            s
+        };
+        let url = "https://example.com/page";
+        assert!(document_excepted(&e("@@||example.com^$document"), url));
+        assert!(document_excepted(&e("@@||example.com^$doc,important"), url));
+        // a plain network exception is not a cosmetic one; neither is another site's
+        assert!(!document_excepted(&e("@@||example.com^"), url));
+        assert!(!document_excepted(&e("@@||example.com^$image"), url));
+        assert!(!document_excepted(&e("@@||other.test^$document"), url));
+        assert!(rule_has_document_option("@@||a^$all,document"));
+        assert!(!rule_has_document_option("@@||a^$domain=document.test"));
+        // end to end: the engine's own hides are what gets masked
+        let eng = e("@@||example.com^$document");
+        let mut c = eng.cosmetic_for(url);
+        assert!(!c.hide_selectors.is_empty());
+        let disabled = if document_excepted(&eng, url) {
+            ext_rules::target::ALL
+        } else {
+            0
+        };
+        c.injected_script = "s();".into();
+        mask_cosmetics(&mut c, disabled, Vec::new);
+        assert!(c.hide_selectors.is_empty() && c.injected_script.is_empty() && c.generichide);
+    }
+
+    #[test]
+    fn specifichide_uses_both_engines_generics_minus_page_exceptions() {
+        use super::{generic_hides, merge_cosmetics};
+        use filter_engine::overlay_from_rules;
+        let base = SharedEngine::new();
+        base.install(compile_engine(&[
+            "##[data-g-base]\n##[data-g-excepted]\nexample.com##.specific\n".to_string(),
+        ]));
+        let ov = overlay_from_rules("##[data-g-overlay]\nexample.com#@#[data-g-excepted]")
+            .unwrap()
+            .unwrap();
+        let url = "https://example.com/";
+        let mut c = base.cosmetic_for(url);
+        merge_cosmetics(&mut c, ov.cosmetic_for(url));
+        assert!(c.hide_selectors.iter().any(|s| s == ".specific"), "{c:?}");
+        mask_cosmetics(&mut c, ext_rules::target::SPECIFICHIDE, || {
+            generic_hides(&base, Some(&ov))
+        });
+        let mut got = c.hide_selectors.clone();
+        got.sort();
+        assert_eq!(got, ["[data-g-base]", "[data-g-overlay]"], "{c:?}");
+    }
+
+    #[test]
+    fn remove_true_is_a_remove_action() {
+        assert!(is_remove_style("remove: true"));
+        assert!(is_remove_style(" Remove:true; "));
+        assert!(!is_remove_style("remove: false"));
+        assert!(!is_remove_style("display: none"));
+    }
+}
+
+#[cfg(test)]
 mod cosmetic_merge_tests {
     use super::merge_cosmetics;
     use filter_engine::{compile_engine, overlay_from_rules, SharedEngine};
@@ -1998,6 +2571,40 @@ fn log_request(
         mode: event_mode(rctx),
         error_kind,
         cert_fp,
+    });
+}
+
+/// Request type of Argus's own `/__adblock__/*` and panel traffic: lets the log UI and API
+/// consumers tell it apart from the page's own requests.
+const INTERNAL_TYPE: &str = "internal";
+
+/// Record a request Argus answered itself (an internal endpoint, a refusal, a redirect stub):
+/// every request it serves or refuses is logged once, like the ones it forwards.
+#[allow(clippy::too_many_arguments)]
+fn log_local(
+    rctx: &RequestCtx,
+    action: filter_engine::EventAction,
+    method: &str,
+    url: &str,
+    source: &str,
+    rtype: &str,
+    status: u16,
+    rule: &str,
+) {
+    let profile = rctx.profile.load();
+    profile.engine.record_request(&filter_engine::EventRef {
+        action,
+        method,
+        url,
+        source_host: filter_engine::RequestMatcher::host_of(source),
+        request_type: rtype,
+        rule,
+        list_id: None,
+        client: Some(profile.label.as_ref()),
+        status: Some(status),
+        mode: event_mode(rctx),
+        error_kind: None,
+        cert_fp: None,
     });
 }
 

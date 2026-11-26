@@ -7,6 +7,8 @@
 //!
 //! CPU-bound: call from `spawn_blocking`, never from an async worker.
 
+use std::collections::HashSet;
+
 use adblock::filters::cosmetic::CosmeticFilter;
 use adblock::filters::network::{NetworkFilter, NetworkFilterMask};
 use adblock::lists::{parse_filter, FilterParseError, FilterSet, ParseOptions, ParsedFilter};
@@ -31,6 +33,12 @@ pub struct ListCompileStats {
     /// First [`MAX_ERRORS`] rejections as `(line in the converted rule text, reason)`.
     pub errors: Vec<(usize, String)>,
     pub ext_rules: Vec<ExtRule>,
+    /// `$redirect` / `$redirect-rule` rules naming a resource that is not loaded (only counted
+    /// when the known names were supplied, see [`compile_lists_checked`]). adblock-rust turns
+    /// such a redirect into a plain block.
+    pub redirect_missing: usize,
+    /// First few distinct missing resource names.
+    pub redirect_missing_names: Vec<String>,
 }
 
 /// A compiled engine.
@@ -57,6 +65,7 @@ fn parse_chunk(
     first_line: usize,
     lines: &[&str],
     permissions: PermissionMask,
+    known: Option<&HashSet<String>>,
 ) -> ChunkOut {
     let mut out = ChunkOut {
         list,
@@ -76,6 +85,27 @@ fn parse_chunk(
         };
         match parse_filter(line, true, opts) {
             Ok(ParsedFilter::Network(f)) => {
+                if let (Some(known), true) = (
+                    known,
+                    f.mask.contains(NetworkFilterMask::IS_REDIRECT)
+                        && !f.mask.contains(NetworkFilterMask::IS_EXCEPTION),
+                ) {
+                    if let Some(name) = f.modifier_option.as_deref() {
+                        // `name:priority` form.
+                        let name = match name.rsplit_once(':') {
+                            Some((n, p)) if p.bytes().all(|b| b.is_ascii_digit()) => n,
+                            _ => name,
+                        };
+                        if !known.contains(name) {
+                            out.stats.redirect_missing += 1;
+                            if out.stats.redirect_missing_names.len() < 8
+                                && !out.stats.redirect_missing_names.iter().any(|n| n == name)
+                            {
+                                out.stats.redirect_missing_names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
                 out.overrides |= f.mask.intersects(
                     NetworkFilterMask::IS_EXCEPTION
                         | NetworkFilterMask::IS_IMPORTANT
@@ -115,6 +145,16 @@ pub fn compile_lists(lists: &[&str]) -> Compiled {
 /// Rules of a trusted list may inject scriptlets that require trust (`trusted-*`); rules of any
 /// other list cannot, whatever the resource library holds.
 pub fn compile_lists_with(lists: &[&str], trusted: &[bool]) -> Compiled {
+    compile_lists_checked(lists, trusted, None)
+}
+
+/// Like [`compile_lists_with`]; with `known_redirects` (see [`crate::known_redirect_names`]) every
+/// `$redirect` naming an unknown resource is counted in [`ListCompileStats::redirect_missing`].
+pub fn compile_lists_checked(
+    lists: &[&str],
+    trusted: &[bool],
+    known_redirects: Option<&HashSet<String>>,
+) -> Compiled {
     let line_vecs: Vec<Vec<&str>> = lists.iter().map(|t| t.lines().collect()).collect();
     let chunks: Vec<(usize, usize, &[&str])> = line_vecs
         .iter()
@@ -133,7 +173,7 @@ pub fn compile_lists_with(lists: &[&str], trusted: &[bool]) -> Compiled {
             } else {
                 PermissionMask::default()
             };
-            parse_chunk(*li, *first, c, perm)
+            parse_chunk(*li, *first, c, perm, known_redirects)
         })
         .collect();
 
@@ -147,6 +187,12 @@ pub fn compile_lists_with(lists: &[&str], trusted: &[bool]) -> Compiled {
         s.cosmetic += o.stats.cosmetic;
         s.ext += o.stats.ext;
         s.rejected += o.stats.rejected;
+        s.redirect_missing += o.stats.redirect_missing;
+        for n in o.stats.redirect_missing_names {
+            if s.redirect_missing_names.len() < 8 && !s.redirect_missing_names.contains(&n) {
+                s.redirect_missing_names.push(n);
+            }
+        }
         s.ext_rules.extend(o.stats.ext_rules);
         for e in o.stats.errors {
             if s.errors.len() < MAX_ERRORS {

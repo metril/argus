@@ -243,6 +243,7 @@ update_interval_hours = 24
 allowed_fetch_destinations = []   # e.g. ["192.168.1.0/24", "nas.lan"]
 build_threads = 0               # list-build pool threads (parse/compile on a rebuild, low priority); 0 = half the cores
 recent_blocked_keep_query = false # strip query strings from the recent-blocked list (they can hold tokens)
+request_log_capacity = 1000 # request-log entries per ring (100 to 500000, about 1 KB each); live in Settings
 respect_no_transform = true # skip body rewriting when the origin sends Cache-Control: no-transform
 
 [userscripts]

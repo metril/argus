@@ -570,3 +570,57 @@ async fn saving_after_the_busy_web_port_frees_recovers_and_tracks_the_port() {
         "{body}"
     );
 }
+
+#[tokio::test]
+async fn stealth_settings_are_validated_persisted_and_applied_live() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let cell = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ::common::config::StealthSettings::default(),
+    ));
+    assert!(ctx.state.stealth.set(cell.clone()).is_ok());
+
+    // Off by default, with AdGuard's defaults for the options.
+    let v: Value = admin.get("/api/v1/config").await.json();
+    assert_eq!(v["stealth"]["enabled"], false);
+    assert_eq!(v["stealth"]["third_party_cookie_minutes"], 2880);
+    assert_eq!(v["stealth"]["block_webrtc"], false);
+    assert_eq!(v["stealth"]["block_push"], false);
+    assert_eq!(v["stealth"]["block_location"], false);
+    assert_eq!(v["stealth"]["strip_tracking_params"], false);
+    assert_eq!(v["stealth"]["block_third_party_auth"], false);
+
+    // Bad values are refused and change nothing.
+    for bad in [
+        json!({"mask_ip_address": "not-an-ip"}),
+        json!({"referer_custom": "not a url"}),
+        json!({"user_agent_custom": "a\nb"}),
+        json!({"user_agent_custom": "SomeBot/1.0"}),
+    ] {
+        let r = put(&admin, json!({ "stealth": bad })).await;
+        assert_eq!(r.status_code(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    assert!(!cell.load().enabled);
+
+    let r = put(
+        &admin,
+        json!({"stealth": {"enabled": true, "block_third_party_auth": true, "third_party_cookie_minutes": 5}}),
+    )
+    .await;
+    r.assert_status_ok();
+    let v: Value = r.json();
+    assert!(v["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a == "stealth"));
+    // Live in the proxy's cell, and saved to the overlay.
+    let live = cell.load();
+    assert!(live.enabled && live.block_third_party_auth && live.third_party_cookie_minutes == 5);
+    assert!(live.hide_referer, "omitted fields keep their value");
+    let saved = std::fs::read_to_string(&*ctx.state.overlay_path.read()).unwrap();
+    assert!(
+        saved.contains("[stealth]") && saved.contains("third_party_cookie_minutes = 5"),
+        "{saved}"
+    );
+}

@@ -8,6 +8,7 @@ use crate::headers::is_removable_header;
 use crate::hls::HlsPrune;
 use crate::jsonprune::JsonPrune;
 use crate::pattern::Pattern;
+use crate::removeparam::RemoveParam;
 use crate::replace::ReplaceSpec;
 use crate::util::{host_is_or_under, DomainSet};
 use crate::xmlprune::XmlPrune;
@@ -29,7 +30,13 @@ pub mod target {
     pub const SNIPPET: u32 = 1 << 12;
     pub const SCRIPTLET: u32 = 1 << 13;
     pub const PCSS: u32 = 1 << 14;
-    pub const ALL: u32 = (1 << 15) - 1;
+    /// `$specifichide`: switches off the page's host-specific element hiding.
+    pub const SPECIFICHIDE: u32 = 1 << 15;
+    pub const REMOVEPARAM: u32 = 1 << 16;
+    /// Exception only: `$stealth`. Not part of [`ALL`] (a `$document` exception leaves Stealth
+    /// Mode on).
+    pub const STEALTH: u32 = 1 << 17;
+    pub const ALL: u32 = (1 << 17) - 1;
 }
 
 /// Stage bits: when a rule is evaluated.
@@ -286,6 +293,8 @@ pub enum Action {
     /// `Permissions-Policy` directives to add.
     Permissions(String),
     UrlTransform(ReplaceSpec),
+    /// `$removeparam` (regex, negated or bare forms).
+    RemoveParam(RemoveParam),
     /// Block when a response header matches.
     Header(HeaderMatch),
     HtmlRemove(HtmlRemoval),
@@ -311,6 +320,7 @@ impl Action {
             Self::Cookie(_) => COOKIE,
             Self::Permissions(_) => PERMISSIONS,
             Self::UrlTransform(_) => URLTRANSFORM,
+            Self::RemoveParam(_) => REMOVEPARAM,
             Self::Header(_) => HEADER,
             Self::HtmlRemove(_) => HTML,
             Self::Inject(Injection::Script(_)) => JS,
@@ -506,6 +516,7 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
     let (mut m_in, mut m_out) = (Vec::new(), Vec::new());
     let mut popup = false;
     let mut scope_mask = 0u32;
+    let mut stealth_val = String::new();
     // (target, value, compiled-lazily action builder input)
     let mut act: Option<(String, String)> = None;
 
@@ -562,10 +573,18 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
             "all" => incl = T_ALL,
             "content" if exception => scope_mask |= REPLACE | HTML | HLS | JSONPRUNE | XMLPRUNE,
             "jsinject" if exception => scope_mask |= JS | SCRIPTLET | SNIPPET,
-            "elemhide" | "ehide" if exception => scope_mask |= PCSS | HTML,
-            "urlblock" if exception => scope_mask |= BLOCK | URLTRANSFORM,
+            "elemhide" | "ehide" if exception => scope_mask |= PCSS | HTML | SPECIFICHIDE,
+            "specifichide" | "shide" if exception => scope_mask |= SPECIFICHIDE,
+            "urlblock" if exception => scope_mask |= BLOCK | URLTRANSFORM | REMOVEPARAM,
+            "stealth" if exception && !neg => {
+                if crate::stealth::parse_value(val.unwrap_or("")).is_none() {
+                    return inv("unknown $stealth option");
+                }
+                stealth_val = val.unwrap_or("").to_ascii_lowercase();
+                scope_mask |= STEALTH;
+            }
             "replace" | "jsonprune" | "xmlprune" | "hls" | "cookie" | "removeheader"
-            | "permissions" | "urltransform" | "header" => {
+            | "permissions" | "urltransform" | "header" | "removeparam" => {
                 if neg {
                     return inv("action modifiers cannot be negated");
                 }
@@ -578,7 +597,7 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 if let Some(b) = type_bit(n) {
                     if exception && b == T_DOC && !neg {
                         // `@@...$document` lifts every rule on the page (AdGuard KB "$document").
-                        scope_mask = ALL;
+                        scope_mask |= ALL;
                     }
                     if neg {
                         excl |= b
@@ -604,6 +623,9 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                     BLOCK | HEADER
                 };
                 stage = STAGE_REQ | STAGE_RESP;
+                if mask & STEALTH != 0 {
+                    value = stealth_val.clone();
+                }
                 Action::Disable { mask }
             } else {
                 if scope_mask != 0 {
@@ -623,11 +645,12 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 "removeheader" => REMOVEHEADER,
                 "permissions" => PERMISSIONS,
                 "urltransform" => URLTRANSFORM,
+                "removeparam" => REMOVEPARAM,
                 _ => HEADER,
             };
             let (req_side, resp_side) = match name.as_str() {
                 "cookie" => (true, true),
-                "urltransform" => (true, false),
+                "urltransform" | "removeparam" => (true, false),
                 "removeheader" => (
                     v.to_ascii_lowercase().starts_with("request:"),
                     !v.to_ascii_lowercase().starts_with("request:"),
@@ -654,6 +677,9 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                     "urltransform" => {
                         need_val()?;
                         Action::UrlTransform(ReplaceSpec::parse(v).map_err(unsupported_or_invalid)?)
+                    }
+                    "removeparam" => {
+                        Action::RemoveParam(RemoveParam::parse(v).map_err(unsupported_or_invalid)?)
                     }
                     "jsonprune" => Action::JsonPrune(
                         JsonPrune::parse(&v.replace("\\$", "$")).map_err(unsupported_or_invalid)?,
@@ -1123,6 +1149,23 @@ mod tests {
 
     fn p(raw: &str) -> Result<ParsedRule, RuleError> {
         parse_rule(&ExtRule::new(ExtKind::Other, raw))
+    }
+
+    #[test]
+    fn document_keeps_stealth_in_either_order() {
+        for raw in [
+            "@@||x.test^$stealth,document",
+            "@@||x.test^$document,stealth",
+        ] {
+            let r = p(raw).unwrap();
+            let Action::Disable { mask } = r.action else {
+                panic!("{raw}")
+            };
+            assert!(
+                mask & target::STEALTH != 0 && mask & target::BLOCK != 0,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

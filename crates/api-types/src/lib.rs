@@ -255,6 +255,19 @@ pub struct ProxyConfigResponse {
     /// Source of the signed first-party lists.
     #[serde(default)]
     pub bypass: BypassSourceDto,
+    /// Opt in: keep service workers from bypassing the injection on filtered sites (replaces
+    /// their script with a self-unregistering no-op worker; offline apps and push stop working).
+    #[serde(default)]
+    pub guard_service_workers: bool,
+    /// Hosts (exact or `*.suffix`) the guard leaves alone.
+    #[serde(default)]
+    pub guard_service_workers_exempt: Vec<String>,
+    /// Stealth Mode.
+    #[serde(default)]
+    pub stealth: StealthDto,
+    /// Entries kept by the request log (per ring, about 1 KB each).
+    #[serde(default = "default_request_log_capacity")]
+    pub request_log_capacity: u32,
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
@@ -379,6 +392,63 @@ pub struct BypassSourceDto {
 pub struct BypassSourceUpdate {
     pub lists_base_url: Option<String>,
     pub lists_public_key: Option<String>,
+}
+
+/// Stealth Mode settings (AdGuard parity). Off as a whole until `enabled`; each option then
+/// follows its own switch. See the Settings page for what each one does and may break.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct StealthDto {
+    pub enabled: bool,
+    pub hide_search_queries: bool,
+    pub send_dnt: bool,
+    pub strip_tracking_params: bool,
+    pub hide_referer: bool,
+    pub referer_custom: String,
+    pub hide_user_agent: bool,
+    pub user_agent_custom: String,
+    pub mask_ip: bool,
+    pub mask_ip_address: String,
+    pub remove_x_client_data: bool,
+    pub third_party_cookies: bool,
+    pub third_party_cookie_minutes: u32,
+    pub first_party_cookies: bool,
+    pub first_party_cookie_minutes: u32,
+    pub block_etag: bool,
+    pub block_third_party_auth: bool,
+    pub block_webrtc: bool,
+    pub block_push: bool,
+    pub block_location: bool,
+    pub block_flash: bool,
+    pub block_java: bool,
+}
+
+/// Partial update of [`StealthDto`]; omitted fields keep their value. Applied live.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct StealthUpdate {
+    pub enabled: Option<bool>,
+    pub hide_search_queries: Option<bool>,
+    pub send_dnt: Option<bool>,
+    pub strip_tracking_params: Option<bool>,
+    pub hide_referer: Option<bool>,
+    pub referer_custom: Option<String>,
+    pub hide_user_agent: Option<bool>,
+    pub user_agent_custom: Option<String>,
+    pub mask_ip: Option<bool>,
+    pub mask_ip_address: Option<String>,
+    pub remove_x_client_data: Option<bool>,
+    pub third_party_cookies: Option<bool>,
+    pub third_party_cookie_minutes: Option<u32>,
+    pub first_party_cookies: Option<bool>,
+    pub first_party_cookie_minutes: Option<u32>,
+    pub block_etag: Option<bool>,
+    pub block_third_party_auth: Option<bool>,
+    pub block_webrtc: Option<bool>,
+    pub block_push: Option<bool>,
+    pub block_location: Option<bool>,
+    pub block_flash: Option<bool>,
+    pub block_java: Option<bool>,
 }
 
 /// A listener's effective switches (its own setting, else the global one).
@@ -506,6 +576,20 @@ pub struct UpdateProxyConfigRequest {
     pub webui_port: Option<u16>,
     /// Source of the signed first-party lists; applied live.
     pub bypass: Option<BypassSourceUpdate>,
+    /// Neutralise service workers on filtered sites; applied live.
+    pub guard_service_workers: Option<bool>,
+    /// Replaces the guard's exempt host list; applied live.
+    pub guard_service_workers_exempt: Option<Vec<String>>,
+    /// Stealth Mode settings; applied live.
+    pub stealth: Option<StealthUpdate>,
+    /// Entries kept by the request log (100 to 500000); applied live, keeping the newest when
+    /// it shrinks.
+    #[cfg_attr(feature = "server", validate(range(min = 100, max = 500000)))]
+    pub request_log_capacity: Option<u32>,
+}
+
+fn default_request_log_capacity() -> u32 {
+    1000
 }
 
 /// Connection statistics.

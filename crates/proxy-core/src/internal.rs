@@ -37,13 +37,26 @@ const TOKEN_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Number of generated scriptlet bundles kept for the pages that reference them.
 const SCRIPTLET_CACHE: u64 = 2048;
 
-const BOOT_JS: &str = include_str!("../assets/boot.js");
+/// The boot script: the procedural engine (`procedural.js`) and the boot logic (`boot.js`) in one
+/// function scope, so neither leaks a global into the page.
+const BOOT_JS: &str = concat!(
+    "(function(){\n",
+    include_str!("../assets/procedural.js"),
+    "\n",
+    include_str!("../assets/boot.js"),
+    "\n})();\n"
+);
 
 static BOOT: LazyLock<(String, String)> = LazyLock::new(|| {
     let hash = short_hash(BOOT_JS.as_bytes());
     let path = format!("{}boot.{hash}.js", crate::csp::INTERNAL_PREFIX);
     (hash, path)
 });
+
+/// The boot script's source (procedural engine + boot logic).
+pub fn boot_script() -> &'static str {
+    BOOT_JS
+}
 
 /// Path of the content-hashed `boot.js` for this build.
 pub fn boot_path() -> &'static str {

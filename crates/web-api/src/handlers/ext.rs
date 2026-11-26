@@ -159,6 +159,9 @@ struct Hello {
     token: String,
     #[serde(default)]
     v: u32,
+    /// The `sid` of a session this channel takes over (worker restart, dropped socket).
+    #[serde(default)]
+    resume: Option<String>,
 }
 
 /// Validate a hello: the token is live, its owner is enabled, and it holds the bridge scope
@@ -188,6 +191,23 @@ fn identify(state: &AppState, token: &str) -> Result<ExtIdent, u16> {
 
 /// How many pings pass between token re-verifications of a live channel.
 const REVERIFY_PINGS: u32 = 3;
+
+impl AppState {
+    /// The same checks a `hello` makes, for a stored token id (restoring persisted sessions).
+    pub fn ext_token_ok(&self, token_id: &str) -> bool {
+        let Some(t) = self.tokens.get(token_id) else {
+            return false;
+        };
+        self.tokens.is_live(token_id)
+            && t.stored.scopes.contains(&Scope::UserscriptsBridge)
+            && self
+                .session_store
+                .get_user(&t.stored.created_by)
+                .ok()
+                .flatten()
+                .is_some_and(|u| u.enabled && u.role.scopes().contains(&Scope::UserscriptsBridge))
+    }
+}
 
 /// [`identify`] without marking the token used.
 fn identify_quiet(state: &AppState, token: &str) -> Result<(), u16> {
@@ -224,8 +244,15 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
         Err(code) => return close_with(sock, code, "refused").await,
     };
     let user = ident.user.clone();
-    let (id, sid, mut out) = b.open(ident);
-    let welcome = serde_json::json!({"t": "welcome", "sid": sid, "v": 1}).to_string();
+    let resumed = hello
+        .resume
+        .as_deref()
+        .filter(|r| r.len() <= 128)
+        .and_then(|r| b.resume(&ident, r));
+    let was_resumed = resumed.is_some();
+    let (id, sid, mut out) = resumed.unwrap_or_else(|| b.open(ident));
+    let welcome =
+        serde_json::json!({"t": "welcome", "sid": sid, "v": 1, "resumed": was_resumed}).to_string();
     if sock.send(Message::Text(welcome.into())).await.is_err() {
         b.close(id);
         return;
@@ -240,10 +267,18 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
     }
     state.record_ext_audit(ExtAuditEvent {
         actor: user.clone(),
-        action: "session_open".into(),
+        action: if was_resumed {
+            "session_resume"
+        } else {
+            "session_open"
+        }
+        .into(),
         target: Some(id.to_string()),
     });
     let mut pings = 0u32;
+    // Ends the session for good (revoked, evicted, or the extension said `bye`); otherwise a
+    // dropped channel leaves it in its grace period.
+    let mut hard = false;
     loop {
         tokio::select! {
             o = out.recv() => match o {
@@ -251,6 +286,7 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
                 Some(ExtOut::Binary(v)) => if sock.send(Message::Binary(v.into())).await.is_err() { break },
                 Some(ExtOut::Close(code)) => {
                     let _ = sock.send(Message::Close(Some(CloseFrame { code, reason: "closed".into() }))).await;
+                    hard = true;
                     break;
                 }
                 None => break,
@@ -264,8 +300,13 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
                         pings += 1;
                         if pings.is_multiple_of(REVERIFY_PINGS) && identify_quiet(&state, &hello.token).is_err() {
                             let _ = sock.send(Message::Close(Some(CloseFrame { code: CLOSE_BAD_TOKEN, reason: "revoked".into() }))).await;
+                            hard = true;
                             break;
                         }
+                    }
+                    if t.len() < 64 && t.contains("\"bye\"") {
+                        hard = true;
+                        break;
                     }
                     b.on_text(id, &t).await
                 }
@@ -274,11 +315,21 @@ async fn run_channel(state: Arc<AppState>, b: Arc<dyn ExtBridge>, mut sock: WebS
             },
         }
     }
-    b.close(id);
+    drop(out);
+    if hard {
+        b.close(id);
+    } else {
+        b.detach(id);
+    }
     debug!("extension channel {id} closed");
     state.record_ext_audit(ExtAuditEvent {
         actor: user,
-        action: "session_close".into(),
+        action: if hard {
+            "session_close"
+        } else {
+            "session_detach"
+        }
+        .into(),
         target: Some(id.to_string()),
     });
 }

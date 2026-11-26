@@ -27,7 +27,9 @@ mod pattern;
 mod permissions;
 /// Merge `Permissions-Policy` headers restrictively (never widening the site's own).
 pub use permissions::merge as merge_permissions_policy;
+mod removeparam;
 mod replace;
+pub mod stealth;
 mod style;
 mod types;
 mod util;
@@ -45,6 +47,7 @@ pub use parse::{
     parse_rule, target, Action, HeaderMatch, HtmlRemoval, Injection, ParsedRule, RuleError,
     TextPred, DEFAULT_MAX_ELEMENT_LEN,
 };
+pub use removeparam::{apply as apply_removeparam, restore_exempt, RemoveParam};
 pub use replace::{apply_replace, is_textual_content_type, ReplaceSpec, MAX_REPLACE_BYTES};
 pub use style::is_safe_style;
 pub use types::{

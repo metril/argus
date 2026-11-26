@@ -36,6 +36,17 @@ pub const RELAY_HEADER: &str = "x-argus-relay";
 
 /// Concurrent sessions per bridge token (the oldest is closed beyond it).
 pub const MAX_SESSIONS_PER_TOKEN: usize = 8;
+/// How long a session whose channel dropped stays valid for the extension listener (and
+/// resumable by its token) before it is closed.
+pub const RESUME_GRACE: Duration = Duration::from_secs(120);
+/// Session changes are written to disk this long after the first one.
+const PERSIST_DEBOUNCE_MS: u64 = 1000;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 /// Concurrent jobs per session.
 pub const MAX_JOBS_PER_SESSION: usize = 32;
 /// Documents with a menu record per session (that session's oldest is evicted first).
@@ -94,6 +105,15 @@ fn rand_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
     rand::rngs::OsRng.fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn hash_sid(sid: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(sid.as_bytes()).into()
+}
+
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Constant-time equality of two strings (length is not secret here).
@@ -236,7 +256,10 @@ pub fn is_local_target(host: &str) -> bool {
 // ---- state ----------------------------------------------------------------------------------
 
 struct Session {
-    sid: String,
+    /// SHA-256 of the session secret: the raw `sid` is never kept (nor written to disk).
+    sid_hash: [u8; 32],
+    /// The token's profile restriction as given (kept to persist and rebuild the session).
+    ident_profiles: Option<Vec<String>>,
     token_id: String,
     user: String,
     /// Namespaces the session's token may serve (`None`: all).
@@ -252,6 +275,8 @@ struct Session {
     ndocs: usize,
     /// Pings received (the channel re-verifies its token every [`REVERIFY_PINGS`]).
     pings: u32,
+    /// Set while the channel is down: the session lives (for proxy auth and resume) until then.
+    grace_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +395,8 @@ pub struct ExtHub {
     auditor: OnceLock<Arc<SecurityAuditor>>,
     /// Where the extension's proxy listener is (host if specific, port; 0 = off).
     proxy: Mutex<(Option<String>, u16)>,
+    persist: OnceLock<std::path::PathBuf>,
+    write_pending: AtomicBool,
     ev_gate: OnceLock<Arc<dyn EvGate>>,
     /// Is the extension listener decrypting right now (global MITM on and the listener's own
     /// switch on)? Mirrors `ConnectionHandler::intercepts`.
@@ -399,6 +426,8 @@ impl ExtHub {
             audit: OnceLock::new(),
             auditor: OnceLock::new(),
             proxy: Mutex::new((None, 0)),
+            persist: OnceLock::new(),
+            write_pending: AtomicBool::new(false),
             ev_gate: OnceLock::new(),
             mitm_probe: OnceLock::new(),
             own_guard: OnceLock::new(),
@@ -528,20 +557,9 @@ impl ExtHub {
     /// Register a session; returns `(id, sid, frames to send)`. Closes the token's oldest
     /// session beyond [`MAX_SESSIONS_PER_TOKEN`].
     pub fn open(&self, ident: ExtIdent) -> (u64, String, mpsc::Receiver<ExtOut>) {
+        self.reap();
         let (tx, rx) = mpsc::channel(256);
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
         let sid = rand_hex(16);
-        let pinned = ident
-            .profiles
-            .as_ref()
-            .and_then(|v| v.first())
-            .and_then(|p| p.parse::<u64>().ok());
-        let profiles = ident.profiles.map(|v| {
-            v.iter()
-                .filter_map(|p| p.parse::<u64>().ok())
-                .map(common::profile_store::namespace)
-                .collect::<Vec<_>>()
-        });
         let mut g = self.inner.lock();
         let mine: Vec<(u64, Instant)> = g
             .sessions
@@ -556,10 +574,37 @@ impl ExtHub {
                 }
             }
         }
+        let id = self.insert_session(&mut g, ident, hash_sid(&sid), tx, None);
+        drop(g);
+        self.mark_dirty();
+        (id, sid, rx)
+    }
+
+    fn insert_session(
+        &self,
+        g: &mut Inner,
+        ident: ExtIdent,
+        sid_hash: [u8; 32],
+        tx: mpsc::Sender<ExtOut>,
+        grace_until: Option<Instant>,
+    ) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let pinned = ident
+            .profiles
+            .as_ref()
+            .and_then(|v| v.first())
+            .and_then(|p| p.parse::<u64>().ok());
+        let profiles = ident.profiles.clone().map(|v| {
+            v.iter()
+                .filter_map(|p| p.parse::<u64>().ok())
+                .map(common::profile_store::namespace)
+                .collect::<Vec<_>>()
+        });
         g.sessions.insert(
             id,
             Session {
-                sid: sid.clone(),
+                sid_hash,
+                ident_profiles: ident.profiles,
                 token_id: ident.token_id,
                 user: ident.user,
                 profiles,
@@ -571,9 +616,234 @@ impl ExtHub {
                 opened: Instant::now(),
                 ndocs: 0,
                 pings: 0,
+                grace_until,
             },
         );
-        (id, sid, rx)
+        id
+    }
+
+    // ---- persistence across a restart -----------------------------------------------------
+
+    /// Where the sessions (hashes only) are kept so a restarted Argus accepts the browser's
+    /// sessions again.
+    pub fn set_persist_path(&self, p: std::path::PathBuf) {
+        let _ = self.persist.set(p);
+    }
+
+    fn mark_dirty(&self) {
+        if self.persist.get().is_none() || self.write_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(me) = self.me.upgrade() else {
+            self.write_pending.store(false, Ordering::Release);
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.write_pending.store(false, Ordering::Release);
+            return;
+        };
+        rt.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(PERSIST_DEBOUNCE_MS)).await;
+            me.write_pending.store(false, Ordering::Release);
+            me.persist_now();
+        });
+    }
+
+    /// Write the live and grace sessions now (atomically, mode 0600). Also on shutdown.
+    pub fn persist_now(&self) {
+        let Some(path) = self.persist.get() else {
+            return;
+        };
+        self.reap();
+        let now = unix_now();
+        let inst = Instant::now();
+        let rows: Vec<serde_json::Value> = {
+            let g = self.inner.lock();
+            g.sessions
+                .values()
+                .map(|s| {
+                    // live: a full grace from now; in grace: the real remaining time
+                    let exp = now
+                        + s.grace_until.map_or(RESUME_GRACE.as_secs(), |t| {
+                            t.saturating_duration_since(inst).as_secs()
+                        });
+                    serde_json::json!({
+                        "sid_sha256": s.sid_hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "token_id": s.token_id,
+                        "user": s.user,
+                        "profiles": s.ident_profiles,
+                        "expires": exp,
+                    })
+                })
+                .collect()
+        };
+        let body = serde_json::json!({"v": 1, "sessions": rows}).to_string();
+        let tmp = path.with_extension("tmp");
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)
+        };
+        if let Err(e) = write() {
+            tracing::warn!("could not persist extension sessions: {e}");
+        }
+    }
+
+    /// Reload the persisted sessions as grace sessions (they live [`RESUME_GRACE`] from now),
+    /// except those whose token `token_live` no longer accepts. Returns how many came back.
+    pub fn restore(&self, token_live: &dyn Fn(&str) -> bool) -> usize {
+        let Some(path) = self.persist.get() else {
+            return 0;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return 0;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return 0;
+        };
+        let now = unix_now();
+        let mut n = 0;
+        let mut g = self.inner.lock();
+        for r in v
+            .get("sessions")
+            .and_then(|s| s.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let (Some(h), Some(token_id), Some(user)) = (
+                r.get("sid_sha256").and_then(|x| x.as_str()),
+                r.get("token_id").and_then(|x| x.as_str()),
+                r.get("user").and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            let Some(exp) = r
+                .get("expires")
+                .and_then(|x| x.as_u64())
+                .filter(|e| *e > now)
+            else {
+                continue;
+            };
+            if !token_live(token_id) || h.len() != 64 {
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            let ok = (0..32).all(|i| {
+                u8::from_str_radix(&h[2 * i..2 * i + 2], 16)
+                    .map(|b| hash[i] = b)
+                    .is_ok()
+            });
+            if !ok {
+                continue;
+            }
+            let profiles = r.get("profiles").and_then(|p| p.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+            let (tx, _rx) = mpsc::channel(1); // no channel: dropped receiver, so `detach` semantics hold
+            self.insert_session(
+                &mut g,
+                ExtIdent {
+                    token_id: token_id.into(),
+                    user: user.into(),
+                    profiles,
+                },
+                hash,
+                tx,
+                // never longer than the file says, never longer than a full grace
+                Some(Instant::now() + Duration::from_secs((exp - now).min(RESUME_GRACE.as_secs()))),
+            );
+            n += 1;
+        }
+        n
+    }
+
+    /// The channel of session `id` is gone (network drop, worker restart): keep the session for
+    /// [`RESUME_GRACE`] so the browser's connections stay valid and the extension can resume it.
+    /// No-op when a resume already replaced the channel. Its jobs fail now.
+    pub fn detach(&self, id: u64) {
+        let mut g = self.inner.lock();
+        let Some(s) = g.sessions.get_mut(&id) else {
+            return;
+        };
+        if !s.tx.is_closed() {
+            return;
+        }
+        s.grace_until = Some(Instant::now() + RESUME_GRACE);
+        for (tx, _) in s.jobs.drain().map(|(_, v)| v) {
+            let _ = tx.try_send(JobEvent::Error(
+                br#"{"kind":"network","code":"network","message":"extension disconnected"}"#
+                    .to_vec(),
+            ));
+        }
+        for d in g.docs.values_mut().filter(|d| d.session == id) {
+            for m in d.menus.values() {
+                m.wake.notify_waiters();
+            }
+        }
+        self.mark_dirty();
+    }
+
+    /// Reattach a new channel to the live or grace session `sid` of the same token (same `sid`
+    /// kept). `None`: unknown, expired or another token's.
+    pub fn resume(
+        &self,
+        ident: &ExtIdent,
+        sid: &str,
+    ) -> Option<(u64, String, mpsc::Receiver<ExtOut>)> {
+        self.reap();
+        let mut g = self.inner.lock();
+        let mut found = None;
+        for (id, s) in &g.sessions {
+            // Both compares always run (no early exit on the first mismatch).
+            let a = ct_eq_bytes(&s.sid_hash, &hash_sid(sid));
+            let b = ct_eq(&s.token_id, &ident.token_id);
+            if a & b {
+                found = Some(*id);
+            }
+        }
+        let id = found?;
+        let (tx, rx) = mpsc::channel(256);
+        let s = g.sessions.get_mut(&id)?;
+        s.tx = tx; // the previous channel (if any) sees its queue end and stops
+        s.grace_until = None;
+        drop(g);
+        self.mark_dirty();
+        Some((id, sid.to_string(), rx))
+    }
+
+    /// Close the sessions whose grace ran out.
+    fn reap(&self) {
+        let now = Instant::now();
+        let dead: Vec<(u64, String)> = {
+            let g = self.inner.lock();
+            g.sessions
+                .iter()
+                .filter(|(_, s)| s.grace_until.is_some_and(|t| t <= now))
+                .map(|(i, s)| (*i, s.user.clone()))
+                .collect()
+        };
+        for (id, user) in dead {
+            self.close(id);
+            self.audit(&user, "session_expire", Some(id.to_string()));
+        }
+    }
+
+    /// Test hook: make a session's grace run out now.
+    #[doc(hidden)]
+    pub fn expire_grace_for_test(&self, id: u64) {
+        if let Some(s) = self.inner.lock().sessions.get_mut(&id) {
+            s.grace_until = Some(Instant::now());
+        }
     }
 
     /// Forget a session: its jobs fail, its documents stop being served by it.
@@ -599,6 +869,7 @@ impl ExtHub {
             let _ = r;
             true
         });
+        self.mark_dirty();
     }
 
     /// Close every live session of token `token_id` at once (the token was revoked or expired,
@@ -622,20 +893,24 @@ impl ExtHub {
     }
 
     pub fn is_live(&self, id: u64) -> bool {
+        self.reap();
         self.inner.lock().sessions.contains_key(&id)
     }
 
     pub fn session_count(&self) -> usize {
+        self.reap();
         self.inner.lock().sessions.len()
     }
 
     /// Authenticate the credentials of the extension's proxy listener: the session whose `sid`
     /// is `sid` (constant-time compare against every live session). Nothing else is consulted.
     pub fn authenticate(&self, sid: &str) -> Option<u64> {
+        self.reap();
+        let h = hash_sid(sid);
         let g = self.inner.lock();
         let mut found = None;
         for (id, s) in &g.sessions {
-            if ct_eq(&s.sid, sid) {
+            if ct_eq_bytes(&s.sid_hash, &h) {
                 found = Some(*id);
             }
         }
@@ -680,10 +955,11 @@ impl ExtHub {
 
     /// The session of `sid` belonging to token `token_id` (for the web API).
     pub fn session_for(&self, sid: &str, token_id: &str) -> Option<u64> {
+        let h = hash_sid(sid);
         let g = self.inner.lock();
         let mut found = None;
         for (id, s) in &g.sessions {
-            if ct_eq(&s.sid, sid) && s.token_id == token_id {
+            if ct_eq_bytes(&s.sid_hash, &h) && s.token_id == token_id {
                 found = Some(*id);
             }
         }
@@ -1121,7 +1397,7 @@ impl ExtHub {
             return Route::Jar(Fallback::NoDocument);
         };
         let sid = d.session;
-        let Some(s) = g.sessions.get(&sid) else {
+        let Some(s) = g.sessions.get(&sid).filter(|s| s.grace_until.is_none()) else {
             return Route::Jar(Fallback::Dead);
         };
         // The relay's per-hop check runs in the proxy, so it works only on traffic the proxy
@@ -1195,6 +1471,7 @@ impl ExtHub {
             let s = g
                 .sessions
                 .get_mut(&session)
+                .filter(|s| s.grace_until.is_none())
                 .ok_or_else(|| GmError::new(ErrorCode::Internal, "extension session is gone"))?;
             if s.jobs.len() >= MAX_JOBS_PER_SESSION {
                 return Err(GmError::new(ErrorCode::QuotaExceeded, "too many jobs"));

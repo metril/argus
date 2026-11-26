@@ -70,8 +70,8 @@ describe('Bridge', () => {
     await b.stop();
   });
 
-  it('the proxy message configures the browser proxy; disconnect clears it', async () => {
-    const proxy = { setSid: vi.fn(async () => {}), setServer: vi.fn(async () => {}) };
+  it('the proxy message configures the browser proxy; disconnect keeps it (fail closed)', async () => {
+    const proxy = { setSid: vi.fn(async () => {}), setServer: vi.fn(async () => {}), release: vi.fn(async () => {}), resumeSid: () => null };
     const { b } = setup({ proxy });
     const ws = await welcome(b);
     expect(proxy.setSid).toHaveBeenLastCalledWith(SID);
@@ -83,6 +83,22 @@ describe('Bridge', () => {
     expect(proxy.setSid).toHaveBeenLastCalledWith(null);
     expect(b.status().connected).toBe(false);
     await b.stop();
+  });
+
+  it('hello asks to resume the last session; sign-out says bye and releases the proxy', async () => {
+    let last: string | null = 'old'.repeat(10);
+    const proxy = { setSid: vi.fn(async (s: string | null) => { if (s) last = s; }), setServer: vi.fn(async () => {}), release: vi.fn(async () => {}), resumeSid: () => last };
+    const { b } = setup({ proxy });
+    await b.connect();
+    FakeWS.last.open();
+    expect(FakeWS.last.texts()[0]).toMatchObject({ t: 'hello', resume: 'old'.repeat(10) });
+    FakeWS.last.recv(JSON.stringify({ t: 'welcome', sid: SID, v: 1, resumed: false }));
+    await tick();
+    expect(proxy.setSid).toHaveBeenLastCalledWith(SID);
+    const ws = FakeWS.last;
+    await b.stop();
+    expect(ws.texts().at(-1)).toEqual({ t: 'bye' });
+    expect(proxy.release).toHaveBeenCalled();
   });
 
   it('job without host permission yields error frame', async () => {
@@ -242,7 +258,7 @@ describe('Bridge', () => {
   });
 
   it('a container job fetches without the default cookies, with the marker, through the store relay', async () => {
-    const proxy = { setSid: async () => {}, setServer: async () => {}, storeForToken: (t: string) => (t === 'tok1' ? 'firefox-container-1' : undefined) };
+    const proxy = { setSid: async () => {}, setServer: async () => {}, release: async () => {}, resumeSid: () => null, storeForToken: (t: string) => (t === 'tok1' ? 'firefox-container-1' : undefined) };
     let seen: any;
     const f = vi.fn(async (_u: string, init: any) => { seen = init; return new Response('ok'); });
     const { b, br } = setup({ fetch: f, proxy });
@@ -266,7 +282,7 @@ describe('Bridge', () => {
   });
 
   it('a container cookie job reads and writes that store only', async () => {
-    const proxy = { setSid: async () => {}, setServer: async () => {}, storeForToken: (t: string) => (t === 'tok1' ? 'firefox-container-1' : undefined) };
+    const proxy = { setSid: async () => {}, setServer: async () => {}, release: async () => {}, resumeSid: () => null, storeForToken: (t: string) => (t === 'tok1' ? 'firefox-container-1' : undefined) };
     const { b, br } = setup({ proxy });
     br.cookies.getAll.mockResolvedValue([{ name: 'a', value: '1', domain: 'a.com', path: '/', httpOnly: false }] as any);
     const ws = await welcome(b);
