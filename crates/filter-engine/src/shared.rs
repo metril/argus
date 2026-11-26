@@ -567,8 +567,9 @@ impl SharedEngine {
         self.site_off_with(&Self::site_probe(page_url))
     }
 
-    /// Does an exception (`@@||host^$document` and the like) cover the document at `url`? Also
-    /// returns the generation judged, so a caller can consult its ext index without a race.
+    /// Does a `@@...$document` exception (the option itself; a plain `@@||host^` does not count)
+    /// cover the document at `url`? Also returns the generation judged, so a caller can consult
+    /// its ext index without a race.
     pub fn document_excepted(&self, url: &str) -> (bool, Arc<Generation>) {
         let guard = self.engine.load();
         let hit = self.enabled.load(Ordering::Relaxed)
@@ -577,7 +578,8 @@ impl SharedEngine {
                     .engine
                     .check_network_request_subset(&r, true, true)
                     .exception
-                    .is_some()
+                    .as_deref()
+                    .is_some_and(rule_has_document_option)
             });
         (hit, arc_swap::Guard::into_inner(guard))
     }
@@ -983,6 +985,15 @@ impl<'a> Query<'a> {
 pub fn compile_engine(list_contents: &[String]) -> Vec<u8> {
     let refs: Vec<&str> = list_contents.iter().map(String::as_str).collect();
     compile_lists(&refs).blob
+}
+
+/// Does the exception rule carry the `$document` / `$doc` option?
+pub fn rule_has_document_option(rule: &str) -> bool {
+    let Some((_, opts)) = rule.rsplit_once('$') else {
+        return false;
+    };
+    opts.split(',')
+        .any(|o| matches!(o.trim(), "document" | "doc"))
 }
 
 #[cfg(test)]

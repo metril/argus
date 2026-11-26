@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ProxyController, REALM, statusKind } from '../lib/proxy';
+import { ProxyController, REALM, sessionKey, statusKind } from '../lib/proxy';
 import { parseSetCookie, storeSetCookies } from '../lib/setcookie';
 import { JOB_HEADER, StoreRelay } from '../lib/storerelay';
 import { isBroad } from '../lib/grants';
@@ -420,5 +420,12 @@ describe('ProxyController (fail closed, persisted session)', () => {
     await d.c.init();
     await d.c.setServer(null, 0);
     expect(d.settings.clear).toHaveBeenCalled();
+  });
+});
+
+describe('session storage key', () => {
+  it('keeps a split-incognito instance off the regular instance\'s sid', () => {
+    expect(sessionKey({ extension: { inIncognitoContext: true } })).not.toBe(sessionKey({ extension: { inIncognitoContext: false } }));
+    expect(sessionKey({})).toBe(sessionKey(undefined));
   });
 });

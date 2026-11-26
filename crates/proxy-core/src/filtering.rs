@@ -201,25 +201,8 @@ fn generic_hides(
     c.hide_selectors
 }
 
-/// Does a `@@...$document` exception (the option, not merely a matching `@@||host^`) cover this
-/// page in `engine`? adblock-rust accepts the rule, so it is asked directly with a document request.
 fn document_excepted(engine: &filter_engine::SharedEngine, url: &str) -> bool {
-    let q = filter_engine::Query::new(url, url, "document");
-    let Some(req) = q.request() else {
-        return false;
-    };
-    let r = engine
-        .engine()
-        .check_network_request_subset(req, false, true);
-    r.exception.as_deref().is_some_and(rule_has_document_option)
-}
-
-fn rule_has_document_option(rule: &str) -> bool {
-    let Some((_, opts)) = rule.rsplit_once('$') else {
-        return false;
-    };
-    opts.split(',')
-        .any(|o| matches!(o.trim(), "document" | "doc"))
+    engine.document_excepted(url).0
 }
 
 /// AdGuard's `#$?#sel { remove: true }`: the style block that means "remove the element".
@@ -2199,7 +2182,8 @@ example.com##.box:has-text(X)
 
     #[test]
     fn a_document_exception_is_found_through_adblock_rust() {
-        use super::{document_excepted, rule_has_document_option};
+        use super::document_excepted;
+        use filter_engine::shared::rule_has_document_option;
         let e = |rule: &str| {
             let s = SharedEngine::new();
             s.install(compile_engine(&[format!("example.com##.ad\n{rule}\n")]));

@@ -56,6 +56,8 @@ export const READY_WAIT_MS = 10_000;
 export const UNREACHABLE_AFTER_MS = 3_000;
 /** Where the session survives a worker restart (cleared when the browser quits). */
 const SESSION_KEY = 'argusSession';
+/** Split-incognito instances share `storage.session`: each keeps its own sid (own channel, session, jar). */
+export const sessionKey = (br: any): string => (br?.extension?.inIncognitoContext ? SESSION_KEY + ':incognito' : SESSION_KEY);
 
 interface Persisted { sid: string; server: { host: string | null; port: number } | null }
 
@@ -119,7 +121,7 @@ export class ProxyController {
 
   private async loadSession(): Promise<Persisted | null> {
     try {
-      const r = (await this.store()?.get(SESSION_KEY))?.[SESSION_KEY];
+      const r = (await this.store()?.get(sessionKey(this.d.browser)))?.[sessionKey(this.d.browser)];
       if (r && typeof r.sid === 'string' && r.sid) {
         const sv = r.server;
         const server = sv && Number.isInteger(sv.port) && sv.port > 0 && sv.port < 65536 ? { host: sv.host ?? null, port: sv.port as number } : null;
@@ -131,8 +133,8 @@ export class ProxyController {
 
   private async saveSession() {
     try {
-      if (this.sid) await this.store()?.set({ [SESSION_KEY]: { sid: this.sid, server: this.server } satisfies Persisted });
-      else await this.store()?.remove(SESSION_KEY);
+      if (this.sid) await this.store()?.set({ [sessionKey(this.d.browser)]: { sid: this.sid, server: this.server } satisfies Persisted });
+      else await this.store()?.remove(sessionKey(this.d.browser));
     } catch { /* memory only */ }
   }
 
