@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-11-25
 
 * Upstream proxy (Settings, off by default; `proxy.upstream.proxy`): Argus can send everything it
   connects to through another proxy, HTTP `CONNECT` or SOCKS5, with an optional username and
@@ -39,6 +39,12 @@
   untouched and in order. Connections are grouped per downstream connection, TLS sessions
   resumed per device, and the upstream proxy and destination policy apply as for requests.
   Frames are still relayed untouched, so permessage-deflate stays consistent end to end.
+* Fixes: typing the proxy port as the Argus address reaches the web UI (with the same client and
+  bind restrictions as self-routing); the extension tells a missing server listener from a pending
+  connection and links to its setup, which the web UI can turn on; token lists hide revoked tokens
+  (`include_revoked=true` shows them) and dead tokens are purged hourly and at startup; upstream
+  request errors are logged at `warn` with their full cause; host-blocked sites get the block
+  response instead of a certificate (EV) probe.
 
 ## 0.5.0 — 2026-11-24
 
