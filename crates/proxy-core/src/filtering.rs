@@ -546,6 +546,17 @@ impl ProxyContext {
         self.strict_client.load().evict_conn(conn_id);
     }
 
+    /// The browser-like client WebSocket upgrades to `port` go through (the strict one for the
+    /// proxy's own ports); `None` when browser-like upstream is off (the old dial path serves).
+    pub fn ws_client(&self, port: u16) -> Option<UpstreamClient> {
+        let c = if self.policy.is_own_port(port) {
+            self.strict_client.load_full()
+        } else {
+            self.client.load_full()
+        };
+        c.is_browser_like().then(|| (*c).clone())
+    }
+
     /// The shared pooled upstream client.
     pub fn client(&self) -> UpstreamClient {
         (**self.client.load()).clone()

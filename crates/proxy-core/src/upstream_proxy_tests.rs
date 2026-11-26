@@ -587,6 +587,45 @@ async fn websocket_dials_use_the_proxy() {
     }
 }
 
+/// Browser-like upgrades go through the upstream proxy like any request: the name is resolved
+/// here, vetted, and only the IP is sent; a private target is refused before the proxy is asked.
+#[tokio::test]
+async fn browser_like_upgrades_use_the_proxy_and_the_policy() {
+    for kind in [Http, Socks5] {
+        let ca = ca();
+        let o = origin(&ca).await;
+        let s = stub(kind, None).await;
+        let r = rig(&ca, true, Some(cfg(kind, s.port, None)));
+        let client = build_upstream_client(&r.opts).unwrap();
+        let upgrade = |host: &str| {
+            client
+                .get(url(host, o.port))
+                .header("connection", "Upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .header("sec-websocket-version", "13")
+                .send_upgrade()
+        };
+        // The origin here answers 200: the upgrade is declined, its answer comes back as is.
+        let (resp, up) = upgrade(NAME).await.unwrap();
+        assert_eq!(resp.status(), 200, "{kind:?}");
+        assert!(up.is_none());
+        assert_eq!(
+            s.targets(),
+            vec![format!("{PUBLIC}:{}", o.port)],
+            "{kind:?}"
+        );
+        assert_eq!(o.sni.lock().unwrap()[0].as_deref(), Some(NAME));
+        assert!(o.heads.lock().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("upgrade: websocket"));
+        // Private targets never reach the proxy.
+        let e = upgrade("private.test").await.map(|_| ()).unwrap_err();
+        assert!(crate::policy::is_refusal(&e), "{kind:?}: {e}");
+        assert_eq!(s.targets().len(), 1, "{kind:?}");
+    }
+}
+
 #[tokio::test]
 async fn the_proxy_can_be_switched_live_and_a_bad_config_changes_nothing() {
     let ca = ca();

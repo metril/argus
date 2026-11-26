@@ -832,6 +832,74 @@ impl UpstreamRequest {
     }
 }
 
+impl UpstreamRequest {
+    /// Send an HTTP/1.1 upgrade handshake (WebSocket) over the browser-like client: the same
+    /// emulation chosen from the browser's own headers, in-handshake certificate verification,
+    /// per-downstream-connection group, per-device TLS sessions, upstream proxy and destination
+    /// policy as [`Self::send`]. The headers go out untouched and in order. HTTP/1.1 only, so the
+    /// ALPN offered is `http/1.1`, as a browser's WebSocket connection offers. On `101` the raw
+    /// upgraded stream comes back with the response; anything else is the origin's plain answer.
+    /// Never retried: an upgrade is a one-shot connection.
+    pub async fn send_upgrade(
+        self,
+    ) -> std::result::Result<(UpstreamResponse, Option<wreq::Upgraded>), UpstreamError> {
+        use futures_util::StreamExt;
+        if let Some(m) = self.bad_header {
+            return Err(UpstreamError::Invalid(m));
+        }
+        let UpstreamClient::Wreq(c) = &self.client else {
+            return Err(UpstreamError::Invalid(
+                "upgrades need the browser-like client".into(),
+            ));
+        };
+        let profile = crate::browser_profile::BrowserProfile::classify(&self.headers);
+        let orig = crate::browser_profile::orig_headers(&profile, self.headers.keys());
+        let mut rb = c.request(self.method.clone(), &self.url);
+        if let Some(s) = &self.scope {
+            rb = rb.group(s.group(""));
+        }
+        let mut r = rb
+            .version(wreq::Version::HTTP_11)
+            .emulation(profile.emulation())
+            .default_headers(false)
+            .headers(self.headers)
+            .orig_headers(orig)
+            .send()
+            .await
+            .map_err(UpstreamError::Wreq)?;
+        let peer_cert = r
+            .extensions()
+            .get::<wreq::tls::TlsInfo>()
+            .and_then(|t| t.peer_certificate())
+            .map(<[u8]>::to_vec);
+        let (status, headers) = (r.status(), std::mem::take(r.headers_mut()));
+        if status == hyper::StatusCode::SWITCHING_PROTOCOLS {
+            let up = r.upgrade().await.map_err(UpstreamError::Wreq)?;
+            return Ok((
+                UpstreamResponse {
+                    status,
+                    headers,
+                    peer_cert,
+                    body: futures_util::stream::empty().boxed(),
+                },
+                Some(up),
+            ));
+        }
+        Ok((
+            UpstreamResponse {
+                status,
+                headers,
+                peer_cert,
+                body: r
+                    .bytes_stream()
+                    .map(|c| c.map_err(std::io::Error::other))
+                    .boxed(),
+            },
+            None,
+        ))
+    }
+}
+
 /// Largest fully buffered request body kept to replay it.
 pub const MAX_REPLAY_BODY: usize = 64 * 1024;
 

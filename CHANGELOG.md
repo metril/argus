@@ -23,14 +23,22 @@
   (Chrome, Edge, Firefox or Safari, chosen from its client hints and User-Agent) and forwards the
   browser's headers untouched and in order. Certificates are still verified against Argus's
   trusted roots inside the handshake. Switching it off uses the previous client, kept for one
-  release. WebSockets still use the previous client.
+  release. WebSockets use these connections too (see below).
 * Upstream connections of the browser-like client are now pooled per downstream connection (and
   closed with it), so many browsers no longer share one connection to a site. TLS sessions are
   resumed per device, never across devices.
-* A request that fails before any response arrives on a stale upstream connection (reset, HTTP/2
-  GOAWAY or REFUSED_STREAM, TLS closed without notice) is retried once on a fresh connection, for
-  GET, HEAD, OPTIONS, PUT, DELETE and bodies of up to 64 KiB; streamed bodies, timeouts and
-  certificate errors are never retried.
+* A request that fails before any response arrives on a stale upstream connection is retried once
+  on a fresh connection, for bodies of up to 64 KiB. Non-idempotent requests (POST and the like)
+  are retried only when the site provably never processed them (a refused stream, or nothing was
+  sent); idempotent ones (GET, HEAD, OPTIONS, PUT, DELETE) also after a reset or GOAWAY before any
+  response. Streamed bodies, timeouts and certificate errors are never retried.
+* WebSockets use browser-like connections (when `proxy.upstream.browser_like` is on): the upgrade
+  goes out with the TLS fingerprint of the browser behind it (HTTP/1.1 ALPN, as a browser's
+  WebSocket connection), the certificate is verified inside the handshake, and the handshake
+  headers (Origin, Sec-WebSocket-Protocol, Sec-WebSocket-Extensions, cookies) are forwarded
+  untouched and in order. Connections are grouped per downstream connection, TLS sessions
+  resumed per device, and the upstream proxy and destination policy apply as for requests.
+  Frames are still relayed untouched, so permessage-deflate stays consistent end to end.
 
 ## 0.5.0 — 2026-11-24
 
