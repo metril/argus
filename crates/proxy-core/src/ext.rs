@@ -92,6 +92,25 @@ pub fn request_decision(
     (!d.is_noop()).then_some(d)
 }
 
+/// Re-admit parameters the engine's `$removeparam` dropped but an ext `@@$removeparam`
+/// exception exempts. Returns `rewritten` untouched when no exception matches.
+pub fn exempt_engine_rewrite(
+    idx: &ExtIndex,
+    original: &str,
+    rewritten: String,
+    method: &str,
+    source: &str,
+    rtype: RequestType,
+) -> String {
+    let orig = rule_url(original);
+    let mut info = RequestInfo::new(&orig, method, resource_type(rtype));
+    info.source_url = (rtype != RequestType::Document && !source.is_empty()).then_some(source);
+    match idx.removeparam_exemption(&info) {
+        Some((all, names)) => ext_rules::restore_exempt(original, &rewritten, &names, all),
+        None => rewritten,
+    }
+}
+
 /// Apply ext header edits to a request's header map.
 pub fn apply_request_edits(headers: &mut HeaderMap, edits: &[HeaderEdit]) {
     for e in edits {

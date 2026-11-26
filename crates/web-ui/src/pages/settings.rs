@@ -48,6 +48,8 @@ enum Kind {
     Switch,
     Cidr,
     Ip,
+    /// Host names (`example.com`, `*.example.com`).
+    Hosts,
     /// Free text, not validated here (the server checks it).
     Free,
     /// Write-only text: shown masked, never filled in from the server.
@@ -262,6 +264,20 @@ const SECTIONS: &[Section] = &[
                 dep: None,
             },
             Def {
+                key: "guard_sw",
+                label: "Neutralise service workers",
+                desc: "Off by default. On filtered sites, replace service-worker scripts with a no-op that unregisters itself, so pages are always served through Argus and get filtered. Trade-off: offline apps and push notifications stop working on those sites. Bypassed, exempt and unblocked sites are never touched.",
+                kind: Kind::Switch,
+                dep: None,
+            },
+            Def {
+                key: "guard_sw_exempt",
+                label: "Service-worker exempt hosts",
+                desc: "Hosts left alone by the service-worker setting: example.com, or *.example.com for subdomains.",
+                kind: Kind::Hosts,
+                dep: Some("guard_sw"),
+            },
+            Def {
                 key: "max_conns",
                 label: "Max connections",
                 desc: "Across both listeners. 0 means automatic.",
@@ -406,6 +422,8 @@ fn defaults(key: &str) -> Val {
         "allow_dest" => Val::T(Vec::new()),
         "block_private" => Val::B(false),
         "browser_like" => Val::B(true),
+        "guard_sw" => Val::B(false),
+        "guard_sw_exempt" => Val::T(Vec::new()),
         "up_on" => Val::B(false),
         "up_kind" => Val::S("http".into()),
         "up_host" | "up_user" | "up_pass" => Val::S(String::new()),
@@ -441,6 +459,11 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("allow_dest", Val::T(c.allowed_destinations.clone())),
         ("block_private", Val::B(c.block_private_destinations)),
         ("browser_like", Val::B(c.browser_like_upstream)),
+        ("guard_sw", Val::B(c.guard_service_workers)),
+        (
+            "guard_sw_exempt",
+            Val::T(c.guard_service_workers_exempt.clone()),
+        ),
         ("up_on", Val::B(c.upstream_proxy.enabled)),
         (
             "up_kind",
@@ -485,6 +508,8 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "allow_dest" => &["allowed_destinations"],
         "block_private" => &["block_private_destinations"],
         "browser_like" => &["browser_like_upstream"],
+        "guard_sw" => &["guard_service_workers"],
+        "guard_sw_exempt" => &["guard_service_workers_exempt"],
         "up_on" | "up_kind" | "up_host" | "up_port" | "up_user" | "up_pass" => &["upstream_proxy"],
         "auto_update" => &["auto_update"],
         "lists_url" | "lists_key" => &["bypass"],
@@ -719,6 +744,12 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("browser_like") {
         r.browser_like_upstream = Some(val("browser_like").b());
+    }
+    if dirty("guard_sw_exempt") {
+        r.guard_service_workers_exempt = Some(val("guard_sw_exempt").t());
+    }
+    if dirty("guard_sw") {
+        r.guard_service_workers = Some(val("guard_sw").b());
     }
     r.upstream_proxy = upstream_update(&|k| val(k).s(), &dirty);
     if dirty("auto_update") {
@@ -1258,8 +1289,9 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 on_change=Callback::new(move |v: String| { f.cur.set(Val::S(v)); f.msg.set(None); })
             />
         }.into_any(),
-        Kind::Cidr | Kind::Ip => {
+        Kind::Cidr | Kind::Ip | Kind::Hosts => {
             let is_ip = d.kind == Kind::Ip;
+            let is_hosts = d.kind == Kind::Hosts;
             let tags = RwSignal::new(f.cur.get_untracked().t());
             Effect::new(move |_| { let t = f.cur.get().t(); if tags.get_untracked() != t { tags.set(t); } });
             let terr = RwSignal::new(Option::<String>::None);
@@ -1267,8 +1299,11 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 <TagInput
                     tags=tags
                     label=d.label
-                    placeholder=if is_ip { "1.1.1.1, then Enter" } else { "192.168.1.0/24, then Enter" }
-                    validate=Callback::new(move |v: String| if is_ip {
+                    placeholder=if is_ip { "1.1.1.1, then Enter" } else if is_hosts { "example.com, then Enter" } else { "192.168.1.0/24, then Enter" }
+                    validate=Callback::new(move |v: String| if is_hosts {
+                        let b = v.trim().strip_prefix("*.").unwrap_or(v.trim());
+                        if !b.is_empty() && !b.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '*' | ':')) { None } else { Some(format!("\"{v}\" is not a host. Use example.com or *.example.com.")) }
+                    } else if is_ip {
                         if dns_ok(&v) { None } else { Some(format!("\"{v}\" is not an IP address. Use 1.1.1.1 or 1.1.1.1:53.")) }
                     } else if cidr_ok(&v) { None } else { Some(format!("\"{v}\" is not a CIDR range. Use a form like 192.168.1.0/24.")) })
                     on_change=Callback::new(move |t: Vec<String>| { f.cur.set(Val::T(t)); f.msg.set(None); })

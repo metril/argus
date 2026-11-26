@@ -576,3 +576,7 @@ removes any `http_only` entry from results and refuses `http_only: true` writes 
   off, a Firefox container the user switched off) is simply unbound.
 * Incognito in Chrome needs the extension to be allowed in incognito windows; without it those
   windows are unbound (the proxy setting applies to regular windows only) and use the jar.
+
+### 6.1.1 Service-worker guard (all filtered sites)
+
+Independently of userscripts, `adblock.guard_service_workers` (default on; web UI: Settings, "Neutralise service workers"; `guard_service_workers` in the config API) keeps service workers from serving documents without Argus's injection. On every filtered host a service-worker script fetch is answered with a no-op worker that takes over, handles no fetches and unregisters itself, so the registration "succeeds" (apps do not error) but pages always load through the proxy; filtered HTML documents also run `getRegistrations()` and unregister existing workers. Full-bypass hosts are never touched. Turning it off restores offline apps and push notifications (their pages are then not filtered while a worker serves them from cache).

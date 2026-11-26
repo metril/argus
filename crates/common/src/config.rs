@@ -394,6 +394,16 @@ pub struct AdblockSettings {
     /// those pages anyway.
     #[serde(default = "default_true")]
     pub respect_no_transform: bool,
+    /// Opt in: keep service workers from serving documents without Argus's injection. On filtered
+    /// sites a worker script is answered with a self-unregistering no-op worker and existing
+    /// workers are unregistered by the page, so offline apps and push notifications stop working
+    /// there. Full-bypass hosts, `guard_service_workers_exempt` hosts and sites with blocking off
+    /// (or a `@@$document` / `$elemhide` / `$jsinject` exception) are never touched.
+    #[serde(default)]
+    pub guard_service_workers: bool,
+    /// Hosts (exact, or `*.suffix` for subdomains) the service-worker guard leaves alone.
+    #[serde(default)]
+    pub guard_service_workers_exempt: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -452,6 +462,8 @@ impl Default for AdblockSettings {
             allowed_fetch_destinations: Vec::new(),
             recent_blocked_keep_query: false,
             respect_no_transform: true,
+            guard_service_workers: false,
+            guard_service_workers_exempt: Vec::new(),
         }
     }
 }

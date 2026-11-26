@@ -4613,6 +4613,17 @@
               "null"
             ]
           },
+          "guard_service_workers": {
+            "description": "Opt in: keep service workers from bypassing the injection on filtered sites (replaces\ntheir script with a self-unregistering no-op worker; offline apps and push stop working).",
+            "type": "boolean"
+          },
+          "guard_service_workers_exempt": {
+            "description": "Hosts (exact or `*.suffix`) the guard leaves alone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "host": {
             "type": "string"
           },
@@ -6251,6 +6262,23 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "guard_service_workers": {
+            "description": "Neutralise service workers on filtered sites; applied live.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "guard_service_workers_exempt": {
+            "description": "Replaces the guard's exempt host list; applied live.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },

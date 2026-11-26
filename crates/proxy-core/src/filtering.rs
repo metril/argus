@@ -310,6 +310,10 @@ pub struct ProxyContext {
     /// Leave bodies alone when the origin says `Cache-Control: no-transform` (header-only edits
     /// still apply). Many CDNs set it on everything, hence the switch.
     respect_no_transform: std::sync::atomic::AtomicBool,
+    /// Neutralise service workers on filtered sites (see `AdblockSettings::guard_service_workers`).
+    guard_service_workers: std::sync::atomic::AtomicBool,
+    /// Hosts the guard leaves alone (exact or `*.suffix`).
+    guard_exempt: ArcSwap<Vec<String>>,
     /// Upstream certificates seen by the upstream clients (shared with the web API).
     certs: Arc<common::certstore::CertStore>,
     /// Probe handshakes to learn why an upstream certificate was rejected (when built from
@@ -359,6 +363,8 @@ impl ProxyContext {
             internal: Arc::new(Internal::new()),
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(true),
+            guard_service_workers: std::sync::atomic::AtomicBool::new(false),
+            guard_exempt: ArcSwap::from_pointee(Vec::new()),
             certs: Default::default(),
             prober: None,
             roots: None,
@@ -409,6 +415,55 @@ impl ProxyContext {
     }
 
     /// Honour `Cache-Control: no-transform` on responses (default on).
+    /// Live switch for the service-worker guard.
+    pub fn set_guard_service_workers(&self, on: bool) {
+        self.guard_service_workers.store(on, Ordering::Relaxed);
+    }
+
+    /// Live exempt-host list of the service-worker guard.
+    pub fn set_guard_service_workers_exempt(&self, hosts: Vec<String>) {
+        self.guard_exempt.store(Arc::new(hosts));
+    }
+
+    /// Is the service-worker guard off for `host` / `url`: listed host, per-site blocking off, or
+    /// a `@@$document` / `$elemhide` / `$jsinject` exception?
+    fn sw_guard_exempt(&self, rctx: &RequestCtx, host: &str, url: &str) -> bool {
+        let h = host.to_ascii_lowercase();
+        if self
+            .guard_exempt
+            .load()
+            .iter()
+            .any(|e| match e.strip_prefix("*.") {
+                Some(s) => {
+                    h.len() > s.len() && h.ends_with(s) && h[..h.len() - s.len()].ends_with('.')
+                }
+                None => *e == h,
+            })
+        {
+            return true;
+        }
+        let profile = rctx.profile.load();
+        let probe = SharedEngine::site_probe(url);
+        if profile.engine.site_off_with(&probe)
+            || profile
+                .overlay
+                .as_ref()
+                .is_some_and(|o| o.site_off_with(&probe))
+        {
+            return true;
+        }
+        let (excepted, gen_) = profile.engine.document_excepted(url);
+        if excepted {
+            return true;
+        }
+        gen_.aux::<ext_rules::ExtIndex>().is_some_and(|idx| {
+            let mut info =
+                ext_rules::RequestInfo::new(url, "GET", ext_rules::ResourceType::Document);
+            info.source_url = None;
+            idx.page_exempt(&info)
+        })
+    }
+
     pub fn set_respect_no_transform(&self, respect: bool) {
         self.respect_no_transform.store(respect, Ordering::Relaxed);
     }
@@ -902,6 +957,34 @@ impl ProxyContext {
             }
         }
 
+        // Service-worker guard: a worker would answer navigations from its cache, so the page
+        // never reaches the proxy and gets no injection. On filtered sites its script is replaced
+        // by a worker that unregisters itself and never handles fetches (registration still
+        // "succeeds", so apps do not error). Full-bypass hosts are left alone.
+        if !bypass_full
+            && self.guard_service_workers.load(Ordering::Relaxed)
+            && req.method() == hyper::Method::GET
+            && is_service_worker_fetch(req.headers())
+        {
+            let prof = rctx.profile.load();
+            let site = format!("{scheme}://{host}/");
+            if prof.engine.is_enabled()
+                && rctx.adblock_on()
+                && !self.sw_guard_exempt(rctx, &host, &site)
+            {
+                debug!("Replaced a service worker script for {host}");
+                return Ok(Response::builder()
+                    .status(hyper::StatusCode::OK)
+                    .header("content-type", "application/javascript; charset=utf-8")
+                    .header("cache-control", "no-store")
+                    .header("x-adblock-note", "service worker neutralised")
+                    .body(crate::inject::full_body(bytes::Bytes::from_static(
+                        SW_NOOP.as_bytes(),
+                    )))
+                    .expect("sw shim"));
+            }
+        }
+
         // Take the request apart: the header map is moved, not copied, from here on.
         let (parts, body) = req.into_parts();
         let mut headers = parts.headers;
@@ -1002,20 +1085,35 @@ impl ProxyContext {
                             .as_ref()
                             .is_some_and(|o| o.site_off_with(&probe))
                 };
-                if let Some(new_url) = verdict.rewritten_url {
-                    let navigation =
-                        rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
-                    if navigation {
-                        return Ok(rewrite_redirect(&new_url));
+                let navigation =
+                    rtype == RequestType::Document && (method == hyper::Method::GET || is_head);
+                let ext_idx = generation
+                    .as_ref()
+                    .and_then(|g| g.aux::<ext_rules::ExtIndex>());
+                if let Some(mut new_url) = verdict.rewritten_url {
+                    // `@@$removeparam` exceptions (the engine cannot parse them) restore the
+                    // parameters they exempt.
+                    if let Some(idx) = ext_idx {
+                        let source = source_url(&headers, &url, rtype);
+                        new_url = ext::exempt_engine_rewrite(
+                            idx,
+                            &url,
+                            new_url,
+                            method.as_str(),
+                            source,
+                            rtype,
+                        );
                     }
-                    // Subresource: fetch the cleaned URL transparently.
-                    url = new_url;
+                    if new_url != url {
+                        if navigation {
+                            return Ok(rewrite_redirect(&new_url));
+                        }
+                        // Subresource: fetch the cleaned URL transparently.
+                        url = new_url;
+                    }
                 }
                 // Extended rules run after the engine verdict (see `crate::ext` for precedence).
-                if let Some(idx) = generation
-                    .as_ref()
-                    .and_then(|g| g.aux::<ext_rules::ExtIndex>())
-                {
+                if let Some(idx) = ext_idx {
                     let source = source_url(&headers, &url, rtype);
                     if let Some(d) =
                         ext::request_decision(idx, &url, method.as_str(), source, rtype, &headers)
@@ -1047,6 +1145,15 @@ impl ProxyContext {
                             });
                             let v = filter_engine::MatchResult::blocked(rule);
                             return Ok(block_response(rtype, &v, &url));
+                        }
+                        // `$removeparam` is idempotent: a navigation is redirected to the cleaned
+                        // URL (never to a no-op target, so it cannot loop).
+                        if navigation {
+                            if let Some((cleaned, _)) = d.cleaned_url {
+                                if cleaned != url {
+                                    return Ok(rewrite_redirect(&cleaned));
+                                }
+                            }
                         }
                         // Fetched transparently, never answered with a redirect: a URL
                         // transform need not be idempotent, so a redirect could loop.
@@ -1519,16 +1626,21 @@ impl ProxyContext {
                 } else {
                     None
                 };
+                let sw_guard = self.guard_service_workers.load(Ordering::Relaxed)
+                    && !page_off
+                    && !self.sw_guard_exempt(rctx, &host, &url);
                 let unregister_sw = !blocks_scripts
-                    && us.is_some()
-                    && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
-                        self.internal
-                            .gm
-                            .blocks_service_workers_in(&ix.load(), &host)
-                    });
+                    && ((us.is_some()
+                        && rctx.profile.load().script_index.as_ref().is_some_and(|ix| {
+                            self.internal
+                                .gm
+                                .blocks_service_workers_in(&ix.load(), &host)
+                        }))
+                        || sw_guard);
                 let head = if enabled {
                     build_head(&PageSpec {
                         unregister_sw,
+                        sw_guard: sw_guard && !blocks_scripts,
                         userscripts: us_srcs,
                         panel: panel_key.as_ref(),
                         menu: menu_mode,
@@ -1880,6 +1992,11 @@ fn bad_request(msg: &str) -> Response<ProxyBody> {
 fn bad_gateway(msg: &str) -> Response<ProxyBody> {
     status_response(StatusCode::BAD_GATEWAY, msg)
 }
+
+/// A service worker that takes over, never handles a fetch and unregisters itself (open tabs
+/// are not reloaded; their next navigation goes through the proxy).
+const SW_NOOP: &str = "self.addEventListener('install',function(){self.skipWaiting();});\
+self.addEventListener('activate',function(e){e.waitUntil(self.registration.unregister().catch(function(){}));});\n";
 
 /// A request that fetches a service worker's script: `Service-Worker: script` (set by the browser
 /// for the main script and its updates) or `Sec-Fetch-Dest: serviceworker`.

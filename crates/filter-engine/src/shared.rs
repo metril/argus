@@ -567,6 +567,21 @@ impl SharedEngine {
         self.site_off_with(&Self::site_probe(page_url))
     }
 
+    /// Does an exception (`@@||host^$document` and the like) cover the document at `url`? Also
+    /// returns the generation judged, so a caller can consult its ext index without a race.
+    pub fn document_excepted(&self, url: &str) -> (bool, Arc<Generation>) {
+        let guard = self.engine.load();
+        let hit = self.enabled.load(Ordering::Relaxed)
+            && adblock::request::Request::new(url, url, "document").is_ok_and(|r| {
+                guard
+                    .engine
+                    .check_network_request_subset(&r, true, true)
+                    .exception
+                    .is_some()
+            });
+        (hit, arc_swap::Guard::into_inner(guard))
+    }
+
     /// The probe [`Self::site_off_with`] takes; one probe serves several engines.
     pub fn site_probe(page_url: &str) -> Query<'_> {
         Query::new(SITE_OFF_PROBE, page_url, "other")

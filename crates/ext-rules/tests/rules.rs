@@ -828,3 +828,104 @@ fn page_scoped_exceptions_report_what_they_switch_off() {
     assert_eq!(disabled("@@||other.example^$elemhide"), 0);
     assert_eq!(disabled("site.example#@#.ad"), 0);
 }
+
+#[test]
+fn removeparam_forms_and_exceptions() {
+    let url = "https://s.example/p?a=1&utm_x=2&keep=3&utm_y=4#h";
+    let clean = |rules: &[&str], rt| {
+        idx(rules)
+            .request_decision(&get(url, rt))
+            .cleaned_url
+            .map(|x| x.0)
+    };
+    for rt in [ResourceType::Document, ResourceType::Image] {
+        assert_eq!(
+            clean(&["||s.example^$removeparam=/^utm_/"], rt).as_deref(),
+            Some("https://s.example/p?a=1&keep=3#h")
+        );
+        assert_eq!(
+            clean(&["||s.example^$removeparam=~keep"], rt).as_deref(),
+            Some("https://s.example/p?keep=3#h")
+        );
+        assert_eq!(
+            clean(&["||s.example^$removeparam"], rt).as_deref(),
+            Some("https://s.example/p#h")
+        );
+    }
+    // exceptions: by value, bare, and `$important` beats a plain exception
+    let r = "||s.example^$removeparam=/^utm_/";
+    assert_eq!(
+        clean(
+            &[r, "@@||s.example^$removeparam=/^utm_/"],
+            ResourceType::Document
+        ),
+        None
+    );
+    assert_eq!(
+        clean(&[r, "@@||s.example^$removeparam"], ResourceType::Document),
+        None
+    );
+    assert!(clean(
+        &[r, "@@||s.example^$removeparam=other"],
+        ResourceType::Document
+    )
+    .is_some());
+    // no query / nothing matched: no decision at all
+    let i = idx(&[r]);
+    assert!(i
+        .request_decision(&get("https://s.example/p", ResourceType::Document))
+        .is_noop());
+    // the cleaned URL is a fixpoint (no redirect loop)
+    let d = i.request_decision(&get(url, ResourceType::Document));
+    let c = d.cleaned_url.unwrap().0;
+    assert!(i
+        .request_decision(&get(&c, ResourceType::Document))
+        .is_noop());
+    // $urltransform sees the cleaned URL; cleaned_url stays removeparam-only
+    let i = idx(&[r, "||s.example^$urltransform=/keep=3/keep=4/"]);
+    let d = i.request_decision(&get(url, ResourceType::Document));
+    assert_eq!(d.cleaned_url.unwrap().0, "https://s.example/p?a=1&keep=3#h");
+    assert_eq!(d.rewrite_url.unwrap().0, "https://s.example/p?a=1&keep=4#h");
+}
+
+#[test]
+fn removeparam_exemption_reports_exceptions() {
+    let i = idx(&[
+        "@@||s.example^$removeparam=utm",
+        "@@||t.example^$removeparam",
+    ]);
+    let e = i
+        .removeparam_exemption(&get("https://s.example/p?utm=1", ResourceType::Document))
+        .unwrap();
+    assert_eq!(e, (false, vec!["utm".to_string()]));
+    assert!(
+        i.removeparam_exemption(&get("https://t.example/p?utm=1", ResourceType::Image))
+            .unwrap()
+            .0
+    );
+    assert!(i
+        .removeparam_exemption(&get("https://u.example/p", ResourceType::Image))
+        .is_none());
+}
+
+#[test]
+fn page_exempt_by_document_elemhide_jsinject() {
+    for r in [
+        "@@||d.example^$document",
+        "@@||d.example^$elemhide",
+        "@@||d.example^$jsinject",
+    ] {
+        let i = idx(&[r]);
+        let q = RequestInfo::new("https://d.example/", "GET", ResourceType::Document);
+        assert!(i.page_exempt(&q), "{r}");
+        let q = RequestInfo::new("https://o.example/", "GET", ResourceType::Document);
+        assert!(!i.page_exempt(&q), "{r}");
+    }
+    assert!(
+        !idx(&["@@||d.example^$script"]).page_exempt(&RequestInfo::new(
+            "https://d.example/",
+            "GET",
+            ResourceType::Document
+        ))
+    );
+}

@@ -8,6 +8,7 @@ use crate::headers::is_removable_header;
 use crate::hls::HlsPrune;
 use crate::jsonprune::JsonPrune;
 use crate::pattern::Pattern;
+use crate::removeparam::RemoveParam;
 use crate::replace::ReplaceSpec;
 use crate::util::{host_is_or_under, DomainSet};
 use crate::xmlprune::XmlPrune;
@@ -31,7 +32,8 @@ pub mod target {
     pub const PCSS: u32 = 1 << 14;
     /// `$specifichide`: switches off the page's host-specific element hiding.
     pub const SPECIFICHIDE: u32 = 1 << 15;
-    pub const ALL: u32 = (1 << 16) - 1;
+    pub const REMOVEPARAM: u32 = 1 << 16;
+    pub const ALL: u32 = (1 << 17) - 1;
 }
 
 /// Stage bits: when a rule is evaluated.
@@ -288,6 +290,8 @@ pub enum Action {
     /// `Permissions-Policy` directives to add.
     Permissions(String),
     UrlTransform(ReplaceSpec),
+    /// `$removeparam` (regex, negated or bare forms).
+    RemoveParam(RemoveParam),
     /// Block when a response header matches.
     Header(HeaderMatch),
     HtmlRemove(HtmlRemoval),
@@ -313,6 +317,7 @@ impl Action {
             Self::Cookie(_) => COOKIE,
             Self::Permissions(_) => PERMISSIONS,
             Self::UrlTransform(_) => URLTRANSFORM,
+            Self::RemoveParam(_) => REMOVEPARAM,
             Self::Header(_) => HEADER,
             Self::HtmlRemove(_) => HTML,
             Self::Inject(Injection::Script(_)) => JS,
@@ -566,9 +571,9 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
             "jsinject" if exception => scope_mask |= JS | SCRIPTLET | SNIPPET,
             "elemhide" | "ehide" if exception => scope_mask |= PCSS | HTML | SPECIFICHIDE,
             "specifichide" | "shide" if exception => scope_mask |= SPECIFICHIDE,
-            "urlblock" if exception => scope_mask |= BLOCK | URLTRANSFORM,
+            "urlblock" if exception => scope_mask |= BLOCK | URLTRANSFORM | REMOVEPARAM,
             "replace" | "jsonprune" | "xmlprune" | "hls" | "cookie" | "removeheader"
-            | "permissions" | "urltransform" | "header" => {
+            | "permissions" | "urltransform" | "header" | "removeparam" => {
                 if neg {
                     return inv("action modifiers cannot be negated");
                 }
@@ -626,11 +631,12 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 "removeheader" => REMOVEHEADER,
                 "permissions" => PERMISSIONS,
                 "urltransform" => URLTRANSFORM,
+                "removeparam" => REMOVEPARAM,
                 _ => HEADER,
             };
             let (req_side, resp_side) = match name.as_str() {
                 "cookie" => (true, true),
-                "urltransform" => (true, false),
+                "urltransform" | "removeparam" => (true, false),
                 "removeheader" => (
                     v.to_ascii_lowercase().starts_with("request:"),
                     !v.to_ascii_lowercase().starts_with("request:"),
@@ -657,6 +663,9 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                     "urltransform" => {
                         need_val()?;
                         Action::UrlTransform(ReplaceSpec::parse(v).map_err(unsupported_or_invalid)?)
+                    }
+                    "removeparam" => {
+                        Action::RemoveParam(RemoveParam::parse(v).map_err(unsupported_or_invalid)?)
                     }
                     "jsonprune" => Action::JsonPrune(
                         JsonPrune::parse(&v.replace("\\$", "$")).map_err(unsupported_or_invalid)?,

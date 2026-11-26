@@ -45,6 +45,8 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         tls_passthrough_hosts: config.proxy.tls_passthrough_hosts.clone(),
         block_private_destinations: config.proxy.block_private_destinations,
         browser_like_upstream: config.proxy.upstream.browser_like,
+        guard_service_workers: config.adblock.guard_service_workers,
+        guard_service_workers_exempt: config.adblock.guard_service_workers_exempt.clone(),
         upstream_proxy: upstream_proxy_dto(&config.proxy.upstream.proxy),
         allowed_destinations: config.proxy.allowed_destinations.clone(),
         allowed_clients: config.proxy.allowed_clients.clone(),
@@ -463,6 +465,37 @@ async fn apply_update_locked(
         req.browser_like_upstream,
         can_proxy
     );
+    field!(
+        "guard_service_workers",
+        config.adblock.guard_service_workers,
+        req.guard_service_workers,
+        can_proxy
+    );
+    if let Some(list) = req.guard_service_workers_exempt {
+        let mut next: Vec<String> = Vec::new();
+        for h in list {
+            let h = h.trim().to_ascii_lowercase();
+            let body = h.strip_prefix("*.").unwrap_or(&h);
+            if body.is_empty()
+                || body.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '*' | ':'))
+            {
+                return Err(ApiError::ValidationError(format!(
+                    "guard_service_workers_exempt: `{h}` is not a host (use example.com or *.example.com)"
+                )));
+            }
+            if !next.contains(&h) {
+                next.push(h);
+            }
+        }
+        let changed = next != config.adblock.guard_service_workers_exempt;
+        config.adblock.guard_service_workers_exempt = next;
+        live(
+            "guard_service_workers_exempt",
+            changed,
+            can_proxy,
+            &mut applied,
+        );
+    }
     if let Some(u) = &req.upstream_proxy {
         let next = merge_upstream_proxy(&config.proxy.upstream.proxy, u);
         next.validate().map_err(ApiError::ValidationError)?;

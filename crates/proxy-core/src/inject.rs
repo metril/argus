@@ -203,6 +203,9 @@ pub fn unsafe_styles_dropped() -> u64 {
 pub struct PageSpec<'a> {
     /// Unregister the page's service workers at document start (see [`crate::gm`]).
     pub unregister_sw: bool,
+    /// The service-worker guard applies to this document: the boot script carries `sw` even
+    /// when nothing else needs it.
+    pub sw_guard: bool,
     pub cosmetics: &'a Cosmetics,
     pub internal: &'a Internal,
     /// Host name the beacon token is bound to.
@@ -336,7 +339,11 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
-        if observer || !proc_items.is_empty() || !spec.ext_script.is_empty() || spec.panel.is_some()
+        if observer
+            || !proc_items.is_empty()
+            || !spec.ext_script.is_empty()
+            || spec.panel.is_some()
+            || spec.sw_guard
         {
             let mut cfg = serde_json::json!({
                 "p": proc_items,
@@ -464,6 +471,7 @@ mod tests {
     fn spec<'a>(cos: &'a Cosmetics, internal: &'a Internal) -> PageSpec<'a> {
         PageSpec {
             unregister_sw: false,
+            sw_guard: false,
             cosmetics: cos,
             internal,
             host: "example.test",
