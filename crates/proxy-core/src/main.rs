@@ -75,6 +75,7 @@ async fn main() -> Result<()> {
     )?);
 
     ctx.set_respect_no_transform(config.adblock.respect_no_transform);
+    ctx.set_stealth(config.stealth.clone());
 
     // Hosts excluded from interception / filtering: built-in categories plus the user's own
     // entries and subscriptions, persisted next to the settings overlay.

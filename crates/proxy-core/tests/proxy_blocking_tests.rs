@@ -93,6 +93,7 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
         webui: WebUiSettings::default(),
         dns: Default::default(),
         bypass: Default::default(),
+        stealth: Default::default(),
     }
 }
 

@@ -21,6 +21,155 @@ pub struct ProxyConfig {
     /// Where the first-party bypass lists come from.
     #[serde(default)]
     pub bypass: BypassConfig,
+    /// Stealth Mode: privacy edits to requests, responses and pages.
+    #[serde(default)]
+    pub stealth: StealthSettings,
+}
+
+fn on() -> bool {
+    true
+}
+
+/// Stealth Mode (AdGuard parity). The master switch is off by default; once it is on, each option
+/// follows its own switch, whose defaults are AdGuard's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StealthSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    // General.
+    /// Hide the search query: a click from a search engine's results sends no query to the site.
+    #[serde(default = "on")]
+    pub hide_search_queries: bool,
+    /// Send `DNT: 1` and `Sec-GPC: 1`, and set `navigator.doNotTrack` / `globalPrivacyControl`.
+    #[serde(default = "on")]
+    pub send_dnt: bool,
+    /// Remove tracking parameters (`utm_*`, `fbclid`, `gclid`, ...) from URLs.
+    #[serde(default)]
+    pub strip_tracking_params: bool,
+    /// Hide the Referer from third parties (replaced by `referer_custom`, else the target's own
+    /// origin).
+    #[serde(default = "on")]
+    pub hide_referer: bool,
+    #[serde(default)]
+    pub referer_custom: String,
+    /// Reduce the User-Agent to a generic one of the same browser family.
+    #[serde(default)]
+    pub hide_user_agent: bool,
+    #[serde(default)]
+    pub user_agent_custom: String,
+    /// Send `X-Forwarded-For: <mask_ip_address>`.
+    #[serde(default)]
+    pub mask_ip: bool,
+    #[serde(default)]
+    pub mask_ip_address: String,
+    /// Remove Chrome's `X-Client-Data` header.
+    #[serde(default = "on")]
+    pub remove_x_client_data: bool,
+    // Tracking methods.
+    /// Self-destruct third-party cookies after `third_party_cookie_minutes` (0 blocks them).
+    #[serde(default = "on")]
+    pub third_party_cookies: bool,
+    #[serde(default = "default_3p_cookie_minutes")]
+    pub third_party_cookie_minutes: u32,
+    /// Self-destruct first-party cookies after `first_party_cookie_minutes` (0 blocks them).
+    #[serde(default)]
+    pub first_party_cookies: bool,
+    #[serde(default = "default_1p_cookie_minutes")]
+    pub first_party_cookie_minutes: u32,
+    /// Strip ETag / If-None-Match on third-party requests.
+    #[serde(default = "on")]
+    pub block_etag: bool,
+    /// Drop the Authorization header on third-party requests.
+    #[serde(default)]
+    pub block_third_party_auth: bool,
+    // Browser API.
+    #[serde(default)]
+    pub block_webrtc: bool,
+    #[serde(default)]
+    pub block_push: bool,
+    #[serde(default)]
+    pub block_location: bool,
+    /// No effect: browsers no longer run Flash.
+    #[serde(default = "on")]
+    pub block_flash: bool,
+    /// Makes `navigator.javaEnabled()` false; browsers no longer run Java applets.
+    #[serde(default = "on")]
+    pub block_java: bool,
+}
+
+fn default_3p_cookie_minutes() -> u32 {
+    2880
+}
+
+fn default_1p_cookie_minutes() -> u32 {
+    4320
+}
+
+impl Default for StealthSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hide_search_queries: true,
+            send_dnt: true,
+            strip_tracking_params: false,
+            hide_referer: true,
+            referer_custom: String::new(),
+            hide_user_agent: false,
+            user_agent_custom: String::new(),
+            mask_ip: false,
+            mask_ip_address: String::new(),
+            remove_x_client_data: true,
+            third_party_cookies: true,
+            third_party_cookie_minutes: default_3p_cookie_minutes(),
+            first_party_cookies: false,
+            first_party_cookie_minutes: default_1p_cookie_minutes(),
+            block_etag: true,
+            block_third_party_auth: false,
+            block_webrtc: false,
+            block_push: false,
+            block_location: false,
+            block_flash: true,
+            block_java: true,
+        }
+    }
+}
+
+/// Whether a User-Agent names a browser family the upstream emulation can mirror (the same
+/// families `proxy_core::browser_profile` recognises).
+pub fn ua_family_known(ua: &str) -> bool {
+    ["Firefox/", "FxiOS/", "CriOS/", "Chrome/", "Edg/"]
+        .iter()
+        .any(|m| ua.contains(m))
+        || (ua.contains("Safari/") && ua.contains("Version/"))
+}
+
+impl StealthSettings {
+    /// Reject values that cannot be applied.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.mask_ip_address.is_empty()
+            && self.mask_ip_address.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err("mask_ip_address must be an IP address".into());
+        }
+        for (n, v) in [
+            ("referer_custom", &self.referer_custom),
+            ("user_agent_custom", &self.user_agent_custom),
+        ] {
+            if v.len() > 1024 || v.bytes().any(|b| b < 0x20 || b == 0x7f) {
+                return Err(format!("{n} is not a valid header value"));
+            }
+        }
+        if !self.user_agent_custom.is_empty() && !ua_family_known(&self.user_agent_custom) {
+            return Err(
+                "user_agent_custom must be a Chrome, Edge, Firefox or Safari User-Agent".into(),
+            );
+        }
+        if !self.referer_custom.is_empty() && url::Url::parse(&self.referer_custom).is_err() {
+            return Err("referer_custom must be a URL".into());
+        }
+        Ok(())
+    }
 }
 
 /// First-party bypass lists (see `bypass`): normally left at the defaults. The overrides exist
@@ -672,6 +821,7 @@ impl Default for ProxyConfig {
             webui: WebUiSettings::default(),
             dns: DnsSettings::default(),
             bypass: BypassConfig::default(),
+            stealth: StealthSettings::default(),
         }
     }
 }

@@ -4404,6 +4404,7 @@ dependencies = [
  "hickory-resolver",
  "http-body-util",
  "http2",
+ "httpdate",
  "hyper",
  "hyper-util",
  "ipnet",

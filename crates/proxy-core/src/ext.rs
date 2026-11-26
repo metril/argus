@@ -92,6 +92,14 @@ pub fn request_decision(
     (!d.is_noop()).then_some(d)
 }
 
+/// Stealth options a `$stealth` exception turns off for this request (0 without any).
+pub fn stealth_off(idx: &ExtIndex, url: &str, source: &str, rtype: RequestType) -> u32 {
+    let url = rule_url(url);
+    let mut info = RequestInfo::new(&url, "GET", resource_type(rtype));
+    info.source_url = (rtype != RequestType::Document && !source.is_empty()).then_some(source);
+    idx.stealth_off(&info)
+}
+
 /// Apply ext header edits to a request's header map.
 pub fn apply_request_edits(headers: &mut HeaderMap, edits: &[HeaderEdit]) {
     for e in edits {

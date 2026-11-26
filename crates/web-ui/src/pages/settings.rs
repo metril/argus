@@ -352,6 +352,196 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        id: "stealth",
+        title: "Stealth Mode",
+        sub: "Limits what sites and trackers learn about you, after AdGuard's Stealth Mode. Off by default; the options below apply once it is on. Exceptions per site: @@||example.org^$stealth in a filter list or your rules turns every option off for requests to that site (add $domain=page.example to limit it to requests from a page, or a type such as $script), @@||example.org^$stealth=webrtc|3p-cookie only the listed ones (searchqueries, donottrack, 3p-cookie, 1p-cookie, 3p-cache, 3p-auth, webrtc, push, location, flash, java, referrer, useragent, ip, xclientdata, dpi). Hosts in full bypass and sites with blocking switched off are never touched.",
+        fields: &[
+            Def {
+                key: "st_on",
+                label: "Stealth Mode",
+                desc: "Master switch. Applies to every device at once.",
+                kind: Kind::Switch,
+                dep: None,
+            },
+        ],
+    },
+    Section {
+        id: "stealth_general",
+        title: "Stealth Mode: general",
+        sub: "",
+        fields: &[
+            Def {
+                key: "st_search",
+                label: "Hide search queries",
+                desc: "When you open a site from a search engine's results, the site gets its own address as the Referer instead of the search page, so it cannot see your search words. Also applies to document.referrer.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_dnt",
+                label: "Ask websites not to track me",
+                desc: "Sends Do Not Track and Global Privacy Control (DNT: 1, Sec-GPC: 1) and sets them in the page as well. Sites may ignore them.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_params",
+                label: "Remove tracking parameters from URLs",
+                desc: "Off by default, as AdGuard does this with its URL Tracking filter. Strips utm_*, fbclid, gclid, yclid, mc_eid and similar from addresses, including in the address bar. Can break links that need them, such as some unsubscribe and email-login links.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_referer",
+                label: "Hide Referer from third parties",
+                desc: "Requests to another site get that site's own address as the Referer instead of the page you were on. Form posts keep their Referer. May break sites that check the Referer, such as image hosts that block hotlinking.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_referer_custom",
+                label: "Custom Referer",
+                desc: "Optional. Send this address instead. Empty uses the target site's own address.",
+                kind: Kind::Free,
+                dep: Some("st_referer"),
+            },
+            Def {
+                key: "st_ua",
+                label: "Hide User-Agent",
+                desc: "Replaces the User-Agent with a generic one of the same browser (no exact version or system), and drops detailed client hints and extra languages. Sites that serve by browser or system may change or break; the page's own navigator.userAgent is not changed.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_ua_custom",
+                label: "Custom User-Agent",
+                desc: "Optional. Send this instead. Must be a Chrome, Edge, Firefox or Safari User-Agent. The browser's own client hints are dropped and the connection to the site follows the browser this names, so use one close to yours; a very different one can break sites. Empty uses the generic one.",
+                kind: Kind::Free,
+                dep: Some("st_ua"),
+            },
+            Def {
+                key: "st_xcd",
+                label: "Remove X-Client-Data header",
+                desc: "Stops Chrome from telling Google its version and experiments.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_ip",
+                label: "Mask IP address",
+                desc: "Sends X-Forwarded-For with the address below. It cannot hide your real address: sites still see the connection's. Few sites read it, and some treat it as a proxy sign.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_ip_addr",
+                label: "IP address to send",
+                desc: "Optional. Empty uses 203.0.113.1.",
+                kind: Kind::Free,
+                dep: Some("st_ip"),
+            },
+        ],
+    },
+    Section {
+        id: "stealth_tracking",
+        title: "Stealth Mode: tracking methods",
+        sub: "",
+        fields: &[
+            Def {
+                key: "st_c3p",
+                label: "Delete third-party cookies",
+                desc: "Cookies set by other sites expire after the time below. Can sign you out of social logins and embedded services.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_c3p_min",
+                label: "Third-party cookie lifetime",
+                desc: "0 refuses them entirely. A cookie that already expires sooner keeps its shorter life.",
+                kind: Kind::Num {
+                    unit: "min",
+                    min: 0,
+                    max: 525_600,
+                },
+                dep: Some("st_c3p"),
+            },
+            Def {
+                key: "st_c1p",
+                label: "Delete first-party cookies (not recommended)",
+                desc: "Cookies set by the site you are on expire after the time below. Signs you out of sites and loses settings.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_c1p_min",
+                label: "First-party cookie lifetime",
+                desc: "0 refuses them entirely, which breaks logins.",
+                kind: Kind::Num {
+                    unit: "min",
+                    min: 0,
+                    max: 525_600,
+                },
+                dep: Some("st_c1p"),
+            },
+            Def {
+                key: "st_etag",
+                label: "Block ETag and If-None-Match headers",
+                desc: "Third-party requests carry no cache validators, so a cache cannot be used to recognise you. Third-party files are downloaded every time.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_auth",
+                label: "Block third-party Authorization header",
+                desc: "Stops saved credentials being sent to other sites. May break embedded services and extensions that authenticate that way.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+        ],
+    },
+    Section {
+        id: "stealth_api",
+        title: "Stealth Mode: browser API",
+        sub: "Done by a script added to pages, so it needs ad blocking's page changes (HTML pages only) and does not run in pages that forbid scripts.",
+        fields: &[
+            Def {
+                key: "st_webrtc",
+                label: "Block WebRTC",
+                desc: "Calls only go through TURN relays, so WebRTC cannot reveal your real address behind a proxy or VPN. Breaks video calls, messengers, streaming and games that connect directly.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_push",
+                label: "Block Push API",
+                desc: "Sites cannot ask for or receive push notifications.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_location",
+                label: "Block Location API",
+                desc: "Sites cannot read your location; they are told it was denied.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_flash",
+                label: "Block Flash",
+                desc: "Kept for parity: browsers no longer run Flash, so this changes nothing.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+            Def {
+                key: "st_java",
+                label: "Block Java",
+                desc: "Reports Java as unavailable to pages. Browsers no longer run Java plugins; JavaScript is not affected.",
+                kind: Kind::Switch,
+                dep: Some("st_on"),
+            },
+        ],
+    },
+    Section {
         id: "updates",
         title: "Filter list updates",
         sub: "Background fetch of all enabled lists.",
@@ -412,6 +602,13 @@ fn defaults(key: &str) -> Val {
         "up_port" => Val::S("8080".into()),
         "auto_update" => Val::B(true),
         "lists_url" | "lists_key" => Val::S(String::new()),
+        "st_on" | "st_c1p" | "st_ua" | "st_ip" | "st_auth" | "st_params" | "st_webrtc"
+        | "st_push" | "st_location" => Val::B(false),
+        "st_search" | "st_dnt" | "st_referer" | "st_xcd" | "st_c3p" | "st_etag" | "st_flash"
+        | "st_java" => Val::B(true),
+        "st_referer_custom" | "st_ua_custom" | "st_ip_addr" => Val::S(String::new()),
+        "st_c3p_min" => Val::S("2880".into()),
+        "st_c1p_min" => Val::S("4320".into()),
         "dns_servers" => Val::T(Vec::new()),
         "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => Val::S("0".into()),
         _ => Val::S("24".into()),
@@ -466,6 +663,37 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("dns_min_ttl", Val::S(c.dns.min_ttl_secs.to_string())),
         ("dns_max_ttl", Val::S(c.dns.max_ttl_secs.to_string())),
         ("dns_neg_ttl", Val::S(c.dns.negative_ttl_secs.to_string())),
+        ("st_on", Val::B(c.stealth.enabled)),
+        ("st_search", Val::B(c.stealth.hide_search_queries)),
+        ("st_dnt", Val::B(c.stealth.send_dnt)),
+        ("st_params", Val::B(c.stealth.strip_tracking_params)),
+        ("st_referer", Val::B(c.stealth.hide_referer)),
+        (
+            "st_referer_custom",
+            Val::S(c.stealth.referer_custom.clone()),
+        ),
+        ("st_ua", Val::B(c.stealth.hide_user_agent)),
+        ("st_ua_custom", Val::S(c.stealth.user_agent_custom.clone())),
+        ("st_ip", Val::B(c.stealth.mask_ip)),
+        ("st_ip_addr", Val::S(c.stealth.mask_ip_address.clone())),
+        ("st_xcd", Val::B(c.stealth.remove_x_client_data)),
+        ("st_c3p", Val::B(c.stealth.third_party_cookies)),
+        (
+            "st_c3p_min",
+            Val::S(c.stealth.third_party_cookie_minutes.to_string()),
+        ),
+        ("st_c1p", Val::B(c.stealth.first_party_cookies)),
+        (
+            "st_c1p_min",
+            Val::S(c.stealth.first_party_cookie_minutes.to_string()),
+        ),
+        ("st_etag", Val::B(c.stealth.block_etag)),
+        ("st_auth", Val::B(c.stealth.block_third_party_auth)),
+        ("st_webrtc", Val::B(c.stealth.block_webrtc)),
+        ("st_push", Val::B(c.stealth.block_push)),
+        ("st_location", Val::B(c.stealth.block_location)),
+        ("st_flash", Val::B(c.stealth.block_flash)),
+        ("st_java", Val::B(c.stealth.block_java)),
     ]
 }
 
@@ -489,6 +717,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "auto_update" => &["auto_update"],
         "lists_url" | "lists_key" => &["bypass"],
         "dns_servers" | "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => &["dns"],
+        k if k.starts_with("st_") => &["stealth"],
         _ => &["update_interval_hours"],
     }
 }
@@ -599,6 +828,36 @@ fn error_of(f: &F, all: &[F]) -> Option<String> {
         if let Some(e) = upstream_error(f.def.key, &get) {
             return Some(e);
         }
+    }
+    match f.def.key {
+        "st_ip_addr" if !v.s().trim().is_empty() && v.s().trim().parse::<IpAddr>().is_err() => {
+            return Some("Enter an IP address, or leave empty.".into());
+        }
+        "st_ua_custom"
+            if {
+                let t = v.s();
+                let t = t.trim();
+                let known = ["Firefox/", "FxiOS/", "CriOS/", "Chrome/", "Edg/"]
+                    .iter()
+                    .any(|m| t.contains(m))
+                    || (t.contains("Safari/") && t.contains("Version/"));
+                !t.is_empty() && !known
+            } =>
+        {
+            return Some(
+                "Use a Chrome, Edge, Firefox or Safari User-Agent, or leave empty.".into(),
+            );
+        }
+        "st_referer_custom"
+            if {
+                let t = v.s();
+                let t = t.trim();
+                !t.is_empty() && !t.starts_with("https://") && !t.starts_with("http://")
+            } =>
+        {
+            return Some("Enter a URL such as https://example.org/, or leave empty.".into());
+        }
+        _ => {}
     }
     match f.def.kind {
         Kind::Port | Kind::Num { .. } => {
@@ -760,6 +1019,60 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
             d.negative_ttl_secs = Some(num("dns_neg_ttl"));
         }
         r.dns = Some(d);
+    }
+    if [
+        "st_on",
+        "st_search",
+        "st_dnt",
+        "st_params",
+        "st_referer",
+        "st_referer_custom",
+        "st_ua",
+        "st_ua_custom",
+        "st_ip",
+        "st_ip_addr",
+        "st_xcd",
+        "st_c3p",
+        "st_c3p_min",
+        "st_c1p",
+        "st_c1p_min",
+        "st_etag",
+        "st_auth",
+        "st_webrtc",
+        "st_push",
+        "st_location",
+        "st_flash",
+        "st_java",
+    ]
+    .iter()
+    .any(|k| dirty(k))
+    {
+        r.stealth = Some(api_types::StealthUpdate {
+            enabled: dirty("st_on").then(|| val("st_on").b()),
+            hide_search_queries: dirty("st_search").then(|| val("st_search").b()),
+            send_dnt: dirty("st_dnt").then(|| val("st_dnt").b()),
+            strip_tracking_params: dirty("st_params").then(|| val("st_params").b()),
+            hide_referer: dirty("st_referer").then(|| val("st_referer").b()),
+            referer_custom: dirty("st_referer_custom")
+                .then(|| val("st_referer_custom").s().trim().to_string()),
+            hide_user_agent: dirty("st_ua").then(|| val("st_ua").b()),
+            user_agent_custom: dirty("st_ua_custom")
+                .then(|| val("st_ua_custom").s().trim().to_string()),
+            mask_ip: dirty("st_ip").then(|| val("st_ip").b()),
+            mask_ip_address: dirty("st_ip_addr").then(|| val("st_ip_addr").s().trim().to_string()),
+            remove_x_client_data: dirty("st_xcd").then(|| val("st_xcd").b()),
+            third_party_cookies: dirty("st_c3p").then(|| val("st_c3p").b()),
+            third_party_cookie_minutes: dirty("st_c3p_min").then(|| num("st_c3p_min") as u32),
+            first_party_cookies: dirty("st_c1p").then(|| val("st_c1p").b()),
+            first_party_cookie_minutes: dirty("st_c1p_min").then(|| num("st_c1p_min") as u32),
+            block_etag: dirty("st_etag").then(|| val("st_etag").b()),
+            block_third_party_auth: dirty("st_auth").then(|| val("st_auth").b()),
+            block_webrtc: dirty("st_webrtc").then(|| val("st_webrtc").b()),
+            block_push: dirty("st_push").then(|| val("st_push").b()),
+            block_location: dirty("st_location").then(|| val("st_location").b()),
+            block_flash: dirty("st_flash").then(|| val("st_flash").b()),
+            block_java: dirty("st_java").then(|| val("st_java").b()),
+        });
     }
     r
 }

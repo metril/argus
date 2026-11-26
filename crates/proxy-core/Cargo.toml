@@ -67,6 +67,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 psl = "2"
 url = { workspace = true }
+httpdate = "1"
 bytes = { workspace = true }
 
 # CIDR matching for the destination policy and client ACL

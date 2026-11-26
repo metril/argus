@@ -22,6 +22,7 @@ pub mod error;
 pub mod ev;
 pub mod ext;
 pub mod ext_bridge;
+
 pub mod filtering;
 pub mod gm;
 pub mod http2;
@@ -44,6 +45,7 @@ pub mod scriptctl;
 pub mod sct;
 pub mod self_route;
 pub mod server;
+pub mod stealth;
 pub mod tls;
 pub mod transparent;
 pub mod upstream;

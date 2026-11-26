@@ -374,6 +374,11 @@ impl TestOrigin {
         self.state.requests.lock().clone()
     }
 
+    /// Forget the requests recorded so far.
+    pub fn clear_requests(&self) {
+        self.state.requests.lock().clear();
+    }
+
     /// Requests received for `path` (query ignored).
     pub fn requests_for(&self, path: &str) -> Vec<RecordedRequest> {
         self.requests()

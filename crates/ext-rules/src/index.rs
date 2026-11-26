@@ -526,6 +526,23 @@ impl ExtIndex {
             .collect()
     }
 
+    /// Stealth options turned off for a request by `$stealth` exceptions (a [`crate::stealth`]
+    /// bit set; 0 when none match). Judged like any network rule: the request's URL and type, and
+    /// `$domain=` against the page that issued it.
+    pub fn stealth_off(&self, req: &RequestInfo<'_>) -> u32 {
+        if self.present & target::STEALTH == 0 || self.req.len == 0 {
+            return 0;
+        }
+        let Some(ctx) = Ctx::new(req) else { return 0 };
+        self.net_ids(&self.req, &ctx)
+            .into_iter()
+            .map(|i| &self.rules[i as usize])
+            .filter(|r| r.exception && r.target_mask() & target::STEALTH != 0)
+            .fold(0, |m, r| {
+                m | crate::stealth::parse_value(&r.value).unwrap_or(0)
+            })
+    }
+
     /// Extra network verdict for a request. Pure; allocation-free when no rule matches.
     pub fn request_decision(&self, req: &RequestInfo<'_>) -> RequestDecision {
         let mut d = RequestDecision::default();

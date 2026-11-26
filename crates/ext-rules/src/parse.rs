@@ -29,6 +29,9 @@ pub mod target {
     pub const SNIPPET: u32 = 1 << 12;
     pub const SCRIPTLET: u32 = 1 << 13;
     pub const PCSS: u32 = 1 << 14;
+    /// Exception only: `$stealth`. Not part of [`ALL`] (a `$document` exception leaves Stealth
+    /// Mode on).
+    pub const STEALTH: u32 = 1 << 15;
     pub const ALL: u32 = (1 << 15) - 1;
 }
 
@@ -506,6 +509,7 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
     let (mut m_in, mut m_out) = (Vec::new(), Vec::new());
     let mut popup = false;
     let mut scope_mask = 0u32;
+    let mut stealth_val = String::new();
     // (target, value, compiled-lazily action builder input)
     let mut act: Option<(String, String)> = None;
 
@@ -564,6 +568,13 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
             "jsinject" if exception => scope_mask |= JS | SCRIPTLET | SNIPPET,
             "elemhide" | "ehide" if exception => scope_mask |= PCSS | HTML,
             "urlblock" if exception => scope_mask |= BLOCK | URLTRANSFORM,
+            "stealth" if exception && !neg => {
+                if crate::stealth::parse_value(val.unwrap_or("")).is_none() {
+                    return inv("unknown $stealth option");
+                }
+                stealth_val = val.unwrap_or("").to_ascii_lowercase();
+                scope_mask |= STEALTH;
+            }
             "replace" | "jsonprune" | "xmlprune" | "hls" | "cookie" | "removeheader"
             | "permissions" | "urltransform" | "header" => {
                 if neg {
@@ -604,6 +615,9 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                     BLOCK | HEADER
                 };
                 stage = STAGE_REQ | STAGE_RESP;
+                if mask & STEALTH != 0 {
+                    value = stealth_val.clone();
+                }
                 Action::Disable { mask }
             } else {
                 if scope_mask != 0 {

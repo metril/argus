@@ -90,6 +90,7 @@ fn test_custom_config() {
         webui: WebUiSettings::default(),
         dns: Default::default(),
         bypass: Default::default(),
+        stealth: Default::default(),
     };
 
     assert_eq!(config.proxy.host, "127.0.0.1");

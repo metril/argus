@@ -58,6 +58,7 @@ async fn test_server_with_mitm_enabled() {
         webui: WebUiSettings::default(),
         dns: Default::default(),
         bypass: Default::default(),
+        stealth: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -122,6 +123,7 @@ async fn test_server_with_mitm_disabled() {
         webui: WebUiSettings::default(),
         dns: Default::default(),
         bypass: Default::default(),
+        stealth: Default::default(),
     };
 
     // Create server with MITM disabled
@@ -178,6 +180,7 @@ async fn test_certificate_generation() {
         webui: WebUiSettings::default(),
         dns: Default::default(),
         bypass: Default::default(),
+        stealth: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -265,6 +268,7 @@ async fn test_load_manager_integration() {
         webui: WebUiSettings::default(),
         dns: Default::default(),
         bypass: Default::default(),
+        stealth: Default::default(),
     };
 
     // Create server

@@ -296,6 +296,9 @@ pub struct AppState {
     /// Upstream certificates the proxy has seen (installed by the proxy; empty otherwise).
     pub certs: OnceLock<Arc<common::certstore::CertStore>>,
 
+    /// The proxy's live Stealth Mode settings; saved changes are swapped in here.
+    pub stealth: OnceLock<Arc<arc_swap::ArcSwap<common::config::StealthSettings>>>,
+
     /// Status of the trusted root set (installed by the proxy; absent otherwise).
     pub roots: OnceLock<Arc<common::certstore::RootsStatusCell>>,
 
@@ -889,6 +892,7 @@ pub async fn build_state_full(
         started_at: Instant::now(),
         bypass: OnceLock::new(),
         certs: OnceLock::new(),
+        stealth: OnceLock::new(),
         roots: OnceLock::new(),
         chain_probe: OnceLock::new(),
         argus: OnceLock::new(),
