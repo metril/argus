@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.0 — 2026-11-26
+
+* Element hiding: uBO's procedural engine (`:has`, `:has-text`, `:upward` and the rest)
+  runs in the page and re-runs, throttled, as the page changes. Each selector is its own rule, so
+  one bad selector no longer drops its neighbours, and exceptions (`#@#`, `$elemhide`,
+  `$generichide`) are honoured per selector.
+* Redirect resources: uBO's full set of stand-in resources is bundled, with AdGuard's names as
+  aliases and 10 AdGuard-only resources added, so `$redirect` rules in the default lists no longer
+  fall back to plain blocks. Refreshes are pinned and validated.
+* `$removeparam`: regex, negated and bare forms are supported. A new service-worker guard
+  (Settings, off by default) stops sites' service workers from serving pages Argus never filtered.
+* Stealth mode (Settings, off by default), using AdGuard's options and defaults: hides the
+  referrer and search queries, sends Do Not Track and Global Privacy Control, removes X-Client-Data,
+  and can shorten third-party cookie lifetimes, reduce the User-Agent and strip tracking
+  parameters. `$stealth` exception rules are supported.
+* Extension: routing fails closed. While the proxy toggle is on, the browser never silently goes
+  direct; if Argus is unreachable the popup says so and offers to turn the proxy off. Sessions
+  resume across background-worker and Argus restarts, and private windows get their own session.
+* Request log: every request Argus answers itself is now logged too (its own page assets, stand-in
+  redirects, script-policy and destination-policy blocks, service-worker refusals). Argus's own
+  assets are marked `internal`. The log size is a setting (Settings → Timeouts and limits,
+  100–500,000 entries, default 1000) and changes take effect immediately.
+
 ## 0.6.2 — 2026-11-25
 
 * Extension (Chrome): no more native proxy sign-in prompt after the browser restarts the
