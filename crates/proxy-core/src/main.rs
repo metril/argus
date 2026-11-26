@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
     // per worker; this handle shares the compiled rules as bytes between the proxy and the web API.
     let shared_engine = Arc::new(SharedEngine::new());
     shared_engine.set_enabled(config.adblock.enabled);
+    shared_engine.set_event_capacity(config.adblock.request_log_capacity);
     shared_engine.set_recent_keep_query(config.adblock.recent_blocked_keep_query);
 
     // One pooled upstream client (connect/read timeouts from config, no redirect following).

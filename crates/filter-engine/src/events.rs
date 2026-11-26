@@ -12,8 +12,8 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, TimeZone, Utc};
 use crossbeam::queue::ArrayQueue;
@@ -226,37 +226,67 @@ fn truncate(s: &str, cap: usize) -> &str {
     &s[..n]
 }
 
-/// One lock-free ring with a drained, bounded history for readers.
+/// One lock-free ring with a drained, bounded history for readers. The queue can be swapped for
+/// one of another size ([`Ring::resize`]) while writers push and readers read.
 struct Ring {
-    queue: ArrayQueue<Arc<Raw>>,
+    /// Writers and readers share the lock; only a resize takes it exclusively, so a push can
+    /// never land in a queue that is being replaced.
+    queue: RwLock<ArrayQueue<Arc<Raw>>>,
     history: Mutex<VecDeque<Arc<Raw>>>,
-    cap: usize,
+    cap: AtomicUsize,
 }
 
 impl Ring {
     fn new(cap: usize) -> Self {
         Self {
             // `ArrayQueue` cannot be empty; a disabled ring keeps one slot and never pushes.
-            queue: ArrayQueue::new(cap.max(1)),
+            queue: RwLock::new(ArrayQueue::new(cap.max(1))),
             history: Mutex::new(VecDeque::new()),
-            cap,
+            cap: AtomicUsize::new(cap),
         }
     }
 
     fn push(&self, raw: Arc<Raw>) {
         // Overwrites the oldest event when full; the displaced event is dropped here.
-        drop(self.queue.force_push(raw));
+        drop(
+            self.queue
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .force_push(raw),
+        );
     }
 
-    fn recent(&self, limit: usize) -> Vec<RequestEvent> {
-        let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some(e) = self.queue.pop() {
-            if h.len() >= self.cap {
+    /// Move everything queued into the history (oldest first), keeping the newest `cap`.
+    fn drain_into(&self, h: &mut VecDeque<Arc<Raw>>, q: &ArrayQueue<Arc<Raw>>) {
+        let cap = self.cap.load(Ordering::Relaxed);
+        while let Some(e) = q.pop() {
+            if h.len() >= cap {
                 h.pop_front();
             }
             h.push_back(e);
         }
+    }
+
+    fn recent(&self, limit: usize) -> Vec<RequestEvent> {
+        let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let q = self.queue.read().unwrap_or_else(|e| e.into_inner());
+        self.drain_into(&mut h, &q);
         h.iter().rev().take(limit).map(|r| r.decode()).collect()
+    }
+
+    /// Change the capacity, keeping the newest entries when it shrinks. No event is lost: the
+    /// swap happens with writers excluded, and what was queued moves to the history first.
+    fn resize(&self, cap: usize) {
+        let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.queue.write().unwrap_or_else(|e| e.into_inner());
+        let old = std::mem::replace(&mut *q, ArrayQueue::new(cap.max(1)));
+        // Drain under the larger limit so growing drops nothing, then cut to the new size.
+        self.cap.fetch_max(cap, Ordering::Relaxed);
+        self.drain_into(&mut h, &old);
+        self.cap.store(cap, Ordering::Relaxed);
+        while h.len() > cap {
+            h.pop_front();
+        }
     }
 }
 
@@ -265,7 +295,7 @@ pub struct RequestLog {
     all: Ring,
     blocked: Ring,
     tx: broadcast::Sender<Arc<LiveEvent>>,
-    cap: usize,
+    cap: AtomicUsize,
     /// Keep the query string and fragment of recorded URLs (they can carry secrets such as
     /// tokens, so the default is to strip them before anything is stored).
     keep_query: AtomicBool,
@@ -285,7 +315,7 @@ impl RequestLog {
             all: Ring::new(capacity),
             blocked: Ring::new(capacity),
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
-            cap: capacity,
+            cap: AtomicUsize::new(capacity),
             keep_query: AtomicBool::new(false),
         }
     }
@@ -296,7 +326,15 @@ impl RequestLog {
     }
 
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.cap.load(Ordering::Relaxed)
+    }
+
+    /// Resize both rings live (0 disables recording). Shrinking keeps the newest entries;
+    /// growing keeps all. The live broadcast is not touched.
+    pub fn set_capacity(&self, capacity: usize) {
+        self.all.resize(capacity);
+        self.blocked.resize(capacity);
+        self.cap.store(capacity, Ordering::Relaxed);
     }
 
     /// Live events from now on. A receiver that falls more than [`BROADCAST_CAPACITY`] behind
@@ -338,7 +376,7 @@ impl RequestLog {
 
     /// Record any event. Blocked events also enter the blocked-only ring.
     pub fn record_event(&self, e: &EventRef<'_>) {
-        if self.cap == 0 {
+        if self.capacity() == 0 {
             return;
         }
         let url = if self.keep_query.load(Ordering::Relaxed) {
@@ -512,6 +550,103 @@ mod tests {
             )
         );
         assert!(a.rule.is_none());
+    }
+
+    fn urls(v: Vec<RequestEvent>) -> Vec<String> {
+        v.into_iter().map(|e| e.url).collect()
+    }
+
+    #[test]
+    fn shrinking_keeps_the_newest_and_growing_keeps_everything() {
+        let log = RequestLog::new(5);
+        for i in 0..5 {
+            log.record(&format!("https://h/{i}"), "", "script", "r", None, None);
+        }
+        // Some entries drained into history, some still queued.
+        assert_eq!(log.recent(2).len(), 2);
+        log.record("https://h/5", "", "script", "r", None, None);
+        log.set_capacity(2);
+        assert_eq!(log.capacity(), 2);
+        assert_eq!(urls(log.recent(10)), ["https://h/5", "https://h/4"]);
+        assert_eq!(urls(log.recent_all(10)), ["https://h/5", "https://h/4"]);
+        // Grow: nothing is lost, and the new room is used.
+        log.set_capacity(4);
+        assert_eq!(urls(log.recent(10)), ["https://h/5", "https://h/4"]);
+        for i in 6..9 {
+            log.record(&format!("https://h/{i}"), "", "script", "r", None, None);
+        }
+        assert_eq!(
+            urls(log.recent(10)),
+            ["https://h/8", "https://h/7", "https://h/6", "https://h/5"]
+        );
+    }
+
+    #[test]
+    fn resize_keeps_the_broadcast_and_survives_concurrent_writers() {
+        let log = Arc::new(RequestLog::new(8));
+        let mut rx = log.subscribe();
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    for i in 0..500 {
+                        log.record(&format!("https://h/{t}/{i}"), "", "script", "r", None, None);
+                    }
+                })
+            })
+            .collect();
+        for n in [3, 50, 1, 20, 8] {
+            log.set_capacity(n);
+            assert!(log.recent_all(100).len() <= n);
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(log.capacity(), 8);
+        assert!(log.recent_all(100).len() <= 8);
+        log.record("https://h/last", "", "script", "r", None, None);
+        assert_eq!(log.recent_all(1)[0].url, "https://h/last");
+        // The stream saw events across the resizes (it may have lagged, never closed).
+        let mut got = 0;
+        loop {
+            match rx.try_recv() {
+                Ok(_) => got += 1,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(got > 0);
+    }
+
+    #[test]
+    fn concurrent_resizes_lose_no_event() {
+        use std::collections::HashSet;
+        const TOTAL: usize = 4 * 500;
+        // Grow-only resizes with room for everything: every pushed event must be present.
+        let log = Arc::new(RequestLog::new(3000));
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    for i in 0..500 {
+                        log.record(&format!("https://h/{t}/{i}"), "", "script", "r", None, None);
+                    }
+                })
+            })
+            .collect();
+        for n in [4000, 5000, 100_000, 200_000] {
+            log.set_capacity(n);
+            std::thread::yield_now();
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        let all = urls(log.recent_all(usize::MAX));
+        assert_eq!(all.len(), TOTAL);
+        assert_eq!(all.iter().collect::<HashSet<_>>().len(), TOTAL);
+        // Shrinking afterwards keeps exactly min(cap, total).
+        log.set_capacity(300);
+        assert_eq!(log.recent_all(usize::MAX).len(), 300.min(TOTAL));
     }
 
     #[test]

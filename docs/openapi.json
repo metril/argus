@@ -4637,6 +4637,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "request_log_capacity": {
+            "description": "Entries kept by the request log (per ring, about 1 KB each).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "request_timeout_secs": {
             "format": "int64",
             "minimum": 0,
@@ -6543,6 +6549,15 @@
             ]
           },
           "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "request_log_capacity": {
+            "description": "Entries kept by the request log (100 to 500000); applied live, keeping the newest when\nit shrinks.",
             "format": "int32",
             "minimum": 0,
             "type": [

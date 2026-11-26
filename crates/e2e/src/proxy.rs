@@ -303,6 +303,7 @@ impl TestProxy {
 
         let engine = Arc::new(SharedEngine::new());
         engine.set_enabled(true);
+        engine.set_event_capacity(config.adblock.request_log_capacity);
         install_rules(&engine, rules);
 
         let ctx = Arc::new(

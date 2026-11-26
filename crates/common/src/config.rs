@@ -538,6 +538,10 @@ pub struct AdblockSettings {
     /// often carry tokens, so they are stripped before storing.
     #[serde(default)]
     pub recent_blocked_keep_query: bool,
+    /// Entries kept by the request log (and, separately, by its blocked-only view): about 1 KB
+    /// each per ring. Applied live; 100 to 500000.
+    #[serde(default = "default_request_log_capacity")]
+    pub request_log_capacity: usize,
     /// Leave response bodies alone when the origin sends `Cache-Control: no-transform`
     /// (header-only edits still apply). Many CDNs set it on everything; turn this off to rewrite
     /// those pages anyway.
@@ -553,6 +557,26 @@ pub struct AdblockSettings {
     /// Hosts (exact, or `*.suffix` for subdomains) the service-worker guard leaves alone.
     #[serde(default)]
     pub guard_service_workers_exempt: Vec<String>,
+}
+
+/// Smallest and largest accepted `adblock.request_log_capacity`.
+pub const REQUEST_LOG_CAPACITY_RANGE: std::ops::RangeInclusive<usize> = 100..=500_000;
+
+fn default_request_log_capacity() -> usize {
+    1000
+}
+
+/// `Err` with a message unless `n` is an allowed request-log capacity.
+pub fn validate_request_log_capacity(n: usize) -> Result<(), String> {
+    if REQUEST_LOG_CAPACITY_RANGE.contains(&n) {
+        Ok(())
+    } else {
+        Err(format!(
+            "request_log_capacity: use {} to {}",
+            REQUEST_LOG_CAPACITY_RANGE.start(),
+            REQUEST_LOG_CAPACITY_RANGE.end()
+        ))
+    }
 }
 
 fn default_true() -> bool {
@@ -610,6 +634,7 @@ impl Default for AdblockSettings {
             build_threads: 0,
             allowed_fetch_destinations: Vec::new(),
             recent_blocked_keep_query: false,
+            request_log_capacity: default_request_log_capacity(),
             respect_no_transform: true,
             guard_service_workers: false,
             guard_service_workers_exempt: Vec::new(),
@@ -948,6 +973,8 @@ impl ProxyConfig {
         if cfg.proxy.ext_port == Some(0) {
             cfg.proxy.ext_port = None;
         }
+        validate_request_log_capacity(cfg.adblock.request_log_capacity)
+            .map_err(|e| ConfigError::Parse(format!("[adblock] {e}")))?;
         Ok(cfg)
     }
 
@@ -1156,6 +1183,23 @@ pub fn derive_max_connections() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_log_capacity_defaults_and_is_bounded() {
+        let with = |n: usize| {
+            let mut c = ProxyConfig::default();
+            c.adblock.request_log_capacity = n;
+            ProxyConfig::from_toml(&toml::to_string_pretty(&c).unwrap())
+        };
+        assert_eq!(ProxyConfig::default().adblock.request_log_capacity, 1000);
+        for ok in [100, 1000, 500_000] {
+            assert_eq!(with(ok).unwrap().adblock.request_log_capacity, ok);
+        }
+        for bad in [0, 99, 500_001] {
+            assert!(with(bad).is_err(), "{bad}");
+            assert!(validate_request_log_capacity(bad).is_err());
+        }
+    }
 
     #[test]
     fn legacy_config_without_listener_tables_loads_and_falls_back_to_globals() {

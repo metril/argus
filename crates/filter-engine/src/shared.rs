@@ -409,6 +409,11 @@ impl SharedEngine {
         self.block_log.set_keep_query(keep);
     }
 
+    /// Resize the request log's rings live (newest entries kept when shrinking).
+    pub fn set_event_capacity(&self, capacity: usize) {
+        self.block_log.set_capacity(capacity);
+    }
+
     /// Capacity of the recent-blocked ring.
     pub fn recent_blocked_capacity(&self) -> usize {
         self.block_log.capacity()

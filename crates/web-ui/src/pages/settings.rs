@@ -288,6 +288,17 @@ const SECTIONS: &[Section] = &[
                 },
                 dep: None,
             },
+            Def {
+                key: "log_cap",
+                label: "Request log size",
+                desc: "Requests kept in the Logs page, and again for blocked-only. Applies at once; shrinking keeps the newest.",
+                kind: Kind::Num {
+                    unit: "entries",
+                    min: 100,
+                    max: 500_000,
+                },
+                dep: None,
+            },
         ],
     },
     Section {
@@ -593,6 +604,7 @@ fn defaults(key: &str) -> Val {
         "conn_timeout" => Val::S("30".into()),
         "req_timeout" => Val::S("60".into()),
         "max_conns" => Val::S("0".into()),
+        "log_cap" => Val::S("1000".into()),
         "allow_clients" => Val::T(
             [
                 "127.0.0.0/8",
@@ -652,6 +664,7 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ),
         ("req_timeout", Val::S(c.request_timeout_secs.to_string())),
         ("max_conns", Val::S(c.max_connections.to_string())),
+        ("log_cap", Val::S(c.request_log_capacity.to_string())),
         ("allow_clients", Val::T(c.allowed_clients.clone())),
         ("allow_dest", Val::T(c.allowed_destinations.clone())),
         ("block_private", Val::B(c.block_private_destinations)),
@@ -732,6 +745,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "conn_timeout" => &["connection_timeout_secs"],
         "req_timeout" => &["request_timeout_secs"],
         "max_conns" => &["max_connections"],
+        "log_cap" => &["request_log_capacity"],
         "allow_clients" => &["allowed_clients"],
         "allow_dest" => &["allowed_destinations"],
         "block_private" => &["block_private_destinations"],
@@ -744,6 +758,21 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "dns_servers" | "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => &["dns"],
         k if k.starts_with("st_") => &["stealth"],
         _ => &["update_interval_hours"],
+    }
+}
+
+/// Memory hint for the request-log size: about 1 KB per entry in each of the two rings.
+fn log_cap_hint(v: &str) -> String {
+    match v.trim().parse::<u64>() {
+        Ok(n) if (100..=500_000).contains(&n) => {
+            let kb = n * 2;
+            if kb >= 1024 {
+                format!(" About {:.1} MB of memory.", kb as f64 / 1024.0)
+            } else {
+                format!(" About {kb} KB of memory.")
+            }
+        }
+        _ => " About 1 KB of memory per entry, in each of two lists.".into(),
     }
 }
 
@@ -991,6 +1020,9 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("max_conns") {
         r.max_connections = Some(num("max_conns") as u32);
+    }
+    if dirty("log_cap") {
+        r.request_log_capacity = Some(num("log_cap") as u32);
     }
     if dirty("allow_clients") {
         r.allowed_clients = Some(val("allow_clients").t());
@@ -1658,7 +1690,7 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 } else {
                     view! { <span class="lname" id=label_id.clone()>{d.label}</span> }.into_any()
                 }}
-                <small>{d.desc}</small>
+                <small>{d.desc}{move || (d.key == "log_cap").then(|| log_cap_hint(&f.cur.get().s()))}</small>
                 <span class="fstate">
                     {move || if modified() { view! { <span class="st st-mod">"modified"</span> }.into_any() } else { view! { <span class="st st-def">"default"</span> }.into_any() }}
                     {move || dirty().then(|| view! { <span class="st st-dirty">"unsaved"</span> })}
@@ -1695,6 +1727,13 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_size_hint_counts_two_rings() {
+        assert_eq!(log_cap_hint("1000"), " About 2.0 MB of memory.");
+        assert_eq!(log_cap_hint("100"), " About 200 KB of memory.");
+        assert!(log_cap_hint("abc").contains("per entry"));
+    }
     use api_types::UpstreamProxyKind;
 
     fn vals(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> String {

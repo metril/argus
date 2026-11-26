@@ -171,7 +171,10 @@ disabled or the password is wrong.
 `client` (profile label), `host` (host or subdomains) and `list_id`. Entries carry the URL, source
 host, request type, matched rule, list id (for domain-set hits) and client label. Requires
 `stats:read`. URLs are stored without their query string and fragment unless
-`adblock.recent_blocked_keep_query` is set. `GET /system/metrics` also reports `storage`
+`adblock.recent_blocked_keep_query` is set. The ring size is `request_log_capacity` in
+`GET /config` / `PUT /config` (100 to 500000, default 1000; about 1 KB per entry in each of the two
+rings). A change applies at once, keeps the newest entries when it shrinks and does not disturb
+live streams. `GET /system/metrics` also reports `storage`
 (`deferred_dropped`, `deferred_failed`, `deferred_queued`) for the background database writer.
 
 ## Userscripts

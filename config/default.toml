@@ -56,6 +56,9 @@ allowed_fetch_destinations = []
 build_threads = 0
 # Keep query strings in the recent-blocked list (off: they are stripped because they can hold tokens).
 recent_blocked_keep_query = false
+# Entries the request log keeps (100 to 500000), in each of its two rings (all requests and
+# blocked only); about 1 KB per entry per ring. Also editable live in Settings.
+request_log_capacity = 1000
 # Leave response bodies alone when the origin sends `Cache-Control: no-transform` (header-only rule
 # edits still apply). Many CDNs send it on everything; set false to rewrite those pages anyway.
 respect_no_transform = true

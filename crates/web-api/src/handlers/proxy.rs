@@ -66,6 +66,7 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
             lists_public_key: config.bypass.lists_public_key.clone(),
         },
         stealth: stealth_dto(&config.stealth),
+        request_log_capacity: config.adblock.request_log_capacity as u32,
         bind: None,
     }
 }
@@ -330,6 +331,11 @@ fn valid_cidr(s: &str) -> bool {
 fn apply_live(state: &AppState, config: &ProxyConfig) {
     // Master switch; each listener additionally gates on its own `enable_adblock`.
     state.shared_engine.set_enabled(config.adblock.enabled);
+    if state.shared_engine.recent_blocked_capacity() != config.adblock.request_log_capacity {
+        state
+            .shared_engine
+            .set_event_capacity(config.adblock.request_log_capacity);
+    }
     state.proxy_state.request_timeout_ms.store(
         config.performance.request_timeout_secs.saturating_mul(1000),
         Ordering::Relaxed,
@@ -597,6 +603,12 @@ async fn apply_update_locked(
             &mut applied,
         );
     }
+    field!(
+        "request_log_capacity",
+        config.adblock.request_log_capacity,
+        req.request_log_capacity.map(|v| v as usize),
+        true
+    );
     if let Some(u) = &req.upstream_proxy {
         let next = merge_upstream_proxy(&config.proxy.upstream.proxy, u);
         next.validate().map_err(ApiError::ValidationError)?;

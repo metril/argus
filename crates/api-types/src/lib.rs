@@ -265,6 +265,9 @@ pub struct ProxyConfigResponse {
     /// Stealth Mode.
     #[serde(default)]
     pub stealth: StealthDto,
+    /// Entries kept by the request log (per ring, about 1 KB each).
+    #[serde(default = "default_request_log_capacity")]
+    pub request_log_capacity: u32,
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
@@ -579,6 +582,14 @@ pub struct UpdateProxyConfigRequest {
     pub guard_service_workers_exempt: Option<Vec<String>>,
     /// Stealth Mode settings; applied live.
     pub stealth: Option<StealthUpdate>,
+    /// Entries kept by the request log (100 to 500000); applied live, keeping the newest when
+    /// it shrinks.
+    #[cfg_attr(feature = "server", validate(range(min = 100, max = 500000)))]
+    pub request_log_capacity: Option<u32>,
+}
+
+fn default_request_log_capacity() -> u32 {
+    1000
 }
 
 /// Connection statistics.
