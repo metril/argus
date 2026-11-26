@@ -276,6 +276,16 @@ impl ProxyControl {
         }
     }
 
+    /// Test an upstream proxy configuration (see [`ProxyContext::test_upstream_proxy`]).
+    pub async fn test_upstream_proxy(
+        &self,
+        cfg: &common::config::UpstreamProxy,
+        host: &str,
+        port: u16,
+    ) -> std::result::Result<std::time::Duration, String> {
+        self.ctx.test_upstream_proxy(cfg, host, port).await
+    }
+
     /// Apply the settings that need no rebind: client ACL, TLS passthrough hosts, destination
     /// rules, per-listener switches, DNS, time limits and the connection cap.
     ///
@@ -331,18 +341,23 @@ impl ProxyControl {
                 self.ctx.resolve_all_to(),
             );
             let shutdown = l.shutdown_tx.clone();
+            let handle = self.ctx.proxy_handle().clone();
             new_ws = Some(Arc::new(
                 tokio::task::spawn_blocking(move || {
                     crate::websocket::WsUpstream::new(roots, policy, resolve, t.handshake)
-                        .map(|w| w.with_lifecycle(t.tunnel_idle, shutdown))
+                        .map(|w| w.with_proxy(handle).with_lifecycle(t.tunnel_idle, shutdown))
                 })
                 .await
                 .map_err(|e| Error::Internal(e.to_string()))??,
             ));
         }
-        let upstream = self
-            .ctx
-            .prepare_upstream_timeouts(t.handshake, t.header_read)?;
+        let proxy = self.ctx.prepare_proxy(&config.proxy.upstream.proxy).await?;
+        let upstream = self.ctx.prepare_upstream(
+            t.handshake,
+            t.header_read,
+            config.proxy.upstream.browser_like,
+            proxy,
+        )?;
         // The old `tls_passthrough_hosts` setting lives on as `migrated` bypass entries. Last
         // fallible step: the commit below cannot fail.
         {
@@ -1223,6 +1238,7 @@ impl ProxyServer {
                         self.ctx.resolve_all_to(),
                         t0.handshake,
                     )?
+                    .with_proxy(self.ctx.proxy_handle().clone())
                     .with_lifecycle(t0.tunnel_idle, shutdown_tx.clone()),
                 )))
             } else {

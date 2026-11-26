@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+* Upstream proxy (Settings, off by default; `proxy.upstream.proxy`): Argus can send everything it
+  connects to through another proxy, HTTP `CONNECT` or SOCKS5, with an optional username and
+  password. DNS lookups stay on Argus: it resolves and vets each target itself (private, reserved
+  and its own addresses are still refused) and sends the proxy only that IP, never a name. TLS
+  and `Host` still use the name. Web requests, WebSockets, userscript requests, certificate and
+  EV probes, passthrough tunnels, and Argus's own fetches (filter lists, bypass lists and the
+  root store, extension downloads, userscript imports) all go through it, and nothing connects
+  directly while it is on. The fetches keep their destination checks and certificate
+  verification and pinning, and follow a settings change on the next request. The proxy itself may be on a private network but never one of Argus's own listeners.
+  A Test button checks it (one at a time, ten a minute per token; failures report one generic
+  message, the reason goes to the log). The password is write-only (the API reports `set` or
+  `unset`) and is kept only while the type, host and port stay the same: change any of them and
+  the username and password must be entered again, so saved credentials are never sent to
+  another address.
+  While it is on and browser-like connections are off, the plain wreq client replaces the
+  rustls one (only wreq resolves names locally before tunnelling).
+* Browser-like upstream connections (Settings, on by default; `proxy.upstream.browser_like`):
+  Argus connects to sites with the TLS and HTTP/2 fingerprint of the browser behind each request
+  (Chrome, Edge, Firefox or Safari, chosen from its client hints and User-Agent) and forwards the
+  browser's headers untouched and in order. Certificates are still verified against Argus's
+  trusted roots inside the handshake. Switching it off uses the previous client, kept for one
+  release. WebSockets still use the previous client.
+* Upstream connections of the browser-like client are now pooled per downstream connection (and
+  closed with it), so many browsers no longer share one connection to a site. TLS sessions are
+  resumed per device, never across devices.
+* A request that fails before any response arrives on a stale upstream connection (reset, HTTP/2
+  GOAWAY or REFUSED_STREAM, TLS closed without notice) is retried once on a fresh connection, for
+  GET, HEAD, OPTIONS, PUT, DELETE and bodies of up to 64 KiB; streamed bodies, timeouts and
+  certificate errors are never retried.
+
 ## 0.5.0 — 2026-11-24
 
 * Userscript `@include`/`@exclude` regexes now follow JavaScript semantics (lookaround and

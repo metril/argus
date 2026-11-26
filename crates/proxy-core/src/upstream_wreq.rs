@@ -1,7 +1,8 @@
 //! Minimal wreq (BoringSSL) upstream client constructor for the upstream-client rewrite.
 //!
 //! Phase P0 only: this exists to exercise the two vendored wreq patches (in-handshake certificate
-//! verification hook, CONNECT to a locally resolved IP). Nothing in the proxy path uses it yet.
+//! verification hook, CONNECT to a locally resolved IP). The proxy path builds its client in
+//! `upstream.rs` (`build_upstream_client`).
 
 use std::{sync::Arc, time::Duration};
 

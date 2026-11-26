@@ -226,6 +226,12 @@ pub struct ProxyConfigResponse {
     /// Also refuse private-range destinations.
     #[serde(default)]
     pub block_private_destinations: bool,
+    /// Connect to origins with the requesting browser's TLS/HTTP2 fingerprint.
+    #[serde(default)]
+    pub browser_like_upstream: bool,
+    /// Another proxy Argus's own upstream traffic goes through.
+    #[serde(default)]
+    pub upstream_proxy: UpstreamProxyDto,
     /// CIDR exceptions to the destination refusals.
     #[serde(default)]
     pub allowed_destinations: Vec<String>,
@@ -252,6 +258,80 @@ pub struct ProxyConfigResponse {
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
+}
+
+/// Protocol spoken to the upstream proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProxyKind {
+    /// HTTP `CONNECT`.
+    #[default]
+    Http,
+    /// SOCKS5.
+    Socks5,
+}
+
+/// The upstream proxy as read. The password is never returned: `password` is `"set"` or `"unset"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UpstreamProxyDto {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub kind: UpstreamProxyKind,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_upstream_proxy_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    /// `"set"` or `"unset"`.
+    #[serde(default)]
+    pub password: String,
+}
+
+fn default_upstream_proxy_port() -> u16 {
+    8080
+}
+
+impl Default for UpstreamProxyDto {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kind: UpstreamProxyKind::Http,
+            host: String::new(),
+            port: default_upstream_proxy_port(),
+            username: String::new(),
+            password: "unset".into(),
+        }
+    }
+}
+
+/// Partial update of the upstream proxy; omitted fields keep their value. An empty or omitted
+/// `password` keeps the saved one; clearing `username` also clears the password.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UpstreamProxyUpdate {
+    pub enabled: Option<bool>,
+    pub kind: Option<UpstreamProxyKind>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// Outcome of testing the upstream proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct UpstreamProxyTestResult {
+    pub ok: bool,
+    /// Time to connect through the proxy and finish a TLS handshake.
+    pub latency_ms: Option<u64>,
+    /// Why it failed.
+    pub error: Option<String>,
+    /// The host the test connected to.
+    pub target: String,
 }
 
 /// Upstream DNS settings.
@@ -405,6 +485,9 @@ pub struct UpdateProxyConfigRequest {
     pub tls_passthrough_hosts: Option<Vec<String>>,
     /// Applied live.
     pub block_private_destinations: Option<bool>,
+    pub browser_like_upstream: Option<bool>,
+    /// Upstream proxy settings; applied live (new connections go through the proxy at once).
+    pub upstream_proxy: Option<UpstreamProxyUpdate>,
     /// CIDR list; replaces the current one. Applied live.
     pub allowed_destinations: Option<Vec<String>>,
     /// CIDR list; replaces the current one. Applied live.

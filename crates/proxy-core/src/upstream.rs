@@ -28,11 +28,22 @@ pub struct UpstreamOptions {
     pub dns: Option<Arc<CachedResolver>>,
     /// Idle pooled connections kept per origin; `None` keeps the default of 32.
     pub pool_max_idle_per_host: Option<usize>,
+    /// Bound on the idle pool entries (connection group x origin) of the browser-like client;
+    /// `None`: unbounded.
+    pub pool_max_size: Option<usize>,
+    /// Cap on the TLS sessions kept for resumption, over all devices and hosts; `None`: 4096.
+    pub tls_session_cap: Option<usize>,
     /// Where the certificates upstream servers present are recorded (shared with the web API).
     pub certs: Arc<common::certstore::CertStore>,
     /// The live trusted root set; built from `extra_ca_paths` over the compiled-in floor when
     /// `None` (a context installs one so every client shares it).
     pub roots: Option<Arc<crate::roots::RootsHandle>>,
+    /// Connect with the requesting browser's TLS/HTTP2 fingerprint (the wreq client); off uses
+    /// the rustls client.
+    pub browser_like: bool,
+    /// The live upstream proxy (shared with every other dialer). The clients are built for the
+    /// proxy it holds when they are built.
+    pub proxy: Arc<crate::upstream_proxy::ProxyHandle>,
 }
 
 impl UpstreamOptions {
@@ -51,6 +62,35 @@ impl UpstreamOptions {
         // One caching resolver for every dial: the HTTP client, CONNECT and transparent
         // tunnels and WebSocket (through the policy) share it.
         let dns = Arc::new(CachedResolver::from_settings(&config.dns));
+        let max_connections = match config.performance.max_connections {
+            0 => common::config::derive_max_connections(),
+            n => n,
+        };
+        let policy = Arc::new(
+            DestPolicy::from_config(config)
+                .unwrap_or_else(|e| {
+                    // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
+                    tracing::warn!("destination policy config invalid: {e}");
+                    DestPolicy::default()
+                })
+                .with_resolver(Arc::new(crate::dns::DnsHandle(dns.clone()))),
+        );
+        // An enabled upstream proxy is in force from the first connection (never fall back to
+        // direct): an unusable one makes every dial fail until it is fixed.
+        let proxy = Arc::new(crate::upstream_proxy::ProxyHandle::default());
+        // Control-plane fetches (lists, roots) follow the same live proxy.
+        common::control_bridge::set_upstream_dialer(proxy.clone());
+        let cfg = &config.proxy.upstream.proxy;
+        if cfg.enabled {
+            if let Err(e) = cfg.validate() {
+                tracing::warn!("{e}; upstream connections fail until it is fixed");
+            }
+            proxy.store(Some(Arc::new(crate::upstream_proxy::ProxyEndpoint::new(
+                cfg.clone(),
+                policy.clone(),
+                dns.clone(),
+            ))));
+        }
         Self {
             extra_ca_paths: config.proxy.extra_upstream_ca_paths.clone(),
             resolve_all_to: None,
@@ -62,22 +102,13 @@ impl UpstreamOptions {
             )),
             certs: Default::default(),
             roots: None,
-            dns: Some(dns.clone()),
-            pool_max_idle_per_host: Some(common::config::pool_idle_per_host(
-                match config.performance.max_connections {
-                    0 => common::config::derive_max_connections(),
-                    n => n,
-                },
-            )),
-            policy: Arc::new(
-                DestPolicy::from_config(config)
-                    .unwrap_or_else(|e| {
-                        // `ProxyServer::new` rejects invalid CIDRs; this fallback keeps defaults only.
-                        tracing::warn!("destination policy config invalid: {e}");
-                        DestPolicy::default()
-                    })
-                    .with_resolver(Arc::new(crate::dns::DnsHandle(dns))),
-            ),
+            browser_like: config.proxy.upstream.browser_like,
+            proxy,
+            dns: Some(dns),
+            pool_max_idle_per_host: Some(common::config::pool_idle_per_host(max_connections)),
+            pool_max_size: Some(common::config::pool_total_idle(max_connections)),
+            tls_session_cap: None,
+            policy,
         }
     }
 }
@@ -221,6 +252,7 @@ const PROBE_BACKGROUND: usize = 16;
 struct Busy;
 
 struct ProbeInner {
+    proxy: Arc<crate::upstream_proxy::ProxyHandle>,
     store: Arc<common::certstore::CertStore>,
     roots: Arc<crate::roots::RootsHandle>,
     resolver: PolicyResolver,
@@ -283,12 +315,14 @@ impl CertProber {
         background: usize,
     ) -> Result<Self> {
         Ok(Self(Arc::new(ProbeInner {
+            proxy: opts.proxy.clone(),
             store: opts.certs.clone(),
             roots: opts.roots_handle()?,
             resolver: PolicyResolver {
                 policy: opts.policy.clone(),
                 override_ip: opts.resolve_all_to,
                 strict: false,
+                proxy: None,
                 dns: opts.dns.clone().unwrap_or_else(|| {
                     Arc::new(CachedResolver::from_settings(&Default::default()))
                 }),
@@ -445,7 +479,9 @@ impl ProbeInner {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
         let mut completed = None;
         for addr in addrs {
-            let Ok(tcp) = tokio::net::TcpStream::connect(addr).await else {
+            let Ok(tcp) =
+                crate::upstream_proxy::connect_vetted(self.proxy.load().as_deref(), addr).await
+            else {
                 continue;
             };
             completed = Some(connector.connect(name.clone(), tcp).await.is_ok());
@@ -473,9 +509,22 @@ struct PolicyResolver {
     /// Also refuse every address of this host (client used for the proxy's own ports).
     strict: bool,
     dns: Arc<CachedResolver>,
+    /// The upstream proxy of the client this resolver serves: its alias resolves to the proxy's
+    /// own (loop-checked) addresses instead of going through the destination policy.
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
 }
 
 impl PolicyResolver {
+    fn copy(&self) -> PolicyResolver {
+        PolicyResolver {
+            policy: self.policy.clone(),
+            override_ip: self.override_ip,
+            strict: self.strict,
+            dns: self.dns.clone(),
+            proxy: self.proxy.clone(),
+        }
+    }
+
     /// Resolve (cached) and apply the destination policy to every address, on every call. The
     /// returned addresses are exactly what the connector dials; nothing is resolved again.
     async fn resolve_checked(
@@ -484,6 +533,32 @@ impl PolicyResolver {
     ) -> std::result::Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ip) = self.override_ip {
             return Ok(vec![SocketAddr::new(ip, 0)]);
+        }
+        if let Some(p) = &self.proxy {
+            if name.eq_ignore_ascii_case(p.alias()) {
+                let addrs = p.addrs().await?;
+                // The port comes from the proxy URL.
+                return Ok(addrs
+                    .into_iter()
+                    .map(|a| SocketAddr::new(a.ip(), 0))
+                    .collect());
+            }
+        }
+        // SOCKS connectors resolve IP literals through the resolver too: vet them the same way.
+        if let Ok(ip) = name
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
+            let verdict = if self.strict {
+                self.policy.check_ip_strict(ip)
+            } else {
+                self.policy.check_ip(ip)
+            };
+            return match verdict {
+                Ok(()) => Ok(vec![SocketAddr::new(ip, 0)]),
+                Err(r) => Err(Box::new(PolicyRefused(r))),
+            };
         }
         let addrs = self.dns.resolve(name).await.map_err(|e| {
             Box::new(std::io::Error::other(format!("dns lookup failed: {e}")))
@@ -515,12 +590,7 @@ impl PolicyResolver {
 
 impl reqwest::dns::Resolve for PolicyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let this = PolicyResolver {
-            policy: self.policy.clone(),
-            override_ip: self.override_ip,
-            strict: self.strict,
-            dns: self.dns.clone(),
-        };
+        let this = self.copy();
         Box::pin(async move {
             let v = this.resolve_checked(name.as_str()).await?;
             Ok(Box::new(v.into_iter()) as reqwest::dns::Addrs)
@@ -528,23 +598,720 @@ impl reqwest::dns::Resolve for PolicyResolver {
     }
 }
 
-/// Build the shared upstream client. Redirects are passed through to the downstream client
-/// (the proxy must not follow them itself).
-pub fn build_upstream_client(opts: &UpstreamOptions) -> Result<reqwest::Client> {
-    build_client(opts, false)
+impl wreq::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
+        let this = self.copy();
+        Box::pin(async move {
+            let v = this.resolve_checked(name.as_str()).await?;
+            Ok(Box::new(v.into_iter()) as wreq::dns::Addrs)
+        })
+    }
+}
+
+/// The pooled upstream client: the browser-like wreq client or the previous reqwest one.
+#[derive(Clone)]
+pub enum UpstreamClient {
+    Wreq(wreq::Client),
+    /// The wreq client without a browser fingerprint: used instead of the rustls client while an
+    /// upstream proxy is on, because only wreq resolves names locally before tunnelling.
+    WreqPlain(wreq::Client),
+    /// The shared client, and one that keeps no idle connection: the retry's, which must dial
+    /// (`None` for a client supplied ready-made, whose retry then shares its pool).
+    Reqwest(reqwest::Client, Option<reqwest::Client>),
+}
+
+impl std::fmt::Debug for UpstreamClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Wreq(_) => "UpstreamClient::Wreq",
+            Self::WreqPlain(_) => "UpstreamClient::WreqPlain",
+            Self::Reqwest(..) => "UpstreamClient::Reqwest",
+        })
+    }
+}
+
+impl From<reqwest::Client> for UpstreamClient {
+    fn from(c: reqwest::Client) -> Self {
+        Self::Reqwest(c, None)
+    }
+}
+
+/// A failed upstream request, from either client.
+#[derive(Debug)]
+pub enum UpstreamError {
+    Wreq(wreq::Error),
+    Reqwest(reqwest::Error),
+    /// The request could not be formed (a header that is not valid).
+    Invalid(String),
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wreq(e) => e.fmt(f),
+            Self::Reqwest(e) => e.fmt(f),
+            Self::Invalid(m) => f.write_str(m),
+        }
+    }
+}
+
+impl std::error::Error for UpstreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wreq(e) => Some(e),
+            Self::Reqwest(e) => Some(e),
+            Self::Invalid(_) => None,
+        }
+    }
+}
+
+impl UpstreamError {
+    /// Error kind for the request log.
+    pub fn kind(&self) -> filter_engine::ErrorKind {
+        match self {
+            Self::Wreq(e) => classify_wreq(e),
+            Self::Reqwest(e) => classify_reqwest(e),
+            Self::Invalid(_) => filter_engine::ErrorKind::Other,
+        }
+    }
+}
+
+type BodyStream = futures_util::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>;
+
+/// An upstream request being assembled; nothing is sent (and no client-specific state chosen)
+/// until [`Self::send`], since the browser profile depends on the headers.
+pub struct UpstreamRequest {
+    client: UpstreamClient,
+    method: hyper::Method,
+    url: String,
+    headers: hyper::HeaderMap,
+    bad_header: Option<String>,
+    body: Option<UpstreamBody>,
+    scope: Option<UpstreamScope>,
+}
+
+enum UpstreamBody {
+    Bytes(bytes::Bytes),
+    Stream(BodyStream),
+}
+
+impl UpstreamClient {
+    pub fn request(&self, method: hyper::Method, url: impl AsRef<str>) -> UpstreamRequest {
+        UpstreamRequest {
+            client: self.clone(),
+            method,
+            url: url.as_ref().to_string(),
+            headers: Default::default(),
+            bad_header: None,
+            body: None,
+            scope: None,
+        }
+    }
+
+    pub fn get(&self, url: impl AsRef<str>) -> UpstreamRequest {
+        self.request(hyper::Method::GET, url)
+    }
+
+    /// Drop the idle upstream connections pooled for downstream connection `conn_id`.
+    pub fn evict_conn(&self, conn_id: u64) {
+        if let Self::Wreq(c) | Self::WreqPlain(c) = self {
+            c.evict_group(&wreq::Group::new(conn_id));
+        }
+    }
+
+    /// Drop the idle connections of the retry group `name` (see [`RETRY_SEQ`]).
+    fn evict_named(&self, name: String) {
+        if let Self::Wreq(c) | Self::WreqPlain(c) = self {
+            c.evict_group(&wreq::Group::new(name));
+        }
+    }
+
+    /// Whether this is the browser-like client.
+    pub fn is_browser_like(&self) -> bool {
+        matches!(self, Self::Wreq(_))
+    }
+}
+
+impl UpstreamRequest {
+    /// Add a header (several of one name are kept in order).
+    pub fn header<K, V>(mut self, name: K, value: V) -> Self
+    where
+        K: TryInto<hyper::header::HeaderName>,
+        V: TryInto<hyper::header::HeaderValue>,
+    {
+        match (name.try_into(), value.try_into()) {
+            (Ok(n), Ok(v)) => {
+                self.headers.append(n, v);
+            }
+            _ => self.bad_header = Some("invalid header name or value".into()),
+        }
+        self
+    }
+
+    /// Pool this request's upstream connection with its downstream connection's other requests
+    /// (browser-like client only).
+    pub fn scope(mut self, scope: UpstreamScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    pub fn body(mut self, body: impl Into<bytes::Bytes>) -> Self {
+        self.body = Some(UpstreamBody::Bytes(body.into()));
+        self
+    }
+
+    /// Stream the request body; nothing is buffered.
+    pub fn body_stream<S>(mut self, stream: S) -> Self
+    where
+        S: futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    {
+        use futures_util::StreamExt;
+        self.body = Some(UpstreamBody::Stream(stream.boxed()));
+        self
+    }
+
+    /// Send the request. A request that failed before any response head arrived is retried
+    /// exactly once on a fresh connection when the failure says the connection (not the
+    /// request) was at fault and the request can be sent again: see [`UpstreamError::is_retryable`]
+    /// for what counts, and the rules on bodies and methods below.
+    pub async fn send(self) -> std::result::Result<UpstreamResponse, UpstreamError> {
+        if let Some(m) = self.bad_header {
+            return Err(UpstreamError::Invalid(m));
+        }
+        let Self {
+            client,
+            method,
+            url,
+            headers,
+            body,
+            scope,
+            ..
+        } = self;
+        // Replayable: no body, or one fully buffered (and small); never a stream. Being
+        // replayable allows a retry, it never justifies one: see `UpstreamError::never_ran`.
+        let replay = match &body {
+            None => Some(None),
+            Some(UpstreamBody::Bytes(b)) if b.len() <= MAX_REPLAY_BODY => Some(Some(b.clone())),
+            Some(_) => None,
+        }
+        .map(|b| (headers.clone(), b));
+        let first = send_once(&client, &method, &url, headers, body, scope.as_ref(), "").await;
+        match (first, replay) {
+            (Err(e), Some((headers, body)))
+                if e.never_ran() || (idempotent(&method) && e.is_retryable()) =>
+            {
+                let host = url::Url::parse(&url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_default();
+                common::faults::note(common::faults::Fault::UpstreamRetry, &host);
+                tracing::debug!("Retrying {url} on a new connection after: {e}");
+                let suffix = format!(
+                    "#r{}",
+                    RETRY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                );
+                let r = send_once(
+                    &client,
+                    &method,
+                    &url,
+                    headers,
+                    body.map(UpstreamBody::Bytes),
+                    scope.as_ref(),
+                    &suffix,
+                )
+                .await;
+                // Used once: its connection serves this response and is not pooled for others.
+                client.evict_named(match &scope {
+                    Some(s) => format!("{}{suffix}", s.conn_id),
+                    None => suffix,
+                });
+                r
+            }
+            (r, _) => r,
+        }
+    }
+}
+
+/// Largest fully buffered request body kept to replay it.
+pub const MAX_REPLAY_BODY: usize = 64 * 1024;
+
+fn idempotent(m: &hyper::Method) -> bool {
+    use hyper::Method as M;
+    matches!(*m, M::GET | M::HEAD | M::OPTIONS | M::PUT | M::DELETE)
+}
+
+/// One attempt. `suffix` names the connection group of a retry (never the failed connection's).
+async fn send_once(
+    client: &UpstreamClient,
+    method: &hyper::Method,
+    url: &str,
+    headers: hyper::HeaderMap,
+    body: Option<UpstreamBody>,
+    scope: Option<&UpstreamScope>,
+    suffix: &str,
+) -> std::result::Result<UpstreamResponse, UpstreamError> {
+    use futures_util::StreamExt;
+    match client {
+        UpstreamClient::Reqwest(shared, fresh) => {
+            // A retry (non-empty suffix) takes the client that never reuses a connection.
+            let c = match fresh {
+                Some(f) if !suffix.is_empty() => f,
+                _ => shared,
+            };
+            let mut rb = c.request(method.clone(), url).headers(headers);
+            rb = match body {
+                Some(UpstreamBody::Bytes(b)) => rb.body(b),
+                Some(UpstreamBody::Stream(s)) => rb.body(reqwest::Body::wrap_stream(s)),
+                None => rb,
+            };
+            let r = rb.send().await.map_err(UpstreamError::Reqwest)?;
+            let peer_cert = r
+                .extensions()
+                .get::<reqwest::tls::TlsInfo>()
+                .and_then(|t| t.peer_certificate())
+                .map(<[u8]>::to_vec);
+            let (status, headers) = (r.status(), r.headers().clone());
+            Ok(UpstreamResponse {
+                status,
+                headers,
+                peer_cert,
+                body: r
+                    .bytes_stream()
+                    .map(|c| c.map_err(std::io::Error::other))
+                    .boxed(),
+            })
+        }
+        UpstreamClient::Wreq(c) | UpstreamClient::WreqPlain(c) => {
+            // The profile is the browser's own (client hints, then User-Agent); its
+            // transport fingerprint is used, but none of its headers: the browser's go
+            // through as they came, in their order. The plain client has no fingerprint.
+            let browser = matches!(client, UpstreamClient::Wreq(_));
+            let profile = crate::browser_profile::BrowserProfile::classify(&headers);
+            let orig = crate::browser_profile::orig_headers(&profile, headers.keys());
+            let mut rb = c.request(method.clone(), url);
+            match scope {
+                Some(s) => rb = rb.group(s.group(suffix)),
+                None if !suffix.is_empty() => rb = rb.group(wreq::Group::new(suffix.to_string())),
+                None => {}
+            }
+            if browser {
+                rb = rb.emulation(profile.emulation());
+            }
+            let mut rb = rb.default_headers(false).headers(headers);
+            if browser {
+                rb = rb.orig_headers(orig);
+            }
+            rb = match body {
+                Some(UpstreamBody::Bytes(b)) => rb.body(b),
+                Some(UpstreamBody::Stream(s)) => rb.body(wreq::Body::wrap_stream(s)),
+                None => rb,
+            };
+            let mut r = rb.send().await.map_err(UpstreamError::Wreq)?;
+            let peer_cert = r
+                .extensions()
+                .get::<wreq::tls::TlsInfo>()
+                .and_then(|t| t.peer_certificate())
+                .map(<[u8]>::to_vec);
+            let (status, headers) = (r.status(), std::mem::take(r.headers_mut()));
+            Ok(UpstreamResponse {
+                status,
+                headers,
+                peer_cert,
+                body: r
+                    .bytes_stream()
+                    .map(|c| c.map_err(std::io::Error::other))
+                    .boxed(),
+            })
+        }
+    }
+}
+
+impl UpstreamError {
+    /// Whether the request provably never ran at the origin: the stream was refused
+    /// (REFUSED_STREAM), so any method may be sent again. A reset, EOF or GOAWAY says nothing
+    /// about whether the origin processed the request; those only justify a retry of an
+    /// idempotent method ([`Self::is_retryable`]).
+    pub fn never_ran(&self) -> bool {
+        match self {
+            Self::Wreq(e) => {
+                !e.is_retried()
+                    && chain_has(std::error::Error::source(e), |err| {
+                        err.downcast_ref::<http2::Error>()
+                            .is_some_and(refused_stream_http2)
+                    })
+            }
+            Self::Reqwest(e) => chain_has(std::error::Error::source(e), |err| {
+                err.downcast_ref::<h2::Error>()
+                    .is_some_and(refused_stream_h2)
+            }),
+            Self::Invalid(_) => false,
+        }
+    }
+
+    /// Whether the failure says the connection was at fault before any response head arrived,
+    /// so one more try on a fresh connection is sound: a connection reset, an HTTP/2 GOAWAY or
+    /// REFUSED_STREAM, or a TLS stream that ended without a close (on an established
+    /// connection). Never a policy refusal, a timeout, or a TLS handshake or certificate
+    /// failure.
+    pub fn is_retryable(&self) -> bool {
+        if crate::policy::is_refusal(self) {
+            return false;
+        }
+        match self {
+            Self::Wreq(e) => {
+                !e.is_timeout()
+                    && !e.is_retried()
+                    && retryable_chain(std::error::Error::source(e), e.is_connect())
+            }
+            Self::Reqwest(e) => {
+                !e.is_timeout() && retryable_chain(std::error::Error::source(e), e.is_connect())
+            }
+            Self::Invalid(_) => false,
+        }
+    }
+}
+
+/// The origin itself reset the stream with REFUSED_STREAM. A GOAWAY carrying that code is not
+/// proof the stream was never processed (it may be at or below the last stream id).
+fn refused_stream_http2(h: &http2::Error) -> bool {
+    h.is_reset()
+        && h.is_remote()
+        && !h.is_go_away()
+        && h.reason() == Some(http2::Reason::REFUSED_STREAM)
+}
+
+fn refused_stream_h2(h: &h2::Error) -> bool {
+    h.is_reset()
+        && h.is_remote()
+        && !h.is_go_away()
+        && h.reason() == Some(h2::Reason::REFUSED_STREAM)
+}
+
+fn chain_has(
+    first: Option<&(dyn std::error::Error + 'static)>,
+    f: impl Fn(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    let mut cur = first;
+    while let Some(err) = cur {
+        if f(err) {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// Walk the typed source chain for a failure of the connection itself. `connecting`: the error
+/// came while dialling (a handshake), where a TLS failure is a verdict on the server, not a
+/// stale connection.
+fn retryable_chain(first: Option<&(dyn std::error::Error + 'static)>, connecting: bool) -> bool {
+    use std::io::ErrorKind as I;
+    let mut cur = first;
+    while let Some(err) = cur {
+        if let Some(h) = err.downcast_ref::<http2::Error>() {
+            if h.is_go_away() || h.reason() == Some(http2::Reason::REFUSED_STREAM) {
+                return true;
+            }
+        }
+        if let Some(h) = err.downcast_ref::<h2::Error>() {
+            if h.is_go_away() || h.reason() == Some(h2::Reason::REFUSED_STREAM) {
+                return true;
+            }
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                I::ConnectionReset | I::ConnectionAborted | I::BrokenPipe | I::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        if !connecting {
+            if let Some(ssl) = err.downcast_ref::<btls::ssl::Error>() {
+                if matches!(
+                    ssl.code(),
+                    btls::ssl::ErrorCode::SYSCALL | btls::ssl::ErrorCode::ZERO_RETURN
+                ) {
+                    return true;
+                }
+            }
+            if let Some(stack) = err.downcast_ref::<btls::error::ErrorStack>() {
+                if stack
+                    .errors()
+                    .iter()
+                    .any(|e| e.reason().is_some_and(|r| r.contains("UNEXPECTED_EOF")))
+                {
+                    return true;
+                }
+            }
+        }
+        cur = err.source();
+    }
+    false
+}
+
+/// The head of an upstream response and its body stream.
+pub struct UpstreamResponse {
+    status: hyper::StatusCode,
+    headers: hyper::HeaderMap,
+    peer_cert: Option<Vec<u8>>,
+    body: BodyStream,
+}
+
+impl std::fmt::Debug for UpstreamResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamResponse")
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpstreamResponse {
+    pub fn status(&self) -> hyper::StatusCode {
+        self.status
+    }
+
+    pub fn headers(&self) -> &hyper::HeaderMap {
+        &self.headers
+    }
+
+    pub fn headers_mut(&mut self) -> &mut hyper::HeaderMap {
+        &mut self.headers
+    }
+
+    /// DER of the certificate of the connection that served this response (https only).
+    pub fn peer_certificate(&self) -> Option<&[u8]> {
+        self.peer_cert.as_deref()
+    }
+
+    pub fn bytes_stream(self) -> BodyStream {
+        self.body
+    }
+}
+
+/// Build the shared upstream client (browser-like when `opts.browser_like`). Redirects are
+/// passed through to the downstream client (the proxy must not follow them itself).
+pub fn build_upstream_client(opts: &UpstreamOptions) -> Result<UpstreamClient> {
+    build_client(opts, false, opts.proxy.load())
+}
+
+/// [`build_upstream_client`] for `proxy` instead of the live one (so a replacement can be built
+/// before it is installed).
+pub fn build_upstream_client_via(
+    opts: &UpstreamOptions,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<UpstreamClient> {
+    build_client(opts, false, proxy)
 }
 
 /// Like [`build_upstream_client`], for requests aimed at the proxy's own ports: its resolver
 /// refuses every address of this host, since the resolver cannot see the port.
-pub fn build_strict_upstream_client(opts: &UpstreamOptions) -> Result<reqwest::Client> {
-    build_client(opts, true)
+pub fn build_strict_upstream_client(opts: &UpstreamOptions) -> Result<UpstreamClient> {
+    build_client(opts, true, opts.proxy.load())
 }
 
-fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client> {
+/// [`build_strict_upstream_client`] for `proxy` instead of the live one.
+pub fn build_strict_upstream_client_via(
+    opts: &UpstreamOptions,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<UpstreamClient> {
+    build_client(opts, true, proxy)
+}
+
+fn build_client(
+    opts: &UpstreamOptions,
+    strict: bool,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<UpstreamClient> {
+    match (opts.browser_like, proxy.is_some()) {
+        (true, _) => build_wreq(opts, strict, proxy).map(UpstreamClient::Wreq),
+        (false, true) => build_wreq(opts, strict, proxy).map(UpstreamClient::WreqPlain),
+        // The reqwest path has no upstream proxy support (a proxy selects WreqPlain above), so
+        // its fresh retry client needs none either.
+        (false, false) => Ok(UpstreamClient::Reqwest(
+            build_reqwest(opts, strict, false)?,
+            Some(build_reqwest(opts, strict, true)?),
+        )),
+    }
+}
+
+fn resolver_of(
+    opts: &UpstreamOptions,
+    strict: bool,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> PolicyResolver {
+    PolicyResolver {
+        policy: opts.policy.clone(),
+        override_ip: opts.resolve_all_to,
+        strict,
+        proxy,
+        dns: opts
+            .dns
+            .clone()
+            .unwrap_or_else(|| Arc::new(CachedResolver::from_settings(&Default::default()))),
+    }
+}
+
+/// Counter that makes the group of every retry unique, so a retry never finds the idle
+/// connection of an earlier one.
+static RETRY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+const DEFAULT_TLS_SESSIONS: usize = 4096;
+/// Sessions older than this are not offered (also bounded by the ticket's own lifetime).
+const SESSION_TTL: Duration = Duration::from_secs(2 * 3600);
+/// Sessions kept per (device, origin).
+const SESSIONS_PER_KEY: usize = 8;
+
+/// TLS session cache with a global cap and a lifetime: the oldest session goes first when full,
+/// and a session past its TTL (or its ticket's lifetime) is never offered. TLS 1.3 sessions are
+/// single use.
+pub struct BoundedSessionCache {
+    cap: usize,
+    ttl: Duration,
+    entries: parking_lot::Mutex<
+        std::collections::VecDeque<(
+            wreq::tls::session::Key,
+            wreq::tls::session::TlsSession,
+            std::time::Instant,
+        )>,
+    >,
+}
+
+impl BoundedSessionCache {
+    pub fn new(cap: usize, ttl: Duration) -> Self {
+        Self {
+            cap: cap.max(1),
+            ttl,
+            entries: Default::default(),
+        }
+    }
+
+    fn expired(&self, s: &wreq::tls::session::TlsSession, at: std::time::Instant) -> bool {
+        let life = self.ttl.min(Duration::from_secs(u64::from(s.timeout())));
+        at.elapsed() > life
+    }
+}
+
+impl wreq::tls::session::TlsSessionCache for BoundedSessionCache {
+    fn put(&self, key: wreq::tls::session::Key, session: wreq::tls::session::TlsSession) {
+        let mut e = self.entries.lock();
+        e.push_back((key.clone(), session, std::time::Instant::now()));
+        // Oldest first, so expired ones are at the front.
+        while e.front().is_some_and(|(_, s, at)| self.expired(s, *at)) {
+            e.pop_front();
+        }
+        while e.len() > self.cap {
+            e.pop_front();
+        }
+        let same: Vec<usize> = e
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _, _))| *k == key)
+            .map(|(i, _)| i)
+            .collect();
+        if same.len() > SESSIONS_PER_KEY {
+            e.remove(same[0]);
+        }
+    }
+
+    fn pop(&self, key: &wreq::tls::session::Key) -> Option<wreq::tls::session::TlsSession> {
+        let mut e = self.entries.lock();
+        let i = e
+            .iter()
+            .rposition(|(k, s, at)| k == key && !self.expired(s, *at))?;
+        let (_, s, at) = e.get(i)?.clone();
+        // A TLS 1.3 ticket must not be used twice.
+        if s.protocol_version() == wreq::tls::TlsVersion::TLS_1_3 {
+            e.remove(i);
+        }
+        let _ = at;
+        Some(s)
+    }
+}
+
+/// Idle upstream connections kept per (downstream connection, origin) by the browser-like client.
+const WREQ_IDLE_PER_HOST: usize = 6;
+
+/// Where a request's upstream connection lives: the pool group of its downstream connection, and
+/// the device whose TLS sessions it may resume (the browser-like client only).
+#[derive(Debug, Clone)]
+pub struct UpstreamScope {
+    pub conn_id: u64,
+    pub device: Arc<str>,
+}
+
+impl UpstreamScope {
+    fn group(&self, suffix: &str) -> wreq::Group {
+        if suffix.is_empty() {
+            wreq::Group::new(self.conn_id)
+        } else {
+            wreq::Group::new(format!("{}{suffix}", self.conn_id))
+        }
+        .session(self.device.to_string())
+    }
+}
+
+/// The browser-like client: BoringSSL with the shared root set verified in the handshake. The
+/// browser profile (TLS and HTTP/2 fingerprint) is chosen per request.
+fn build_wreq(
+    opts: &UpstreamOptions,
+    strict: bool,
+    proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
+) -> Result<wreq::Client> {
+    let roots = opts.roots_handle()?;
+    let certs = opts.certs.clone();
+    let verify: wreq::tls::CustomVerify =
+        Arc::new(move |ssl, host| crate::roots::verify_btls(&roots, Some(&certs), ssl, host));
+    let mut b = wreq::Client::builder()
+        .tls_info(true)
+        .redirect(wreq::redirect::Policy::none())
+        // Argus retries itself (once, on a fresh connection group, see `UpstreamRequest::send`).
+        .retry(wreq::retry::Policy::never())
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        // Connections are pooled per downstream connection (and origin), so a few idle ones
+        // each are plenty; the whole pool is bounded by `pool_max_size`. A group's connections
+        // are evicted when its downstream connection closes; the idle timeout is the backstop.
+        .pool_max_idle_per_host(
+            opts.pool_max_idle_per_host
+                .unwrap_or(32)
+                .min(WREQ_IDLE_PER_HOST),
+        )
+        .pool_max_size(opts.pool_max_size.unwrap_or(0))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tls_custom_verify(verify)
+        // Sessions kept per device and host for resumption, bounded overall and in age.
+        .tls_session_cache(Arc::new(BoundedSessionCache::new(
+            opts.tls_session_cap.unwrap_or(DEFAULT_TLS_SESSIONS),
+            SESSION_TTL,
+        )))
+        .dns_resolver(Arc::new(resolver_of(opts, strict, proxy.clone())));
+    // Never the environment's proxy: it would bypass the destination policy.
+    b = match &proxy {
+        Some(p) => b.proxy(
+            p.wreq_proxy()
+                .map_err(|e| Error::Config(format!("Invalid upstream proxy: {e}")))?,
+        ),
+        None => b.no_proxy(),
+    };
+    if let Some(t) = opts.connect_timeout {
+        b = b.connect_timeout(t);
+    }
+    if let Some(t) = opts.read_timeout {
+        b = b.read_timeout(t);
+    }
+    b.build()
+        .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))
+}
+
+/// `fresh`: keep no idle connection, so every request dials (the retry's client).
+fn build_reqwest(opts: &UpstreamOptions, strict: bool, fresh: bool) -> Result<reqwest::Client> {
     // `no_proxy`: never route through an environment-configured proxy, which would bypass the
     // destination policy.
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        // Argus makes the one retry itself (on a fresh connection, and only when sound).
+        .retry(reqwest::retry::never())
         // Each response carries the certificate of the connection that served it.
         .tls_info(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -557,7 +1324,11 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
         // Bound idle descriptors per origin (scaled to the descriptor budget); connections
         // beyond this are closed when idle. reqwest has no total cap, so the budget also
         // reserves one descriptor per connection slot for the pool.
-        .pool_max_idle_per_host(opts.pool_max_idle_per_host.unwrap_or(32))
+        .pool_max_idle_per_host(if fresh {
+            0
+        } else {
+            opts.pool_max_idle_per_host.unwrap_or(32)
+        })
         .pool_idle_timeout(Duration::from_secs(60))
         // Grow HTTP/2 flow-control windows to the measured bandwidth-delay product instead of
         // the 64 KiB default, which throttles large downloads from distant origins.
@@ -570,15 +1341,7 @@ fn build_client(opts: &UpstreamOptions, strict: bool) -> Result<reqwest::Client>
     if let Some(t) = opts.read_timeout {
         builder = builder.read_timeout(t);
     }
-    builder = builder.dns_resolver(Arc::new(PolicyResolver {
-        policy: opts.policy.clone(),
-        override_ip: opts.resolve_all_to,
-        strict,
-        dns: opts
-            .dns
-            .clone()
-            .unwrap_or_else(|| Arc::new(CachedResolver::from_settings(&Default::default()))),
-    }));
+    builder = builder.dns_resolver(Arc::new(resolver_of(opts, strict, None)));
     builder
         .build()
         .map_err(|e| Error::Config(format!("Failed to build upstream HTTP client: {e}")))
@@ -648,6 +1411,7 @@ mod tests {
             policy: Arc::new(DestPolicy::default()),
             override_ip: None,
             strict: false,
+            proxy: None,
             dns: dns.clone(),
         };
         for _ in 0..3 {
@@ -744,6 +1508,64 @@ pub fn classify_reqwest(e: &reqwest::Error) -> filter_engine::ErrorKind {
     } else {
         K::Other
     }
+}
+
+/// Error kind of a failed browser-like upstream request (see [`classify_reqwest`]). Decided from
+/// the typed source chain only, never from the top error's text: that carries the request URI,
+/// which can contain any word.
+pub fn classify_wreq(e: &wreq::Error) -> filter_engine::ErrorKind {
+    use filter_engine::ErrorKind as K;
+    use std::error::Error as _;
+    if e.is_timeout() {
+        return K::UpstreamTimeout;
+    }
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = e.source();
+    let mut io_kind = None;
+    while let Some(err) = cur {
+        if err.is::<rustls::Error>() || err.is::<btls::error::ErrorStack>() {
+            return K::UpstreamTls;
+        }
+        if let Some(ssl) = err.downcast_ref::<btls::ssl::Error>() {
+            // A BoringSSL protocol failure with no I/O cause is the handshake being refused
+            // (our verify hook, or the server's alert); SYSCALL is the transport going away.
+            if let Some(io) = ssl.io_error() {
+                io_kind = io_kind.or(Some(classify_io(io)));
+            } else if ssl.code() == btls::ssl::ErrorCode::SSL {
+                return K::UpstreamTls;
+            } else if ssl.code() == btls::ssl::ErrorCode::SYSCALL
+                || ssl.code() == btls::ssl::ErrorCode::ZERO_RETURN
+            {
+                io_kind = io_kind.or(Some(K::UpstreamReset));
+            }
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            match classify_io(io) {
+                K::Other => {}
+                k @ (K::UpstreamTls | K::UpstreamTimeout) => return k,
+                k => io_kind = io_kind.or(Some(k)),
+            }
+        }
+        cur = err.source();
+    }
+    if let Some(k) = io_kind {
+        return k;
+    }
+    if e.is_connection_reset() {
+        return K::UpstreamReset;
+    }
+    // Message text of the sources only (not the URI-bearing top error).
+    let mut cur = e.source();
+    while let Some(err) = cur {
+        let t = err.to_string().to_ascii_lowercase();
+        if t.contains("incomplete message")
+            || t.contains("connection closed")
+            || t.contains("connection reset")
+        {
+            return K::UpstreamReset;
+        }
+        cur = err.source();
+    }
+    K::Other
 }
 
 #[cfg(test)]

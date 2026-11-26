@@ -1,3 +1,4 @@
+// Modified by Argus: `Pool::evict_where` (evict one downstream connection's upstream connections, patch 4).
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
@@ -80,6 +81,9 @@ struct PoolInner<T, K: Eq + Hash> {
     // state, waiting to receive a new Request to send on the socket.
     idle: LruCache<K, Vec<Idle<T>>>,
     max_idle_per_host: usize,
+    // Bound on idle connections over all keys (Argus: counts connections, not keys; the
+    // oldest idle connection of the least recently used key goes first).
+    max_total_idle: Option<usize>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -120,9 +124,8 @@ impl<T, K: Key> Pool<T, K> {
         let inner = if config.is_enabled() {
             Some(Arc::new(Mutex::new(PoolInner {
                 connecting: HashSet::default(),
-                idle: config
-                    .max_pool_size
-                    .map_or_else(LruCache::unbounded, LruCache::new),
+                idle: LruCache::unbounded(),
+                max_total_idle: config.max_pool_size.map(NonZeroUsize::get),
                 idle_interval_ref: None,
                 max_idle_per_host: config.max_idle_per_host,
                 waiters: HashMap::default(),
@@ -143,6 +146,26 @@ impl<T, K: Key> Pool<T, K> {
 }
 
 impl<T: Poolable, K: Key> Pool<T, K> {
+    /// Drop every idle connection (and parked waiter) whose key `matches`.
+    pub fn evict_where(&self, matches: impl Fn(&K) -> bool) {
+        let Some(ref enabled) = self.inner else {
+            return;
+        };
+        let mut inner = enabled.lock();
+        let keys: Vec<K> = inner
+            .idle
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| matches(k))
+            .cloned()
+            .collect();
+        let evicted: Vec<_> = keys.iter().filter_map(|k| inner.idle.pop(k)).collect();
+        inner.waiters.retain(|k, _| !matches(k));
+        // Dropped outside the lock: closing a connection can run arbitrary drop code.
+        drop(inner);
+        drop(evicted);
+    }
+
     /// Returns a `Checkout` which is a future that resolves if an idle
     /// connection becomes available.
     pub fn checkout(&self, key: K) -> Checkout<T, K> {
@@ -362,10 +385,35 @@ impl<T: Poolable, K: Key> PoolInner<T, K> {
                     idle_at: now,
                 });
             }
+            self.trim_idle();
 
             self.spawn_idle_interval(__pool_ref);
         } else {
             trace!("put; found waiter for {:?}", key)
+        }
+    }
+
+    /// Drop idle connections (oldest of the least recently used key first) until at most
+    /// `max_total_idle` remain.
+    fn trim_idle(&mut self) {
+        let Some(max) = self.max_total_idle else {
+            return;
+        };
+        let mut total: usize = self.idle.iter().map(|(_, v)| v.len()).sum();
+        while total > max {
+            let Some(key) = self.idle.peek_lru().map(|(k, _)| k.clone()) else {
+                break;
+            };
+            if let Some(list) = self.idle.peek_mut(&key) {
+                if !list.is_empty() {
+                    drop(list.remove(0));
+                    total -= 1;
+                }
+                if !list.is_empty() {
+                    continue;
+                }
+            }
+            self.idle.pop(&key);
         }
     }
 
@@ -1106,5 +1154,27 @@ mod tests {
         assert!(pool.locked().idle.get(&key1).is_none());
         assert!(pool.locked().idle.get(&key2).is_some());
         assert!(pool.locked().idle.get(&key3).is_some());
+    }
+
+    /// Argus patch 6: the re-send of an unstarted request must not take an idle connection.
+    #[tokio::test]
+    async fn an_idle_connection_is_not_handed_to_the_resend_key() {
+        use crate::conn::descriptor::{resend_descriptor, tests::descriptor};
+
+        let original = descriptor();
+        let (key, resend_key) = (original.id(), resend_descriptor(&original).id());
+        let pool = pool_no_timer();
+        drop(pool.pooled(c(key.clone()), Uniq(7)));
+
+        let mut resend = pool.checkout(resend_key);
+        assert!(
+            PollOnce(&mut resend).await.is_none(),
+            "the re-send took an idle connection"
+        );
+        // The idle connection is still there for ordinary requests.
+        match pool.checkout(key).await {
+            Ok(pooled) => assert_eq!(*pooled, Uniq(7)),
+            Err(_) => panic!("not ready"),
+        }
     }
 }

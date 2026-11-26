@@ -32,8 +32,12 @@ async-stream = { workspace = true }
 async-compression = { workspace = true, features = ["zstd"] }
 brotli = "8"
 # Upstream-client rewrite (phase P0): vendored wreq (BoringSSL) with local patches, see vendor/README.md.
-wreq = "6.0.0-rc.31"
+wreq = { version = "6.0.0-rc.31", features = ["stream", "socks"] }
 wreq-util = "3.0.0-rc.14"
+# Peer-chain access and ex_data in the in-handshake verify hook (already in the graph via wreq).
+btls = "0.5.6"
+# Typed HTTP/2 errors (GOAWAY, REFUSED_STREAM) of the wreq client, for the retry decision.
+http2 = "0.5"
 
 # TLS
 rustls = { workspace = true }
