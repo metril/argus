@@ -597,7 +597,7 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 if let Some(b) = type_bit(n) {
                     if exception && b == T_DOC && !neg {
                         // `@@...$document` lifts every rule on the page (AdGuard KB "$document").
-                        scope_mask = ALL;
+                        scope_mask |= ALL;
                     }
                     if neg {
                         excl |= b
@@ -1149,6 +1149,23 @@ mod tests {
 
     fn p(raw: &str) -> Result<ParsedRule, RuleError> {
         parse_rule(&ExtRule::new(ExtKind::Other, raw))
+    }
+
+    #[test]
+    fn document_keeps_stealth_in_either_order() {
+        for raw in [
+            "@@||x.test^$stealth,document",
+            "@@||x.test^$document,stealth",
+        ] {
+            let r = p(raw).unwrap();
+            let Action::Disable { mask } = r.action else {
+                panic!("{raw}")
+            };
+            assert!(
+                mask & target::STEALTH != 0 && mask & target::BLOCK != 0,
+                "{raw}"
+            );
+        }
     }
 
     #[test]

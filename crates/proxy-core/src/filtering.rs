@@ -1707,6 +1707,7 @@ impl ProxyContext {
                     None
                 };
                 let sw_guard = self.guard_service_workers.load(Ordering::Relaxed)
+                    && enabled
                     && !page_off
                     && !self.sw_guard_exempt(rctx, &host, &url);
                 let unregister_sw = !blocks_scripts
@@ -1731,7 +1732,7 @@ impl ProxyContext {
                         host: &host,
                         nonce: &nonce,
                         script_ok: !blocks_scripts,
-                        observer_ok: !opaque,
+                        observer_ok: !opaque && enabled,
                     })
                 } else {
                     Default::default()

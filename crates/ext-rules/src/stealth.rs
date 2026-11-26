@@ -51,6 +51,7 @@ pub fn parse_value(v: &str) -> Option<u32> {
         return Some(ALL);
     }
     v.split('|')
+        .filter(|n| !n.trim().is_empty())
         .try_fold(0u32, |m, n| Some(m | option_bit(n.trim())?))
 }
 
@@ -73,6 +74,7 @@ mod tests {
         assert_eq!(parse_value("webrtc|push"), Some(WEBRTC | PUSH));
         assert_eq!(parse_value("fingerprinting"), Some(0));
         assert_eq!(parse_value("nope"), None);
+        assert_eq!(parse_value("webrtc||push"), Some(WEBRTC | PUSH));
     }
 
     fn req<'a>(url: &'a str, src: Option<&'a str>, t: ResourceType) -> RequestInfo<'a> {

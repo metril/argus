@@ -553,3 +553,16 @@ async fn the_shim_is_nonced_and_covers_frames_and_the_referrer() {
     let js = shim_of(&env, &body).await.unwrap();
     assert!(js.contains("contentWindow") && js.contains("'referrer'"));
 }
+
+#[tokio::test]
+async fn blocking_off_with_stealth_on_injects_only_the_shim() {
+    let env = env_with(&["##.ad"], |_| {}).await;
+    env.proxy.ctx.set_guard_service_workers(true);
+    let on = page_body(&env, "page.test").await;
+    assert!(on.contains("__ab_cfg"), "{on}");
+    env.proxy.ctx.set_adblock_enabled(false);
+    let body = page_body(&env, "page.test").await;
+    assert!(shim_of(&env, &body).await.is_some(), "{body}");
+    assert!(!body.contains("__ab_cfg") && !body.contains("sw:1") && !body.contains("\"sw\""));
+    assert!(!body.contains("__adblock_cosmetic"), "{body}");
+}
