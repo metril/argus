@@ -7,6 +7,16 @@ use e2e::{EntryMode, MockResponse, TestEnv};
 
 const PAGE: &str = "https://page.test/article?q=1";
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 async fn env_with(rules: &[&str], f: impl Fn(&mut StealthSettings)) -> TestEnv {
     let env = TestEnv::start_tweaked(EntryMode::Explicit, rules, &|c| {
         c.stealth.enabled = true;
@@ -186,6 +196,9 @@ async fn tracking_params_are_removed_and_documents_redirect() {
         .unwrap()
         .ends_with("/p?k=v"));
     assert!(env.origin.requests_for("/p").is_empty());
+    let stub = logged_with(&env, "shop.test", "tracking parameters stripped");
+    assert_eq!(stub.len(), 1, "{stub:?}");
+    assert_eq!(stub[0].status, Some(307));
 }
 
 #[tokio::test]

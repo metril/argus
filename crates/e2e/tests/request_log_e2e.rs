@@ -89,3 +89,26 @@ e2e_test!(
         assert_eq!(t.mode, expected_mode(&env));
     }
 );
+
+e2e_test!(
+    internal_endpoints_are_logged_once,
+    rules = Vec::<&str>::new(),
+    |env| {
+        let url = env
+            .origin
+            .https_url("app.test", "/__adblock__/does-not-exist");
+        let r = env.client().get(&url).await;
+        let status = r.status().as_u16();
+        let hits: Vec<_> = env
+            .proxy
+            .engine
+            .recent_requests(50)
+            .into_iter()
+            .filter(|e| e.url.contains("/__adblock__/does-not-exist"))
+            .collect();
+        assert_eq!(hits.len(), 1, "served by Argus, logged once: {hits:?}");
+        assert_eq!(hits[0].status, Some(status));
+        assert_eq!(hits[0].request_type, "internal");
+        assert_eq!(hits[0].mode, expected_mode(&env));
+    }
+);

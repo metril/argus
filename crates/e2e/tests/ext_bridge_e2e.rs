@@ -14,6 +14,16 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use userscript_engine::install::{finish_install, plan_install, Approvals, Fetched};
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 const PAGE: &str = "<!doctype html><html><head><title>t</title></head><body>hi</body></html>";
 
 fn script(extra: &str, browser: bool) -> userscript_engine::Userscript {
@@ -494,6 +504,8 @@ e2e_test!(
         // a redirect hop to a host outside @connect is refused before it is fetched
         let r = get("evil.test", "/bad", relay.clone()).await;
         assert_eq!(r.status(), 403);
+        let ev = logged_with(&env, "/bad", "relayed request refused");
+        assert_eq!(ev.len(), 1, "{ev:?}");
         // so is one from a connection of another session, or of a container store
         let (_o, osid, _orx) = session(&h, "t9");
         let other = ext_client(&env, &osid, "").await;
@@ -528,6 +540,12 @@ e2e_test!(
         );
         let r = get("api.test", "/ok", "unknown".into()).await;
         assert_eq!(r.status(), 403);
+        let ev = logged_with(&env, "/ok", "relayed request refused");
+        assert_eq!(
+            ev.len(),
+            3,
+            "other session, container store, unknown: {ev:?}"
+        );
         assert!(env.origin.requests().iter().all(|r| r.path() != "/bad"));
         assert!(env.origin.requests().iter().all(|r| {
             r.headers
@@ -787,6 +805,8 @@ e2e_test!(
             assert!(r.headers().get("location").is_none());
             assert!(r.headers().get("set-cookie").is_none());
         }
+        let ev = logged_with(&env, "/r-", "relayed redirect refused");
+        assert_eq!(ev.len(), 5, "one event per refused hop: {ev:?}");
         // a Location that cannot be checked is refused too: empty, doubled, or UTF-8 that points
         // at a bypassed host
         env.origin.route(

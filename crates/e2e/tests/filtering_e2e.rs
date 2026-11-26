@@ -337,6 +337,16 @@ e2e_test!(
 
 const PAGE: &str = "<!DOCTYPE html><html><head></head><body>x</body></html>";
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 async fn sw_script(env: &TestEnv, host: &str) -> reqwest::Response {
     env.client()
         .request(reqwest::Method::GET, &env.origin.https_url(host, "/sw.js"))
@@ -377,6 +387,9 @@ e2e_test!(
             "{body}"
         );
         assert!(env.origin.requests_for("/sw.js").len() == 1);
+        let shim = logged_with(&env, "/sw.js", "service worker neutralised");
+        assert_eq!(shim.len(), 1, "{shim:?}");
+        assert_eq!(shim[0].status, Some(200));
         // Documents get the boot script with the unregister flag.
         let html = get_as(&env, &env.origin.https_url("app.test", "/"), "document")
             .await

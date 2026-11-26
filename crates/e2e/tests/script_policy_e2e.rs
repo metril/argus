@@ -33,6 +33,16 @@ fn origin_str(env: &TestEnv, host: &str) -> String {
     env.origin.https_url(host, "/")
 }
 
+/// Events in the request log whose URL contains `needle` and whose rule is `rule`.
+fn logged_with(env: &TestEnv, needle: &str, rule: &str) -> Vec<filter_engine::RequestEvent> {
+    env.proxy
+        .engine
+        .recent_requests(1000)
+        .into_iter()
+        .filter(|e| e.url.contains(needle) && e.rule.as_deref().unwrap_or("") == rule)
+        .collect()
+}
+
 /// A subresource request as a browser would send it from `page_host`.
 async fn sub(
     env: &TestEnv,
@@ -153,6 +163,9 @@ e2e_test!(
             0,
             "never reached the origin"
         );
+        let ev = logged_with(&env, "/cdn.js", "script policy");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0].action, filter_engine::EventAction::Blocked);
         let rep = store.report_for(P, "app.test").expect("report");
         let item = rep.items.iter().find(|i| i.cap == C::Script).expect("item");
         assert_eq!(item.source.as_deref(), Some("cdn.test"));

@@ -922,15 +922,32 @@ impl ProxyContext {
             self.bypass().note_bypassed();
         }
 
+        let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let local_url = || format!("{}{pq}", origin_of(scheme, &url_host, port));
+        let hdr_type = |h: &hyper::HeaderMap| classify(&method, h, pq);
+
         // The reserved confirmation host is answered by the proxy alone: never filtered, never
         // forwarded, whatever the entry mode.
         if self.internal.panel.is_panel_host(&host) {
             let origin = origin_of(scheme, &url_host, port);
-            return Ok(self
+            let resp = self
                 .internal
                 .panel
                 .handle(&self.internal, req, rctx, &origin)
-                .await);
+                .await;
+            if !bypass_full {
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Allowed,
+                    method.as_str(),
+                    &local_url(),
+                    "",
+                    INTERNAL_TYPE,
+                    resp.status().as_u16(),
+                    "",
+                );
+            }
+            return Ok(resp);
         }
 
         // Internal endpoints are answered locally for every host: never filtered, never
@@ -944,7 +961,26 @@ impl ProxyContext {
                 resolve_all_to: self.resolve_all_to,
                 scope: rctx.upstream_scope(),
             };
-            return Ok(self.internal.handle(req, &host, &origin, rctx, &up).await);
+            let src = req
+                .headers()
+                .get(hyper::header::REFERER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let resp = self.internal.handle(req, &host, &origin, rctx, &up).await;
+            if !bypass_full {
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Allowed,
+                    method.as_str(),
+                    &local_url(),
+                    &src,
+                    INTERNAL_TYPE,
+                    resp.status().as_u16(),
+                    "",
+                );
+            }
+            return Ok(resp);
         }
 
         // A service-worker script fetch (also `importScripts` inside one) on a host where a
@@ -959,6 +995,16 @@ impl ProxyContext {
             });
             if refuse {
                 debug!("Refused a service worker script fetch for {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &local_url(),
+                    "",
+                    hdr_type(req.headers()).as_str(),
+                    403,
+                    "service worker refused",
+                );
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::FORBIDDEN)
                     .header("cache-control", "no-store")
@@ -984,6 +1030,16 @@ impl ProxyContext {
                 && !self.sw_guard_exempt(rctx, &host, &site)
             {
                 debug!("Replaced a service worker script for {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Allowed,
+                    method.as_str(),
+                    &local_url(),
+                    "",
+                    hdr_type(req.headers()).as_str(),
+                    200,
+                    "service worker neutralised",
+                );
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::OK)
                     .header("content-type", "application/javascript; charset=utf-8")
@@ -1035,6 +1091,16 @@ impl ProxyContext {
             });
             if !allowed {
                 debug!("Refused a relayed request for {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &url,
+                    "",
+                    RequestType::Other.as_str(),
+                    403,
+                    "relayed request refused",
+                );
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::FORBIDDEN)
                     .header("cache-control", "no-store")
@@ -1117,6 +1183,16 @@ impl ProxyContext {
                     }
                     if new_url != url {
                         if navigation {
+                            log_local(
+                                rctx,
+                                filter_engine::EventAction::Allowed,
+                                method.as_str(),
+                                &url,
+                                "",
+                                rtype.as_str(),
+                                307,
+                                "url rewritten",
+                            );
                             return Ok(rewrite_redirect(&new_url));
                         }
                         // Subresource: fetch the cleaned URL transparently.
@@ -1162,6 +1238,16 @@ impl ProxyContext {
                         if navigation {
                             if let Some((cleaned, _)) = d.cleaned_url {
                                 if cleaned != url {
+                                    log_local(
+                                        rctx,
+                                        filter_engine::EventAction::Allowed,
+                                        method.as_str(),
+                                        &url,
+                                        "",
+                                        rtype.as_str(),
+                                        307,
+                                        "url rewritten",
+                                    );
                                     return Ok(rewrite_redirect(&cleaned));
                                 }
                             }
@@ -1194,6 +1280,16 @@ impl ProxyContext {
                     .is_some()
                 {
                     debug!("Blocked {} by script policy", url);
+                    log_local(
+                        rctx,
+                        filter_engine::EventAction::Blocked,
+                        method.as_str(),
+                        &url,
+                        "",
+                        rtype.as_str(),
+                        403,
+                        "script policy",
+                    );
                     return Ok(policy_block_response(rtype, &url));
                 }
             }
@@ -1234,6 +1330,16 @@ impl ProxyContext {
             if m & ext_rules::stealth::TRACKING_PARAMS != 0 {
                 if let Some(new_url) = stealth::strip_tracking(&url) {
                     if rtype == RequestType::Document && (method == hyper::Method::GET || is_head) {
+                        log_local(
+                            rctx,
+                            filter_engine::EventAction::Allowed,
+                            method.as_str(),
+                            &url,
+                            "",
+                            rtype.as_str(),
+                            307,
+                            "tracking parameters stripped",
+                        );
                         return Ok(rewrite_redirect(&new_url));
                     }
                     url = new_url;
@@ -1265,6 +1371,18 @@ impl ProxyContext {
         if let Err(r) = self.policy.check_literal(&host, port) {
             common::faults::note(common::faults::Fault::PolicyRefusal, &host);
             debug!("Refused destination {host}:{port}: {r}");
+            if !bypass_full {
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &url,
+                    "",
+                    rtype.as_str(),
+                    403,
+                    "destination policy",
+                );
+            }
             return Ok(refused_response());
         }
         let client = if self.policy.is_own_port(port) {
@@ -1388,6 +1506,18 @@ impl ProxyContext {
             Err(e) if is_refusal(&e) => {
                 common::faults::note(common::faults::Fault::PolicyRefusal, &host);
                 debug!("Refused destination {host}:{port} (resolved): {e}");
+                if !bypass_full {
+                    log_local(
+                        rctx,
+                        filter_engine::EventAction::Blocked,
+                        method.as_str(),
+                        &url,
+                        "",
+                        rtype.as_str(),
+                        403,
+                        "destination policy",
+                    );
+                }
                 return Ok(refused_response());
             }
             Err(e) => {
@@ -1482,6 +1612,16 @@ impl ProxyContext {
             };
             if !ok {
                 debug!("Refused a relayed redirect from {host}");
+                log_local(
+                    rctx,
+                    filter_engine::EventAction::Blocked,
+                    method.as_str(),
+                    &url,
+                    "",
+                    rtype.as_str(),
+                    502,
+                    "relayed redirect refused",
+                );
                 // No Set-Cookie, no Location: only the refusal.
                 return Ok(Response::builder()
                     .status(hyper::StatusCode::BAD_GATEWAY)
@@ -2431,6 +2571,40 @@ fn log_request(
         mode: event_mode(rctx),
         error_kind,
         cert_fp,
+    });
+}
+
+/// Request type of Argus's own `/__adblock__/*` and panel traffic: lets the log UI and API
+/// consumers tell it apart from the page's own requests.
+const INTERNAL_TYPE: &str = "internal";
+
+/// Record a request Argus answered itself (an internal endpoint, a refusal, a redirect stub):
+/// every request it serves or refuses is logged once, like the ones it forwards.
+#[allow(clippy::too_many_arguments)]
+fn log_local(
+    rctx: &RequestCtx,
+    action: filter_engine::EventAction,
+    method: &str,
+    url: &str,
+    source: &str,
+    rtype: &str,
+    status: u16,
+    rule: &str,
+) {
+    let profile = rctx.profile.load();
+    profile.engine.record_request(&filter_engine::EventRef {
+        action,
+        method,
+        url,
+        source_host: filter_engine::RequestMatcher::host_of(source),
+        request_type: rtype,
+        rule,
+        list_id: None,
+        client: Some(profile.label.as_ref()),
+        status: Some(status),
+        mode: event_mode(rctx),
+        error_kind: None,
+        cert_fp: None,
     });
 }
 
