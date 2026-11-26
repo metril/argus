@@ -113,6 +113,9 @@ impl std::fmt::Debug for ElementFilter {
 /// Everything to do to one response, computed once from the request URL, type and headers.
 #[derive(Default, Clone)]
 pub struct ResponseTransforms {
+    /// `ext_rules::target` bits that URL-scoped exceptions (`$elemhide`, `$jsinject`, ...) switch
+    /// off for this page; applied to the cosmetic engine's output too.
+    pub disabled: u32,
     /// Replace the response with the block response (a `$header` rule matched).
     pub block: Option<String>,
     /// JavaScript from trusted rules (`#%#`, scriptlets, snippets), run before page scripts.

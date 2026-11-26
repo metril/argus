@@ -803,3 +803,28 @@ fn untrusted_cookie_rules_cannot_weaken_a_cookie() {
         "{out:?}"
     );
 }
+
+// ---- page-scoped cosmetic exceptions ------------------------------------------------------------
+
+#[test]
+fn page_scoped_exceptions_report_what_they_switch_off() {
+    use ext_rules::target::{JS, PCSS, SCRIPTLET, SNIPPET, SPECIFICHIDE};
+    let r = get("https://site.example/page", ResourceType::Document);
+    let disabled = |rule: &str| plan(&idx(&[rule]), &r, "text/html", &[]).disabled;
+    let d = disabled("@@||site.example^$elemhide");
+    assert!(
+        d & PCSS != 0 && d & SPECIFICHIDE != 0 && d & JS == 0,
+        "{d:#b}"
+    );
+    let d = disabled("@@||site.example^$specifichide");
+    assert!(d & SPECIFICHIDE != 0 && d & PCSS == 0, "{d:#b}");
+    let d = disabled("@@||site.example^$jsinject");
+    assert!(d & (JS | SCRIPTLET | SNIPPET) == (JS | SCRIPTLET | SNIPPET) && d & PCSS == 0);
+    assert_eq!(
+        disabled("@@||site.example^$document") & (PCSS | JS),
+        PCSS | JS
+    );
+    // another site, and a rule scoped to a cosmetic selector, switch nothing off
+    assert_eq!(disabled("@@||other.example^$elemhide"), 0);
+    assert_eq!(disabled("site.example#@#.ad"), 0);
+}

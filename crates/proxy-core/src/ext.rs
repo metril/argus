@@ -207,10 +207,11 @@ impl TransformSource for ExtTransformSource {
                 headers: &headers,
             },
         );
-        if plan.is_noop() {
+        if plan.is_noop() && plan.disabled == 0 {
             return None;
         }
         let mut t = ResponseTransforms {
+            disabled: plan.disabled,
             block: plan.block.map(|id| {
                 idx.rule(id)
                     .map_or_else(|| "$header".to_string(), |r| r.raw.clone())

@@ -178,6 +178,10 @@ pub struct ResponsePlan<'a> {
     pub injections: Vec<&'a Injection>,
     /// Every rule that took part (for logging).
     pub matched: Vec<RuleId>,
+    /// [`crate::target`] bits switched off for this page by matching URL-scoped exceptions
+    /// (`@@||x^$elemhide`, `$specifichide`, `$jsinject`, `$content`, `$document`...). Besides
+    /// masking this index's own rules, a caller applies them to other engines' output.
+    pub disabled: u32,
 }
 
 impl ResponsePlan<'_> {

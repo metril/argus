@@ -660,6 +660,12 @@ impl ExtIndex {
             && (mime_raw.eq_ignore_ascii_case("text/html")
                 || mime_raw.eq_ignore_ascii_case("application/xhtml+xml"));
         let mut ids = self.net_ids(&self.resp, &ctx);
+        plan.disabled = ids
+            .iter()
+            .map(|&i| &self.rules[i as usize])
+            .filter(|r| r.exception && r.value.is_empty())
+            .filter(|r| matches!(r.action, Action::Disable { .. }))
+            .fold(0, |m, r| m | r.target_mask());
         if is_html {
             ids.extend(self.dom_ids(&ctx.host));
         }

@@ -139,7 +139,8 @@ fn apply_overlay(
 /// overlay exceptions are visible here (a bare `#@#.x` is resolved inside the overlay engine
 /// alone), an overlay exception cannot cancel a base *procedural* filter, and `$generichide`
 /// cannot strip the non-class/id "misc" generic selectors already in the base's static list;
-/// `$elemhide` is not understood by the engine at all (base or overlay).
+/// `$elemhide`, `$specifichide` and `$jsinject` are not understood by the engine at all (base or
+/// overlay); the caller applies them to the merged result with [`mask_cosmetics`].
 fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosmetics) {
     if !ov.exceptions.is_empty() {
         base.hide_selectors.retain(|s| !ov.exceptions.contains(s));
@@ -154,6 +155,80 @@ fn merge_cosmetics(base: &mut filter_engine::Cosmetics, ov: filter_engine::Cosme
     }
     base.generichide |= ov.generichide;
     base.exceptions.extend(ov.exceptions);
+}
+
+/// Apply the page-scoped exception bits (`ext_rules::target`) to the cosmetic engine's output:
+/// `$elemhide` drops every hide and the observer; `$specifichide` keeps only the generic hides
+/// (`generic`, evaluated lazily: the selectors a host without rules gets); `$jsinject` drops the
+/// scriptlets. (`$content` is HTML filtering and `$replace`, not scriptlets, as in AdGuard.)
+pub(crate) fn mask_cosmetics(
+    cos: &mut filter_engine::Cosmetics,
+    disabled: u32,
+    generic: impl FnOnce() -> Vec<String>,
+) {
+    use ext_rules::target::{JS, PCSS, SCRIPTLET, SNIPPET, SPECIFICHIDE};
+    if disabled & PCSS != 0 {
+        cos.hide_selectors.clear();
+        cos.procedural_actions.clear();
+        cos.generichide = true;
+    } else if disabled & SPECIFICHIDE != 0 {
+        cos.hide_selectors = if cos.generichide {
+            Vec::new()
+        } else {
+            let mut g = generic();
+            // the page's own `#@#` exceptions still cancel generic hides
+            g.retain(|s| !cos.exceptions.contains(s));
+            g
+        };
+        cos.procedural_actions.clear();
+    }
+    if disabled & (JS | SCRIPTLET | SNIPPET) != 0 {
+        cos.injected_script.clear();
+    }
+}
+
+/// The hides a host with no rules of its own gets from both of the profile's engines (the generic
+/// ones): what `$specifichide` leaves.
+fn generic_hides(
+    engine: &filter_engine::SharedEngine,
+    overlay: Option<&filter_engine::SharedEngine>,
+) -> Vec<String> {
+    const NO_RULES: &str = "https://argus-generic-hide.invalid/";
+    let mut c = engine.cosmetic_for(NO_RULES);
+    if let Some(ov) = overlay.filter(|o| o.is_enabled()) {
+        merge_cosmetics(&mut c, ov.cosmetic_for(NO_RULES));
+    }
+    c.hide_selectors
+}
+
+/// Does a `@@...$document` exception (the option, not merely a matching `@@||host^`) cover this
+/// page in `engine`? adblock-rust accepts the rule, so it is asked directly with a document request.
+fn document_excepted(engine: &filter_engine::SharedEngine, url: &str) -> bool {
+    let q = filter_engine::Query::new(url, url, "document");
+    let Some(req) = q.request() else {
+        return false;
+    };
+    let r = engine
+        .engine()
+        .check_network_request_subset(req, false, true);
+    r.exception.as_deref().is_some_and(rule_has_document_option)
+}
+
+fn rule_has_document_option(rule: &str) -> bool {
+    let Some((_, opts)) = rule.rsplit_once('$') else {
+        return false;
+    };
+    opts.split(',')
+        .any(|o| matches!(o.trim(), "document" | "doc"))
+}
+
+/// AdGuard's `#$?#sel { remove: true }`: the style block that means "remove the element".
+fn is_remove_style(style: &str) -> bool {
+    let n: String = style
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ';')
+        .collect();
+    n.eq_ignore_ascii_case("remove:true")
 }
 
 /// Generic hide selectors for the classes and ids a page reports, from both of the profile's
@@ -1359,9 +1434,38 @@ impl ProxyContext {
                     .collect();
                 let (blocks_scripts, opaque) = csp::sandbox_facts(&csp_headers);
                 let mut cos = cosmetics.unwrap_or_default();
+                // `$elemhide` / `$specifichide` / `$jsinject` exceptions (seen by the ext index) and
+                // `@@...$document` exceptions (accepted by adblock-rust itself, so the ext index
+                // never sees them) mask what the cosmetic engine produced too: it implements
+                // none of them.
+                let disabled = {
+                    let prof = rctx.profile.load();
+                    let doc = document_excepted(&prof.engine, &url)
+                        || prof
+                            .overlay
+                            .as_ref()
+                            .is_some_and(|ov| ov.is_enabled() && document_excepted(ov, &url));
+                    transforms.disabled | if doc { ext_rules::target::ALL } else { 0 }
+                };
+                mask_cosmetics(&mut cos, disabled, || {
+                    let prof = rctx.profile.load();
+                    generic_hides(&prof.engine, prof.overlay.as_deref())
+                });
+                if disabled & (ext_rules::target::PCSS | ext_rules::target::SPECIFICHIDE) != 0 {
+                    transforms.procedural.clear();
+                }
+                if disabled
+                    & (ext_rules::target::JS
+                        | ext_rules::target::SCRIPTLET
+                        | ext_rules::target::SNIPPET)
+                    != 0
+                {
+                    transforms.scripts.clear();
+                }
                 // Extended CSS the engine rejected goes to the in-page procedural evaluator.
                 for (selector, style) in &transforms.procedural {
                     let action = match style {
+                        Some(s) if is_remove_style(s) => serde_json::json!({"type": "remove"}),
                         Some(s) => serde_json::json!({"type": "style", "arg": s}),
                         None => serde_json::json!({"type": "hide"}),
                     };
@@ -1906,6 +2010,133 @@ mod url_tests {
             ),
             "http://example.com:8080/x"
         );
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_mask_tests {
+    use super::{is_remove_style, mask_cosmetics};
+    use ext_rules::target::{JS, PCSS, SPECIFICHIDE};
+    use filter_engine::{compile_engine, Cosmetics, SharedEngine};
+
+    fn cos() -> Cosmetics {
+        Cosmetics {
+            hide_selectors: vec![".specific".into(), ".generic-misc".into()],
+            procedural_actions: vec!["{}".into()],
+            injected_script: "scriptlet();".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn elemhide_drops_every_hide_and_the_observer() {
+        let mut c = cos();
+        mask_cosmetics(&mut c, PCSS, || panic!("not needed"));
+        assert!(c.hide_selectors.is_empty() && c.procedural_actions.is_empty());
+        assert!(c.generichide, "no class/id observer either");
+        assert_eq!(
+            c.injected_script, "scriptlet();",
+            "scriptlets are not element hiding"
+        );
+    }
+
+    #[test]
+    fn specifichide_keeps_only_the_generic_hides() {
+        let mut c = cos();
+        mask_cosmetics(&mut c, SPECIFICHIDE, || vec![".generic-misc".into()]);
+        assert_eq!(c.hide_selectors, [".generic-misc"]);
+        assert!(c.procedural_actions.is_empty() && !c.generichide);
+        let mut g = cos();
+        g.generichide = true;
+        mask_cosmetics(&mut g, SPECIFICHIDE, || vec![".generic-misc".into()]);
+        assert!(g.hide_selectors.is_empty());
+    }
+
+    #[test]
+    fn jsinject_stops_scriptlets_only() {
+        let mut c = cos();
+        mask_cosmetics(&mut c, JS, Vec::new);
+        assert!(c.injected_script.is_empty());
+        assert_eq!(c.hide_selectors.len(), 2);
+        let mut n = cos();
+        mask_cosmetics(&mut n, 0, Vec::new);
+        assert_eq!(n.injected_script, "scriptlet();");
+        assert_eq!(n.hide_selectors.len(), 2);
+    }
+
+    #[test]
+    fn masking_an_engines_real_output() {
+        let e = SharedEngine::new();
+        e.install(compile_engine(&["example.com##.ad
+example.com##.box:has-text(X)
+"
+        .to_string()]));
+        let mut c = e.cosmetic_for("https://example.com/");
+        assert!(!c.hide_selectors.is_empty());
+        mask_cosmetics(&mut c, PCSS, Vec::new);
+        assert!(c.hide_selectors.is_empty() && c.generichide);
+    }
+
+    #[test]
+    fn a_document_exception_is_found_through_adblock_rust() {
+        use super::{document_excepted, rule_has_document_option};
+        let e = |rule: &str| {
+            let s = SharedEngine::new();
+            s.install(compile_engine(&[format!("example.com##.ad\n{rule}\n")]));
+            s
+        };
+        let url = "https://example.com/page";
+        assert!(document_excepted(&e("@@||example.com^$document"), url));
+        assert!(document_excepted(&e("@@||example.com^$doc,important"), url));
+        // a plain network exception is not a cosmetic one; neither is another site's
+        assert!(!document_excepted(&e("@@||example.com^"), url));
+        assert!(!document_excepted(&e("@@||example.com^$image"), url));
+        assert!(!document_excepted(&e("@@||other.test^$document"), url));
+        assert!(rule_has_document_option("@@||a^$all,document"));
+        assert!(!rule_has_document_option("@@||a^$domain=document.test"));
+        // end to end: the engine's own hides are what gets masked
+        let eng = e("@@||example.com^$document");
+        let mut c = eng.cosmetic_for(url);
+        assert!(!c.hide_selectors.is_empty());
+        let disabled = if document_excepted(&eng, url) {
+            ext_rules::target::ALL
+        } else {
+            0
+        };
+        c.injected_script = "s();".into();
+        mask_cosmetics(&mut c, disabled, Vec::new);
+        assert!(c.hide_selectors.is_empty() && c.injected_script.is_empty() && c.generichide);
+    }
+
+    #[test]
+    fn specifichide_uses_both_engines_generics_minus_page_exceptions() {
+        use super::{generic_hides, merge_cosmetics};
+        use filter_engine::overlay_from_rules;
+        let base = SharedEngine::new();
+        base.install(compile_engine(&[
+            "##[data-g-base]\n##[data-g-excepted]\nexample.com##.specific\n".to_string(),
+        ]));
+        let ov = overlay_from_rules("##[data-g-overlay]\nexample.com#@#[data-g-excepted]")
+            .unwrap()
+            .unwrap();
+        let url = "https://example.com/";
+        let mut c = base.cosmetic_for(url);
+        merge_cosmetics(&mut c, ov.cosmetic_for(url));
+        assert!(c.hide_selectors.iter().any(|s| s == ".specific"), "{c:?}");
+        mask_cosmetics(&mut c, ext_rules::target::SPECIFICHIDE, || {
+            generic_hides(&base, Some(&ov))
+        });
+        let mut got = c.hide_selectors.clone();
+        got.sort();
+        assert_eq!(got, ["[data-g-base]", "[data-g-overlay]"], "{c:?}");
+    }
+
+    #[test]
+    fn remove_true_is_a_remove_action() {
+        assert!(is_remove_style("remove: true"));
+        assert!(is_remove_style(" Remove:true; "));
+        assert!(!is_remove_style("remove: false"));
+        assert!(!is_remove_style("display: none"));
     }
 }
 

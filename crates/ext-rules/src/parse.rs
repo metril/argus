@@ -29,7 +29,9 @@ pub mod target {
     pub const SNIPPET: u32 = 1 << 12;
     pub const SCRIPTLET: u32 = 1 << 13;
     pub const PCSS: u32 = 1 << 14;
-    pub const ALL: u32 = (1 << 15) - 1;
+    /// `$specifichide`: switches off the page's host-specific element hiding.
+    pub const SPECIFICHIDE: u32 = 1 << 15;
+    pub const ALL: u32 = (1 << 16) - 1;
 }
 
 /// Stage bits: when a rule is evaluated.
@@ -562,7 +564,8 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
             "all" => incl = T_ALL,
             "content" if exception => scope_mask |= REPLACE | HTML | HLS | JSONPRUNE | XMLPRUNE,
             "jsinject" if exception => scope_mask |= JS | SCRIPTLET | SNIPPET,
-            "elemhide" | "ehide" if exception => scope_mask |= PCSS | HTML,
+            "elemhide" | "ehide" if exception => scope_mask |= PCSS | HTML | SPECIFICHIDE,
+            "specifichide" | "shide" if exception => scope_mask |= SPECIFICHIDE,
             "urlblock" if exception => scope_mask |= BLOCK | URLTRANSFORM,
             "replace" | "jsonprune" | "xmlprune" | "hls" | "cookie" | "removeheader"
             | "permissions" | "urltransform" | "header" => {

@@ -239,6 +239,23 @@ jobs:
           name: argus-extension
           path: extension/.output/*.zip
 
+  js-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: crates/proxy-core/js-tests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/proxy-core/js-tests/package-lock.json
+      - run: npm ci
+      - name: Procedural cosmetic engine (jsdom)
+        run: npm test
+
   wreq-patches:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -262,7 +279,7 @@ jobs:
 
   ci-ok:
     if: always()
-    needs: [fmt, clippy, build, test, wreq-patches, e2e, browser, kernel, extension, ext-e2e]
+    needs: [fmt, clippy, build, test, wreq-patches, e2e, browser, kernel, extension, ext-e2e, js-engine]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
