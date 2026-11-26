@@ -191,7 +191,7 @@ pub struct ProxySettings {
 pub struct UpstreamSettings {
     /// Connect to origins the way the browser behind the request would (its TLS and HTTP/2
     /// fingerprint, header order), so sites that reject non-browser clients accept the proxy. Off
-    /// uses the previous rustls client, kept for one release.
+    /// uses the same client without the browser fingerprint.
     #[serde(default = "default_true")]
     pub browser_like: bool,
     /// Send Argus's own upstream traffic through another proxy (`[proxy.upstream.proxy]`).

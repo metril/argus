@@ -24,8 +24,6 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 h2 = { workspace = true }
 http-body-util = { workspace = true }
-# Shared pooled upstream client for forwarding proxied requests (TLS-capable, streaming).
-reqwest = { workspace = true, features = ["stream"] }
 # Streaming response bodies + HTML cosmetic injection.
 futures-util = { workspace = true }
 async-stream = { workspace = true }
@@ -118,6 +116,8 @@ userscript-engine = { path = "../userscript-engine" }
 
 # Web API (optional)
 web-api = { path = "../web-api", optional = true }
+# The web API's control-plane HTTP client (feature `webui`).
+reqwest = { workspace = true, optional = true }
 
 # Filter-list service (always on — loads, compiles and refreshes the rules)
 list-service = { path = "../list-service", default-features = false }
@@ -148,10 +148,12 @@ default = ["websockets", "bundled-ubo-resources"]
 bundled-ubo-resources = ["list-service/bundled-ubo-resources"]
 websockets = ["dep:tokio-tungstenite"]
 userscripts = []
-webui = ["dep:web-api"]
+webui = ["dep:web-api", "dep:reqwest"]
 full = ["websockets", "userscripts", "webui", "bundled-ubo-resources"]
 
 [dev-dependencies]
+# Test clients that talk to the proxy.
+reqwest = { workspace = true }
 proxy-core = { path = ".", features = ["test-hooks"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }

@@ -123,7 +123,7 @@ async fn fixture() -> Fx {
     );
     let manager = Arc::new(UserscriptManager::new(dir.path().join("us")).unwrap());
     let ctx = Arc::new(
-        ProxyContext::new(default.clone(), reqwest::Client::new(), true).with_policy(Arc::new(
+        ProxyContext::new(default.clone(), true).with_policy(Arc::new(
             proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
         )),
     );

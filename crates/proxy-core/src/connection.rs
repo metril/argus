@@ -1510,7 +1510,7 @@ mod tests {
     #[test]
     fn connection_ctx_carries_real_client_addr_and_default_profile() {
         let engine = Arc::new(filter_engine::SharedEngine::new());
-        let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+        let ctx = Arc::new(ProxyContext::new(engine, true));
         let shared = Arc::new(ConnectionShared {
             mitm: Default::default(),
             enable_http2: false,
@@ -1536,7 +1536,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let engine = Arc::new(filter_engine::SharedEngine::new());
         engine.install(filter_engine::compile_engine(&["/ads/\n".to_string()]));
-        let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+        let ctx = Arc::new(ProxyContext::new(engine, true));
         // Token "tok" maps to a profile that blocks nothing; the default (by address) blocks /ads/.
         let open = Arc::new(filter_engine::SharedEngine::new());
         let slot = Arc::new(filter_engine::ArcSwap::from_pointee(crate::Profile::new(

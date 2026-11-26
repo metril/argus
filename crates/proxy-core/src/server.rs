@@ -334,21 +334,10 @@ impl ProxyControl {
             .as_ref()
             .filter(|l| l.shared.ws.load().is_none() && config.any_listener(|f| f.websockets))
         {
-            let (roots, policy, resolve) = (
-                self.ctx
-                    .roots_handle(&config.proxy.extra_upstream_ca_paths)?,
-                self.ctx.policy().clone(),
-                self.ctx.resolve_all_to(),
-            );
             let shutdown = l.shutdown_tx.clone();
-            let handle = self.ctx.proxy_handle().clone();
             new_ws = Some(Arc::new(
-                tokio::task::spawn_blocking(move || {
-                    crate::websocket::WsUpstream::new(roots, policy, resolve, t.handshake)
-                        .map(|w| w.with_proxy(handle).with_lifecycle(t.tunnel_idle, shutdown))
-                })
-                .await
-                .map_err(|e| Error::Internal(e.to_string()))??,
+                crate::websocket::WsUpstream::new(t.handshake)
+                    .with_lifecycle(t.tunnel_idle, shutdown),
             ));
         }
         let proxy = self.ctx.prepare_proxy(&config.proxy.upstream.proxy).await?;
@@ -1231,15 +1220,8 @@ impl ProxyServer {
             #[cfg(feature = "websockets")]
             ws: if self.config.any_listener(|f| f.websockets) {
                 ArcSwapOption::new(Some(Arc::new(
-                    crate::websocket::WsUpstream::new(
-                        self.ctx
-                            .roots_handle(&self.config.proxy.extra_upstream_ca_paths)?,
-                        self.ctx.policy().clone(),
-                        self.ctx.resolve_all_to(),
-                        t0.handshake,
-                    )?
-                    .with_proxy(self.ctx.proxy_handle().clone())
-                    .with_lifecycle(t0.tunnel_idle, shutdown_tx.clone()),
+                    crate::websocket::WsUpstream::new(t0.handshake)
+                        .with_lifecycle(t0.tunnel_idle, shutdown_tx.clone()),
                 )))
             } else {
                 ArcSwapOption::empty()

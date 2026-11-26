@@ -109,11 +109,9 @@ struct Fixture {
 
 async fn fixture(default: Arc<SharedEngine>, require_token: bool) -> Fixture {
     let (origin, seen) = spawn_origin().await;
-    let ctx = Arc::new(
-        ProxyContext::new(default, reqwest::Client::new(), true).with_policy(Arc::new(
-            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
-        )),
-    );
+    let ctx = Arc::new(ProxyContext::new(default, true).with_policy(Arc::new(
+        proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+    )));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap().port();
     let server = ProxyServer::new(config(proxy, require_token), ctx.clone()).unwrap();

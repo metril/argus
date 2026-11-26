@@ -326,7 +326,7 @@ pub fn rig(trusted: &Ca, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
     rig_with(trusted, true, tweak)
 }
 
-/// Like [`rig`], for the browser-like (wreq) or the plain (reqwest) client.
+/// Like [`rig`], for the browser-like or the plain (no fingerprint) client.
 pub fn rig_with(trusted: &Ca, browser_like: bool, tweak: impl FnOnce(&mut UpstreamOptions)) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join("ca.pem");
