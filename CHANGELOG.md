@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+* Extension (Chrome): no more native proxy sign-in prompt after the browser restarts the
+  extension's background worker. A challenge from the extension listener waits for the session to
+  reconnect (up to 10 s) and is cancelled rather than handed to the browser; host names are
+  compared case- and bracket-insensitively. Sign-out always completes: the token is forgotten
+  first, the proxy setting is cleared, and the server-side revoke is best effort (3 s), so the
+  address and other settings can be changed again.
+
 ## 0.6.1 — 2026-11-25
 
 * The previous upstream client is removed. With browser-like connections off, Argus uses the same

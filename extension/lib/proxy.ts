@@ -41,7 +41,17 @@ function rand(n: number): string {
   return Array.from(a, (b) => (b % 36).toString(36)).join('');
 }
 
-export interface ProxyDeps { browser: any; firefox: boolean; argusHost: () => Promise<string> }
+/** Hosts compare equal across case, a trailing dot and IPv6 brackets (`[::1]` vs `::1`). */
+export function normHost(h: string | undefined | null): string {
+  return (h ?? '').trim().toLowerCase().replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
+}
+
+/** How long a 407 from our listener waits for the channel to (re)connect before it is cancelled. */
+export const READY_WAIT_MS = 10_000;
+
+export interface ProxyDeps { browser: any; firefox: boolean; argusHost: () => Promise<string>; readyWaitMs?: number }
+
+
 
 /**
  * Sends the browser through Argus's extension listener while the toggle is on and the channel is
@@ -59,12 +69,19 @@ export class ProxyController {
   private byToken = new Map<string, string>();
   private answered = new Set<string>();
   private argus = '';
+  private waiters: Array<() => void> = [];
 
   constructor(private d: ProxyDeps) {}
 
-  async init() {
-    this.state = await loadProxyState(this.d.browser);
-    await this.apply();
+  /** Settles once the stored state is read: a 407 that wakes a fresh worker must wait for it. */
+  private ready: Promise<void> = Promise.resolve();
+
+  init(): Promise<void> {
+    this.ready = (async () => {
+      this.state = await loadProxyState(this.d.browser);
+      await this.apply();
+    })();
+    return this.ready;
   }
 
   /** The stored state changed elsewhere (storage): read it again. */
@@ -86,12 +103,26 @@ export class ProxyController {
     if (sid !== this.sid) { this.tokens.clear(); this.byToken.clear(); this.answered.clear(); this.serverKnown = false; }
     this.sid = sid;
     await this.apply();
+    this.wake();
+  }
+
+  private wake() { if (this.active()) { const w = this.waiters; this.waiters = []; for (const f of w) f(); } }
+
+  /** Resolves true once active (the channel is up), false after `ms`. */
+  private whenActive(ms: number): Promise<boolean> {
+    if (this.active()) return Promise.resolve(true);
+    return new Promise((res) => {
+      const done = () => { clearTimeout(t); res(this.active()); };
+      const t = setTimeout(() => { this.waiters = this.waiters.filter((f) => f !== done); res(false); }, ms);
+      this.waiters.push(done);
+    });
   }
 
   async setServer(host: string | null | undefined, port: number | null | undefined) {
     this.server = port && port > 0 && port < 65536 ? { host: host || null, port } : null;
     this.serverKnown = true;
     await this.apply();
+    this.wake();
   }
 
   /** Whether the server has an extension listener: `pending` until it has said. */
@@ -151,13 +182,14 @@ export class ProxyController {
 
   /** Firefox `proxy.onRequest`: our listener for enabled stores, direct otherwise. */
   async route(d: { cookieStoreId?: string; url?: string }): Promise<{ type: string; host?: string; port?: number; username?: string; password?: string; proxyDNS?: boolean }> {
+    await this.ready;
     if (!this.active() || !this.storeEnabled(d.cookieStoreId)) return { type: 'direct' };
     const t = await this.target();
     if (!t) return { type: 'direct' };
     if (d.url) {
       try {
         const u = new URL(d.url);
-        if (u.hostname === (await this.d.argusHost())) return { type: 'direct' };
+        if (normHost(u.hostname) === normHost(await this.d.argusHost())) return { type: 'direct' };
       } catch { /* proxy it */ }
     }
     // SOCKS5 with per-request credentials: `ext` / `sid[:store token]`. Firefox keeps one
@@ -174,15 +206,22 @@ export class ProxyController {
    * active; each request id is answered once (a rejected secret ends there, no retry loop).
    */
   async auth(d: { isProxy?: boolean; realm?: string; challenger?: { host?: string; port?: number }; requestId?: string; cookieStoreId?: string }): Promise<{ authCredentials?: { username: string; password: string }; cancel?: boolean }> {
-    if (!d.isProxy || d.realm !== REALM || !this.active() || !this.sid) return {};
-    const t = await this.target();
-    if (!t || d.challenger?.host !== t.host || d.challenger?.port !== t.port) return {};
+    if (!d.isProxy || d.realm !== REALM) return {};
+    await this.ready;
+    // The background worker restarts (MV3 idles it out) while Chrome keeps the proxy setting:
+    // the channel is down for a moment. Wait for it rather than let Chrome show its own prompt.
+    if (this.state.enabled && !this.active() && !(await this.whenActive(this.d.readyWaitMs ?? READY_WAIT_MS))) return { cancel: true };
+    const t = this.server ? await this.target() : null;
+    const ours = !!t && normHost(d.challenger?.host) === normHost(t.host) && d.challenger?.port === t.port;
+    // Ours but unanswerable (just turned off, in-flight): end it, never a native prompt.
+    if (!this.active() || !this.sid) return ours ? { cancel: true } : {};
+    if (!ours) return {};
     if (d.requestId) {
       if (this.answered.has(d.requestId)) return { cancel: true };
       this.answered.add(d.requestId);
       if (this.answered.size > 2000) this.answered.clear();
     }
-    if (!this.storeEnabled(d.cookieStoreId)) return {};
+    if (!this.storeEnabled(d.cookieStoreId)) return { cancel: true };
     return { authCredentials: { username: 'ext', password: this.sid } };
   }
 }
