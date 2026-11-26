@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
-use filter_engine::{build_set, try_build_engine, ListInput, SharedEngine};
+use filter_engine::{build_set_checked, try_build_engine, ListInput, SharedEngine};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 use tracing::warn;
@@ -184,7 +184,8 @@ impl ListService {
                     includes: i.includes,
                 })
                 .collect();
-            let mut built = pool.install(|| build_set(&list_inputs));
+            let known = filter_engine::known_redirect_names(&resources);
+            let mut built = pool.install(|| build_set_checked(&list_inputs, Some(&known)));
             drop(list_inputs);
             mark_trusted(&mut built.ext, &trusted);
             let engine = try_build_engine(&built.blob, &resources).map_err(Error::Other)?;

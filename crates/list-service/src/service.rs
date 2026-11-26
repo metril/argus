@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use common::net_policy::{control_plane_client, is_refusal, NetPolicy};
 use filter_engine::{
-    build_set, formats::find_includes, try_build_engine, FilterList, ListFormat, ListInput,
+    build_set_checked, formats::find_includes, try_build_engine, FilterList, ListFormat, ListInput,
     ListReport, SharedEngine,
 };
 use futures_util::StreamExt;
@@ -803,7 +803,8 @@ impl ListService {
                     includes: i.includes,
                 })
                 .collect();
-            let mut built = pool.install(|| build_set(&list_inputs));
+            let known = filter_engine::known_redirect_names(&resources);
+            let mut built = pool.install(|| build_set_checked(&list_inputs, Some(&known)));
             drop(list_inputs);
             mark_trusted(&mut built.ext, &trusted_lists);
             // A blob the engine cannot load back (for example more rules than its flatbuffer
@@ -1216,10 +1217,51 @@ impl ListService {
         origin: Option<&reqwest::Url>,
         cap: usize,
     ) -> std::result::Result<String, String> {
+        let body = self.fetch_bytes(url, origin, cap).await?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// Like [`Self::get_text`] but the raw body (binary resources).
+    pub(crate) async fn get_bytes(
+        &self,
+        url: impl AsRef<str>,
+    ) -> std::result::Result<Vec<u8>, String> {
+        self.fetch_bytes(url.as_ref(), None, self.cfg.max_list_bytes)
+            .await
+    }
+
+    /// GET `url` with an explicit `Accept` header (the GitHub API's commit-SHA form).
+    pub(crate) async fn get_text_accept(
+        &self,
+        url: &str,
+        accept: &str,
+    ) -> std::result::Result<String, String> {
+        let b = self.fetch_bytes_with(url, None, 4096, Some(accept)).await?;
+        Ok(String::from_utf8_lossy(&b).into_owned())
+    }
+
+    async fn fetch_bytes(
+        &self,
+        url: &str,
+        origin: Option<&reqwest::Url>,
+        cap: usize,
+    ) -> std::result::Result<Vec<u8>, String> {
+        self.fetch_bytes_with(url, origin, cap, None).await
+    }
+
+    async fn fetch_bytes_with(
+        &self,
+        url: &str,
+        origin: Option<&reqwest::Url>,
+        cap: usize,
+        accept: Option<&str>,
+    ) -> std::result::Result<Vec<u8>, String> {
         self.precheck(url).map_err(|e| format!("{url}: {e}"))?;
-        let resp = self
-            .client
-            .get(url)
+        let mut req = self.client.get(url);
+        if let Some(a) = accept {
+            req = req.header(reqwest::header::ACCEPT, a);
+        }
+        let resp = req
             .header(reqwest::header::ACCEPT_ENCODING, "gzip, br, zstd")
             .timeout(self.cfg.fetch_timeout)
             .send()
@@ -1230,8 +1272,7 @@ impl ListService {
         if !resp.status().is_success() {
             return Err(format!("{url}: HTTP {}", resp.status()));
         }
-        let body = read_capped(resp, cap).await?;
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        read_capped(resp, cap).await
     }
 
     async fn download(
