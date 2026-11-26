@@ -1,4 +1,5 @@
 import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
+import { signOutInBackground } from '../lib/auth';
 import { Bridge } from '../lib/bridge';
 import { onStorageChanged } from '../lib/changes';
 import { respondAsync } from '../lib/messages';
@@ -100,6 +101,10 @@ export default defineBackground(() => {
     if (msg?.type === 'bridge-reconnect') {
       if (sender?.id !== browser.runtime.id) return undefined;
       return bridge.connect().then(() => bridge.status());
+    }
+    if (msg?.type === 'sign-out') {
+      if (sender?.id !== browser.runtime.id) return undefined;
+      return signOutInBackground({ bridge, proxy }).then(() => true);
     }
     if (msg?.type === 'bridge-status') {
       if (sender?.id !== browser.runtime.id) return undefined;

@@ -3,7 +3,7 @@ import { fakeBrowser } from 'wxt/testing/fake-browser';
 import { render } from 'preact';
 import { act } from 'preact/test-utils';
 import { fetchCert } from '../lib/api';
-import { normalizeUrl, signIn, signOut } from '../lib/auth';
+import { normalizeUrl, signIn, signOut, signOutInBackground } from '../lib/auth';
 import { CommandList, ErrorBanner, SignInForm } from '../ui/components';
 
 const resp = (status: number, body: unknown = {}, headers: Record<string, string> = { 'content-type': 'application/json' }) =>
@@ -63,6 +63,54 @@ describe('signOut and 401', () => {
     await signOut();
     expect(f).toHaveBeenCalledWith('https://a.lan/api/v1/tokens/self', expect.objectContaining({ method: 'DELETE' }));
     expect(await fakeBrowser.storage.local.get()).toEqual({ argusUrl: 'https://a.lan' });
+  });
+  it('background sign-out removes the token before stopping, then revokes with the captured token', async () => {
+    await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok', tokenId: 't', user: 'u' });
+    const order: string[] = [];
+    const bridge = { stop: async () => { order.push('stop:' + JSON.stringify(await fakeBrowser.storage.local.get('token'))); } };
+    const proxy = { apply: async () => { order.push('apply'); } };
+    vi.stubGlobal('fetch', async (_u: string, init: any) => { order.push('revoke:' + init.headers.Authorization); return new Response(null, { status: 204 }); });
+    await signOutInBackground({ bridge, proxy });
+    expect(order).toEqual(['stop:{}', 'apply', 'revoke:Bearer tok']);
+  });
+  it('a hung revoke is cut off after 3s', async () => {
+    vi.useFakeTimers();
+    try {
+      await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok' });
+      vi.stubGlobal('fetch', (_u: string, init: any) => new Promise((_r, rej) => init.signal.addEventListener('abort', () => rej(new Error('abort')))));
+      const p = signOutInBackground({ bridge: { stop: async () => {} }, proxy: { apply: async () => {} } });
+      await vi.advanceTimersByTimeAsync(3100);
+      await p;
+    } finally { vi.useRealTimers(); }
+  });
+  it('popup: worker asleep (sendMessage rejects) still removes the token and revokes', async () => {
+    await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok', tokenId: 't' });
+    vi.spyOn((fakeBrowser as any).runtime, 'sendMessage').mockRejectedValue(new Error('no receiver'));
+    const f = vi.fn(async (..._a: unknown[]) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', f);
+    await signOut();
+    expect(await fakeBrowser.storage.local.get()).toEqual({ argusUrl: 'https://a.lan' });
+    expect(f).toHaveBeenCalled();
+  });
+  it('popup: a hanging background is abandoned after the wait, token removed regardless', async () => {
+    vi.useFakeTimers();
+    try {
+      await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok' });
+      vi.spyOn((fakeBrowser as any).runtime, 'sendMessage').mockImplementation(() => new Promise(() => {}));
+      vi.stubGlobal('fetch', async () => new Response(null, { status: 204 }));
+      const p = signOut();
+      await vi.advanceTimersByTimeAsync(1600);
+      await p;
+      expect(await fakeBrowser.storage.local.get()).toEqual({ argusUrl: 'https://a.lan' });
+    } finally { vi.useRealTimers(); }
+  });
+  it('popup: when the background handled it, the popup does not repeat the revoke', async () => {
+    await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok' });
+    vi.spyOn((fakeBrowser as any).runtime, 'sendMessage').mockResolvedValue(true);
+    const f = vi.fn();
+    vi.stubGlobal('fetch', f);
+    await signOut();
+    expect(f).not.toHaveBeenCalled();
   });
   it('a 401 on the API is a session error; a refused proxy is not', async () => {
     const s = { argusUrl: 'https://a.lan', token: 't' };

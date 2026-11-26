@@ -50,13 +50,35 @@ export async function useToken(rawUrl: string, token: string, check: (s: Setting
   return { ok: true };
 }
 
-/** Revokes this extension's token (best effort) and forgets it; the URL stays for next time. */
-export async function signOut(): Promise<void> {
+const TOKEN_KEYS = ['token', 'tokenId', 'user', 'since'];
+
+async function revoke(argusUrl?: string, token?: string) {
+  if (!argusUrl || !token) return;
+  try { await fetch(`${argusUrl}/api/v1/tokens/self`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(3000) }); } catch { /* offline: still signed out locally */ }
+}
+
+/**
+ * Background side of sign-out: the token goes first (so nothing can reconnect with it), then the
+ * channel stops and the proxy clears, then the captured token is revoked (best effort, bounded).
+ */
+export async function signOutInBackground(d: { bridge: { stop(): Promise<void> }; proxy: { apply(): Promise<void> } }): Promise<void> {
   const s = await getSettings();
-  if (s.argusUrl && s.token) {
-    try { await fetch(`${s.argusUrl}/api/v1/tokens/self`, { method: 'DELETE', headers: { Authorization: `Bearer ${s.token}` } }); } catch { /* offline: still sign out locally */ }
+  await browser.storage.local.remove(TOKEN_KEYS);
+  try { await d.bridge.stop(); await d.proxy.apply(); } catch { /* ignore */ }
+  await revoke(s.argusUrl, s.token);
+}
+
+/** UI side: the background does it (it outlives the popup); if it cannot be reached, do it here. */
+export async function signOut(waitMs = 1500): Promise<void> {
+  const s = await getSettings();
+  let done = false;
+  try {
+    done = !!(await Promise.race([browser.runtime.sendMessage({ type: 'sign-out' }), new Promise((r) => setTimeout(() => r(false), waitMs))]));
+  } catch { /* worker gone */ }
+  if (!done) {
+    await browser.storage.local.remove(TOKEN_KEYS);
+    await revoke(s.argusUrl, s.token);
   }
-  await browser.storage.local.remove(['token', 'tokenId', 'user', 'since']);
 }
 
 /** `argus.json` in a downloaded Chrome zip carries this server's address. */

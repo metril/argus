@@ -16,6 +16,64 @@ function mk(firefox: boolean, enabled = true) {
 }
 const ch = (host = 'argus.local', port = 3130) => ({ isProxy: true, realm: REALM, challenger: { host, port }, requestId: Math.random().toString() });
 
+describe('ProxyController (worker restart)', () => {
+  it('a 407 during the reconnect gap waits for the session instead of falling to the native prompt', async () => {
+    const { c } = mk(false);
+    await c.init(); // fresh worker: no sid, no server yet; Chrome still has the proxy setting
+    const p = c.auth(ch());
+    await new Promise((r) => setTimeout(r, 20));
+    await c.setServer(null, 3130);
+    await c.setSid('a'.repeat(32));
+    expect(await p).toEqual({ authCredentials: { username: 'ext', password: 'a'.repeat(32) } });
+  });
+  it('a 407 that arrives before init has read the stored state still waits for it', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const settings = { set: vi.fn(async () => {}), clear: vi.fn(async () => {}) };
+    const br = { proxy: { settings }, storage: { local: { get: vi.fn(async (k: string) => { await gate; return { [k]: { enabled: true, stores: {} } }; }), set: vi.fn() } } };
+    const c = new ProxyController({ browser: br, firefox: false, argusHost: async () => 'argus.local', readyWaitMs: 2000 });
+    const init = c.init();
+    const p = c.auth(ch());
+    release();
+    await init;
+    await c.setServer(null, 3130);
+    await c.setSid('a'.repeat(32));
+    expect(await p).toHaveProperty('authCredentials');
+  });
+  it('our own listener but unanswerable (just turned off, or a disabled store) is cancelled, a foreign one left alone', async () => {
+    const { c } = mk(false);
+    await c.init();
+    await c.setServer(null, 3130);
+    await c.setSid('a'.repeat(32));
+    await c.setState({ enabled: false, stores: {} });
+    expect(await c.auth(ch())).toEqual({ cancel: true });
+    expect(await c.auth(ch('evil.test'))).toEqual({});
+    await c.setState({ enabled: true, stores: { x: false } });
+    expect(await c.auth({ ...ch(), cookieStoreId: 'x' })).toEqual({ cancel: true });
+  });
+  it('cancels (no native prompt) when the channel never comes back', async () => {
+    const settings = { set: vi.fn(async () => {}), clear: vi.fn(async () => {}) };
+    const br = { proxy: { settings }, storage: { local: { get: vi.fn(async (k: string) => ({ [k]: { enabled: true, stores: {} } })), set: vi.fn() } } };
+    const c = new ProxyController({ browser: br, firefox: false, argusHost: async () => 'argus.local', readyWaitMs: 30 });
+    await c.init();
+    expect(await c.auth(ch())).toEqual({ cancel: true });
+  });
+  it('stays out of the way when the toggle is off', async () => {
+    const { c } = mk(false, false);
+    await c.init();
+    expect(await c.auth(ch())).toEqual({});
+  });
+  it('compares hosts across case, trailing dot and IPv6 brackets', async () => {
+    const { c } = mk(false);
+    await c.init();
+    await c.setServer('[::1]', 3130);
+    await c.setSid('a'.repeat(32));
+    expect(await c.auth(ch('::1'))).toHaveProperty('authCredentials');
+    await c.setServer('Argus.Local.', 3130);
+    expect(await c.auth(ch('argus.local'))).toHaveProperty('authCredentials');
+  });
+});
+
 describe('ProxyController (Chrome)', () => {
   it('sets fixed_servers only while enabled and connected, clears otherwise', async () => {
     const { c, settings } = mk(false);
@@ -53,10 +111,11 @@ describe('ProxyController (Chrome)', () => {
     await c.init();
     await c.setServer(null, 3130);
     await c.setSid('a'.repeat(32));
-    expect(await c.auth(ch())).toEqual({});
+    expect(await c.auth(ch())).toEqual({ cancel: true }); // ours, but off: ended, not prompted
     await c.setState({ enabled: true, stores: {} });
     await c.setSid(null);
-    expect(await c.auth(ch())).toEqual({});
+    c['d'].readyWaitMs = 20; // disconnected while on: cancelled after a bounded wait, never answered
+    expect(await c.auth(ch())).toEqual({ cancel: true });
   });
 });
 
