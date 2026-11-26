@@ -273,6 +273,158 @@ fn status_response(status: StatusCode, msg: &'static str) -> Response<ProxyBody>
         .expect("static response")
 }
 
+/// Splice the downstream upgrade with the upstream stream `up` in a background task, ending on
+/// idle, shutdown, or the end of the extension session the connection authenticated as.
+fn spawn_splice<U>(
+    ws: &WsUpstream,
+    ctx: &ProxyContext,
+    rctx: &RequestCtx,
+    desc: String,
+    client_upgrade: hyper::upgrade::OnUpgrade,
+    up: impl std::future::Future<Output = std::result::Result<U, String>> + Send + 'static,
+) where
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let idle = ws.idle_timeout();
+    let shutdown = ws.shutdown.as_ref().map(|tx| tx.subscribe());
+    // A splice on a connection that authenticated as an extension session ends with that session.
+    let cancel: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+        rctx.ext.map(|session| {
+            let hub = ctx.internal().gm.ext().clone();
+            Box::pin(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if !hub.is_live(session) {
+                        return;
+                    }
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+    tokio::spawn(async move {
+        let (client, upstream) = tokio::join!(client_upgrade, up);
+        match (client, upstream) {
+            (Ok(client), Ok(upstream)) => {
+                let client = TokioIo::new(client);
+                match splice(client, upstream, idle, shutdown, cancel).await {
+                    Ok((up, down)) => debug!("WebSocket {} closed (up {up}B, down {down}B)", desc),
+                    Err(e) => debug!("WebSocket {} ended: {}", desc, e),
+                }
+            }
+            (Err(e), _) => debug!("WebSocket upgrade failed for {}: {}", desc, e),
+            (_, Err(e)) => debug!("WebSocket upstream upgrade failed for {}: {}", desc, e),
+        }
+    });
+}
+
+/// The browser-like path: the handshake goes through the same wreq client as HTTP (emulation of
+/// the browser behind the request, in-handshake certificate verification, the downstream
+/// connection's pool group and device TLS sessions, the upstream proxy, and the destination
+/// policy), as an HTTP/1.1 upgrade with the browser's headers untouched and in order. The two
+/// upgraded streams are then spliced byte-for-byte, so `Sec-WebSocket-Extensions` (for example
+/// permessage-deflate) negotiated by the origin is exactly what the browser was offered.
+async fn upgrade_browser_like(
+    ws: &WsUpstream,
+    ctx: &ProxyContext,
+    rctx: &RequestCtx,
+    mut req: Request<Incoming>,
+    target: &Target,
+    check_url: &str,
+    client: crate::upstream::UpstreamClient,
+) -> Result<Response<ProxyBody>> {
+    // Literals are judged here; names are judged on what they resolve to, in the client's resolver.
+    if let Err(why) = ctx.policy().check_literal(&target.host, target.port) {
+        common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
+        debug!("Refused WebSocket to {}: {}", check_url, why);
+        return Ok(refused_response());
+    }
+    let scheme = if target.tls { "https" } else { "http" };
+    let host = authority::url_host(&target.host);
+    let authority_of = |h: &str| format!("{h}:{}", target.port);
+    let mut dial_host = host.clone();
+    let mut host_override = None;
+    // Code-only resolve override: IP literals skip the resolver, so aim them at it explicitly.
+    if let (Some(over), Ok(_)) = (ctx.resolve_all_to(), target.host.parse::<IpAddr>()) {
+        dial_host = authority::url_host(&over.to_string());
+        host_override = Some(authority_of(&host));
+    }
+    let url = format!(
+        "{scheme}://{}{}",
+        authority_of(&dial_host),
+        target.path_and_query
+    );
+    let mut rb = client.request(Method::GET, url);
+    if let Some(s) = rctx.upstream_scope() {
+        rb = rb.scope(s);
+    }
+    if let Some(h) = host_override {
+        rb = rb.header(HOST, h);
+    }
+    for (name, value) in req.headers() {
+        if name == HeaderName::from_static("proxy-authorization")
+            || name == HeaderName::from_static("proxy-connection")
+            || name == HeaderName::from_static(crate::ext_bridge::RELAY_HEADER)
+            || name == HOST
+            || name == hyper::header::CONTENT_LENGTH
+            || name == hyper::header::TRANSFER_ENCODING
+        {
+            continue;
+        }
+        rb = rb.header(name.clone(), value.clone());
+    }
+    let sent = match tokio::time::timeout(ws.dial_timeout, rb.send_upgrade()).await {
+        Ok(r) => r,
+        Err(_) => {
+            return Ok(status_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "WebSocket upstream timeout",
+            ))
+        }
+    };
+    let (resp, upgraded) = match sent {
+        Ok(r) => r,
+        Err(e) if crate::policy::is_refusal(&e) => {
+            common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
+            debug!("Refused WebSocket to {} (resolved): {}", check_url, e);
+            return Ok(refused_response());
+        }
+        Err(e) => {
+            common::faults::note(common::faults::Fault::UpstreamError, &target.host);
+            debug!("WebSocket upstream to {} failed: {}", check_url, e);
+            return Ok(status_response(
+                StatusCode::BAD_GATEWAY,
+                "WebSocket upstream unavailable",
+            ));
+        }
+    };
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let Some(upgraded) = upgraded else {
+        // The origin refused the upgrade: hand its answer back unchanged.
+        let mut out = Response::builder().status(status);
+        *out.headers_mut().expect("builder headers") = headers;
+        let body = http_body_util::StreamBody::new(futures_util::TryStreamExt::map_ok(
+            resp.bytes_stream(),
+            hyper::body::Frame::data,
+        ))
+        .boxed_unsync();
+        return out
+            .body(body)
+            .map_err(|e| Error::Http(format!("Bad upgrade response: {e}")));
+    };
+    spawn_splice(
+        ws,
+        ctx,
+        rctx,
+        check_url.to_string(),
+        hyper::upgrade::on(&mut req),
+        async move { Ok(upgraded) },
+    );
+    let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    *out.headers_mut().expect("builder headers") = headers;
+    out.body(full_body(Bytes::new()))
+        .map_err(|e| Error::Http(format!("Bad upgrade response: {e}")))
+}
+
 /// Handle a WebSocket upgrade request: filter, dial upstream, forward the handshake, then splice.
 ///
 /// `default_tls` is true for decrypted (MITM) traffic, whose origin-form URIs carry no scheme.
@@ -312,6 +464,10 @@ pub async fn proxy_upgrade(
             .header("cache-control", "no-store")
             .body(full_body(Bytes::from_static(b"Blocked")))
             .expect("static response"));
+    }
+
+    if let Some(client) = ctx.ws_client(target.port) {
+        return upgrade_browser_like(ws, ctx, rctx, req, &target, &check_url, client).await;
     }
 
     let io = match ws.dial(&target.host, target.port, target.tls).await {
@@ -395,36 +551,13 @@ pub async fn proxy_upgrade(
     }
 
     let up_upgrade = hyper::upgrade::on(&mut resp);
-    let client_upgrade = hyper::upgrade::on(&mut req);
-    let desc = check_url.clone();
-    let idle = ws.idle_timeout();
-    let shutdown = ws.shutdown.as_ref().map(|tx| tx.subscribe());
-    // A splice on a connection that authenticated as an extension session ends with that session.
-    let cancel: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
-        rctx.ext.map(|session| {
-            let hub = ctx.internal().gm.ext().clone();
-            Box::pin(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    if !hub.is_live(session) {
-                        return;
-                    }
-                }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        });
-    tokio::spawn(async move {
-        match tokio::try_join!(client_upgrade, up_upgrade) {
-            Ok((client, upstream)) => {
-                let client = TokioIo::new(client);
-                let upstream = TokioIo::new(upstream);
-                match splice(client, upstream, idle, shutdown, cancel).await {
-                    Ok((up, down)) => debug!("WebSocket {} closed (up {up}B, down {down}B)", desc),
-                    Err(e) => debug!("WebSocket {} ended: {}", desc, e),
-                }
-            }
-            Err(e) => debug!("WebSocket upgrade failed for {}: {}", desc, e),
-        }
-    });
+    let up = async move {
+        up_upgrade
+            .await
+            .map(TokioIo::new)
+            .map_err(|e| e.to_string())
+    };
+    spawn_splice(ws, ctx, rctx, check_url, hyper::upgrade::on(&mut req), up);
 
     let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
     *out.headers_mut().expect("builder headers") = resp.headers().clone();

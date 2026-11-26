@@ -308,6 +308,10 @@ fn title_case(name: &str) -> String {
     if name.starts_with("sec-ch-") {
         return name.to_string();
     }
+    // The WebSocket handshake headers carry a capital `S` in `WebSocket` (RFC 6455).
+    if let Some(rest) = name.strip_prefix("sec-websocket-") {
+        return format!("Sec-WebSocket-{}", title_case(rest));
+    }
     let mut out = String::with_capacity(name.len());
     let mut up = true;
     for c in name.chars() {
