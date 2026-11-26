@@ -68,7 +68,7 @@ describe('signOut and 401', () => {
     await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok', tokenId: 't', user: 'u' });
     const order: string[] = [];
     const bridge = { stop: async () => { order.push('stop:' + JSON.stringify(await fakeBrowser.storage.local.get('token'))); } };
-    const proxy = { apply: async () => { order.push('apply'); } };
+    const proxy = { release: async () => { order.push('apply'); } };
     vi.stubGlobal('fetch', async (_u: string, init: any) => { order.push('revoke:' + init.headers.Authorization); return new Response(null, { status: 204 }); });
     await signOutInBackground({ bridge, proxy });
     expect(order).toEqual(['stop:{}', 'apply', 'revoke:Bearer tok']);
@@ -78,7 +78,7 @@ describe('signOut and 401', () => {
     try {
       await fakeBrowser.storage.local.set({ argusUrl: 'https://a.lan', token: 'tok' });
       vi.stubGlobal('fetch', (_u: string, init: any) => new Promise((_r, rej) => init.signal.addEventListener('abort', () => rej(new Error('abort')))));
-      const p = signOutInBackground({ bridge: { stop: async () => {} }, proxy: { apply: async () => {} } });
+      const p = signOutInBackground({ bridge: { stop: async () => {} }, proxy: { release: async () => {} } });
       await vi.advanceTimersByTimeAsync(3100);
       await p;
     } finally { vi.useRealTimers(); }

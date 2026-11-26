@@ -403,6 +403,18 @@ impl ConnectionHandler {
         };
         // The extension listener: only a live session's credentials in the CONNECT head open
         // a tunnel; everything inside it is bound to that session.
+        if let Some(sess) = self
+            .conn
+            .ext_session()
+            .filter(|s| !self.ext_hub().is_live(*s))
+        {
+            // Bound to a session that really ended: drop the connection, no `407` mid-stream.
+            let _ = sess;
+            return Err(Error::Connection(format!(
+                "extension session ended for {}",
+                self.client_addr
+            )));
+        }
         if self.conn.is_ext_listener() && !self.ext_authenticate(proxy_auth_value(&buf[..head_len]))
         {
             let _ = stream.write_all(EXT_AUTH_REQUIRED_RAW).await;
@@ -942,7 +954,11 @@ async fn handle_request(
     if conn.is_ext_listener() {
         let hub = shared.ctx.internal().gm.ext();
         let ok = match conn.ext_session() {
-            Some(s) => hub.is_live(s),
+            Some(s) if !hub.is_live(s) => {
+                // The bound session really ended: drop the connection, never a `407` mid-stream.
+                return Err(Error::Connection("extension session ended".into()));
+            }
+            Some(_) => true,
             None => req
                 .headers()
                 .get(hyper::header::PROXY_AUTHORIZATION)

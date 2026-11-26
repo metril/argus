@@ -60,13 +60,16 @@ export class Bridge {
     if (this.ws) return;
     const s = await this.d.getSettings();
     if (this.ws || this.stopped) return;
-    if (!s.argusUrl || !s.token) { await this.d.proxy?.setSid(null); return; }
+    if (!s.argusUrl || !s.token) { await this.d.proxy?.release(); return; }
     let ws: any;
     try { ws = new this.d.WebSocketCtor(wsUrl(s.argusUrl)); } catch { this.scheduleRetry(); return; }
     const gen = ++this.gen;
     this.ws = ws;
     ws.binaryType = 'arraybuffer';
-    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', token: s.token, v: 1 }));
+    // Ask for the previous session back (same sid): a restarted worker or a short outage keeps
+    // the browser's tunnels valid. The server refuses it when it is gone or not this token's.
+    const resume = this.d.proxy?.resumeSid?.() ?? null;
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', token: s.token, v: 1, ...(resume ? { resume } : {}) }));
     ws.onmessage = (ev: { data: unknown }) => { if (gen === this.gen) void this.onMessage(ev.data); };
     ws.onerror = () => { /* close follows */ };
     ws.onclose = () => { if (gen === this.gen) void this.onClose(); };
@@ -79,9 +82,12 @@ export class Bridge {
     await this.connect();
   }
 
+  /** Sign-out: the session ends now (`bye`), and the browser stops using Argus. */
   async stop(): Promise<void> {
     this.stopped = true;
+    try { if (this.sid) this.ws?.send('{"t":"bye"}'); } catch { /* ignore */ }
     await this.teardown(true);
+    await this.d.proxy?.release();
   }
 
   private async teardown(closeSocket: boolean) {
@@ -96,7 +102,7 @@ export class Bridge {
     for (const j of this.jobs.values()) { j.cancelled = true; j.abort.abort(); }
     this.jobs.clear();
     if (ws && closeSocket) { try { ws.close(); } catch { /* ignore */ } }
-    // Disconnected: the browser goes direct and no 407 is answered.
+    // Disconnected: the proxy setting stays (fail closed) and the last sid is kept to resume.
     await this.d.proxy?.setSid(null);
   }
 
@@ -108,7 +114,7 @@ export class Bridge {
   private scheduleRetry() {
     if (this.retryTimer) return;
     const wait = this.backoff;
-    this.backoff = Math.min(this.backoff * 2, 30_000);
+    this.backoff = Math.min(this.backoff * 2, 10_000);
     this.retryTimer = setTimeout(() => { this.retryTimer = null; void this.connect(); }, wait);
   }
 

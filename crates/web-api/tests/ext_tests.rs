@@ -204,7 +204,19 @@ async fn hello_needs_a_live_token_with_the_bridge_scope() {
     assert_eq!(*fake.closed.lock(), vec![7]);
     assert_eq!(fake.texts.lock().len(), 1);
     assert_eq!(audit_rows(&ctx.state, "ext/session_open"), 1);
-    // the close is audited right after the socket ends
+    // a dropped socket is audited as a detach (the session may be resumed)
+    for _ in 0..100 {
+        if audit_rows(&ctx.state, "ext/session_detach") == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(audit_rows(&ctx.state, "ext/session_detach"), 1);
+
+    // an explicit `bye` ends the session for good
+    let mut ws = hello(&server, &good).await;
+    let _: Value = ws.receive_json().await;
+    ws.send_text(r#"{"t":"bye"}"#).await;
     for _ in 0..100 {
         if audit_rows(&ctx.state, "ext/session_close") == 1 {
             break;

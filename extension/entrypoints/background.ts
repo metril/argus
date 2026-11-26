@@ -21,6 +21,12 @@ export default defineBackground(() => {
   const intercepted = new Map<number, Interception>();
 
   async function update(tabId: number, url?: string) {
+    // Argus is on but unreachable: the browser is blocked (not direct); say so on every tab.
+    if (proxy.unreachable()) {
+      await action.setBadgeText({ tabId, text: '!' });
+      await action.setBadgeBackgroundColor({ tabId, color: '#f2695f' });
+      return;
+    }
     const host = hostOf(url);
     if (!host) { await action.setBadgeText({ tabId, text: '' }); return; }
     const b = badgeFor(await cachedLookup(host));
@@ -29,11 +35,17 @@ export default defineBackground(() => {
     try { await (action as any).setBadgeTextColor?.({ tabId, color: '#0c0f13' }); } catch { /* optional */ }
   }
 
+  async function refreshBadges() {
+    try {
+      for (const t of await browser.tabs.query({})) if (t.id !== undefined) await update(t.id, t.url);
+    } catch { /* ignore */ }
+  }
+
   // Userscript bridge: channel to the proxy for relayed requests, and the proxy settings that
   // bind this browser's documents to the channel's session (proxy authentication, never headers).
   const firefox = typeof (browser as any).contextualIdentities !== 'undefined' || /Firefox\//.test(navigator.userAgent);
   const argusHost = async () => { try { return new URL((await getSettings()).argusUrl).hostname; } catch { return ''; } };
-  const proxy = new ProxyController({ browser, firefox, argusHost });
+  const proxy: ProxyController = new ProxyController({ browser, firefox, argusHost, onStatus: () => void refreshBadges() });
   const bridge = new Bridge({ WebSocketCtor: WebSocket, browser, getSettings, proxy, storeRelay: new StoreRelay(browser) });
   void proxy.init().then(() => bridge.connect());
   const b: any = browser;
@@ -95,8 +107,8 @@ export default defineBackground(() => {
       if (sender?.id !== browser.runtime.id) return undefined;
       const m = msg as { type: string; state?: ProxyState; storeId?: string };
       if (m.type === 'store-token') return Promise.resolve(proxy.tokenFor(m.storeId));
-      if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => ({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), firefox }));
-      return Promise.resolve({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), firefox });
+      if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => ({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox }));
+      return Promise.resolve({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox });
     }
     if (msg?.type === 'bridge-reconnect') {
       if (sender?.id !== browser.runtime.id) return undefined;
