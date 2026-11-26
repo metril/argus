@@ -326,6 +326,114 @@ pub fn convert_ubo_redirects(
     })
 }
 
+/// One entry of AdGuard Scriptlets' `dist/redirects.json`.
+#[derive(Debug, serde::Deserialize)]
+struct AdguardEntry {
+    title: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default, rename = "isBlocking")]
+    is_blocking: bool,
+    #[serde(rename = "contentType")]
+    content_type: String,
+    content: String,
+}
+
+/// File extension for a redirect's content type (`image/gif;base64` -> `gif`).
+fn ext_of_content_type(ct: &str) -> &'static str {
+    match ct.split(';').next().unwrap_or("").trim() {
+        "image/gif" => "gif",
+        "image/png" => "png",
+        "audio/mp3" | "audio/mpeg" => "mp3",
+        "video/mp4" => "mp4",
+        "text/xml" | "application/xml" => "xml",
+        "text/html" => "html",
+        "text/css" => "css",
+        "application/javascript" | "text/javascript" => "js",
+        "application/json" => "json",
+        _ => "txt",
+    }
+}
+
+/// Convert AdGuard Scriptlets' `dist/redirects.json` into validated resources, for the names
+/// uBO's library lacks. `taken` holds every name and alias already registered (uBO's resources
+/// and AdGuard-name aliases): an entry whose title is taken is skipped (uBO's resource is used),
+/// and only the free aliases of the others are registered. Content gets the same type and
+/// script validation as uBO's files; blocking-page redirects (`isBlocking`) are not `$redirect`
+/// bodies and are skipped.
+pub fn convert_adguard_redirects(
+    json: &str,
+    taken: &HashSet<String>,
+) -> Result<ScriptletConversion, String> {
+    let entries: Vec<AdguardEntry> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut taken = taken.clone();
+    let (mut dropped, mut resources) = (Vec::new(), Vec::new());
+    for e in entries {
+        if e.is_blocking || taken.contains(&e.title) {
+            continue;
+        }
+        let file = format!("{}.{}", e.title, ext_of_content_type(&e.content_type));
+        let bytes = if e.content_type.contains(";base64") {
+            match base64::engine::general_purpose::STANDARD.decode(e.content.trim()) {
+                Ok(b) => b,
+                Err(_) => {
+                    dropped.push(DroppedResource {
+                        name: e.title,
+                        reason: "content is not valid base64".into(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            e.content.clone().into_bytes()
+        };
+        if let Err(reason) = validate_file(&file, &bytes) {
+            dropped.push(DroppedResource {
+                name: e.title,
+                reason,
+            });
+            continue;
+        }
+        let aliases: Vec<String> = e
+            .aliases
+            .into_iter()
+            .filter(|a| taken.insert(a.clone()))
+            .collect();
+        taken.insert(e.title.clone());
+        resources.push(Resource {
+            name: e.title,
+            aliases,
+            kind: ResourceType::Mime(mime_of(&file)),
+            content: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            dependencies: vec![],
+            permission: PermissionMask::default(),
+        });
+    }
+    let v = validate_resources(resources);
+    dropped.extend(v.dropped);
+    Ok(ScriptletConversion {
+        resources: v.resources,
+        dropped,
+    })
+}
+
+/// [`convert_adguard_redirects`] against a resources JSON array (`base`, e.g. the converted uBO
+/// redirects): returns `base` extended with AdGuard's additional resources.
+pub fn with_adguard_redirects(
+    base: &str,
+    adguard_json: &str,
+) -> Result<(String, Vec<DroppedResource>), String> {
+    let mut all: Vec<Resource> = serde_json::from_str(base).map_err(|e| e.to_string())?;
+    let taken: HashSet<String> = all
+        .iter()
+        .flat_map(|r| std::iter::once(&r.name).chain(&r.aliases).cloned())
+        .collect();
+    let c = convert_adguard_redirects(adguard_json, &taken)?;
+    all.extend(c.resources);
+    let json = serde_json::to_string(&all).map_err(|e| e.to_string())?;
+    Ok((json, c.dropped))
+}
+
 /// Names of the files a redirect map needs fetched.
 pub fn redirect_file_names(map_js: &str) -> Result<Vec<String>, String> {
     Ok(parse_redirect_map(map_js)?
@@ -493,6 +601,32 @@ mod tests {
         assert_eq!(c.resources.len(), 1);
         assert_eq!(c.dropped.len(), 1);
         assert!(c.resources[0].aliases.contains(&"noopjs".to_string()));
+    }
+
+    #[test]
+    fn adguard_only_names_are_added_with_the_same_validation() {
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let ag = serde_json::json!([
+            {"title":"noopjs","aliases":["x"],"isBlocking":false,"contentType":"application/javascript;base64","content":b64("(function(){})()")},
+            {"title":"metrika-yandex-tag","aliases":["ym","x"],"isBlocking":false,"contentType":"application/javascript;base64","content":b64("!function(s){window.ym=1}({},[])")},
+            {"title":"broken","aliases":[],"isBlocking":false,"contentType":"application/javascript;base64","content":b64("(function(){")},
+            {"title":"bad.gif","aliases":[],"isBlocking":false,"contentType":"image/gif;base64","content":b64("junk")},
+            {"title":"page","aliases":[],"isBlocking":true,"contentType":"text/html;base64","content":b64("<p>")},
+        ])
+        .to_string();
+        let taken = HashSet::from(["noopjs".to_string()]);
+        let c = convert_adguard_redirects(&ag, &taken).unwrap();
+        let names: Vec<_> = c.resources.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["metrika-yandex-tag"], "uBO's noopjs wins");
+        assert_eq!(c.resources[0].aliases, ["ym", "x"]);
+        let mut d: Vec<_> = c.dropped.iter().map(|d| d.name.as_str()).collect();
+        d.sort();
+        assert_eq!(d, ["bad.gif", "broken"]);
+        assert!(known_redirect_names(&c.resources).contains("ym"));
+        // A taken alias is not registered twice.
+        let taken = HashSet::from(["x".to_string()]);
+        let c = convert_adguard_redirects(&ag, &taken).unwrap();
+        assert_eq!(c.resources[1].aliases, ["ym"]);
     }
 
     #[test]

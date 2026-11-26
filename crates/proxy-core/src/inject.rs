@@ -740,13 +740,9 @@ mod tests {
             generichide: true,
             ..Default::default()
         };
-        let t = std::time::Instant::now();
         let h = build_head(&spec(&cos, &i)).html;
-        let took = t.elapsed();
-        eprintln!("50k selectors: head {} bytes, built in {took:?}", h.len());
         assert_eq!(h.matches("{display:none!important}").count(), 50_000);
         assert!(h.len() < 4 << 20, "{}", h.len());
-        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     #[test]

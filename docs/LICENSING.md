@@ -31,3 +31,5 @@ Without the library nothing from it is compiled in; the file stays in the source
   `noop.txt`, `noop.json`, `noop-vmap1.0.xml`, `1x1.gif`, `1x1.png`, `noop-0.1s.mp3`) are original:
   text bodies are trivial and the binary files are assembled in code from the GIF, PNG/zlib and
   MPEG specifications. Only the resource names follow uBO conventions so existing rules resolve.
+- The embedded `$redirect` set also holds the AdGuard redirect resources uBO lacks (GPL-3.0,
+  AdguardTeam/Scriptlets `dist/redirects.json`; see `crates/filter-engine/resources/SOURCE.txt`).

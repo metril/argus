@@ -55,7 +55,7 @@ pub use shared::{
 };
 pub use stats::{BlockingStats, FilterStats};
 pub use ubo_redirects::{
-    convert_ubo_redirects, known_redirect_names, looks_like_scriptlet, merge_resources_json,
-    parse_redirect_map, redirect_file_names, ubo_redirects_to_json, RedirectEntry,
-    ADGUARD_REDIRECT_ALIASES,
+    convert_adguard_redirects, convert_ubo_redirects, known_redirect_names, looks_like_scriptlet,
+    merge_resources_json, parse_redirect_map, redirect_file_names, ubo_redirects_to_json,
+    with_adguard_redirects, RedirectEntry, ADGUARD_REDIRECT_ALIASES,
 };

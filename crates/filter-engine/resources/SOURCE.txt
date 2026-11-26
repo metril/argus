@@ -16,9 +16,16 @@ named by src/js/redirect-resources.js; binary files base64) plus AdGuard redirec
 by `convert_ubo_redirects`. Refreshed at runtime together with the scriptlets (map + files fetched
 from the same raw base URL), the bundled copy filling any gap.
 
+AdGuard additions: ubo-redirects.json also holds the 10 AdGuard `$redirect` resources uBO lacks
+(ati-smarttag, didomi-loader, freewheel-admanager, gemius, matomo, metrika-yandex-tag,
+metrika-yandex-watch, naver-wcslog, pardot-1.0, prebid), from AdguardTeam/Scriptlets v2.5.1
+(2026-08-25; dist/redirects.json, GPL-3.0; v2.6.0 was under 14 days old). uBO's resource wins
+where both exist; the same file-type and script validation applies (`convert_adguard_redirects`).
+
 Offline fallback only: a copy fetched at runtime (or cached in the data dir) takes precedence.
 
 Regenerate: download the files (and src/js/urlskip.js) at the desired commit into a directory, then
   cargo run -p filter-engine --example gen_resources -- <dir> crates/filter-engine/resources/ubo-resources.json \
-    <redirect-resources.js> <web_accessible_resources dir> crates/filter-engine/resources/ubo-redirects.json
+    <redirect-resources.js> <web_accessible_resources dir> crates/filter-engine/resources/ubo-redirects.json \
+    <AdGuard Scriptlets package/dist/redirects.json>
 and update this file.

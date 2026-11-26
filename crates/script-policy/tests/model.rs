@@ -709,6 +709,39 @@ fn page_context_from_headers() {
 }
 
 #[test]
+fn enabled_default_policy_keeps_the_iubenda_badge_script_from_loading() {
+    // canyoublockit.com's footer loads cdn.iubenda.com/iubenda.js, which turns the privacy-policy
+    // link into a 115x22 `iubenda-ibadge` iframe. With the script policy on (shipped default:
+    // third-party scripts denied) that request is refused, so the link stays a plain anchor and
+    // no badge renders. This is a script-policy effect, not a cosmetic or list rule.
+    let c = compile(&rs());
+    let p = c.decide("https", "canyoublockit.com", None);
+    let hints = p.network_hints();
+    let req = |dest: &str, host: &'static str| SubRequest {
+        dest: FetchDest::from_header(dest),
+        ping: false,
+        target: Source {
+            scheme: Some(Scheme::Https),
+            host,
+        },
+    };
+    assert_eq!(
+        p.check_request(&hints, &req("script", "cdn.iubenda.com")),
+        HintVerdict::Block { cap: C::Script }
+    );
+    assert_eq!(
+        p.check_request(&hints, &req("script", "canyoublockit.com")),
+        HintVerdict::Allow
+    );
+    // With the policy off (the default) nothing is judged and the badge renders.
+    let mut off = rs();
+    off.settings.enabled = false;
+    let c = compile(&off);
+    let p = c.decide("https", "canyoublockit.com", None);
+    assert!(p.network_hints().is_empty());
+}
+
+#[test]
 fn network_hints_block_denied_third_party_subresources() {
     let c = compile(&rs());
     let p = c.decide("https", "www.example.com", None);

@@ -233,6 +233,42 @@ mod redirects {
     }
 
     #[test]
+    fn adguard_only_redirects_are_served_and_ubo_wins_overlaps() {
+        let e = engine_with(&[
+            "||a.test/m.js$script,redirect=metrika-yandex-tag",
+            "||b.test/g.js$script,redirect=gemius",
+            "||c.test/n.js$script,redirect=noopjs",
+        ]);
+        let known = known_redirect_names(&e.resources());
+        for n in [
+            "ati-smarttag",
+            "didomi-loader",
+            "freewheel-admanager",
+            "gemius",
+            "matomo",
+            "metrika-yandex-tag",
+            "metrika-yandex-watch",
+            "naver-wcslog",
+            "pardot-1.0",
+            "prebid",
+        ] {
+            assert!(known.contains(n), "{n}");
+        }
+        for u in ["https://a.test/m.js", "https://b.test/g.js"] {
+            let r = e.check(u, "https://site.test/", "script");
+            assert!(r.redirect_resource().is_some(), "{u}: {r:?}");
+        }
+        // uBO's noop.js is the one behind `noopjs` (AdGuard's duplicate is not registered).
+        let n = e.resources();
+        assert_eq!(
+            n.iter()
+                .filter(|r| r.aliases.contains(&"noopjs".into()))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn redirect_to_a_missing_resource_is_counted() {
         let e = SharedEngine::new();
         let json = merge_resources_json(BUNDLED_RESOURCES_JSON, BUNDLED_REDIRECTS_JSON).unwrap();
