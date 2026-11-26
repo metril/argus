@@ -539,9 +539,30 @@ impl ExtIndex {
         }
         let live = self.survivors(
             &ids,
-            target::BLOCK | target::URLTRANSFORM | target::COOKIE | target::REMOVEHEADER,
+            target::BLOCK
+                | target::URLTRANSFORM
+                | target::COOKIE
+                | target::REMOVEHEADER
+                | target::REMOVEPARAM,
         );
         let mut cur: Cow<'_, str> = Cow::Borrowed(req.url);
+        // `$removeparam` first (so `$urltransform` sees the cleaned URL); all rules in one pass.
+        let rp: Vec<(u32, &crate::RemoveParam)> = live
+            .iter()
+            .filter_map(|&id| match &self.rules[id as usize].action {
+                Action::RemoveParam(s) => Some((id, s)),
+                _ => None,
+            })
+            .collect();
+        if !rp.is_empty() {
+            let specs: Vec<&crate::RemoveParam> = rp.iter().map(|(_, s)| *s).collect();
+            if let Some(n) = crate::removeparam::apply(&cur, &specs) {
+                d.cleaned_url = Some((n.clone(), rp[0].0));
+                d.rewrite_url = Some((n.clone(), rp[0].0));
+                d.matched.extend(rp.iter().map(|(i, _)| *i));
+                cur = Cow::Owned(n);
+            }
+        }
         let mut cookies: Vec<&CookieSpec> = Vec::new();
         for id in live {
             match &self.rules[id as usize].action {
@@ -583,6 +604,44 @@ impl ExtIndex {
             }
         }
         d
+    }
+
+    /// What request-side `$removeparam` exceptions matching `req` exempt from the network
+    /// engine's own (plain-name) removal: `(all, names)`. `None` when no exception matches.
+    pub fn removeparam_exemption(&self, req: &RequestInfo<'_>) -> Option<(bool, Vec<String>)> {
+        if self.present & target::REMOVEPARAM == 0 {
+            return None;
+        }
+        let ctx = Ctx::new(req)?;
+        let mut out: Option<(bool, Vec<String>)> = None;
+        for id in self.net_ids(&self.req, &ctx) {
+            let r = &self.rules[id as usize];
+            if r.exception && r.target_mask() & target::REMOVEPARAM != 0 {
+                let o = out.get_or_insert((false, Vec::new()));
+                if r.value.is_empty() {
+                    o.0 = true;
+                } else {
+                    o.1.push(r.value.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Does a bare exception that switches off page-level behaviour (`@@||host^$document`,
+    /// `$elemhide`, `$jsinject`) match `req`?
+    pub fn page_exempt(&self, req: &RequestInfo<'_>) -> bool {
+        let mask = target::PCSS | target::JS;
+        if self.present & mask == 0 {
+            return false;
+        }
+        let Some(ctx) = Ctx::new(req) else {
+            return false;
+        };
+        self.net_ids(&self.req, &ctx).into_iter().any(|id| {
+            let r = &self.rules[id as usize];
+            r.exception && r.value.is_empty() && r.target_mask() & mask != 0
+        })
     }
 
     /// The body transforms among `ids` (rule ids from [`ResponsePlan::matched`]), grouped like

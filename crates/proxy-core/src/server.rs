@@ -399,6 +399,10 @@ impl ProxyControl {
             }
         }
         self.timeouts.store(Arc::new(t));
+        self.ctx
+            .set_guard_service_workers(config.adblock.guard_service_workers);
+        self.ctx
+            .set_guard_service_workers_exempt(config.adblock.guard_service_workers_exempt.clone());
         self.ctx.commit_upstream(upstream);
         if let (Some(roots), Some(extras)) = (self.ctx.roots(), new_extras) {
             roots.commit_extras(extras);

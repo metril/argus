@@ -165,9 +165,16 @@ pub fn redirect_response(res: RedirectResource) -> Response<ProxyBody> {
 /// 307 to the `$removeparam`-cleaned URL (document navigations). Default ports are normalized
 /// away so the client sees a natural URL.
 pub fn rewrite_redirect(new_url: &str) -> Response<ProxyBody> {
-    let location = url::Url::parse(new_url)
-        .map(String::from)
-        .unwrap_or_else(|_| new_url.to_string());
+    // Only the scheme's default port is dropped; every other byte of the cleaned URL stays
+    // exactly as the rule engine produced it (`url::Url` would re-encode some of them).
+    let plain = crate::ext::rule_url(new_url);
+    let location = if plain.bytes().all(|b| (0x21..0x7f).contains(&b)) {
+        plain.into_owned()
+    } else {
+        url::Url::parse(new_url)
+            .map(String::from)
+            .unwrap_or_else(|_| new_url.to_string())
+    };
     base(StatusCode::TEMPORARY_REDIRECT, "rewritten")
         .header("location", location)
         .body(full_body(Bytes::new()))
@@ -218,6 +225,16 @@ mod tests {
         }
         let sub = block_response(RequestType::Subdocument, &v, "u");
         assert_eq!(sub.status(), 200);
+    }
+
+    #[test]
+    fn rewrite_redirect_keeps_the_cleaned_url_bytes() {
+        // `url::Url` would turn `|` into `%7C` and re-case nothing else; keep it as given.
+        let r = rewrite_redirect("https://a.test:443/p?x=%2f%7e&y=a|b&z=%E2%82%AC");
+        assert_eq!(
+            r.headers()["location"],
+            "https://a.test/p?x=%2f%7e&y=a|b&z=%E2%82%AC"
+        );
     }
 
     #[test]

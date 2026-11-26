@@ -255,6 +255,13 @@ pub struct ProxyConfigResponse {
     /// Source of the signed first-party lists.
     #[serde(default)]
     pub bypass: BypassSourceDto,
+    /// Opt in: keep service workers from bypassing the injection on filtered sites (replaces
+    /// their script with a self-unregistering no-op worker; offline apps and push stop working).
+    #[serde(default)]
+    pub guard_service_workers: bool,
+    /// Hosts (exact or `*.suffix`) the guard leaves alone.
+    #[serde(default)]
+    pub guard_service_workers_exempt: Vec<String>,
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
@@ -506,6 +513,10 @@ pub struct UpdateProxyConfigRequest {
     pub webui_port: Option<u16>,
     /// Source of the signed first-party lists; applied live.
     pub bypass: Option<BypassSourceUpdate>,
+    /// Neutralise service workers on filtered sites; applied live.
+    pub guard_service_workers: Option<bool>,
+    /// Replaces the guard's exempt host list; applied live.
+    pub guard_service_workers_exempt: Option<Vec<String>>,
 }
 
 /// Connection statistics.
