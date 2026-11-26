@@ -11,7 +11,6 @@ use std::sync::Arc;
 fn test_ctx() -> Arc<ProxyContext> {
     Arc::new(ProxyContext::new(
         Arc::new(filter_engine::SharedEngine::new()),
-        reqwest::Client::new(),
         false,
     ))
 }

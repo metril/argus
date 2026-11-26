@@ -26,11 +26,7 @@ async fn start(transparent: bool) -> Running {
     config.proxy.host = HOST.into();
     config.mitm.enabled = false;
     config.proxy.enable_websockets = false;
-    let ctx = Arc::new(ProxyContext::new(
-        Arc::new(SharedEngine::new()),
-        reqwest::Client::new(),
-        true,
-    ));
+    let ctx = Arc::new(ProxyContext::new(Arc::new(SharedEngine::new()), true));
     let server = ProxyServer::new(config, ctx).unwrap();
     let ctl = server.control();
     let lm = server.load_manager().clone();
@@ -422,11 +418,7 @@ async fn start_cfg(
     config.proxy.transparent_port = tport;
     config.mitm.enabled = false;
     config.proxy.enable_websockets = false;
-    let ctx = Arc::new(ProxyContext::new(
-        Arc::new(SharedEngine::new()),
-        reqwest::Client::new(),
-        true,
-    ));
+    let ctx = Arc::new(ProxyContext::new(Arc::new(SharedEngine::new()), true));
     let server = ProxyServer::new(config, ctx).unwrap();
     let ctl = server.control();
     let task = tokio::spawn(async move {

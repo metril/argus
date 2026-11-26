@@ -552,50 +552,15 @@ async fn probes_use_the_proxy() {
     }
 }
 
-#[cfg(feature = "websockets")]
-#[tokio::test]
-async fn websocket_dials_use_the_proxy() {
-    for kind in [Http, Socks5] {
-        let ca = ca();
-        let o = origin(&ca).await;
-        let s = stub(kind, None).await;
-        let r = rig(&ca, true, Some(cfg(kind, s.port, None)));
-        let ws = crate::websocket::WsUpstream::new(
-            r.opts.roots.clone().unwrap(),
-            r.policy.clone(),
-            None,
-            Duration::from_secs(5),
-        )
-        .unwrap()
-        .with_proxy(r.opts.proxy.clone());
-        ws.dial(NAME, o.port, true).await.unwrap();
-        assert_eq!(
-            s.targets(),
-            vec![format!("{PUBLIC}:{}", o.port)],
-            "{kind:?}"
-        );
-        for _ in 0..50 {
-            if !o.sni.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(o.sni.lock().unwrap()[0].as_deref(), Some(NAME));
-        // A private target is refused before the proxy is asked.
-        assert!(ws.dial("private.test", o.port, true).await.is_err());
-        assert_eq!(s.targets().len(), 1);
-    }
-}
-
 /// Browser-like upgrades go through the upstream proxy like any request: the name is resolved
 /// here, vetted, and only the IP is sent; a private target is refused before the proxy is asked.
 #[tokio::test]
-async fn browser_like_upgrades_use_the_proxy_and_the_policy() {
-    for kind in [Http, Socks5] {
+async fn upgrades_use_the_proxy_and_the_policy() {
+    for (kind, browser_like) in [(Http, true), (Socks5, true), (Http, false), (Socks5, false)] {
         let ca = ca();
         let o = origin(&ca).await;
         let s = stub(kind, None).await;
-        let r = rig(&ca, true, Some(cfg(kind, s.port, None)));
+        let r = rig(&ca, browser_like, Some(cfg(kind, s.port, None)));
         let client = build_upstream_client(&r.opts).unwrap();
         let upgrade = |host: &str| {
             client
@@ -608,12 +573,12 @@ async fn browser_like_upgrades_use_the_proxy_and_the_policy() {
         };
         // The origin here answers 200: the upgrade is declined, its answer comes back as is.
         let (resp, up) = upgrade(NAME).await.unwrap();
-        assert_eq!(resp.status(), 200, "{kind:?}");
+        assert_eq!(resp.status(), 200, "{kind:?} browser_like={browser_like}");
         assert!(up.is_none());
         assert_eq!(
             s.targets(),
             vec![format!("{PUBLIC}:{}", o.port)],
-            "{kind:?}"
+            "{kind:?} browser_like={browser_like}"
         );
         assert_eq!(o.sni.lock().unwrap()[0].as_deref(), Some(NAME));
         assert!(o.heads.lock().unwrap()[0]
@@ -621,8 +586,11 @@ async fn browser_like_upgrades_use_the_proxy_and_the_policy() {
             .contains("upgrade: websocket"));
         // Private targets never reach the proxy.
         let e = upgrade("private.test").await.map(|_| ()).unwrap_err();
-        assert!(crate::policy::is_refusal(&e), "{kind:?}: {e}");
-        assert_eq!(s.targets().len(), 1, "{kind:?}");
+        assert!(
+            crate::policy::is_refusal(&e),
+            "{kind:?} browser_like={browser_like}: {e}"
+        );
+        assert_eq!(s.targets().len(), 1, "{kind:?} browser_like={browser_like}");
     }
 }
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* The previous upstream client is removed. With browser-like connections off, Argus uses the same
+  client without the browser fingerprint (WebSockets too).
+
 ## 0.6.0 — 2026-11-25
 
 * Upstream proxy (Settings, off by default; `proxy.upstream.proxy`): Argus can send everything it

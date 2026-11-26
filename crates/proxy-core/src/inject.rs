@@ -40,7 +40,7 @@ pub fn full_body(bytes: Bytes) -> ProxyBody {
     Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
 }
 
-/// Stream a reqwest response body straight through (no buffering, original encoding preserved).
+/// Stream an upstream response body straight through (no buffering, original encoding preserved).
 pub fn passthrough_body(resp: crate::upstream::UpstreamResponse) -> ProxyBody {
     let stream = resp.bytes_stream().map(|res| res.map(Frame::data));
     BodyExt::boxed_unsync(StreamBody::new(stream))

@@ -293,7 +293,23 @@ async fn a_goaway_refused_stream_is_not_retried_for_a_post() {
 }
 
 #[tokio::test]
-async fn the_reqwest_retry_uses_a_new_connection_not_an_idle_one() {
+async fn the_plain_client_retries_a_get_once_on_a_new_connection() {
+    for act in [Act::Refuse, Act::Goaway] {
+        let before = retries();
+        let (r, o) = setup_with(false, first_on(0, act)).await;
+        let resp = base(&r.client, hyper::Method::GET, &o)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{act:?}");
+        assert_eq!(o.stats.conns.load(Ordering::SeqCst), 2, "{act:?}");
+        assert_eq!(o.stats.requests.load(Ordering::SeqCst), 2, "{act:?}");
+        assert_eq!(retries() - before, 1, "{act:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_plain_clients_retry_uses_a_new_connection_not_an_idle_one() {
     // Connection 0 serves the first request and stays idle in the pool, then refuses the second.
     let script: Script = Arc::new(|c, n| {
         if c == 0 && n == 1 {

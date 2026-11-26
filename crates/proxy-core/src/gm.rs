@@ -1644,8 +1644,7 @@ async fn run_outbound(
         } else {
             up.client
         };
-        let method =
-            reqwest::Method::from_bytes(cur.method.as_bytes()).unwrap_or(reqwest::Method::GET);
+        let method = hyper::Method::from_bytes(cur.method.as_bytes()).unwrap_or(hyper::Method::GET);
         let mut dial = cur.url.clone();
         let mut host_hdr = None;
         if let (Some(over), Some(h)) = (up.resolve_all_to, cur.url.host_str()) {

@@ -1,6 +1,6 @@
 //! WebSocket proxying.
 //!
-//! The client's upgrade request is forwarded upstream (over TLS for `wss`) and, when the origin
+//! The client's upgrade request is forwarded upstream by the upstream client (over TLS for `wss`) and, when the origin
 //! answers `101`, both upgraded streams are spliced byte-for-byte. Extensions and subprotocols
 //! negotiated end to end therefore keep working, and the proxy never re-frames messages.
 
@@ -8,22 +8,18 @@ use crate::authority;
 use crate::connection::IdleIo;
 use crate::filtering::{refused_response, ProxyContext};
 use crate::inject::{full_body, ProxyBody};
-use crate::policy::DestPolicy;
 use crate::request_ctx::RequestCtx;
 use crate::{Error, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{HeaderMap, HeaderName, HOST};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::ServerName;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
-use tokio_rustls::TlsConnector;
 use tracing::debug;
 
 /// Check if a request is a WebSocket upgrade request
@@ -63,57 +59,24 @@ pub fn extract_ws_target(uri: &hyper::Uri, headers: &hyper::HeaderMap) -> Result
     Ok(format!("{}://{}{}", scheme, host, path))
 }
 
-/// Object-safe duplex stream (plain TCP or TLS) used for upstream WebSocket connections.
-pub trait WsIo: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> WsIo for T {}
-
-/// How WebSocket upgrades dial upstream: same trust roots as the HTTP client (built-in web roots
-/// plus the configured extra CAs) and an optional fixed-IP override matching
-/// `UpstreamOptions::resolve_all_to`.
+/// Lifecycle of upstream WebSocket upgrades: the handshake deadline, how long a spliced
+/// connection may sit idle, and the proxy shutdown signal that ends it. The connection itself is
+/// made by the upstream client (see [`crate::upstream::UpstreamRequest::send_upgrade`]).
 pub struct WsUpstream {
-    tls: TlsConnector,
-    policy: Arc<DestPolicy>,
-    resolve_all_to: Option<IpAddr>,
     dial_timeout: Duration,
     /// Spliced connections close after this long without traffic.
     idle_timeout: std::sync::atomic::AtomicU64,
     /// Spliced connections end when the proxy shuts down.
     shutdown: Option<broadcast::Sender<()>>,
-    /// The upstream proxy upgrades are dialled through, when on.
-    proxy: Arc<crate::upstream_proxy::ProxyHandle>,
 }
 
 impl WsUpstream {
-    pub fn new(
-        roots: Arc<crate::roots::RootsHandle>,
-        policy: Arc<DestPolicy>,
-        resolve_all_to: Option<IpAddr>,
-        dial_timeout: Duration,
-    ) -> Result<Self> {
-        // Verified against the live root set on every handshake.
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Tls(format!("Failed to select TLS versions: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(crate::roots::LiveVerifier::new(roots, None)))
-        .with_no_client_auth();
-        Ok(Self {
-            tls: TlsConnector::from(Arc::new(config)),
-            policy,
-            resolve_all_to,
+    pub fn new(dial_timeout: Duration) -> Self {
+        Self {
             dial_timeout,
             idle_timeout: std::sync::atomic::AtomicU64::new(300_000),
             shutdown: None,
-            proxy: Default::default(),
-        })
-    }
-
-    /// Dial through the live upstream proxy `proxy` holds.
-    pub fn with_proxy(mut self, proxy: Arc<crate::upstream_proxy::ProxyHandle>) -> Self {
-        self.proxy = proxy;
-        self
+        }
     }
 
     /// Idle timeout for spliced connections, and the proxy shutdown signal that ends them.
@@ -134,35 +97,6 @@ impl WsUpstream {
     /// The idle timeout new spliced connections get.
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_millis(self.idle_timeout.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
-    pub(crate) async fn dial(&self, host: &str, port: u16, tls: bool) -> Result<Box<dyn WsIo>> {
-        let connect = async {
-            // Resolve once, check the policy on the resolved address, connect to exactly that.
-            let tcp = crate::upstream_proxy::dial(
-                &self.policy,
-                self.proxy.load().as_deref(),
-                host,
-                port,
-                self.resolve_all_to,
-            )
-            .await?;
-            let _ = tcp.set_nodelay(true);
-            if !tls {
-                return Ok::<Box<dyn WsIo>, Error>(Box::new(tcp));
-            }
-            let name = ServerName::try_from(host.to_string())
-                .map_err(|e| Error::Tls(format!("Invalid server name {host}: {e}")))?;
-            let stream = self
-                .tls
-                .connect(name, tcp)
-                .await
-                .map_err(|e| Error::Tls(format!("Upstream TLS handshake failed: {e}")))?;
-            Ok(Box::new(stream))
-        };
-        tokio::time::timeout(self.dial_timeout, connect)
-            .await
-            .map_err(|_| Error::Timeout)?
     }
 }
 
@@ -316,13 +250,13 @@ fn spawn_splice<U>(
     });
 }
 
-/// The browser-like path: the handshake goes through the same wreq client as HTTP (emulation of
-/// the browser behind the request, in-handshake certificate verification, the downstream
+/// The handshake goes through the same wreq client as HTTP (emulation of the browser behind the
+/// request when browser-like upstream is on, in-handshake certificate verification, the downstream
 /// connection's pool group and device TLS sessions, the upstream proxy, and the destination
 /// policy), as an HTTP/1.1 upgrade with the browser's headers untouched and in order. The two
 /// upgraded streams are then spliced byte-for-byte, so `Sec-WebSocket-Extensions` (for example
 /// permessage-deflate) negotiated by the origin is exactly what the browser was offered.
-async fn upgrade_browser_like(
+async fn upgrade(
     ws: &WsUpstream,
     ctx: &ProxyContext,
     rctx: &RequestCtx,
@@ -425,14 +359,14 @@ async fn upgrade_browser_like(
         .map_err(|e| Error::Http(format!("Bad upgrade response: {e}")))
 }
 
-/// Handle a WebSocket upgrade request: filter, dial upstream, forward the handshake, then splice.
+/// Handle a WebSocket upgrade request: filter, upgrade upstream, forward the handshake, then splice.
 ///
 /// `default_tls` is true for decrypted (MITM) traffic, whose origin-form URIs carry no scheme.
 pub async fn proxy_upgrade(
     ws: &WsUpstream,
     ctx: &ProxyContext,
     rctx: &RequestCtx,
-    mut req: Request<Incoming>,
+    req: Request<Incoming>,
     default_tls: bool,
     fallback: Option<(String, u16)>,
 ) -> Result<Response<ProxyBody>> {
@@ -466,103 +400,8 @@ pub async fn proxy_upgrade(
             .expect("static response"));
     }
 
-    if let Some(client) = ctx.ws_client(target.port) {
-        return upgrade_browser_like(ws, ctx, rctx, req, &target, &check_url, client).await;
-    }
-
-    let io = match ws.dial(&target.host, target.port, target.tls).await {
-        Ok(io) => io,
-        Err(Error::DestinationRefused(why)) => {
-            common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
-            debug!("Refused WebSocket to {}: {}", check_url, why);
-            return Ok(refused_response());
-        }
-        Err(e) => {
-            debug!("WebSocket upstream dial to {} failed: {}", check_url, e);
-            return Ok(status_response(
-                StatusCode::BAD_GATEWAY,
-                "WebSocket upstream unavailable",
-            ));
-        }
-    };
-
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
-        .await
-        .map_err(|e| Error::Connection(format!("WebSocket upstream handshake: {e}")))?;
-    tokio::spawn(async move {
-        let _ = conn.with_upgrades().await;
-    });
-
-    // Forward the client's handshake (Sec-WebSocket-* and the Upgrade pair included).
-    let mut up_req = Request::builder()
-        .method(Method::GET)
-        .uri(target.path_and_query.as_str())
-        .body(Empty::<Bytes>::new())
-        .map_err(|e| Error::Http(format!("Bad upgrade request: {e}")))?;
-    {
-        let headers = up_req.headers_mut();
-        for (name, value) in req.headers() {
-            // The forwarded request has no body: framing headers of the client's request would
-            // make the origin wait for one.
-            if name == HeaderName::from_static("proxy-authorization")
-                || name == HeaderName::from_static("proxy-connection")
-                || name == HeaderName::from_static(crate::ext_bridge::RELAY_HEADER)
-                || name == HOST
-                || name == hyper::header::CONTENT_LENGTH
-                || name == hyper::header::TRANSFER_ENCODING
-            {
-                continue;
-            }
-            headers.append(name.clone(), value.clone());
-        }
-        // Host is rebuilt from the accepted target, never taken from the client.
-        let default = if target.tls { 443 } else { 80 };
-        let host = authority::url_host(&target.host);
-        let value = if target.port == default {
-            host
-        } else {
-            format!("{host}:{}", target.port)
-        };
-        if let Ok(v) = value.parse() {
-            headers.insert(HOST, v);
-        }
-    }
-
-    let mut resp = match tokio::time::timeout(ws.dial_timeout, sender.send_request(up_req)).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            debug!("WebSocket upstream request failed: {}", e);
-            return Ok(status_response(
-                StatusCode::BAD_GATEWAY,
-                "WebSocket upstream error",
-            ));
-        }
-        Err(_) => {
-            return Ok(status_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "WebSocket upstream timeout",
-            ))
-        }
-    };
-
-    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        // Origin refused the upgrade: hand its answer back unchanged.
-        return Ok(resp.map(|b| b.map_err(std::io::Error::other).boxed_unsync()));
-    }
-
-    let up_upgrade = hyper::upgrade::on(&mut resp);
-    let up = async move {
-        up_upgrade
-            .await
-            .map(TokioIo::new)
-            .map_err(|e| e.to_string())
-    };
-    spawn_splice(ws, ctx, rctx, check_url, hyper::upgrade::on(&mut req), up);
-
-    let mut out = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
-    *out.headers_mut().expect("builder headers") = resp.headers().clone();
-    out.body(full_body(Bytes::new()))
-        .map_err(|e| Error::Http(format!("Bad upgrade response: {e}")))
+    let client = ctx.ws_client(target.port);
+    upgrade(ws, ctx, rctx, req, &target, &check_url, client).await
 }
 
 #[cfg(test)]

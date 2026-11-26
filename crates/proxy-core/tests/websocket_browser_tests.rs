@@ -331,15 +331,47 @@ async fn a_name_not_matching_the_certificate_fails_too() {
 }
 
 #[tokio::test]
-async fn the_plain_client_refuses_upgrades() {
+async fn the_plain_client_upgrades_and_verifies_in_the_handshake() {
     let trusted = ca("trusted");
+    let (der, key) = leaf(&trusted, "ws.test");
+    let (port, seen) = origin(vec![der], key).await;
     let r = support::rig_with(&trusted, false, |_| {});
+    let (resp, up) = r
+        .client
+        .get(format!("https://ws.test:{port}/chat"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", KEY)
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-protocol", "chat")
+        .send_upgrade()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 101);
+    assert_eq!(resp.headers()["sec-websocket-protocol"], "chat");
+    let mut up = up.expect("upgraded");
+    up.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    up.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"ping");
+    let s = wait_for(&seen, 1).remove(0);
+    assert_eq!(s.alpn, [b"http/1.1".to_vec()], "{}", s.head);
+
+    // An untrusted certificate is refused inside the handshake here too.
+    let rogue = ca("rogue");
+    let (der, key) = leaf(&rogue, "ws.test");
+    let (port, seen) = origin(vec![der], key).await;
     let err = r
         .client
-        .get("https://ws.test:1/")
+        .get(format!("https://ws.test:{port}/chat"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-key", KEY)
         .send_upgrade()
         .await
         .map(|_| ())
         .unwrap_err();
-    assert!(matches!(err, UpstreamError::Invalid(_)), "{err:?}");
+    assert_eq!(err.kind(), filter_engine::ErrorKind::UpstreamTls, "{err}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(seen.lock().unwrap().iter().all(|s| s.head.is_empty()));
 }

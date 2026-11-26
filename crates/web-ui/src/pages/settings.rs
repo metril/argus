@@ -257,7 +257,7 @@ const SECTIONS: &[Section] = &[
             Def {
                 key: "browser_like",
                 label: "Browser-like connections",
-                desc: "Connect to sites the way your browser does (same TLS and HTTP/2 fingerprint).",
+                desc: "Connect to sites the way your browser does (same TLS and HTTP/2 fingerprint). Off uses the same client without the browser fingerprint.",
                 kind: Kind::Switch,
                 dep: None,
             },

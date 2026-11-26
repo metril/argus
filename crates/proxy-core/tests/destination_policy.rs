@@ -122,11 +122,7 @@ async fn invalid_cidr_config_is_rejected_at_startup() {
     let mut config = ProxyConfig::default();
     config.mitm.enabled = false;
     config.proxy.allowed_clients = vec!["not-a-cidr".into()];
-    let ctx = Arc::new(ProxyContext::new(
-        Arc::new(SharedEngine::new()),
-        reqwest::Client::new(),
-        false,
-    ));
+    let ctx = Arc::new(ProxyContext::new(Arc::new(SharedEngine::new()), false));
     assert!(ProxyServer::new(config.clone(), ctx.clone()).is_err());
     config.proxy.allowed_clients = vec![];
     config.proxy.allowed_destinations = vec!["10.0.0.0/33".into()];

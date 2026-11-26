@@ -129,11 +129,9 @@ async fn proxy_injects_cosmetics_and_answers_dynamic_endpoint() {
     // Generic class-hiding rule (delivered via the dynamic class/id path).
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["##.sponsored\n".to_string()]));
-    let ctx = Arc::new(
-        ProxyContext::new(engine, reqwest::Client::new(), true).with_policy(Arc::new(
-            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
-        )),
-    );
+    let ctx = Arc::new(ProxyContext::new(engine, true).with_policy(Arc::new(
+        proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+    )));
 
     let proxy_port = spawn_proxy(ctx).await;
 
@@ -195,11 +193,9 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["||blocked.test^\n".to_string()]));
 
-    let ctx = Arc::new(
-        ProxyContext::new(engine, reqwest::Client::new(), true).with_policy(Arc::new(
-            proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
-        )),
-    );
+    let ctx = Arc::new(ProxyContext::new(engine, true).with_policy(Arc::new(
+        proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+    )));
 
     // Real proxy server.
     let proxy_port = spawn_proxy(ctx).await;
@@ -242,7 +238,7 @@ async fn blocked_host_with_unresolvable_dns_is_blocked_not_reset_when_ev_tunnell
     let tmp = tempfile::tempdir().unwrap();
     let engine = Arc::new(SharedEngine::new());
     engine.install(compile_engine(&["||blocked.invalid^\n".to_string()]));
-    let ctx = Arc::new(ProxyContext::new(engine, reqwest::Client::new(), true));
+    let ctx = Arc::new(ProxyContext::new(engine, true));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

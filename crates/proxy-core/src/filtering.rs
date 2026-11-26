@@ -2,7 +2,7 @@
 //!
 //! [`ProxyContext`] carries the shared, `Send + Sync` handles every connection needs: the
 //! [`SharedEngine`] (one `Arc<Engine>` behind an `ArcSwap`) for block/allow decisions and a single
-//! pooled [`reqwest::Client`] for forwarding requests upstream over real TLS.
+//! pooled [`UpstreamClient`] for forwarding requests upstream over real TLS.
 //!
 //! Per request the pipeline is: classify (resource type + source URL) -> engine check ->
 //! block / `$redirect` resource / `$removeparam` rewrite -> stream upstream -> `$csp` header and
@@ -247,15 +247,26 @@ pub struct ProxyContext {
 impl ProxyContext {
     /// `adblock_enabled == false` disables the engine at startup; afterwards the on/off state is
     /// the engine's live flag (see [`Self::set_adblock_enabled`]), so UI toggles take effect.
-    pub fn new(engine: Arc<SharedEngine>, client: reqwest::Client, adblock_enabled: bool) -> Self {
+    pub fn new(engine: Arc<SharedEngine>, adblock_enabled: bool) -> Self {
+        let opts = UpstreamOptions::default();
+        let client = build_upstream_client(&opts).expect("default upstream client");
+        let strict = build_strict_upstream_client(&opts).expect("default upstream client");
+        Self::with_clients(engine, client, strict, adblock_enabled)
+    }
+
+    fn with_clients(
+        engine: Arc<SharedEngine>,
+        client: UpstreamClient,
+        strict: UpstreamClient,
+        adblock_enabled: bool,
+    ) -> Self {
         if !adblock_enabled {
             engine.set_enabled(false);
         }
         let default_slot = default_profile_slot(engine.clone());
-        let client = UpstreamClient::from(client);
         Self {
             engine,
-            strict_client: ArcSwap::from_pointee(client.clone()),
+            strict_client: ArcSwap::from_pointee(strict),
             policy: Arc::default(),
             web_server: parking_lot::RwLock::new(None),
             upstream_opts: parking_lot::Mutex::new(None),
@@ -345,9 +356,12 @@ impl ProxyContext {
         let roots = opts.roots_handle()?;
         opts.roots = Some(roots.clone());
         let opts = &opts;
-        let mut ctx = Self::new(engine, reqwest::Client::new(), adblock_enabled);
-        ctx.client = ArcSwap::from_pointee(build_upstream_client(opts)?);
-        ctx.strict_client = ArcSwap::from_pointee(build_strict_upstream_client(opts)?);
+        let mut ctx = Self::with_clients(
+            engine,
+            build_upstream_client(opts)?,
+            build_strict_upstream_client(opts)?,
+            adblock_enabled,
+        );
         ctx.roots = Some(roots);
         *ctx.upstream_opts.lock() = Some(opts.clone());
         ctx.policy = opts.policy.clone();
@@ -546,15 +560,15 @@ impl ProxyContext {
         self.strict_client.load().evict_conn(conn_id);
     }
 
-    /// The browser-like client WebSocket upgrades to `port` go through (the strict one for the
-    /// proxy's own ports); `None` when browser-like upstream is off (the old dial path serves).
-    pub fn ws_client(&self, port: u16) -> Option<UpstreamClient> {
+    /// The client WebSocket upgrades to `port` go through (the strict one for the proxy's own
+    /// ports).
+    pub fn ws_client(&self, port: u16) -> UpstreamClient {
         let c = if self.policy.is_own_port(port) {
             self.strict_client.load_full()
         } else {
             self.client.load_full()
         };
-        c.is_browser_like().then(|| (*c).clone())
+        (*c).clone()
     }
 
     /// The shared pooled upstream client.
@@ -578,7 +592,7 @@ impl ProxyContext {
 
     /// Build the replacement clients without installing them (the fallible half of
     /// [`Self::set_upstream_timeouts`]); `None` when nothing changes. `browser_like` picks the
-    /// client: the browser-like one or the previous rustls one. `proxy` is the upstream proxy
+    /// client: with or without the browser fingerprint. `proxy` is the upstream proxy
     /// the new clients (and, once committed, every dialer) use.
     pub fn prepare_upstream(
         &self,
@@ -842,7 +856,7 @@ impl ProxyContext {
         // hop arrives here). Like the proxy's own GM requests it is not filtered.
         let mut bypass_full = bypass_full;
         if let Some(r) = relay.as_deref() {
-            let allowed = reqwest::Url::parse(&url).is_ok_and(|u| {
+            let allowed = url::Url::parse(&url).is_ok_and(|u| {
                 self.internal.gm.ext().check_relay(
                     r,
                     &u,
@@ -994,7 +1008,7 @@ impl ProxyContext {
         // Stream the request body upstream; nothing is buffered.
         let has_body = !body.is_end_stream();
 
-        // Destination policy. reqwest skips its resolver for IP-literal hosts, so literals are
+        // Destination policy. the client skips its resolver for IP-literal hosts, so literals are
         // judged here; names are judged on what they resolve to, inside the client's resolver.
         if let Err(r) = self.policy.check_literal(&host, port) {
             common::faults::note(common::faults::Fault::PolicyRefusal, &host);
@@ -1009,13 +1023,13 @@ impl ProxyContext {
 
         let listed = connection_listed(&headers);
         let transformable_request = rtype.is_frame();
-        // Code-only resolve override: reqwest never resolves IP literals, so aim those at the
+        // Code-only resolve override: the client never resolves IP literals, so aim those at the
         // override explicitly (the policy has already judged the requested literal) and keep the
         // original authority in `Host`.
         let mut dial_url = url.clone();
         let mut host_override = None;
         if let (Some(over), Ok(_)) = (self.resolve_all_to, host.parse::<IpAddr>()) {
-            if let Ok(mut u) = reqwest::Url::parse(&url) {
+            if let Ok(mut u) = url::Url::parse(&url) {
                 if u.set_ip_host(over).is_ok() {
                     dial_url = u.to_string();
                     host_override = Some(format!("{url_host}:{port}"));
@@ -1030,8 +1044,8 @@ impl ProxyContext {
             rb = rb.header(HOST, h);
         }
         for (name, value) in headers.iter() {
-            // reqwest sets Host itself; don't forward hop-by-hop headers. Content-Length is only
-            // kept for streamed bodies (it keeps the upload un-chunked); reqwest derives it
+            // the client sets Host itself; don't forward hop-by-hop headers. Content-Length is only
+            // kept for streamed bodies (it keeps the upload un-chunked); the client derives it
             // otherwise.
             if is_hop_by_hop(name)
                 || listed.contains(name)
@@ -1776,7 +1790,7 @@ fn is_service_worker_fetch(h: &hyper::HeaderMap) -> bool {
 fn relay_redirect_target(
     base: &str,
     h: &hyper::HeaderMap,
-) -> std::result::Result<Option<reqwest::Url>, ()> {
+) -> std::result::Result<Option<url::Url>, ()> {
     let mut it = h.get_all(hyper::header::LOCATION).iter();
     let Some(first) = it.next() else {
         return Ok(None);
@@ -1789,7 +1803,7 @@ fn relay_redirect_target(
     if raw.is_empty() {
         return Err(());
     }
-    reqwest::Url::parse(base)
+    url::Url::parse(base)
         .ok()
         .and_then(|b| b.join(raw).ok())
         .map(Some)
