@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 — 2026-11-25
 
 * Extension (Chrome): no more native proxy sign-in prompt after the browser restarts the
   extension's background worker. A challenge from the extension listener waits for the session to
