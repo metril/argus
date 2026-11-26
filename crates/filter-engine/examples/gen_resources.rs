@@ -5,6 +5,9 @@
 //!
 //! Files are converted in name order, exactly as the runtime fetcher does; resources that fail
 //! validation are dropped and listed.
+//!
+//! With three more arguments it also converts the `$redirect` resources:
+//! `... <output.json> <redirect-resources.js> <web_accessible_resources dir> <redirects.json>`
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -35,5 +38,28 @@ fn main() {
     );
     for d in &dropped {
         println!("  dropped {}: {}", d.name, d.reason);
+    }
+    if let (Some(map), Some(wa), Some(rout)) = (args.next(), args.next(), args.next()) {
+        let map_js = std::fs::read_to_string(&map).expect("read map");
+        let mut files = std::collections::HashMap::new();
+        for name in filter_engine::redirect_file_names(&map_js).expect("map") {
+            if let Ok(b) = std::fs::read(std::path::Path::new(&wa).join(&name)) {
+                files.insert(name, b);
+            }
+        }
+        let (json, dropped) =
+            filter_engine::ubo_redirects_to_json(&map_js, &files).expect("convert");
+        std::fs::write(&rout, &json).expect("write");
+        let n = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+            .unwrap()
+            .len();
+        println!(
+            "redirects: {n} resources, {} bytes, {} dropped",
+            json.len(),
+            dropped.len()
+        );
+        for d in &dropped {
+            println!("  dropped {}: {}", d.name, d.reason);
+        }
     }
 }

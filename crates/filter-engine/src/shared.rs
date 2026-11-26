@@ -164,13 +164,15 @@ pub fn try_build_engine(
 
 fn apply_resources(mut engine: AdblockEngine, user_resources: &[Resource]) -> Arc<AdblockEngine> {
     let mut all: Vec<Resource> = user_resources.to_vec();
-    for b in builtin_redirect_resources() {
-        let taken = all
-            .iter()
-            .any(|r| r.name == b.name || r.aliases.contains(&b.name));
-        if !taken {
-            all.push(b);
+    for mut b in builtin_redirect_resources() {
+        // The library wins by name and alias; a built-in only loses the aliases it clashes
+        // with (a name clash would make the engine reject the whole resource).
+        let taken = |id: &String| all.iter().any(|r| r.name == *id || r.aliases.contains(id));
+        if taken(&b.name) {
+            continue;
         }
+        b.aliases.retain(|a| !taken(a));
+        all.push(b);
     }
     engine.use_resources(all);
     Arc::new(engine)
@@ -1238,6 +1240,25 @@ mod tests {
         let res = r.redirect_resource().expect("redirect resource");
         assert_eq!(res.mime, "image/gif");
         assert!(res.body.starts_with(b"GIF8"));
+    }
+
+    #[test]
+    fn builtin_keeps_its_name_when_the_library_takes_its_aliases() {
+        let s = SharedEngine::new();
+        let lib = serde_json::json!([{
+            "name": "2x2.png", "aliases": ["32x32.png"], "kind": {"mime": "image/png"},
+            "content": "AAAA"
+        }]);
+        s.set_resources_from_json(&lib.to_string()).unwrap();
+        s.install(compile_engine(&[
+            "||ads.test/p.png$redirect=1x1.png\n".to_string()
+        ]));
+        let r = s.check("https://ads.test/p.png", "https://site.test/", "image");
+        let res = r
+            .redirect_resource()
+            .expect("built-in 1x1.png still served");
+        assert_eq!(res.mime, "image/png");
+        assert_eq!(&res.body[1..4], b"PNG");
     }
 
     #[test]

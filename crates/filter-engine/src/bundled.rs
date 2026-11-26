@@ -12,6 +12,13 @@ pub const BUNDLED_RESOURCES_JSON: &str = include_str!("../resources/ubo-resource
 #[cfg(not(feature = "bundled-ubo-resources"))]
 pub const BUNDLED_RESOURCES_JSON: &str = "";
 
+/// adblock-rust resources JSON array of the uBO `$redirect` resources (neutered scripts, images,
+/// media, VAST/VMAP; names, aliases and AdGuard names); empty unless the feature is on.
+#[cfg(feature = "bundled-ubo-resources")]
+pub const BUNDLED_REDIRECTS_JSON: &str = include_str!("../resources/ubo-redirects.json");
+#[cfg(not(feature = "bundled-ubo-resources"))]
+pub const BUNDLED_REDIRECTS_JSON: &str = "";
+
 /// Upstream commit of the bundled snapshot (empty when not bundled).
 #[cfg(feature = "bundled-ubo-resources")]
 pub const BUNDLED_RESOURCES_COMMIT: &str = "5934db2a0437a50182c4a8f3da2e0941cf806253";
@@ -30,6 +37,7 @@ mod tests {
     fn nothing_bundled_by_default() {
         assert!(!BUNDLED_AVAILABLE);
         assert!(BUNDLED_RESOURCES_JSON.is_empty() && BUNDLED_RESOURCES_COMMIT.is_empty());
+        assert!(BUNDLED_REDIRECTS_JSON.is_empty());
     }
 
     #[cfg(feature = "bundled-ubo-resources")]

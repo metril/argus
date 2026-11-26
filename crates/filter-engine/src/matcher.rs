@@ -173,9 +173,16 @@ impl RequestMatcher {
         if result.matched {
             let rule = result.filter.unwrap_or_else(|| "unknown".to_string());
             let mut r = match result.redirect {
-                Some(redirect) => MatchResult::redirect(redirect, rule),
-                None => MatchResult::blocked(rule),
+                Some(redirect) => MatchResult::redirect(redirect, rule.clone()),
+                None => MatchResult::blocked(rule.clone()),
             };
+            // A `$redirect=` that resolved to a scriptlet (through one of its aliases) must not
+            // serve the scriptlet's source: treat it like a missing resource, a plain block.
+            if r.redirect_resource()
+                .is_some_and(|res| crate::ubo_redirects::looks_like_scriptlet(&res.body))
+            {
+                r = MatchResult::blocked(rule);
+            }
             r.important = result.important;
             return r;
         }

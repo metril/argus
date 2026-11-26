@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::compile::{compile_lists_with, route_domain_rules};
+use crate::compile::{compile_lists_checked, route_domain_rules};
 use crate::domainset::DomainSet;
 use crate::formats::{
     convert, dedupe, ConvertOptions, Converted, ExtRule, IpRange, ListFormat, ListMeta, MAX_ERRORS,
@@ -58,6 +58,13 @@ pub struct ListReport {
     pub cosmetic: usize,
     /// Extended rules handed off (not run by the engine).
     pub ext: usize,
+    /// `$redirect` rules naming a resource that is not loaded (they act as plain blocks).
+    /// Only counted by [`build_set_checked`].
+    #[serde(default)]
+    pub redirect_missing: usize,
+    /// First few distinct missing resource names.
+    #[serde(default)]
+    pub redirect_missing_names: Vec<String>,
     /// Rules the engine rejected.
     pub rejected: usize,
     /// IP / CIDR ranges collected for the IP matcher.
@@ -101,6 +108,15 @@ impl BuiltSet {
 
 /// Convert, dedupe and compile `inputs`.
 pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
+    build_set_checked(inputs, None)
+}
+
+/// Like [`build_set`]; with `known_redirects` (see [`crate::known_redirect_names`]) rules whose
+/// `$redirect` resource is not loaded are counted and logged per list.
+pub fn build_set_checked(
+    inputs: &[ListInput],
+    known_redirects: Option<&HashSet<String>>,
+) -> BuiltSet {
     let mut converted: Vec<Converted> = inputs
         .par_iter()
         .map(|i| {
@@ -138,7 +154,7 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
 
     let texts: Vec<&str> = deduped.iter().map(|(t, _)| t.as_str()).collect();
     let trusted: Vec<bool> = inputs.iter().map(|i| i.trusted).collect();
-    let compiled = compile_lists_with(&texts, &trusted);
+    let compiled = compile_lists_checked(&texts, &trusted, known_redirects);
     drop(texts);
     let engine_network = compiled.per_list.iter().any(|c| c.network > 0);
     let domain_build = routed
@@ -155,6 +171,14 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
         .zip(compiled.per_list)
         .enumerate()
     {
+        if cs.redirect_missing > 0 {
+            tracing::warn!(
+                "List {}: {} $redirect rule(s) name a missing resource (served as plain blocks), e.g. {}",
+                input.id,
+                cs.redirect_missing,
+                cs.redirect_missing_names.join(", ")
+            );
+        }
         let domain_dup = domain_dups.get(li).copied().unwrap_or(0);
         let domain_kept = domain_routed[li].saturating_sub(domain_dup);
         let mut errors: Vec<ReportIssue> = c
@@ -190,6 +214,8 @@ pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
             network: cs.network + domain_kept,
             cosmetic: cs.cosmetic,
             ext: c.ext.len() + cs.ext,
+            redirect_missing: cs.redirect_missing,
+            redirect_missing_names: cs.redirect_missing_names.clone(),
             rejected: cs.rejected,
             ip_ranges: c.ip_block.len() + c.ip_allow.len(),
             error_count: c.stats.error_count + cs.rejected,

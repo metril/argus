@@ -155,11 +155,27 @@ pub fn policy_block_response(ty: RequestType, url: &str) -> Response<ProxyBody> 
 }
 
 /// Serve a `$redirect` resource in place of the original response.
-pub fn redirect_response(res: RedirectResource) -> Response<ProxyBody> {
-    base(StatusCode::OK, "redirected")
+///
+/// Status 200 with the resource's MIME type. `origin` is the request's `Origin` header: a
+/// credentialed cross-origin `fetch`/XHR (which a wildcard `access-control-allow-origin` would
+/// fail) gets that origin echoed back, so the page cannot tell the answer from a real one.
+pub fn redirect_response(res: RedirectResource, origin: Option<&str>) -> Response<ProxyBody> {
+    let mut r = base(StatusCode::OK, "redirected")
         .header("content-type", res.mime)
         .body(full_body(Bytes::from(res.body)))
-        .expect("redirect response")
+        .expect("redirect response");
+    if let Some(o) = origin.filter(|o| *o != "null") {
+        if let Ok(v) = hyper::header::HeaderValue::from_str(o) {
+            let h = r.headers_mut();
+            h.insert("access-control-allow-origin", v);
+            h.insert(
+                "access-control-allow-credentials",
+                hyper::header::HeaderValue::from_static("true"),
+            );
+            h.insert("vary", hyper::header::HeaderValue::from_static("origin"));
+        }
+    }
+    r
 }
 
 /// 307 to the `$removeparam`-cleaned URL (document navigations). Default ports are normalized
@@ -239,10 +255,13 @@ mod tests {
             assert_eq!(r.headers()["x-adblock"], "blocked", "{ty:?}");
             assert_eq!(r.headers()["cache-control"], "no-store", "{ty:?}");
         }
-        let r = redirect_response(RedirectResource {
-            mime: "text/javascript".into(),
-            body: vec![],
-        });
+        let r = redirect_response(
+            RedirectResource {
+                mime: "text/javascript".into(),
+                body: vec![],
+            },
+            None,
+        );
         assert_eq!(r.headers()["cache-control"], "no-store");
         assert_eq!(
             rewrite_redirect("https://a.test/").headers()["cache-control"],
@@ -250,12 +269,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn redirect_echoes_the_request_origin_for_credentialed_cors() {
+        let res = || RedirectResource {
+            mime: "application/javascript".into(),
+            body: vec![],
+        };
+        let r = redirect_response(res(), Some("https://site.test"));
+        let h = r.headers();
+        assert_eq!(h["access-control-allow-origin"], "https://site.test");
+        assert_eq!(h["access-control-allow-credentials"], "true");
+        assert_eq!(h["content-type"], "application/javascript");
+        assert_eq!(r.status(), 200);
+        // No `nosniff`: a text/plain stub for a `$script` / `$stylesheet` redirect must still run.
+        assert!(h.get("x-content-type-options").is_none());
+        assert_eq!(h["cross-origin-resource-policy"], "cross-origin");
+        let r = redirect_response(res(), Some("null"));
+        assert_eq!(r.headers()["access-control-allow-origin"], "*");
+    }
+
     #[tokio::test]
     async fn redirect_and_rewrite_responses() {
-        let r = redirect_response(RedirectResource {
-            mime: "image/gif".into(),
-            body: vec![1, 2, 3],
-        });
+        let r = redirect_response(
+            RedirectResource {
+                mime: "image/gif".into(),
+                body: vec![1, 2, 3],
+            },
+            None,
+        );
         assert_eq!(r.headers()["content-type"], "image/gif");
         assert_eq!(r.headers()["x-adblock"], "redirected");
         assert_eq!(body_of(r).await.as_ref(), &[1, 2, 3]);

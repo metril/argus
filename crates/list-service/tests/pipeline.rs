@@ -545,3 +545,141 @@ async fn persisted_ext_index_is_live_after_a_restart_without_the_network() {
     f.gate.notify_one();
     svc2.wait_idle().await;
 }
+
+// ---- redirect resource refresh ---------------------------------------------------------------------
+
+const REDIRECT_RULES: &str = "||a.test/fx.js$script,redirect=fixture-r.js\n\
+||a.test/ads.js$script,redirect=googlesyndication_adsbygoogle.js\n";
+
+const SCRIPTLET_FIXTURE: &str =
+    "builtinScriptlets.push({ name: 'fixture-only.js', fn: fixtureOnly });\nfunction fixtureOnly() { window.fixtureRan = 1; }\n";
+
+fn redirect_body(e: &SharedEngine, url: &str) -> Option<String> {
+    let r = e.check(url, "http://site.test/", "script");
+    assert!(r.blocked, "{url}");
+    r.redirect_resource()
+        .map(|r| String::from_utf8(r.body).unwrap())
+}
+
+/// Serve scriptlets plus a redirect map under the layout the fetcher derives from a
+/// `.../src/js/resources` base URL, then run one refresh.
+async fn refresh_with_redirects(f: Arc<Files>) -> Env {
+    f.set("/src/js/resources/scriptlets.js", SCRIPTLET_FIXTURE);
+    f.set("/l", REDIRECT_RULES);
+    let addr = serve(f).await;
+    let e = env(one(addr, "/l"), |c| {
+        c.scriptlet_resources_url = format!("http://{addr}/src/js/resources");
+        c.scriptlet_retry_initial = Duration::from_millis(5);
+    });
+    e.svc.reload_now().await;
+    let mut ready = e.svc.scriptlets_ready();
+    let s = e.svc.clone();
+    tokio::spawn(async move { s.ensure_scriptlet_resources().await });
+    ready.wait_for(|r| *r).await.unwrap();
+    e
+}
+
+#[cfg(feature = "bundled-ubo-resources")]
+#[tokio::test]
+async fn a_complete_redirect_refresh_replaces_and_fills_gaps_from_the_bundle() {
+    let f = Arc::new(Files::default());
+    f.set(
+        "/src/js/redirect-resources.js",
+        "export default new Map([['fixture-r.js', { data: 'text' }]]);",
+    );
+    f.set(
+        "/src/web_accessible_resources/fixture-r.js",
+        "window.fx = 1;",
+    );
+    let e = refresh_with_redirects(f).await;
+    assert_eq!(
+        redirect_body(&e.engine, "http://a.test/fx.js").as_deref(),
+        Some("window.fx = 1;")
+    );
+    // Not in the fetched map: still served, from the bundled set.
+    assert!(redirect_body(&e.engine, "http://a.test/ads.js").is_some());
+}
+
+#[cfg(feature = "bundled-ubo-resources")]
+#[tokio::test]
+async fn a_partial_redirect_fetch_keeps_the_bundled_set_atomically() {
+    let f = Arc::new(Files::default());
+    f.set(
+        "/src/js/redirect-resources.js",
+        "export default new Map([['fixture-r.js', {}], ['other.js', {}]]);",
+    );
+    f.set(
+        "/src/web_accessible_resources/fixture-r.js",
+        "window.fx = 1;",
+    );
+    // other.js is missing upstream (404): the whole fetched redirect set is refused.
+    let e = refresh_with_redirects(f).await;
+    assert_eq!(redirect_body(&e.engine, "http://a.test/fx.js"), None);
+    assert!(redirect_body(&e.engine, "http://a.test/ads.js").is_some());
+    // The scriptlets of the same refresh were still applied.
+    assert!(e
+        .engine
+        .resources()
+        .iter()
+        .any(|r| r.name == "fixture-only.js"));
+}
+
+#[cfg(feature = "bundled-ubo-resources")]
+#[tokio::test]
+async fn an_invalid_redirect_file_keeps_the_bundled_set() {
+    let f = Arc::new(Files::default());
+    f.set(
+        "/src/js/redirect-resources.js",
+        "export default new Map([['fixture-r.js', {}], ['bad.gif', {}], ['broken.js', {}]]);",
+    );
+    f.set(
+        "/src/web_accessible_resources/fixture-r.js",
+        "window.fx = 1;",
+    );
+    f.set("/src/web_accessible_resources/bad.gif", "not a gif");
+    f.set("/src/web_accessible_resources/broken.js", "function (");
+    let e = refresh_with_redirects(f).await;
+    assert_eq!(redirect_body(&e.engine, "http://a.test/fx.js"), None);
+    assert!(redirect_body(&e.engine, "http://a.test/ads.js").is_some());
+}
+
+#[cfg(feature = "bundled-ubo-resources")]
+#[tokio::test]
+async fn an_old_cache_without_redirects_is_filled_from_the_bundle_and_refreshed() {
+    let f = Arc::new(Files::default());
+    f.set("/l", REDIRECT_RULES);
+    f.set(
+        "/src/js/redirect-resources.js",
+        "export default new Map([['fixture-r.js', {}]]);",
+    );
+    f.set(
+        "/src/web_accessible_resources/fixture-r.js",
+        "window.fx = 2;",
+    );
+    let addr = serve(f.clone()).await;
+    // Cache written before redirects were fetched; the source is unreachable at first.
+    let json = r#"[{"name":"noopjs.js","aliases":[],"kind":{"mime":"application/javascript"},"content":"KGZ1bmN0aW9uKCl7fSkoKTs="}]"#;
+    let e = env(one(addr, "/l"), |c| {
+        c.scriptlet_resources_url = "http://127.0.0.1:1/src/js/resources".into();
+    });
+    std::fs::write(e.dir.path().join("resources.json"), json).unwrap();
+    // Unreachable source + cache: bundled redirects fill the gap, no error.
+    e.svc.ensure_scriptlet_resources().await;
+    e.svc.reload_now().await;
+    assert!(redirect_body(&e.engine, "http://a.test/ads.js").is_some());
+
+    // Reachable source: the stale cache is refreshed with the fetched redirects.
+    f.set("/src/js/resources/scriptlets.js", SCRIPTLET_FIXTURE);
+    let e2 = env(one(addr, "/l"), |c| {
+        c.scriptlet_resources_url = format!("http://{addr}/src/js/resources");
+    });
+    std::fs::write(e2.dir.path().join("resources.json"), json).unwrap();
+    e2.svc.ensure_scriptlet_resources().await;
+    e2.svc.reload_now().await;
+    assert_eq!(
+        redirect_body(&e2.engine, "http://a.test/fx.js").as_deref(),
+        Some("window.fx = 2;")
+    );
+    let cached = std::fs::read_to_string(e2.dir.path().join("resources.json")).unwrap();
+    assert!(cached.contains("fixture-r.js") && cached.contains("googlesyndication"));
+}

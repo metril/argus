@@ -910,7 +910,10 @@ impl ProxyContext {
                         count_page_block(sc, source_url(&headers, &url, rtype));
                     }
                     if let Some(res) = verdict.redirect_resource() {
-                        return Ok(redirect_response(res));
+                        let origin = headers
+                            .get(hyper::header::ORIGIN)
+                            .and_then(|v| v.to_str().ok());
+                        return Ok(redirect_response(res, origin));
                     }
                     return Ok(block_response(rtype, &verdict, &url));
                 }
