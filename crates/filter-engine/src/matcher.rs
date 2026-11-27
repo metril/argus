@@ -83,7 +83,17 @@ impl MatchResult {
             .unwrap_or(url)
             .to_ascii_lowercase();
         let is_js = path.ends_with(".js") || path.ends_with(".mjs");
-        if is_js
+        // An extensionless final segment (`/gtag/js?id=..`) qualifies when the script verdict is
+        // a redirect to a JavaScript resource: a data endpoint is not named like that.
+        let bare_segment = path
+            .rsplit('/')
+            .next()
+            .is_some_and(|seg| !seg.is_empty() && !seg.contains('.'));
+        let js_stub = bare_segment
+            && script
+                .redirect_resource()
+                .is_some_and(|r| r.mime.contains("javascript"));
+        if (is_js || js_stub)
             && self.blocked
             && self.redirect.is_none()
             && script.blocked
@@ -331,8 +341,8 @@ mod tests {
         assert!(m.redirect.is_some());
         for u in [
             "https://a.test/api.json",
-            "https://a.test/api?u=t.js",
             "https://a.test/",
+            "https://a.test/a/b/",
         ] {
             let r = MatchResult::blocked("b").with_sibling_stub(u, &stub);
             assert!(
@@ -340,6 +350,15 @@ mod tests {
                 "{u}"
             );
         }
+        // A script path without an extension takes a JavaScript stub, never another type.
+        let gtag = "https://a.test/gtag/js?id=G-1.2";
+        let m = MatchResult::blocked("b").with_sibling_stub(gtag, &stub);
+        assert_eq!(m.redirect, stub.redirect);
+        let img = MatchResult::redirect("data:image/gif;base64,AA==", "i");
+        assert!(MatchResult::blocked("b")
+            .with_sibling_stub(gtag, &img)
+            .redirect
+            .is_none());
         let own = MatchResult::redirect("data:image/gif;base64,AA==", "o");
         assert_eq!(
             own.clone().with_sibling_stub(js, &stub).redirect,
