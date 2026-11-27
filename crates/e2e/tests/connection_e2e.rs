@@ -62,6 +62,21 @@ e2e_test!(
             .await
             .unwrap();
         let url = format!("ws://blocked-ws.test:{}/ws", env.origin.http_port());
+        // `proxy.block_response = fail`: the handshake fails like a network error, no response.
+        let err = tokio_tungstenite::client_async(url.clone(), tcp)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, tokio_tungstenite::tungstenite::Error::Http(_)),
+            "{err:?}"
+        );
+        // `synthetic`: an explicit 403.
+        env.proxy
+            .ctx
+            .set_block_response(proxy_core::config::BlockResponse::Synthetic);
+        let tcp = tokio::net::TcpStream::connect(env.proxy.entry_addr())
+            .await
+            .unwrap();
         let err = tokio_tungstenite::client_async(url, tcp).await.unwrap_err();
         assert!(matches!(err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403));
         assert!(env.origin.requests_for("/ws").is_empty());
@@ -134,6 +149,9 @@ e2e_test!(
             .unwrap();
         let url = format!("ws://filteredws.test:{}/ws", env.origin.http_port());
         let err = tokio_tungstenite::client_async(url, tcp).await.unwrap_err();
-        assert!(matches!(err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403));
+        assert!(
+            !matches!(err, tokio_tungstenite::tungstenite::Error::Http(_)),
+            "{err:?}"
+        );
     }
 );

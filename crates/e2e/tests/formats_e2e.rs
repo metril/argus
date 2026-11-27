@@ -28,20 +28,17 @@ fn rules_for(lists: &[(&str, ListFormat, bool)]) -> Vec<&'static str> {
 async fn is_blocked(env: &TestEnv, host: &str) -> bool {
     env.origin.route("/ad.js", MockResponse::ok("origin-body"));
     let before = env.origin.requests_for("/ad.js").len();
-    let resp = env
+    let sent = env
         .client()
-        .get(&env.origin.https_url(host, "/ad.js"))
+        .try_get(&env.origin.https_url(host, "/ad.js"))
         .await;
-    let blocked = resp
-        .headers()
-        .get("x-adblock")
-        .is_some_and(|v| v == "blocked");
+    let blocked = e2e::was_blocked(&sent);
     let reached = env.origin.requests_for("/ad.js").len() - before;
     if blocked {
         assert_eq!(reached, 0, "{host}: blocked request reached the origin");
     } else {
         assert_eq!(reached, 1, "{host}: allowed request must reach the origin");
-        assert_eq!(resp.text().await.unwrap(), "origin-body");
+        assert_eq!(sent.unwrap().text().await.unwrap(), "origin-body");
     }
     blocked
 }

@@ -74,6 +74,39 @@ fn rule_label(action: LogAction, rule: Option<&str>) -> String {
     }
 }
 
+/// How a block was carried out, as shown in the log.
+fn outcome_key(o: api_types::LogOutcome) -> &'static str {
+    match o {
+        api_types::LogOutcome::Aborted => "aborted",
+        api_types::LogOutcome::Synthetic => "synthetic",
+    }
+}
+
+/// What the outcome means for the requester.
+fn outcome_text(o: api_types::LogOutcome) -> &'static str {
+    match o {
+        api_types::LogOutcome::Aborted => {
+            "aborted: the request failed like a network error (HTTP/2 stream reset or HTTP/1 connection closed)"
+        }
+        api_types::LogOutcome::Synthetic => {
+            "synthetic: the requester got a block page, blank frame, pixel or empty success"
+        }
+    }
+}
+
+/// The rule column: the rule, then how the block was carried out.
+fn rule_column(
+    action: LogAction,
+    rule: Option<&str>,
+    outcome: Option<api_types::LogOutcome>,
+) -> String {
+    let base = rule_label(action, rule);
+    match outcome {
+        Some(o) => format!("{base} \u{b7} {}", outcome_key(o)),
+        None => base,
+    }
+}
+
 fn mode_key(m: LogMode) -> &'static str {
     match m {
         LogMode::Explicit => "explicit",
@@ -685,7 +718,7 @@ pub fn LogsPage() -> impl IntoView {
                                         <span class="m">{e.method.clone()}</span>
                                         <span class="u" title=e.url.clone()>{host}<span class="p">{path}</span></span>
                                         <span class=if e.rule.is_some() { "rule" } else { "rule none" }>
-                                            {rule_label(e.action, e.rule.as_deref())}
+                                            {rule_column(e.action, e.rule.as_deref(), e.outcome)}
                                         </span>
                                         <span class=if e.mode == LogMode::Transparent { "tag tp mode" } else { "tag mode" }>
                                             {mode_key(e.mode)}
@@ -734,6 +767,7 @@ pub fn LogsPage() -> impl IntoView {
                             <dt>"Page"</dt><dd class="mono">{e.source_host.clone().unwrap_or_else(|| "-".into())}</dd>
                             <dt>"Rule"</dt><dd class="mono">{rule_label(e.action, e.rule.as_deref())}</dd>
                             <dt>"List"</dt><dd>{e.list_id.clone().unwrap_or_else(|| "-".into())}</dd>
+                            {e.outcome.map(|o| view! { <dt>"Outcome"</dt><dd>{outcome_text(o)}</dd> })}
                             {e.error_kind.map(|k| view! { <dt>"Error"</dt><dd>{error_kind_label(k)}</dd> })}
                             <dt>"Status"</dt><dd class="num">{e.status.map(|s| s.to_string()).unwrap_or_else(|| "-".into())}</dd>
                         </dl>

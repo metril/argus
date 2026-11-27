@@ -42,6 +42,7 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         update_interval_hours: config.adblock.update_interval_hours,
         transparent_port: config.proxy.transparent_port,
         ext_port: config.proxy.ext_port,
+        block_response: config.proxy.block_response.as_str().to_string(),
         tls_passthrough_hosts: config.proxy.tls_passthrough_hosts.clone(),
         block_private_destinations: config.proxy.block_private_destinations,
         browser_like_upstream: config.proxy.upstream.browser_like,
@@ -554,6 +555,12 @@ async fn apply_update_locked(
         req.ext_port.map(|p| (p != 0).then_some(p)),
         can_proxy
     );
+    if let Some(v) = &req.block_response {
+        let next: common::config::BlockResponse = v.parse().map_err(ApiError::ValidationError)?;
+        let changed = next != config.proxy.block_response;
+        config.proxy.block_response = next;
+        live("block_response", changed, can_proxy, &mut applied);
+    }
     field!(
         "tls_passthrough_hosts",
         config.proxy.tls_passthrough_hosts,

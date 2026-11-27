@@ -116,6 +116,19 @@ impl TestEnv {
     }
 }
 
+/// Whether the proxy blocked the request behind `r`: it answered `x-adblock: blocked`, or it
+/// aborted the request (`proxy.block_response = fail`: an HTTP/2 stream reset or a closed
+/// HTTP/1 connection, which clients report as a transport error, never a timeout).
+pub fn was_blocked(r: &Result<reqwest::Response, reqwest::Error>) -> bool {
+    match r {
+        Ok(resp) => resp
+            .headers()
+            .get("x-adblock")
+            .is_some_and(|v| v == "blocked"),
+        Err(e) => !e.is_timeout(),
+    }
+}
+
 /// Declare an e2e test once; it is instantiated per [`EntryMode`] as `<name>::explicit` and
 /// `<name>::transparent`.
 ///

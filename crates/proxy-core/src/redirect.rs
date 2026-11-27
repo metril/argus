@@ -6,6 +6,7 @@
 use crate::inject::{full_body, ProxyBody};
 use crate::request_type::RequestType;
 use bytes::Bytes;
+use common::config::BlockResponse;
 use filter_engine::{MatchResult, RedirectResource};
 use hyper::{Response, StatusCode};
 
@@ -152,6 +153,67 @@ pub fn policy_block_response(ty: RequestType, url: &str) -> Response<ProxyBody> 
         hyper::header::HeaderValue::from_static("policy"),
     );
     r
+}
+
+/// How a block is carried out: answered with a response, or aborted (the request fails like a
+/// network error).
+pub enum BlockOutcome {
+    Respond(Response<ProxyBody>),
+    Abort,
+}
+
+impl BlockOutcome {
+    /// The response, or the abort as an error for the service to return (HTTP/2: that stream is
+    /// reset with CANCEL; HTTP/1: the connection is closed).
+    pub fn into_result(self) -> crate::Result<Response<ProxyBody>> {
+        match self {
+            Self::Respond(r) => Ok(r),
+            Self::Abort => Err(crate::Error::blocked()),
+        }
+    }
+}
+
+/// Whether a block of `ty` is aborted under `mode`. The single decision point: documents keep
+/// their block page, subdocuments a blank page and images a GIF (so no error pages or broken
+/// icons show up in ad slots); everything else fails like a network error under `fail`.
+pub fn aborts(mode: BlockResponse, ty: RequestType) -> bool {
+    mode == BlockResponse::Fail
+        && !matches!(
+            ty,
+            RequestType::Document | RequestType::Subdocument | RequestType::Image
+        )
+}
+
+/// The outcome recorded in the request log for a block of `ty` under `mode`.
+pub fn log_outcome(mode: BlockResponse, ty: RequestType) -> filter_engine::EventOutcome {
+    if aborts(mode, ty) {
+        filter_engine::EventOutcome::Aborted
+    } else {
+        filter_engine::EventOutcome::Synthetic
+    }
+}
+
+/// Carry out a block of `ty` under `mode`.
+pub fn block_outcome(
+    mode: BlockResponse,
+    ty: RequestType,
+    verdict: &MatchResult,
+    url: &str,
+) -> BlockOutcome {
+    if aborts(mode, ty) {
+        BlockOutcome::Abort
+    } else {
+        BlockOutcome::Respond(block_response(ty, verdict, url))
+    }
+}
+
+/// [`block_outcome`] for a request the script policy refused (`x-adblock: policy`).
+pub fn policy_block_outcome(mode: BlockResponse, ty: RequestType, url: &str) -> BlockOutcome {
+    if aborts(mode, ty) {
+        BlockOutcome::Abort
+    } else {
+        BlockOutcome::Respond(policy_block_response(ty, url))
+    }
 }
 
 /// Serve a `$redirect` resource in place of the original response.
@@ -321,5 +383,51 @@ mod tests {
         let r = rewrite_redirect("https://a.test:443/p?x=1");
         assert_eq!(r.status(), 307);
         assert_eq!(r.headers()["location"], "https://a.test/p?x=1");
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use RequestType::*;
+
+    #[test]
+    fn only_documents_frames_and_images_are_answered_under_fail() {
+        for ty in [Document, Subdocument, Image] {
+            assert!(!aborts(BlockResponse::Fail, ty), "{ty:?}");
+        }
+        for ty in [
+            Script, Stylesheet, Font, Media, Xhr, Websocket, Ping, Object, Other,
+        ] {
+            assert!(aborts(BlockResponse::Fail, ty), "{ty:?}");
+            assert!(!aborts(BlockResponse::Synthetic, ty), "{ty:?}");
+        }
+        let v = MatchResult::blocked("||a^");
+        assert!(matches!(
+            block_outcome(BlockResponse::Fail, Script, &v, "u"),
+            BlockOutcome::Abort
+        ));
+        assert!(matches!(
+            block_outcome(BlockResponse::Fail, Image, &v, "u"),
+            BlockOutcome::Respond(_)
+        ));
+        assert!(matches!(
+            policy_block_outcome(BlockResponse::Synthetic, Script, "u"),
+            BlockOutcome::Respond(_)
+        ));
+        assert!(matches!(
+            policy_block_outcome(BlockResponse::Fail, Xhr, "u"),
+            BlockOutcome::Abort
+        ));
+    }
+
+    #[test]
+    fn abort_is_an_h2_cancel_error() {
+        let e = BlockOutcome::Abort.into_result().unwrap_err();
+        assert!(e.is_blocked());
+        // hyper reads the reset reason from the `h2::Error` in the source chain.
+        let src = std::error::Error::source(&e).and_then(|s| s.downcast_ref::<h2::Error>());
+        assert_eq!(src.and_then(|h| h.reason()), Some(h2::Reason::CANCEL));
+        assert!(crate::Error::chain_is_blocked(&e));
     }
 }

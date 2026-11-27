@@ -60,6 +60,7 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
             enable_http2: false,
             transparent_port: None,
             ext_port: None,
+            block_response: Default::default(),
             tls_passthrough_hosts: Vec::new(),
             block_private_destinations: false,
             allowed_destinations: Vec::new(),
@@ -199,7 +200,7 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     )));
 
     // Real proxy server.
-    let proxy_port = spawn_proxy(ctx).await;
+    let proxy_port = spawn_proxy(ctx.clone()).await;
 
     // Client that routes through our proxy.
     let client = reqwest::Client::builder()
@@ -217,7 +218,17 @@ async fn proxy_blocks_matching_host_and_forwards_others() {
     assert_eq!(allowed.status(), 200);
     assert_eq!(allowed.text().await.unwrap(), "origin-hello");
 
-    // Blocked host → synthetic response, and it never reaches any origin (the host doesn't even resolve).
+    // Blocked host → the request fails like a network error (`proxy.block_response = fail`, the
+    // default), and it never reaches any origin (the host doesn't even resolve).
+    let aborted = client
+        .get("http://blocked.test/ads.js")
+        .send()
+        .await
+        .expect_err("a blocked script is aborted");
+    assert!(!aborted.is_timeout(), "{aborted:?}");
+
+    // `synthetic` → a well-formed empty answer instead.
+    ctx.set_block_response(proxy_core::config::BlockResponse::Synthetic);
     let blocked = client
         .get("http://blocked.test/ads.js")
         .send()
@@ -267,7 +278,7 @@ async fn blocked_host_with_unresolvable_dns_is_blocked_not_reset_when_ev_tunnell
         .build()
         .unwrap();
     let r = client
-        .get("https://blocked.invalid/ads.js")
+        .get("https://blocked.invalid/ads.png")
         .send()
         .await
         .expect("the blocked host gets the block response, not a reset");

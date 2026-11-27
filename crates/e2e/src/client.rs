@@ -199,4 +199,10 @@ impl TestClient {
             .await
             .unwrap_or_else(|e| panic!("GET {url} failed: {e:?}"))
     }
+
+    /// GET that returns the transport error instead of panicking (a blocked request that fails
+    /// by design under `proxy.block_response = fail`).
+    pub async fn try_get(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
+        self.request(reqwest::Method::GET, url).send().await
+    }
 }

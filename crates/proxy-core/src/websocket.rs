@@ -319,6 +319,12 @@ async fn upgrade(
         Err(e) if crate::policy::is_refusal(&e) => {
             common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
             debug!("Refused WebSocket to {} (resolved): {}", check_url, e);
+            // A sinkholed name fails the connection attempt like a network error.
+            if crate::policy::refusal_of(&e) == Some(crate::policy::Refusal::Sinkhole)
+                && ctx.block_response() == common::config::BlockResponse::Fail
+            {
+                return Err(Error::blocked());
+            }
             return Ok(refused_response());
         }
         Err(e) => {
@@ -392,6 +398,13 @@ pub async fn proxy_upgrade(
     }
     if !bypass_full && ctx.should_block_with(rctx, &check_url, &origin, "websocket") {
         debug!("Blocked WebSocket to {}", check_url);
+        // `fail`: the connection attempt fails like a network error, as in an extension blocker.
+        if crate::redirect::aborts(
+            ctx.block_response(),
+            crate::request_type::RequestType::Websocket,
+        ) {
+            return Err(Error::blocked());
+        }
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .header("x-adblock", "blocked")

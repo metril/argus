@@ -57,6 +57,7 @@ fn test_custom_config() {
             enable_http2: false,
             transparent_port: None,
             ext_port: None,
+            block_response: Default::default(),
             tls_passthrough_hosts: Vec::new(),
             block_private_destinations: false,
             allowed_destinations: Vec::new(),

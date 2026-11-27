@@ -222,6 +222,11 @@ allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192
 block_private_destinations = false
 # CIDR exceptions that win over the refusals above (never over the proxy's own listeners):
 allowed_destinations = []
+# How a blocked request is answered: "fail" (scripts, fetch/XHR, styles, pings, media, fonts and
+# WebSockets fail like a network error; documents, frames and images keep their block page, blank
+# page and 1x1 GIF) or "synthetic" (every block gets a well-formed success response). Also in
+# Settings, applied live.
+block_response = "fail"
 
 [performance]
 max_connections = 0          # 0 = derive from the soft RLIMIT_NOFILE (3 fds per connection plus a reserve; the soft limit is raised to the hard limit first)

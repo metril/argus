@@ -1692,6 +1692,7 @@ dependencies = [
  "ext-rules",
  "filter-engine",
  "futures-util",
+ "h2",
  "hdrhistogram",
  "http-body-util",
  "hyper",

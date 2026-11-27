@@ -83,6 +83,29 @@ impl ErrorKind {
     }
 }
 
+/// How a blocked request was carried out (`proxy.block_response`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventOutcome {
+    /// The request failed like a network error (HTTP/2 stream reset, HTTP/1 connection closed).
+    Aborted,
+    /// The requester got a well-formed answer (block page, blank frame, GIF, 204, redirect resource).
+    Synthetic,
+}
+
+impl EventOutcome {
+    fn code(self) -> u8 {
+        self as u8 + 1
+    }
+    fn from_code(c: u8) -> Option<Self> {
+        match c {
+            1 => Some(Self::Aborted),
+            2 => Some(Self::Synthetic),
+            _ => None,
+        }
+    }
+}
+
 /// How the connection reached the proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -119,6 +142,9 @@ pub struct RequestEvent {
     /// SHA-256 fingerprint (hex) of the upstream server certificate, for decrypted requests.
     #[serde(default)]
     pub cert_fp: Option<String>,
+    /// How a block was carried out; set on blocks of requests the proxy judged itself.
+    #[serde(default)]
+    pub outcome: Option<EventOutcome>,
 }
 
 /// An event as broadcast to live subscribers: the decoded event plus its lowercased searchable
@@ -159,6 +185,7 @@ pub struct EventRef<'a> {
     pub mode: EventMode,
     pub error_kind: Option<ErrorKind>,
     pub cert_fp: Option<&'a str>,
+    pub outcome: Option<EventOutcome>,
 }
 
 const FIELDS: usize = 8;
@@ -177,6 +204,8 @@ struct Raw {
     transparent: bool,
     /// 0 = none.
     error_kind: u8,
+    /// 0 = none.
+    outcome: u8,
 }
 
 impl Raw {
@@ -207,6 +236,7 @@ impl Raw {
             },
             error_kind: ErrorKind::from_code(self.error_kind),
             cert_fp: self.has_cert_fp.then(|| field(7)),
+            outcome: EventOutcome::from_code(self.outcome),
         }
     }
 }
@@ -371,6 +401,7 @@ impl RequestLog {
             mode: EventMode::Explicit,
             error_kind: None,
             cert_fp: None,
+            outcome: None,
         });
     }
 
@@ -416,6 +447,7 @@ impl RequestLog {
                 status: e.status.unwrap_or(0),
                 transparent: e.mode == EventMode::Transparent,
                 error_kind: e.error_kind.map_or(0, ErrorKind::code),
+                outcome: e.outcome.map_or(0, EventOutcome::code),
             })
         });
         if self.tx.receiver_count() > 0 {
@@ -522,6 +554,7 @@ mod tests {
             mode: EventMode::Transparent,
             error_kind: None,
             cert_fp: None,
+            outcome: None,
         }
     }
 

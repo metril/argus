@@ -575,7 +575,7 @@ impl PolicyResolver {
             match verdict {
                 Ok(()) => allowed.push(SocketAddr::new(*ip, 0)),
                 Err(r) => {
-                    denied.get_or_insert(r);
+                    denied.get_or_insert(r.for_resolved_name(name, *ip));
                 }
             }
         }

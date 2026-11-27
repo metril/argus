@@ -445,6 +445,7 @@ async fn request_log_seed_is_not_clamped_to_200_and_honours_since() {
             mode: EventMode::Explicit,
             error_kind: None,
             cert_fp: None,
+            outcome: None,
         });
     }
     let v: Value = admin.get("/api/v1/logs/requests?limit=300").await.json();

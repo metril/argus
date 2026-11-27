@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+* Blocked requests now fail like a network error (`proxy.block_response = "fail"`, the default;
+  Settings, applied live), as with an extension blocker, so page scripts and ad-block tests no
+  longer count a blocked resource as loaded. Scripts, fetch/XHR, styles, pings, media, fonts,
+  objects and WebSockets are aborted (HTTP/2: only that stream is reset, with CANCEL; HTTP/1: the
+  connection is closed); documents keep the block page, frames a blank page and images a 1x1 GIF.
+  `"synthetic"` restores the old always-succeeds answers. A public name that resolves to 0.0.0.0,
+  `::` or loopback (a DNS sinkhole) is aborted too and logged as `sinkholed-upstream`. The request
+  log shows each block's outcome (`aborted` or `synthetic`).
+
 ## 0.7.0 — 2026-11-26
 
 * Element hiding: uBO's procedural engine (`:has`, `:has-text`, `:upward` and the rest)

@@ -98,7 +98,7 @@ browser_test!(
         );
         s.origin.route("/", MockResponse::html(format!(
         "<!doctype html><img id=ok src='{b}/ok.gif'><img id=blocked src='{b}/ad.png'><img id=redir src='{b}/r.gif'>\
-         <script src='{b}/ad.js' onload='window.__jsdone=1'></script>")));
+         <script src='{b}/ad.js' onload='window.__jsdone=1' onerror='window.__jserr=1'></script>")));
         s.goto(&s.url("page.test", "/")).await;
         s.wait_for(
             "images settled",
@@ -116,8 +116,13 @@ browser_test!(
             1,
             "redirect replacement must decode"
         );
-        s.wait_for("neutered script finished", "window.__jsdone === 1")
-            .await;
+        // `proxy.block_response = fail`: the blocked script fails to load (Chrome reports the
+        // reset stream as net::ERR_HTTP2_PROTOCOL_ERROR) instead of loading an empty script.
+        s.wait_for(
+            "blocked script failed",
+            "window.__jserr === 1 && window.__jsdone === undefined",
+        )
+        .await;
         assert_eq!(s.eval("typeof window.__adjs").await, "undefined");
         assert!(
             s.origin.requests_for("/ad.png").is_empty()

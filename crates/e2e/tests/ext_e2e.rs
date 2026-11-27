@@ -211,6 +211,9 @@ e2e_test!(
     header_rule_blocks_a_response_with_a_matching_header,
     rules = ["/hdr.js^$header=x-ad:yes"],
     |env| {
+        env.proxy
+            .ctx
+            .set_block_response(proxy_core::config::BlockResponse::Synthetic);
         env.origin
             .route("/hdr.js", js("real();").header("x-ad", "yes"));
         for v in VERSIONS {
@@ -231,6 +234,9 @@ e2e_test!(
         "/tblk$to=ext.test,xhr",
     ],
     |env| {
+        env.proxy
+            .ctx
+            .set_block_response(proxy_core::config::BlockResponse::Synthetic);
         for p in ["/dblk", "/mblk", "/tblk", "/ok"] {
             env.origin.route(p, MockResponse::ok("real"));
         }

@@ -8,7 +8,7 @@ use ipnet::IpNet;
 use std::net::IpAddr;
 
 pub use common::net_policy::{
-    canonical, classify, is_refusal, Class, GuardedResolver as PolicyResolver,
+    canonical, classify, is_refusal, refusal_of, Class, GuardedResolver as PolicyResolver,
     NetPolicy as DestPolicy, PolicyRefused, Refusal, ResolveError,
 };
 
