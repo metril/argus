@@ -1360,3 +1360,28 @@ async fn a_restore_skips_expired_rows_and_never_extends_an_expiry() {
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert_eq!(c.session_count(), 0, "expired on the file's schedule");
 }
+
+#[tokio::test]
+async fn reported_popups_are_consumed_once_per_session() {
+    let f = fx(false);
+    let hub = f.gm.ext().clone();
+    let (a, _sa, _ra) = hub.open(ident("t1"));
+    let (b, _sb, _rb) = hub.open(ident("t2"));
+    let msg = json!({"t": "popup", "url": "https://pop.test/x#f", "opener": "https://page.test/"});
+    hub.on_text(a, &msg.to_string()).await;
+    // malformed reports are ignored
+    hub.on_text(a, r#"{"t":"popup","url":"https://z.test/"}"#)
+        .await;
+    assert_eq!(
+        hub.take_popup(b, "https://pop.test/x"),
+        None,
+        "other session"
+    );
+    assert_eq!(hub.take_popup(a, "https://other.test/"), None);
+    assert_eq!(
+        hub.take_popup(a, "https://pop.test/x").as_deref(),
+        Some("https://page.test/")
+    );
+    assert_eq!(hub.take_popup(a, "https://pop.test/x"), None, "consumed");
+    assert_eq!(hub.take_popup(a, "https://z.test/"), None);
+}

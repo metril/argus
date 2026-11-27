@@ -19,7 +19,7 @@ export default defineConfig({
     content_security_policy: { extension_pages: "script-src 'self'; object-src 'self';" },
     action: { default_icon: icons },
     permissions: [
-      'storage', 'tabs', 'cookies', 'scripting', 'activeTab', 'alarms', 'proxy', 'webRequest',
+      'storage', 'tabs', 'cookies', 'scripting', 'activeTab', 'alarms', 'proxy', 'webRequest', 'webNavigation',
       ...(browser === 'firefox' ? ['webRequestBlocking', 'contextualIdentities'] : ['webRequestAuthProvider']),
     ],
     // Chrome: a separate instance runs in incognito windows, with its own connection, session

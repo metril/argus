@@ -137,6 +137,8 @@ pub struct Internal {
     pub panel: Arc<crate::panel::PanelHost>,
     /// Policy-violation reports accepted so far per document (rate limit).
     pv_counts: moka::sync::Cache<String, Arc<std::sync::atomic::AtomicU32>>,
+    /// Document / stylesheet tracking per device (request source fallback).
+    pub pages: crate::pages::PageTracker,
 }
 
 /// Violation reports accepted per document.
@@ -163,6 +165,7 @@ impl Internal {
             unsupported: Default::default(),
             gm: Arc::new(crate::gm::GmHost::new()),
             panel: Arc::default(),
+            pages: Default::default(),
             pv_counts: moka::sync::Cache::builder()
                 .max_capacity(16_384)
                 .time_to_idle(Duration::from_secs(600))
