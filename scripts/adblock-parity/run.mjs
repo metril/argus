@@ -2,7 +2,7 @@
 // One shard: one blocker x one browser, all test sites -> one JSON file.
 //   node run.mjs --blocker none|argus|ubol|ubo|adguard-ext|adguard-desktop --browser chrome|firefox
 //                [--proxy host:port] [--ca path/to/ca.crt] [--sites turtlecute,toolz] [--out file.json]
-//                [--chrome-path /usr/bin/google-chrome] [--ready-timeout 120]
+//                [--chrome-path /usr/bin/google-chrome] [--ready-timeout 120] [--settle 15]
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,23 +32,48 @@ if (args.unavailable) { writeDoc(unavailableDoc(args.unavailable)); process.exit
 if (blocker === 'argus' && (!proxy || !caPath)) throw new Error('argus needs --proxy host:port and --ca <root CA pem>');
 if (!['chrome', 'firefox'].includes(browser)) throw new Error('--browser chrome|firefox');
 
-// Canary: an ad host every blocker in the matrix blocks. Resolves true once a no-cors fetch from a normal
-// http origin is rejected, i.e. the blocker's engine is loaded and filtering. Polled, not slept.
+// Canary: an ad host every blocker in the matrix blocks. Two probes from a normal http origin, both polled:
+//  - fetch(no-cors) must reject with a TypeError within FAST_MS (a timeout/abort is an ERROR, not "blocked");
+//  - a <script src> of the same host must fire onerror within FAST_MS (onload = reached, timeout = error).
+// Ready = both blocked on 2 consecutive polls. Verdicts: 'blocked' | 'reached' | 'error'.
+const FAST_MS = 3000;
 const notFiltering = `blocker not filtering: canary ad host still reachable after ${readyTimeoutMs / 1000}s (never scored)`;
-// Pure `||host^` tracker hosts (no $redirect stub), so a filtering blocker aborts them. A majority must reject.
-// Argus only: a response carrying `x-adblock: blocked|redirected` (headers readable via a cors fetch) also counts
-// as blocked. Extension baselines stay strict (reject only).
+// Three pure `||host^` tracker hosts (no $redirect stub), probed in parallel; a majority must be blocked.
+// Per host two probes: fetch(no-cors) must reject with a TypeError within FAST_MS (timeout/abort = 'error'),
+// and a <script src> must fire onerror within FAST_MS (onload = 'reached'). Both must be blocked.
+// Argus only: a cors fetch whose response carries `x-adblock: blocked|redirected` also counts as a blocked
+// fetch, and a script that loads (Argus may serve a redirect stub) is tolerated. Extensions stay strict.
 const canaryFor = (isArgus) => `(async () => {
+  const FAST = ${FAST_MS}, ARGUS = ${isArgus};
   const urls = ['https://adservice.google.com/ddm/fls/z', 'https://ads.pubmatic.com/AdServer/js/showad.js', 'https://www.googleadservices.com/pagead/conversion.js'];
   const one = async (u) => {
-    const q = u + (u.includes('?') ? '&' : '?') + 'c=' + Date.now();
-    try { await fetch(q, { mode: 'no-cors', cache: 'no-store' }); } catch (e) { return true; }
-    ${isArgus ? "try { const r = await fetch(q, { mode: 'cors', cache: 'no-store' }); return /^(blocked|redirected)$/.test(r.headers.get('x-adblock') || ''); } catch (e) { return true; }" : 'return false;'}
+    const q = (k) => u + (u.includes('?') ? '&' : '?') + k + '=' + Date.now();
+    const f = (async () => {
+      const c = new AbortController(); const t = setTimeout(() => c.abort(), 8000); const t0 = Date.now();
+      try { await fetch(q('c'), { mode: 'no-cors', cache: 'no-store', signal: c.signal }); }
+      catch (e) { return e instanceof TypeError && Date.now() - t0 <= FAST ? 'blocked' : 'error'; } finally { clearTimeout(t); }
+      if (!ARGUS) return 'reached';
+      try { const r = await fetch(q('m'), { mode: 'cors', cache: 'no-store' }); return /^(blocked|redirected)$/.test(r.headers.get('x-adblock') || '') ? 'blocked' : 'reached'; }
+      catch (e) { return e instanceof TypeError ? 'blocked' : 'error'; }
+    })();
+    const sc = new Promise((res) => { const t0 = Date.now(); const el = document.createElement('script');
+      const done = (v) => { clearTimeout(to); el.remove(); res(v); };
+      const to = setTimeout(() => done('error'), 8000);
+      el.onerror = () => done(Date.now() - t0 <= FAST ? 'blocked' : 'error'); el.onload = () => done('reached');
+      el.src = q('s'); document.head.appendChild(el); });
+    const [fv, sv] = await Promise.all([f, sc]);
+    return { host: new URL(u).host, fetch: fv, script: sv, blocked: fv === 'blocked' && (sv === 'blocked' || (ARGUS && sv === 'reached')) };
   };
-  const n = (await Promise.all(urls.map(one))).filter(Boolean).length;
-  return n * 2 > urls.length;
+  const hosts = await Promise.all(urls.map(one));
+  return { ok: hosts.filter((h) => h.blocked).length * 2 > urls.length, hosts };
 })()`;
 const CANARY = canaryFor(blocker === 'argus');
+// Unblocked control host: must stay reachable on every site run, else the run is discarded and retried once.
+const CONTROL = `(async () => { const c = new AbortController(); const t = setTimeout(() => c.abort(), 10000);
+  try { await fetch('https://example.com/?c=' + Date.now(), { mode: 'no-cors', cache: 'no-store', signal: c.signal }); return true; } catch (e) { return false; } finally { clearTimeout(t); } })()`;
+const SETTLE_MS = +(args['settle'] ?? 15) * 1000; // after the canary passes, let the engine finish loading
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let lastCanary = null;
 
 function nssImport(dbDir, ca) {
   if (spawnSync('certutil', ['-V']).error) return false;
@@ -60,14 +85,47 @@ function nssImport(dbDir, ca) {
   return true;
 }
 
-async function pollReady(evalFn) {
+async function pollReady(evalFn, beforeEach) {
   if (blocker === 'none') return true;
   const t0 = Date.now();
+  let streak = 0;
   while (Date.now() - t0 < readyTimeoutMs) {
-    if (await evalFn()) return true;
-    await new Promise((r) => setTimeout(r, 1000));
+    if (beforeEach) await beforeEach().catch(() => {});
+    lastCanary = await evalFn();
+    streak = lastCanary?.ok ? streak + 1 : 0;
+    if (streak >= 2) { log('canary blocked', JSON.stringify(lastCanary), '- settling', SETTLE_MS / 1000, 's'); await sleep(SETTLE_MS); return true; }
+    await sleep(1000);
   }
+  log('canary last state:', JSON.stringify(lastCanary));
   return false;
+}
+
+// Chrome MV3 extension state: service worker -> enabled DNR rulesets + storage keys (logged on failure,
+// and polled so the canary only counts once static rulesets are enabled).
+async function chromeExtState(ctx) {
+  const out = [];
+  for (const w of ctx.serviceWorkers()) {
+    if (!w.url().startsWith('chrome-extension://')) continue;
+    const st = await w.evaluate(async () => ({
+      rulesets: await chrome.declarativeNetRequest.getEnabledRulesets().catch((e) => 'err:' + e),
+      storageKeys: await chrome.storage.local.get(null).then((o) => Object.keys(o).slice(0, 40)).catch(() => null),
+    })).catch((e) => ({ error: String(e).split('\n')[0] }));
+    out.push({ sw: w.url(), ...st });
+  }
+  return out;
+}
+async function chromeFailureDump(ctx) {
+  log('extension state:', JSON.stringify(await chromeExtState(ctx)));
+  for (const p of ctx.pages()) log('page', p.url(), '|', await p.evaluate(() => document.body?.innerText.replace(/\s+/g, ' ').slice(0, 300)).catch(() => ''));
+}
+// Opening the extension's options page wakes its MV3 service worker (and triggers first-run init).
+async function keepAlive(ctx) {
+  const w = ctx.serviceWorkers().find((x) => x.url().startsWith('chrome-extension://'));
+  if (!w) return;
+  const origin = new URL(w.url()).origin;
+  if (ctx.pages().some((p) => p.url().startsWith(origin))) return;
+  const p = await ctx.newPage();
+  await p.goto(origin + '/pages/options.html', { timeout: 15000 }).catch(() => {});
 }
 
 // ---------- Chrome (playwright-core) ----------
@@ -97,7 +155,12 @@ async function runChrome() {
   const ua = await (async () => { const p = ctx.pages()[0] || (await ctx.newPage()); return p.evaluate(() => navigator.userAgent); })();
   const canaryPage = ctx.pages()[0] || (await ctx.newPage());
   await canaryPage.goto('http://example.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-  const ready = await pollReady(() => canaryPage.evaluate(CANARY).catch(() => false));
+  const rulesetsUp = async () => { const st = await chromeExtState(ctx); return !EXT.has(blocker) || st.length === 0 || st.some((x) => Array.isArray(x.rulesets) && x.rulesets.length); };
+  const ready = await pollReady(
+    async () => ((await rulesetsUp().catch(() => true)) ? canaryPage.evaluate(CANARY).catch(() => null) : null),
+    async () => { if (blocker === 'adguard-ext') await keepAlive(ctx); },
+  );
+  if (!ready && EXT.has(blocker)) await chromeFailureDump(ctx);
   for (const p of ctx.pages()) if (p !== canaryPage) await p.close().catch(() => {});
   if (!ready) {
     await ctx.close();
@@ -110,7 +173,9 @@ async function runChrome() {
       const p = await ctx.newPage();
       try {
         await p.goto(s.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        return await p.evaluate(extractorSource(s));
+        const r = await p.evaluate(extractorSource(s));
+        r.control = await p.evaluate(CONTROL).catch(() => false);
+        return r;
       } finally { await p.close().catch(() => {}); }
     }));
   }
@@ -147,7 +212,14 @@ async function runFirefox() {
     const ua = await driver.executeScript('return navigator.userAgent');
     const home = (await driver.getAllWindowHandles())[0];
     await driver.get('http://example.com/');
-    const ready = await pollReady(() => driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${CANARY}.then(cb, () => cb(false));`).catch(() => false));
+    const ready = await pollReady(() => driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${CANARY}.then(cb, () => cb(null));`).catch(() => null));
+    if (!ready && EXT.has(blocker)) {
+      // Log what the extension left open (welcome/onboarding tabs) to diagnose first-run blockers.
+      for (const h of await driver.getAllWindowHandles()) {
+        await driver.switchTo().window(h);
+        log('tab', await driver.getCurrentUrl().catch(() => '?'), '|', await driver.executeScript("return (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 300)").catch(() => ''));
+      }
+    }
     // Close welcome/first-run tabs the extensions open.
     if (!ready) return { unavailable: notFiltering };
     for (const h of await driver.getAllWindowHandles()) if (h !== home) { await driver.switchTo().window(h); await driver.close(); }
@@ -158,6 +230,7 @@ async function runFirefox() {
         await driver.get(s.url);
         const r = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${extractorSource(s)}.then(cb, (e) => cb({ __error: String(e) }));`);
         if (r?.__error) throw new Error(r.__error);
+        r.control = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${CONTROL}.then(cb, () => cb(false));`).catch(() => false);
         return r;
       }));
     }
@@ -168,20 +241,28 @@ async function runFirefox() {
   }
 }
 
+// Each site runs twice and the SECOND result is kept (the first warms the blocker: lazily compiled rules,
+// first-visit onboarding); the first is recorded as firstPercent. A run is valid only if the unblocked
+// control host was reachable; a failed or invalid run is discarded and retried once.
 async function measure(site, fn) {
   const t0 = Date.now();
-  let lastErr;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const r = await fn();
-      log(site.id, `${r.score.passed}/${r.score.total} (${r.score.percent}%) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
-      return { site: site.id, url: site.url, ok: true, ...r, seconds: Math.round((Date.now() - t0) / 1000) };
-    } catch (e) { lastErr = e; log(site.id, 'attempt', attempt, 'failed:', e.message.split('\n')[0]); }
+  let lastErr = new Error('no result'), first = null, kept = null;
+  for (let pass = 1; pass <= 2; pass++) {
+    let got = null;
+    for (let attempt = 1; attempt <= 2 && !got; attempt++) {
+      try {
+        const r = await fn();
+        if (!r.control) { lastErr = new Error('control host https://example.com/ unreachable'); log(site.id, `pass ${pass} attempt ${attempt} discarded:`, lastErr.message); continue; }
+        got = r;
+      } catch (e) { lastErr = e; log(site.id, `pass ${pass} attempt ${attempt} failed:`, e.message.split('\n')[0]); }
+    }
+    if (got) { log(site.id, `pass ${pass}: ${got.score.passed}/${got.score.total} (${got.score.percent}%)`); if (pass === 1) first = got; kept = got; }
   }
+  if (kept) { const { control, ...r } = kept; return { site: site.id, url: site.url, ok: true, ...r, controlOk: true, firstPercent: first?.score.percent, seconds: Math.round((Date.now() - t0) / 1000) }; }
   return { site: site.id, url: site.url, ok: false, error: lastErr.message.split('\n')[0], score: { passed: 0, total: 0, percent: 0 }, categories: {}, tests: [], meta: {} };
 }
 
 const started = new Date().toISOString();
 const r = await (browser === 'chrome' ? runChrome() : runFirefox());
 if (r.unavailable) { log('baseline unavailable:', r.unavailable); writeDoc(unavailableDoc(r.unavailable)); process.exit(0); }
-writeDoc({ blocker, browser, platform: process.platform, proxy: blocker === 'argus' ? proxy : null, extensionVersion: r.extVersion, userAgent: r.ua, canaryBlocked: r.ready, started, finished: new Date().toISOString(), results: r.results });
+writeDoc({ blocker, browser, platform: process.platform, proxy: blocker === 'argus' ? proxy : null, extensionVersion: r.extVersion, userAgent: r.ua, canaryBlocked: !!r.ready, canary: lastCanary, started, finished: new Date().toISOString(), results: r.results });

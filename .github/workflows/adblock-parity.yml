@@ -14,7 +14,7 @@ name: Adblock parity
 #     (the only documented switch is /q; the EXE installer is also reported to take /quiet, unverified).
 #   - The only documented activation path is the `LicenseKey` policy under HKLM\Software\Policies\AdGuard
 #     (no CLI activation switch exists), which this job deliberately does not use.
-# Whether a trial starts headlessly is unverified: the shard self-checks that a known ad host is blocked and,
+# Onboarding has no documented headless switch (see the UI Automation step); the shard self-checks that a known ad host is blocked and,
 # if not, reports "baseline unavailable" (kept green, excluded by the aggregator) with logs and a screenshot.
 
 on:
@@ -52,7 +52,7 @@ jobs:
   shard:
     name: ${{ matrix.blocker }} / ${{ matrix.browser }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -157,6 +157,39 @@ jobs:
           $exe = Get-ChildItem 'C:\Program Files\AdGuard','C:\Program Files (x86)\AdGuard' -Filter Adguard.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $exe) { throw 'Adguard.exe not found after install' }
           Start-Process $exe.FullName
+      - name: Complete AdGuard onboarding (UI Automation, best effort)
+        id: onboarding
+        continue-on-error: true
+        run: |
+          # No documented headless path exists: the admins page only documents `msiexec /q /i` and the
+          # LicenseKey policy (https://adguard.com/kb/adguard-for-windows/admins-documentation/); no MSI
+          # property, registry key or settings file skips the EULA/"Welcome on board" screen. So click through it
+          # with Microsoft UI Automation (System.Windows.Automation, in-box; docs:
+          # https://learn.microsoft.com/dotnet/framework/ui-automation/). Unverified against AdGuard's UI: if its
+          # window exposes no UIA tree, nothing is clicked, the canary fails and the baseline is "unavailable".
+          New-Item -ItemType Directory -Force diag | Out-Null
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+          $want = '^(accept( and continue)?|i accept|agree|continue|next|start( free)? trial|start|get started|let''s go|skip|done|finish|ok|got it)$'
+          $seen = [System.Collections.Generic.HashSet[string]]::new()
+          $deadline = (Get-Date).AddSeconds(120); $idle = 0
+          while ((Get-Date) -lt $deadline -and $idle -lt 12) {
+            $clicked = $false
+            foreach ($w in [System.Windows.Automation.AutomationElement]::RootElement.FindAll('Children', [System.Windows.Automation.Condition]::TrueCondition)) {
+              if ($w.Current.Name -notmatch 'AdGuard') { continue }
+              foreach ($e in $w.FindAll('Descendants', [System.Windows.Automation.Condition]::TrueCondition)) {
+                $n = $e.Current.Name.Trim(); [void]$seen.Add("$($e.Current.ControlType.ProgrammaticName): $n")
+                $isCheck = $e.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox
+                if ($isCheck -and $n -match 'agree|accept|terms|license') {
+                  $tp = $null; if ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$tp) -and $tp.Current.ToggleState -eq 'Off') { $tp.Toggle(); $clicked = $true }
+                } elseif ($n -match $want -and -not $e.Current.IsOffscreen) {
+                  $ip = $null; if ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) { try { $ip.Invoke(); $clicked = $true; Write-Host "clicked: $n"; Start-Sleep 2 } catch {} }
+                }
+              }
+            }
+            if ($clicked) { $idle = 0 } else { $idle++ }
+            Start-Sleep 5
+          }
+          $seen | Sort-Object | Out-File diag\uia-elements.txt
       - name: AdGuard run (the shard polls the canary until protection is active, else reports unavailable)
         id: run
         if: steps.install.outcome == 'success'

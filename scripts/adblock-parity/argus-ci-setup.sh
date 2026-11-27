@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepares a freshly started Argus container for the parity run: waits until it is healthy, creates the
 # first admin, switches the filter lists to the uBOL-equivalent default set (uBlock filters, badware,
-# privacy, quick-fixes, unbreak, EasyList, EasyPrivacy, Peter Lowe's), waits for the engine build and
+# privacy, quick-fixes, unbreak, EasyList, EasyPrivacy, Peter Lowe's, uBO's urlhaus-1), waits for the engine build and
 # downloads the root CA.
 #   argus-ci-setup.sh <web-ui-base-url> <ca-out-file>      e.g. http://127.0.0.1:3000 /tmp/argus-ca.crt
 # LIST_SET_REGEX overrides which list names stay enabled (case-insensitive extended regex).
@@ -31,6 +31,10 @@ echo "$lists" | jq -c '.items[]' | while read -r l; do
     call -X PUT -d '{"enabled":false}' "$api/lists/$id" >/dev/null
   fi
 done
+# uBO's default-on urlhaus-1 (Online Malicious URL Blocklist). Not in Argus's catalogue (checked
+# crates/filter-engine/src/list.rs), so it is added as a custom list with uAssets' contentURL for that id.
+urlhaus='{"id":"urlhaus-1","name":"Online Malicious URL Blocklist","url":"https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt","enabled":true,"format":"abp","allowlist":false,"trusted":false}'
+call -X POST -d "$urlhaus" "$api/lists" >/dev/null || call -X PUT -d '{"enabled":true}' "$api/lists/urlhaus-1" >/dev/null
 call -X POST "$api/lists/refresh" >/dev/null || true
 
 # Engine ready: a build has completed, none is running, scriptlets loaded.
