@@ -90,7 +90,10 @@ impl Principal {
 pub enum RouteAuth {
     Public,
     Authenticated,
+    /// Every listed scope.
     Scopes(Vec<Scope>),
+    /// At least one of the listed scopes (several single-scope `security` alternatives).
+    AnyOf(Vec<Scope>),
 }
 
 impl RouteAuth {
@@ -99,6 +102,7 @@ impl RouteAuth {
             RouteAuth::Public => String::new(),
             RouteAuth::Authenticated => "authenticated".into(),
             RouteAuth::Scopes(s) => s.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
+            RouteAuth::AnyOf(s) => s.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("|"),
         }
     }
 }
@@ -134,6 +138,11 @@ const RESTRICTED_GLOBAL_READS: [Scope; 6] = [
 /// - custom rules are the default profile's overlay: readable only with access to profile `0`;
 /// - everything else (any write to global state, users, audit, admin routes): refused.
 pub fn restricted_may_use(p: &Principal, rule: &RouteAuth, method: &Method) -> bool {
+    if let RouteAuth::AnyOf(any) = rule {
+        return any
+            .iter()
+            .any(|s| restricted_may_use(p, &RouteAuth::Scopes(vec![*s]), method));
+    }
     let RouteAuth::Scopes(required) = rule else {
         return true;
     };
@@ -199,6 +208,18 @@ impl RouteTable {
                     RouteAuth::Public
                 } else if scopes.is_empty() {
                     RouteAuth::Authenticated
+                } else if sec.len() > 1
+                    && sec.iter().all(|r| {
+                        r.as_object().is_some_and(|o| {
+                            o.values()
+                                .map(|v| v.as_array().map_or(0, Vec::len))
+                                .sum::<usize>()
+                                == 1
+                        })
+                    })
+                {
+                    // Alternatives (OpenAPI: any one requirement object suffices).
+                    RouteAuth::AnyOf(scopes)
                 } else {
                     RouteAuth::Scopes(scopes)
                 };
@@ -406,6 +427,21 @@ fn check(
         ));
     }
 
+    if let RouteAuth::AnyOf(any) = rule {
+        if !any.iter().any(|s| principal.has(*s)) {
+            return Err(ApiError::coded(
+                axum::http::StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                format!(
+                    "Missing required scope: one of {}",
+                    any.iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+    }
     if let RouteAuth::Scopes(required) = rule {
         if let Some(missing) = required.iter().find(|s| !principal.has(**s)) {
             return Err(ApiError::coded(

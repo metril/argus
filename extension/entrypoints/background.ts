@@ -1,4 +1,5 @@
-import { cachedLookup, clearCache, getSettings, hostOf, type Lookup } from '../lib/api';
+import { cachedLookup, clearCache, fetchRecentBlocked, getSettings, hostOf, type Lookup } from '../lib/api';
+import { blockedTotal, classify, hostnameOf, StatsStore } from '../lib/stats';
 import { signOutInBackground } from '../lib/auth';
 import { Bridge } from '../lib/bridge';
 import { FriendlyFrames } from '../lib/friendly-frames';
@@ -9,6 +10,11 @@ import { RouteTracker } from '../lib/route';
 import { StoreRelay } from '../lib/storerelay';
 
 /** The toolbar badge is a colored dot for the site state; nothing when there is nothing to say. */
+/** Compact count for the badge (it holds about four characters). */
+function badgeCount(n: number): string {
+  return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k` : `${Math.min(99, Math.floor(n / 1000))}k`;
+}
+
 function badgeFor(v: Lookup): { text: string; color: string } {
   switch (v.kind) {
     case 'ok': return v.cert.verdict === 'invalid' ? { text: '!', color: '#f2695f' } : { text: '●', color: '#4fc48d' };
@@ -22,6 +28,19 @@ export default defineBackground(() => {
   const action = browser.action;
   const routes = new RouteTracker();
 
+  // Per-tab request counters, kept in storage.session so they survive the service worker sleeping.
+  const stats = new StatsStore((browser.storage as any).session, (tabId) => refreshBadge(tabId));
+
+  const badgeTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  /** Debounced per tab: a page can produce hundreds of counter changes a second. */
+  function refreshBadge(tabId: number) {
+    if (badgeTimers.has(tabId)) return;
+    badgeTimers.set(tabId, setTimeout(() => { badgeTimers.delete(tabId); void refreshBadgeNow(tabId); }, 250));
+  }
+  async function refreshBadgeNow(tabId: number) {
+    try { const t = await browser.tabs.get(tabId); await update(tabId, t.url); } catch { /* tab gone */ }
+  }
+
   async function update(tabId: number, url?: string) {
     // Argus is on but unreachable: the browser is blocked (not direct); say so on every tab.
     if (proxy.unreachable()) {
@@ -29,10 +48,13 @@ export default defineBackground(() => {
       await action.setBadgeBackgroundColor({ tabId, color: '#f2695f' });
       return;
     }
+    // The text is this page's blocked count; the colour keeps the certificate state (a problem
+    // still shows as `!`).
+    const count = blockedTotal(await stats.tab(tabId));
     const host = hostOf(url);
-    if (!host) { await action.setBadgeText({ tabId, text: '' }); return; }
-    const b = badgeFor(await cachedLookup(host));
-    await action.setBadgeText({ tabId, text: b.text });
+    const b = host ? badgeFor(await cachedLookup(host)) : { text: '', color: '#80868b' };
+    const text = b.text === '!' ? '!' : count > 0 ? badgeCount(count) : b.text;
+    await action.setBadgeText({ tabId, text });
     await action.setBadgeBackgroundColor({ tabId, color: b.color });
     try { await (action as any).setBadgeTextColor?.({ tabId, color: '#0c0f13' }); } catch { /* optional */ }
   }
@@ -81,7 +103,7 @@ export default defineBackground(() => {
     if (info.status === 'complete' || info.url) void update(tabId, tab.url);
   });
   browser.storage.onChanged.addListener((changes: Record<string, unknown>) => onStorageChanged(changes, { clearCache, bridge, proxy }));
-  browser.tabs.onRemoved.addListener((id) => routes.forget(id));
+  browser.tabs.onRemoved.addListener((id) => { routes.forget(id); void stats.dispatch({ t: 'close', tabId: id }); });
   // New tabs / windows opened by a page: the proxy learns the opener (for `$popup`).
   b.webNavigation?.onCreatedNavigationTarget?.addListener((d: { url?: string; sourceTabId?: number }) => {
     if (d.url && d.sourceTabId !== undefined && d.sourceTabId >= 0) void bridge.reportPopup(d.url, d.sourceTabId);
@@ -97,10 +119,59 @@ export default defineBackground(() => {
     ['responseHeaders'],
   );
 
+  // Counters: every response (the proxy's `x-adblock` tag marks blocks), cached completions, and
+  // network errors (aborted blocks, attributed through the proxy's recent-blocked list).
+  // Non-blocking, all request types; the same API on Chrome and Firefox.
+  const seen = new Set<string>();
+  const remember = (id: string) => { seen.add(id); if (seen.size > 2000) seen.delete(seen.values().next().value as string); };
+  wr?.onHeadersReceived?.addListener(
+    (d: { tabId: number; requestId: string; url: string; type: string; statusCode?: number; responseHeaders?: { name: string; value?: string }[] }) => {
+      if (d.tabId < 0) return;
+      remember(d.requestId);
+      // Each redirect hop reports its own response; only the final one is a request of the page.
+      if (d.statusCode !== undefined && d.statusCode >= 300 && d.statusCode <= 399) return;
+      void stats.dispatch({ t: 'response', tabId: d.tabId, main: d.type === 'main_frame', kind: classify(d.responseHeaders), host: hostnameOf(d.url) });
+    },
+    { urls: ['<all_urls>'] },
+    ['responseHeaders'],
+  );
+  wr?.onCompleted?.addListener(
+    (d: { tabId: number; requestId: string; url: string; type: string; fromCache?: boolean }) => {
+      // Served from cache without onHeadersReceived (Chrome): a cached response was never a block.
+      if (d.tabId < 0 || !d.fromCache || seen.has(d.requestId)) return;
+      void stats.dispatch({ t: 'response', tabId: d.tabId, main: d.type === 'main_frame', kind: 'allowed', host: hostnameOf(d.url) });
+    },
+    { urls: ['<all_urls>'] },
+  );
+  wr?.onErrorOccurred?.addListener(
+    (d: { tabId: number; url: string; type: string; error?: string }) => {
+      if (d.tabId < 0) return;
+      void stats.dispatch({ t: 'error', tabId: d.tabId, main: d.type === 'main_frame', url: d.url, now: Date.now(), ...(d.error ? { error: d.error } : {}) });
+      scheduleReconcile(d.tabId);
+    },
+    { urls: ['<all_urls>'] },
+  );
+  const timers = new Map<number, ReturnType<typeof setTimeout>>();
+  async function reconcileTab(tabId: number) {
+    if ((await stats.tab(tabId)).pending.length === 0) return;
+    const r = await fetchRecentBlocked(await getSettings());
+    // Unreachable or without the scope: nothing is attributed, so the errors expire as "failed".
+    await stats.dispatch({ t: 'reconcile', tabId, blocked: r.ok ? r.value.entries.map((e) => ({ url: e.url, at: Date.parse(e.time), source: e.source_host })) : [], now: Date.now() });
+  }
+  function scheduleReconcile(tabId: number) {
+    if (timers.has(tabId)) return;
+    timers.set(tabId, setTimeout(() => { timers.delete(tabId); void reconcileTab(tabId); }, 1500));
+  }
+
   browser.runtime.onMessage.addListener(respondAsync((msg: { type?: string; tabId?: number }, sender: { id?: string }) => {
     if (msg?.type === 'interception' && msg.tabId !== undefined) {
       const enabled = proxy.getState().enabled;
       return Promise.resolve({ route: routes.route(msg.tabId, enabled), enabled });
+    }
+    if (msg?.type === 'tab-stats' && msg.tabId !== undefined) {
+      if (sender?.id !== browser.runtime.id) return undefined;
+      const id = msg.tabId;
+      return reconcileTab(id).then(() => stats.tab(id)).then((st) => ({ stats: { ...st, pending: [] } }));
     }
     if (msg?.type === 'proxy-get' || msg?.type === 'proxy-set' || msg?.type === 'store-token') {
       if (sender?.id !== browser.runtime.id) return undefined;

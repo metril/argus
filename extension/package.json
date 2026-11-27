@@ -22,6 +22,7 @@
   },
   "dependencies": {
     "@preact/signals": "^2.3.2",
-    "preact": "^10.27.2"
+    "preact": "^10.27.2",
+    "tldts": "^7.0.17"
   }
 }

@@ -42,6 +42,7 @@ scopes! {
     ListsWrite => "lists:write", "Add, edit, remove and refresh filter lists; change the update schedule.";
     RulesRead => "rules:read", "Read custom rules; validate rules and test URLs against the engine (no changes).";
     RulesWrite => "rules:write", "Replace the custom rules.";
+    RulesSite => "rules:site", "Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules.";
     EngineReload => "engine:reload", "Trigger a rebuild of the blocking engine.";
     StatsRead => "stats:read", "Read blocking, proxy and engine statistics.";
     LogsRead => "logs:read", "Read the request log, live and recent (full browsing history of every client the token may see).";
@@ -95,6 +96,7 @@ impl Scope {
                 self,
                 Scope::ListsWrite
                     | Scope::RulesWrite
+                    | Scope::RulesSite
                     | Scope::ScriptsWrite
                     | Scope::UserscriptsBridge
                     | Scope::PolicyWrite
@@ -141,6 +143,7 @@ pub const RESOURCES: &[Resource] = &[
         admin: false,
         levels: &[
             lv("Read", &[Scope::RulesRead]),
+            lv("Per-site switch", &[Scope::RulesSite]),
             lv("Read & write", &[Scope::RulesWrite]),
         ],
     },
@@ -284,7 +287,12 @@ impl Resource {
 }
 
 /// Template: scopes for a one-click preset.
-pub const TEMPLATE_BROWSER_EXTENSION: &[Scope] = &[Scope::LogsRead, Scope::UserscriptsBridge];
+pub const TEMPLATE_BROWSER_EXTENSION: &[Scope] = &[
+    Scope::LogsRead,
+    Scope::UserscriptsBridge,
+    Scope::StatsRead,
+    Scope::RulesSite,
+];
 pub const TEMPLATE_MONITORING: &[Scope] = &[Scope::StatsRead, Scope::SystemRead];
 
 impl fmt::Display for Scope {

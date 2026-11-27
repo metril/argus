@@ -69,20 +69,26 @@ pub fn finalize(spec: utoipa::openapi::OpenApi) -> (Value, RouteTable) {
                     .get("security")
                     .and_then(Value::as_array)
                     .is_some_and(|s| s.iter().any(|r| r.as_object().is_some_and(Map::is_empty)));
-                let scopes: Vec<Value> = op
+                // Each original requirement is an alternative; each is accepted with either
+                // credential, so emit one requirement per alternative for both schemes.
+                let alts: Vec<Vec<Value>> = op
                     .get("security")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .flat_map(|r| r.as_object().into_iter().flat_map(|o| o.values()))
-                    .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+                    .map(|r| {
+                        r.as_object()
+                            .into_iter()
+                            .flat_map(|o| o.values())
+                            .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+                            .collect()
+                    })
                     .collect();
                 if op.contains_key("security") && !public {
-                    // One declaration, two accepted credentials.
-                    op.insert(
-                        "security".into(),
-                        json!([{"bearer_auth": scopes}, {"cookie_auth": scopes}]),
-                    );
+                    let mut reqs: Vec<Value> =
+                        alts.iter().map(|s| json!({"bearer_auth": s})).collect();
+                    reqs.extend(alts.iter().map(|s| json!({"cookie_auth": s})));
+                    op.insert("security".into(), Value::Array(reqs));
                 }
                 let responses = op
                     .entry("responses")

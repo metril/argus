@@ -39,7 +39,15 @@ async fn mints_a_token_with_exactly_the_extension_scopes_and_no_session() {
         .map(|s| s.as_str().to_string())
         .collect();
     scopes.sort();
-    assert_eq!(scopes, ["logs:read", "userscripts:bridge"]);
+    assert_eq!(
+        scopes,
+        [
+            "logs:read",
+            "rules:site",
+            "stats:read",
+            "userscripts:bridge"
+        ]
+    );
     let me: Value = ctx.bearer("GET", "/api/v1/auth/me", secret).await.json();
     assert_eq!(me["username"], "alice");
 }
@@ -179,4 +187,133 @@ async fn expires_at_must_be_future_and_exclusive_with_days() {
         .unwrap()
         .to_string();
     assert!(at.starts_with("2998-12-31T22:00:00"), "{at}");
+}
+
+#[tokio::test]
+async fn extension_token_reads_stats_and_switches_sites_but_site_scope_is_narrow() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    ctx.user(&admin, "alice", "user").await;
+    let v: Value = mint(&ctx, "alice", json!({})).await.json();
+    let ext = v["token"].as_str().unwrap();
+    ctx.bearer("GET", "/api/v1/stats/filter", ext)
+        .await
+        .assert_status_ok();
+    ctx.bearer("GET", "/api/v1/stats/blocked/recent", ext)
+        .await
+        .assert_status_ok();
+    ctx.bearer("PUT", "/api/v1/rules/site-exceptions/shop.test", ext)
+        .await
+        .assert_status_ok();
+    let st: Value = ctx
+        .bearer("GET", "/api/v1/rules/site-exceptions/shop.test", ext)
+        .await
+        .json();
+    assert_eq!(st, json!({"site": "shop.test", "disabled": true}));
+    ctx.bearer("DELETE", "/api/v1/rules/site-exceptions/shop.test", ext)
+        .await
+        .assert_status_ok();
+    // A public suffix is refused: one click must not switch blocking off for a whole suffix.
+    for suffix in ["com", "co.uk", "herokuapp.com"] {
+        ctx.bearer(
+            "PUT",
+            &format!("/api/v1/rules/site-exceptions/{suffix}"),
+            ext,
+        )
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    }
+    ctx.bearer(
+        "PUT",
+        "/api/v1/rules/site-exceptions/foo.herokuapp.com",
+        ext,
+    )
+    .await
+    .assert_status_ok();
+    ctx.bearer(
+        "DELETE",
+        "/api/v1/rules/site-exceptions/foo.herokuapp.com",
+        ext,
+    )
+    .await
+    .assert_status_ok();
+    // rules:site does not open the rest of the rules.
+    ctx.bearer("PUT", "/api/v1/rules/custom", ext)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    // A token without rules:site is refused, with a scope error (the extension re-signs in).
+    let old = ctx
+        .token(&admin, &["logs:read", "userscripts:bridge"])
+        .await;
+    for m in ["GET", "PUT", "DELETE"] {
+        let r = ctx
+            .bearer(m, "/api/v1/rules/site-exceptions/shop.test", &old)
+            .await;
+        r.assert_status(StatusCode::FORBIDDEN);
+        assert_eq!(r.json::<Value>()["error"]["code"], "insufficient_scope");
+    }
+    ctx.bearer("GET", "/api/v1/stats/filter", &old)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn re_signing_in_upgrades_an_older_extension_token() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let alice = ctx.user(&admin, "alice", "user").await;
+    let r = alice
+        .post("/api/v1/tokens")
+        .json(&json!({"name": "Extension · Chrome", "scopes": ["logs:read", "userscripts:bridge"]}))
+        .await;
+    r.assert_status(StatusCode::CREATED);
+    let old: Value = r.json();
+    let (id, secret) = (
+        old["token"]["id"].as_str().unwrap(),
+        old["secret"].as_str().unwrap(),
+    );
+    let new: Value = mint(&ctx, "alice", json!({"replace_token_id": id}))
+        .await
+        .json();
+    ctx.bearer("GET", "/api/v1/auth/me", secret)
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+    ctx.bearer(
+        "GET",
+        "/api/v1/stats/filter",
+        new["token"].as_str().unwrap(),
+    )
+    .await
+    .assert_status_ok();
+}
+
+#[tokio::test]
+async fn rules_write_still_switches_sites_and_rules_site_still_cannot_edit_rules() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let w = ctx.token(&admin, &["rules:write"]).await;
+    for m in ["PUT", "DELETE"] {
+        ctx.bearer(m, "/api/v1/rules/site-exceptions/shop.test", &w)
+            .await
+            .assert_status_ok();
+    }
+    ctx.bearer("GET", "/api/v1/rules/site-exceptions/shop.test", &w)
+        .await
+        .assert_status_ok();
+    let r = ctx.token(&admin, &["rules:read"]).await;
+    ctx.bearer("GET", "/api/v1/rules/site-exceptions/shop.test", &r)
+        .await
+        .assert_status_ok();
+    ctx.bearer("PUT", "/api/v1/rules/site-exceptions/shop.test", &r)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    let site = ctx.token(&admin, &["rules:site"]).await;
+    ctx.bearer("PUT", "/api/v1/rules/custom", &site)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    // The web UI's session (role bundle) keeps working.
+    admin
+        .put("/api/v1/rules/site-exceptions/shop.test")
+        .await
+        .assert_status_ok();
 }

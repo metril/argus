@@ -371,3 +371,11 @@ pub struct PanelSettingsInput {
 pub struct SiteExceptionsResponse {
     pub sites: Vec<String>,
 }
+
+/// Whether ad blocking is switched off for one site.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SiteExceptionState {
+    pub site: String,
+    pub disabled: bool,
+}

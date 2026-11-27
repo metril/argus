@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 const P: &str = "/api/v1/profiles";
 const D: &str = "/api/v1/devices";
-const ALL_PROFILE_SCOPES: [&str; 10] = [
+const ALL_PROFILE_SCOPES: [&str; 11] = [
     "profiles:read",
     "profiles:write",
     "devices:read",
@@ -19,6 +19,7 @@ const ALL_PROFILE_SCOPES: [&str; 10] = [
     "scripts:write",
     "rules:read",
     "rules:write",
+    "rules:site",
 ];
 
 /// Mint a token restricted to `profiles` (ids) for `sess`.
@@ -405,6 +406,7 @@ async fn restricted_token_global_resources() {
         "lists:write",
         "rules:read",
         "rules:write",
+        "rules:site",
         "config:read",
         "config:write",
         "stats:read",

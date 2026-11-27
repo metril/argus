@@ -5604,6 +5604,7 @@
           "ListsWrite",
           "RulesRead",
           "RulesWrite",
+          "RulesSite",
           "EngineReload",
           "StatsRead",
           "LogsRead",
@@ -5696,6 +5697,22 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "SiteExceptionState": {
+        "description": "Whether ad blocking is switched off for one site.",
+        "properties": {
+          "disabled": {
+            "type": "boolean"
+          },
+          "site": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "site",
+          "disabled"
         ],
         "type": "object"
       },
@@ -8278,6 +8295,7 @@
       "profiles:read": "List and view filtering profiles (lists and overlay rules) the token may access.",
       "profiles:write": "Create, edit and delete filtering profiles.",
       "rules:read": "Read custom rules; validate rules and test URLs against the engine (no changes).",
+      "rules:site": "Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules.",
       "rules:write": "Replace the custom rules.",
       "scripts:read": "View userscripts and their source.",
       "scripts:write": "Install, update, enable, disable and remove userscripts; view and clear their stored values.",
@@ -17835,7 +17853,17 @@
         "security": [
           {
             "bearer_auth": [
+              "rules:site"
+            ]
+          },
+          {
+            "bearer_auth": [
               "rules:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:site"
             ]
           },
           {
@@ -17845,6 +17873,117 @@
           }
         ],
         "summary": "Switch ad blocking back on for a site.",
+        "tags": [
+          "rules"
+        ]
+      },
+      "get": {
+        "operationId": "get_site_exception",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Host name, lowercase punycode",
+            "in": "path",
+            "name": "site",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteExceptionState"
+                }
+              }
+            },
+            "description": "State of the site"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "rules:write"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "rules:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:read"
+            ]
+          }
+        ],
+        "summary": "Whether ad blocking is switched off for one site (readable with `rules:site`, so the browser\nextension needs no access to the rest of the rules).",
         "tags": [
           "rules"
         ]
@@ -17929,7 +18068,17 @@
         "security": [
           {
             "bearer_auth": [
+              "rules:site"
+            ]
+          },
+          {
+            "bearer_auth": [
               "rules:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:site"
             ]
           },
           {
