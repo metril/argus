@@ -207,7 +207,10 @@ fn spec_documents_security_errors_and_relative_server() {
                 assert!(op["responses"].get("401").is_none(), "{m} {path}");
             } else {
                 let sec = op["security"].as_array().unwrap();
-                assert_eq!(sec.len(), 2, "{m} {path} accepts bearer and cookie");
+                assert!(
+                    sec.len() >= 2 && sec.len() % 2 == 0,
+                    "{m} {path} accepts bearer and cookie"
+                );
                 assert_eq!(
                     op["responses"]["401"]["content"]["application/json"]["schema"]["$ref"],
                     "#/components/schemas/ErrorEnvelope"
@@ -221,6 +224,23 @@ fn spec_documents_security_errors_and_relative_server() {
         doc["components"]["x-scopes"].as_object().unwrap().len(),
         Scope::ALL.len()
     );
+}
+
+#[test]
+fn spec_emits_one_requirement_per_alternative_for_both_credentials() {
+    let (doc, table) = spec();
+    let sec = &doc["paths"]["/api/v1/rules/site-exceptions/{site}"]["put"]["security"];
+    assert_eq!(
+        sec,
+        &serde_json::json!([
+            {"bearer_auth": ["rules:site"]}, {"bearer_auth": ["rules:write"]},
+            {"cookie_auth": ["rules:site"]}, {"cookie_auth": ["rules:write"]},
+        ])
+    );
+    assert!(matches!(
+        table.get("PUT", "/api/v1/rules/site-exceptions/{site}"),
+        Some(RouteAuth::AnyOf(s)) if s.len() == 2
+    ));
 }
 
 // ------------------------------------------------------------------ (c) authorization matrix
@@ -278,7 +298,7 @@ async fn authorization_matrix_generated_from_the_spec() {
                 let s = send(&ctx, method, &url, None).await;
                 assert_ne!(s, StatusCode::FORBIDDEN, "{method} {path} (public)");
             }
-            RouteAuth::Authenticated | RouteAuth::Scopes(_) => {
+            RouteAuth::Authenticated | RouteAuth::Scopes(_) | RouteAuth::AnyOf(_) => {
                 // 1. no credentials -> 401
                 assert_eq!(
                     send(&ctx, method, &url, None).await,
@@ -306,6 +326,27 @@ async fn authorization_matrix_generated_from_the_spec() {
                         s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
                         "{method} {path} with exactly {exact:?} got {s}"
                     );
+                } else if let RouteAuth::AnyOf(any) = auth {
+                    // Alternatives: none of them -> 403; each one alone -> allowed.
+                    let others: Vec<&str> = all
+                        .iter()
+                        .copied()
+                        .filter(|s| !any.iter().any(|r| r.as_str() == *s))
+                        .collect();
+                    let secret = ctx.token(&admin, &others).await;
+                    assert_eq!(
+                        send(&ctx, method, &url, Some(&secret)).await,
+                        StatusCode::FORBIDDEN,
+                        "{method} {path} with none of {any:?}"
+                    );
+                    for one in any {
+                        let secret = ctx.token(&admin, &[one.as_str()]).await;
+                        let s = send(&ctx, method, &url, Some(&secret)).await;
+                        assert!(
+                            s != StatusCode::UNAUTHORIZED && s != StatusCode::FORBIDDEN,
+                            "{method} {path} with only {one} got {s}"
+                        );
+                    }
                 } else {
                     // Any authenticated principal passes.
                     let secret = ctx.token(&admin, &["lists:read"]).await;

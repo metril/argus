@@ -82,3 +82,30 @@ export function hostOf(url?: string): string | null {
   } catch { return null; }
 }
 
+export type FilterStats = components['schemas']['FilterStatsResponse'];
+
+/** Result of an authenticated JSON call; `scope` means the token lacks a scope (an older extension token). */
+export type Call<T> = { ok: true; value: T } | { ok: false; scope: boolean; status: number };
+
+async function call<T>(s: Settings, method: string, path: string, signal?: AbortSignal): Promise<Call<T>> {
+  if (!s.argusUrl || !s.token) return { ok: false, scope: false, status: 0 };
+  try {
+    const res = await fetch(`${s.argusUrl}/api/v1${path}`, { method, headers: { Authorization: `Bearer ${s.token}` }, ...(signal ? { signal } : {}) });
+    if (res.ok) return { ok: true, value: (await res.json()) as T };
+    let scope = false;
+    if (res.status === 403 && isJson(res)) {
+      try { scope = (await res.json())?.error?.code === 'insufficient_scope'; } catch { /* not the envelope */ }
+    }
+    return { ok: false, scope, status: res.status };
+  } catch {
+    return { ok: false, scope: false, status: 0 };
+  }
+}
+
+export const fetchFilterStats = (s: Settings, signal?: AbortSignal) => call<FilterStats>(s, 'GET', '/stats/filter', signal);
+export const fetchRecentBlocked = (s: Settings) => call<{ entries: { url: string; time: string; source_host?: string | null }[] }>(s, 'GET', '/stats/blocked/recent?limit=200');
+const siteUrl = (site: string) => `/rules/site-exceptions/${encodeURIComponent(site)}`;
+export const getSiteState = (s: Settings, site: string, signal?: AbortSignal) => call<{ site: string; disabled: boolean }>(s, 'GET', siteUrl(site), signal);
+/** `off` switches ad blocking off for the site (PUT), otherwise back on (DELETE). */
+export const setSiteOff = (s: Settings, site: string, off: boolean) => call<{ sites: string[] }>(s, off ? 'PUT' : 'DELETE', siteUrl(site));
+

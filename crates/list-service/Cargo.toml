@@ -26,6 +26,7 @@ async-compression = { workspace = true, features = ["zstd"] }
 tokio-util = { workspace = true }
 minisign-verify = "0.3"
 url = { workspace = true }
+psl = "2"
 minisign = { version = "0.7", optional = true }
 
 [features]

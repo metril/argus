@@ -37,7 +37,7 @@ omit both for a token that never expires.
 `POST /auth/extension-token` `{username, password, browser, replace_token_id?}` checks the
 credentials like login (same rate limit, no session, no cookies) and returns
 `{token, token_id, user}`: a never-expiring token named `Extension · {browser}` with exactly
-`logs:read` and `userscripts:bridge`. 401 for wrong credentials, 403 `insufficient_role` when the
+`logs:read`, `userscripts:bridge`, `stats:read` and `rules:site`. 401 for wrong credentials, 403 `insufficient_role` when the
 role lacks either scope. `replace_token_id` revokes that token if it is the caller's own (anyone
 else's id is ignored). `DELETE /tokens/self` lets any API token revoke itself (400 for a cookie
 session). Both routes accept extension origins (CORS); `GET /downloads/extension/chrome` adds an
@@ -55,6 +55,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `lists:write` | - | yes | yes | Add, edit, remove and refresh filter lists; change the update schedule. |
 | `rules:read` | yes | yes | yes | Read custom rules; validate rules and test URLs against the engine (no changes). |
 | `rules:write` | - | yes | yes | Replace the custom rules. |
+| `rules:site` | - | yes | yes | Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules. |
 | `engine:reload` | - | - | yes | Trigger a rebuild of the blocking engine. |
 | `stats:read` | yes | yes | yes | Read blocking, proxy and engine statistics. |
 | `logs:read` | - | yes | yes | Read the request log, live and recent (full browsing history of every client the token may see). |
@@ -230,7 +231,7 @@ for the model. Routes take `?profile=<id>` (default `0`) and writes are audited.
 | `GET /policy/reports?site=` | read | Blocked sources per page for one-click allow, fed by the proxy's blocks and the browsers' violation reports of the policy the proxy added. |
 | `GET`, `PUT /policy/panel` | read / write | In-page panel: `enabled` (per profile, off by default), `hotkey` (default `Alt+Shift+A`; modifiers plus one key, with Alt, Ctrl or Meta), `menu_button` (`off`, `on_demand` default, `always`: corner button for userscript menu commands, independent of `enabled`), `auth` (`pin` default, `session`, `none`), `pin` (4 to 64 characters; write-only, `pin_set` says whether one is set), `clear_pin`. Returns `reserved_host`. |
 | `GET /rules/site-exceptions` | `rules:read` | Sites with ad blocking switched off. |
-| `PUT`, `DELETE /rules/site-exceptions/{site}` | `rules:write` | Switch ad blocking off or on for a site (a host name, lowercase punycode). Stored as custom rules (`@@$domain=site` plus the sentinel `\|\|adblock.invalid^`), so they appear in `GET /rules/custom`. |
+| `GET`, `PUT`, `DELETE /rules/site-exceptions/{site}` | `rules:site` or `rules:write` | Switch ad blocking off or on for a site (a host name, lowercase punycode). Stored as custom rules (`@@$domain=site` plus the sentinel `\|\|adblock.invalid^`), so they appear in `GET /rules/custom`. |
 
 Deployment settings are in `[script_control]` (`panel_enabled`, `panel_host`, `dashboard_url`). The
 panel's own endpoints (`/__adblock__/panel/state`, `/__adblock__/pv`, and the reserved host) are

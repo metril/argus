@@ -17,7 +17,11 @@ pub fn exception_line(site: &str) -> Option<String> {
 }
 
 fn valid(site: &str) -> bool {
-    let ok = !site.is_empty()
+    // A public suffix (`com`, `co.uk`, `herokuapp.com`) would switch blocking off for everyone
+    // under it. Unknown names (`localhost`, IPs) are not suffixes and stay allowed.
+    let is_suffix = psl::suffix(site.as_bytes()).is_some_and(|s| s.is_known() && s.as_bytes() == site.as_bytes());
+    let ok = !is_suffix
+        && !site.is_empty()
         && site.len() <= 253
         && !site.starts_with(['.', '-'])
         && !site.ends_with(['.', '-'])
@@ -98,6 +102,16 @@ mod tests {
             set("", "a.test", true).unwrap(),
             format!("@@$domain=a.test\n{SENTINEL}\n")
         );
+    }
+
+    #[test]
+    fn public_suffixes_are_refused() {
+        for bad in ["com", "co.uk", "gov.au", "com.pl", "herokuapp.com", "github.io"] {
+            assert!(set("", bad, true).is_none(), "{bad:?}");
+        }
+        for ok in ["shop.com.pl", "x.gov.au", "foo.herokuapp.com", "localhost", "10.0.0.1"] {
+            assert!(set("", ok, true).is_some(), "{ok:?}");
+        }
     }
 
     #[test]

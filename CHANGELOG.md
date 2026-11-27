@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Extension popup: "Blocked on this page" (count and share of requests), the domains the page connected to with blocked/allowed counts, and the proxy's blocked/total since start. The toolbar badge shows the page's blocked count (its colour still shows the certificate state; `!` for a problem). Counters are per tab, reset on navigation, kept in `storage.session`. Requests the proxy aborts (default `block_response = fail`) are attributed through `GET /stats/blocked/recent`; unexplained network errors are not counted as blocks.
+- Extension popup: "Argus on this site" switch (per registrable domain) using the site exceptions, with a reload offer. The popup now re-reads every card when the active tab navigates or changes (previously only the route line did), and drops late answers for the old page.
+- New scope `rules:site`: switch ad blocking off or on for one site (`GET`/`PUT`/`DELETE /rules/site-exceptions/{site}`, `GET` is new), without access to the rest of the rules. Part of the User role; `rules:write` still works on all three, `GET` also accepts `rules:read`.
+- Extension tokens now carry `logs:read`, `userscripts:bridge`, `stats:read` and `rules:site`. An older extension token gets a "Sign in again" notice in the popup; signing in replaces and revokes it.
+
 ## 0.9.3 — 2026-11-27
 
 - Domain-set compression: a plain `||host^` rule is dropped at build time when a shorter suffix rule from any list already covers it (exact `|scheme://host^` rules are never touched). Decisions and attribution are unchanged; the count is reported per list as `compressed` (list report, build summary, Filters page). On HaGeZi Pro+Ultimate with EasyList and EasyPrivacy the set shrinks from 338k to 311k entries.

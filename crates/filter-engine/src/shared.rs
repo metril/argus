@@ -1144,6 +1144,44 @@ mod tests {
     }
 
     #[test]
+    fn aborted_blocks_reach_the_recent_blocked_ring_with_their_url() {
+        use crate::events::{EventAction, EventMode, EventOutcome, EventRef};
+        let e = SharedEngine::new();
+        e.install(compile_engine(&["||ads.test^$script\n".to_string()]));
+        // The engine records the block itself, whatever the proxy then does with the response.
+        assert!(
+            e.check("https://ads.test/p.js?id=1", "https://page.test/", "script")
+                .blocked
+        );
+        // The proxy records the abort for the extended-rule path with the Aborted outcome.
+        e.record_request(&EventRef {
+            action: EventAction::Blocked,
+            method: "GET",
+            url: "https://trk.test/b.js?x=1#f",
+            source_host: "page.test",
+            request_type: "script",
+            rule: "||trk.test^",
+            list_id: None,
+            client: None,
+            status: None,
+            mode: EventMode::Explicit,
+            error_kind: None,
+            cert_fp: None,
+            outcome: Some(EventOutcome::Aborted),
+        });
+        let urls: Vec<String> = e.recent_blocked(10).into_iter().map(|r| r.url).collect();
+        // Query strings and fragments are stripped before storage (they can hold secrets).
+        assert!(
+            urls.contains(&"https://ads.test/p.js".to_string()),
+            "{urls:?}"
+        );
+        assert!(
+            urls.contains(&"https://trk.test/b.js".to_string()),
+            "{urls:?}"
+        );
+    }
+
+    #[test]
     fn shared_stats_log_and_switch_across_engines() {
         let a = SharedEngine::new();
         let b = SharedEngine::with_shared(a.stats_handle(), a.block_log_handle(), a.enabled_flag());

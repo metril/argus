@@ -88,6 +88,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(rules::get_custom_report))
         .routes(routes!(rules::list_site_exceptions))
         .routes(routes!(
+            rules::get_site_exception,
             rules::put_site_exception,
             rules::delete_site_exception
         ))

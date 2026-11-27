@@ -286,9 +286,11 @@ pub async fn login(
 }
 
 /// Scopes of an extension token: what the popup and the userscript bridge need, nothing else.
-const EXTENSION_SCOPES: [api_types::Scope; 2] = [
+const EXTENSION_SCOPES: [api_types::Scope; 4] = [
     api_types::Scope::LogsRead,
     api_types::Scope::UserscriptsBridge,
+    api_types::Scope::StatsRead,
+    api_types::Scope::RulesSite,
 ];
 
 /// Sign in from the browser extension: the same credential check and rate limit as login, but no
@@ -353,16 +355,14 @@ pub async fn extension_token(
             None,
         )?;
         // Only the caller's own extension tokens may be replaced.
-        let mut want = EXTENSION_SCOPES.to_vec();
-        want.sort();
+        let want = EXTENSION_SCOPES.to_vec();
         let replaced = match replace {
             Some(id)
                 if st.tokens.get(&id).is_some_and(|t| {
-                    let mut have = t.stored.scopes.clone();
-                    have.sort();
+                    // A subset: tokens minted by an older version (fewer scopes) upgrade here.
                     t.stored.created_by == uid
                         && t.stored.name.starts_with("Extension · ")
-                        && have == want
+                        && t.stored.scopes.iter().all(|s| want.contains(s))
                 }) =>
             {
                 st.tokens.revoke(&id)?;

@@ -283,6 +283,25 @@ pub async fn list_site_exceptions(
     }))
 }
 
+/// Whether ad blocking is switched off for one site (readable with `rules:site`, so the browser
+/// extension needs no access to the rest of the rules).
+#[utoipa::path(
+    get, path = "/rules/site-exceptions/{site}", tag = "rules",
+    security(("bearer_auth" = ["rules:site"]), ("bearer_auth" = ["rules:write"]), ("bearer_auth" = ["rules:read"])),
+    params(ProfileQuery, ("site" = String, Path, description = "Host name, lowercase punycode")),
+    responses((status = 200, description = "State of the site", body = api_types::SiteExceptionState))
+)]
+pub async fn get_site_exception(
+    State(state): State<Arc<AppState>>,
+    profile: ProfileParam,
+    crate::error::ApiPath(site): crate::error::ApiPath<String>,
+) -> ApiResult<Json<api_types::SiteExceptionState>> {
+    let st = state.clone();
+    let rules = blocking(move || profile_rules(&st, profile.id)).await?;
+    let disabled = list_service::site_exceptions::list(&rules).contains(&site);
+    Ok(Json(api_types::SiteExceptionState { site, disabled }))
+}
+
 /// The rules text exceptions live in: the global custom rules for the default profile, the
 /// profile's overlay rules otherwise.
 fn profile_rules(st: &AppState, id: u64) -> ApiResult<String> {
@@ -341,7 +360,7 @@ async fn set_site_exception(
 /// Switch ad blocking off for a site (document exception in the custom rules).
 #[utoipa::path(
     put, path = "/rules/site-exceptions/{site}", tag = "rules",
-    security(("bearer_auth" = ["rules:write"])),
+    security(("bearer_auth" = ["rules:site"]), ("bearer_auth" = ["rules:write"])),
     params(ProfileQuery, ("site" = String, Path, description = "Host name, lowercase punycode")),
     responses(
         (status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse),
@@ -360,7 +379,7 @@ pub async fn put_site_exception(
 /// Switch ad blocking back on for a site.
 #[utoipa::path(
     delete, path = "/rules/site-exceptions/{site}", tag = "rules",
-    security(("bearer_auth" = ["rules:write"])),
+    security(("bearer_auth" = ["rules:site"]), ("bearer_auth" = ["rules:write"])),
     params(ProfileQuery, ("site" = String, Path, description = "Host name, lowercase punycode")),
     responses(
         (status = 200, description = "Sites with ad blocking off", body = api_types::SiteExceptionsResponse),
