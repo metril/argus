@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Prepares a freshly started Argus container for the parity run: waits until it is healthy, creates the
 # first admin, switches the filter lists to the uBOL-equivalent default set (uBlock filters, badware,
-# privacy, quick-fixes, unbreak, EasyList, EasyPrivacy, Peter Lowe's, uBO's urlhaus-1), waits for the engine build and
+# privacy, quick-fixes, unbreak, EasyList, EasyPrivacy, Peter Lowe's, uBO's urlhaus-1) plus AdGuard Windows' defaults
+# (AdGuard Base, Tracking Protection, URL Tracking, Mobile Ads), waits for the engine build and
 # downloads the root CA.
 #   argus-ci-setup.sh <web-ui-base-url> <ca-out-file>      e.g. http://127.0.0.1:3000 /tmp/argus-ca.crt
 # LIST_SET_REGEX overrides which list names stay enabled (case-insensitive extended regex).
 set -euo pipefail
 base="${1:?web ui base url}"; ca_out="${2:?ca output file}"
 api="$base/api/v1"
-keep="${LIST_SET_REGEX:-^(ublock.*(filters|badware|privacy|quick|unbreak)|easylist|easyprivacy|peter lowe)}"
+keep="${LIST_SET_REGEX:-^(ublock.*(filters|badware|privacy|quick|unbreak)|easylist|easyprivacy|peter lowe|adguard (base|tracking protection|url tracking|mobile ads))}"
 jar="$(mktemp)"; trap 'rm -f "$jar"' EXIT
 
 for i in $(seq 1 90); do curl -fsS "$api/health" >/dev/null 2>&1 && break; sleep 2; [ "$i" = 90 ] && { echo "argus never became healthy" >&2; exit 1; }; done
@@ -25,7 +26,7 @@ echo "$lists" | jq -r '.items[] | "\(.enabled)\t\(.name)"' | sed 's/^/before: /'
 echo "$lists" | jq -c '.items[]' | while read -r l; do
   id="$(jq -r .id <<<"$l")"; name="$(jq -r .name <<<"$l")"
   if echo "$name" | grep -Eiq "$keep"; then
-    trusted=false; echo "$name" | grep -Eiq '^ublock' && trusted=true
+    trusted=false; echo "$name" | grep -Eiq "^(ublock|adguard)" && trusted=true
     call -X PUT -d "{\"enabled\":true,\"trusted\":$trusted}" "$api/lists/$id" >/dev/null
   else
     call -X PUT -d '{"enabled":false}' "$api/lists/$id" >/dev/null

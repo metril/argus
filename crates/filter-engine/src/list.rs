@@ -70,13 +70,23 @@ pub fn is_known_trusted_source(url: &str) -> bool {
             "filters" | "privacy" | "badware" | "quick-fixes" | "unbreak" | "resource-abuse"
         );
     }
+    // AdGuard's own numbered filters: 2 Base, 3 Tracking Protection, 11 Mobile Ads, 17 URL Tracking.
     u.strip_prefix("https://filters.adtidy.org/")
         .is_some_and(|r| {
-            r.ends_with("/filters/2.txt") || r.ends_with("/filters/2_without_easylist.txt")
+            let Some((_, f)) = r.rsplit_once("/filters/") else {
+                return false;
+            };
+            matches!(
+                f,
+                "2.txt" | "2_without_easylist.txt" | "3.txt" | "11.txt" | "17.txt"
+            )
         })
 }
 
-/// The default filter lists seeded for a fresh install: uBlock Origin Lite's default set.
+/// The default filter lists seeded for a fresh install: the union of uBlock Origin Lite's default
+/// set and AdGuard for Windows' recommended lists (Base, Tracking Protection, URL Tracking, Mobile
+/// Ads). AdGuard Annoyances and Social Media are left out on purpose: they break embeds, chat
+/// widgets and logins. Existing installs keep their set.
 ///
 /// Single source of truth, shared by the in-memory manager and the persistent store so both agree
 /// on what "the defaults" are.
@@ -86,6 +96,16 @@ pub fn default_filter_lists() -> Vec<FilterList> {
         let mut l = FilterList::new(id.into(), name.into(), format!("{UBO}/{file}"));
         l.format = ListFormat::Ubo;
         l.trusted = true;
+        l
+    };
+    let adguard = |id: &str, name: &str, file: &str| {
+        let mut l = FilterList::new(
+            id.into(),
+            name.into(),
+            format!("https://filters.adtidy.org/extension/ublock/filters/{file}"),
+        );
+        l.format = ListFormat::Ubo;
+        l.trusted = is_known_trusted_source(&l.url);
         l
     };
     let mut easylist = FilterList::new(
@@ -132,6 +152,22 @@ pub fn default_filter_lists() -> Vec<FilterList> {
         easylist,
         easyprivacy,
         lowe,
+        adguard(
+            "adguard-base",
+            "AdGuard Base filter",
+            "2_without_easylist.txt",
+        ),
+        adguard(
+            "adguard-tracking",
+            "AdGuard Tracking Protection filter",
+            "3.txt",
+        ),
+        adguard(
+            "adguard-url-tracking",
+            "AdGuard URL Tracking filter",
+            "17.txt",
+        ),
+        adguard("adguard-mobile", "AdGuard Mobile Ads filter", "11.txt"),
     ]
 }
 

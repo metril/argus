@@ -592,11 +592,16 @@ mod tests {
             "easylist",
             "easyprivacy",
             "peter-lowe",
+            "adguard-base",
+            "adguard-tracking",
+            "adguard-url-tracking",
+            "adguard-mobile",
         ] {
             assert!(ids.contains(id), "{id}");
         }
         for l in &all {
-            assert_eq!(l.trusted, l.id.starts_with("ublock-"), "{}", l.id);
+            let official = l.id.starts_with("ublock-") || l.id.starts_with("adguard-");
+            assert_eq!(l.trusted, official, "{}", l.id);
         }
     }
 
