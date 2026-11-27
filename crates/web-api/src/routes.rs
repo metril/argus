@@ -66,6 +66,10 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(lists::refresh_all_lists))
         .routes(routes!(lists::get_catalogue))
         .routes(routes!(lists::add_from_catalogue))
+        .routes(routes!(
+            lists::get_blocking_profile,
+            lists::put_blocking_profile
+        ))
         .routes(routes!(lists::get_schedule, lists::put_schedule))
         .routes(routes!(
             lists::get_filter_list,

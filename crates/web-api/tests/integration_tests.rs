@@ -1589,3 +1589,68 @@ async fn recent_blocked_urls_drop_query_strings_and_need_stats_read() {
         .await
         .assert_status_forbidden();
 }
+
+#[tokio::test]
+async fn strict_profile_toggles_live_and_only_touches_its_own_lists() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let ids = |v: &Value| -> Vec<String> {
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    admin
+        .post("/api/v1/lists")
+        .json(&json!({"id": "mine", "name": "Mine", "url": "https://example.com/x.txt", "enabled": false}))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let before = ids(&admin.get("/api/v1/lists?limit=200").await.json());
+
+    let p: Value = admin.get("/api/v1/lists/profile").await.json();
+    assert_eq!(p["mode"], "default");
+
+    admin
+        .put("/api/v1/lists/profile")
+        .json(&json!({"mode": "bogus"}))
+        .await
+        .assert_status_bad_request();
+
+    let p: Value = admin
+        .put("/api/v1/lists/profile")
+        .json(&json!({"mode": "strict"}))
+        .await
+        .json();
+    assert_eq!(p["mode"], "strict");
+    // argus-extra stays pending (fail-safe) while the signed catalogue has not loaded.
+    assert_eq!(p["pending"], json!(["argus-extra"]));
+    let now = ids(&admin.get("/api/v1/lists?limit=200").await.json());
+    for id in [
+        "adguard-annoyances",
+        "adguard-social",
+        "easylist-cookie",
+        "fanboy-social",
+        "ublock-annoyances",
+    ] {
+        assert!(now.contains(&id.to_string()), "{id} missing");
+        let l: Value = admin.get(&format!("/api/v1/lists/{id}")).await.json();
+        assert_eq!(l["enabled"], true, "{id}");
+    }
+    assert!(!now.contains(&"argus-extra".to_string()));
+    let p: Value = admin.get("/api/v1/lists/profile").await.json();
+    assert_eq!(p["mode"], "strict", "persisted");
+
+    let p: Value = admin
+        .put("/api/v1/lists/profile")
+        .json(&json!({"mode": "default"}))
+        .await
+        .json();
+    assert_eq!(p["mode"], "default");
+    let mut after = ids(&admin.get("/api/v1/lists?limit=200").await.json());
+    let mut before = before;
+    after.sort();
+    before.sort();
+    assert_eq!(after, before, "only Strict's lists are removed");
+}

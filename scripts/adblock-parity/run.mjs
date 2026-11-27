@@ -16,6 +16,7 @@ import { SITES, extractorSource } from './sites.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]?.startsWith('--') || all[i + 1] === undefined ? 'true' : all[i + 1]]] : a), []));
 const blocker = args.blocker || 'none';
+const isArgus = blocker === 'argus' || blocker === 'argus-strict';
 const browser = args.browser || 'chrome';
 const proxy = args.proxy || process.env.ARGUS_PROXY;
 const caPath = args.ca || process.env.ARGUS_CA;
@@ -30,7 +31,7 @@ const writeDoc = (d) => { fs.mkdirSync(path.dirname(out), { recursive: true }); 
 const unavailableDoc = (reason) => ({ blocker, browser, platform: process.platform, unavailable: reason, results: [], finished: new Date().toISOString() });
 if (args.unavailable) { writeDoc(unavailableDoc(args.unavailable)); process.exit(0); }
 
-if (blocker === 'argus' && (!proxy || !caPath)) throw new Error('argus needs --proxy host:port and --ca <root CA pem>');
+if (isArgus && (!proxy || !caPath)) throw new Error('argus needs --proxy host:port and --ca <root CA pem>');
 if (!['chrome', 'firefox'].includes(browser)) throw new Error('--browser chrome|firefox');
 
 // Canary: an ad host every blocker in the matrix blocks. Two probes from a normal http origin, both polled:
@@ -73,7 +74,7 @@ const canaryFor = (isArgus, scriptOnly = false) => `(async () => {
 // AdGuard's Firefox extension (MV2) filters <script> loads on these hosts but, in CI, let no-cors fetches through
 // (pubmatic blocked; googlesyndication/adservice fetch 'reached' for the full 120s). Its engine is up when the
 // script probe is blocked, so judge readiness on the script probe there; per-site scoring is unaffected.
-const CANARY = canaryFor(blocker === 'argus', blocker === 'adguard-ext' && browser === 'firefox');
+const CANARY = canaryFor(isArgus, blocker === 'adguard-ext' && browser === 'firefox');
 // Control request: must keep working on every site run, else the run is discarded and retried once. It is a
 // same-origin fetch of the test page's own URL: no list can scope a rule to "third-party requests from this
 // site" onto it (AdGuard Base ships `*$3p,domain=adblock.turtlecute.org|paileactivist.github.io`, which blocks any
@@ -149,7 +150,7 @@ async function runChrome() {
     extVersion = e.version;
     a.push(`--disable-extensions-except=${e.path}`, `--load-extension=${e.path}`);
   }
-  if (blocker === 'argus') {
+  if (isArgus) {
     a.push(`--proxy-server=http://${proxy}`);
     if (!nssImport(path.join(home, '.pki', 'nssdb'), caPath)) throw new Error('certutil (libnss3-tools) is required to trust the Argus CA');
   }
@@ -203,7 +204,7 @@ async function runFirefox() {
   const opts = new firefox.Options();
   opts.addArguments('-headless', '-profile', profile);
   if (process.env.FIREFOX_BIN) opts.setBinary(process.env.FIREFOX_BIN);
-  if (blocker === 'argus') {
+  if (isArgus) {
     if (!nssImport(profile, caPath)) throw new Error('certutil (libnss3-tools) is required to trust the Argus CA in the Firefox profile');
     const [h, p] = [proxy.split(':')[0], +proxy.split(':')[1]];
     for (const [k, v] of Object.entries({ 'network.proxy.type': 1, 'network.proxy.http': h, 'network.proxy.http_port': p, 'network.proxy.ssl': h, 'network.proxy.ssl_port': p, 'network.proxy.no_proxies_on': '' })) opts.setPreference(k, v);
@@ -284,4 +285,4 @@ async function measure(site, fn) {
 const started = new Date().toISOString();
 const r = await (browser === 'chrome' ? runChrome() : runFirefox());
 if (r.unavailable) { log('baseline unavailable:', r.unavailable); writeDoc(unavailableDoc(r.unavailable)); process.exit(0); }
-writeDoc({ blocker, browser, platform: process.platform, proxy: blocker === 'argus' ? proxy : null, extensionVersion: r.extVersion, userAgent: r.ua, canaryBlocked: !!r.ready, canary: lastCanary, started, finished: new Date().toISOString(), results: r.results });
+writeDoc({ blocker, browser, platform: process.platform, proxy: isArgus ? proxy : null, extensionVersion: r.extVersion, userAgent: r.ua, canaryBlocked: !!r.ready, canary: lastCanary, started, finished: new Date().toISOString(), results: r.results });

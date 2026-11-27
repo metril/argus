@@ -89,6 +89,10 @@ pub struct FilterCatalogueEntry {
     /// uBlock Origin's lists and AdGuard Base.
     #[serde(default, deserialize_with = "null_default")]
     pub trusted: bool,
+    /// `"strict"`: only added by the opt-in Strict profile, never seeded. Missing, null or any
+    /// other value is an ordinary entry.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl CatalogueEntry for FilterCatalogueEntry {
@@ -105,6 +109,11 @@ impl CatalogueEntry for FilterCatalogueEntry {
 }
 
 impl FilterCatalogueEntry {
+    /// Part of the Strict profile.
+    pub fn is_strict(&self) -> bool {
+        self.profile.as_deref() == Some(filter_engine::PROFILE_STRICT)
+    }
+
     /// The list format this entry maps to (`None`: not one we can add).
     pub fn list_format(&self) -> Option<filter_engine::ListFormat> {
         use filter_engine::ListFormat as F;

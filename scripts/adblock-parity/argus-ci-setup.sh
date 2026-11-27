@@ -5,6 +5,8 @@
 # (AdGuard Base, Tracking Protection, URL Tracking, Mobile Ads), waits for the engine build and
 # downloads the root CA.
 #   argus-ci-setup.sh <web-ui-base-url> <ca-out-file>      e.g. http://127.0.0.1:3000 /tmp/argus-ca.crt
+# ARGUS_PROFILE=strict additionally switches on the opt-in Strict blocking profile (extra annoyance,
+# cookie, social and tracker lists; used by the informational argus-strict shard).
 # LIST_SET_REGEX overrides which list names stay enabled (case-insensitive extended regex).
 set -euo pipefail
 base="${1:?web ui base url}"; ca_out="${2:?ca output file}"
@@ -36,6 +38,10 @@ done
 # crates/filter-engine/src/list.rs), so it is added as a custom list with uAssets' contentURL for that id.
 urlhaus='{"id":"urlhaus-1","name":"Online Malicious URL Blocklist","url":"https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt","enabled":true,"format":"abp","allowlist":false,"trusted":false}'
 call -X POST -d "$urlhaus" "$api/lists" >/dev/null || call -X PUT -d '{"enabled":true}' "$api/lists/urlhaus-1" >/dev/null
+# After the keep/disable loop, so the Strict lists stay on. The default shard never sets this.
+if [ "${ARGUS_PROFILE:-}" = strict ]; then
+  call -X PUT -d '{"mode":"strict"}' "$api/lists/profile" | jq -c '{mode,pending}'
+fi
 call -X POST "$api/lists/refresh" >/dev/null || true
 
 # Engine ready: a build has completed, none is running, scriptlets loaded.

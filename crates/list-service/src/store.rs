@@ -54,6 +54,8 @@ pub struct ListStore {
     blobs: PathBuf,
     /// Serialises blob writes against garbage collection.
     blob_lock: Mutex<()>,
+    /// Serialises whole Strict-profile operations.
+    pub(crate) strict_lock: Mutex<()>,
 }
 
 fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -99,6 +101,7 @@ impl ListStore {
             db,
             blobs,
             blob_lock: Mutex::new(()),
+            strict_lock: Mutex::new(()),
         };
         if let Err(e) = store.gc_blobs() {
             warn!("blob garbage collection failed: {e}");
@@ -150,6 +153,14 @@ impl ListStore {
             let v = t.get(key).map_err(db_err)?.map(|g| g.value().to_vec());
             Ok(v)
         })
+    }
+
+    pub(crate) fn get_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.get_raw(tables::META, key)
+    }
+
+    pub(crate) fn put_meta(&self, key: &str, v: &[u8]) -> Result<()> {
+        self.put_raw(tables::META, key, v, Durability::Immediate)
     }
 
     pub fn get_custom_rules(&self) -> Result<String> {
@@ -361,6 +372,66 @@ impl ListStore {
         self.put_raw(tables::LISTS, &list.id, &ser(list)?, Durability::Eventual)
     }
 
+    /// Read-modify-write one list in a single transaction, as currently stored. A deleted list is
+    /// skipped (`false`), never resurrected. For fetch results: `f` must only touch fetch
+    /// metadata, never `enabled`.
+    pub fn update_list(&self, id: &str, f: impl FnOnce(&mut FilterList)) -> Result<bool> {
+        self.wtx(Durability::Eventual, |t| {
+            let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
+            let cur = tb.get(id).map_err(db_err)?.map(|g| g.value().to_vec());
+            let Some(cur) = cur else { return Ok(false) };
+            let mut l: FilterList = de(&cur)?;
+            f(&mut l);
+            tb.insert(id, ser(&l)?.as_slice()).map_err(db_err)?;
+            Ok(true)
+        })
+    }
+
+    /// Strict enable in ONE transaction: the list changes and the state record commit together,
+    /// so a crash never leaves lists Strict owns unrecorded.
+    pub(crate) fn strict_enable_tx(
+        &self,
+        key: &str,
+        wanted: Vec<FilterList>,
+        mut st: crate::StrictState,
+    ) -> Result<crate::StrictState> {
+        self.wtx(Durability::Immediate, |t| {
+            {
+                let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
+                for l in &wanted {
+                    let cur = tb
+                        .get(l.id.as_str())
+                        .map_err(db_err)?
+                        .map(|g| g.value().to_vec());
+                    match cur {
+                        None => {
+                            tb.insert(l.id.as_str(), ser(l)?.as_slice())
+                                .map_err(db_err)?;
+                            st.added.insert(l.id.clone());
+                        }
+                        Some(b) => {
+                            let mut cur: FilterList = de(&b)?;
+                            if !cur.enabled {
+                                cur.enabled = true;
+                                tb.insert(l.id.as_str(), ser(&cur)?.as_slice())
+                                    .map_err(db_err)?;
+                                if !st.added.contains(&l.id) {
+                                    st.enabled.insert(l.id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            st.active = true;
+            t.open_table(tables::META)
+                .map_err(db_err)?
+                .insert(key, ser(&st)?.as_slice())
+                .map_err(db_err)?;
+            Ok(st)
+        })
+    }
+
     /// Store a list definition durably (user-initiated; call from a blocking context).
     pub fn upsert_durable(&self, list: &FilterList) -> Result<()> {
         self.put_raw(tables::LISTS, &list.id, &ser(list)?, Durability::Immediate)
@@ -484,7 +555,13 @@ impl ListStore {
 
     /// Seed the default lists on a fresh install (no-op if any list exists), in one transaction.
     pub fn seed_defaults_if_empty(&self) -> Result<()> {
-        let defaults = default_filter_lists();
+        // Strict-profile entries are opt-in: never part of a seed.
+        let strict: Vec<String> = filter_engine::strict_catalogue_lists()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        let mut defaults = default_filter_lists();
+        defaults.retain(|l| !strict.contains(&l.id));
         let seeded = self.wtx(Durability::Immediate, |t| {
             let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
             if !tb.is_empty().map_err(db_err)? {
