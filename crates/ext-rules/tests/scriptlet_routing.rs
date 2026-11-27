@@ -63,11 +63,17 @@ fn scriptlet_arguments_unescape_and_keep_inner_empties() {
 #[test]
 fn domain_scoped_and_excepted() {
     let rules = ["a.example##+js(no-topics)", "b.example#@#+js(no-topics)"];
-    assert_eq!(plan_injections(&rules, false, "https://a.example/").len(), 1);
+    assert_eq!(
+        plan_injections(&rules, false, "https://a.example/").len(),
+        1
+    );
     assert!(plan_injections(&rules, false, "https://c.example/").is_empty());
     let rules = ["##+js(no-topics)", "b.example#@#+js(no-topics)"];
     assert!(plan_injections(&rules, false, "https://b.example/").is_empty());
-    assert_eq!(plan_injections(&rules, false, "https://a.example/").len(), 1);
+    assert_eq!(
+        plan_injections(&rules, false, "https://a.example/").len(),
+        1
+    );
 }
 
 #[test]
@@ -130,7 +136,10 @@ fn remove_forms_are_remove_actions() {
     );
     assert_eq!(
         procedural(&inj),
-        [(".promo".to_string(), Some("margin: 0 !important".to_string()))]
+        [(
+            ".promo".to_string(),
+            Some("margin: 0 !important".to_string())
+        )]
     );
     // Procedural operators in front of the action keep working.
     let inj = plan_injections(

@@ -916,16 +916,26 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("sub/internal.key");
         let a = load_or_create_key(&f).unwrap();
-        assert_eq!(load_or_create_key(&f).unwrap(), a, "reused, not regenerated");
+        assert_eq!(
+            load_or_create_key(&f).unwrap(),
+            a,
+            "reused, not regenerated"
+        );
         assert_ne!(a, [0u8; 32]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
             // A file left world-readable is tightened, and keeps its key.
             std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert_eq!(load_or_create_key(&f).unwrap(), a);
-            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         // A damaged file is replaced by a fresh key.
         std::fs::write(&f, "not a key").unwrap();
@@ -946,7 +956,11 @@ mod tests {
         assert!(second.token_valid(&tok, "x.test"));
         assert!(second.doc_token_valid(&doc, "x.test").is_some());
         assert!(!second.token_valid(&tok, "y.test"));
-        assert_eq!(second.put_scriptlet("window.a=1;"), path, "same URL after restart");
+        assert_eq!(
+            second.put_scriptlet("window.a=1;"),
+            path,
+            "same URL after restart"
+        );
         // The bundle itself comes back from disk when memory has none.
         let third = Internal::with_state_dir(d.path());
         let hash = path.rsplit('/').next().unwrap().trim_end_matches(".js");
@@ -960,11 +974,25 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let i = Internal::with_state_dir(d.path());
         let path = i.put_scriptlet("good()");
-        let hash = path.rsplit('/').next().unwrap().trim_end_matches(".js").to_string();
+        let hash = path
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .trim_end_matches(".js")
+            .to_string();
         let file = d.path().join("scriptlets").join(format!("{hash}.js"));
         std::fs::write(&file, "evil()").unwrap();
-        assert!(i.stored_scriptlet(&hash).is_none(), "content must match its keyed hash");
-        for bad in ["../internal.key", "..%2f", "short", &"g".repeat(24), &"a".repeat(25)] {
+        assert!(
+            i.stored_scriptlet(&hash).is_none(),
+            "content must match its keyed hash"
+        );
+        for bad in [
+            "../internal.key",
+            "..%2f",
+            "short",
+            &"g".repeat(24),
+            &"a".repeat(25),
+        ] {
             assert!(i.stored_scriptlet(bad).is_none(), "{bad}");
         }
     }
@@ -984,10 +1012,11 @@ mod tests {
         assert!(BOOT_JS.contains("function argusBoot(cfg0,nonce0,base0,css0)"));
         assert!(BOOT_JS.contains("\nargusBoot();\n"));
         // Every scriptlet the alias table has no uBO name for is implemented in the page runtime.
-        let table: std::collections::HashSet<&str> = filter_engine::formats::scriptlet_alias_table()
-            .iter()
-            .map(|(a, _)| *a)
-            .collect();
+        let table: std::collections::HashSet<&str> =
+            filter_engine::formats::scriptlet_alias_table()
+                .iter()
+                .map(|(a, _)| *a)
+                .collect();
         for name in [
             "debug-current-inline-script",
             "debug-on-property-read",
@@ -1011,7 +1040,10 @@ mod tests {
             "trusted-create-element",
             "trusted-dispatch-event",
         ] {
-            assert!(!table.contains(name), "{name} has a uBO name; drop the native");
+            assert!(
+                !table.contains(name),
+                "{name} has a uBO name; drop the native"
+            );
             assert!(
                 BOOT_JS.contains(&format!("'{name}':")),
                 "{name} is neither aliased nor implemented"

@@ -210,7 +210,9 @@ test('mutating page: elements added continuously for 2s all get hidden', async (
 });
 
 test('boot script: runs the procedural items from the config at once, leaks no global', async () => {
-    const boot = '(function(){\n' + SRC + '\n' + readFileSync(new URL('../assets/boot.js', import.meta.url), 'utf8') + '\n})();\n';
+    const asset = n => readFileSync(new URL('../assets/' + n, import.meta.url), 'utf8');
+    // As internal.rs assembles it.
+    const boot = '(function(){\nfunction argusBoot(cfg0,nonce0,base0,css0){\n' + SRC + '\n' + asset('natives.js') + '\n' + asset('boot.js') + '\n}\nargusBoot();\n})();\n';
     const cfg = { p: [{ o: [{ type: 'css-selector', arg: '.x' }, { type: 'has-text', arg: 'Ad' }], a: 'hide' }], o: false, t: 't' };
     const dom = new JSDOM(`<!doctype html><html><head><script type="application/json" id="__ab_cfg">${JSON.stringify(cfg)}</script></head><body><b class=x id=a>Ad</b><b class=x id=b>No</b></body></html>`,
         { runScripts: 'outside-only', pretendToBeVisual: true });

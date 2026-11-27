@@ -1,6 +1,8 @@
 //! AdGuard scriptlet coverage, generic scriptlet / action routing and `remove: true` forms.
 
-use filter_engine::{compile_lists, convert, ConvertOptions, Converted, ExtKind, ListFormat, SharedEngine};
+use filter_engine::{
+    compile_lists, convert, ConvertOptions, Converted, ExtKind, ListFormat, SharedEngine,
+};
 
 fn one(rule: &str) -> Converted {
     convert(
@@ -116,9 +118,11 @@ fn generic_scriptlets_and_actions_are_handed_off_not_filed_as_css() {
 #[test]
 fn scriptlet_script_resolves_from_the_resource_library() {
     let engine = SharedEngine::new();
-    assert!(engine.scriptlet_script("aopr", &["a.b".into()], false).is_none());
+    assert!(engine
+        .scriptlet_script("aopr", &["a.b".into()], false)
+        .is_none());
     let json = serde_json::json!([{
-        "name": "abort-on-property-read.js", "aliases": ["aopr"],
+        "name": "abort-on-property-read.js", "aliases": ["aopr.js"],
         "kind": {"mime": "application/javascript"},
         "content": "ZnVuY3Rpb24gYWJvcnRPblByb3BlcnR5UmVhZCgpIHt9",
     }]);
@@ -139,7 +143,7 @@ fn trust_is_the_resources_not_the_spelling() {
     let engine = SharedEngine::new();
     let json = serde_json::json!([{
         "name": "trusted-replace-node-text.js",
-        "aliases": ["trusted-rpnt", "replace-node-text", "rpnt"],
+        "aliases": ["trusted-rpnt.js", "replace-node-text.js", "rpnt.js"],
         "kind": {"mime": "application/javascript"},
         "content": "ZnVuY3Rpb24gdHJ1c3RlZFJlcGxhY2VOb2RlVGV4dCgpIHt9",
         "permission": 1,
@@ -154,7 +158,9 @@ fn trust_is_the_resources_not_the_spelling() {
         "rpnt.js",
     ] {
         assert!(
-            engine.scriptlet_script(name, &["a".into()], false).is_none(),
+            engine
+                .scriptlet_script(name, &["a".into()], false)
+                .is_none(),
             "{name} must not run for an untrusted rule"
         );
         assert!(

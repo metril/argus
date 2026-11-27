@@ -571,10 +571,7 @@ fn cosmetic_rule(t: &str, c: &Cosmetic<'_>) -> Rule {
         "##" | "#@#" if c.body.starts_with('^') => ext(ExtKind::HtmlFilter),
         "##" | "#@#" | "#?#" | "#@?#" => match remove_form(c.body) {
             // `sel:style(remove: true)` is the remove action, not a style declaration.
-            Some(sel) => Rule::Emit(
-                vec![format!("{}{}{sel}:remove()", c.domains, c.sep)],
-                true,
-            ),
+            Some(sel) => Rule::Emit(vec![format!("{}{}{sel}:remove()", c.domains, c.sep)], true),
             None => Rule::Emit(vec![t.to_string()], false),
         },
         "#$#" | "#@$#" | "#$?#" | "#@$?#" => {

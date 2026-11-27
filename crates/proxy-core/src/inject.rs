@@ -374,7 +374,9 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             head.has_script = true;
             head.observer = observer;
             if !spec.ext_script.is_empty() {
-                let path = spec.internal.put_scriptlet(&wrap_ext_script(spec.ext_script));
+                let path = spec
+                    .internal
+                    .put_scriptlet(&wrap_ext_script(spec.ext_script));
                 let _ = write!(
                     head.html,
                     "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
@@ -573,8 +575,14 @@ mod tests {
         // Exposed before it runs, so a throwing scriptlet still reaches frames.
         assert!(w.find(".sl=sl;") < w.find("\nsl();"));
         let x = wrap_ext_script("window.q = \"</script>\";");
-        assert!(x.ends_with("window.q = \"</script>\";"), "runs as is, in global scope");
-        assert!(x.contains(".xs=\"window.q = \\\"\\u003c/script\\u003e\\\";\";"), "{x}");
+        assert!(
+            x.ends_with("window.q = \"</script>\";"),
+            "runs as is, in global scope"
+        );
+        assert!(
+            x.contains(".xs=\"window.q = \\\"\\u003c/script\\u003e\\\";\";"),
+            "{x}"
+        );
     }
 
     #[test]

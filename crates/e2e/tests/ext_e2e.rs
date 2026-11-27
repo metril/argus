@@ -372,7 +372,10 @@ e2e_test!(
             assert!(b.contains("\"no-topics\""), "{b}");
             // No selector made of the scriptlet call or of the action.
             assert!(!html.contains("+js("), "{html}");
-            assert!(!html.contains(":remove()") && !html.contains(":style("), "{html}");
+            assert!(
+                !html.contains(":remove()") && !html.contains(":style("),
+                "{html}"
+            );
             assert!(html.contains("\"a\":\"remove\""), "{html}");
             assert!(html.contains(".promo") && html.contains(".gone"), "{html}");
         }
@@ -388,7 +391,10 @@ e2e_test!(
             MockResponse::html("<html><head></head><body>x</body></html>"),
         );
         let html = text(get(&env, HttpVersion::Http1, "/p", "document", &[])).await;
-        assert!(html.contains("\"f\":1"), "frames flag in the config: {html}");
+        assert!(
+            html.contains("\"f\":1"),
+            "frames flag in the config: {html}"
+        );
         let i = html.find("src=\"/__adblock__/boot.").unwrap();
         let r = &html[i + 5..];
         let boot_path = &r[..r.find('"').unwrap()];
@@ -516,8 +522,9 @@ fn nt_page() -> MockResponse {
 #[tokio::test]
 async fn no_transform_keeps_the_body_but_header_edits_still_apply() {
     for mode in [EntryMode::Explicit, EntryMode::Transparent] {
-        let env = TestEnv::start_tweaked(mode, &NT_RULES, &|c| c.adblock.respect_no_transform = true)
-            .await;
+        let env =
+            TestEnv::start_tweaked(mode, &NT_RULES, &|c| c.adblock.respect_no_transform = true)
+                .await;
         env.origin.route("/nt", nt_page());
         let r = get(&env, HttpVersion::Http1, "/nt", "document", &[]).await;
         assert!(r.headers().get("x-secret").is_none(), "header edit applies");
