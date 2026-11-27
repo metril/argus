@@ -1367,6 +1367,32 @@ mod tests {
     }
 
     #[test]
+    fn adguard_list_redirect_stub_becomes_a_block_ubo_list_keeps_stub() {
+        use crate::{build_set, ListFormat, ListInput};
+        let rules = "||mc.yandex.ru^\n\
+                     ||mc.yandex.ru/metrika/tag.js$script,redirect=noopjs\n\
+                     ||pagead2.test/adsbygoogle.js$xhr,redirect=noop.js,script\n";
+        for (id, stub) in [("adguard-tracking", false), ("ublock-filters", true)] {
+            let s = SharedEngine::new();
+            build_set(&[ListInput {
+                id: id.into(),
+                content: rules.into(),
+                format: ListFormat::Auto,
+                ..Default::default()
+            }])
+            .install_into(&s);
+            for url in [
+                "https://mc.yandex.ru/metrika/tag.js",
+                "https://pagead2.test/adsbygoogle.js",
+            ] {
+                let r = s.check(url, "https://site.test/", "script");
+                assert!(r.blocked, "{id} {url}");
+                assert_eq!(r.redirect.is_some(), stub, "{id} {url}");
+            }
+        }
+    }
+
+    #[test]
     fn redirect_rule_applies_only_with_a_block() {
         let s = engine_with(&["||ads.test^$script", "||ads.test^$redirect-rule=noop.js"]);
         let r = s.check("https://ads.test/a.js", "https://site.test/", "script");
