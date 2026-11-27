@@ -291,8 +291,18 @@ async fn x_argus_marker_only_on_document_navigations() {
         .build()
         .unwrap();
     let url = format!("http://127.0.0.1:{origin_port}/");
-    for (dest, marked) in [("document", true), ("iframe", true), ("empty", false), ("script", false)] {
-        let r = client.get(&url).header("sec-fetch-dest", dest).send().await.unwrap();
+    for (dest, marked) in [
+        ("document", true),
+        ("iframe", true),
+        ("empty", false),
+        ("script", false),
+    ] {
+        let r = client
+            .get(&url)
+            .header("sec-fetch-dest", dest)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(
             r.headers().contains_key("x-argus"),
             marked,
