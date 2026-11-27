@@ -39,7 +39,7 @@ impl Class {
     }
 
     fn path(self) -> &'static str {
-        ["/small", "/medium", "/ads/banner.js", "/page.html"][self as usize]
+        ["/small", "/medium", "/ads/banner.gif", "/page.html"][self as usize]
     }
 
     fn host(self, idx: usize, suffix: &str) -> String {
@@ -166,7 +166,7 @@ pub fn generate_list(n: usize, seed: u64, w: &Workload) -> String {
 pub fn setup_origin(origin: &TestOrigin) {
     origin.set_recording(false);
     origin.route("/small", MockResponse::ok(vec![b'x'; SMALL_LEN]));
-    origin.route("/ads/banner.js", MockResponse::ok(vec![b'x'; SMALL_LEN]));
+    origin.route("/ads/banner.gif", MockResponse::ok(vec![b'x'; SMALL_LEN]));
     origin.route("/medium", MockResponse::ok(vec![b'y'; MEDIUM_LEN]));
     let mut page = String::from(
         "<!DOCTYPE html><html><head><title>page</title></head><body><div class=\"ad-banner\">ad</div>",

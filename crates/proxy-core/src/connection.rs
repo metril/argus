@@ -270,6 +270,8 @@ impl ConnectionHandler {
             } else {
                 filter_engine::EventMode::Explicit
             },
+            // A blocked tunnel is refused by closing it.
+            Some(filter_engine::EventOutcome::Aborted),
         );
         true
     }
@@ -314,6 +316,7 @@ impl ConnectionHandler {
             status: None,
             error_kind,
             cert_fp: None,
+            outcome: None,
             mode: if rctx.transparent {
                 filter_engine::EventMode::Transparent
             } else {
@@ -466,26 +469,36 @@ impl ConnectionHandler {
                 .map_err(|e| Error::Connection(format!("Failed to send 200 response: {}", e)))?;
             return Ok(Entry::WebUi(Prefixed::new(leftover, stream), web, port));
         }
+        let mut sinkhole = false;
         let refused = if intercept_tls {
             ctx.policy().check_literal(&host, port).is_err()
         } else {
-            matches!(
-                tokio::time::timeout(
-                    limit,
-                    ctx.policy().resolve(&host, port, ctx.resolve_all_to())
-                )
-                .await,
-                Ok(Err(crate::policy::ResolveError::Refused(_)))
+            match tokio::time::timeout(
+                limit,
+                ctx.policy().resolve(&host, port, ctx.resolve_all_to()),
             )
+            .await
+            {
+                Ok(Err(crate::policy::ResolveError::Refused(r))) => {
+                    sinkhole = r == crate::policy::Refusal::Sinkhole;
+                    true
+                }
+                _ => false,
+            }
         };
         if refused {
             common::faults::note(common::faults::Fault::PolicyRefusal, &host);
             debug!("Refused CONNECT to {host}:{port} from {}", self.client_addr);
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 403 Forbidden\r\nx-adblock: destination-refused\r\nconnection: close\r\ncontent-length: 19\r\n\r\nDestination refused",
-                )
-                .await;
+            // A sinkholed name fails the tunnel like a network error under `fail`: a 502 that
+            // closes the connection (a silent close could make a browser treat the proxy as
+            // dead and go direct, around Argus).
+            let abort = sinkhole && ctx.block_response() == common::config::BlockResponse::Fail;
+            let reply: &[u8] = if abort {
+                b"HTTP/1.1 502 Bad Gateway\r\nx-adblock: sinkholed-upstream\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+            } else {
+                b"HTTP/1.1 403 Forbidden\r\nx-adblock: destination-refused\r\nconnection: close\r\ncontent-length: 19\r\n\r\nDestination refused"
+            };
+            let _ = stream.write_all(reply).await;
             return Err(Error::DestinationRefused(format!("{host}:{port}")));
         }
         stream
@@ -764,9 +777,15 @@ impl ConnectionHandler {
             .serve_connection(TokioIo::new(io), service)
             .with_upgrades()
             .await
-            .map_err(|err| {
+            .or_else(|err| {
+                // A blocked request that fails by design closes the connection without a
+                // response: the intended outcome, not a connection error.
+                if Error::chain_is_blocked(&err) {
+                    debug!("HTTP/1 connection from {client_addr} closed: request blocked");
+                    return Ok(());
+                }
                 debug!("HTTP/1 connection error from {}: {}", client_addr, err);
-                Error::Connection(format!("Connection error: {}", err))
+                Err(Error::Connection(format!("Connection error: {}", err)))
             })
     }
 
@@ -825,6 +844,12 @@ impl ConnectionHandler {
             Ok(Ok(s)) => s,
             Ok(Err(e @ Error::DestinationRefused(_))) => {
                 common::faults::note(common::faults::Fault::PolicyRefusal, &target.host);
+                let source = if matches!(&e, Error::DestinationRefused(m) if m == common::net_policy::Refusal::SINKHOLE_REASON)
+                {
+                    Some(common::net_policy::Refusal::SINKHOLE_REASON)
+                } else {
+                    source
+                };
                 self.log_connection(filter_engine::EventAction::Blocked, target, source, None);
                 debug!("Refused tunnel to {}:{}: {e}", target.host, target.port);
                 return Err(e);
@@ -1553,6 +1578,7 @@ mod tests {
         let engine = Arc::new(filter_engine::SharedEngine::new());
         engine.install(filter_engine::compile_engine(&["/ads/\n".to_string()]));
         let ctx = Arc::new(ProxyContext::new(engine, true));
+        ctx.set_block_response(crate::config::BlockResponse::Synthetic);
         // Token "tok" maps to a profile that blocks nothing; the default (by address) blocks /ads/.
         let open = Arc::new(filter_engine::SharedEngine::new());
         let slot = Arc::new(filter_engine::ArcSwap::from_pointee(crate::Profile::new(

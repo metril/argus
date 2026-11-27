@@ -29,6 +29,13 @@ pub enum Error {
     #[error("client rejected the proxy certificate: {0}")]
     ClientRejectedCert(String),
 
+    /// A blocked request deliberately failed instead of being answered (`proxy.block_response =
+    /// fail`). Returned from the service: hyper resets that one HTTP/2 stream with the `h2`
+    /// reason found in the error's source chain (CANCEL), and closes an HTTP/1 connection
+    /// without a response. Not a fault: nothing counts or logs it as one.
+    #[error("request blocked: aborted")]
+    Blocked(#[source] h2::Error),
+
     #[error("Timeout error")]
     Timeout,
 
@@ -41,5 +48,29 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<common::Error> for Error {
     fn from(err: common::Error) -> Self {
         Error::Internal(err.to_string())
+    }
+}
+
+impl Error {
+    /// The abort answering a blocked request (HTTP/2: RST_STREAM CANCEL).
+    pub fn blocked() -> Self {
+        Error::Blocked(h2::Error::from(h2::Reason::CANCEL))
+    }
+
+    /// Whether this is a deliberate block abort, not a failure.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Error::Blocked(_))
+    }
+
+    /// Whether this error carries a deliberate block abort anywhere in its source chain.
+    pub fn chain_is_blocked(err: &(dyn std::error::Error + 'static)) -> bool {
+        let mut cur = Some(err);
+        while let Some(e) = cur {
+            if matches!(e.downcast_ref::<Error>(), Some(Error::Blocked(_))) {
+                return true;
+            }
+            cur = e.source();
+        }
+        false
     }
 }

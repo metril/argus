@@ -24,6 +24,27 @@ pub enum Refusal {
     Private,
     /// The proxy's own listener.
     OwnListener,
+    /// A public host name that resolved to an unspecified or loopback address: a DNS sinkhole
+    /// (what ad-blocking resolvers answer for a blocked name).
+    Sinkhole,
+}
+
+impl Refusal {
+    /// Reason text recorded for a [`Refusal::Sinkhole`].
+    pub const SINKHOLE_REASON: &'static str = "sinkholed-upstream";
+
+    /// The refusal of an address that `name` resolved to: a reserved answer that is unspecified
+    /// or loopback, for a name that is not itself local, is a sinkhole.
+    pub fn for_resolved_name(self, name: &str, ip: IpAddr) -> Refusal {
+        let n = name.trim_end_matches('.').to_ascii_lowercase();
+        let local = n == "localhost" || n.ends_with(".localhost") || !n.contains('.');
+        let c = canonical(ip);
+        if self == Refusal::Reserved && !local && (c.is_unspecified() || c.is_loopback()) {
+            Refusal::Sinkhole
+        } else {
+            self
+        }
+    }
 }
 
 impl fmt::Display for Refusal {
@@ -32,6 +53,7 @@ impl fmt::Display for Refusal {
             Refusal::Reserved => "reserved address",
             Refusal::Private => "private address",
             Refusal::OwnListener => "the proxy's own listener",
+            Refusal::Sinkhole => Refusal::SINKHOLE_REASON,
         })
     }
 }
@@ -50,14 +72,19 @@ impl std::error::Error for PolicyRefused {}
 
 /// Whether `err` (or anything in its source chain) is a [`PolicyRefused`].
 pub fn is_refusal(err: &(dyn std::error::Error + 'static)) -> bool {
+    refusal_of(err).is_some()
+}
+
+/// The [`Refusal`] carried by `err` (or anything in its source chain).
+pub fn refusal_of(err: &(dyn std::error::Error + 'static)) -> Option<Refusal> {
     let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = cur {
-        if e.is::<PolicyRefused>() {
-            return true;
+        if let Some(p) = e.downcast_ref::<PolicyRefused>() {
+            return Some(p.0);
         }
         cur = e.source();
     }
-    false
+    None
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -470,7 +497,7 @@ impl NetPolicy {
             match self.check(addr.ip(), port) {
                 Ok(()) => return Ok(addr),
                 Err(r) => {
-                    denied.get_or_insert(r);
+                    denied.get_or_insert(r.for_resolved_name(bare, addr.ip()));
                 }
             }
         }

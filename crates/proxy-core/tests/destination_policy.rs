@@ -128,3 +128,249 @@ async fn invalid_cidr_config_is_rejected_at_startup() {
     config.proxy.allowed_destinations = vec!["10.0.0.0/33".into()];
     assert!(ProxyServer::new(config, ctx).is_err());
 }
+
+// ---- DNS sinkholes: a public name that resolves to 0.0.0.0, `::` or loopback -----------------
+
+use proxy_core::config::BlockResponse;
+use proxy_core::dns::{BackendResult, DnsBackend, DnsCacheConfig, DnsFailure, FailKind};
+use std::net::IpAddr;
+use std::pin::Pin;
+
+/// A DNS backend answering fixed addresses, never touching the network.
+struct FixedDns(Vec<(&'static str, IpAddr)>);
+
+impl DnsBackend for FixedDns {
+    fn lookup(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = BackendResult> + Send>> {
+        let r = match self.0.iter().find(|(n, _)| *n == name) {
+            Some((_, ip)) => Ok((vec![*ip], Duration::from_secs(60))),
+            None => Err(DnsFailure::new(FailKind::NotFound, "no such name")),
+        };
+        Box::pin(async move { r })
+    }
+}
+
+/// Proxy (plain HTTP, no MITM) whose DNS answers come from `answers`: its port, context and
+/// engine (for the request log).
+async fn proxy_with_dns(
+    mode: BlockResponse,
+    answers: Vec<(&'static str, IpAddr)>,
+) -> (u16, Arc<ProxyContext>, Arc<SharedEngine>) {
+    let mut config = ProxyConfig::default();
+    config.proxy.host = "127.0.0.1".into();
+    config.proxy.block_response = mode;
+    config.mitm.enabled = false;
+    let engine = Arc::new(SharedEngine::new());
+    let ctx = Arc::new(
+        ProxyContext::with_upstream(
+            engine.clone(),
+            &UpstreamOptions::from_config(&config),
+            false,
+        )
+        .unwrap(),
+    );
+    ctx.dns().expect("dns").reconfigure_with(
+        Arc::new(FixedDns(answers)),
+        DnsCacheConfig {
+            capacity: 16,
+            min_ttl: Duration::ZERO,
+            max_ttl: Duration::from_secs(60),
+            negative_ttl: Duration::ZERO,
+        },
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = ProxyServer::new(config, ctx.clone()).unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(1);
+    tokio::spawn(async move {
+        let _ = server.serve(listener, tx).await;
+    });
+    (port, ctx, engine)
+}
+
+fn sinks() -> Vec<(&'static str, IpAddr)> {
+    vec![
+        ("localhost", "127.0.0.1".parse().unwrap()),
+        ("v4.sink.test", "0.0.0.0".parse().unwrap()),
+        ("v6.sink.test", "::".parse().unwrap()),
+        ("lo.sink.test", "127.0.0.1".parse().unwrap()),
+        ("lo6.sink.test", "::1".parse().unwrap()),
+        // Link-local is refused too, but it is not a sinkhole answer.
+        ("meta.sink.test", "169.254.169.254".parse().unwrap()),
+    ]
+}
+
+async fn raw_get(proxy_port: u16, url: &str) -> Vec<u8> {
+    let host = url.split('/').nth(2).unwrap();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
+        .await
+        .unwrap();
+    s.write_all(
+        format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    out
+}
+
+#[tokio::test]
+async fn sinkholed_name_is_aborted_not_answered_under_fail() {
+    let (p, _ctx, _) = proxy_with_dns(BlockResponse::Fail, sinks()).await;
+    for name in [
+        "v4.sink.test",
+        "v6.sink.test",
+        "lo.sink.test",
+        "lo6.sink.test",
+    ] {
+        // The connection is closed without a response: nothing for the page to count as loaded.
+        let out = raw_get(p, &format!("http://{name}/")).await;
+        assert!(out.is_empty(), "{name}: {}", String::from_utf8_lossy(&out));
+        let err = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{p}")).unwrap())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{name}/"))
+            .send()
+            .await
+            .expect_err(name);
+        assert!(!err.is_timeout(), "{name}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn non_sinkhole_refusals_keep_the_403_under_fail() {
+    let origin = origin().await;
+    let (p, _ctx, _) = proxy_with_dns(BlockResponse::Fail, sinks()).await;
+    // Link-local (cloud metadata) and loopback by the name `localhost` are policy refusals, not
+    // sinkholes: they keep the explicit 403.
+    for url in [
+        "http://meta.sink.test/".to_string(),
+        format!("http://localhost:{origin}/"),
+        format!("http://127.0.0.1:{origin}/"),
+    ] {
+        let r = get_via(p, &url).await;
+        assert!(is_refused(&r), "{url}: {}", r.status());
+    }
+}
+
+#[tokio::test]
+async fn sinkholed_name_keeps_the_403_under_synthetic() {
+    let (p, _ctx, _) = proxy_with_dns(BlockResponse::Synthetic, sinks()).await;
+    let r = get_via(p, "http://v4.sink.test/").await;
+    assert!(is_refused(&r), "{}", r.status());
+}
+
+#[tokio::test]
+async fn sinkhole_setting_applies_live() {
+    let (p, ctx, _) = proxy_with_dns(BlockResponse::Synthetic, sinks()).await;
+    assert!(is_refused(&get_via(p, "http://v4.sink.test/").await));
+    ctx.set_block_response(BlockResponse::Fail);
+    assert!(raw_get(p, "http://v4.sink.test/").await.is_empty());
+    ctx.set_block_response(BlockResponse::Synthetic);
+    assert!(is_refused(&get_via(p, "http://v4.sink.test/").await));
+}
+
+#[tokio::test]
+async fn sinkholed_name_is_logged_with_its_reason_and_outcome() {
+    let (p, _ctx, engine) = proxy_with_dns(BlockResponse::Fail, sinks()).await;
+    assert!(raw_get(p, "http://v4.sink.test/x").await.is_empty());
+    let ev = engine
+        .recent_requests(10)
+        .into_iter()
+        .find(|e| e.url.contains("v4.sink.test"))
+        .expect("logged");
+    assert_eq!(ev.rule.as_deref(), Some("sinkholed-upstream"));
+    assert_eq!(ev.outcome, Some(filter_engine::EventOutcome::Aborted));
+    assert_eq!(ev.action, filter_engine::EventAction::Blocked);
+    assert_eq!(ev.status, None);
+}
+
+#[tokio::test]
+async fn sinkholed_connect_gets_a_502_that_closes_under_fail() {
+    let (p, _ctx, _) = proxy_with_dns(BlockResponse::Fail, sinks()).await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p))
+        .await
+        .unwrap();
+    s.write_all(b"CONNECT v4.sink.test:443 HTTP/1.1\r\nHost: v4.sink.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 502"), "{text}");
+    assert!(
+        text.contains("connection: close") && text.contains("sinkholed-upstream"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn sinkholed_documents_and_images_keep_their_answer_under_fail() {
+    let (p, _ctx, _) = proxy_with_dns(BlockResponse::Fail, sinks()).await;
+    for dest in ["document", "iframe", "image"] {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p))
+            .await
+            .unwrap();
+        s.write_all(
+            format!("GET http://v4.sink.test/ HTTP/1.1\r\nHost: v4.sink.test\r\nSec-Fetch-Dest: {dest}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+        let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 403"), "{dest}: {text}");
+        assert!(text.contains("destination-refused"), "{dest}: {text}");
+    }
+    // A script to the same name is aborted.
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p))
+        .await
+        .unwrap();
+    s.write_all(b"GET http://v4.sink.test/a.js HTTP/1.1\r\nHost: v4.sink.test\r\nSec-Fetch-Dest: script\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    assert!(out.is_empty());
+}
+
+#[test]
+fn sinkhole_classification() {
+    use common::net_policy::Refusal;
+    let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+    let r = Refusal::Reserved;
+    for a in ["0.0.0.0", "::", "127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+        assert_eq!(
+            r.for_resolved_name("ads.example.com", ip(a)),
+            Refusal::Sinkhole,
+            "{a}"
+        );
+    }
+    // Local names and non-sinkhole reserved answers keep their refusal.
+    assert_eq!(
+        r.for_resolved_name("localhost", ip("127.0.0.1")),
+        Refusal::Reserved
+    );
+    assert_eq!(
+        r.for_resolved_name("a.localhost", ip("127.0.0.1")),
+        Refusal::Reserved
+    );
+    assert_eq!(
+        r.for_resolved_name("router", ip("0.0.0.0")),
+        Refusal::Reserved
+    );
+    assert_eq!(
+        r.for_resolved_name("x.example.com", ip("169.254.169.254")),
+        Refusal::Reserved
+    );
+    assert_eq!(
+        Refusal::Private.for_resolved_name("x.example.com", ip("0.0.0.0")),
+        Refusal::Private
+    );
+}

@@ -18,7 +18,9 @@ use tracing::{debug, info, warn};
 
 use crate::compile::compile_lists;
 use crate::domainset::{DomainHit, DomainSet, Scheme};
-use crate::events::{BlockLog, EventAction, EventMode, EventRef, RequestEvent, DEFAULT_CAPACITY};
+use crate::events::{
+    BlockLog, EventAction, EventMode, EventOutcome, EventRef, RequestEvent, DEFAULT_CAPACITY,
+};
 use crate::formats::{ExtRule, IpRange, IpSet};
 use crate::matcher::{MatchResult, RequestMatcher};
 use crate::precheck;
@@ -499,6 +501,7 @@ impl SharedEngine {
             mode: event.mode,
             error_kind: event.error_kind,
             cert_fp: event.cert_fp.as_deref(),
+            outcome: event.outcome,
         });
     }
 
@@ -747,6 +750,7 @@ impl SharedEngine {
             Some(client),
             "",
             EventMode::Explicit,
+            None,
         )
     }
 
@@ -762,6 +766,7 @@ impl SharedEngine {
         client: &str,
         method: &str,
         mode: EventMode,
+        outcome: Option<EventOutcome>,
     ) -> MatchResult {
         self.record(
             r,
@@ -771,6 +776,7 @@ impl SharedEngine {
             Some(client),
             method,
             mode,
+            outcome,
         )
     }
 
@@ -804,6 +810,7 @@ impl SharedEngine {
                         Some(client),
                         "",
                         EventMode::Explicit,
+                        None,
                     ),
                     arc_swap::Guard::into_inner(guard),
                 );
@@ -831,6 +838,7 @@ impl SharedEngine {
             client,
             "",
             EventMode::Explicit,
+            None,
         )
     }
 
@@ -845,6 +853,7 @@ impl SharedEngine {
         client: Option<&str>,
         method: &str,
         mode: EventMode,
+        outcome: Option<EventOutcome>,
     ) -> MatchResult {
         if r.blocked {
             self.stats
@@ -862,6 +871,7 @@ impl SharedEngine {
                 mode,
                 error_kind: None,
                 cert_fp: None,
+                outcome,
             });
         } else {
             self.stats.record_allowed();

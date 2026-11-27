@@ -16,6 +16,12 @@ allowed_clients = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192
 block_private_destinations = false
 # CIDR exceptions that override the refusals (not for the proxy's own listeners).
 allowed_destinations = []
+# How a blocked request is answered. "fail": scripts, fetch/XHR, styles, pings, media, fonts and
+# WebSockets fail like a network error, as with an extension blocker (HTTP/2: that one stream is
+# reset with CANCEL; HTTP/1: the connection is closed); documents keep the block page, frames a
+# blank page and images a 1x1 GIF. A public name that resolves to 0.0.0.0, :: or loopback (a DNS
+# sinkhole) fails the same way. "synthetic": every block gets a well-formed success response.
+block_response = "fail"
 
 [mitm]
 enabled = true

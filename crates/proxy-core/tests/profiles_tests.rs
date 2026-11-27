@@ -38,6 +38,7 @@ fn config(port: u16, require_token: bool) -> ProxyConfig {
             enable_http2: false,
             transparent_port: None,
             ext_port: None,
+            block_response: proxy_core::config::BlockResponse::Synthetic,
             tls_passthrough_hosts: Vec::new(),
             block_private_destinations: false,
             allowed_destinations: Vec::new(),

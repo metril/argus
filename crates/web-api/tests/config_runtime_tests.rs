@@ -624,3 +624,55 @@ async fn stealth_settings_are_validated_persisted_and_applied_live() {
         "{saved}"
     );
 }
+
+#[tokio::test]
+async fn block_response_applies_live_persists_and_rejects_unknown_values() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let fake = Arc::new(Fake::default());
+    assert!(ctx.state.runtime.set(fake.clone()).is_ok());
+
+    // Default: fail.
+    let got = admin.get("/api/v1/config").await.json::<Value>();
+    assert_eq!(got["block_response"], "fail");
+
+    let r = put(&admin, json!({"block_response": "synthetic"})).await;
+    r.assert_status_ok();
+    let body: Value = r.json();
+    assert_eq!(body["block_response"], "synthetic", "{body}");
+    assert_eq!(body["restart_required"], json!([]), "{body}");
+    assert!(
+        body["applied"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("block_response")),
+        "{body}"
+    );
+    // The runtime was handed the new config (this is what flips the live proxy's setting).
+    assert_eq!(
+        ctx.state.proxy_state.config.read().proxy.block_response,
+        ::common::config::BlockResponse::Synthetic
+    );
+    let overlay = std::fs::read_to_string(ctx.state.overlay_path.read().clone()).unwrap();
+    assert!(
+        overlay.contains("block_response = \"synthetic\""),
+        "{overlay}"
+    );
+
+    // Unknown values are rejected and change nothing.
+    let r = put(&admin, json!({"block_response": "drop"})).await;
+    assert_eq!(r.status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        admin.get("/api/v1/config").await.json::<Value>()["block_response"],
+        "synthetic"
+    );
+
+    // Back to the default: persists as `fail` again.
+    put(&admin, json!({"block_response": "fail"}))
+        .await
+        .assert_status_ok();
+    assert_eq!(
+        admin.get("/api/v1/config").await.json::<Value>()["block_response"],
+        "fail"
+    );
+}

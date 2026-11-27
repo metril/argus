@@ -32,9 +32,15 @@ e2e_test!(allowed_https_h2, rules = BLOCKED_RULES, |env| {
 e2e_test!(blocked_never_reaches_origin, rules = BLOCKED_RULES, |env| {
     env.origin.route("/ad.js", MockResponse::ok("ad"));
     let client = env.client();
-    let resp = client
-        .get(&env.origin.https_url("blocked.test", "/ad.js"))
-        .await;
+    let url = env.origin.https_url("blocked.test", "/ad.js");
+    // `proxy.block_response = fail` (the default): the script request fails like a network error.
+    let e = client.try_get(&url).await.expect_err("aborted");
+    assert!(!e.is_timeout(), "{e:?}");
+    // `synthetic`: an empty JS body.
+    env.proxy
+        .ctx
+        .set_block_response(proxy_core::config::BlockResponse::Synthetic);
+    let resp = client.get(&url).await;
     assert_eq!(resp.status(), 200); // script block: empty JS body
     assert_eq!(
         resp.headers().get("content-type").unwrap(),

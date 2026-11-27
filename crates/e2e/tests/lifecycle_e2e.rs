@@ -79,8 +79,8 @@ async fn profile_swap_applies(mode: EntryMode) {
     let generation = slot.load().generation + 1;
     slot.store(Arc::new(Profile::new(slot.load().id, generation, engine)));
     // Same pooled client => same connection, same RequestCtx.
-    let resp = c.get(&url).await;
-    assert_eq!(resp.headers()["x-adblock"], "blocked");
+    // A blocked script is aborted (`proxy.block_response = fail`).
+    assert!(e2e::was_blocked(&c.try_get(&url).await));
 }
 
 both_modes!(

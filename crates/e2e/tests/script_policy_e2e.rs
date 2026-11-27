@@ -52,6 +52,10 @@ async fn sub(
     path: &str,
     dest: &str,
 ) -> reqwest::Response {
+    // These tests judge what was blocked, by its answer.
+    env.proxy
+        .ctx
+        .set_block_response(proxy_core::config::BlockResponse::Synthetic);
     c.request(reqwest::Method::GET, &env.origin.https_url(host, path))
         .header("referer", origin_str(env, page_host))
         .header("sec-fetch-dest", dest)

@@ -42,3 +42,6 @@ serde_json = { workspace = true }
 base64 = "0.22"
 hdrhistogram = { version = "7", default-features = false }
 libc = "0.2"
+
+[dev-dependencies]
+h2 = { workspace = true }

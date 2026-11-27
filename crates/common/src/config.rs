@@ -282,6 +282,42 @@ pub struct ListenerFlagValues {
     pub adblock: bool,
 }
 
+/// What a blocked request gets back (`proxy.block_response`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockResponse {
+    /// The request fails like a network error, as in an extension blocker: xhr/fetch, scripts,
+    /// styles, pings, media, fonts, objects, other and WebSockets are aborted (HTTP/2: that one
+    /// stream is reset with CANCEL; HTTP/1: the connection is closed). Documents still get the
+    /// block page, subdocuments a blank page and images a 1x1 GIF.
+    #[default]
+    Fail,
+    /// Every block gets a well-formed success response (204, empty 200, GIF).
+    Synthetic,
+}
+
+impl BlockResponse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
+impl std::str::FromStr for BlockResponse {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fail" => Ok(Self::Fail),
+            "synthetic" => Ok(Self::Synthetic),
+            o => Err(format!(
+                "block_response must be fail or synthetic, not {o:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxySettings {
     pub host: String,
@@ -296,6 +332,9 @@ pub struct ProxySettings {
     /// answers `407` to anything without the extension's credentials; bound to `proxy.host`.
     #[serde(default)]
     pub ext_port: Option<u16>,
+    /// How a blocked subresource is answered (see [`BlockResponse`]).
+    #[serde(default)]
+    pub block_response: BlockResponse,
     /// Settings of the explicit-proxy listener (`[proxy.explicit]`). A key left out falls back
     /// to the global setting (`mitm.enabled`, `proxy.enable_http2`, `proxy.enable_websockets`,
     /// `adblock.enabled`).
@@ -825,6 +864,7 @@ impl Default for ProxyConfig {
                 enable_http2: true,
                 transparent_port: None,
                 ext_port: None,
+                block_response: BlockResponse::default(),
                 explicit: ListenerOverrides::default(),
                 transparent: ListenerOverrides::default(),
                 tls_passthrough_hosts: Vec::new(),

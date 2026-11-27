@@ -401,6 +401,7 @@ impl ProxyControl {
         self.timeouts.store(Arc::new(t));
         self.ctx
             .set_guard_service_workers(config.adblock.guard_service_workers);
+        self.ctx.set_block_response(config.proxy.block_response);
         self.ctx
             .set_guard_service_workers_exempt(config.adblock.guard_service_workers_exempt.clone());
         self.ctx.commit_upstream(upstream);
@@ -962,6 +963,7 @@ impl ProxyServer {
             tracing::warn!("could not migrate tls_passthrough_hosts: {e}");
         }
         ctx.set_require_device_token(config.proxy.require_device_token);
+        ctx.set_block_response(config.proxy.block_response);
         ctx.set_request_timeout(std::time::Duration::from_secs(
             config.performance.request_timeout_secs,
         ));

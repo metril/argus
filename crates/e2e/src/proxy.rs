@@ -260,6 +260,7 @@ impl TestProxy {
                 enable_http2: true,
                 transparent_port: (mode == EntryMode::Transparent).then_some(0),
                 ext_port: None,
+                block_response: Default::default(),
                 tls_passthrough_hosts: passthrough.iter().map(|s| s.to_string()).collect(),
                 block_private_destinations: false,
                 allowed_destinations: Vec::new(),

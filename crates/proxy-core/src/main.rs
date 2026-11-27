@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
 
     ctx.set_respect_no_transform(config.adblock.respect_no_transform);
     ctx.set_guard_service_workers(config.adblock.guard_service_workers);
+    ctx.set_block_response(config.proxy.block_response);
     ctx.set_guard_service_workers_exempt(config.adblock.guard_service_workers_exempt.clone());
     ctx.set_stealth(config.stealth.clone());
 

@@ -3203,6 +3203,14 @@
         ],
         "type": "string"
       },
+      "LogOutcome": {
+        "description": "How a blocked request was carried out.",
+        "enum": [
+          "aborted",
+          "synthetic"
+        ],
+        "type": "string"
+      },
       "LoginRequest": {
         "description": "Login request payload.",
         "properties": {
@@ -4575,6 +4583,10 @@
             "description": "Also refuse private-range destinations.",
             "type": "boolean"
           },
+          "block_response": {
+            "description": "How a blocked subresource is answered: `fail` (the request fails like a network error;\ndocuments, subdocuments and images keep their block page, blank frame and GIF) or\n`synthetic` (every block gets a well-formed success response).",
+            "type": "string"
+          },
           "browser_like_upstream": {
             "description": "Connect to origins with the requesting browser's TLS/HTTP2 fingerprint.",
             "type": "boolean"
@@ -4897,6 +4909,17 @@
           },
           "mode": {
             "$ref": "#/components/schemas/LogMode"
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LogOutcome",
+                "description": "How a block was carried out: `aborted` (the request failed like a network error) or\n`synthetic` (the requester got a block page, blank frame, GIF or empty success)."
+              }
+            ]
           },
           "request_type": {
             "type": "string"
@@ -6438,6 +6461,13 @@
             "description": "Applied live.",
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "block_response": {
+            "description": "`fail` or `synthetic`; applied live.",
+            "type": [
+              "string",
               "null"
             ]
           },

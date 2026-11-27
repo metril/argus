@@ -35,7 +35,8 @@ pub use compile::{
 pub use domainset::{DomainHit, DomainSet, DomainSetBuilder, Scheme};
 pub use error::{Error, Result};
 pub use events::{
-    BlockLog, ErrorKind, EventAction, EventMode, EventRef, LiveEvent, RequestEvent, RequestLog,
+    BlockLog, ErrorKind, EventAction, EventMode, EventOutcome, EventRef, LiveEvent, RequestEvent,
+    RequestLog,
 };
 pub use formats::{
     convert, detect, ConvertOptions, ConvertStats, Converted, ExtKind, ExtRule, IpRange, IpSet,

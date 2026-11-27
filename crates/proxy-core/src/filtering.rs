@@ -15,7 +15,9 @@ use crate::inject::{build_head, full_body, passthrough_body, PageSpec, ProxyBody
 use crate::internal::Internal;
 use crate::policy::{is_refusal, DestPolicy};
 use crate::profiles::Profiles;
-use crate::redirect::{block_response, policy_block_response, redirect_response, rewrite_redirect};
+use crate::redirect::{
+    block_outcome, log_outcome, policy_block_outcome, redirect_response, rewrite_redirect,
+};
 use crate::request_ctx::{default_profile_slot, Profile, ProfileSlot, RequestCtx};
 use crate::request_type::{classify, source_url_hinted, RequestType};
 use crate::rewrite::codec::{choose_encoding, response_codings};
@@ -318,6 +320,8 @@ pub struct ProxyContext {
     respect_no_transform: std::sync::atomic::AtomicBool,
     /// Neutralise service workers on filtered sites (see `AdblockSettings::guard_service_workers`).
     guard_service_workers: std::sync::atomic::AtomicBool,
+    /// `proxy.block_response` (0 = fail, 1 = synthetic), live.
+    block_response: std::sync::atomic::AtomicU8,
     /// Hosts the guard leaves alone (exact or `*.suffix`).
     guard_exempt: ArcSwap<Vec<String>>,
     /// Live Stealth Mode settings (shared with the web API, which swaps them on save).
@@ -372,6 +376,7 @@ impl ProxyContext {
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(false),
             guard_service_workers: std::sync::atomic::AtomicBool::new(true),
+            block_response: std::sync::atomic::AtomicU8::new(0),
             guard_exempt: ArcSwap::from_pointee(Vec::new()),
             stealth: Arc::default(),
             certs: Default::default(),
@@ -427,6 +432,23 @@ impl ProxyContext {
     /// Live switch for the service-worker guard.
     pub fn set_guard_service_workers(&self, on: bool) {
         self.guard_service_workers.store(on, Ordering::Relaxed);
+    }
+
+    /// Live switch for how blocked requests are answered (`proxy.block_response`).
+    pub fn set_block_response(&self, mode: common::config::BlockResponse) {
+        self.block_response.store(
+            matches!(mode, common::config::BlockResponse::Synthetic) as u8,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// How blocked requests are answered right now.
+    pub fn block_response(&self) -> common::config::BlockResponse {
+        if self.block_response.load(Ordering::Relaxed) == 1 {
+            common::config::BlockResponse::Synthetic
+        } else {
+            common::config::BlockResponse::Fail
+        }
     }
 
     /// Live exempt-host list of the service-worker guard.
@@ -889,9 +911,19 @@ impl ProxyContext {
             let q = filter_engine::Query::new(url, source_url, resource_type);
             let base = profile.engine.check_deferred_q(&q);
             let v = apply_overlay(&profile, base, &q);
+            let outcome = Some(log_outcome(self.block_response(), RequestType::Websocket));
             profile
                 .engine
-                .record_verdict(v, url, source_url, resource_type, &profile.label)
+                .record_verdict_meta(
+                    v,
+                    url,
+                    source_url,
+                    resource_type,
+                    &profile.label,
+                    "",
+                    filter_engine::EventMode::Explicit,
+                    outcome,
+                )
                 .blocked
         }
     }
@@ -1159,6 +1191,14 @@ impl ProxyContext {
                 let q = filter_engine::Query::new(&url, source, rtype.as_str());
                 let (verdict, gen_) = engine.check_gen_deferred_q(&q);
                 let verdict = apply_overlay(&profile, verdict, &q);
+                let block_mode = self.block_response();
+                let outcome = verdict.blocked.then(|| {
+                    if verdict.redirect_resource().is_some() {
+                        filter_engine::EventOutcome::Synthetic
+                    } else {
+                        log_outcome(block_mode, rtype)
+                    }
+                });
                 let verdict = engine.record_verdict_meta(
                     verdict,
                     &url,
@@ -1167,6 +1207,7 @@ impl ProxyContext {
                     &profile.label,
                     method.as_str(),
                     event_mode(rctx),
+                    outcome,
                 );
                 generation = Some(gen_);
                 if verdict.blocked {
@@ -1183,7 +1224,7 @@ impl ProxyContext {
                             .and_then(|v| v.to_str().ok());
                         return Ok(redirect_response(res, origin));
                     }
-                    return Ok(block_response(rtype, &verdict, &url));
+                    return block_outcome(block_mode, rtype, &verdict, &url).into_result();
                 }
                 // A non-default profile keeps its per-site exceptions in its overlay rules.
                 page_off = rtype.is_frame() && {
@@ -1274,9 +1315,11 @@ impl ProxyContext {
                                 mode: event_mode(rctx),
                                 error_kind: None,
                                 cert_fp: None,
+                                outcome: Some(log_outcome(self.block_response(), rtype)),
                             });
                             let v = filter_engine::MatchResult::blocked(rule);
-                            return Ok(block_response(rtype, &v, &url));
+                            return block_outcome(self.block_response(), rtype, &v, &url)
+                                .into_result();
                         }
                         // `$removeparam` is idempotent: a navigation is redirected to the cleaned
                         // URL (never to a no-op target, so it cannot loop).
@@ -1329,17 +1372,19 @@ impl ProxyContext {
                     .is_some()
                 {
                     debug!("Blocked {} by script policy", url);
-                    log_local(
+                    let mode = self.block_response();
+                    log_local_with(
                         rctx,
                         filter_engine::EventAction::Blocked,
                         method.as_str(),
                         &url,
                         "",
                         rtype.as_str(),
-                        403,
+                        (!crate::redirect::aborts(mode, rtype)).then_some(403),
                         "script policy",
+                        Some(log_outcome(mode, rtype)),
                     );
-                    return Ok(policy_block_response(rtype, &url));
+                    return policy_block_outcome(mode, rtype, &url).into_result();
                 }
             }
         }
@@ -1555,17 +1600,35 @@ impl ProxyContext {
             Err(e) if is_refusal(&e) => {
                 common::faults::note(common::faults::Fault::PolicyRefusal, &host);
                 debug!("Refused destination {host}:{port} (resolved): {e}");
+                // A public name that resolves to 0.0.0.0, `::` or loopback is a DNS sinkhole's
+                // answer for a blocked name: under `fail` the request fails like a network
+                // error (no 403 the page would take for a loaded resource).
+                let sinkhole =
+                    crate::policy::refusal_of(&e) == Some(crate::policy::Refusal::Sinkhole);
+                let abort = sinkhole && crate::redirect::aborts(self.block_response(), rtype);
                 if !bypass_full {
-                    log_local(
+                    log_local_with(
                         rctx,
                         filter_engine::EventAction::Blocked,
                         method.as_str(),
                         &url,
                         "",
                         rtype.as_str(),
-                        403,
-                        "destination policy",
+                        (!abort).then_some(403),
+                        if sinkhole {
+                            common::net_policy::Refusal::SINKHOLE_REASON
+                        } else {
+                            "destination policy"
+                        },
+                        sinkhole.then_some(if abort {
+                            filter_engine::EventOutcome::Aborted
+                        } else {
+                            filter_engine::EventOutcome::Synthetic
+                        }),
                     );
+                }
+                if abort {
+                    return Err(Error::blocked());
                 }
                 return Ok(refused_response());
             }
@@ -1768,7 +1831,7 @@ impl ProxyContext {
             // A `$header` rule matched the response: answer with the block response instead.
             debug!("Blocked {} by response rule {}", url, rule);
             let v = filter_engine::MatchResult::blocked(rule);
-            return Ok(block_response(rtype, &v, &url));
+            return block_outcome(self.block_response(), rtype, &v, &url).into_result();
         }
         if kind == BodyKind::None {
             // Redirects, 204s, `no-transform`, downloads...: header edits only.
@@ -2662,6 +2725,7 @@ fn log_request(
         mode: event_mode(rctx),
         error_kind,
         cert_fp,
+        outcome: None,
     });
 }
 
@@ -2682,6 +2746,32 @@ fn log_local(
     status: u16,
     rule: &str,
 ) {
+    log_local_with(
+        rctx,
+        action,
+        method,
+        url,
+        source,
+        rtype,
+        Some(status),
+        rule,
+        None,
+    );
+}
+
+/// [`log_local`] that also records how a block was carried out.
+#[allow(clippy::too_many_arguments)]
+fn log_local_with(
+    rctx: &RequestCtx,
+    action: filter_engine::EventAction,
+    method: &str,
+    url: &str,
+    source: &str,
+    rtype: &str,
+    status: Option<u16>,
+    rule: &str,
+    outcome: Option<filter_engine::EventOutcome>,
+) {
     let profile = rctx.profile.load();
     profile.engine.record_request(&filter_engine::EventRef {
         action,
@@ -2692,10 +2782,11 @@ fn log_local(
         rule,
         list_id: None,
         client: Some(profile.label.as_ref()),
-        status: Some(status),
+        status,
         mode: event_mode(rctx),
         error_kind: None,
         cert_fp: None,
+        outcome,
     });
 }
 

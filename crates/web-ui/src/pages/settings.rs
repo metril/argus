@@ -77,6 +77,8 @@ struct F {
 
 const UPSTREAM_KINDS: &[(&str, &str)] = &[("http", "HTTP"), ("socks5", "SOCKS5")];
 
+const BLOCK_RESPONSES: &[(&str, &str)] = &[("fail", "Fail"), ("synthetic", "Fake success")];
+
 const HOURS: &[(&str, &str)] = &[("6", "6 h"), ("12", "12 h"), ("24", "24 h"), ("168", "7 d")];
 
 struct Section {
@@ -254,6 +256,13 @@ const SECTIONS: &[Section] = &[
                     min: 1,
                     max: 3600,
                 },
+                dep: None,
+            },
+            Def {
+                key: "block_response",
+                label: "Blocked requests",
+                desc: "Fail: a blocked script, fetch, stylesheet, ping, media, font or WebSocket fails like a network error, as with an extension blocker, so pages see the block. Documents still get the block page, frames a blank page and images a transparent pixel. Fake success answers every block with an empty success instead.",
+                kind: Kind::Seg(BLOCK_RESPONSES),
                 dep: None,
             },
             Def {
@@ -624,6 +633,7 @@ fn defaults(key: &str) -> Val {
         "allow_dest" => Val::T(Vec::new()),
         "block_private" => Val::B(false),
         "browser_like" => Val::B(true),
+        "block_response" => Val::S("fail".into()),
         "guard_sw" => Val::B(false),
         "guard_sw_exempt" => Val::T(Vec::new()),
         "up_on" => Val::B(false),
@@ -669,6 +679,7 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("allow_dest", Val::T(c.allowed_destinations.clone())),
         ("block_private", Val::B(c.block_private_destinations)),
         ("browser_like", Val::B(c.browser_like_upstream)),
+        ("block_response", Val::S(c.block_response.clone())),
         ("guard_sw", Val::B(c.guard_service_workers)),
         (
             "guard_sw_exempt",
@@ -750,6 +761,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "allow_dest" => &["allowed_destinations"],
         "block_private" => &["block_private_destinations"],
         "browser_like" => &["browser_like_upstream"],
+        "block_response" => &["block_response"],
         "guard_sw" => &["guard_service_workers"],
         "guard_sw_exempt" => &["guard_service_workers_exempt"],
         "up_on" | "up_kind" | "up_host" | "up_port" | "up_user" | "up_pass" => &["upstream_proxy"],
@@ -1035,6 +1047,9 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("browser_like") {
         r.browser_like_upstream = Some(val("browser_like").b());
+    }
+    if dirty("block_response") {
+        r.block_response = Some(val("block_response").s());
     }
     if dirty("guard_sw_exempt") {
         r.guard_service_workers_exempt = Some(val("guard_sw_exempt").t());

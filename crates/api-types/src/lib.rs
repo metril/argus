@@ -220,6 +220,11 @@ pub struct ProxyConfigResponse {
     /// browser through it so documents are bound to the extension session.
     #[serde(default)]
     pub ext_port: Option<u16>,
+    /// How a blocked subresource is answered: `fail` (the request fails like a network error;
+    /// documents, subdocuments and images keep their block page, blank frame and GIF) or
+    /// `synthetic` (every block gets a well-formed success response).
+    #[serde(default = "default_block_response")]
+    pub block_response: String,
     /// TLS hosts never intercepted (exact or `*.suffix`).
     #[serde(default)]
     pub tls_passthrough_hosts: Vec<String>,
@@ -551,6 +556,8 @@ pub struct UpdateProxyConfigRequest {
     pub transparent_port: Option<u16>,
     /// Extension listener port; `0` turns it off. Applied live.
     pub ext_port: Option<u16>,
+    /// `fail` or `synthetic`; applied live.
+    pub block_response: Option<String>,
     /// Replaces the TLS passthrough host list. Applied live.
     pub tls_passthrough_hosts: Option<Vec<String>>,
     /// Applied live.
@@ -586,6 +593,10 @@ pub struct UpdateProxyConfigRequest {
     /// it shrinks.
     #[cfg_attr(feature = "server", validate(range(min = 100, max = 500000)))]
     pub request_log_capacity: Option<u32>,
+}
+
+fn default_block_response() -> String {
+    "fail".into()
 }
 
 fn default_request_log_capacity() -> u32 {

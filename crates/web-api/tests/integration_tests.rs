@@ -481,6 +481,7 @@ async fn request_log_capacity_changes_live_via_config_put() {
             mode: filter_engine::EventMode::Explicit,
             error_kind: None,
             cert_fp: None,
+            outcome: None,
         });
     }
     assert_eq!(e.recent_blocked(1000).len(), 150);

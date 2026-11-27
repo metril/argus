@@ -161,45 +161,6 @@ e2e_test!(
 );
 
 e2e_test!(
-    block_response_shape_per_type,
-    rules = ["||blk.test^"],
-    |env| {
-        // (Sec-Fetch-Dest, status, content-type, body check)
-        let cases: [(&str, u16, Option<&str>); 8] = [
-            ("document", 403, Some("text/html; charset=utf-8")),
-            ("iframe", 200, Some("text/html; charset=utf-8")),
-            ("image", 200, Some("image/gif")),
-            ("script", 200, Some("application/javascript")),
-            ("style", 200, Some("text/css")),
-            ("empty", 204, None),
-            ("font", 204, None),
-            ("video", 204, None),
-        ];
-        for (dest, status, ctype) in cases {
-            let resp = get_as(&env, &env.origin.https_url("blk.test", "/r"), dest).await;
-            assert_eq!(resp.status(), status, "dest={dest}");
-            assert_eq!(resp.headers()["x-adblock"], "blocked", "dest={dest}");
-            assert_eq!(resp.headers()["cache-control"], "no-store", "dest={dest}");
-            match ctype {
-                Some(c) => assert_eq!(resp.headers()["content-type"], c, "dest={dest}"),
-                None => assert!(resp.headers().get("content-type").is_none(), "dest={dest}"),
-            }
-            let body = resp.bytes().await.unwrap();
-            match dest {
-                "document" => {
-                    let s = String::from_utf8_lossy(&body);
-                    assert!(s.contains("||blk.test^"), "block page names the rule: {s}");
-                }
-                "image" => assert!(body.starts_with(b"GIF8")),
-                "script" | "style" | "empty" | "font" | "video" => assert!(body.is_empty()),
-                _ => {}
-            }
-        }
-        assert!(env.origin.requests().is_empty());
-    }
-);
-
-e2e_test!(
     third_party_with_origin_only_referer,
     rules = ["||tp.test^$third-party"],
     |env| {
@@ -210,7 +171,7 @@ e2e_test!(
             let url = url.clone();
             async move {
                 c.request(reqwest::Method::GET, &url)
-                    .header("sec-fetch-dest", "script")
+                    .header("sec-fetch-dest", "image")
                     .header("referer", referer)
                     .send()
                     .await

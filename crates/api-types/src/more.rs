@@ -425,6 +425,19 @@ pub struct RequestLogEntry {
     /// resolves via `GET /certs/{fp}`.
     #[serde(default)]
     pub cert_fp: Option<String>,
+    /// How a block was carried out: `aborted` (the request failed like a network error) or
+    /// `synthetic` (the requester got a block page, blank frame, GIF or empty success).
+    #[serde(default)]
+    pub outcome: Option<LogOutcome>,
+}
+
+/// How a blocked request was carried out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogOutcome {
+    Aborted,
+    Synthetic,
 }
 
 /// Verification outcome of an upstream certificate.

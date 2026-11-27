@@ -16,7 +16,7 @@ e2e_test!(
     rules = ["||ads.test^"],
     |env| {
         env.origin.route("/ok", MockResponse::ok("fine"));
-        env.origin.route("/ad.js", MockResponse::ok("ad"));
+        env.origin.route("/ad.png", MockResponse::ok("ad"));
         let mut live = env.proxy.engine.subscribe_requests();
 
         let ok = env
@@ -26,7 +26,7 @@ e2e_test!(
         assert_eq!(ok.status(), 200);
         let ad = env
             .client()
-            .get(&env.origin.https_url("ads.test", "/ad.js"))
+            .get(&env.origin.https_url("ads.test", "/ad.png"))
             .await;
         assert_eq!(
             ad.headers().get("x-adblock").map(|v| v.as_bytes()),

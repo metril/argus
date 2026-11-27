@@ -15,10 +15,12 @@ fn input(id: &str, content: &str, format: ListFormat) -> ListInput {
 
 async fn is_blocked(env: &TestEnv, host: &str, path: &str) -> bool {
     env.origin.route(path, MockResponse::ok("origin-body"));
-    let resp = env.client().get(&env.origin.https_url(host, path)).await;
-    resp.headers()
-        .get("x-adblock")
-        .is_some_and(|v| v == "blocked")
+    // A blocked script fails (`proxy.block_response = fail`); a pass-through answers.
+    e2e::was_blocked(
+        &env.client()
+            .try_get(&env.origin.https_url(host, path))
+            .await,
+    )
 }
 
 e2e_test!(

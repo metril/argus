@@ -4,13 +4,11 @@ use e2e::{EntryMode, MockResponse, TestEnv};
 
 async fn blocked(env: &TestEnv) -> bool {
     env.origin.route("/a.js", MockResponse::ok("origin-body"));
-    let resp = env
-        .client()
-        .get(&env.origin.https_url("ads.test", "/a.js"))
-        .await;
-    resp.headers()
-        .get("x-adblock")
-        .is_some_and(|v| v == "blocked")
+    e2e::was_blocked(
+        &env.client()
+            .try_get(&env.origin.https_url("ads.test", "/a.js"))
+            .await,
+    )
 }
 
 /// Ad blocking off on the transparent listener only (global setting on).
