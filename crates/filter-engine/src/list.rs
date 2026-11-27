@@ -215,6 +215,9 @@ impl CatalogueEntry {
 /// The `profile` value of catalogue entries that belong to the opt-in Strict profile.
 pub const PROFILE_STRICT: &str = "strict";
 
+/// The `profile` value of signed catalogue entries offered once and enabled by default.
+pub const PROFILE_DEFAULT: &str = "default";
+
 /// Id of the signed argus-lists entry ("Argus Extra Trackers", `profile: strict`); reported as
 /// pending while the signed catalogue has not loaded.
 pub const STRICT_ARGUS_EXTRA_ID: &str = "argus-extra";

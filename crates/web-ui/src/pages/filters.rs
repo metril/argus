@@ -756,6 +756,7 @@ pub fn FiltersPage() -> impl IntoView {
                                             {e.name.clone()}" "
                                             <span class="badge">{if e.source == "signed" { "signed" } else { "built-in" }}</span>
                                             {e.profile.as_deref().is_some_and(|p| p == "strict").then(|| view! { " " <span class="badge" title="Added by the Strict profile: blocks more and may break some sites">"strict - may break sites"</span> })}
+                                            {e.profile.as_deref().is_some_and(|p| p == "default").then(|| view! { " " <span class="badge" title="Offered once and enabled by default; remove or disable it and it stays that way">"Argus default"</span> })}
                                             {e.noncommercial.then(|| view! { " " <span class="badge" title=tip.clone()>"non-commercial"</span> })}
                                         </div>
                                         <div class="url">

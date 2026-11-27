@@ -5,6 +5,7 @@
 //! Independent of the web UI: the proxy constructs and starts it unconditionally.
 
 mod argus;
+mod default_profile;
 mod error;
 mod persist;
 mod report;

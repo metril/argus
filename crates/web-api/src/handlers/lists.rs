@@ -687,7 +687,10 @@ pub async fn get_catalogue(
                 noncommercial: e.noncommercial,
                 licence_note: e.licence_note.clone(),
                 trusted: e.trusted,
-                profile: e.profile.clone().filter(|_| e.is_strict()),
+                profile: e
+                    .profile
+                    .clone()
+                    .filter(|_| e.is_strict() || e.is_default()),
                 source: "signed".into(),
             })
             .collect();
