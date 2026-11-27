@@ -2118,6 +2118,16 @@ impl ProxyContext {
         let mut response = builder
             .body(body)
             .map_err(|e| Error::Connection(format!("build response: {e}")))?;
+        // Document navigations only (`Sec-Fetch-Dest: document`/`iframe`): page script cannot read
+        // its own document's headers, so the extension can tell a tab is filtered without a
+        // fetch()/XHR ever seeing a marker. Removed otherwise so an origin cannot fake it.
+        if rtype.is_frame() {
+            response
+                .headers_mut()
+                .insert("x-argus", HeaderValue::from_static("1"));
+        } else {
+            response.headers_mut().remove("x-argus");
+        }
         for edit in &transforms.header_edits {
             match edit {
                 HeaderEdit::Set(n, v) => {

@@ -82,4 +82,3 @@ export function hostOf(url?: string): string | null {
   } catch { return null; }
 }
 
-export type Interception = 'intercepted' | 'direct' | 'unknown';
