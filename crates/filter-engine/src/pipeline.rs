@@ -106,6 +106,53 @@ impl BuiltSet {
     }
 }
 
+/// Is this list AdGuard's: an `adguard-` id or an explicitly forced AdGuard format (never
+/// auto-detected syntax)?
+fn is_adguard_origin(i: &ListInput) -> bool {
+    !i.allowlist && (i.format == ListFormat::Adguard || i.id.starts_with("adguard-"))
+}
+
+fn is_opt(o: &str, k: &str) -> bool {
+    o.strip_prefix(k).is_some_and(|r| r.starts_with('='))
+}
+
+/// Drop the redirect stub of every blocking rule: `$redirect=x` is removed (the rule stays a
+/// plain block with its other options) and a `$redirect-rule=x` rule, which only adds a stub, is
+/// dropped. Exceptions and site-specific rules (`domain=` / `from=`) are kept untouched.
+pub(crate) fn strip_redirects(rules: &str) -> String {
+    let mut out = String::with_capacity(rules.len());
+    for line in rules.lines() {
+        let Some((pat, opts)) = line
+            .rsplit_once('$')
+            .filter(|_| line.contains("redirect") && !line.starts_with("@@"))
+        else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if opts
+            .split(',')
+            .any(|o| is_opt(o, "domain") || is_opt(o, "from"))
+        {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let is = is_opt;
+        if opts.split(',').any(|o| is(o, "redirect-rule")) {
+            continue;
+        }
+        let kept: Vec<&str> = opts.split(',').filter(|o| !is(o, "redirect")).collect();
+        out.push_str(pat);
+        if !kept.is_empty() {
+            out.push('$');
+            out.push_str(&kept.join(","));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Convert, dedupe and compile `inputs`.
 pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
     build_set_checked(inputs, None)
@@ -130,6 +177,15 @@ pub fn build_set_checked(
             )
         })
         .collect();
+
+    // AdGuard-origin lists: their `$redirect` stubs are AdGuard's resources, which uBO/uBOL never
+    // serve (uBO's own lists block these requests outright), so a stub would load where uBO
+    // blocks. Keep the block, drop the stub.
+    for (c, i) in converted.iter_mut().zip(inputs) {
+        if is_adguard_origin(i) {
+            c.rules = strip_redirects(&c.rules);
+        }
+    }
 
     // Pure domain rules go to the compact domain set (deduplicated there); only the rest is
     // text-deduplicated and compiled into the engine.
@@ -304,6 +360,35 @@ mod tests {
         assert_eq!(e.network + e.cosmetic, 0);
         assert_eq!(e.duplicates, 6);
         assert_eq!(e.rejected, 0);
+    }
+
+    #[test]
+    fn strips_redirect_stubs_from_blocking_rules_only() {
+        let rules = "||mc.yandex.ru/metrika/tag.js$script,redirect=metrika-yandex-tag\n\
+                     ||ads.test/a.js$xhr,redirect=googlesyndication_adsbygoogle.js,script\n\
+                     ||ads.test^$redirect-rule=noop.js\n\
+                     @@||ads.test/ok.js$redirect=noop.js\n\
+                     ||site.test/a.js$script,redirect=noop.js,domain=x.com\n\
+                     ||site.test/b.js$script,redirect-rule=noop.js,from=x.com\n";
+        assert_eq!(
+            strip_redirects(rules),
+            "||mc.yandex.ru/metrika/tag.js$script\n||ads.test/a.js$xhr,script\n\
+             @@||ads.test/ok.js$redirect=noop.js\n\
+             ||site.test/a.js$script,redirect=noop.js,domain=x.com\n\
+             ||site.test/b.js$script,redirect-rule=noop.js,from=x.com\n"
+        );
+        let l = |id: &str| input(id, "", ListFormat::Auto, false);
+        assert!(is_adguard_origin(&l("adguard-base")));
+        let forced = input("x", "", ListFormat::Adguard, false);
+        assert!(is_adguard_origin(&forced));
+        // Auto-detected AdGuard syntax does not count.
+        assert!(!is_adguard_origin(&l("x")));
+        assert!(!is_adguard_origin(&input(
+            "ublock-filters",
+            "",
+            ListFormat::Ubo,
+            false
+        )));
     }
 
     #[test]
