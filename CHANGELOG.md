@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.8.4 — 2026-11-27
+
+- Generic `$redirect` rules from AdGuard lists now block instead of serving a stub, matching uBO.
+- Parity harness: script-only canary for AdGuard on Firefox.
+
 ## 0.8.3 — 2026-11-27
 
 * CNAME uncloaking, as uBlock Origin does on Firefox. A request that passes the filters is judged
