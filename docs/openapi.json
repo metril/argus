@@ -1118,6 +1118,10 @@
             "description": "`signed` (verified argus-lists catalogue) or `builtin`.",
             "type": "string"
           },
+          "trusted": {
+            "description": "Adding it makes the list trusted (extended rules may run).",
+            "type": "boolean"
+          },
           "url": {
             "type": "string"
           }

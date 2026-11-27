@@ -85,6 +85,10 @@ pub struct FilterCatalogueEntry {
     pub region: Option<String>,
     #[serde(default, deserialize_with = "null_default")]
     pub noncommercial: bool,
+    /// The list's extended rules (scriptlets, `$replace`, ...) may run; set by the catalogue for
+    /// uBlock Origin's lists and AdGuard Base.
+    #[serde(default, deserialize_with = "null_default")]
+    pub trusted: bool,
 }
 
 impl CatalogueEntry for FilterCatalogueEntry {

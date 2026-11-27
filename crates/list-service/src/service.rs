@@ -439,6 +439,7 @@ impl ListService {
     pub fn open(cfg: ListServiceConfig, engine: Arc<SharedEngine>) -> Result<Arc<Self>> {
         let store = ListStore::open(&cfg.data_dir)?;
         store.seed_defaults_if_empty()?;
+        store.migrate_trust()?;
         let guard = Arc::new(
             NetPolicy::control_plane(&cfg.allowed_fetch_destinations)
                 .map_err(|e| Error::Other(e.to_string()))?,
