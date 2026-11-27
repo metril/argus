@@ -30,6 +30,7 @@ async fn h2_over_tls(env: &TestEnv, sni: &str) -> H2 {
 fn req(env: &TestEnv, path: &str, dest: &str) -> Request<Empty<Bytes>> {
     Request::get(format!("https://a.test:{}{path}", env.origin.https_port()))
         .header("sec-fetch-dest", dest)
+        .header("sec-fetch-mode", "cors")
         .header("sec-fetch-site", "cross-site")
         .header("referer", "https://page.test/")
         .body(Empty::<Bytes>::new())
@@ -280,20 +281,45 @@ e2e_test!(
     |env| {
         env.origin
             .route("/fakepage.html", MockResponse::ok("origin"));
-        let fetch = |host: &'static str, method: reqwest::Method, dest: &'static str| {
+        let fetch_mode = |host: &'static str,
+                          method: reqwest::Method,
+                          dest: &'static str,
+                          mode: &'static str| {
             let c = env.client();
             let url = env.origin.https_url(host, "/fakepage.html");
             async move {
                 c.request(method, &url)
                     .header("sec-fetch-dest", dest)
-                    .header("sec-fetch-mode", "no-cors")
+                    .header("sec-fetch-mode", mode)
                     .header("sec-fetch-site", "cross-site")
                     .header("referer", "https://adblock.turtlecute.org/")
                     .send()
                     .await
             }
         };
-        // The turtlecute probe: HEAD, `Sec-Fetch-Dest: empty` (xhr), explicit `$xhr` rule.
+        let fetch = |host: &'static str, method: reqwest::Method, dest: &'static str| {
+            fetch_mode(host, method, dest, "cors")
+        };
+        // A no-cors fetch/xhr/beacon is opaque to the page: aborted (logged as an abort), as
+        // uBO's redirect ends up failing on Firefox, not answered with the stub.
+        for (host, m) in [
+            ("pagead2.test", reqwest::Method::HEAD),
+            ("txt.test", reqwest::Method::GET),
+        ] {
+            assert!(
+                fetch_mode(host, m, "empty", "no-cors").await.is_err(),
+                "{host}"
+            );
+        }
+        let ev = env.proxy.engine.recent_requests(100);
+        let ev = ev.iter().find(|e| e.url.contains("pagead2.test")).unwrap();
+        assert_eq!(ev.outcome, Some(EventOutcome::Aborted));
+        // Element loads keep the stub even in no-cors mode.
+        let r = fetch_mode("scr.test", reqwest::Method::GET, "script", "no-cors")
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["x-adblock"], "redirected");
+        // The cors-mode probe: HEAD, `Sec-Fetch-Dest: empty` (xhr), explicit `$xhr` rule.
         let r = fetch("pagead2.test", reqwest::Method::HEAD, "empty")
             .await
             .unwrap();
@@ -325,5 +351,45 @@ e2e_test!(
         assert!(fetch("plain.test", reqwest::Method::GET, "empty")
             .await
             .is_err());
+    }
+);
+
+e2e_test!(
+    h2_upstream_timeout_resets_only_that_fetch_stream,
+    rules = RULES,
+    |env| {
+        env.origin.route("/ok", MockResponse::ok("fine"));
+        env.origin.route(
+            "/slow",
+            MockResponse::ok("late").delayed(std::time::Duration::from_secs(30)),
+        );
+        env.proxy
+            .ctx
+            .set_request_timeout(std::time::Duration::from_millis(300));
+        let s = h2_over_tls(&env, "a.test").await;
+        let (slow_fetch, ok, slow_doc) = tokio::join!(
+            s.clone().send_request(req(&env, "/slow", "empty")),
+            s.clone().send_request(req(&env, "/ok", "empty")),
+            s.clone().send_request(req(&env, "/slow", "document")),
+        );
+        // A fetch to an unresponsive upstream fails like a network error, not a 504 ...
+        let e = slow_fetch.expect_err("fetch");
+        assert_eq!(reset_reason(&e), Some(h2::Reason::CONNECT_ERROR), "{e:?}");
+        // ... the other stream on the connection is untouched ...
+        let ok = ok.expect("other stream");
+        assert_eq!(ok.status(), 200);
+        assert_eq!(read_body(ok).await, "fine");
+        // ... and a document keeps the 504.
+        assert_eq!(slow_doc.expect("document").status(), 504);
+        // Logged as an upstream timeout, never as a block.
+        let ev = log_of(&env, "/slow");
+        assert!(
+            ev.iter()
+                .all(|e| e.action == EventAction::Error && e.outcome.is_none()),
+            "{ev:?}"
+        );
+        assert!(ev
+            .iter()
+            .any(|e| e.error_kind == Some(filter_engine::ErrorKind::UpstreamTimeout)));
     }
 );

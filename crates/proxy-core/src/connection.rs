@@ -470,6 +470,7 @@ impl ConnectionHandler {
             return Ok(Entry::WebUi(Prefixed::new(leftover, stream), web, port));
         }
         let mut sinkhole = false;
+        let mut unresolved = false;
         let refused = if intercept_tls {
             ctx.policy().check_literal(&host, port).is_err()
         } else {
@@ -483,9 +484,25 @@ impl ConnectionHandler {
                     sinkhole = r == crate::policy::Refusal::Sinkhole;
                     true
                 }
-                _ => false,
+                // No answer for the name (NXDOMAIN, no addresses, resolver failure or timeout):
+                // an opaque tunnel to it cannot work, so say so before the 200.
+                Ok(Err(_)) | Err(_) => {
+                    unresolved = true;
+                    false
+                }
+                Ok(Ok(_)) => false,
             }
         };
+        if unresolved && ctx.block_response() == common::config::BlockResponse::Fail {
+            common::faults::note(common::faults::Fault::UpstreamError, &host);
+            debug!("CONNECT to {host}:{port}: name does not resolve");
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nx-adblock: unresolved-upstream\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+                )
+                .await;
+            return Err(Error::Connection(format!("{host}:{port} does not resolve")));
+        }
         if refused {
             common::faults::note(common::faults::Fault::PolicyRefusal, &host);
             debug!("Refused CONNECT to {host}:{port} from {}", self.client_addr);
@@ -780,8 +797,8 @@ impl ConnectionHandler {
             .or_else(|err| {
                 // A blocked request that fails by design closes the connection without a
                 // response: the intended outcome, not a connection error.
-                if Error::chain_is_blocked(&err) {
-                    debug!("HTTP/1 connection from {client_addr} closed: request blocked");
+                if Error::chain_is_abort(&err) {
+                    debug!("HTTP/1 connection from {client_addr} closed: request aborted");
                     return Ok(());
                 }
                 debug!("HTTP/1 connection error from {}: {}", client_addr, err);

@@ -322,6 +322,12 @@ pub struct ProxyContext {
     guard_service_workers: std::sync::atomic::AtomicBool,
     /// `proxy.block_response` (0 = fail, 1 = synthetic), live.
     block_response: std::sync::atomic::AtomicU8,
+    /// Recent upstream failures of aborted requests, by `host:port`: a browser retries an
+    /// aborted HTTP/1 request on a reused socket, and the retry must fail fast, not dial (and
+    /// count a fault) again.
+    recent_unreachable: std::sync::Mutex<
+        std::collections::HashMap<String, (std::time::Instant, filter_engine::ErrorKind)>,
+    >,
     /// Hosts the guard leaves alone (exact or `*.suffix`).
     guard_exempt: ArcSwap<Vec<String>>,
     /// Live Stealth Mode settings (shared with the web API, which swaps them on save).
@@ -377,6 +383,7 @@ impl ProxyContext {
             respect_no_transform: std::sync::atomic::AtomicBool::new(false),
             guard_service_workers: std::sync::atomic::AtomicBool::new(true),
             block_response: std::sync::atomic::AtomicU8::new(0),
+            recent_unreachable: Default::default(),
             guard_exempt: ArcSwap::from_pointee(Vec::new()),
             stealth: Arc::default(),
             certs: Default::default(),
@@ -432,6 +439,30 @@ impl ProxyContext {
     /// Live switch for the service-worker guard.
     pub fn set_guard_service_workers(&self, on: bool) {
         self.guard_service_workers.store(on, Ordering::Relaxed);
+    }
+
+    /// How long, and how many, upstream failures are remembered.
+    const UNREACHABLE_TTL: Duration = Duration::from_secs(10);
+    const UNREACHABLE_CAP: usize = 1024;
+
+    fn recent_failure(&self, key: &str) -> Option<filter_engine::ErrorKind> {
+        let map = self.recent_unreachable.lock().ok()?;
+        map.get(key)
+            .filter(|(t, _)| t.elapsed() < Self::UNREACHABLE_TTL)
+            .map(|(_, k)| *k)
+    }
+
+    fn note_failure(&self, key: String, kind: filter_engine::ErrorKind) {
+        let Ok(mut map) = self.recent_unreachable.lock() else {
+            return;
+        };
+        if map.len() >= Self::UNREACHABLE_CAP {
+            map.retain(|_, (t, _)| t.elapsed() < Self::UNREACHABLE_TTL);
+            if map.len() >= Self::UNREACHABLE_CAP {
+                map.clear();
+            }
+        }
+        map.insert(key, (std::time::Instant::now(), kind));
     }
 
     /// Live switch for how blocked requests are answered (`proxy.block_response`).
@@ -1192,8 +1223,12 @@ impl ProxyContext {
                 let (verdict, gen_) = engine.check_gen_deferred_q(&q);
                 let verdict = apply_overlay(&profile, verdict, &q);
                 let block_mode = self.block_response();
+                let abort_redirect = verdict.redirect_resource().is_some()
+                    && crate::redirect::aborts_redirect(block_mode, &headers);
                 let outcome = verdict.blocked.then(|| {
-                    if verdict.redirect_resource().is_some() {
+                    if abort_redirect {
+                        filter_engine::EventOutcome::Aborted
+                    } else if verdict.redirect_resource().is_some() {
                         filter_engine::EventOutcome::Synthetic
                     } else {
                         log_outcome(block_mode, rtype)
@@ -1217,6 +1252,10 @@ impl ProxyContext {
                             sc,
                             source_url_hinted(&headers, &url, rtype, page_hint.as_deref()),
                         );
+                    }
+                    if abort_redirect {
+                        debug!("Aborted redirect (no-cors) for {url}");
+                        return Err(Error::blocked());
                     }
                     if let Some(res) = verdict.redirect_resource() {
                         let origin = headers
@@ -1563,6 +1602,28 @@ impl ProxyContext {
             }
         }
 
+        let abort_ok =
+            crate::redirect::aborts_upstream_failure(self.block_response(), rtype, &headers);
+        let fail_key = format!("{host}:{port}");
+        if abort_ok {
+            if let Some(kind) = self.recent_failure(&fail_key) {
+                // The immediate retry of an aborted request: no second dial, no second fault.
+                if !bypass_full {
+                    log_request(
+                        None,
+                        rctx,
+                        filter_engine::EventAction::Error,
+                        method.as_str(),
+                        &url,
+                        src_of(&orig_referer, &headers, &url, rtype, page_hint.as_deref()),
+                        rtype,
+                        None,
+                        Some(kind),
+                    );
+                }
+                return Err(Error::upstream_unreachable());
+            }
+        }
         let sent = if timeout_ms == 0 {
             rb.send().await
         } else {
@@ -1575,6 +1636,13 @@ impl ProxyContext {
                 Ok(r) => r,
                 Err(_) => {
                     common::faults::note(common::faults::Fault::UpstreamTimeout, &host);
+                    let abort = abort_ok;
+                    if abort {
+                        self.note_failure(
+                            fail_key.clone(),
+                            filter_engine::ErrorKind::UpstreamTimeout,
+                        );
+                    }
                     if !bypass_full {
                         log_request(
                             None,
@@ -1584,9 +1652,12 @@ impl ProxyContext {
                             &url,
                             src_of(&orig_referer, &headers, &url, rtype, page_hint.as_deref()),
                             rtype,
-                            Some(504),
+                            (!abort).then_some(504),
                             Some(filter_engine::ErrorKind::UpstreamTimeout),
                         );
+                    }
+                    if abort {
+                        return Err(Error::upstream_unreachable());
                     }
                     return Ok(status_response(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -1636,6 +1707,10 @@ impl ProxyContext {
                 common::faults::note(common::faults::Fault::UpstreamError, &host);
                 warn!("Upstream error for {url}: {}", error_chain(&e));
                 let kind = e.kind();
+                let abort = abort_ok;
+                if abort {
+                    self.note_failure(fail_key.clone(), kind);
+                }
                 let hostport = common::certstore::hostport(&url_host, port);
                 // A certificate failure: one cached, single-flight probe handshake tells which
                 // certificate was presented and why it was rejected.
@@ -1657,9 +1732,12 @@ impl ProxyContext {
                         &url,
                         src_of(&orig_referer, &headers, &url, rtype, page_hint.as_deref()),
                         rtype,
-                        Some(502),
+                        (!abort).then_some(502),
                         Some(kind),
                     );
+                }
+                if abort {
+                    return Err(Error::upstream_unreachable());
                 }
                 if kind == filter_engine::ErrorKind::UpstreamTls {
                     let info = failed_fp
