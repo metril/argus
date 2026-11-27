@@ -279,6 +279,7 @@ struct RouteChunk {
     list: usize,
     entries: Vec<Entry>,
     removals: Vec<(u64, u8)>,
+    ancestors: Vec<(u64, u64)>,
     routed: usize,
     text: String,
 }
@@ -313,16 +314,20 @@ pub fn route_domain_rules(lists: &[&str], list_ids: Vec<String>) -> DomainRouted
                 list: *li,
                 entries: Vec::new(),
                 removals: Vec::new(),
+                ancestors: Vec::new(),
                 routed: 0,
                 text: String::new(),
             };
             for raw in text.lines() {
                 match route(raw.trim()) {
-                    Route::Suffix(h) => o.entries.push(Entry {
-                        key: suffix_key(h),
-                        bit: 0,
-                        list,
-                    }),
+                    Route::Suffix(h) => {
+                        o.entries.push(Entry {
+                            key: suffix_key(h),
+                            bit: 0,
+                            list,
+                        });
+                        crate::domainset::push_ancestors(h, &mut o.ancestors);
+                    }
                     Route::Exact(s, h) => o.entries.push(Entry {
                         key: exact_key(h),
                         bit: s.bit(),
@@ -347,7 +352,7 @@ pub fn route_domain_rules(lists: &[&str], list_ids: Vec<String>) -> DomainRouted
     for o in outs {
         routed[o.list] += o.routed;
         engine_text[o.list].push_str(&o.text);
-        builder.merge(o.entries, o.removals);
+        builder.merge(o.entries, o.removals, o.ancestors);
     }
     DomainRouted {
         builder,

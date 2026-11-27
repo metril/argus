@@ -50,6 +50,9 @@ pub struct ListReport {
     pub skipped: usize,
     /// Rules dropped as duplicates of an earlier rule (this or an earlier list).
     pub duplicates: usize,
+    /// Domain rules dropped because a shorter suffix rule (any list) already covers them.
+    #[serde(default)]
+    pub compressed: usize,
     /// Rules rewritten into supported syntax.
     pub translated: usize,
     /// Network rules accepted by the engine.
@@ -240,6 +243,7 @@ pub fn build_set_checked(
         .builder
         .finish(compiled.engine_overrides, engine_network);
     let domain_dups = domain_build.duplicates;
+    let domain_comp = domain_build.compressed;
 
     let (mut ext, mut ip_block, mut ip_allow) = (Vec::new(), Vec::new(), Vec::<IpRange>::new());
     let mut reports = Vec::with_capacity(inputs.len());
@@ -259,7 +263,8 @@ pub fn build_set_checked(
             );
         }
         let domain_dup = domain_dups.get(li).copied().unwrap_or(0);
-        let domain_kept = domain_routed[li].saturating_sub(domain_dup);
+        let domain_comp = domain_comp.get(li).copied().unwrap_or(0);
+        let domain_kept = domain_routed[li].saturating_sub(domain_dup + domain_comp);
         let mut errors: Vec<ReportIssue> = c
             .stats
             .errors
@@ -289,6 +294,7 @@ pub fn build_set_checked(
             converted: c.stats.converted,
             skipped: c.stats.skipped,
             duplicates: *dups + domain_dup,
+            compressed: domain_comp,
             translated: c.stats.translated,
             network: cs.network + domain_kept,
             cosmetic: cs.cosmetic,
@@ -383,6 +389,32 @@ mod tests {
         assert_eq!(e.network + e.cosmetic, 0);
         assert_eq!(e.duplicates, 6);
         assert_eq!(e.rejected, 0);
+    }
+
+    #[test]
+    fn domain_compression_is_counted_per_list_and_ip_and_wildcards_are_unaffected() {
+        let parent = "||example.com^\n";
+        let child = "||ads.example.com^\n||deep.ads.example.com^\n||other.net^\n||*.wild.org^\n";
+        let built = build_set(&[
+            input("p", parent, ListFormat::Auto, false),
+            input("c", child, ListFormat::Auto, false),
+            input("ip", "0.0.0.0/8\n", ListFormat::Auto, false),
+        ]);
+        let (p, c) = (&built.reports[0], &built.reports[1]);
+        assert_eq!((p.compressed, c.compressed), (0, 2));
+        assert_eq!(c.duplicates, 0);
+        // The two absorbed rules still count in the list's total, not as network rules.
+        assert_eq!(c.network, 2);
+        assert_eq!(built.reports[2].compressed, 0);
+        let hit = built
+            .domains
+            .lookup("x.deep.ads.example.com", crate::domainset::Scheme::Https)
+            .unwrap();
+        assert_eq!(built.domains.list_id(hit.list), Some("p"));
+        assert!(built
+            .domains
+            .lookup("a.other.net", crate::domainset::Scheme::Https)
+            .is_some());
     }
 
     #[test]

@@ -22,6 +22,8 @@
 //! default rule to (see [`crate::precheck`]).
 
 use rayon::prelude::*;
+use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 
 const SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -97,6 +99,38 @@ pub fn suffix_key(host: &str) -> u64 {
 pub fn exact_key(host: &str) -> u64 {
     finish(raw_hash(host) ^ EXACT_SALT)
 }
+
+/// Appends `(host key, ancestor key)` for every proper label suffix of `host` that still has two
+/// labels (`a.b.c.com` gives `b.c.com` and `c.com`), derived from the right-to-left hash states.
+pub(crate) fn push_ancestors(host: &str, out: &mut Vec<(u64, u64)>) {
+    let b = host.as_bytes();
+    let child = suffix_key(host);
+    let (mut h, mut dots) = (SEED, 0u32);
+    for j in (1..b.len()).rev() {
+        if b[j] == b'.' {
+            // `h` hashes b[j + 1..], a proper suffix with `dots` dots.
+            if dots > 0 {
+                out.push((child, finish(h)));
+            }
+            dots += 1;
+        }
+        h = step(h, b[j]);
+    }
+}
+
+/// Identity hasher for keys that are already well-mixed 64-bit hashes.
+#[derive(Default)]
+struct IdHasher(u64);
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {}
+    fn write_u64(&mut self, k: u64) {
+        self.0 = k;
+    }
+}
+type KeySet = HashSet<u64, BuildHasherDefault<IdHasher>>;
 
 /// A match in a [`DomainSet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,6 +392,8 @@ pub struct DomainSetBuilder {
     pub(crate) entries: Vec<Entry>,
     /// `(key, bit)` pairs disabled by a matching `$badfilter` rule.
     pub(crate) removals: Vec<(u64, u8)>,
+    /// `(suffix key, key of one proper two-plus-label ancestor)`, for compression.
+    pub(crate) ancestors: Vec<(u64, u64)>,
 }
 
 /// Result of [`DomainSetBuilder::finish`].
@@ -365,6 +401,8 @@ pub struct DomainSetBuild {
     pub set: DomainSet,
     /// Per list index: rules dropped as duplicates of an earlier rule.
     pub duplicates: Vec<usize>,
+    /// Per list index: `||host^` rules dropped because a shorter suffix rule already covers them.
+    pub compressed: Vec<usize>,
 }
 
 impl DomainSetBuilder {
@@ -383,6 +421,7 @@ impl DomainSetBuilder {
             bit: 0,
             list,
         });
+        push_ancestors(host, &mut self.ancestors);
     }
 
     /// Add `|scheme://host^`.
@@ -404,7 +443,13 @@ impl DomainSetBuilder {
         self.removals.push((exact_key(host), scheme.bit()));
     }
 
-    pub(crate) fn merge(&mut self, entries: Vec<Entry>, removals: Vec<(u64, u8)>) {
+    pub(crate) fn merge(
+        &mut self,
+        entries: Vec<Entry>,
+        removals: Vec<(u64, u8)>,
+        ancestors: Vec<(u64, u64)>,
+    ) {
+        self.ancestors.extend(ancestors);
         self.entries.extend(entries);
         self.removals.extend(removals);
     }
@@ -417,6 +462,7 @@ impl DomainSetBuilder {
             lists,
             mut entries,
             mut removals,
+            ancestors,
         } = self;
         removals.sort_unstable();
         removals.dedup();
@@ -442,6 +488,34 @@ impl DomainSetBuilder {
             }
         }
         drop(entries);
+
+        // Compression: a `||host^` rule is redundant when a proper label suffix of it is also a
+        // `||host^` rule (the lookup walks suffixes shortest first, so the ancestor already wins,
+        // with the same scheme/type applicability and the same engine exception handling). Exact
+        // `|scheme://host^` rules are never touched. Runs after `$badfilter` removal, so a disabled
+        // ancestor absorbs nothing. O(n) with hash sets.
+        let mut compressed = vec![0usize; lists.len().max(1)];
+        if !ancestors.is_empty() {
+            let present: KeySet = uniq.iter().filter(|u| u.1 == 0).map(|u| u.0).collect();
+            let covered: KeySet = ancestors
+                .iter()
+                .filter(|(_, a)| present.contains(a))
+                .map(|(c, _)| *c)
+                .collect();
+            drop(present);
+            if !covered.is_empty() {
+                uniq.retain(|&(k, mask, list)| {
+                    let drop_it = mask == 0 && covered.contains(&k);
+                    if drop_it {
+                        if let Some(c) = compressed.get_mut(list as usize) {
+                            *c += 1;
+                        }
+                    }
+                    !drop_it
+                });
+            }
+        }
+        drop(ancestors);
 
         let n = uniq.len();
         let cap = if n == 0 { 0 } else { n * 5 / 3 + 8 };
@@ -471,6 +545,7 @@ impl DomainSetBuilder {
                 engine_network,
             },
             duplicates,
+            compressed,
         }
     }
 }
@@ -627,6 +702,136 @@ mod tests {
             "com", "A.com", "a..b", ".a.b", "a.b.", "-a.com", "a-.com", "1.2.3.4", "a.b/c", "é.com",
         ] {
             assert!(!is_set_host(bad), "{bad}");
+        }
+    }
+
+    fn build_counts(rules: &[(&str, u16)], exact: &[(&str, Scheme)]) -> DomainSetBuild {
+        let mut b = DomainSetBuilder::new(vec!["a".into(), "b".into()]);
+        for (h, l) in rules {
+            b.add_suffix(h, *l);
+        }
+        for (h, s) in exact {
+            b.add_exact(h, *s, 1);
+        }
+        b.finish(false, true)
+    }
+
+    #[test]
+    fn parent_absorbs_child_and_reports_parent_list() {
+        let r = build_counts(&[("ads.example.com", 1), ("example.com", 0)], &[]);
+        assert_eq!(r.set.len(), 1);
+        assert_eq!(r.compressed, [0, 1]);
+        let hit = r.set.lookup("x.ads.example.com", Scheme::Https).unwrap();
+        assert_eq!((hit.list, hit.start), (0, 6));
+    }
+
+    #[test]
+    fn deep_chain_compresses_even_across_missing_intermediates() {
+        let r = build_counts(
+            &[
+                ("a.b.c.d.com", 0),
+                ("b.c.d.com", 0),
+                ("x.y.z.d.com", 1),
+                ("d.com", 0),
+            ],
+            &[],
+        );
+        assert_eq!(r.set.len(), 1);
+        assert_eq!(r.compressed, [2, 1]);
+        assert!(r.set.lookup("q.x.y.z.d.com", Scheme::Http).is_some());
+    }
+
+    #[test]
+    fn sibling_and_unrelated_are_kept() {
+        let r = build_counts(
+            &[
+                ("a.example.com", 0),
+                ("b.example.com", 0),
+                ("example.org", 0),
+            ],
+            &[],
+        );
+        assert_eq!(r.set.len(), 3);
+        assert_eq!(r.compressed, [0, 0]);
+        // A bare label suffix is not a rule: `com` never absorbs anything.
+        assert!(r.set.lookup("c.example.com", Scheme::Http).is_none());
+    }
+
+    #[test]
+    fn exact_rules_are_never_compressed_or_absorbing() {
+        // Exact child under a suffix parent: kept (scheme/type applicability differs).
+        let r = build_counts(&[("example.com", 0)], &[("ads.example.com", Scheme::Http)]);
+        assert_eq!((r.set.len(), r.compressed.iter().sum::<usize>()), (2, 0));
+        assert!(r
+            .set
+            .lookup_exact("ads.example.com", Scheme::Http)
+            .is_some());
+        // Suffix child under an exact parent: kept (an exact rule is not a suffix rule).
+        let r = build_counts(&[("ads.example.com", 0)], &[("example.com", Scheme::Http)]);
+        assert_eq!((r.set.len(), r.compressed.iter().sum::<usize>()), (2, 0));
+        assert!(r.set.lookup("ads.example.com", Scheme::Https).is_some());
+    }
+
+    #[test]
+    fn badfiltered_parent_absorbs_nothing() {
+        let mut b = DomainSetBuilder::new(vec!["a".into()]);
+        b.add_suffix("example.com", 0);
+        b.add_suffix("ads.example.com", 0);
+        b.remove_suffix("example.com");
+        let r = b.finish(false, true);
+        assert_eq!((r.set.len(), r.compressed[0]), (1, 0));
+        assert!(r.set.lookup("ads.example.com", Scheme::Http).is_some());
+        assert!(r.set.lookup("example.com", Scheme::Http).is_none());
+    }
+
+    /// Reference: uncompressed suffix walk over plain strings (shortest suffix first).
+    fn naive(rules: &[(String, u16)], host: &str) -> Option<(u16, usize)> {
+        let mut starts: Vec<usize> = vec![0];
+        starts.extend(host.match_indices('.').map(|(i, _)| i + 1));
+        starts.reverse();
+        for st in starts {
+            let suf = &host[st..];
+            if !suf.contains('.') {
+                continue;
+            }
+            // Mirror the table: duplicates keep the lowest list index.
+            if let Some(l) = rules.iter().filter(|(h, _)| h == suf).map(|r| r.1).min() {
+                return Some((l, st));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn compression_never_changes_lookups() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let labels = ["a", "b", "c", "d", "e"];
+        let host = |rnd: &mut dyn FnMut(u64) -> u64| {
+            let depth = 2 + rnd(4) as usize;
+            (0..depth)
+                .map(|_| labels[rnd(5) as usize])
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        for _ in 0..30 {
+            let rules: Vec<(String, u16)> =
+                (0..12).map(|_| (host(&mut rnd), rnd(2) as u16)).collect();
+            let mut b = DomainSetBuilder::new(vec!["a".into(), "b".into()]);
+            for (h, l) in &rules {
+                b.add_suffix(h, *l);
+            }
+            let set = b.finish(false, true).set;
+            for _ in 0..200 {
+                let q = host(&mut rnd);
+                let got = set.lookup(&q, Scheme::Https).map(|h| (h.list, h.start));
+                assert_eq!(got, naive(&rules, &q), "{q} vs {rules:?}");
+            }
         }
     }
 

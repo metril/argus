@@ -46,6 +46,9 @@ pub struct BuildSummary {
     pub domain_set: usize,
     /// Rules dropped as duplicates across all lists.
     pub duplicates: usize,
+    /// Domain rules dropped because a shorter suffix rule (any list) already covers them.
+    #[serde(default)]
+    pub compressed: usize,
     /// True when the live engine was loaded from the persisted blob rather than compiled.
     pub from_persisted: bool,
     /// Hex cache key of the live engine.

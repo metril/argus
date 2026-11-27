@@ -649,6 +649,9 @@ pub struct ListReport {
     pub skipped: usize,
     /// Rules dropped as duplicates.
     pub deduped: usize,
+    /// Domain rules dropped because a shorter suffix rule already covers them.
+    #[serde(default)]
+    pub compressed: usize,
     /// Rules rewritten into engine syntax.
     pub translated: usize,
     pub rejected: usize,
@@ -704,6 +707,8 @@ pub struct BuildSummary {
     /// Pure domain rules in the compact domain set.
     pub domain_set: usize,
     pub duplicates: usize,
+    #[serde(default)]
+    pub compressed: usize,
     pub from_persisted: bool,
     /// Handed-off rules by kind.
     pub ext_counts: std::collections::BTreeMap<String, usize>,
