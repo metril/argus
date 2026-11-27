@@ -44,7 +44,7 @@ pub use formats::{
 };
 pub use list::{
     catalogue, default_filter_lists, is_known_trusted_source, strict_catalogue_lists,
-    CatalogueEntry, FilterList, PROFILE_STRICT, STRICT_ARGUS_EXTRA_ID,
+    CatalogueEntry, FilterList, PROFILE_DEFAULT, PROFILE_STRICT, STRICT_ARGUS_EXTRA_ID,
 };
 pub use matcher::{MatchResult, RedirectResource, RequestMatcher};
 pub use pipeline::{build_set, build_set_checked, BuiltSet, ListInput, ListReport, ReportIssue};

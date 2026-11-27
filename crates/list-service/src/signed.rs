@@ -21,6 +21,11 @@ const MAX_ENTRIES: usize = 5000;
 /// An entry that can be checked after parsing; invalid ones are skipped, not fatal.
 pub trait CatalogueEntry: DeserializeOwned {
     fn validate(&self) -> Result<(), String>;
+
+    /// The list to offer once and enable (`profile: default` filter entries); `None` otherwise.
+    fn default_list(&self) -> Option<filter_engine::FilterList> {
+        None
+    }
 }
 
 fn https(url: &str) -> bool {
@@ -89,8 +94,9 @@ pub struct FilterCatalogueEntry {
     /// uBlock Origin's lists and AdGuard Base.
     #[serde(default, deserialize_with = "null_default")]
     pub trusted: bool,
-    /// `"strict"`: only added by the opt-in Strict profile, never seeded. Missing, null or any
-    /// other value is an ordinary entry.
+    /// `"strict"`: only added by the opt-in Strict profile, never seeded. `"default"`: offered
+    /// once and enabled when the catalogue loads. Missing, null or any other value is an
+    /// ordinary entry.
     #[serde(default)]
     pub profile: Option<String>,
 }
@@ -106,9 +112,26 @@ impl CatalogueEntry for FilterCatalogueEntry {
         }
         Ok(())
     }
+
+    fn default_list(&self) -> Option<filter_engine::FilterList> {
+        if !self.is_default() {
+            return None;
+        }
+        let mut l =
+            filter_engine::FilterList::new(self.id.clone(), self.name.clone(), self.url.clone());
+        l.format = self.list_format()?;
+        l.trusted = self.trusted;
+        l.enabled = true;
+        Some(l)
+    }
 }
 
 impl FilterCatalogueEntry {
+    /// Offered once and enabled by default.
+    pub fn is_default(&self) -> bool {
+        self.profile.as_deref() == Some(filter_engine::PROFILE_DEFAULT)
+    }
+
     /// Part of the Strict profile.
     pub fn is_strict(&self) -> bool {
         self.profile.as_deref() == Some(filter_engine::PROFILE_STRICT)
@@ -368,6 +391,26 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         }
     }
 
+    /// Offer the verified catalogue's `profile: default` lists once (see
+    /// [`crate::ListStore::default_offer`]) and rebuild when any was added.
+    fn offer_defaults(&self, entries: &[E]) {
+        let Some(svc) = &self.svc else { return };
+        let lists: Vec<_> = entries.iter().filter_map(|e| e.default_list()).collect();
+        if lists.is_empty() {
+            return;
+        }
+        match svc.store().default_offer(lists) {
+            Ok(added) if !added.is_empty() => {
+                tracing::info!("{}: enabled default lists {added:?}", self.kind);
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    svc.trigger();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("{}: could not offer default lists: {e}", self.kind),
+        }
+    }
+
     /// Load the last good copy from the cache (verified again).
     pub fn init_cache(&self) {
         let cfg = self.cfg();
@@ -401,6 +444,7 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                     }
                 }
                 self.raise_floor(&version);
+                self.offer_defaults(&entries);
                 *self.current.write() = Some(Arc::new(Loaded {
                     entries,
                     version,
@@ -491,6 +535,7 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
             }
         }
         self.raise_floor(&version);
+        self.offer_defaults(&entries);
         *self.current.write() = Some(Arc::new(Loaded {
             entries,
             version: version.clone(),
@@ -683,6 +728,47 @@ mod tests {
         let sig = s.sign(&text, "v2026.11.23", "filters.json");
         assert!(d.apply(format!("{text} "), sig, None).await.is_err());
         assert!(d.get().is_none());
+    }
+
+    fn profiled_json() -> String {
+        let e = |id: &str, profile: &str| {
+            format!(
+                r#"{{"id":"{id}","name":"{id}","url":"https://example.test/{id}.txt","format":"abp","category":"ads"{profile}}}"#
+            )
+        };
+        format!(
+            r#"{{"schema":1,"kind":"filters","entries":[{},{},{},{}]}}"#,
+            e("d1", r#","profile":"default""#),
+            e("s1", r#","profile":"strict""#),
+            e("x1", r#","profile":"paranoid""#),
+            e("p1", "")
+        )
+    }
+
+    #[tokio::test]
+    async fn default_profile_entries_are_offered_once_on_load_and_unknown_profiles_ignored() {
+        let s = Signer::new();
+        let (_d, svc) = svc();
+        let cfg = ArgusConfig {
+            base_url: String::new(),
+            public_key: s.public_key(),
+            cache_dir: None,
+        };
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), cfg);
+        let store = svc.store();
+        assert!(store.get("d1").unwrap().is_none(), "fail-safe before load");
+        let text = profiled_json();
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        d.apply(text.clone(), sig, None).await.unwrap();
+        assert!(store.get("d1").unwrap().unwrap().enabled);
+        for id in ["s1", "x1", "p1"] {
+            assert!(store.get(id).unwrap().is_none(), "{id} must not be added");
+        }
+        // The user removes it; a newer release does not bring it back.
+        store.remove("d1").unwrap();
+        let sig = s.sign(&text, "v2026.11.24", "filters.json");
+        d.apply(text, sig, None).await.unwrap();
+        assert!(store.get("d1").unwrap().is_none());
     }
 
     #[tokio::test]

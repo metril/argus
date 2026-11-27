@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Signed catalogue entries with `profile: "default"` (Argus Base) are added and enabled once on every install after the verified catalogue loads; the offered ids are kept, so a list you remove or disable stays that way. Strict never touches them. The Filters page badges them "Argus default".
+
 ## 0.9.1 — 2026-11-27
 
 - A blocked fetch of an extensionless script URL (e.g. gtag/js) gets the script JS stub when that exact URL is stubbed as a script.

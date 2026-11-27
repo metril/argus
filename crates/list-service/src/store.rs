@@ -432,6 +432,44 @@ impl ListStore {
         })
     }
 
+    /// Offer each of `wanted` once, in one transaction: a list not yet offered is added (when the
+    /// store has none of that id) and its id recorded under `key`, so a list the user later
+    /// removes or disables is never offered again. Returns the ids actually added.
+    pub(crate) fn default_offer_tx(
+        &self,
+        key: &str,
+        wanted: Vec<FilterList>,
+        mut offered: std::collections::BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        self.wtx(Durability::Immediate, |t| {
+            let mut added = Vec::new();
+            {
+                let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
+                let mut urls = std::collections::BTreeSet::new();
+                for it in tb.iter().map_err(db_err)? {
+                    urls.insert(de::<FilterList>(it.map_err(db_err)?.1.value())?.url);
+                }
+                for l in &wanted {
+                    if !offered.insert(l.id.clone()) {
+                        continue;
+                    }
+                    if tb.get(l.id.as_str()).map_err(db_err)?.is_none()
+                        && urls.insert(l.url.clone())
+                    {
+                        tb.insert(l.id.as_str(), ser(l)?.as_slice())
+                            .map_err(db_err)?;
+                        added.push(l.id.clone());
+                    }
+                }
+            }
+            t.open_table(tables::META)
+                .map_err(db_err)?
+                .insert(key, ser(&offered)?.as_slice())
+                .map_err(db_err)?;
+            Ok(added)
+        })
+    }
+
     /// Store a list definition durably (user-initiated; call from a blocking context).
     pub fn upsert_durable(&self, list: &FilterList) -> Result<()> {
         self.put_raw(tables::LISTS, &list.id, &ser(list)?, Durability::Immediate)

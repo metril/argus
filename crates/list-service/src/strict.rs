@@ -73,10 +73,12 @@ impl ListStore {
     pub fn strict_disable(&self) -> Result<StrictState> {
         let _g = self.strict_lock.lock();
         let st = self.strict_state()?;
-        for id in &st.added {
+        // Lists offered by the `default` profile are never Strict's to remove or disable.
+        let offered = self.default_offered()?;
+        for id in st.added.iter().filter(|i| !offered.contains(*i)) {
             self.remove(id)?;
         }
-        for id in &st.enabled {
+        for id in st.enabled.iter().filter(|i| !offered.contains(*i)) {
             self.set_enabled(id, false)?;
         }
         let off = StrictState::default();
