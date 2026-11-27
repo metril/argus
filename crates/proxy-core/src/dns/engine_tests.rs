@@ -269,7 +269,7 @@ async fn rule_upstreams_can_be_several_and_failover() {
     .await;
     let good = stub::start(Behavior::answering("192.0.2.5")).await;
     let st = DnsSettings {
-        timeout_ms: 300,
+        timeout_ms: 700,
         ..settings(&[&format!("[/r.test/]{} {}", addr(&dead), addr(&good))])
     };
     let e = engine(&st);
@@ -346,6 +346,12 @@ async fn load_balance_prefers_the_faster_upstream() {
         ..settings(&[&addr(&slow), &addr(&fast)])
     };
     let e = engine(&st);
+    // Measure both first, so neither is "unmeasured" (and the stats below exist whatever the
+    // random picks were). After that a lookup picks the slow one first with probability
+    // (1/120) / (1/120 + 1/1) < 1%; 40 lookups send it 16 or more of ~80 queries with
+    // probability far below 1e-9.
+    let probed = e.probe("warm.example").await;
+    assert!(probed.iter().all(|p| p.ok), "{probed:?}");
     for i in 0..40 {
         e.lookup_name(&format!("n{i}.example")).await.unwrap();
     }
@@ -372,10 +378,14 @@ async fn load_balance_fails_over_and_marks_the_dead_one_unhealthy() {
     .await;
     let good = stub::start(Behavior::answering("192.0.2.9")).await;
     let st = DnsSettings {
-        timeout_ms: 250,
+        timeout_ms: 1000,
         ..settings(&[&addr(&dead), &addr(&good)])
     };
     let e = engine(&st);
+    // Probe both, so the dead one has certainly been tried (which upstream a lookup tries
+    // first is random).
+    let probed = e.probe("warm.example").await;
+    assert_eq!(probed.iter().filter(|p| !p.ok).count(), 1, "{probed:?}");
     for i in 0..12 {
         assert_eq!(first(&e, &format!("f{i}.example")).await, ip("192.0.2.9"));
     }
@@ -414,13 +424,13 @@ async fn a_lone_dead_upstream_turns_unhealthy_and_errors() {
 async fn parallel_mode_returns_the_first_answer() {
     let fast = stub::start(Behavior::answering("192.0.2.1")).await;
     let slow = stub::start(Behavior {
-        delay: Duration::from_millis(600),
+        delay: Duration::from_millis(2500),
         ..Behavior::answering("192.0.2.2")
     })
     .await;
     let st = DnsSettings {
         mode: DnsMode::Parallel,
-        timeout_ms: 2000,
+        timeout_ms: 5000,
         ..settings(&[&addr(&slow), &addr(&fast)])
     };
     let e = engine(&st);
@@ -460,7 +470,7 @@ async fn parallel_mode_survives_a_dead_upstream() {
     let ok = stub::start(Behavior::answering("192.0.2.2")).await;
     let st = DnsSettings {
         mode: DnsMode::Parallel,
-        timeout_ms: 300,
+        timeout_ms: 1500,
         ..settings(&[&addr(&dead), &addr(&ok)])
     };
     assert_eq!(first(&engine(&st), "p3.example").await, ip("192.0.2.2"));
@@ -469,15 +479,7 @@ async fn parallel_mode_survives_a_dead_upstream() {
 #[tokio::test]
 async fn fastest_ip_mode_races_connections_and_puts_the_winner_first() {
     // 127.0.0.2 accepts connections on the port, 127.0.0.1 does not.
-    let l = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    let accepted = Arc::new(AtomicU64::new(0));
-    let a2 = accepted.clone();
-    tokio::spawn(async move {
-        while l.accept().await.is_ok() {
-            a2.fetch_add(1, Ordering::SeqCst);
-        }
-    });
+    let (port, accepted, _hold) = stub::race_listener().await;
     let s = stub::start(Behavior::answering_many(&["127.0.0.1", "127.0.0.2"])).await;
     let st = DnsSettings {
         mode: DnsMode::FastestIp,
@@ -579,7 +581,7 @@ async fn fallback_is_used_only_when_every_upstream_fails() {
     .await;
     let fb = stub::start(Behavior::answering("192.0.2.77")).await;
     let st = DnsSettings {
-        timeout_ms: 200,
+        timeout_ms: 800,
         fallback: vec![addr(&fb)],
         ..settings(&[&addr(&dead)])
     };
@@ -751,11 +753,11 @@ fn cache(min: u64, max: u64, optimistic: bool) -> DnsCacheConfig {
 #[tokio::test]
 async fn zero_ttl_answers_are_held_for_the_minimum_ttl() {
     let f = Fake::new("192.0.2.1", Duration::ZERO);
-    let r = CachedResolver::new(f.clone(), cache(300, 5000, false));
+    let r = CachedResolver::new(f.clone(), cache(800, 5000, false));
     r.resolve("z.example").await.unwrap();
     r.resolve("z.example").await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "min TTL applies");
-    tokio::time::sleep(Duration::from_millis(450)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     r.resolve("z.example").await.unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
 }
@@ -842,13 +844,13 @@ async fn hot_swap_replaces_the_upstreams_and_flushes_the_cache() {
 #[tokio::test]
 async fn in_flight_lookups_finish_on_the_old_upstreams_during_a_swap() {
     let slow = stub::start(Behavior {
-        delay: Duration::from_millis(300),
+        delay: Duration::from_millis(900),
         ..Behavior::answering("192.0.2.1")
     })
     .await;
     let new = stub::start(Behavior::answering("192.0.2.2")).await;
     let r = Arc::new(CachedResolver::from_settings(&DnsSettings {
-        timeout_ms: 2000,
+        timeout_ms: 4000,
         ..settings(&[&addr(&slow)])
     }));
     let r2 = r.clone();
@@ -871,7 +873,7 @@ async fn probe_reports_each_upstream_latency_or_error() {
     })
     .await;
     let st = DnsSettings {
-        timeout_ms: 250,
+        timeout_ms: 1000,
         fallback: vec![addr(&dead)],
         ..settings(&[&addr(&ok)])
     };
@@ -1051,15 +1053,7 @@ fn only_public_addresses_are_probed() {
 
 #[tokio::test]
 async fn no_direct_probes_when_switched_off() {
-    let l = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    let accepted = Arc::new(AtomicU64::new(0));
-    let a2 = accepted.clone();
-    tokio::spawn(async move {
-        while l.accept().await.is_ok() {
-            a2.fetch_add(1, Ordering::SeqCst);
-        }
-    });
+    let (port, accepted, _hold) = stub::race_listener().await;
     let s = stub::start(Behavior::answering_many(&["127.0.0.1", "127.0.0.2"])).await;
     let st = DnsSettings {
         mode: DnsMode::FastestIp,

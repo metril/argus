@@ -215,9 +215,15 @@ where
 
 /// UDP and TCP on the same ephemeral port.
 pub async fn start(b: Behavior) -> Stub {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = tcp.local_addr().unwrap();
-    let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+    // The UDP port of the same number may be taken by another process (tests run in parallel
+    // processes): pick again.
+    let (tcp, udp, addr) = loop {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        if let Ok(udp) = tokio::net::UdpSocket::bind(addr).await {
+            break (tcp, udp, addr);
+        }
+    };
     let (core, mut stub, ()) = Core::new(b);
     stub.addr = addr;
     let c = core.clone();
@@ -446,4 +452,29 @@ pub async fn start_h3(b: Behavior, t: &Tls) -> Stub {
         }
     });
     stub
+}
+
+/// A TCP listener on 127.0.0.2 counting accepted connections, on a port that is also reserved
+/// (bound, not listening, so connects are refused) on 127.0.0.1, where no other process can
+/// listen on it. Keep the returned socket alive.
+pub async fn race_listener() -> (u16, Arc<AtomicU64>, tokio::net::TcpSocket) {
+    loop {
+        let l = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hold = tokio::net::TcpSocket::new_v4().unwrap();
+        if hold
+            .bind(SocketAddr::new("127.0.0.1".parse().unwrap(), port))
+            .is_err()
+        {
+            continue;
+        }
+        let accepted = Arc::new(AtomicU64::new(0));
+        let a2 = accepted.clone();
+        tokio::spawn(async move {
+            while l.accept().await.is_ok() {
+                a2.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        return (port, accepted, hold);
+    }
 }
