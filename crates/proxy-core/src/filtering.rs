@@ -322,6 +322,8 @@ pub struct ProxyContext {
     guard_service_workers: std::sync::atomic::AtomicBool,
     /// `proxy.block_response` (0 = fail, 1 = synthetic), live.
     block_response: std::sync::atomic::AtomicU8,
+    /// CNAME uncloaking (`[adblock.cname]`), live.
+    cname: crate::cname::Uncloak,
     /// Recent upstream failures of aborted requests, by `host:port`: a browser retries an
     /// aborted HTTP/1 request on a reused socket, and the retry must fail fast, not dial (and
     /// count a fault) again.
@@ -383,6 +385,7 @@ impl ProxyContext {
             respect_no_transform: std::sync::atomic::AtomicBool::new(false),
             guard_service_workers: std::sync::atomic::AtomicBool::new(true),
             block_response: std::sync::atomic::AtomicU8::new(0),
+            cname: Default::default(),
             recent_unreachable: Default::default(),
             guard_exempt: ArcSwap::from_pointee(Vec::new()),
             stealth: Arc::default(),
@@ -471,6 +474,116 @@ impl ProxyContext {
             matches!(mode, common::config::BlockResponse::Synthetic) as u8,
             Ordering::Relaxed,
         );
+    }
+
+    /// Live CNAME uncloaking settings (`[adblock.cname]`); also bounds how long the resolver
+    /// remembers a canonical name.
+    pub fn set_cname(&self, s: &common::config::CnameSettings) {
+        self.cname.set(s);
+        if let Some(d) = self.dns() {
+            d.set_cname_max_ttl(s.max_ttl_secs);
+        }
+    }
+
+    /// `cnameIgnoreExceptions` (see [`crate::cname::Uncloak::ignores_exceptions`]).
+    pub(crate) fn cname_ignores_exceptions(&self) -> bool {
+        self.cname.ignores_exceptions()
+    }
+
+    /// The canonical name `host` should be judged under as well, read from the answer the dial
+    /// will use (so no extra lookup), or `None` when uncloaking does not apply: see
+    /// [`crate::cname::Uncloak`]. `source` is the page URL the request belongs to.
+    pub(crate) async fn uncloaked_name(
+        &self,
+        host: &str,
+        source: &str,
+        is_document: bool,
+    ) -> Option<String> {
+        // With a code-only dial override nothing resolves the name, and a lookup would be extra.
+        if !self.cname.enabled() || self.resolve_all_to.is_some() {
+            return None;
+        }
+        let source_host = url::Url::parse(source)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        if self.cname.skip_request(host, &source_host, is_document) {
+            return None;
+        }
+        let dns = self.dns()?;
+        let r = dns.peek_canon(host).await.ok()?;
+        self.cname.accept(host, r.canonical.as_deref()?)
+    }
+
+    /// After a request passed the first check: judge it again under its canonical name, with the
+    /// same source and type (uBO re-runs `onBeforeSuspendableRequest` with the aliased URL,
+    /// vapi-background-ext.js:200-218). A block is answered like any other (`block_response`) and
+    /// logged with the rule `cname:<canonical>`.
+    #[allow(clippy::too_many_arguments)]
+    async fn cname_blocked(
+        &self,
+        rctx: &RequestCtx,
+        method: &hyper::Method,
+        url: &str,
+        host: &str,
+        rtype: RequestType,
+        source: &str,
+        excepted: bool,
+        headers: &HeaderMap,
+    ) -> Option<Result<Response<ProxyBody>>> {
+        if excepted && self.cname.ignores_exceptions() {
+            return None;
+        }
+        let host = host.to_ascii_lowercase();
+        let cn = self
+            .uncloaked_name(&host, source, rtype == RequestType::Document)
+            .await?;
+        let replay = self.cname.replay_url(url, &host, &cn)?;
+        let profile = rctx.profile.load();
+        let q = filter_engine::Query::new(&replay, source, rtype.as_str());
+        let (verdict, _) = profile.engine.check_gen_deferred_q(&q);
+        let verdict = apply_overlay(&profile, verdict, &q);
+        if !verdict.blocked {
+            return None;
+        }
+        debug!("Blocked {url} ({}) by CNAME {cn}", rtype.as_str());
+        let block_mode = self.block_response();
+        let abort_redirect = verdict.redirect_resource().is_some()
+            && crate::redirect::aborts_redirect(block_mode, headers);
+        let outcome = if abort_redirect {
+            filter_engine::EventOutcome::Aborted
+        } else if verdict.redirect_resource().is_some() {
+            filter_engine::EventOutcome::Synthetic
+        } else {
+            log_outcome(block_mode, rtype)
+        };
+        // The reason shown in the log is the canonical name, not the rule that matched it.
+        let mut logged = verdict;
+        logged.matched_rule = Some(format!("cname:{cn}"));
+        logged.list_id = None;
+        let logged = profile.engine.record_verdict_meta(
+            logged,
+            url,
+            source,
+            rtype.as_str(),
+            &profile.label,
+            method.as_str(),
+            event_mode(rctx),
+            Some(outcome),
+        );
+        if let Some(sc) = &profile.script_control {
+            count_page_block(sc, source);
+        }
+        if abort_redirect {
+            return Some(Err(Error::blocked()));
+        }
+        if let Some(res) = logged.redirect_resource() {
+            let origin = headers
+                .get(hyper::header::ORIGIN)
+                .and_then(|v| v.to_str().ok());
+            return Some(Ok(redirect_response(res, origin)));
+        }
+        Some(block_outcome(block_mode, rtype, &logged, url).into_result())
     }
 
     /// How blocked requests are answered right now.
@@ -1214,6 +1327,9 @@ impl ProxyContext {
         // response is judged by the same one.
         let mut generation: Option<Arc<filter_engine::Generation>> = None;
         let mut request_edits: Vec<ext_rules::HeaderEdit> = Vec::new();
+        // Set when the request passed the engine and may still be judged by its canonical name:
+        // the page it belongs to, and whether an exception matched it.
+        let mut cname_probe: Option<(String, bool)> = None;
         {
             let profile = rctx.profile.load();
             let engine = &profile.engine;
@@ -1264,6 +1380,9 @@ impl ProxyContext {
                         return Ok(redirect_response(res, origin));
                     }
                     return block_outcome(block_mode, rtype, &verdict, &url).into_result();
+                }
+                if self.cname.enabled() {
+                    cname_probe = Some((source.to_string(), verdict.exception_rule.is_some()));
                 }
                 // A non-default profile keeps its per-site exceptions in its overlay rules.
                 page_off = rtype.is_frame() && {
@@ -1425,6 +1544,18 @@ impl ProxyContext {
                     );
                     return policy_block_outcome(mode, rtype, &url).into_result();
                 }
+            }
+        }
+
+        // CNAME uncloaking: the profile guard above is gone, so the lookup may await.
+        if let Some((source, excepted)) = cname_probe {
+            if let Some(r) = self
+                .cname_blocked(
+                    rctx, &method, &url, &host, rtype, &source, excepted, &headers,
+                )
+                .await
+            {
+                return r;
             }
         }
 

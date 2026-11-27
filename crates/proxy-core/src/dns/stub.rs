@@ -2,7 +2,7 @@
 //! test starts its own, so tests share nothing and run in parallel.
 
 use hickory_resolver::proto::op::{Message, OpCode, ResponseCode};
-use hickory_resolver::proto::rr::rdata::{opt::EdnsOption, A, AAAA, PTR};
+use hickory_resolver::proto::rr::rdata::{opt::EdnsOption, A, AAAA, CNAME, PTR};
 use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -25,6 +25,9 @@ pub struct Behavior {
     pub drop: bool,
     /// Answer every query with this code (SERVFAIL, REFUSED...).
     pub rcode: Option<ResponseCode>,
+    /// CNAME links (name to target, lowercase, no dot): a query for a linked name is answered
+    /// with the chain, then the addresses of the last target.
+    pub cnames: HashMap<String, String>,
     /// PTR answers by reversed name.
     pub ptr: HashMap<String, String>,
     /// Set the TC bit on UDP answers (the full answer is sent over TCP).
@@ -40,6 +43,7 @@ impl Default for Behavior {
             delay: Duration::ZERO,
             drop: false,
             rcode: None,
+            cnames: HashMap::new(),
             ptr: HashMap::new(),
             truncate_udp: false,
         }
@@ -154,17 +158,32 @@ impl Core {
         }
         match qq.query_type() {
             RecordType::A | RecordType::AAAA => {
-                let ips = b.answers.get(&name).cloned().or(b.default.clone());
+                // Follow the CNAME chain (bounded), answering each link.
+                let mut target = name.clone();
+                for _ in 0..16 {
+                    let Some(next) = b.cnames.get(&target) else {
+                        break;
+                    };
+                    if let (Ok(owner), Ok(to)) = (
+                        Name::from_ascii(format!("{target}.")),
+                        Name::from_ascii(format!("{next}.")),
+                    ) {
+                        r.add_answer(Record::from_rdata(owner, b.ttl, RData::CNAME(CNAME(to))));
+                    }
+                    target = next.clone();
+                }
+                let ips = b.answers.get(&target).cloned().or(b.default.clone());
                 match ips {
                     None => r.metadata.response_code = ResponseCode::NXDomain,
                     Some(ips) => {
+                        let owner = Name::from_ascii(format!("{target}.")).unwrap();
                         for ip in ips {
                             let d = match (ip, qq.query_type()) {
                                 (IpAddr::V4(v), RecordType::A) => RData::A(A(v)),
                                 (IpAddr::V6(v), RecordType::AAAA) => RData::AAAA(AAAA(v)),
                                 _ => continue,
                             };
-                            r.add_answer(Record::from_rdata(qq.name().clone(), b.ttl, d));
+                            r.add_answer(Record::from_rdata(owner.clone(), b.ttl, d));
                         }
                     }
                 }

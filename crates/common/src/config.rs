@@ -724,7 +724,57 @@ pub struct AdblockSettings {
     /// Hosts (exact, or `*.suffix` for subdomains) the service-worker guard leaves alone.
     #[serde(default)]
     pub guard_service_workers_exempt: Vec<String>,
+    /// CNAME uncloaking (`[adblock.cname]`).
+    #[serde(default)]
+    pub cname: CnameSettings,
 }
+
+/// CNAME uncloaking, mirroring uBlock Origin's Firefox behaviour: a request that is not blocked
+/// is judged again under the canonical name its host resolves to, so a tracker hidden behind a
+/// first-party alias (`cmp.example.com` -> `tracker.cdn.net`) is still blocked. The names and
+/// defaults are those of uBO's advanced settings (`cnameUncloakEnabled`, `cnameIgnoreList`,
+/// `cnameIgnore1stParty`, `cnameIgnoreExceptions`, `cnameIgnoreRootDocument`,
+/// `cnameReplayFullURL`; `max_ttl_secs` is uBO's `dnsCacheTTL`). All of it applies live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CnameSettings {
+    /// Master switch (`cnameUncloakEnabled`, default on).
+    pub enabled: bool,
+    /// Canonical names never uncloaked: a name matches an entry when it equals it or is a
+    /// subdomain of it (`*.` prefixes are accepted; `*` matches everything), as uBO's
+    /// `cnameIgnoreList`.
+    pub ignore_list: Vec<String>,
+    /// Skip a canonical name on the same registrable domain as the request host
+    /// (`cnameIgnore1stParty`, default on).
+    pub ignore_first_party: bool,
+    /// Skip requests an exception filter matched (`cnameIgnoreExceptions`, default on).
+    pub ignore_exceptions: bool,
+    /// Skip the page's own host and document requests (`cnameIgnoreRootDocument`, default on).
+    pub ignore_root_document: bool,
+    /// Longest time a canonical name is remembered, in seconds (uBO `dnsCacheTTL`, 600). The
+    /// DNS record's own TTL still caps it.
+    pub max_ttl_secs: u64,
+    /// Judge the whole URL under the canonical name instead of scheme, host and `/`
+    /// (`cnameReplayFullURL`, default off).
+    pub replay_full_url: bool,
+}
+
+impl Default for CnameSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_list: Vec::new(),
+            ignore_first_party: true,
+            ignore_exceptions: true,
+            ignore_root_document: true,
+            max_ttl_secs: 600,
+            replay_full_url: false,
+        }
+    }
+}
+
+/// Accepted `adblock.cname.max_ttl_secs`.
+pub const CNAME_MAX_TTL_RANGE: std::ops::RangeInclusive<u64> = 1..=86_400;
 
 /// Smallest and largest accepted `adblock.request_log_capacity`.
 pub const REQUEST_LOG_CAPACITY_RANGE: std::ops::RangeInclusive<usize> = 100..=500_000;
@@ -805,6 +855,7 @@ impl Default for AdblockSettings {
             respect_no_transform: false,
             guard_service_workers: true,
             guard_service_workers_exempt: Vec::new(),
+            cname: CnameSettings::default(),
         }
     }
 }

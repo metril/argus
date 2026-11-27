@@ -60,9 +60,72 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
             lists_public_key: config.bypass.lists_public_key.clone(),
         },
         stealth: stealth_dto(&config.stealth),
+        cname: cname_dto(&config.adblock.cname),
         request_log_capacity: config.adblock.request_log_capacity as u32,
         bind: None,
     }
+}
+
+fn cname_dto(c: &common::config::CnameSettings) -> api_types::CnameDto {
+    api_types::CnameDto {
+        enabled: c.enabled,
+        ignore_list: c.ignore_list.clone(),
+        ignore_first_party: c.ignore_first_party,
+        ignore_exceptions: c.ignore_exceptions,
+        ignore_root_document: c.ignore_root_document,
+        max_ttl_secs: c.max_ttl_secs,
+        replay_full_url: c.replay_full_url,
+    }
+}
+
+/// Merge an update into the CNAME settings, rejecting what is not a host name or a TTL in range.
+fn merge_cname(
+    c: &mut common::config::CnameSettings,
+    u: api_types::CnameUpdate,
+) -> Result<(), ApiError> {
+    if let Some(v) = u.enabled {
+        c.enabled = v;
+    }
+    if let Some(list) = u.ignore_list {
+        let mut next: Vec<String> = Vec::new();
+        for h in list {
+            let h = h.trim().to_ascii_lowercase();
+            let body = h.strip_prefix("*.").unwrap_or(&h);
+            if h != "*"
+                && (body.is_empty()
+                    || body.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '*' | ':')))
+            {
+                return Err(ApiError::ValidationError(format!(
+                    "cname.ignore_list: `{h}` is not a host (use example.com, *.example.com or *)"
+                )));
+            }
+            if !next.contains(&h) {
+                next.push(h);
+            }
+        }
+        c.ignore_list = next;
+    }
+    if let Some(v) = u.ignore_first_party {
+        c.ignore_first_party = v;
+    }
+    if let Some(v) = u.ignore_exceptions {
+        c.ignore_exceptions = v;
+    }
+    if let Some(v) = u.ignore_root_document {
+        c.ignore_root_document = v;
+    }
+    if let Some(v) = u.max_ttl_secs {
+        if !common::config::CNAME_MAX_TTL_RANGE.contains(&v) {
+            return Err(ApiError::ValidationError(
+                "cname.max_ttl_secs: use 1 to 86400".into(),
+            ));
+        }
+        c.max_ttl_secs = v;
+    }
+    if let Some(v) = u.replay_full_url {
+        c.replay_full_url = v;
+    }
+    Ok(())
 }
 
 fn stealth_dto(s: &common::config::StealthSettings) -> api_types::StealthDto {
@@ -641,6 +704,14 @@ async fn apply_update_locked(
         can_web
     );
     field!("webui_port", config.webui.port, req.webui_port, can_web);
+    if let Some(u) = req.cname {
+        let mut next = config.adblock.cname.clone();
+        merge_cname(&mut next, u)?;
+        if next != config.adblock.cname {
+            config.adblock.cname = next;
+            live("cname", true, can_proxy, &mut applied);
+        }
+    }
     if let Some(u) = req.stealth {
         let mut next = config.stealth.clone();
         merge_stealth(&mut next, u);

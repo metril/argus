@@ -1112,3 +1112,60 @@ async fn sinkholed_answers_still_reach_the_policy() {
     // A sinkholed answer is never a candidate for the fastest-address race either.
     assert!(!engine::probeable(ip("0.0.0.0")) && !engine::probeable(ip("127.0.0.1")));
 }
+
+// ---- CNAME chains ----
+
+fn chained(ttl: u32) -> Behavior {
+    let mut b = Behavior {
+        ttl,
+        ..Behavior::default()
+    };
+    b.cnames
+        .insert("cmp.site.test".into(), "edge.cdn.test".into());
+    b.cnames
+        .insert("edge.cdn.test".into(), "d2gt.tracker.test".into());
+    b.answers
+        .insert("d2gt.tracker.test".into(), vec![ip("192.0.2.7")]);
+    b.answers.insert("plain.test".into(), vec![ip("192.0.2.8")]);
+    b
+}
+
+#[tokio::test]
+async fn the_last_cname_target_comes_from_the_dial_lookup() {
+    let s = stub::start(chained(60)).await;
+    let r = CachedResolver::from_settings(&settings(&[&addr(&s)]));
+    let a = r.resolve_canon("cmp.site.test").await.unwrap();
+    assert_eq!(&*a.addrs, &[ip("192.0.2.7")]);
+    assert_eq!(a.canonical.as_deref(), Some("d2gt.tracker.test"));
+    // A name without a CNAME has no canonical name.
+    assert_eq!(r.resolve_canon("plain.test").await.unwrap().canonical, None);
+    // Cached next to the addresses: the second read asks nothing.
+    let before = s.count();
+    let again = r.resolve_canon("cmp.site.test").await.unwrap();
+    assert_eq!(again.canonical.as_deref(), Some("d2gt.tracker.test"));
+    assert_eq!(s.count(), before);
+    // Only the address queries of the one lookup were made for the alias (no CNAME query).
+    assert!(s
+        .log
+        .lock()
+        .iter()
+        .all(|(_, t)| matches!(t, RecordType::A | RecordType::AAAA)));
+}
+
+#[tokio::test]
+async fn the_cname_is_dropped_after_its_max_ttl() {
+    let s = stub::start(chained(60)).await;
+    let r = CachedResolver::from_settings(&settings(&[&addr(&s)]));
+    r.set_cname_max_ttl(1);
+    assert!(r
+        .resolve_canon("cmp.site.test")
+        .await
+        .unwrap()
+        .canonical
+        .is_some());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let late = r.resolve_canon("cmp.site.test").await.unwrap();
+    // The addresses are still served from the cache; the alias is no longer trusted.
+    assert_eq!(&*late.addrs, &[ip("192.0.2.7")]);
+    assert_eq!(late.canonical, None);
+}

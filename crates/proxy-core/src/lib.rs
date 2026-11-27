@@ -14,6 +14,7 @@ pub mod browser_profile;
 pub mod ca;
 pub mod ca_encryption;
 pub mod circuit_breaker;
+pub mod cname;
 pub mod config;
 pub mod connection;
 pub mod csp;

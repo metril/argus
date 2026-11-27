@@ -3,7 +3,10 @@
 //! falls back when they all fail. It is a [`Resolver`]; the cache sits in front of it.
 
 use super::upstream::{Bootstrap, Env, Role, Upstream, UpstreamStats};
-use super::{addresses, query_message, BackendResult, BoxFut, DnsFailure, FailKind, Resolver};
+use super::{
+    addresses, canonical_name, query_message, BackendResult, BoxFut, CanonResult, DnsFailure,
+    FailKind, Resolver,
+};
 use common::config::{DnsEcs, DnsMode, DnsSettings};
 use dns_syntax::{is_private_name, private_reverse_zone};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -390,7 +393,7 @@ impl Engine {
     }
 
     /// A and AAAA of `name` from `group`.
-    async fn addrs_from(&self, group: &[Arc<Upstream>], name: &str) -> BackendResult {
+    async fn addrs_from(&self, group: &[Arc<Upstream>], name: &str) -> CanonResult {
         let ecs = self.ecs();
         let qa = query_message(name, RecordType::A, ecs);
         let q6 = query_message(name, RecordType::AAAA, ecs);
@@ -407,9 +410,11 @@ impl Engine {
         let mut ttl = u32::MAX;
         let mut nx = false;
         let mut err: Option<DnsFailure> = None;
+        let mut canon: Option<String> = None;
         for r in [Some(a), aaaa].into_iter().flatten() {
             match r {
                 Ok(msgs) => {
+                    canon = canon.or_else(|| canonical_name(name, &msgs));
                     for m in &msgs {
                         if m.metadata.response_code
                             == hickory_resolver::proto::op::ResponseCode::NXDomain
@@ -450,14 +455,19 @@ impl Engine {
             ips = fastest_first(ips, &self.race).await;
         }
         let ttl = if ttl == u32::MAX { 30 } else { ttl };
-        Ok((ips, Duration::from_secs(ttl as u64)))
+        Ok((ips, Duration::from_secs(ttl as u64), canon))
     }
 
     /// Forward lookup with routing and fallback.
     pub async fn lookup_name(&self, name: &str) -> BackendResult {
+        self.lookup_name_canon(name).await.map(|(a, t, _)| (a, t))
+    }
+
+    /// [`Self::lookup_name`] with the canonical name of the answer.
+    pub async fn lookup_name_canon(&self, name: &str) -> CanonResult {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         let r = match self.route(&name) {
-            Route::System => self.system.lookup(&name).await,
+            Route::System => self.system.lookup_canon(&name).await,
             Route::Group(g) => {
                 let r = self.addrs_from(g, &name).await;
                 match r {
@@ -471,17 +481,17 @@ impl Engine {
                 }
             }
         };
-        r.map(|(mut ips, ttl)| {
+        r.map(|(mut ips, ttl, canon)| {
             if !self.ipv6 {
                 ips.retain(|i| i.is_ipv4());
             }
-            (ips, ttl)
+            (ips, ttl, canon)
         })
-        .and_then(|(ips, ttl)| {
+        .and_then(|(ips, ttl, canon)| {
             if ips.is_empty() {
                 Err(DnsFailure::new(FailKind::NotFound, "no IPv4 addresses"))
             } else {
-                Ok((ips, ttl))
+                Ok((ips, ttl, canon))
             }
         })
     }
@@ -639,6 +649,11 @@ impl Resolver for EngineResolver {
     fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
         let (e, n) = (self.0.clone(), name.to_string());
         Box::pin(async move { e.lookup_name(&n).await })
+    }
+
+    fn lookup_canon(&self, name: &str) -> BoxFut<CanonResult> {
+        let (e, n) = (self.0.clone(), name.to_string());
+        Box::pin(async move { e.lookup_name_canon(&n).await })
     }
 
     fn lookup_ptr(&self, ip: IpAddr) -> BoxFut<Result<Vec<String>, DnsFailure>> {
