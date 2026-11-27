@@ -345,6 +345,8 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-13)}
 .flist{list-style:none;margin:0;padding:0}
 .flist li{display:grid;grid-template-columns:30px minmax(0,1fr) 84px 96px 72px 64px;gap:var(--s3) var(--s4);align-items:center;padding:12px var(--s4);border-top:1px solid var(--line)}
 .flist li:first-child{border-top:0}
+.flist.pin>li{height:var(--rowh,62px);box-sizing:border-box;overflow:hidden}
+.flist .ficon{display:grid;place-items:center;width:30px;height:18px}
 .flist .nm{font-weight:500}
 .flist .url{font:12px var(--font-mono);color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .flist .meta{display:contents}
