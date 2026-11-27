@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.9.1 — 2026-11-27
+
+- A blocked fetch of an extensionless script URL (e.g. gtag/js) gets the script JS stub when that exact URL is stubbed as a script.
+- Parity harness: slow network failures are excluded from scoring.
+
 ## 0.9.0 — 2026-11-27
 
 - Opt-in Strict blocking profile (Filters page, `GET`/`PUT /api/v1/lists/profile`): adds AdGuard Annoyances and Social Media, EasyList Cookie, Fanboy Social, uBO Annoyances and every signed `profile: strict` entry (Argus Extra Trackers). It blocks more and may break sites (fix with per-site allow rules). Applied live and persisted; switching back removes only what Strict added. Default is unchanged.
