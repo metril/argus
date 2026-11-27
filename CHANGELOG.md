@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.8.6 — 2026-11-27
+
+- A blocked fetch of a .js URL whose script request is stubbed now gets the same stub (anti-adblock size checks).
+
 ## 0.8.5 — 2026-11-27
 
 - AdGuard bare-host root exceptions (HTTPS-filtering-off workarounds) are dropped.
