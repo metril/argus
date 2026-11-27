@@ -1,0 +1,227 @@
+name: Adblock parity
+
+# NOT a required PR check: it measures live third-party test sites and is inherently flaky. It runs only on
+# manual dispatch and weekly; there is deliberately no pull_request trigger.
+
+# Runs the public adblock test sites against Argus and every baseline blocker, then fails if Argus scores
+# below any baseline in any category. Harness: scripts/adblock-parity (run locally with run.sh).
+#
+# AdGuard for Windows (job `adguard-desktop`) runs in TRIAL mode only: no licence key, no secret, no sign-in.
+# Sources for the install flags (AdGuard knowledge base, "Documentation for admins"):
+#   https://adguard.com/kb/adguard-for-windows/admins-documentation
+#   - MSI x64 (vendor alias https://agrd.io/adguard_setup64_msi is unversioned; we pin the versioned
+#     static.adtidy.org URL + sha256 in extensions.json and verify it before install); silent install: `msiexec /q /i AdGuard.msi`
+#     (the only documented switch is /q; the EXE installer is also reported to take /quiet, unverified).
+#   - The only documented activation path is the `LicenseKey` policy under HKLM\Software\Policies\AdGuard
+#     (no CLI activation switch exists), which this job deliberately does not use.
+# Whether a trial starts headlessly is unverified: the shard self-checks that a known ad host is blocked and,
+# if not, reports "baseline unavailable" (kept green, excluded by the aggregator) with logs and a screenshot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      argus_image:
+        description: Argus image to test
+        default: ghcr.io/metril/argus:latest
+      build_from_source:
+        description: Build the image from this ref instead of pulling argus_image
+        type: boolean
+        default: false
+      tolerance:
+        description: Allowed shortfall in percentage points (live test sites are noisy)
+        default: '0'
+      sites:
+        description: Comma-separated site ids (empty = all)
+        default: ''
+  schedule:
+    - cron: '0 5 * * 1'
+
+concurrency:
+  group: adblock-parity-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ARGUS_IMAGE: ${{ inputs.argus_image || 'ghcr.io/metril/argus:latest' }}
+  # Playwright's bundled Chromium: branded Chrome 137+ ignores --load-extension.
+  CHROME_PATH: ''
+
+jobs:
+  shard:
+    name: ${{ matrix.blocker }} / ${{ matrix.browser }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { blocker: none, browser: chrome }
+          - { blocker: none, browser: firefox }
+          - { blocker: argus, browser: chrome }
+          - { blocker: argus, browser: firefox }
+          - { blocker: ubol, browser: chrome }
+          - { blocker: ubo, browser: firefox }
+          - { blocker: adguard-ext, browser: chrome }
+          - { blocker: adguard-ext, browser: firefox }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: scripts/adblock-parity/package-lock.json
+
+      - name: Install harness dependencies and tools
+        working-directory: scripts/adblock-parity
+        run: |
+          npm ci --no-audit --no-fund
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libnss3-tools jq
+          if [ "${{ matrix.browser }}" = chrome ]; then npx playwright-core install --with-deps chromium; fi
+
+      - name: Build Argus image
+        if: matrix.blocker == 'argus' && inputs.build_from_source
+        run: docker build -t argus-parity:local .
+      - name: Pull Argus image
+        if: matrix.blocker == 'argus' && !inputs.build_from_source
+        run: docker pull "$ARGUS_IMAGE"
+
+      - name: Start Argus, apply the uBOL-equivalent list set, fetch the CA
+        if: matrix.blocker == 'argus'
+        run: |
+          image="$ARGUS_IMAGE"; [ "${{ inputs.build_from_source }}" = true ] && image=argus-parity:local
+          docker volume create argus-certs >/dev/null; docker volume create argus-data >/dev/null
+          docker run -d --name argus --network host --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            -e RUST_LOG=info -e WEBUI_DIST_PATH=/app/webui \
+            -v argus-certs:/app/certs -v argus-data:/app/data -v argus-logs:/app/logs \
+            "$image"
+          scripts/adblock-parity/argus-ci-setup.sh http://127.0.0.1:3000 "$RUNNER_TEMP/argus-ca.crt"
+      - name: Dump Argus logs on failure
+        if: failure() && matrix.blocker == 'argus'
+        run: docker logs argus 2>&1 | tail -n 200
+
+      - name: Run shard
+        working-directory: scripts/adblock-parity
+        env:
+          SITES: ${{ inputs.sites }}
+          ARGUS_PROXY: 127.0.0.1:8080
+          ARGUS_CA: ${{ runner.temp }}/argus-ca.crt
+        run: |
+          ./run.sh --blocker "${{ matrix.blocker }}" --browser "${{ matrix.browser }}" \
+            ${SITES:+--sites "$SITES"} \
+            --out "results/${{ matrix.blocker }}-${{ matrix.browser }}.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: shard-${{ matrix.blocker }}-${{ matrix.browser }}
+          path: scripts/adblock-parity/results/*.json
+          if-no-files-found: warn
+
+  adguard-desktop:
+    name: adguard-desktop / chrome (trial)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true # a baseline that cannot be set up must never block the others
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: scripts/adblock-parity
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: scripts/adblock-parity/package-lock.json
+      - run: |
+          npm ci --no-audit --no-fund
+          npx playwright-core install chromium
+      - name: Control run (no blocker, before AdGuard is installed)
+        env:
+          SITES: ${{ inputs.sites }}
+        run: node run.mjs --blocker none --browser chrome --out results/none-chrome-win.json $(if ($env:SITES) { '--sites'; $env:SITES })
+      - name: Install and start AdGuard (silent, trial)
+        id: install
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force diag | Out-Null
+          $pin = (Get-Content extensions.json -Raw | ConvertFrom-Json).'adguard-desktop'.windows
+          Invoke-WebRequest -Uri $pin.url -OutFile "$env:RUNNER_TEMP\AdGuard.msi" -MaximumRedirection 10
+          $got = (Get-FileHash "$env:RUNNER_TEMP\AdGuard.msi" -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $pin.sha256) { throw "AdGuard MSI sha256 mismatch: pinned $($pin.sha256), got $got (run update-extensions.mjs)" }
+          $p = Start-Process msiexec -ArgumentList '/q','/i',"$env:RUNNER_TEMP\AdGuard.msi",'/l*v',"$PWD\diag\msi.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "msiexec exit code $($p.ExitCode)" }
+          $exe = Get-ChildItem 'C:\Program Files\AdGuard','C:\Program Files (x86)\AdGuard' -Filter Adguard.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw 'Adguard.exe not found after install' }
+          Start-Process $exe.FullName
+      - name: AdGuard run (the shard polls the canary until protection is active, else reports unavailable)
+        id: run
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          SITES: ${{ inputs.sites }}
+        run: node run.mjs --blocker adguard-desktop --browser chrome --ready-timeout 180 --out results/adguard-desktop-chrome.json $(if ($env:SITES) { '--sites'; $env:SITES })
+      - name: Report baseline unavailable
+        if: always() && (steps.install.outcome != 'success' || steps.run.outcome != 'success')
+        run: node run.mjs --blocker adguard-desktop --browser chrome --unavailable "install or run step failed (see adguard-diagnostics artifact)" --out results/adguard-desktop-chrome.json
+      - name: Capture diagnostics (logs and screenshot)
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force diag | Out-Null
+          Get-ChildItem "$env:ProgramData\Adguard","$env:LOCALAPPDATA\Adguard","$env:APPDATA\Adguard" -Recurse -Include *.log -ErrorAction SilentlyContinue | Select-Object -First 20 | Copy-Item -Destination diag -ErrorAction SilentlyContinue
+          Get-Process | Where-Object Name -like '*dguard*' | Select-Object Name,Id | Out-File diag\processes.txt
+          Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+          $bmp.Save("$PWD\diag\screen.png")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: shard-adguard-desktop-chrome
+          path: scripts/adblock-parity/results/*.json
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: adguard-diagnostics
+          path: scripts/adblock-parity/diag
+          if-no-files-found: ignore
+
+  # Single aggregator check: renders the score table into the job summary, uploads it, and fails when Argus
+  # is below a baseline in any category. Use this job's name as the required check.
+  aggregate:
+    name: adblock-parity
+    needs: [shard, adguard-desktop]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: true
+      - name: Merge, summarise, compare
+        env:
+          TOLERANCE: ${{ inputs.tolerance }}
+        run: |
+          set +e
+          node scripts/adblock-parity/aggregate.mjs shards --out report.md --merged merged.json \
+            --tolerance "${TOLERANCE:-0}" > /dev/null
+          rc=$?
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: adblock-parity-report
+          path: |
+            report.md
+            merged.json
