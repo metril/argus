@@ -272,11 +272,11 @@ mod tests {
         edited.push(Scope::ListsRead);
         assert_eq!(template_of(&edited, &held), Template::Custom);
         assert_eq!(template_of(&[], &held), Template::Custom);
-        // A template only grants what the holder has.
+        // A template only grants what the holder has: a viewer keeps only stats:read.
         let viewer = api_types::UserRole::Viewer.scopes();
         assert_eq!(
             Template::BrowserExtension.scopes(&viewer).unwrap(),
-            vec![] as Vec<Scope>
+            vec![Scope::StatsRead]
         );
         let ro = Template::ReadOnly.scopes(&held).unwrap();
         assert!(ro.iter().all(|s| s.action() == "read"));

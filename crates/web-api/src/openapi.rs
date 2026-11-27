@@ -85,7 +85,8 @@ pub fn finalize(spec: utoipa::openapi::OpenApi) -> (Value, RouteTable) {
                     })
                     .collect();
                 if op.contains_key("security") && !public {
-                    let mut reqs: Vec<Value> = alts.iter().map(|s| json!({"bearer_auth": s})).collect();
+                    let mut reqs: Vec<Value> =
+                        alts.iter().map(|s| json!({"bearer_auth": s})).collect();
                     reqs.extend(alts.iter().map(|s| json!({"cookie_auth": s})));
                     op.insert("security".into(), Value::Array(reqs));
                 }

@@ -215,16 +215,28 @@ async fn extension_token_reads_stats_and_switches_sites_but_site_scope_is_narrow
         .assert_status_ok();
     // A public suffix is refused: one click must not switch blocking off for a whole suffix.
     for suffix in ["com", "co.uk", "herokuapp.com"] {
-        ctx.bearer("PUT", &format!("/api/v1/rules/site-exceptions/{suffix}"), ext)
-            .await
-            .assert_status(StatusCode::BAD_REQUEST);
+        ctx.bearer(
+            "PUT",
+            &format!("/api/v1/rules/site-exceptions/{suffix}"),
+            ext,
+        )
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
     }
-    ctx.bearer("PUT", "/api/v1/rules/site-exceptions/foo.herokuapp.com", ext)
-        .await
-        .assert_status_ok();
-    ctx.bearer("DELETE", "/api/v1/rules/site-exceptions/foo.herokuapp.com", ext)
-        .await
-        .assert_status_ok();
+    ctx.bearer(
+        "PUT",
+        "/api/v1/rules/site-exceptions/foo.herokuapp.com",
+        ext,
+    )
+    .await
+    .assert_status_ok();
+    ctx.bearer(
+        "DELETE",
+        "/api/v1/rules/site-exceptions/foo.herokuapp.com",
+        ext,
+    )
+    .await
+    .assert_status_ok();
     // rules:site does not open the rest of the rules.
     ctx.bearer("PUT", "/api/v1/rules/custom", ext)
         .await
