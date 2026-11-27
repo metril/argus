@@ -1344,7 +1344,13 @@ impl ProxyContext {
                 let source = source_url_hinted(&headers, &url, rtype, page_hint.as_deref());
                 let q = filter_engine::Query::new(&url, source, rtype.as_str());
                 let (verdict, gen_) = engine.check_gen_deferred_q(&q);
-                let verdict = apply_overlay(&profile, verdict, &q);
+                let mut verdict = apply_overlay(&profile, verdict, &q);
+                // A `fetch` of a URL whose `$script` rule serves a stub gets that stub too.
+                if verdict.blocked && verdict.redirect.is_none() && rtype == RequestType::Xhr {
+                    let sq = filter_engine::Query::new(&url, source, RequestType::Script.as_str());
+                    let (sv, _) = engine.check_gen_deferred_q(&sq);
+                    verdict = verdict.with_sibling_stub(&url, &apply_overlay(&profile, sv, &sq));
+                }
                 let block_mode = self.block_response();
                 let abort_redirect = verdict.redirect_resource().is_some()
                     && crate::redirect::aborts_redirect(block_mode, &headers);
