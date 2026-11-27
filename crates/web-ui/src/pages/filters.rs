@@ -15,7 +15,7 @@ use crate::api::filters::{
     ListReport, TestUrlResponse,
 };
 use crate::api::ApiClient;
-use crate::components::{ConfirmButton, Drawer, Icon, Layout, Modal, Pill, Segmented, Switch};
+use crate::components::{ConfirmButton, Drawer, Icon, Layout, Modal, Pill, Switch};
 use crate::state::use_app_state;
 use crate::utils::format_number;
 use std::rc::Rc;
@@ -60,52 +60,6 @@ pub fn FiltersPage() -> impl IntoView {
     let row_h = Signal::derive(move || if is_narrow() { 104.0 } else { 62.0 });
 
     let build = RwSignal::new(Option::<BuildSummary>::None);
-    // Blocking profile: "default" or "strict"; `profile_busy` while a switch is applied.
-    let profile = RwSignal::new("default".to_string());
-    let profile_busy = RwSignal::new(false);
-    {
-        let app_state = app_state.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            match ApiClient::new().get_blocking_profile().await {
-                Ok(p) => {
-                    profile.set(p.mode.clone());
-                    // Strict was switched on before the signed catalogue loaded: add the rest now.
-                    if p.mode == "strict"
-                        && !p.pending.is_empty()
-                        && ApiClient::new()
-                            .set_blocking_profile("strict")
-                            .await
-                            .is_ok()
-                    {
-                        reload.update(|n| *n += 1);
-                    }
-                }
-                Err(e) => app_state.error(format!("Failed to load blocking profile: {e}")),
-            }
-        });
-    }
-    let set_profile = {
-        let app_state = app_state.clone();
-        Callback::new(move |mode: String| {
-            if profile_busy.get_untracked() || profile.get_untracked() == mode {
-                return;
-            }
-            profile_busy.set(true);
-            let app_state = app_state.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                match ApiClient::new().set_blocking_profile(&mode).await {
-                    Ok(p) => {
-                        profile.set(p.mode);
-                        reload.update(|n| *n += 1);
-                        nudge_build_poll();
-                        app_state.success("Blocking profile applied");
-                    }
-                    Err(e) => app_state.error(format!("Failed to switch profile: {e}")),
-                }
-                profile_busy.set(false);
-            });
-        })
-    };
     let show_catalogue = RwSignal::new(false);
     let catalogue = RwSignal::new(Vec::<CatalogueEntryResponse>::new());
     let catalogue_add = RwSignal::new(Option::<String>::None);
@@ -122,6 +76,7 @@ pub fn FiltersPage() -> impl IntoView {
     });
     let cat_source = RwSignal::new(String::new());
     let cat_fetched = RwSignal::new(Option::<String>::None);
+    let cat_version = RwSignal::new(Option::<String>::None);
     let cat_q = RwSignal::new(String::new());
     let cat_category = RwSignal::new(String::new());
     let cat_region = RwSignal::new(String::new());
@@ -133,6 +88,7 @@ pub fn FiltersPage() -> impl IntoView {
             .into_iter()
             .filter(|e| {
                 (c.is_empty() || e.category == c)
+                    && !e.installed
                     && (r.is_empty() || e.region.as_deref() == Some(r.as_str()))
                     && (q.is_empty()
                         || e.name.to_lowercase().contains(&q)
@@ -140,6 +96,22 @@ pub fn FiltersPage() -> impl IntoView {
                         || e.id.to_lowercase().contains(&q))
             })
             .collect::<Vec<_>>()
+    });
+    // Not-installed entries grouped by category (alphabetical, entries by name).
+    let cat_groups = Signal::derive(move || {
+        let mut v = cat_filtered.get();
+        v.sort_by(|a, b| {
+            (a.category.as_str(), a.name.to_lowercase())
+                .cmp(&(b.category.as_str(), b.name.to_lowercase()))
+        });
+        let mut groups: Vec<(String, Vec<CatalogueEntryResponse>)> = Vec::new();
+        for e in v {
+            match groups.last_mut() {
+                Some((c, items)) if *c == e.category => items.push(e),
+                _ => groups.push((e.category.clone(), vec![e])),
+            }
+        }
+        groups
     });
     let cat_categories = Memo::new(move |_| {
         let mut v: Vec<String> = catalogue.get().iter().map(|e| e.category.clone()).collect();
@@ -328,7 +300,7 @@ pub fn FiltersPage() -> impl IntoView {
                         Ok(_) => {
                             catalogue.update(|c| {
                                 if let Some(e) = c.iter_mut().find(|e| e.id == id) {
-                                    e.added = true;
+                                    e.installed = true;
                                 }
                             });
                             reload.update(|n| *n += 1);
@@ -449,30 +421,6 @@ pub fn FiltersPage() -> impl IntoView {
 
             <div class="card">
                 <div class="card-h">
-                    <h3>"Blocking profile"</h3>
-                    <div class="r">
-                        <Segmented
-                            options=vec![("default".to_string(), "Default".to_string()), ("strict".to_string(), "Strict".to_string())]
-                            value=profile
-                            on_change=set_profile
-                            label="Blocking profile"
-                            disabled=profile_busy
-                        />
-                    </div>
-                </div>
-                <div class="card-b">
-                    <p class="hint box">
-                        {move || if profile.get() == "strict" {
-                            "Strict is on: on top of the default lists it also blocks cookie banners, social widgets, chat and A/B-testing scripts and extra trackers. This may break some sites; fix one with a per-site allow rule in the custom rules below. Switching back to Default removes only the lists Strict added; lists you added yourself are not touched."
-                        } else {
-                            "Default blocks ads, trackers, malware and the common annoyances. Strict adds the AdGuard Annoyances and Social Media, EasyList Cookie, Fanboy Social and uBO Annoyances lists plus Argus Extra Trackers: it blocks more (cookie banners, social widgets, chat and A/B-testing scripts) and may break some sites, which you can fix with per-site allow rules in the custom rules below."
-                        }}
-                    </p>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-h">
                     <h3>"Filter lists"</h3>
                     <span class="sub">{move || format!("{} lists", format_number(counts.get().map(|c| c.all).unwrap_or(0) as u64))}</span>
                     <div class="r">
@@ -488,6 +436,7 @@ pub fn FiltersPage() -> impl IntoView {
                                         Ok(c) => {
                                             cat_source.set(c.source);
                                             cat_fetched.set(c.fetched_at);
+                                            cat_version.set(c.version);
                                             catalogue.set(c.entries);
                                         }
                                         Err(e) => app_c.error(format!("Failed to load catalogue: {e}")),
@@ -723,10 +672,12 @@ pub fn FiltersPage() -> impl IntoView {
                 on_close=Callback::new(move |_| show_catalogue.set(false))
             >
                 <p class="hint">
-                    {move || if cat_source.get() == "signed" {
+                    {move || if cat_source.get() == "snapshot" {
+                        format!("Built-in copy, release {}", cat_version.get().unwrap_or_default())
+                    } else if cat_source.get() == "signed" && cat_fetched.get().is_some() {
                         format!("Signed · {}", cat_fetched.get().map(|d| d.chars().take(10).collect::<String>()).unwrap_or_default())
                     } else {
-                        "Built-in".to_string()
+                        "Catalogue not loaded yet".to_string()
                     }}
                     " · Check each list's licence before use."
                 </p>
@@ -742,42 +693,38 @@ pub fn FiltersPage() -> impl IntoView {
                         {move || cat_regions.get().into_iter().map(|c| view! { <option value=c.clone()>{c.clone()}</option> }).collect_view()}
                     </select>
                 </div>
-                <ul class="flist">
-                    <For
-                        each=move || cat_filtered.get()
-                        key=|e| (e.id.clone(), e.added)
-                        children=move |e| {
-                            let id = e.id.clone();
-                            let tip = e.licence_note.clone().unwrap_or_else(|| format!("Licence {} forbids commercial use", e.licence));
-                            view! {
-                                <li style="grid-template-columns:minmax(0,1fr) auto">
-                                    <div style="min-width:0">
-                                        <div class="nm">
-                                            {e.name.clone()}" "
-                                            <span class="badge">{if e.source == "signed" { "signed" } else { "built-in" }}</span>
-                                            {e.profile.as_deref().is_some_and(|p| p == "strict").then(|| view! { " " <span class="badge" title="Added by the Strict profile: blocks more and may break some sites">"strict - may break sites"</span> })}
-                                            {e.profile.as_deref().is_some_and(|p| p == "default").then(|| view! { " " <span class="badge" title="Offered once and enabled by default; remove or disable it and it stays that way">"Argus default"</span> })}
-                                            {e.noncommercial.then(|| view! { " " <span class="badge" title=tip.clone()>"non-commercial"</span> })}
+                {move || cat_groups.get().is_empty().then(|| view! { <p class="hint">"Every catalogue list is already installed."</p> })}
+                <For
+                    each=move || cat_groups.get()
+                    key=|(c, items)| (c.clone(), items.iter().map(|e| e.id.clone()).collect::<Vec<_>>())
+                    children=move |(cat, items)| view! {
+                        <h4 style="margin:12px 0 4px">{cat}</h4>
+                        <ul class="flist">
+                            {items.into_iter().map(|e| {
+                                let id = e.id.clone();
+                                let tip = e.licence_note.clone().unwrap_or_else(|| format!("Licence {} forbids commercial use", e.licence));
+                                view! {
+                                    <li style="grid-template-columns:minmax(0,1fr) auto">
+                                        <div style="min-width:0">
+                                            <div class="nm">
+                                                {e.name.clone()}
+                                                {e.default_enabled.then(|| view! { " " <span class="badge" title="Recommended: enabled on a fresh install">"recommended"</span> })}
+                                                {e.noncommercial.then(|| view! { " " <span class="badge" title=tip.clone()>"non-commercial"</span> })}
+                                            </div>
+                                            <div class="url">
+                                                {e.format.clone()}
+                                                {e.region.clone().map(|r| format!(" | {r}"))}
+                                                " | "{e.licence.clone()}
+                                            </div>
+                                            {(!e.description.is_empty()).then(|| view! { <div class="url">{e.description.clone()}</div> })}
                                         </div>
-                                        <div class="url">
-                                            {e.format.clone()}" | "{e.category.clone()}
-                                            {e.region.clone().map(|r| format!(" | {r}"))}
-                                            " | "{e.licence.clone()}
-                                        </div>
-                                        {(!e.description.is_empty()).then(|| view! { <div class="url">{e.description.clone()}</div> })}
-                                    </div>
-                                    {if e.added {
-                                        view! { <Pill kind="ok" text="Added" /> }.into_any()
-                                    } else {
-                                        view! {
-                                            <button type="button" class="btn sm primary" on:click=move |_| catalogue_add.set(Some(id.clone()))>"Add"</button>
-                                        }.into_any()
-                                    }}
-                                </li>
-                            }
-                        }
-                    />
-                </ul>
+                                        <button type="button" class="btn sm primary" on:click=move |_| catalogue_add.set(Some(id.clone()))>"Add"</button>
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                    }
+                />
             </Modal>
         </Layout>
     }

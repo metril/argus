@@ -107,13 +107,25 @@ fn blocked(e: &SharedEngine) -> bool {
 }
 
 #[tokio::test]
-async fn open_seeds_default_lists() {
+async fn open_starts_empty_and_the_embedded_snapshot_seeds_it() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = ListServiceConfig {
         data_dir: dir.path().to_path_buf(),
         ..Default::default()
     };
     let svc = ListService::open(cfg, Arc::new(SharedEngine::new())).unwrap();
+    assert!(svc.store().get_all().unwrap().is_empty());
+    // Offline first boot: the signed snapshot compiled into the binary seeds the defaults.
+    let doc = list_service::SignedDoc::<list_service::FilterCatalogueEntry>::new(
+        "filters",
+        Some(svc.clone()),
+        list_service::ArgusConfig {
+            base_url: "http://unused.test".into(),
+            public_key: common::bypass::ARGUS_LISTS_PUBLIC_KEY.into(),
+            cache_dir: None,
+        },
+    );
+    doc.init_cache();
     assert!(svc.store().get_all().unwrap().len() >= 4);
 }
 

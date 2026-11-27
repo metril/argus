@@ -3,8 +3,6 @@
 // in any category.   node aggregate.mjs <dir-with-shard-json> [--out report.md] [--merged merged.json] [--tolerance 0]
 // Comparison pairs (same browser; the desktop app only runs Chrome): argus/chrome vs ubol, adguard-ext,
 // adguard-desktop (chrome); argus/firefox vs ubo, adguard-ext (firefox). `--tolerance` is in percentage points.
-// `argus-strict` (Argus with the opt-in Strict profile) is its own informational column; it never
-// takes part in the verdict, which stays on default `argus`.
 import fs from 'node:fs';
 import path from 'node:path';
 import { rescore, testKey } from './net.mjs';
@@ -20,7 +18,7 @@ const key = (s) => `${s.blocker}/${s.browser}${s.platform === 'win32' ? ' (win)'
 // Baselines that could not be set up (e.g. AdGuard for Windows trial needs an account) are reported, never compared.
 const unavailable = all.filter((s) => s.unavailable);
 const shards = all.filter((s) => !s.unavailable);
-const order = ['none', 'argus', 'argus-strict', 'ubol', 'ubo', 'adguard-ext', 'adguard-desktop'];
+const order = ['none', 'argus', 'ubol', 'ubo', 'adguard-ext', 'adguard-desktop'];
 shards.sort((a, b) => order.indexOf(a.blocker) - order.indexOf(b.blocker) || a.browser.localeCompare(b.browser));
 // Network-dependent tests (slow rejections = runner network failures, see net.mjs): a test tagged in ANY shard is
 // unmeasurable for EVERY blocker on that site; scores are recomputed without it.
@@ -75,7 +73,6 @@ for (const browser of ['chrome', 'firefox']) {
 const unstable = shards.flatMap((s) => s.results.flatMap((r) => (r.tests || []).filter((t) => t.passes && t.passes.some(Boolean) && !t.passes.every(Boolean)).map((t) => `${key(s)} ${r.site} / ${t.category} / ${t.name}: ${t.passes.map((p) => (p ? 'P' : 'F')).join('')}`)));
 const broken = shards.flatMap((s) => s.results.filter((r) => !r.ok).map((r) => `${key(s)} ${r.site}: ${r.error}`));
 if (unavailable.length) md += `\n## Baselines unavailable (excluded)\n\n${unavailable.map((s) => `- \`${key(s)}\`: baseline unavailable: ${s.unavailable}`).join('\n')}\n`;
-if (shards.some((s) => s.blocker === 'argus-strict')) md += '\n_`argus-strict` is informational and does not affect the verdict._\n';
 md += '\n## Verdict\n\n' + (failures.length ? `**FAIL**: Argus is below a baseline in ${failures.length} place(s):\n\n${failures.map((f) => '- ' + f).join('\n')}\n` : '**PASS**: Argus matches or beats every baseline in every category.\n');
 if (netRows.length) md += `\n## Network-dependent tests (excluded from every blocker's score)\n\n${netRows.map((f) => '- ' + f).join('\n')}\n`;
 if (unstable.length) md += `\n## Unstable tests (passed in some passes, counted as failed)\n\n${unstable.map((f) => '- ' + f).join('\n')}\n`;

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Prepares a freshly started Argus container for the parity run: waits until it is healthy, creates the
-# first admin, switches the filter lists to the uBOL-equivalent default set (uBlock filters, badware,
-# privacy, quick-fixes, unbreak, EasyList, EasyPrivacy, Peter Lowe's, uBO's urlhaus-1) plus AdGuard Windows' defaults
-# (AdGuard Base, Tracking Protection, URL Tracking, Mobile Ads), waits for the engine build and
-# downloads the root CA.
+# first admin, enables exactly the lists named by ARGUS_LIST_IDS (and disables all others), waits for the
+# engine build and downloads the root CA.
 #   argus-ci-setup.sh <web-ui-base-url> <ca-out-file>      e.g. http://127.0.0.1:3000 /tmp/argus-ca.crt
-# ARGUS_PROFILE=strict additionally switches on the opt-in Strict blocking profile (extra annoyance,
-# cookie, social and tracker lists; used by the informational argus-strict shard).
-# LIST_SET_REGEX overrides which list names stay enabled (case-insensitive extended regex).
+# ARGUS_LIST_IDS: comma/space-separated list ids. Default: the uBOL-equivalent set (uBlock filters,
+# badware, privacy, quick-fixes, unbreak, EasyList, EasyPrivacy, Peter Lowe's) plus AdGuard Windows'
+# defaults (AdGuard Base, Tracking Protection, URL Tracking, Mobile Ads) plus argus-base. Ids not installed
+# are added from the (signed) catalogue; the script fails if a required id never appears.
 set -euo pipefail
 base="${1:?web ui base url}"; ca_out="${2:?ca output file}"
 api="$base/api/v1"
-keep="${LIST_SET_REGEX:-^(ublock.*(filters|badware|privacy|quick|unbreak)|easylist|easyprivacy|peter lowe|adguard (base|tracking protection|url tracking|mobile ads)|argus base)}"
+ids="${ARGUS_LIST_IDS:-ublock-filters ublock-badware ublock-privacy ublock-quick-fixes ublock-unbreak easylist easyprivacy peter-lowe adguard-base adguard-tracking adguard-url-tracking adguard-mobile argus-base}"
+ids="$(echo "$ids" | tr ', ' '\n\n' | sed '/^$/d')"
 jar="$(mktemp)"; trap 'rm -f "$jar"' EXIT
 
 for i in $(seq 1 90); do curl -fsS "$api/health" >/dev/null 2>&1 && break; sleep 2; [ "$i" = 90 ] && { echo "argus never became healthy" >&2; exit 1; }; done
@@ -23,14 +23,22 @@ curl -fsS -c "$jar" -H 'Content-Type: application/json' -d "$body" "$api/auth/re
 csrf="$(awk '$6=="csrf_token"{print $7}' "$jar")"
 call() { curl -fsS -b "$jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' "$@"; }
 
-# Default-profile lists (Argus Base) arrive once the signed catalogue verifies; wait for them.
-for i in $(seq 1 60); do call "$api/lists?limit=500" | jq -e '.items[] | select(.id=="argus-base")' >/dev/null && break; sleep 2; [ "$i" = 60 ] && echo "warning: argus-base never offered" >&2; done
+# Add wanted ids that are not installed from the catalogue (signed entries such as argus-base arrive once
+# the signed catalogue verifies); wait up to 120s, fail loudly if one never appears.
+for i in $(seq 1 60); do
+  have="$(call "$api/lists?limit=500" | jq -r '.items[].id')"; missing=""
+  for id in $ids; do
+    grep -qx "$id" <<<"$have" || { missing="$missing $id"; call -X POST "$api/lists/catalogue/$id" >/dev/null 2>&1 || true; }
+  done
+  [ -z "$missing" ] && break
+  sleep 2; [ "$i" = 60 ] && { echo "required list ids never appeared:$missing" >&2; exit 1; }
+done
 lists="$(call "$api/lists?limit=500")"
-echo "$lists" | jq -r '.items[] | "\(.enabled)\t\(.name)"' | sed 's/^/before: /'
-echo "$lists" | jq -c '.items[]' | while read -r l; do
-  id="$(jq -r .id <<<"$l")"; name="$(jq -r .name <<<"$l")"
-  if echo "$name" | grep -Eiq "$keep"; then
-    trusted=false; echo "$name" | grep -Eiq "^(ublock|adguard)" && trusted=true
+cat_trust="$(call "$api/lists/catalogue" | jq -r '.entries[] | select(.trusted) | .id')"
+echo "$lists" | jq -r '.items[] | "\(.enabled)\t\(.id)"' | sed 's/^/before: /'
+echo "$lists" | jq -r '.items[].id' | while read -r id; do
+  if grep -qx "$id" <<<"$ids"; then
+    trusted=false; grep -qx "$id" <<<"$cat_trust" && trusted=true
     call -X PUT -d "{\"enabled\":true,\"trusted\":$trusted}" "$api/lists/$id" >/dev/null
   else
     call -X PUT -d '{"enabled":false}' "$api/lists/$id" >/dev/null
@@ -40,10 +48,6 @@ done
 # crates/filter-engine/src/list.rs), so it is added as a custom list with uAssets' contentURL for that id.
 urlhaus='{"id":"urlhaus-1","name":"Online Malicious URL Blocklist","url":"https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt","enabled":true,"format":"abp","allowlist":false,"trusted":false}'
 call -X POST -d "$urlhaus" "$api/lists" >/dev/null || call -X PUT -d '{"enabled":true}' "$api/lists/urlhaus-1" >/dev/null
-# After the keep/disable loop, so the Strict lists stay on. The default shard never sets this.
-if [ "${ARGUS_PROFILE:-}" = strict ]; then
-  call -X PUT -d '{"mode":"strict"}' "$api/lists/profile" | jq -c '{mode,pending}'
-fi
 call -X POST "$api/lists/refresh" >/dev/null || true
 
 # Engine ready: a build has completed, none is running, scriptlets loaded.

@@ -590,8 +590,8 @@ pub async fn get_userscript_catalogue(
         })
         .collect();
     Ok(Json(UserscriptCatalogueResponse {
-        source: "signed".into(),
-        fetched_at: Some(doc.fetched_at.clone()),
+        source: if doc.embedded { "snapshot" } else { "signed" }.into(),
+        fetched_at: doc.fetched_at.clone(),
         version: Some(doc.version.clone()),
         entries,
     }))

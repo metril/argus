@@ -781,23 +781,22 @@ pub struct CatalogueEntryResponse {
     /// Adding it makes the list trusted (extended rules may run).
     #[serde(default)]
     pub trusted: bool,
-    /// `strict`: added by the Strict profile; blocks more and may break sites.
+    /// Recommended: installed and enabled on a fresh install.
     #[serde(default)]
-    pub profile: Option<String>,
-    /// `signed` (verified argus-lists catalogue) or `builtin`.
-    #[serde(default)]
-    pub source: String,
-    /// Already added as a list.
-    pub added: bool,
+    pub default_enabled: bool,
+    /// Already installed as a list.
+    pub installed: bool,
 }
 
 /// The catalogue and where it came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CatalogueResponse {
-    /// `signed` or `builtin`.
+    /// `signed` for a fetched argus-lists release, `snapshot` for the signed copy built into the
+    /// binary (no release fetched yet), `signed` with no entries while none has loaded.
     pub source: String,
-    /// When the signed copy was verified (RFC 3339); absent for the built-in one.
+    /// When the signed copy was fetched and verified (RFC 3339); absent for `snapshot` and while
+    /// none has loaded.
     pub fetched_at: Option<String>,
     /// Release of the signed copy.
     pub version: Option<String>,
@@ -824,24 +823,4 @@ pub struct ExtRuleResponse {
     /// Why the rule is unsupported / invalid.
     #[serde(default)]
     pub reason: Option<String>,
-}
-
-/// The blocking profile: `default` or `strict`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct BlockingProfileResponse {
-    /// `default` or `strict`.
-    pub mode: String,
-    /// Lists Strict created (removed again on switching back).
-    pub added: Vec<String>,
-    /// Strict lists not added yet (the signed `argus-extra` list until the signed catalogue loads).
-    pub pending: Vec<String>,
-}
-
-/// Switch the blocking profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct SetBlockingProfileRequest {
-    /// `default` or `strict`.
-    pub mode: String,
 }
