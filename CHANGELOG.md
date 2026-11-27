@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.8.5 — 2026-11-27
+
+- AdGuard bare-host root exceptions (HTTPS-filtering-off workarounds) are dropped.
+- Scriptlet resources: bundled copy installed at startup; uBO pinned via git refs instead of the rate-limited GitHub API.
+
 ## 0.8.4 — 2026-11-27
 
 - Generic `$redirect` rules from AdGuard lists now block instead of serving a stub, matching uBO.
