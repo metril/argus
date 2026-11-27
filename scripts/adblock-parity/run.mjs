@@ -70,9 +70,12 @@ const canaryFor = (isArgus) => `(async () => {
   return { ok: hosts.filter((h) => h.blocked).length * 2 > urls.length, hosts };
 })()`;
 const CANARY = canaryFor(blocker === 'argus');
-// Unblocked control host: must stay reachable on every site run, else the run is discarded and retried once.
+// Control request: must keep working on every site run, else the run is discarded and retried once. It is a
+// same-origin fetch of the test page's own URL: no list can scope a rule to "third-party requests from this
+// site" onto it (AdGuard Base ships `*$3p,domain=adblock.turtlecute.org|paileactivist.github.io`, which blocks any
+// third-party control host such as example.com), and blocking the page's own document would break the test.
 const CONTROL = `(async () => { const c = new AbortController(); const t = setTimeout(() => c.abort(), 10000);
-  try { await fetch('https://example.com/?c=' + Date.now(), { mode: 'no-cors', cache: 'no-store', signal: c.signal }); return true; } catch (e) { return false; } finally { clearTimeout(t); } })()`;
+  try { await fetch(location.href, { cache: 'no-store', signal: c.signal }); return true; } catch (e) { return false; } finally { clearTimeout(t); } })()`;
 const SETTLE_MS = +(args['settle'] ?? 15) * 1000; // after the canary passes, let the engine finish loading
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let lastCanary = null;
@@ -228,6 +231,12 @@ async function runFirefox() {
     await driver.switchTo().window(home);
     const results = [];
     for (const s of sites) {
+      if (blocker === 'ubo' && s.fetchProbe) {
+        // uBO on Firefox answers blocked no-cors fetches locally (opaque response in ~8ms, while script loads of the
+        // same host fail), so a page that scores by "fetch rejected" reads uBO as blocking nothing. Not measurable.
+        results.push({ site: s.id, url: s.url, ok: false, error: 'not measurable: uBO/Firefox resolves blocked no-cors fetches as opaque responses', score: { passed: 0, total: 0, percent: 0 }, categories: {}, tests: [], meta: {} });
+        continue;
+      }
       results.push(await measure(s, async () => {
         await driver.get(s.url);
         const r = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${extractorSource(s)}.then(cb, (e) => cb({ __error: String(e) }));`);
@@ -254,7 +263,7 @@ async function measure(site, fn) {
     for (let attempt = 1; attempt <= 2 && !got; attempt++) {
       try {
         const r = await fn();
-        if (!r.control) { lastErr = new Error('control host https://example.com/ unreachable'); log(site.id, `pass ${pass} attempt ${attempt} discarded:`, lastErr.message); continue; }
+        if (!r.control) { lastErr = new Error('control (same-origin fetch of the test page) failed'); log(site.id, `pass ${pass} attempt ${attempt} discarded:`, lastErr.message); continue; }
         got = r;
       } catch (e) { lastErr = e; log(site.id, `pass ${pass} attempt ${attempt} failed:`, e.message.split('\n')[0]); }
     }
