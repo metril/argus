@@ -19,7 +19,7 @@ members = [
 exclude = ["vendor/wreq", "vendor/wreq-util"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # Real floor: oxc_parser 0.126 (filter-engine) requires Rust 1.92. Toolchain is pinned to
 # stable in rust-toolchain.toml; no nightly features are used.
