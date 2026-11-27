@@ -4,6 +4,7 @@
 //                [--proxy host:port] [--ca path/to/ca.crt] [--sites turtlecute,toolz] [--out file.json]
 //                [--chrome-path /usr/bin/google-chrome] [--ready-timeout 120] [--settle 15]
 import fs from 'node:fs';
+import { combinePasses } from './combine.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -255,13 +256,17 @@ async function runFirefox() {
   }
 }
 
-// Each site runs twice and the SECOND result is kept (the first warms the blocker: lazily compiled rules,
-// first-visit onboarding); the first is recorded as firstPercent. A run is valid only if the unblocked
-// control host was reachable; a failed or invalid run is discarded and retried once.
+// Each site runs PARITY_PASSES times (default 2). A run is valid only if the unblocked control host was
+// reachable; a failed or invalid run is discarded and retried once. A test counts as passed only if it passed in
+// EVERY valid scored pass (the leading warm-up pass absorbs lazy compile/caches and is not scored) (symmetric for all blockers), de-noising timeouts/network failures that read as "blocked".
+// Per-test pass vectors are recorded in `tests[].passes`; firstPercent is the first valid pass's score.
+const PASSES = Math.max(1, +(process.env.PARITY_PASSES || 2)); // scored passes; one extra unscored warm-up pass runs first
 async function measure(site, fn) {
   const t0 = Date.now();
-  let lastErr = new Error('no result'), first = null, kept = null;
-  for (let pass = 1; pass <= 2; pass++) {
+  let lastErr = new Error('no result');
+  const runs = [];
+  let warm = null;
+  for (let pass = 0; pass <= PASSES; pass++) {
     let got = null;
     for (let attempt = 1; attempt <= 2 && !got; attempt++) {
       try {
@@ -270,9 +275,9 @@ async function measure(site, fn) {
         got = r;
       } catch (e) { lastErr = e; log(site.id, `pass ${pass} attempt ${attempt} failed:`, e.message.split('\n')[0]); }
     }
-    if (got) { log(site.id, `pass ${pass}: ${got.score.passed}/${got.score.total} (${got.score.percent}%)`); if (pass === 1) first = got; kept = got; }
+    if (got) { log(site.id, `pass ${pass === 0 ? "warm-up (unscored)" : pass}: ${got.score.passed}/${got.score.total} (${got.score.percent}%)`); if (pass === 0) warm = got; else runs.push(got); }
   }
-  if (kept) { const { control, ...r } = kept; return { site: site.id, url: site.url, ok: true, ...r, controlOk: true, firstPercent: first?.score.percent, seconds: Math.round((Date.now() - t0) / 1000) }; }
+  if (runs.length) { const { control, ...r } = combinePasses(runs); return { site: site.id, url: site.url, ok: true, ...r, controlOk: true, passes: runs.length, firstPercent: warm?.score.percent, seconds: Math.round((Date.now() - t0) / 1000) }; }
   return { site: site.id, url: site.url, ok: false, error: lastErr.message.split('\n')[0], score: { passed: 0, total: 0, percent: 0 }, categories: {}, tests: [], meta: {} };
 }
 

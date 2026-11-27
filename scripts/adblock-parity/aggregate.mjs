@@ -57,9 +57,12 @@ for (const browser of ['chrome', 'firefox']) {
     }
   }
 }
+// Tests that passed in some passes but not all (noisy: timeouts/network failures); already scored as failed.
+const unstable = shards.flatMap((s) => s.results.flatMap((r) => (r.tests || []).filter((t) => t.passes && t.passes.some(Boolean) && !t.passes.every(Boolean)).map((t) => `${key(s)} ${r.site} / ${t.category} / ${t.name}: ${t.passes.map((p) => (p ? 'P' : 'F')).join('')}`)));
 const broken = shards.flatMap((s) => s.results.filter((r) => !r.ok).map((r) => `${key(s)} ${r.site}: ${r.error}`));
 if (unavailable.length) md += `\n## Baselines unavailable (excluded)\n\n${unavailable.map((s) => `- \`${key(s)}\`: baseline unavailable: ${s.unavailable}`).join('\n')}\n`;
 md += '\n## Verdict\n\n' + (failures.length ? `**FAIL**: Argus is below a baseline in ${failures.length} place(s):\n\n${failures.map((f) => '- ' + f).join('\n')}\n` : '**PASS**: Argus matches or beats every baseline in every category.\n');
+if (unstable.length) md += `\n## Unstable tests (passed in some passes, counted as failed)\n\n${unstable.map((f) => '- ' + f).join('\n')}\n`;
 if (broken.length) md += `\nExtraction errors (not scored):\n\n${broken.map((f) => '- ' + f).join('\n')}\n`;
 
 fs.writeFileSync(opt('out', path.join(dir, 'report.md')), md);
