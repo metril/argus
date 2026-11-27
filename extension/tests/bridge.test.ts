@@ -29,6 +29,7 @@ function setup(opts: { perm?: boolean; grants?: string[]; fetch?: any; proxy?: a
       getAll: vi.fn(async () => ({ origins: ['https://a.com/*', 'chrome://x/*', '<all_urls>'] })),
     },
     cookies: { getAll: vi.fn(async () => []), set: vi.fn(), remove: vi.fn() },
+    tabs: { get: vi.fn(async (id: number) => { if (id === 9) throw new Error('gone'); return { url: id === 1 ? 'https://opener.test/p' : 'chrome://newtab/' }; }) },
     storage: { local: { get: vi.fn(async () => ({ granted: opts.perm === false ? [] : (opts.grants ?? ['https://a.com/*']) })), set: vi.fn(async () => {}) } },
   };
   const b = new Bridge({
@@ -54,6 +55,19 @@ const meta = (o: object) => ({
 
 describe('Bridge', () => {
   beforeEach(() => { FakeWS.last = undefined as any; });
+
+  it('reports popups with the opener tab URL, only when connected and http(s)', async () => {
+    const { b } = setup();
+    await b.reportPopup('https://pop.test/', 1); // not connected: nothing
+    const ws = await welcome(b);
+    const before = ws.texts().length;
+    await b.reportPopup('https://pop.test/x', 1);
+    await b.reportPopup('about:blank', 1);
+    await b.reportPopup('https://pop.test/y', 2); // opener not http(s)
+    await b.reportPopup('https://pop.test/z', 9); // tab gone
+    const t = ws.texts().slice(before);
+    expect(t).toEqual([{ t: 'popup', url: 'https://pop.test/x', opener: 'https://opener.test/p' }]);
+  });
 
   it('sends hello first, then perms after welcome; token not in URL', async () => {
     const { b } = setup();

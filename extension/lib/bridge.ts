@@ -126,6 +126,21 @@ export class Bridge {
     } catch { /* ignore */ }
   }
 
+  /**
+   * A tab was opened by another one (`webNavigation.onCreatedNavigationTarget`): tell Argus the
+   * target URL and the opener tab's URL, so `$popup` rules and the opener's `$domain` apply. The
+   * proxy matches it to the navigation request of this session (consumed once, 30 s).
+   */
+  async reportPopup(target: string, sourceTabId: number): Promise<void> {
+    if (!this.sid || !this.ws || !/^https?:/i.test(target)) return;
+    try {
+      const tab = await this.d.browser.tabs.get(sourceTabId);
+      const opener: string | undefined = tab?.url;
+      if (!opener || !/^https?:/i.test(opener) || !this.ws) return;
+      this.ws.send(JSON.stringify({ t: 'popup', url: target, opener }));
+    } catch { /* tab gone */ }
+  }
+
   private async onMessage(data: unknown) {
     if (typeof data === 'string') {
       let m: any;

@@ -80,6 +80,10 @@ export default defineBackground(() => {
   });
   browser.storage.onChanged.addListener((changes: Record<string, unknown>) => onStorageChanged(changes, { clearCache, bridge, proxy }));
   browser.tabs.onRemoved.addListener((id) => intercepted.delete(id));
+  // New tabs / windows opened by a page: the proxy learns the opener (for `$popup`).
+  b.webNavigation?.onCreatedNavigationTarget?.addListener((d: { url?: string; sourceTabId?: number }) => {
+    if (d.url && d.sourceTabId !== undefined && d.sourceTabId >= 0) void bridge.reportPopup(d.url, d.sourceTabId);
+  });
 
   // Firefox only: inspect the certificate the browser actually received.
   const wr = (browser as any).webRequest;

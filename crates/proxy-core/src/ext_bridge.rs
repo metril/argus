@@ -277,7 +277,15 @@ struct Session {
     pings: u32,
     /// Set while the channel is down: the session lives (for proxy auth and resume) until then.
     grace_until: Option<Instant>,
+    /// Popups the extension reported (`webNavigation.onCreatedNavigationTarget`): target URL,
+    /// opener tab URL and when. Bounded by [`MAX_POPUPS`], valid for [`POPUP_TTL`].
+    popups: VecDeque<(String, String, Instant)>,
 }
+
+/// Reported popups kept per session.
+const MAX_POPUPS: usize = 32;
+/// How long a reported popup waits for its navigation request.
+const POPUP_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct MenuCmd {
@@ -617,6 +625,7 @@ impl ExtHub {
                 ndocs: 0,
                 pings: 0,
                 grace_until,
+                popups: VecDeque::new(),
             },
         );
         id
@@ -1002,8 +1011,43 @@ impl ExtHub {
                 };
                 self.audit(&user, "perms", Some(format!("{} origins", origins.len())));
             }
+            Some("popup") => {
+                let get = |k: &str| {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .filter(|x| x.len() <= 8192)
+                        .map(str::to_string)
+                };
+                let (Some(url), Some(opener)) = (get("url"), get("opener")) else {
+                    return;
+                };
+                let mut g = self.inner.lock();
+                if let Some(s) = g.sessions.get_mut(&id) {
+                    let now = Instant::now();
+                    s.popups.retain(|p| now.duration_since(p.2) < POPUP_TTL);
+                    if s.popups.len() >= MAX_POPUPS {
+                        s.popups.pop_front();
+                    }
+                    s.popups.push_back((url, opener, now));
+                }
+            }
             _ => {}
         }
+    }
+
+    /// The opener the extension reported for a document navigation to `url` in this session,
+    /// consumed by the lookup (a popup is one navigation).
+    pub fn take_popup(&self, id: u64, url: &str) -> Option<String> {
+        let url = url.split('#').next().unwrap_or(url);
+        let mut g = self.inner.lock();
+        let s = g.sessions.get_mut(&id)?;
+        let now = Instant::now();
+        s.popups.retain(|p| now.duration_since(p.2) < POPUP_TTL);
+        let i = s
+            .popups
+            .iter()
+            .position(|p| p.0.split('#').next().unwrap_or(&p.0) == url)?;
+        s.popups.remove(i).map(|p| p.1)
     }
 
     /// Binary frame from the extension: an answer to one of this session's jobs.

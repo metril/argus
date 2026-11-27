@@ -32,6 +32,7 @@ pub mod listener_flags;
 pub mod load_manager;
 pub mod memory_monitor;
 pub mod mitm;
+pub mod pages;
 pub mod panel;
 pub mod policy;
 pub mod profile_build;

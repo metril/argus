@@ -17,7 +17,7 @@ use crate::policy::{is_refusal, DestPolicy};
 use crate::profiles::Profiles;
 use crate::redirect::{block_response, policy_block_response, redirect_response, rewrite_redirect};
 use crate::request_ctx::{default_profile_slot, Profile, ProfileSlot, RequestCtx};
-use crate::request_type::{classify, source_url, RequestType};
+use crate::request_type::{classify, source_url_hinted, RequestType};
 use crate::rewrite::codec::{choose_encoding, response_codings};
 use crate::rewrite::pipeline::{transform_html, transform_text, Outcome};
 use crate::rewrite::{
@@ -95,11 +95,12 @@ fn src_of<'a>(
     headers: &'a hyper::HeaderMap,
     url: &'a str,
     rtype: RequestType,
+    hint: Option<&'a str>,
 ) -> &'a str {
     orig_referer
         .as_deref()
         .filter(|_| rtype != RequestType::Document)
-        .unwrap_or_else(|| source_url(headers, url, rtype))
+        .unwrap_or_else(|| source_url_hinted(headers, url, rtype, hint))
 }
 
 fn origin_of(scheme: &str, url_host: &str, port: u16) -> String {
@@ -1113,6 +1114,20 @@ impl ProxyContext {
 
         // Filter decision. The profile guard is dropped before any `.await`.
         let rtype = classify(&method, &headers, path_and_query);
+        // The page this request belongs to when the headers do not name it (CSS-initiated or
+        // Referer-less requests), and the popup opener of a document navigation.
+        let page_hint: Option<String> = {
+            let dev = rctx
+                .device
+                .as_deref()
+                .map_or_else(|| rctx.client_addr.ip().to_string(), str::to_string);
+            self.internal.pages.hint(&dev, &headers, &url, rtype)
+        };
+        // Only the extension knows an opener; a report that has not arrived yet fails open.
+        let popup_opener: Option<String> = rctx
+            .ext
+            .filter(|_| rtype == RequestType::Document)
+            .and_then(|s| self.internal.gm.ext().take_popup(s, &url));
         let mut csp: Option<String> = None;
         // A document the user switched ad blocking off for (see `SharedEngine::site_off`): no
         // cosmetics, scriptlets or extended rules for it.
@@ -1125,7 +1140,7 @@ impl ProxyContext {
             let profile = rctx.profile.load();
             let engine = &profile.engine;
             if engine.is_enabled() && rctx.adblock_on() && !bypass_full {
-                let source = source_url(&headers, &url, rtype);
+                let source = source_url_hinted(&headers, &url, rtype, page_hint.as_deref());
                 let q = filter_engine::Query::new(&url, source, rtype.as_str());
                 let (verdict, gen_) = engine.check_gen_deferred_q(&q);
                 let verdict = apply_overlay(&profile, verdict, &q);
@@ -1142,7 +1157,10 @@ impl ProxyContext {
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
                     if let Some(sc) = &profile.script_control {
-                        count_page_block(sc, source_url(&headers, &url, rtype));
+                        count_page_block(
+                            sc,
+                            source_url_hinted(&headers, &url, rtype, page_hint.as_deref()),
+                        );
                     }
                     if let Some(res) = verdict.redirect_resource() {
                         let origin = headers
@@ -1171,7 +1189,7 @@ impl ProxyContext {
                     // `@@$removeparam` exceptions (the engine cannot parse them) restore the
                     // parameters they exempt.
                     if let Some(idx) = ext_idx {
-                        let source = source_url(&headers, &url, rtype);
+                        let source = source_url_hinted(&headers, &url, rtype, page_hint.as_deref());
                         new_url = ext::exempt_engine_rewrite(
                             idx,
                             &url,
@@ -1201,10 +1219,19 @@ impl ProxyContext {
                 }
                 // Extended rules run after the engine verdict (see `crate::ext` for precedence).
                 if let Some(idx) = ext_idx {
-                    let source = source_url(&headers, &url, rtype);
-                    if let Some(d) =
-                        ext::request_decision(idx, &url, method.as_str(), source, rtype, &headers)
-                    {
+                    let source = source_url_hinted(&headers, &url, rtype, page_hint.as_deref());
+                    if let Some(d) = ext::request_decision(
+                        idx,
+                        &url,
+                        method.as_str(),
+                        source,
+                        rtype,
+                        &headers,
+                        ext::DecisionCtx {
+                            engine_exception: verdict.exception_rule.is_some(),
+                            popup: popup_opener.as_deref(),
+                        },
+                    ) {
                         if let Some(id) = d.block {
                             let parsed = idx.rule(id);
                             let rule = parsed.map(|r| r.raw.clone()).unwrap_or_default();
@@ -1212,7 +1239,10 @@ impl ProxyContext {
                                 debug!("Blocked {} by extended rule {}", url, rule);
                             }
                             if let Some(sc) = &profile.script_control {
-                                count_page_block(sc, source_url(&headers, &url, rtype));
+                                count_page_block(
+                                    sc,
+                                    source_url_hinted(&headers, &url, rtype, page_hint.as_deref()),
+                                );
                             }
                             engine.stats_handle().record_blocked(rtype.as_str(), &host);
                             // Borrowed straight into the ring: no event struct, no clock read here.
@@ -1261,7 +1291,11 @@ impl ProxyContext {
                     }
                 }
                 if rtype.is_frame() {
-                    csp = engine.csp_for(&url, source_url(&headers, &url, rtype), rtype.as_str());
+                    csp = engine.csp_for(
+                        &url,
+                        source_url_hinted(&headers, &url, rtype, page_hint.as_deref()),
+                        rtype.as_str(),
+                    );
                 }
             }
             // Script policy network hints: one atomic load when the master switch is off.
@@ -1305,7 +1339,7 @@ impl ProxyContext {
         let mut stealth_third = false;
         let mut orig_referer: Option<String> = None;
         if st.enabled && !bypass_full {
-            let src = source_url(&headers, &url, rtype).to_string();
+            let src = source_url_hinted(&headers, &url, rtype, page_hint.as_deref()).to_string();
             stealth_third = rtype != RequestType::Document && stealth::is_third_party(&host, &src);
             let page = if rtype == RequestType::Document || src.is_empty() {
                 url.clone()
@@ -1488,7 +1522,7 @@ impl ProxyContext {
                             filter_engine::EventAction::Error,
                             method.as_str(),
                             &url,
-                            src_of(&orig_referer, &headers, &url, rtype),
+                            src_of(&orig_referer, &headers, &url, rtype, page_hint.as_deref()),
                             rtype,
                             Some(504),
                             Some(filter_engine::ErrorKind::UpstreamTimeout),
@@ -1543,7 +1577,7 @@ impl ProxyContext {
                         filter_engine::EventAction::Error,
                         method.as_str(),
                         &url,
-                        src_of(&orig_referer, &headers, &url, rtype),
+                        src_of(&orig_referer, &headers, &url, rtype, page_hint.as_deref()),
                         rtype,
                         Some(502),
                         Some(kind),
@@ -1581,7 +1615,7 @@ impl ProxyContext {
                 filter_engine::EventAction::Allowed,
                 method.as_str(),
                 &url,
-                src_of(&orig_referer, &headers, &url, rtype),
+                src_of(&orig_referer, &headers, &url, rtype, page_hint.as_deref()),
                 rtype,
                 Some(status.as_u16()),
                 None,
@@ -1697,7 +1731,13 @@ impl ProxyContext {
                     s.transforms_for(&ResponseInfo {
                         generation: generation.as_ref(),
                         method: method.as_str(),
-                        source_url: src_of(&orig_referer, &headers, &url, rtype),
+                        source_url: src_of(
+                            &orig_referer,
+                            &headers,
+                            &url,
+                            rtype,
+                            page_hint.as_deref(),
+                        ),
                         url: &url,
                         request_type: rtype,
                         status,

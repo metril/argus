@@ -155,8 +155,26 @@ fn classify_extension(path: &str) -> RequestType {
 /// * With neither: `Sec-Fetch-Site: cross-site` yields `""` (the engine then treats the request
 ///   as third-party); any other value, or no fetch metadata, counts as same-party.
 pub fn source_url<'a>(headers: &'a HeaderMap, url: &'a str, ty: RequestType) -> &'a str {
+    source_url_hinted(headers, url, ty, None)
+}
+
+/// [`source_url`] with the page the proxy resolved itself (see `crate::pages`), which wins over
+/// the header inference: it covers a `Referer` that names a stylesheet and a missing one.
+///
+/// `Sec-Fetch-Site: same-origin|same-site|none` with no `Referer`/`Origin` yields the request
+/// URL itself: first-party for `$third-party`, which is right at eTLD+1 granularity (`same-site`
+/// is by definition the same registrable domain).
+pub fn source_url_hinted<'a>(
+    headers: &'a HeaderMap,
+    url: &'a str,
+    ty: RequestType,
+    hint: Option<&'a str>,
+) -> &'a str {
     if ty == RequestType::Document {
         return url;
+    }
+    if let Some(h) = hint.filter(|h| !h.is_empty()) {
+        return h;
     }
     if let Some(r) = hstr(headers, REFERER).filter(|r| !r.is_empty()) {
         return r;
@@ -273,6 +291,34 @@ mod tests {
         let h = hm(&[("sec-fetch-site", "same-origin")]);
         assert_eq!(source_url(&h, url, RequestType::Image), url);
         assert_eq!(source_url(&HeaderMap::new(), url, RequestType::Image), url);
+    }
+
+    #[test]
+    fn hint_overrides_headers_but_not_documents() {
+        let url = "https://f.test/x.woff2";
+        let h = hm(&[("referer", "https://cdn.test/a.css")]);
+        assert_eq!(
+            source_url_hinted(&h, url, RequestType::Font, Some("https://page.test/")),
+            "https://page.test/"
+        );
+        assert_eq!(
+            source_url_hinted(&h, url, RequestType::Font, None),
+            "https://cdn.test/a.css"
+        );
+        assert_eq!(
+            source_url_hinted(&h, url, RequestType::Document, Some("https://x/")),
+            url
+        );
+    }
+
+    #[test]
+    fn same_site_without_referer_is_first_party() {
+        // Source = the request URL: same registrable domain, so `$third-party` is false.
+        let u = "https://cdn.page.test/a.js";
+        for s in ["same-site", "same-origin", "none"] {
+            let h = hm(&[("sec-fetch-site", s)]);
+            assert_eq!(source_url(&h, u, RequestType::Script), u, "{s}");
+        }
     }
 
     #[test]
