@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.3 — 2026-11-27
+
 * CNAME uncloaking, as uBlock Origin does on Firefox. A request that passes the filters is judged
   again under the canonical name its host resolves to, so `cmp.osano.com` (a CNAME of a
   CloudFront host EasyPrivacy blocks) is blocked. The name comes from the answer Argus already
