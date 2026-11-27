@@ -22,11 +22,34 @@ const MAX_ENTRIES: usize = 5000;
 pub trait CatalogueEntry: DeserializeOwned {
     fn validate(&self) -> Result<(), String>;
 
-    /// The list to offer once and enable (`profile: default` filter entries); `None` otherwise.
-    fn default_list(&self) -> Option<filter_engine::FilterList> {
+    /// The list to install, enabled, on a first run (`default_enabled` filter entries).
+    fn seed_list(&self) -> Option<filter_engine::FilterList> {
+        None
+    }
+
+    /// The signed snapshot shipped in the binary, used until a cached or fetched copy verifies.
+    fn snapshot() -> Option<Snapshot> {
         None
     }
 }
+
+/// A signed catalogue release compiled into the binary: the document, the signed `meta.json`
+/// and both signatures. It is verified exactly like fetched data.
+#[derive(Debug, Clone, Copy)]
+pub struct Snapshot {
+    pub text: &'static str,
+    pub sig: &'static str,
+    pub meta: &'static str,
+    pub meta_sig: &'static str,
+}
+
+/// The embedded `filters.json` release (refresh with `scripts/update-catalogue-snapshot.sh`).
+const FILTERS_SNAPSHOT: Snapshot = Snapshot {
+    text: include_str!("../assets/catalogue/filters.json"),
+    sig: include_str!("../assets/catalogue/filters.json.minisig"),
+    meta: include_str!("../assets/catalogue/meta.json"),
+    meta_sig: include_str!("../assets/catalogue/meta.json.minisig"),
+};
 
 fn https(url: &str) -> bool {
     url.len() > 8 && url[..8].eq_ignore_ascii_case("https://")
@@ -94,11 +117,9 @@ pub struct FilterCatalogueEntry {
     /// uBlock Origin's lists and AdGuard Base.
     #[serde(default, deserialize_with = "null_default")]
     pub trusted: bool,
-    /// `"strict"`: only added by the opt-in Strict profile, never seeded. `"default"`: offered
-    /// once and enabled when the catalogue loads. Missing, null or any other value is an
-    /// ordinary entry.
-    #[serde(default)]
-    pub profile: Option<String>,
+    /// Installed and enabled once on a first run, before the user has any lists.
+    #[serde(default, deserialize_with = "null_default")]
+    pub default_enabled: bool,
 }
 
 impl CatalogueEntry for FilterCatalogueEntry {
@@ -113,8 +134,12 @@ impl CatalogueEntry for FilterCatalogueEntry {
         Ok(())
     }
 
-    fn default_list(&self) -> Option<filter_engine::FilterList> {
-        if !self.is_default() {
+    fn snapshot() -> Option<Snapshot> {
+        Some(FILTERS_SNAPSHOT)
+    }
+
+    fn seed_list(&self) -> Option<filter_engine::FilterList> {
+        if !self.default_enabled {
             return None;
         }
         let mut l =
@@ -127,16 +152,6 @@ impl CatalogueEntry for FilterCatalogueEntry {
 }
 
 impl FilterCatalogueEntry {
-    /// Offered once and enabled by default.
-    pub fn is_default(&self) -> bool {
-        self.profile.as_deref() == Some(filter_engine::PROFILE_DEFAULT)
-    }
-
-    /// Part of the Strict profile.
-    pub fn is_strict(&self) -> bool {
-        self.profile.as_deref() == Some(filter_engine::PROFILE_STRICT)
-    }
-
     /// The list format this entry maps to (`None`: not one we can add).
     pub fn list_format(&self) -> Option<filter_engine::ListFormat> {
         use filter_engine::ListFormat as F;
@@ -205,8 +220,10 @@ pub struct Loaded<E> {
     pub entries: Vec<E>,
     /// Release the document came from (`vYYYY.MM.DD[.N]`).
     pub version: String,
-    /// When it was verified (RFC 3339).
-    pub fetched_at: String,
+    /// When it was verified (RFC 3339); `None` for the copy embedded in the binary.
+    pub fetched_at: Option<String>,
+    /// The copy embedded in the binary, not one fetched or cached.
+    pub embedded: bool,
 }
 
 #[derive(Deserialize)]
@@ -391,15 +408,12 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         }
     }
 
-    /// Offer the verified catalogue's `profile: default` lists once (see
-    /// [`crate::ListStore::default_offer`]) and rebuild when any was added.
-    fn offer_defaults(&self, entries: &[E]) {
+    /// Seed the store once from the verified catalogue's `default_enabled` lists (see
+    /// [`crate::ListStore::seed_catalogue`]) and rebuild when any was added.
+    fn seed(&self, entries: &[E]) {
         let Some(svc) = &self.svc else { return };
-        let lists: Vec<_> = entries.iter().filter_map(|e| e.default_list()).collect();
-        if lists.is_empty() {
-            return;
-        }
-        match svc.store().default_offer(lists) {
+        let lists: Vec<_> = entries.iter().filter_map(|e| e.seed_list()).collect();
+        match svc.store().seed_catalogue(lists) {
             Ok(added) if !added.is_empty() => {
                 tracing::info!("{}: enabled default lists {added:?}", self.kind);
                 if tokio::runtime::Handle::try_current().is_ok() {
@@ -407,12 +421,57 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                 }
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!("{}: could not offer default lists: {e}", self.kind),
+            Err(e) => tracing::warn!("{}: could not seed lists: {e}", self.kind),
         }
     }
 
-    /// Load the last good copy from the cache (verified again).
+    /// Install the embedded snapshot, verified like fetched data, unless a copy is already in
+    /// force. Never replaces a cached or fetched release and respects the downgrade floor.
+    pub(crate) fn load_snapshot(&self, snap: &Snapshot) -> Result<(), String> {
+        if self.get().is_some() {
+            return Ok(());
+        }
+        // A fetch in progress will install something newer; never race it.
+        let Ok(_g) = self.busy.try_lock() else {
+            return Ok(());
+        };
+        if self.get().is_some() {
+            return Ok(());
+        }
+        let cfg = self.cfg();
+        let (entries, version) =
+            self.check(&cfg, snap.text, snap.sig, Some((snap.meta, snap.meta_sig)))?;
+        if let Some(f) = self.floor() {
+            if version_cmp(&version, &f) == Some(Ordering::Less) {
+                return Err(format!("snapshot {version} is older than {f}"));
+            }
+        }
+        self.raise_floor(&version);
+        self.seed(&entries);
+        *self.current.write() = Some(Arc::new(Loaded {
+            entries,
+            version,
+            fetched_at: None,
+            embedded: true,
+        }));
+        *self.installed.lock() = Some((snap.text.to_string(), snap.sig.to_string()));
+        Ok(())
+    }
+
+    /// Load the last good copy from the cache (verified again); when there is none, the embedded
+    /// snapshot.
     pub fn init_cache(&self) {
+        self.load_cache();
+        if self.get().is_none() {
+            if let Some(snap) = E::snapshot() {
+                if let Err(e) = self.load_snapshot(&snap) {
+                    tracing::warn!("{}: ignoring the embedded snapshot: {e}", self.kind);
+                }
+            }
+        }
+    }
+
+    fn load_cache(&self) {
         let cfg = self.cfg();
         self.applied_key.lock().clone_from(&cfg.public_key);
         if let Some(v) = Self::path(&cfg, &format!("{}.version", self.kind))
@@ -444,11 +503,12 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                     }
                 }
                 self.raise_floor(&version);
-                self.offer_defaults(&entries);
+                self.seed(&entries);
                 *self.current.write() = Some(Arc::new(Loaded {
                     entries,
                     version,
-                    fetched_at: chrono::Utc::now().to_rfc3339(),
+                    fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+                    embedded: false,
                 }));
                 *self.installed.lock() = Some((text, sig));
             }
@@ -535,11 +595,12 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
             }
         }
         self.raise_floor(&version);
-        self.offer_defaults(&entries);
+        self.seed(&entries);
         *self.current.write() = Some(Arc::new(Loaded {
             entries,
             version: version.clone(),
-            fetched_at: chrono::Utc::now().to_rfc3339(),
+            fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+            embedded: false,
         }));
         *self.installed.lock() = Some((text.clone(), sig.clone()));
         if let (Some(vp), Some(tp), Some(sp)) = (
@@ -730,45 +791,156 @@ mod tests {
         assert!(d.get().is_none());
     }
 
-    fn profiled_json() -> String {
-        let e = |id: &str, profile: &str| {
+    fn seeded_json() -> String {
+        let e = |id: &str, extra: &str| {
             format!(
-                r#"{{"id":"{id}","name":"{id}","url":"https://example.test/{id}.txt","format":"abp","category":"ads"{profile}}}"#
+                r#"{{"id":"{id}","name":"{id}","url":"https://example.test/{id}.txt","format":"abp","category":"ads"{extra}}}"#
             )
         };
         format!(
             r#"{{"schema":1,"kind":"filters","entries":[{},{},{},{}]}}"#,
-            e("d1", r#","profile":"default""#),
-            e("s1", r#","profile":"strict""#),
-            e("x1", r#","profile":"paranoid""#),
+            e("d1", r#","default_enabled":true,"trusted":true"#),
+            e("d2", r#","default_enabled":true,"profile":"strict""#),
+            e("x1", r#","default_enabled":null"#),
             e("p1", "")
         )
     }
 
-    #[tokio::test]
-    async fn default_profile_entries_are_offered_once_on_load_and_unknown_profiles_ignored() {
-        let s = Signer::new();
-        let (_d, svc) = svc();
-        let cfg = ArgusConfig {
+    fn test_cfg(s: &Signer) -> ArgusConfig {
+        ArgusConfig {
             base_url: String::new(),
             public_key: s.public_key(),
             cache_dir: None,
-        };
-        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), cfg);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_enabled_entries_seed_once_and_a_removed_list_stays_removed() {
+        let s = Signer::new();
+        let (_d, svc) = svc();
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), test_cfg(&s));
         let store = svc.store();
         assert!(store.get("d1").unwrap().is_none(), "fail-safe before load");
-        let text = profiled_json();
+        let text = seeded_json();
         let sig = s.sign(&text, "v2026.11.23", "filters.json");
         d.apply(text.clone(), sig, None).await.unwrap();
-        assert!(store.get("d1").unwrap().unwrap().enabled);
-        for id in ["s1", "x1", "p1"] {
-            assert!(store.get(id).unwrap().is_none(), "{id} must not be added");
-        }
-        // The user removes it; a newer release does not bring it back.
+        let ids: Vec<_> = store.get_all().unwrap().into_iter().map(|l| l.id).collect();
+        assert_eq!(ids, ["d1", "d2"], "exactly the default_enabled set");
+        let d1 = store.get("d1").unwrap().unwrap();
+        assert!(d1.enabled && d1.trusted);
+        assert!(!store.get("d2").unwrap().unwrap().trusted);
+        // The user removes one; a newer release does not bring it back.
         store.remove("d1").unwrap();
         let sig = s.sign(&text, "v2026.11.24", "filters.json");
         d.apply(text, sig, None).await.unwrap();
         assert!(store.get("d1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_populated_store_is_not_seeded() {
+        let s = Signer::new();
+        let (_d, svc) = svc();
+        let mine =
+            filter_engine::FilterList::new("mine".into(), "Mine".into(), "https://e/m".into());
+        svc.store().upsert(&mine).unwrap();
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), test_cfg(&s));
+        let text = seeded_json();
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        d.apply(text, sig, None).await.unwrap();
+        let ids: Vec<_> = svc
+            .store()
+            .get_all()
+            .unwrap()
+            .into_iter()
+            .map(|l| l.id)
+            .collect();
+        assert_eq!(ids, ["mine"]);
+    }
+
+    fn real_cfg() -> ArgusConfig {
+        ArgusConfig {
+            base_url: String::new(),
+            public_key: common::bypass::ARGUS_LISTS_PUBLIC_KEY.to_string(),
+            cache_dir: None,
+        }
+    }
+
+    #[test]
+    fn the_embedded_snapshot_verifies_with_the_compiled_in_key() {
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", None, real_cfg());
+        d.load_snapshot(&FILTERS_SNAPSHOT).unwrap();
+        let l = d.get().unwrap();
+        assert!(l.embedded && l.fetched_at.is_none());
+        assert!(l.version.starts_with('v'));
+        assert!(l.entries.iter().any(|e| e.default_enabled));
+        assert!(l.entries.iter().any(|e| !e.default_enabled));
+    }
+
+    #[test]
+    fn a_tampered_snapshot_is_rejected() {
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        for tamper in 0..3 {
+            let mut snap = FILTERS_SNAPSHOT;
+            match tamper {
+                0 => snap.text = leak(format!("{} ", snap.text)),
+                1 => snap.meta = leak(snap.meta.replacen("filters", "filterz", 1)),
+                _ => snap.sig = leak(snap.sig.replacen('A', "B", 1)),
+            }
+            let d = SignedDoc::<FilterCatalogueEntry>::new("filters", None, real_cfg());
+            assert!(d.load_snapshot(&snap).is_err(), "tamper {tamper}");
+            assert!(d.get().is_none());
+        }
+    }
+
+    #[test]
+    fn a_snapshot_signed_by_another_key_is_rejected() {
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", None, test_cfg(&Signer::new()));
+        assert!(d.load_snapshot(&FILTERS_SNAPSHOT).is_err());
+    }
+
+    #[tokio::test]
+    async fn first_boot_without_network_seeds_the_snapshots_default_set() {
+        let (_d, svc) = svc();
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), real_cfg());
+        d.init_cache();
+        let loaded = d.get().expect("snapshot in force");
+        let want: std::collections::BTreeSet<_> = loaded
+            .entries
+            .iter()
+            .filter(|e| e.default_enabled)
+            .map(|e| e.id.clone())
+            .collect();
+        assert!(!want.is_empty());
+        let all = svc.store().get_all().unwrap();
+        let got: std::collections::BTreeSet<_> = all.iter().map(|l| l.id.clone()).collect();
+        assert_eq!(got, want);
+        assert!(all.iter().all(|l| l.enabled));
+        // A second start (restart) changes nothing, even after a removal.
+        let victim = want.iter().next().unwrap().clone();
+        svc.store().remove(&victim).unwrap();
+        let d2 = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), real_cfg());
+        d2.init_cache();
+        assert!(svc.store().get(&victim).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_newer_cache_beats_the_snapshot() {
+        let s = Signer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2099.01.01", "filters.json");
+        let d = doc(&s, "filters", Some(dir.path()));
+        d.apply(text, sig, None).await.unwrap();
+        // Restart: the cache loads, and the snapshot (signed by the same test key) is not used.
+        let again = doc(&s, "filters", Some(dir.path()));
+        again.load_cache();
+        assert_eq!(again.get().unwrap().version, "v2099.01.01");
+        again.load_snapshot(&FILTERS_SNAPSHOT).unwrap();
+        assert_eq!(again.get().unwrap().version, "v2099.01.01");
+        // Nor can an older fetched release replace it.
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.27.4", "filters.json");
+        assert!(again.apply(text, sig, None).await.is_err());
     }
 
     #[tokio::test]

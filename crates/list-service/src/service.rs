@@ -441,11 +441,12 @@ impl ListService {
         })
     }
 
-    /// Open the store under `cfg.data_dir`, seed default lists on a fresh install and build the
+    /// Open the store under `cfg.data_dir` (lists are seeded later from the verified signed
+    /// catalogue) and build the
     /// list-download HTTP client.
     pub fn open(cfg: ListServiceConfig, engine: Arc<SharedEngine>) -> Result<Arc<Self>> {
         let store = ListStore::open(&cfg.data_dir)?;
-        store.seed_defaults_if_empty()?;
+        store.migrate_profiles()?;
         store.migrate_trust()?;
         let guard = Arc::new(
             NetPolicy::control_plane(&cfg.allowed_fetch_destinations)
@@ -1410,7 +1411,13 @@ mod tests {
     async fn panicking_build_does_not_hang_and_records_status() {
         let dir = tempfile::tempdir().unwrap();
         let store = ListStore::open(dir.path()).unwrap();
-        store.seed_defaults_if_empty().unwrap();
+        store
+            .upsert(&filter_engine::FilterList::new(
+                "t1".into(),
+                "T1".into(),
+                "https://example.test/t1.txt".into(),
+            ))
+            .unwrap();
         let list = store
             .get_all()
             .unwrap()

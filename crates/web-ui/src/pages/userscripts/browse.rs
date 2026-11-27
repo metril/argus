@@ -240,6 +240,11 @@ pub fn BrowsePanel(ctx: Ctx) -> impl IntoView {
                     .unwrap_or_else(|| "unknown".into()),
                 c.entries.len()
             ),
+            Some(c) if c.source == "snapshot" => format!(
+                "Built-in copy, release {} \u{b7} {} scripts",
+                c.version.as_deref().unwrap_or("unknown"),
+                c.entries.len()
+            ),
             Some(_) => "Catalogue not available yet".to_string(),
             None => "Signed catalogue".to_string(),
         })

@@ -479,35 +479,6 @@
         ],
         "type": "object"
       },
-      "BlockingProfileResponse": {
-        "description": "The blocking profile: `default` or `strict`.",
-        "properties": {
-          "added": {
-            "description": "Lists Strict created (removed again on switching back).",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "mode": {
-            "description": "`default` or `strict`.",
-            "type": "string"
-          },
-          "pending": {
-            "description": "Strict lists not added yet (the signed `argus-extra` list until the signed catalogue loads).",
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "mode",
-          "added",
-          "pending"
-        ],
-        "type": "object"
-      },
       "BuildState": {
         "description": "Where the build pipeline is.",
         "oneOf": [
@@ -1104,12 +1075,12 @@
       "CatalogueEntryResponse": {
         "description": "A well-known list that can be added with `POST /lists/catalogue/{id}`.",
         "properties": {
-          "added": {
-            "description": "Already added as a list.",
-            "type": "boolean"
-          },
           "category": {
             "type": "string"
+          },
+          "default_enabled": {
+            "description": "Recommended: installed and enabled on a fresh install.",
+            "type": "boolean"
           },
           "description": {
             "type": "string"
@@ -1123,6 +1094,10 @@
           },
           "id": {
             "type": "string"
+          },
+          "installed": {
+            "description": "Already installed as a list.",
+            "type": "boolean"
           },
           "licence": {
             "type": "string"
@@ -1140,23 +1115,12 @@
             "description": "The licence forbids commercial use.",
             "type": "boolean"
           },
-          "profile": {
-            "description": "`strict`: added by the Strict profile; blocks more and may break sites.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "region": {
             "description": "Language/region the list targets (`de`, `fr`, ...).",
             "type": [
               "string",
               "null"
             ]
-          },
-          "source": {
-            "description": "`signed` (verified argus-lists catalogue) or `builtin`.",
-            "type": "string"
           },
           "trusted": {
             "description": "Adding it makes the list trusted (extended rules may run).",
@@ -1173,7 +1137,7 @@
           "format",
           "category",
           "licence",
-          "added"
+          "installed"
         ],
         "type": "object"
       },
@@ -1187,14 +1151,14 @@
             "type": "array"
           },
           "fetched_at": {
-            "description": "When the signed copy was verified (RFC 3339); absent for the built-in one.",
+            "description": "When the signed copy was fetched and verified (RFC 3339); absent for `snapshot` and while\nnone has loaded.",
             "type": [
               "string",
               "null"
             ]
           },
           "source": {
-            "description": "`signed` or `builtin`.",
+            "description": "`signed` for a fetched argus-lists release, `snapshot` for the signed copy built into the\nbinary (no release fetched yet), `signed` with no entries while none has loaded.",
             "type": "string"
           },
           "version": {
@@ -5675,19 +5639,6 @@
         ],
         "type": "object"
       },
-      "SetBlockingProfileRequest": {
-        "description": "Switch the blocking profile.",
-        "properties": {
-          "mode": {
-            "description": "`default` or `strict`.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "mode"
-        ],
-        "type": "object"
-      },
       "SetEnabledRequest": {
         "description": "Toggle a userscript's enabled state.",
         "properties": {
@@ -7554,7 +7505,7 @@
             ]
           },
           "source": {
-            "description": "`signed`, or `unavailable` while none has verified yet (then `entries` is empty).",
+            "description": "`signed`, `snapshot` (the copy built into the binary), or `unavailable` while none has verified yet (then `entries` is empty).",
             "type": "string"
           },
           "version": {
@@ -13530,7 +13481,7 @@
             ]
           }
         ],
-        "summary": "The catalogue of well-known lists: the signed argus-lists one when verified, else the\nbuilt-in hosts/domain/IP lists.",
+        "summary": "The catalogue of well-known lists, from the verified signed argus-lists release (or the\nsigned snapshot shipped with the binary); empty only if none has verified.",
         "tags": [
           "lists"
         ]
@@ -13615,160 +13566,6 @@
           }
         ],
         "summary": "Add a catalogue entry as an enabled list and rebuild the engine.",
-        "tags": [
-          "lists"
-        ]
-      }
-    },
-    "/api/v1/lists/profile": {
-      "get": {
-        "operationId": "get_blocking_profile",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BlockingProfileResponse"
-                }
-              }
-            },
-            "description": "Profile"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing, invalid, expired or revoked credentials"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing scope, or CSRF check failed"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Rate limit exceeded"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Internal error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": [
-              "lists:read"
-            ]
-          },
-          {
-            "cookie_auth": [
-              "lists:read"
-            ]
-          }
-        ],
-        "summary": "The blocking profile in effect: `default` or the opt-in `strict`.",
-        "tags": [
-          "lists"
-        ]
-      },
-      "put": {
-        "operationId": "put_blocking_profile",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SetBlockingProfileRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BlockingProfileResponse"
-                }
-              }
-            },
-            "description": "Profile"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing, invalid, expired or revoked credentials"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Missing scope, or CSRF check failed"
-          },
-          "429": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Rate limit exceeded"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            },
-            "description": "Internal error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": [
-              "lists:write"
-            ]
-          },
-          {
-            "cookie_auth": [
-              "lists:write"
-            ]
-          }
-        ],
-        "summary": "Switch the blocking profile. Strict adds extra annoyance, social and tracker lists on top of\nthe default set; switching back removes only what Strict added. Applied live and persisted.",
         "tags": [
           "lists"
         ]

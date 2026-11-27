@@ -174,8 +174,8 @@ The ports: **8080** (explicit proxy: HTTP and HTTPS via CONNECT), **3000** (Web 
    machine use the server's LAN IP (e.g. `192.168.1.50:8080`), **not** `localhost`.
    - **macOS**: System Settings → Network → (your interface) → Details → Proxies → enable **Web
      Proxy (HTTP)** and **Secure Web Proxy (HTTPS)**, both `Server: <server-ip>`, `Port: 8080`.
-5. **Manage blocklists** — the default lists (EasyList, EasyPrivacy, AdGuard Base/Tracking) are
-   seeded and downloaded automatically; add your own under **Filters**. Lists are **persisted**
+5. **Manage blocklists** — the catalogue's recommended lists (EasyList, EasyPrivacy, AdGuard Base/Tracking, ...) are
+   seeded once and downloaded automatically; add your own under **Filters**. Lists are **persisted**
    in the local database and survive restarts, and the engine recompiles automatically when you change them.
 6. **Verify it's working**:
    - `curl http://<server>:3000/api/v1/health` returns `{"status":"healthy",...}`.
@@ -303,10 +303,15 @@ rejected without storing anything.
 
 ### List catalogue
 
-A catalogue of well-known hosts, domain and IP lists (StevenBlack, AdAway, HaGeZi, OISD, Phishing
-Army, Spamhaus DROP, Feodo, ...) is built in but **disabled by default**; nothing is downloaded until
-you add one (Filters, then Catalogue, or `POST /api/v1/lists/catalogue/{id}`). Each entry shows its
-licence: check it before use.
+All lists come from the signed argus-lists catalogue (EasyList, uBlock filters, AdGuard, HaGeZi,
+OISD, Phishing Army, ...); none are compiled into the binary. A signed snapshot ships with it and is
+used until a cached or fetched release verifies. A fresh install gets the catalogue's recommended
+lists once, enabled; every other list is added on demand (Filters, then Catalogue, or
+`POST /api/v1/lists/catalogue/{id}`). Any list can be enabled, disabled or removed, and a removed
+list is never added back. Each entry shows its licence: check it before use.
+
+The embedded snapshot lives in `crates/list-service/assets/catalogue/`; refresh it from the latest
+release with `scripts/update-catalogue-snapshot.sh` before cutting a release.
 
 ### Fetch policy
 

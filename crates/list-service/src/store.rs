@@ -18,7 +18,7 @@ use common::db::redb::{
     Durability, ReadTransaction, ReadableTable, ReadableTableMetadata, WriteTransaction,
 };
 use common::db::{tables, Db};
-use filter_engine::{default_filter_lists, FilterList, ListReport};
+use filter_engine::{FilterList, ListReport};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,7 +28,12 @@ use crate::report::BuildSummary;
 use crate::{Error, Result};
 
 const CUSTOM_RULES_KEY: &str = "custom_rules";
+const TRUST_MIGRATION_KEY: &str = "trust_migration_v1";
 const SUMMARY_KEY: &str = "build_summary";
+/// Set once the signed catalogue has seeded (or found lists already installed).
+const CATALOGUE_SEEDED_KEY: &str = "catalogue_seeded";
+/// META keys of the removed Strict / default blocking profiles.
+const OLD_PROFILE_KEYS: [&str; 2] = ["default_offered", "strict_profile"];
 /// Report key for the custom rules (not a list id: list ids cannot contain NUL).
 pub(crate) const CUSTOM_REPORT_ID: &str = "\0custom";
 
@@ -54,8 +59,6 @@ pub struct ListStore {
     blobs: PathBuf,
     /// Serialises blob writes against garbage collection.
     blob_lock: Mutex<()>,
-    /// Serialises whole Strict-profile operations.
-    pub(crate) strict_lock: Mutex<()>,
 }
 
 fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -101,7 +104,6 @@ impl ListStore {
             db,
             blobs,
             blob_lock: Mutex::new(()),
-            strict_lock: Mutex::new(()),
         };
         if let Err(e) = store.gc_blobs() {
             warn!("blob garbage collection failed: {e}");
@@ -159,6 +161,7 @@ impl ListStore {
         self.get_raw(tables::META, key)
     }
 
+    #[cfg(test)]
     pub(crate) fn put_meta(&self, key: &str, v: &[u8]) -> Result<()> {
         self.put_raw(tables::META, key, v, Durability::Immediate)
     }
@@ -387,89 +390,6 @@ impl ListStore {
         })
     }
 
-    /// Strict enable in ONE transaction: the list changes and the state record commit together,
-    /// so a crash never leaves lists Strict owns unrecorded.
-    pub(crate) fn strict_enable_tx(
-        &self,
-        key: &str,
-        wanted: Vec<FilterList>,
-        mut st: crate::StrictState,
-    ) -> Result<crate::StrictState> {
-        self.wtx(Durability::Immediate, |t| {
-            {
-                let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
-                for l in &wanted {
-                    let cur = tb
-                        .get(l.id.as_str())
-                        .map_err(db_err)?
-                        .map(|g| g.value().to_vec());
-                    match cur {
-                        None => {
-                            tb.insert(l.id.as_str(), ser(l)?.as_slice())
-                                .map_err(db_err)?;
-                            st.added.insert(l.id.clone());
-                        }
-                        Some(b) => {
-                            let mut cur: FilterList = de(&b)?;
-                            if !cur.enabled {
-                                cur.enabled = true;
-                                tb.insert(l.id.as_str(), ser(&cur)?.as_slice())
-                                    .map_err(db_err)?;
-                                if !st.added.contains(&l.id) {
-                                    st.enabled.insert(l.id.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            st.active = true;
-            t.open_table(tables::META)
-                .map_err(db_err)?
-                .insert(key, ser(&st)?.as_slice())
-                .map_err(db_err)?;
-            Ok(st)
-        })
-    }
-
-    /// Offer each of `wanted` once, in one transaction: a list not yet offered is added (when the
-    /// store has none of that id) and its id recorded under `key`, so a list the user later
-    /// removes or disables is never offered again. Returns the ids actually added.
-    pub(crate) fn default_offer_tx(
-        &self,
-        key: &str,
-        wanted: Vec<FilterList>,
-        mut offered: std::collections::BTreeSet<String>,
-    ) -> Result<Vec<String>> {
-        self.wtx(Durability::Immediate, |t| {
-            let mut added = Vec::new();
-            {
-                let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
-                let mut urls = std::collections::BTreeSet::new();
-                for it in tb.iter().map_err(db_err)? {
-                    urls.insert(de::<FilterList>(it.map_err(db_err)?.1.value())?.url);
-                }
-                for l in &wanted {
-                    if !offered.insert(l.id.clone()) {
-                        continue;
-                    }
-                    if tb.get(l.id.as_str()).map_err(db_err)?.is_none()
-                        && urls.insert(l.url.clone())
-                    {
-                        tb.insert(l.id.as_str(), ser(l)?.as_slice())
-                            .map_err(db_err)?;
-                        added.push(l.id.clone());
-                    }
-                }
-            }
-            t.open_table(tables::META)
-                .map_err(db_err)?
-                .insert(key, ser(&offered)?.as_slice())
-                .map_err(db_err)?;
-            Ok(added)
-        })
-    }
-
     /// Store a list definition durably (user-initiated; call from a blocking context).
     pub fn upsert_durable(&self, list: &FilterList) -> Result<()> {
         self.put_raw(tables::LISTS, &list.id, &ser(list)?, Durability::Immediate)
@@ -572,7 +492,7 @@ impl ListStore {
     /// One-time migration: mark installed lists trusted when they are a known uBlock Origin or
     /// AdGuard Base list (by URL). Returns how many were changed; later runs are no-ops.
     pub fn migrate_trust(&self) -> Result<usize> {
-        const KEY: &str = "trust_migration_v1";
+        const KEY: &str = TRUST_MIGRATION_KEY;
         if self.get_raw(tables::META, KEY)?.is_some() {
             return Ok(0);
         }
@@ -591,30 +511,75 @@ impl ListStore {
         Ok(n)
     }
 
-    /// Seed the default lists on a fresh install (no-op if any list exists), in one transaction.
-    pub fn seed_defaults_if_empty(&self) -> Result<()> {
-        // Strict-profile entries are opt-in: never part of a seed.
-        let strict: Vec<String> = filter_engine::strict_catalogue_lists()
-            .into_iter()
-            .map(|l| l.id)
-            .collect();
-        let mut defaults = default_filter_lists();
-        defaults.retain(|l| !strict.contains(&l.id));
-        let seeded = self.wtx(Durability::Immediate, |t| {
-            let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
-            if !tb.is_empty().map_err(db_err)? {
-                return Ok(false);
+    /// Drop the metadata of the removed blocking profiles (`default_offered`, `strict_profile`).
+    /// Lists they added stay as ordinary lists. When the store shows a prior run (old profile
+    /// keys, the trust migration, a build summary, or any stored list) and the catalogue was
+    /// never seeded, mark it seeded in the same transaction so an install whose user deleted
+    /// every list is not re-seeded. Must run before [`Self::migrate_trust`], which writes its
+    /// own marker on a fresh store.
+    pub fn migrate_profiles(&self) -> Result<()> {
+        self.wtx(Durability::Immediate, |t| {
+            let mut m = t.open_table(tables::META).map_err(db_err)?;
+            let mut prior = false;
+            for k in OLD_PROFILE_KEYS {
+                prior |= m.remove(k).map_err(db_err)?.is_some();
             }
-            for l in &defaults {
-                tb.insert(l.id.as_str(), ser(l)?.as_slice())
+            prior |= m.get(TRUST_MIGRATION_KEY).map_err(db_err)?.is_some();
+            prior |= m.get(SUMMARY_KEY).map_err(db_err)?.is_some();
+            if !prior {
+                let l = t.open_table(tables::LISTS).map_err(db_err)?;
+                prior = !l.is_empty().map_err(db_err)?;
+            }
+            if prior && m.get(CATALOGUE_SEEDED_KEY).map_err(db_err)?.is_none() {
+                m.insert(CATALOGUE_SEEDED_KEY, b"1".as_slice())
                     .map_err(db_err)?;
             }
-            Ok::<_, Error>(true)
+            Ok(())
+        })
+    }
+
+    /// Whether the catalogue has been seeded (or found a populated store) before.
+    pub fn catalogue_seeded(&self) -> Result<bool> {
+        Ok(self.get_meta(CATALOGUE_SEEDED_KEY)?.is_some())
+    }
+
+    /// One-time seed from the verified catalogue: when it has never run and the store has no
+    /// lists, add `wanted` (enabled). A store that already has lists is left untouched. Either way
+    /// the flag is set, so a list the user later removes or disables never comes back. Returns the
+    /// ids added.
+    pub fn seed_catalogue(&self, wanted: Vec<FilterList>) -> Result<Vec<String>> {
+        let added = self.wtx(Durability::Immediate, |t| {
+            if t.open_table(tables::META)
+                .map_err(db_err)?
+                .get(CATALOGUE_SEEDED_KEY)
+                .map_err(db_err)?
+                .is_some()
+            {
+                return Ok(Vec::new());
+            }
+            let mut added = Vec::new();
+            {
+                let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
+                if tb.is_empty().map_err(db_err)? {
+                    for l in &wanted {
+                        if tb.get(l.id.as_str()).map_err(db_err)?.is_none() {
+                            tb.insert(l.id.as_str(), ser(l)?.as_slice())
+                                .map_err(db_err)?;
+                            added.push(l.id.clone());
+                        }
+                    }
+                }
+            }
+            t.open_table(tables::META)
+                .map_err(db_err)?
+                .insert(CATALOGUE_SEEDED_KEY, b"1".as_slice())
+                .map_err(db_err)?;
+            Ok::<_, Error>(added)
         })?;
-        if seeded {
-            info!("Seeded {} default filter lists", defaults.len());
+        if !added.is_empty() {
+            info!("Seeded {} lists from the catalogue", added.len());
         }
-        Ok(())
+        Ok(added)
     }
 }
 
@@ -681,43 +646,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn seed_defaults_only_when_empty() {
-        let (store, _d) = temp_store();
-        store.seed_defaults_if_empty().unwrap();
-        let n = store.get_all().unwrap().len();
-        assert!(n >= 4);
-        store.remove("easylist").unwrap();
-        store.seed_defaults_if_empty().unwrap();
-        assert_eq!(store.get_all().unwrap().len(), n - 1);
+    fn wanted(ids: &[&str]) -> Vec<FilterList> {
+        ids.iter()
+            .map(|i| FilterList::new((*i).into(), (*i).into(), format!("https://e/{i}.txt")))
+            .collect()
     }
 
     #[test]
-    fn defaults_are_the_ubol_set_with_ubo_trusted() {
+    fn seed_runs_once_on_an_empty_store() {
         let (store, _d) = temp_store();
-        store.seed_defaults_if_empty().unwrap();
-        let all = store.get_all().unwrap();
-        let ids: HashSet<_> = all.iter().map(|l| l.id.as_str()).collect();
-        for id in [
-            "ublock-filters",
-            "ublock-privacy",
-            "ublock-badware",
-            "ublock-quick-fixes",
-            "ublock-unbreak",
-            "easylist",
-            "easyprivacy",
-            "peter-lowe",
-            "adguard-base",
-            "adguard-tracking",
-            "adguard-url-tracking",
-            "adguard-mobile",
+        assert_eq!(store.seed_catalogue(wanted(&["a", "b"])).unwrap().len(), 2);
+        assert!(store.catalogue_seeded().unwrap());
+        store.remove("a").unwrap();
+        assert!(store
+            .seed_catalogue(wanted(&["a", "b"]))
+            .unwrap()
+            .is_empty());
+        assert!(store.get("a").unwrap().is_none());
+    }
+
+    #[test]
+    fn seed_leaves_a_populated_store_alone_and_sets_the_flag() {
+        let (store, _d) = temp_store();
+        store.upsert(&wanted(&["mine"])[0]).unwrap();
+        assert!(store.seed_catalogue(wanted(&["a"])).unwrap().is_empty());
+        assert!(store.get("a").unwrap().is_none());
+        assert!(store.catalogue_seeded().unwrap());
+    }
+
+    #[test]
+    fn profile_metadata_is_dropped() {
+        let (store, _d) = temp_store();
+        store.put_meta("default_offered", b"[]").unwrap();
+        store.put_meta("strict_profile", b"{}").unwrap();
+        store.migrate_profiles().unwrap();
+        assert!(store.get_meta("default_offered").unwrap().is_none());
+        assert!(store.get_meta("strict_profile").unwrap().is_none());
+    }
+
+    #[test]
+    fn upgraded_store_with_no_lists_is_not_reseeded() {
+        for key in [
+            "trust_migration_v1",
+            "default_offered",
+            "strict_profile",
+            "build_summary",
         ] {
-            assert!(ids.contains(id), "{id}");
+            let (store, _d) = temp_store();
+            store.put_meta(key, b"1").unwrap();
+            store.migrate_profiles().unwrap();
+            store.migrate_trust().unwrap();
+            assert!(store.catalogue_seeded().unwrap(), "{key}");
+            assert!(
+                store.seed_catalogue(wanted(&["a"])).unwrap().is_empty(),
+                "{key}"
+            );
+            assert!(store.get("a").unwrap().is_none(), "{key}");
         }
-        for l in &all {
-            let official = l.id.starts_with("ublock-") || l.id.starts_with("adguard-");
-            assert_eq!(l.trusted, official, "{}", l.id);
-        }
+    }
+
+    #[test]
+    fn fresh_store_still_seeds_after_migrations() {
+        let (store, _d) = temp_store();
+        store.migrate_profiles().unwrap();
+        store.migrate_trust().unwrap();
+        assert!(!store.catalogue_seeded().unwrap());
+        assert_eq!(store.seed_catalogue(wanted(&["a"])).unwrap(), vec!["a"]);
     }
 
     #[test]

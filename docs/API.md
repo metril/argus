@@ -155,11 +155,13 @@ disabled or the password is wrong.
   extended-rule index did with them: per kind `parsed`, `active`, `dropped_untrusted`,
   `unsupported`, `parse_errors`, `badfiltered`; `dropped_untrusted_by_list`; the first parse
   `issues` and how many more were `issues_truncated`.
-- `GET /lists/catalogue`, `POST /lists/catalogue/{id}`: browse the default-disabled catalogue and
-  add an entry as a list. The catalogue is the signed argus-lists one once it has verified, else
-  the built-in one. **Breaking change:** the response is now an object `{source, version,
-  fetched_at, entries}` (`source` is `signed` or `builtin`), no longer a bare array; each entry
-  also carries `description`, `homepage`, `region`, `noncommercial`, `licence_note` and `source`.
+- `GET /lists/catalogue`, `POST /lists/catalogue/{id}`: browse the signed argus-lists catalogue
+  and add an entry as an enabled list. It is the verified release, or the signed snapshot shipped
+  with the binary until one has loaded; nothing is compiled in. The response is an object
+  `{source, version, fetched_at, entries}`; each entry carries `description`, `homepage`,
+  `region`, `noncommercial`, `licence_note`, `trusted`, `default_enabled` (recommended: installed
+  once on a fresh install) and `installed`. Every list, including seeded ones, can be removed with
+  `DELETE /lists/{id}` and is not added back.
 - `GET /rules/ext?kind=`: paginated read-only listing of handed-off rules, each with its source
   `list` and `state`: `active`, `dropped_untrusted`, `unsupported` (with `reason`), `invalid`,
   `badfiltered`, `badfilter`, or `unknown` while a rebuild is being installed.

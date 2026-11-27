@@ -6,6 +6,11 @@
 - Extension popup: "Argus on this site" switch (per registrable domain) using the site exceptions, with a reload offer. The popup now re-reads every card when the active tab navigates or changes (previously only the route line did), and drops late answers for the old page.
 - New scope `rules:site`: switch ad blocking off or on for one site (`GET`/`PUT`/`DELETE /rules/site-exceptions/{site}`, `GET` is new), without access to the rest of the rules. Part of the User role; `rules:write` still works on all three, `GET` also accepts `rules:read`.
 - Extension tokens now carry `logs:read`, `userscripts:bridge`, `stats:read` and `rules:site`. An older extension token gets a "Sign in again" notice in the popup; signing in replaces and revokes it.
+- Blocking profiles are gone (`GET`/`PUT /api/v1/lists/profile` and the Filters-page card): every list is now just a list you can enable, disable or remove. The lists that used to be Strict-only (AdGuard Annoyances and Social Media, EasyList Cookie, Fanboy Social, uBO Annoyances, Argus Extra Trackers) are ordinary catalogue lists you can add and enable.
+- Lists come from the signed argus-lists catalogue; none are compiled in any more. A signed snapshot of the catalogue ships with the binary and is used (verified like a download) until a cached or fetched release is available, so a first start with no network still has its lists. A cached or newer release always wins.
+- A fresh install gets the catalogue's recommended lists (`default_enabled`) once, enabled; an existing install is not changed. Any list can be removed and never comes back, across restarts and catalogue updates.
+- Catalogue API: `GET /lists/catalogue` serves the signed catalogue only; entries report `installed`, `default_enabled` and `trusted` (`added`, `profile` and `source` per entry are removed). The Add-list picker shows the lists not yet installed, grouped by category, and marks recommended ones.
+- Parity harness: the `argus-strict` shard and column are removed.
 
 ## 0.9.3 — 2026-11-27
 

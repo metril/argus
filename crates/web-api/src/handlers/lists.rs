@@ -4,12 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use api_types::{
-    AddFilterListRequest, BlockingProfileResponse, BuildState, BuildSummary,
-    CatalogueEntryResponse, CatalogueResponse, EngineStatusResponse, ExtRuleResponse,
-    FilterListCounts, FilterListResponse, FilterListsPage, ListMetaDto, ListReport,
-    ListStatusResponse, MessageResponse, Page, ReportIssueDto, ScheduleResponse,
-    SetBlockingProfileRequest, UpdateFilterListRequest, UpdateProxyConfigRequest,
-    UpdateScheduleRequest,
+    AddFilterListRequest, BuildState, BuildSummary, CatalogueEntryResponse, CatalogueResponse,
+    EngineStatusResponse, ExtRuleResponse, FilterListCounts, FilterListResponse, FilterListsPage,
+    ListMetaDto, ListReport, ListStatusResponse, MessageResponse, Page, ReportIssueDto,
+    ScheduleResponse, UpdateFilterListRequest, UpdateProxyConfigRequest, UpdateScheduleRequest,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Deserialize;
@@ -653,8 +651,8 @@ fn ext_stats_dto(s: &ext_rules::ExtStats) -> api_types::ExtStatsDto {
     }
 }
 
-/// The catalogue of well-known lists: the signed argus-lists one when verified, else the
-/// built-in hosts/domain/IP lists.
+/// The catalogue of well-known lists, from the verified signed argus-lists release (or the
+/// signed snapshot shipped with the binary); empty only if none has verified.
 #[utoipa::path(
     get, path = "/lists/catalogue", tag = "lists",
     security(("bearer_auth" = ["lists:read"])),
@@ -669,64 +667,38 @@ pub async fn get_catalogue(
         .into_iter()
         .map(|l| l.id)
         .collect();
-    if let Some(doc) = state.filter_catalogue().get() {
-        let entries = doc
-            .entries
-            .iter()
-            // An entry whose format we cannot add is not offered.
-            .filter(|e| e.list_format().is_some())
-            .map(|e| CatalogueEntryResponse {
-                added: have.contains(&e.id),
-                id: e.id.clone(),
-                name: e.name.clone(),
-                url: e.url.clone(),
-                format: e.format.clone(),
-                category: e.category.clone(),
-                licence: e.licence.clone(),
-                description: e.description.clone(),
-                homepage: e.homepage.clone(),
-                region: e.region.clone(),
-                noncommercial: e.noncommercial,
-                licence_note: e.licence_note.clone(),
-                trusted: e.trusted,
-                profile: e
-                    .profile
-                    .clone()
-                    .filter(|_| e.is_strict() || e.is_default()),
-                source: "signed".into(),
-            })
-            .collect();
-        return Ok(Json(CatalogueResponse {
-            source: "signed".into(),
-            fetched_at: Some(doc.fetched_at.clone()),
-            version: Some(doc.version.clone()),
-            entries,
-        }));
-    }
-    let entries = filter_engine::catalogue()
-        .into_iter()
+    let doc = state.filter_catalogue().get();
+    let entries = doc
+        .iter()
+        .flat_map(|d| d.entries.iter())
+        // An entry whose format we cannot add is not offered.
+        .filter(|e| e.list_format().is_some())
         .map(|e| CatalogueEntryResponse {
-            added: have.contains(e.id),
-            id: e.id.into(),
-            name: e.name.into(),
-            url: e.url.into(),
-            format: e.format.as_str().into(),
-            category: e.category.into(),
-            licence: e.licence.into(),
-            description: String::new(),
-            homepage: String::new(),
-            region: None,
+            installed: have.contains(&e.id),
+            id: e.id.clone(),
+            name: e.name.clone(),
+            url: e.url.clone(),
+            format: e.format.clone(),
+            category: e.category.clone(),
+            licence: e.licence.clone(),
+            description: e.description.clone(),
+            homepage: e.homepage.clone(),
+            region: e.region.clone(),
             noncommercial: e.noncommercial,
-            licence_note: None,
-            trusted: filter_engine::is_known_trusted_source(e.url),
-            profile: e.profile.map(Into::into),
-            source: "builtin".into(),
+            licence_note: e.licence_note.clone(),
+            trusted: e.trusted,
+            default_enabled: e.default_enabled,
         })
         .collect();
     Ok(Json(CatalogueResponse {
-        source: "builtin".into(),
-        fetched_at: None,
-        version: None,
+        source: if doc.as_ref().is_some_and(|d| d.embedded) {
+            "snapshot"
+        } else {
+            "signed"
+        }
+        .into(),
+        fetched_at: doc.as_ref().and_then(|d| d.fetched_at.clone()),
+        version: doc.as_ref().map(|d| d.version.clone()),
         entries,
     }))
 }
@@ -744,7 +716,8 @@ pub async fn add_from_catalogue(
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<(StatusCode, Json<FilterListResponse>)> {
     let not_found = || ApiError::NotFound(format!("Catalogue entry '{id}' not found"));
-    let mut list = if let Some(doc) = state.filter_catalogue().get() {
+    let mut list = {
+        let doc = state.filter_catalogue().get().ok_or_else(not_found)?;
         let e = doc
             .entries
             .iter()
@@ -757,12 +730,6 @@ pub async fn add_from_catalogue(
         l.format = format;
         l.trusted = e.trusted;
         l
-    } else {
-        filter_engine::catalogue()
-            .into_iter()
-            .find(|e| e.id == id)
-            .ok_or_else(not_found)?
-            .to_filter_list()
     };
     if state.filter_store.exists(&id)? {
         return Err(ApiError::AlreadyExists(format!("Filter list '{id}'")));
@@ -780,110 +747,6 @@ pub async fn add_from_catalogue(
         StatusCode::CREATED,
         Json(filter_list_response(&state, &list)),
     ))
-}
-
-/// Every `profile: strict` entry of the signed argus-lists catalogue as a list, `None` until the
-/// signed catalogue has loaded and verified (fail-safe: nothing is added from it before that).
-fn signed_strict(state: &AppState) -> Option<Vec<filter_engine::FilterList>> {
-    let doc = state.filter_catalogue().get()?;
-    Some(
-        doc.entries
-            .iter()
-            .filter(|e| e.is_strict())
-            .filter_map(|e| {
-                let mut l =
-                    filter_engine::FilterList::new(e.id.clone(), e.name.clone(), e.url.clone());
-                l.format = e.list_format()?;
-                l.trusted = e.trusted;
-                Some(l)
-            })
-            .collect(),
-    )
-}
-
-fn profile_response(
-    strict: bool,
-    added: Vec<String>,
-    pending: Vec<String>,
-) -> BlockingProfileResponse {
-    BlockingProfileResponse {
-        mode: if strict { "strict" } else { "default" }.into(),
-        added,
-        pending,
-    }
-}
-
-/// The blocking profile in effect: `default` or the opt-in `strict`.
-#[utoipa::path(
-    get, path = "/lists/profile", tag = "lists",
-    security(("bearer_auth" = ["lists:read"])),
-    responses((status = 200, description = "Profile", body = BlockingProfileResponse))
-)]
-pub async fn get_blocking_profile(
-    State(state): State<Arc<AppState>>,
-) -> ApiResult<Json<BlockingProfileResponse>> {
-    let st = state.filter_store.strict_state()?;
-    let mut pending = Vec::new();
-    if st.active {
-        // Signed Strict entries (argus-extra, ...) not added yet; until the signed catalogue
-        // loads that is argus-extra.
-        let ids = match signed_strict(&state) {
-            Some(v) => v.into_iter().map(|l| l.id).collect(),
-            None => vec![filter_engine::STRICT_ARGUS_EXTRA_ID.to_string()],
-        };
-        for id in ids {
-            if !state.filter_store.exists(&id)? {
-                pending.push(id);
-            }
-        }
-    }
-    Ok(Json(profile_response(
-        st.active,
-        st.added.into_iter().collect(),
-        pending,
-    )))
-}
-
-/// Switch the blocking profile. Strict adds extra annoyance, social and tracker lists on top of
-/// the default set; switching back removes only what Strict added. Applied live and persisted.
-#[utoipa::path(
-    put, path = "/lists/profile", tag = "lists",
-    security(("bearer_auth" = ["lists:write"])),
-    request_body = SetBlockingProfileRequest,
-    responses((status = 200, description = "Profile", body = BlockingProfileResponse))
-)]
-pub async fn put_blocking_profile(
-    State(state): State<Arc<AppState>>,
-    Extension(p): Extension<Principal>,
-    ApiJson(req): ApiJson<SetBlockingProfileRequest>,
-) -> ApiResult<Json<BlockingProfileResponse>> {
-    let strict = match req.mode.as_str() {
-        "strict" => true,
-        "default" => false,
-        m => {
-            return Err(ApiError::ValidationError(format!(
-                "Unknown profile '{m}' (use 'default' or 'strict')"
-            )))
-        }
-    };
-    let extra = signed_strict(&state);
-    let st = state.clone();
-    let (now, pending) = blocking(move || {
-        if strict {
-            let r = st.filter_store.strict_enable(extra)?;
-            Ok((r.state, r.pending))
-        } else {
-            Ok((st.filter_store.strict_disable()?, vec![]))
-        }
-    })
-    .await?;
-    info!("Blocking profile set to '{}' by {}", req.mode, p.username);
-    state.list_service.trigger();
-    Ok(Json(profile_response(
-        now.active,
-        now.added.into_iter().collect(),
-        pending,
-    )))
 }
 
 #[derive(Debug, Default, Deserialize, IntoParams)]

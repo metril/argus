@@ -17,7 +17,7 @@ import { netInitScript, NET_RECORDER_FN, tagNetwork } from './net.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]?.startsWith('--') || all[i + 1] === undefined ? 'true' : all[i + 1]]] : a), []));
 const blocker = args.blocker || 'none';
-const isArgus = blocker === 'argus' || blocker === 'argus-strict';
+const isArgus = blocker === 'argus';
 const browser = args.browser || 'chrome';
 const proxy = args.proxy || process.env.ARGUS_PROXY;
 const caPath = args.ca || process.env.ARGUS_CA;

@@ -309,7 +309,7 @@ pub struct UserscriptCatalogueEntryDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct UserscriptCatalogueResponse {
-    /// `signed`, or `unavailable` while none has verified yet (then `entries` is empty).
+    /// `signed`, `snapshot` (the copy built into the binary), or `unavailable` while none has verified yet (then `entries` is empty).
     pub source: String,
     pub fetched_at: Option<String>,
     pub version: Option<String>,

@@ -53,8 +53,6 @@ jobs:
     name: ${{ matrix.blocker }} / ${{ matrix.browser }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    # argus-strict is informational: a failed shard must not fail the run or the verdict.
-    continue-on-error: ${{ matrix.blocker == 'argus-strict' }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,8 +61,6 @@ jobs:
           - { blocker: none, browser: firefox }
           - { blocker: argus, browser: chrome }
           - { blocker: argus, browser: firefox }
-          - { blocker: argus-strict, browser: chrome }
-          - { blocker: argus-strict, browser: firefox }
           - { blocker: ubol, browser: chrome }
           - { blocker: ubo, browser: firefox }
           - { blocker: adguard-ext, browser: chrome }
@@ -92,10 +88,8 @@ jobs:
         if: startsWith(matrix.blocker, 'argus') && !inputs.build_from_source
         run: docker pull "$ARGUS_IMAGE"
 
-      - name: Start Argus, apply the uBOL-equivalent list set (plus Strict for argus-strict), fetch the CA
+      - name: Start Argus, apply the uBOL-equivalent list set, fetch the CA
         if: startsWith(matrix.blocker, 'argus')
-        env:
-          ARGUS_PROFILE: ${{ matrix.blocker == 'argus-strict' && 'strict' || '' }}
         run: |
           image="$ARGUS_IMAGE"; [ "${{ inputs.build_from_source }}" = true ] && image=argus-parity:local
           docker volume create argus-certs >/dev/null; docker volume create argus-data >/dev/null

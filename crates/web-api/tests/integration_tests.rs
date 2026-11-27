@@ -1211,35 +1211,14 @@ async fn list_format_allowlist_and_catalogue() {
         (Some("auto"), Some(false))
     );
 
+    // No signed catalogue has verified: nothing is offered and nothing can be added from it.
     let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
-    assert_eq!(cat["source"], "builtin");
     assert!(cat["fetched_at"].is_null());
-    let cat = cat["entries"].as_array().unwrap();
-    assert!(cat.len() >= 10 && cat.iter().all(|e| e["added"] == false));
-    let added = admin.post("/api/v1/lists/catalogue/adaway").await;
-    assert_eq!(added.status_code(), StatusCode::CREATED);
-    let a: Value = added.json();
-    assert_eq!(
-        (a["format"].as_str(), a["enabled"].as_bool()),
-        (Some("hosts"), Some(true))
-    );
-    assert_eq!(
-        admin
-            .post("/api/v1/lists/catalogue/adaway")
-            .await
-            .status_code(),
-        StatusCode::CONFLICT
-    );
+    assert!(cat["entries"].as_array().unwrap().is_empty());
     admin
-        .post("/api/v1/lists/catalogue/nope")
+        .post("/api/v1/lists/catalogue/adaway")
         .await
         .assert_status_not_found();
-    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
-    assert!(cat["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|e| e["id"] == "adaway" && e["added"] == true));
 }
 
 fn catalogue_doc(
@@ -1267,12 +1246,12 @@ async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
     let doc = catalogue_doc(&ctx, &signer);
     let admin = ctx.admin().await;
 
-    // A copy signed with the wrong key is refused: the built-in catalogue still serves.
+    // A copy signed with the wrong key is refused: nothing is offered.
     let text = filters_json("ubo");
     let bad = Signer::new().sign(&text, "v2026.11.23", "filters.json");
     assert!(doc.apply(text.clone(), bad, None).await.is_err());
     let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
-    assert_eq!(cat["source"], "builtin");
+    assert!(cat["entries"].as_array().unwrap().is_empty());
 
     let sig = signer.sign(&text, "v2026.11.23", "filters.json");
     doc.apply(text, sig, None).await.unwrap();
@@ -1282,8 +1261,12 @@ async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
     assert!(cat["fetched_at"].is_string());
     let e = &cat["entries"][0];
     assert_eq!(
-        (e["id"].as_str(), e["format"].as_str(), e["source"].as_str()),
-        (Some("fx"), Some("ubo"), Some("signed"))
+        (e["id"].as_str(), e["format"].as_str()),
+        (Some("fx"), Some("ubo"))
+    );
+    assert_eq!(
+        (e["default_enabled"].as_bool(), e["installed"].as_bool()),
+        (Some(false), Some(false))
     );
     assert_eq!(
         (e["region"].as_str(), e["noncommercial"].as_bool()),
@@ -1312,13 +1295,20 @@ async fn a_signed_catalogue_is_served_and_adds_with_its_format() {
         (a["format"].as_str(), a["enabled"].as_bool()),
         (Some("ubo"), Some(true))
     );
-    // Built-in ids are not in the signed catalogue.
+    // Ids outside the signed catalogue are not found.
     admin
         .post("/api/v1/lists/catalogue/adaway")
         .await
         .assert_status_not_found();
     let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
-    assert_eq!(cat["entries"][0]["added"], true);
+    assert_eq!(cat["entries"][0]["installed"], true);
+    // Any list can be removed; the catalogue offers it again.
+    admin
+        .delete("/api/v1/lists/fx")
+        .await
+        .assert_status_success();
+    let cat: Value = admin.get("/api/v1/lists/catalogue").await.json();
+    assert_eq!(cat["entries"][0]["installed"], false);
 }
 
 #[tokio::test]
@@ -1591,66 +1581,16 @@ async fn recent_blocked_urls_drop_query_strings_and_need_stats_read() {
 }
 
 #[tokio::test]
-async fn strict_profile_toggles_live_and_only_touches_its_own_lists() {
+async fn the_blocking_profile_endpoints_are_gone() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;
-    let ids = |v: &Value| -> Vec<String> {
-        v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l["id"].as_str().unwrap().to_string())
-            .collect()
-    };
     admin
-        .post("/api/v1/lists")
-        .json(&json!({"id": "mine", "name": "Mine", "url": "https://example.com/x.txt", "enabled": false}))
+        .get("/api/v1/lists/profile")
         .await
-        .assert_status(StatusCode::CREATED);
-    let before = ids(&admin.get("/api/v1/lists?limit=200").await.json());
-
-    let p: Value = admin.get("/api/v1/lists/profile").await.json();
-    assert_eq!(p["mode"], "default");
-
+        .assert_status_not_found();
     admin
-        .put("/api/v1/lists/profile")
-        .json(&json!({"mode": "bogus"}))
-        .await
-        .assert_status_bad_request();
-
-    let p: Value = admin
         .put("/api/v1/lists/profile")
         .json(&json!({"mode": "strict"}))
         .await
-        .json();
-    assert_eq!(p["mode"], "strict");
-    // argus-extra stays pending (fail-safe) while the signed catalogue has not loaded.
-    assert_eq!(p["pending"], json!(["argus-extra"]));
-    let now = ids(&admin.get("/api/v1/lists?limit=200").await.json());
-    for id in [
-        "adguard-annoyances",
-        "adguard-social",
-        "easylist-cookie",
-        "fanboy-social",
-        "ublock-annoyances",
-    ] {
-        assert!(now.contains(&id.to_string()), "{id} missing");
-        let l: Value = admin.get(&format!("/api/v1/lists/{id}")).await.json();
-        assert_eq!(l["enabled"], true, "{id}");
-    }
-    assert!(!now.contains(&"argus-extra".to_string()));
-    let p: Value = admin.get("/api/v1/lists/profile").await.json();
-    assert_eq!(p["mode"], "strict", "persisted");
-
-    let p: Value = admin
-        .put("/api/v1/lists/profile")
-        .json(&json!({"mode": "default"}))
-        .await
-        .json();
-    assert_eq!(p["mode"], "default");
-    let mut after = ids(&admin.get("/api/v1/lists?limit=200").await.json());
-    let mut before = before;
-    after.sort();
-    before.sort();
-    assert_eq!(after, before, "only Strict's lists are removed");
+        .assert_status_not_found();
 }
