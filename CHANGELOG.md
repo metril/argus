@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.8.2 — 2026-11-27
+
+* Fresh installs now also enable AdGuard's recommended lists (Base, Tracking Protection, URL
+  Tracking, Mobile Ads) on top of uBO Lite's defaults. This covers OEM telemetry, mobile ads and
+  email/video trackers. Existing installs are unchanged.
+* Parity harness: fixed the Firefox canary (cross-realm TypeError) and the canary hosts.
+
 ## 0.8.1 — 2026-11-27
 
 * Upstream failures now look like a direct connection's. A host that does not resolve, refuses or
