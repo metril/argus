@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0 — 2026-11-27
+
 - Opt-in Strict blocking profile (Filters page, `GET`/`PUT /api/v1/lists/profile`): adds AdGuard Annoyances and Social Media, EasyList Cookie, Fanboy Social, uBO Annoyances and every signed `profile: strict` entry (Argus Extra Trackers). It blocks more and may break sites (fix with per-site allow rules). Applied live and persisted; switching back removes only what Strict added. Default is unchanged.
 - Catalogue entries carry an optional `profile` field; `strict` entries are never seeded.
 - Parity harness: informational `argus-strict` shard and column (not part of the verdict).
