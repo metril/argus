@@ -550,9 +550,9 @@ pub fn FiltersPage() -> impl IntoView {
                     </div>
                 </div>
                 <Show when=pin_custom>
-                    <ul class="flist">
-                        <li style=move || format!("height:{}px;box-sizing:border-box", row_h.get())>
-                            <span class="dim" aria-hidden="true"><Icon name="audit" /></span>
+                    <ul class="flist pin">
+                        <li style=move || format!("--rowh:{}px", row_h.get())>
+                            <span class="dim ficon" aria-hidden="true"><Icon name="audit" /></span>
                             <div style="min-width:0">
                                 <div class="nm">"Custom rules"</div>
                                 <div class="url">"Your own rules, edited below"</div>
