@@ -41,7 +41,9 @@ pub use formats::{
     convert, detect, ConvertOptions, ConvertStats, Converted, ExtKind, ExtRule, IpRange, IpSet,
     ListFormat, ListMeta,
 };
-pub use list::{catalogue, default_filter_lists, CatalogueEntry, FilterList};
+pub use list::{
+    catalogue, default_filter_lists, is_known_trusted_source, CatalogueEntry, FilterList,
+};
 pub use matcher::{MatchResult, RedirectResource, RequestMatcher};
 pub use pipeline::{build_set, build_set_checked, BuiltSet, ListInput, ListReport, ReportIssue};
 pub use redirect_resources::builtin_redirect_resources;

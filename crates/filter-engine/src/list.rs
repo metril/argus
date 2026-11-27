@@ -57,32 +57,81 @@ impl FilterList {
     }
 }
 
-/// The default filter lists seeded for a fresh install.
+/// Whether this URL is a known uBlock Origin / AdGuard Base list (used to migrate lists installed
+/// before catalogue trust existed). Never decided by list id: ids are user-chosen.
+pub fn is_known_trusted_source(url: &str) -> bool {
+    let u = url.split(['?', '#']).next().unwrap_or(url);
+    const UBO: &str = "https://ublockorigin.github.io/uAssets/filters/";
+    const UBO_RAW: &str = "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/";
+    if let Some(f) = u.strip_prefix(UBO).or_else(|| u.strip_prefix(UBO_RAW)) {
+        let name = f.trim_end_matches(".txt").trim_end_matches(".min");
+        return matches!(
+            name,
+            "filters" | "privacy" | "badware" | "quick-fixes" | "unbreak" | "resource-abuse"
+        );
+    }
+    u.strip_prefix("https://filters.adtidy.org/")
+        .is_some_and(|r| {
+            r.ends_with("/filters/2.txt") || r.ends_with("/filters/2_without_easylist.txt")
+        })
+}
+
+/// The default filter lists seeded for a fresh install: uBlock Origin Lite's default set.
 ///
 /// Single source of truth, shared by the in-memory manager and the persistent store so both agree
 /// on what "the defaults" are.
 pub fn default_filter_lists() -> Vec<FilterList> {
+    const UBO: &str = "https://ublockorigin.github.io/uAssets/filters";
+    let ubo = |id: &str, name: &str, file: &str| {
+        let mut l = FilterList::new(id.into(), name.into(), format!("{UBO}/{file}"));
+        l.format = ListFormat::Ubo;
+        l.trusted = true;
+        l
+    };
+    let mut easylist = FilterList::new(
+        "easylist".into(),
+        "EasyList".into(),
+        "https://easylist.to/easylist/easylist.txt".into(),
+    );
+    easylist.format = ListFormat::Abp;
+    let mut easyprivacy = FilterList::new(
+        "easyprivacy".into(),
+        "EasyPrivacy".into(),
+        "https://easylist.to/easylist/easyprivacy.txt".into(),
+    );
+    easyprivacy.format = ListFormat::Abp;
+    let mut lowe = FilterList::new(
+        "peter-lowe".into(),
+        "Peter Lowe's Ad and tracking server list".into(),
+        "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext"
+            .into(),
+    );
+    lowe.format = ListFormat::Hosts;
     vec![
-        FilterList::new(
-            "easylist".to_string(),
-            "EasyList".to_string(),
-            "https://easylist.to/easylist/easylist.txt".to_string(),
+        ubo("ublock-filters", "uBlock filters", "filters.min.txt"),
+        ubo(
+            "ublock-privacy",
+            "uBlock filters - Privacy",
+            "privacy.min.txt",
         ),
-        FilterList::new(
-            "easyprivacy".to_string(),
-            "EasyPrivacy".to_string(),
-            "https://easylist.to/easylist/easyprivacy.txt".to_string(),
+        ubo(
+            "ublock-badware",
+            "uBlock filters - Badware risks",
+            "badware.min.txt",
         ),
-        FilterList::new(
-            "adguard-base".to_string(),
-            "AdGuard Base Filter".to_string(),
-            "https://filters.adtidy.org/extension/chromium/filters/2.txt".to_string(),
+        ubo(
+            "ublock-quick-fixes",
+            "uBlock filters - Quick fixes",
+            "quick-fixes.min.txt",
         ),
-        FilterList::new(
-            "adguard-tracking".to_string(),
-            "AdGuard Tracking Protection".to_string(),
-            "https://filters.adtidy.org/extension/chromium/filters/3.txt".to_string(),
+        ubo(
+            "ublock-unbreak",
+            "uBlock filters - Unbreak",
+            "unbreak.min.txt",
         ),
+        easylist,
+        easyprivacy,
+        lowe,
     ]
 }
 
@@ -107,6 +156,7 @@ impl CatalogueEntry {
         let mut l = FilterList::new(self.id.into(), self.name.into(), self.url.into());
         l.enabled = false;
         l.format = self.format;
+        l.trusted = is_known_trusted_source(self.url);
         l
     }
 }
@@ -128,9 +178,9 @@ pub fn catalogue() -> Vec<CatalogueEntry> {
         e
     };
     vec![
+        nc(e("peter-lowe", "Peter Lowe's Ad and tracking server list", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext", Hosts, "ads+tracking", "free for personal use")),
         e("stevenblack-unified", "StevenBlack Unified Hosts", "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", Hosts, "ads+malware", "MIT"),
         e("adaway", "AdAway", "https://adaway.org/hosts.txt", Hosts, "ads", "CC BY 3.0"),
-        nc(e("peter-lowe", "Peter Lowe's Ad and tracking server list", "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext", Hosts, "ads+tracking", "free for personal use")),
         e("blocklistproject-ads", "The Block List Project: Ads", "https://blocklistproject.github.io/Lists/ads.txt", Hosts, "ads", "Unlicense"),
         nc(e("developerdan-ads", "Developer Dan's Ads and Tracking Extended", "https://www.github.developerdan.com/hosts/lists/ads-and-tracking-extended.txt", Hosts, "ads+tracking", "CC BY-NC-SA 4.0")),
         e("hagezi-light-domains", "HaGeZi Light (domains)", "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt", Domains, "ads+tracking", "GPL-3.0"),
@@ -159,7 +209,9 @@ mod tests {
             assert_ne!(e.format, ListFormat::Auto);
         }
         let defaults: Vec<_> = default_filter_lists().into_iter().map(|l| l.id).collect();
-        assert!(c.iter().all(|e| !defaults.iter().any(|d| d == e.id)));
+        assert!(c
+            .iter()
+            .all(|e| e.id == "peter-lowe" || !defaults.iter().any(|d| d == e.id)));
     }
 
     #[test]

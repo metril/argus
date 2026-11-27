@@ -760,6 +760,9 @@ pub struct CatalogueEntryResponse {
     pub noncommercial: bool,
     #[serde(default)]
     pub licence_note: Option<String>,
+    /// Adding it makes the list trusted (extended rules may run).
+    #[serde(default)]
+    pub trusted: bool,
     /// `signed` (verified argus-lists catalogue) or `builtin`.
     #[serde(default)]
     pub source: String,

@@ -460,6 +460,28 @@ impl ListStore {
         Ok(removed)
     }
 
+    /// One-time migration: mark installed lists trusted when they are a known uBlock Origin or
+    /// AdGuard Base list (by URL). Returns how many were changed; later runs are no-ops.
+    pub fn migrate_trust(&self) -> Result<usize> {
+        const KEY: &str = "trust_migration_v1";
+        if self.get_raw(tables::META, KEY)?.is_some() {
+            return Ok(0);
+        }
+        let mut n = 0;
+        for mut l in self.get_all()? {
+            if !l.trusted && filter_engine::is_known_trusted_source(&l.url) {
+                l.trusted = true;
+                self.upsert_durable(&l)?;
+                n += 1;
+            }
+        }
+        self.put_raw(tables::META, KEY, b"1", Durability::Immediate)?;
+        if n > 0 {
+            info!("Marked {n} installed filter lists trusted");
+        }
+        Ok(n)
+    }
+
     /// Seed the default lists on a fresh install (no-op if any list exists), in one transaction.
     pub fn seed_defaults_if_empty(&self) -> Result<()> {
         let defaults = default_filter_lists();
@@ -553,6 +575,73 @@ mod tests {
         store.remove("easylist").unwrap();
         store.seed_defaults_if_empty().unwrap();
         assert_eq!(store.get_all().unwrap().len(), n - 1);
+    }
+
+    #[test]
+    fn defaults_are_the_ubol_set_with_ubo_trusted() {
+        let (store, _d) = temp_store();
+        store.seed_defaults_if_empty().unwrap();
+        let all = store.get_all().unwrap();
+        let ids: HashSet<_> = all.iter().map(|l| l.id.as_str()).collect();
+        for id in [
+            "ublock-filters",
+            "ublock-privacy",
+            "ublock-badware",
+            "ublock-quick-fixes",
+            "ublock-unbreak",
+            "easylist",
+            "easyprivacy",
+            "peter-lowe",
+        ] {
+            assert!(ids.contains(id), "{id}");
+        }
+        for l in &all {
+            assert_eq!(l.trusted, l.id.starts_with("ublock-"), "{}", l.id);
+        }
+    }
+
+    #[test]
+    fn trust_migration_marks_known_lists_once() {
+        let (store, _d) = temp_store();
+        let mk = |id: &str, url: &str| FilterList::new(id.into(), id.into(), url.into());
+        store
+            .upsert(&mk("ublock-filters", "https://x/y.txt"))
+            .unwrap();
+        store
+            .upsert(&mk(
+                "real",
+                "https://ublockorigin.github.io/uAssets/filters/filters.min.txt",
+            ))
+            .unwrap();
+        store
+            .upsert(&mk(
+                "mine",
+                "https://ublockorigin.github.io/uAssets/filters/unbreak.min.txt",
+            ))
+            .unwrap();
+        store
+            .upsert(&mk(
+                "ag",
+                "https://filters.adtidy.org/extension/chromium/filters/2.txt",
+            ))
+            .unwrap();
+        store
+            .upsert(&mk("easylist", "https://easylist.to/easylist/easylist.txt"))
+            .unwrap();
+        assert_eq!(store.migrate_trust().unwrap(), 3);
+        assert!(
+            !store.get("ublock-filters").unwrap().unwrap().trusted,
+            "id alone is not trust"
+        );
+        assert!(store.get("mine").unwrap().unwrap().trusted);
+        assert!(store.get("ag").unwrap().unwrap().trusted);
+        assert!(!store.get("easylist").unwrap().unwrap().trusted);
+        // One-time: a user who un-trusts afterwards is not overridden.
+        let mut l = store.get("mine").unwrap().unwrap();
+        l.trusted = false;
+        store.upsert(&l).unwrap();
+        assert_eq!(store.migrate_trust().unwrap(), 0);
+        assert!(!store.get("mine").unwrap().unwrap().trusted);
     }
 
     #[test]

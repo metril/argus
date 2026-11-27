@@ -684,6 +684,7 @@ pub async fn get_catalogue(
                 region: e.region.clone(),
                 noncommercial: e.noncommercial,
                 licence_note: e.licence_note.clone(),
+                trusted: e.trusted,
                 source: "signed".into(),
             })
             .collect();
@@ -709,6 +710,7 @@ pub async fn get_catalogue(
             region: None,
             noncommercial: e.noncommercial,
             licence_note: None,
+            trusted: filter_engine::is_known_trusted_source(e.url),
             source: "builtin".into(),
         })
         .collect();
@@ -744,6 +746,7 @@ pub async fn add_from_catalogue(
         })?;
         let mut l = filter_engine::FilterList::new(e.id.clone(), e.name.clone(), e.url.clone());
         l.format = format;
+        l.trusted = e.trusted;
         l
     } else {
         filter_engine::catalogue()
