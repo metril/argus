@@ -11,7 +11,7 @@
 set -euo pipefail
 base="${1:?web ui base url}"; ca_out="${2:?ca output file}"
 api="$base/api/v1"
-keep="${LIST_SET_REGEX:-^(ublock.*(filters|badware|privacy|quick|unbreak)|easylist|easyprivacy|peter lowe|adguard (base|tracking protection|url tracking|mobile ads))}"
+keep="${LIST_SET_REGEX:-^(ublock.*(filters|badware|privacy|quick|unbreak)|easylist|easyprivacy|peter lowe|adguard (base|tracking protection|url tracking|mobile ads)|argus base)}"
 jar="$(mktemp)"; trap 'rm -f "$jar"' EXIT
 
 for i in $(seq 1 90); do curl -fsS "$api/health" >/dev/null 2>&1 && break; sleep 2; [ "$i" = 90 ] && { echo "argus never became healthy" >&2; exit 1; }; done
@@ -23,6 +23,8 @@ curl -fsS -c "$jar" -H 'Content-Type: application/json' -d "$body" "$api/auth/re
 csrf="$(awk '$6=="csrf_token"{print $7}' "$jar")"
 call() { curl -fsS -b "$jar" -H "X-CSRF-Token: $csrf" -H 'Content-Type: application/json' "$@"; }
 
+# Default-profile lists (Argus Base) arrive once the signed catalogue verifies; wait for them.
+for i in $(seq 1 60); do call "$api/lists?limit=500" | jq -e '.items[] | select(.id=="argus-base")' >/dev/null && break; sleep 2; [ "$i" = 60 ] && echo "warning: argus-base never offered" >&2; done
 lists="$(call "$api/lists?limit=500")"
 echo "$lists" | jq -r '.items[] | "\(.enabled)\t\(.name)"' | sed 's/^/before: /'
 echo "$lists" | jq -c '.items[]' | while read -r l; do
