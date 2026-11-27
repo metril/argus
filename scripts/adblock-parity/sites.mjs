@@ -7,12 +7,13 @@ import { fileURLToPath } from 'node:url';
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'extractors');
 const common = fs.readFileSync(path.join(dir, '_common.js'), 'utf8');
 
+// fetchProbe: the page decides blocked/not-blocked from whether fetch(HEAD, no-cors) rejects.
 export const SITES = [
-  { id: 'turtlecute', url: 'https://adblock.turtlecute.org/', file: 'turtle' },
+  { id: 'turtlecute', url: 'https://adblock.turtlecute.org/', file: 'turtle', fetchProbe: true },
   { id: 'superadblocktest', url: 'https://superadblocktest.com/?run=1', file: 'super' },
   { id: 'adblock-tester', url: 'https://adblock-tester.com/', file: 'tester' },
   { id: 'blockify', url: 'https://getblockify.com/adblock-test', file: 'blockify' },
-  { id: 'toolz', url: 'https://paileactivist.github.io/toolz/adblock.html', file: 'paile' },
+  { id: 'toolz', url: 'https://paileactivist.github.io/toolz/adblock.html', file: 'paile', fetchProbe: true },
 ];
 
 // One expression evaluating to a Promise of the result; usable by page.evaluate (Playwright) and by
