@@ -352,12 +352,32 @@ pub struct UpstreamProxyTestResult {
     pub target: String,
 }
 
-/// Upstream DNS settings.
+/// Upstream DNS settings: what Argus uses to resolve names for its own connections.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct DnsDto {
-    /// `ip` or `ip:port`; empty uses the system resolver.
+    /// Upstream lines in AdGuard syntax (`1.1.1.1`, `tls://...`, `https://...`, `h3://...`,
+    /// `quic://...`, `sdns://...`, `[/domain/]upstream`); empty uses the system resolver.
+    #[serde(default)]
     pub servers: Vec<String>,
+    /// File path or http(s) URL with more upstream lines.
+    #[serde(default)]
+    pub upstreams_source: String,
+    /// `load_balance`, `parallel` or `fastest_ip`.
+    #[serde(default)]
+    pub mode: String,
+    /// Plain-IP resolvers for the host names of encrypted upstreams.
+    #[serde(default)]
+    pub bootstrap: Vec<String>,
+    /// Used only when every upstream fails.
+    #[serde(default)]
+    pub fallback: Vec<String>,
+    /// Send PTR lookups and LAN names to the private resolvers.
+    #[serde(default)]
+    pub private_rdns: bool,
+    /// Plain-IP resolvers for those; empty uses the system resolver.
+    #[serde(default)]
+    pub private_resolvers: Vec<String>,
     /// Maximum cached names.
     pub cache_size: u64,
     /// Lower clamp on cached TTLs, seconds.
@@ -366,6 +386,24 @@ pub struct DnsDto {
     pub max_ttl_secs: u64,
     /// How long failed lookups are cached, seconds.
     pub negative_ttl_secs: u64,
+    /// Serve expired answers while refreshing them in the background.
+    #[serde(default)]
+    pub optimistic_cache: bool,
+    /// Validate DNSSEC and refuse answers that fail.
+    #[serde(default)]
+    pub dnssec: bool,
+    /// Resolve AAAA records.
+    #[serde(default)]
+    pub ipv6: bool,
+    /// `off`, `auto` or `custom`.
+    #[serde(default)]
+    pub ecs: String,
+    /// Subnet for `ecs = custom`, e.g. `203.0.113.0/24`.
+    #[serde(default)]
+    pub ecs_subnet: String,
+    /// Per-upstream query timeout, milliseconds.
+    #[serde(default)]
+    pub timeout_ms: u64,
 }
 
 /// Partial DNS update; omitted fields keep their value.
@@ -373,10 +411,80 @@ pub struct DnsDto {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct DnsUpdate {
     pub servers: Option<Vec<String>>,
+    pub upstreams_source: Option<String>,
+    pub mode: Option<String>,
+    pub bootstrap: Option<Vec<String>>,
+    pub fallback: Option<Vec<String>>,
+    pub private_rdns: Option<bool>,
+    pub private_resolvers: Option<Vec<String>>,
     pub cache_size: Option<u64>,
     pub min_ttl_secs: Option<u64>,
     pub max_ttl_secs: Option<u64>,
     pub negative_ttl_secs: Option<u64>,
+    pub optimistic_cache: Option<bool>,
+    pub dnssec: Option<bool>,
+    pub ipv6: Option<bool>,
+    pub ecs: Option<String>,
+    pub ecs_subnet: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// Health and speed of one configured upstream.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DnsUpstreamStat {
+    /// Short label of the upstream (`tls://dns.google:853`).
+    pub upstream: String,
+    /// `upstream`, `fallback`, `bootstrap` or `private`.
+    pub role: String,
+    /// `udp`, `tcp`, `tls`, `https`, `h3`, `quic` or `dnscrypt`.
+    pub transport: String,
+    pub queries: u64,
+    pub failures: u64,
+    pub consecutive_failures: u32,
+    /// Smoothed round-trip time, milliseconds.
+    pub rtt_ms: Option<f64>,
+    pub last_rtt_ms: Option<f64>,
+    pub healthy: bool,
+    pub last_error: Option<String>,
+    /// Seconds since the last good answer.
+    pub last_ok_secs_ago: Option<u64>,
+}
+
+/// Live upstream-DNS figures.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DnsStatsResponse {
+    pub upstreams: Vec<DnsUpstreamStat>,
+    /// Names in the cache.
+    pub cached_names: u64,
+    /// Lookups answered from the cache.
+    pub cache_hits: u64,
+    /// Lookups that went to the upstreams.
+    pub cache_misses: u64,
+}
+
+/// Outcome of one upstream in "Test upstreams".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DnsTestResult {
+    pub upstream: String,
+    /// `upstream`, `fallback`, `bootstrap`, `private` or `system`.
+    pub role: String,
+    pub ok: bool,
+    pub latency_ms: Option<f64>,
+    pub error: Option<String>,
+    /// Addresses returned for the probe name.
+    pub answers: Vec<String>,
+}
+
+/// Result of probing every upstream once.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DnsTestResponse {
+    /// The name that was looked up.
+    pub name: String,
+    pub results: Vec<DnsTestResult>,
 }
 
 /// Where the signed first-party lists come from. Empty = the built-in location and key.

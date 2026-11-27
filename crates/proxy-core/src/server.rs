@@ -177,7 +177,9 @@ pub struct ProxyControl {
     /// The `tls_passthrough_hosts` last synced into the bypass entries.
     legacy_passthrough: parking_lot::Mutex<Vec<String>>,
     /// DNS settings currently in effect (a change rebuilds the resolver and flushes its cache).
-    dns_cfg: parking_lot::Mutex<common::config::DnsSettings>,
+    dns_cfg: parking_lot::Mutex<(common::config::DnsSettings, Vec<String>)>,
+    /// The data directory (upstream-list files are read from its `dns` folder).
+    dns_dir: std::path::PathBuf,
     /// Test hook: make restoring a closed listener fail.
     #[cfg(any(test, feature = "test-hooks"))]
     fail_restore: std::sync::atomic::AtomicBool,
@@ -286,6 +288,53 @@ impl ProxyControl {
         self.ctx.test_upstream_proxy(cfg, host, port).await
     }
 
+    /// Health and RTT of the upstream resolvers in force, and the cache counters.
+    pub fn dns_stats(&self) -> Option<api_types::DnsStatsResponse> {
+        let d = self.ctx.dns()?;
+        let (hits, misses) = d.stats();
+        Some(api_types::DnsStatsResponse {
+            upstreams: d
+                .upstream_stats()
+                .into_iter()
+                .map(|u| api_types::DnsUpstreamStat {
+                    upstream: u.upstream,
+                    role: u.role.into(),
+                    transport: u.transport.into(),
+                    queries: u.queries,
+                    failures: u.failures,
+                    consecutive_failures: u.consecutive_failures,
+                    rtt_ms: u.rtt_ms,
+                    last_rtt_ms: u.last_rtt_ms,
+                    healthy: u.healthy,
+                    last_error: u.last_error,
+                    last_ok_secs_ago: u.last_ok_secs_ago,
+                })
+                .collect(),
+            cached_names: d.cached_names_approx(),
+            cache_hits: hits,
+            cache_misses: misses,
+        })
+    }
+
+    /// Probe every upstream of `settings` once (see [`crate::dns::test_upstreams`]).
+    pub async fn test_dns(
+        &self,
+        settings: &common::config::DnsSettings,
+    ) -> std::result::Result<Vec<api_types::DnsTestResult>, String> {
+        let lines = crate::dns::load_upstream_lines(settings, &self.dns_dir).await?;
+        let r = crate::dns::test_upstreams(settings, &lines).await?;
+        Ok(r.into_iter()
+            .map(|p| api_types::DnsTestResult {
+                upstream: p.upstream,
+                role: p.role.into(),
+                ok: p.ok,
+                latency_ms: p.latency_ms,
+                error: p.error,
+                answers: p.answers.iter().map(|a| a.to_string()).collect(),
+            })
+            .collect())
+    }
+
     /// Apply the settings that need no rebind: client ACL, TLS passthrough hosts, destination
     /// rules, per-listener switches, DNS, time limits and the connection cap.
     ///
@@ -298,6 +347,10 @@ impl ProxyControl {
         common::net_policy::parse_nets(&config.proxy.allowed_destinations)
             .map_err(|e| Error::Config(e.to_string()))?;
         config.dns.validate().map_err(Error::Config)?;
+        // Upstream lines from the optional file or URL, read on every apply.
+        let dns_lines = crate::dns::load_upstream_lines(&config.dns, &config.adblock.data_dir)
+            .await
+            .map_err(Error::Config)?;
         let lazy = LazyCfg::of(config);
         let t = Timeouts::from_config(&config.performance);
         let live = self.live.load_full();
@@ -391,11 +444,12 @@ impl ProxyControl {
         self.ext_flags.set(config.listener_flags(false));
         {
             let mut cur = self.dns_cfg.lock();
-            if format!("{:?}", *cur) != format!("{:?}", config.dns) {
+            if format!("{:?}", cur.0) != format!("{:?}", config.dns) || cur.1 != dns_lines {
                 if let Some(d) = self.ctx.dns() {
-                    d.reconfigure(&config.dns);
+                    d.set_direct_probes(!config.proxy.upstream.proxy.enabled);
+                    d.reconfigure_lines(&config.dns, &dns_lines);
                 }
-                *cur = config.dns.clone();
+                *cur = (config.dns.clone(), dns_lines);
             }
         }
         self.timeouts.store(Arc::new(t));
@@ -1049,7 +1103,8 @@ impl ProxyServer {
             #[cfg(any(test, feature = "test-hooks"))]
             fail_restore: std::sync::atomic::AtomicBool::new(false),
             lazy_cfg: parking_lot::Mutex::new(LazyCfg::of(&config)),
-            dns_cfg: parking_lot::Mutex::new(config.dns.clone()),
+            dns_cfg: parking_lot::Mutex::new((config.dns.clone(), Vec::new())),
+            dns_dir: config.adblock.data_dir.clone(),
             legacy_passthrough: parking_lot::Mutex::new(config.proxy.tls_passthrough_hosts.clone()),
             running: tokio::sync::Mutex::new(None),
         });

@@ -18,6 +18,7 @@ anyhow = { workspace = true }
 
 # Utilities
 url = { workspace = true }
+dns-syntax = { path = "../dns-syntax" }
 bytes = { workspace = true }
 
 # Time

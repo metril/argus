@@ -11,6 +11,7 @@ members = [
     "crates/web-ui",
     "crates/common",
     "crates/api-types",
+    "crates/dns-syntax",
     "crates/e2e",
     "crates/e2e-browser",
 ]

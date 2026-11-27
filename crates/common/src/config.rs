@@ -186,13 +186,63 @@ pub struct BypassConfig {
     pub lists_public_key: String,
 }
 
-/// Upstream DNS resolution and caching.
+/// How queries are spread over the upstream servers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsMode {
+    /// One upstream per query, picked at random weighted by measured speed (the default).
+    #[default]
+    LoadBalance,
+    /// Ask every upstream at once; the first answer wins.
+    Parallel,
+    /// Ask every upstream, then race connections to the returned addresses; fastest first.
+    FastestIp,
+}
+
+/// EDNS Client Subnet (RFC 7871) behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsEcs {
+    /// Send none.
+    #[default]
+    Off,
+    /// The proxy host's own public address, truncated to /24 (IPv4) or /56 (IPv6). Sent only
+    /// when that address is public.
+    Auto,
+    /// The subnet in `ecs_subnet`.
+    Custom,
+}
+
+/// Upstream DNS resolution and caching (what Argus uses to resolve names for its own upstream
+/// connections; it is not a DNS server).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsSettings {
-    /// Resolver addresses (`ip` or `ip:port`, UDP with TCP fallback). Empty uses the system
+    /// Upstream resolvers, one AdGuard-syntax line each: `1.1.1.1`, `tls://dns.google`,
+    /// `https://dns.google/dns-query`, `h3://...`, `quic://...`, `sdns://...`, and per-domain
+    /// `[/example.com/]10.0.0.1` (`[/lan/]#` = the default upstreams). Empty uses the system
     /// resolver configuration (`/etc/resolv.conf`).
     #[serde(default)]
     pub servers: Vec<String>,
+    /// Optional file path or http(s) URL holding more upstream lines (read on every apply).
+    #[serde(default)]
+    pub upstreams_source: String,
+    /// How queries are spread over the upstreams.
+    #[serde(default)]
+    pub mode: DnsMode,
+    /// Plain-IP resolvers used only to resolve the host names of encrypted upstreams. Empty
+    /// uses the system resolver for that.
+    #[serde(default)]
+    pub bootstrap: Vec<String>,
+    /// Used only when every upstream fails. Empty: the lookup fails.
+    #[serde(default)]
+    pub fallback: Vec<String>,
+    /// Send PTR lookups and LAN names (`.lan`, `.local`, RFC 1918 reverse zones...) to the
+    /// private resolvers instead of the upstreams.
+    #[serde(default = "default_true")]
+    pub private_rdns: bool,
+    /// Resolvers for those names (plain IPs). Empty uses the system resolver.
+    #[serde(default)]
+    pub private_resolvers: Vec<String>,
     /// Maximum cached names.
     #[serde(default = "default_dns_cache_size")]
     pub cache_size: u64,
@@ -202,9 +252,27 @@ pub struct DnsSettings {
     /// Upper clamp on cached TTLs, seconds.
     #[serde(default = "default_dns_max_ttl")]
     pub max_ttl_secs: u64,
-    /// How long failed lookups (NXDOMAIN, errors) are cached, seconds.
+    /// How long failed lookups (NXDOMAIN, no addresses) are cached, seconds.
     #[serde(default = "default_dns_negative_ttl")]
     pub negative_ttl_secs: u64,
+    /// Serve an expired cached answer at once and refresh it in the background.
+    #[serde(default)]
+    pub optimistic_cache: bool,
+    /// Validate DNSSEC; answers that fail validation are refused.
+    #[serde(default)]
+    pub dnssec: bool,
+    /// Resolve AAAA records. Off: only IPv4 addresses are used.
+    #[serde(default = "default_true")]
+    pub ipv6: bool,
+    /// EDNS Client Subnet.
+    #[serde(default)]
+    pub ecs: DnsEcs,
+    /// Subnet for `ecs = "custom"`, e.g. `203.0.113.0/24`.
+    #[serde(default)]
+    pub ecs_subnet: String,
+    /// Per-upstream query timeout, milliseconds.
+    #[serde(default = "default_dns_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 fn default_dns_cache_size() -> u64 {
@@ -219,19 +287,47 @@ fn default_dns_max_ttl() -> u64 {
 fn default_dns_negative_ttl() -> u64 {
     10
 }
+fn default_dns_timeout_ms() -> u64 {
+    5000
+}
+
+/// `ip/prefix` as used by `dns.ecs_subnet`.
+pub fn parse_ecs_subnet(s: &str) -> Result<(std::net::IpAddr, u8), String> {
+    let (ip, len) = s
+        .trim()
+        .split_once('/')
+        .ok_or("expected a subnet like 203.0.113.0/24")?;
+    let ip: std::net::IpAddr = ip.parse().map_err(|_| "invalid subnet address")?;
+    let len: u8 = len.parse().map_err(|_| "invalid prefix length")?;
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    if len == 0 || len > max {
+        return Err(format!("prefix length must be 1..={max}"));
+    }
+    Ok((ip, len))
+}
+
+/// Only the line number: the text may come from a file and must not be echoed back.
+fn fmt_errs(what: &str, errs: Vec<(usize, String)>) -> String {
+    format!("{what}, line {}: not valid", errs[0].0)
+}
 
 impl DnsSettings {
-    /// Check the values a user can set: servers are `ip` or `ip:port`, the cache holds at least
-    /// one name, and `min_ttl_secs <= max_ttl_secs`.
+    /// Check the values a user can set: every list line parses, the cache holds at least one
+    /// name, and `min_ttl_secs <= max_ttl_secs`.
     pub fn validate(&self) -> Result<(), String> {
-        for s in &self.servers {
-            let ok =
-                s.parse::<std::net::SocketAddr>().is_ok() || s.parse::<std::net::IpAddr>().is_ok();
-            if !ok {
-                return Err(format!(
-                    "dns.servers: {s:?} is not an IP address or ip:port"
-                ));
-            }
+        dns_syntax::parse_upstreams(&self.servers).map_err(|e| fmt_errs("dns.servers", e))?;
+        dns_syntax::parse_flat(&self.fallback).map_err(|e| fmt_errs("dns.fallback", e))?;
+        dns_syntax::parse_plain(&self.bootstrap).map_err(|e| fmt_errs("dns.bootstrap", e))?;
+        dns_syntax::parse_plain(&self.private_resolvers)
+            .map_err(|e| fmt_errs("dns.private_resolvers", e))?;
+        if self
+            .servers
+            .len()
+            .max(self.fallback.len())
+            .max(self.bootstrap.len())
+            > 256
+        {
+            return Err("dns: at most 256 lines per list".into());
         }
         if self.cache_size == 0 || self.cache_size > 10_000_000 {
             return Err("dns.cache_size must be between 1 and 10000000".into());
@@ -244,6 +340,23 @@ impl DnsSettings {
                 "dns: max_ttl_secs is limited to 7 days and negative_ttl_secs to 1 day".into(),
             );
         }
+        if !(100..=60_000).contains(&self.timeout_ms) {
+            return Err("dns.timeout_ms must be between 100 and 60000".into());
+        }
+        if self.ecs == DnsEcs::Custom {
+            parse_ecs_subnet(&self.ecs_subnet).map_err(|e| format!("dns.ecs_subnet: {e}"))?;
+        }
+        let src = self.upstreams_source.trim();
+        if src.len() > 2048 {
+            return Err("dns.upstreams_source is too long".into());
+        }
+        if src.contains("://") {
+            match url::Url::parse(src) {
+                Ok(u) if u.scheme() == "https" => {}
+                Ok(_) => return Err("dns.upstreams_source URLs must be https".into()),
+                Err(_) => return Err("dns.upstreams_source is not a valid URL".into()),
+            }
+        }
         Ok(())
     }
 }
@@ -252,10 +365,22 @@ impl Default for DnsSettings {
     fn default() -> Self {
         Self {
             servers: Vec::new(),
+            upstreams_source: String::new(),
+            mode: DnsMode::default(),
+            bootstrap: Vec::new(),
+            fallback: Vec::new(),
+            private_rdns: true,
+            private_resolvers: Vec::new(),
             cache_size: default_dns_cache_size(),
             min_ttl_secs: default_dns_min_ttl(),
             max_ttl_secs: default_dns_max_ttl(),
             negative_ttl_secs: default_dns_negative_ttl(),
+            optimistic_cache: false,
+            dnssec: false,
+            ipv6: true,
+            ecs: DnsEcs::Off,
+            ecs_subnet: String::new(),
+            timeout_ms: default_dns_timeout_ms(),
         }
     }
 }
@@ -1477,5 +1602,55 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("data_dir"));
+    }
+
+    #[test]
+    fn dns_settings_validate_every_list_and_option() {
+        let ok = DnsSettings {
+            servers: vec!["tls://dns.google".into(), "[/lan/]10.0.0.1".into()],
+            bootstrap: vec!["1.1.1.1".into()],
+            fallback: vec!["https://dns.quad9.net/dns-query".into()],
+            private_resolvers: vec!["192.168.1.1".into()],
+            ecs: DnsEcs::Custom,
+            ecs_subnet: "203.0.113.0/24".into(),
+            ..Default::default()
+        };
+        ok.validate().unwrap();
+        let bad = |f: fn(&mut DnsSettings)| {
+            let mut d = ok.clone();
+            f(&mut d);
+            d.validate().unwrap_err()
+        };
+        assert!(bad(|d| d.servers.push("nonsense".into())).contains("dns.servers, line 3"));
+        assert!(bad(|d| d.fallback.push("[/a.com/]1.1.1.1".into())).contains("dns.fallback"));
+        assert!(bad(|d| d.bootstrap = vec!["tls://dns.google".into()]).contains("dns.bootstrap"));
+        assert!(bad(|d| d.private_resolvers = vec!["x".into()]).contains("private"));
+        assert!(bad(|d| d.ecs_subnet = "203.0.113.0".into()).contains("ecs_subnet"));
+        assert!(bad(|d| d.timeout_ms = 5).contains("timeout_ms"));
+        assert!(bad(|d| d.upstreams_source = "http://[bad".into()).contains("upstreams_source"));
+    }
+
+    #[test]
+    fn dns_settings_persist_in_the_overlay() {
+        let (_d, b, o) = layer_dir();
+        let mut c = ProxyConfig::load_layered(&b, &o).unwrap();
+        c.dns.servers = vec!["tls://dns.google".into(), "[/lan/]#".into()];
+        c.dns.mode = DnsMode::FastestIp;
+        c.dns.optimistic_cache = true;
+        c.dns.ecs = DnsEcs::Auto;
+        c.save_overlay(&b, &o).unwrap();
+        let text = std::fs::read_to_string(&o).unwrap();
+        assert!(
+            text.contains("fastest_ip") && text.contains("optimistic_cache"),
+            "{text}"
+        );
+        let back = ProxyConfig::load_layered(&b, &o).unwrap();
+        assert_eq!(back.dns.servers, c.dns.servers);
+        assert_eq!(back.dns.mode, DnsMode::FastestIp);
+        assert!(back.dns.optimistic_cache && back.dns.ecs == DnsEcs::Auto);
+        assert!(
+            back.dns.ipv6 && back.dns.private_rdns,
+            "untouched defaults stay"
+        );
     }
 }

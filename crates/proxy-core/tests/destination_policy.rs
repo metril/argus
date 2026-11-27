@@ -178,6 +178,7 @@ async fn proxy_with_dns(
             min_ttl: Duration::ZERO,
             max_ttl: Duration::from_secs(60),
             negative_ttl: Duration::ZERO,
+            optimistic: false,
         },
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

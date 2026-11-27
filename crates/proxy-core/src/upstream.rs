@@ -62,6 +62,7 @@ impl UpstreamOptions {
         // One caching resolver for every dial: the HTTP client, CONNECT and transparent
         // tunnels and WebSocket (through the policy) share it.
         let dns = Arc::new(CachedResolver::from_settings(&config.dns));
+        dns.set_direct_probes(!config.proxy.upstream.proxy.enabled);
         let max_connections = match config.performance.max_connections {
             0 => common::config::derive_max_connections(),
             n => n,
@@ -1329,7 +1330,7 @@ mod tests {
     }
 
     struct Fixed(std::sync::atomic::AtomicU64, IpAddr);
-    impl crate::dns::DnsBackend for Fixed {
+    impl crate::dns::Resolver for Fixed {
         fn lookup(
             &self,
             _n: &str,
@@ -1351,6 +1352,7 @@ mod tests {
                 min_ttl: Duration::from_secs(60),
                 max_ttl: Duration::from_secs(60),
                 negative_ttl: Duration::from_secs(60),
+                optimistic: false,
             },
         ));
         let r = PolicyResolver {
