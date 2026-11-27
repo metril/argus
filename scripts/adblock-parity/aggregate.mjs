@@ -7,6 +7,7 @@
 // takes part in the verdict, which stays on default `argus`.
 import fs from 'node:fs';
 import path from 'node:path';
+import { rescore, testKey } from './net.mjs';
 
 const argv = process.argv.slice(2);
 const dir = argv.find((a) => !a.startsWith('--') && argv[argv.indexOf(a) - 1]?.startsWith('--') !== true) || '.';
@@ -21,6 +22,17 @@ const unavailable = all.filter((s) => s.unavailable);
 const shards = all.filter((s) => !s.unavailable);
 const order = ['none', 'argus', 'argus-strict', 'ubol', 'ubo', 'adguard-ext', 'adguard-desktop'];
 shards.sort((a, b) => order.indexOf(a.blocker) - order.indexOf(b.blocker) || a.browser.localeCompare(b.browser));
+// Network-dependent tests (slow rejections = runner network failures, see net.mjs): a test tagged in ANY shard is
+// unmeasurable for EVERY blocker on that site; scores are recomputed without it.
+const netSkip = {};
+for (const s of shards) for (const r of s.results) for (const t of r.tests || []) if (t.network) (netSkip[r.site] ||= new Map()).set(testKey(t), { category: t.category, name: t.name });
+const netRows = [];
+for (const s of shards) for (const r of s.results) {
+  const skip = netSkip[r.site];
+  if (!skip || !r.ok) continue;
+  Object.assign(r, rescore(r.tests, new Set(skip.keys())));
+  for (const t of r.tests) if (t.network) netRows.push(`${key(s)} ${r.site} / ${t.category} / ${t.name}: rejected after ${t.netMs.join(', ')} ms`);
+}
 const siteIds = [...new Set(shards.flatMap((s) => s.results.map((r) => r.site)))];
 const get = (s, site) => s.results.find((r) => r.site === site);
 const pct = (r) => (r && r.ok ? `${r.score.percent.toFixed(1)}%` : r ? 'ERR' : '-');
@@ -65,6 +77,7 @@ const broken = shards.flatMap((s) => s.results.filter((r) => !r.ok).map((r) => `
 if (unavailable.length) md += `\n## Baselines unavailable (excluded)\n\n${unavailable.map((s) => `- \`${key(s)}\`: baseline unavailable: ${s.unavailable}`).join('\n')}\n`;
 if (shards.some((s) => s.blocker === 'argus-strict')) md += '\n_`argus-strict` is informational and does not affect the verdict._\n';
 md += '\n## Verdict\n\n' + (failures.length ? `**FAIL**: Argus is below a baseline in ${failures.length} place(s):\n\n${failures.map((f) => '- ' + f).join('\n')}\n` : '**PASS**: Argus matches or beats every baseline in every category.\n');
+if (netRows.length) md += `\n## Network-dependent tests (excluded from every blocker's score)\n\n${netRows.map((f) => '- ' + f).join('\n')}\n`;
 if (unstable.length) md += `\n## Unstable tests (passed in some passes, counted as failed)\n\n${unstable.map((f) => '- ' + f).join('\n')}\n`;
 if (broken.length) md += `\nExtraction errors (not scored):\n\n${broken.map((f) => '- ' + f).join('\n')}\n`;
 

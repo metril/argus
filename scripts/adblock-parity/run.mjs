@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import { ensureExtension } from './fetch-extensions.mjs';
 import { SITES, extractorSource } from './sites.mjs';
+import { netInitScript, NET_RECORDER_FN, tagNetwork } from './net.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, v, i, all) => (v.startsWith('--') ? [...a, [v.slice(2), all[i + 1]?.startsWith('--') || all[i + 1] === undefined ? 'true' : all[i + 1]]] : a), []));
@@ -182,8 +183,10 @@ async function runChrome() {
     results.push(await measure(s, async () => {
       const p = await ctx.newPage();
       try {
+        await p.addInitScript(netInitScript);
         await p.goto(s.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
         const r = await p.evaluate(extractorSource(s));
+        tagNetwork(r, await p.evaluate(() => window.__argusNet || []).catch(() => []));
         r.control = await p.evaluate(CONTROL).catch(() => false);
         return r;
       } finally { await p.close().catch(() => {}); }
@@ -198,11 +201,13 @@ async function runChrome() {
 async function runFirefox() {
   const { Builder } = await import('selenium-webdriver');
   const firefox = (await import('selenium-webdriver/firefox.js')).default;
+  const getScriptManager = (await import('selenium-webdriver/bidi/scriptManager.js')).default;
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'parity-ff-'));
   const profile = path.join(tmp, 'profile');
   fs.mkdirSync(profile);
   const opts = new firefox.Options();
   opts.addArguments('-headless', '-profile', profile);
+  opts.enableBidi();
   if (process.env.FIREFOX_BIN) opts.setBinary(process.env.FIREFOX_BIN);
   if (isArgus) {
     if (!nssImport(profile, caPath)) throw new Error('certutil (libnss3-tools) is required to trust the Argus CA in the Firefox profile');
@@ -234,6 +239,8 @@ async function runFirefox() {
     if (!ready) return { unavailable: notFiltering };
     for (const h of await driver.getAllWindowHandles()) if (h !== home) { await driver.switchTo().window(h); await driver.close(); }
     await driver.switchTo().window(home);
+    // Firefox/selenium has no addInitScript: a BiDi preload script runs the recorder before page scripts.
+    try { await (await getScriptManager([], driver)).addPreloadScript(NET_RECORDER_FN); } catch (e) { log('net recorder unavailable:', e.message.split('\n')[0]); }
     const results = [];
     for (const s of sites) {
       if (blocker === 'ubo' && s.fetchProbe) {
@@ -246,6 +253,7 @@ async function runFirefox() {
         await driver.get(s.url);
         const r = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${extractorSource(s)}.then(cb, (e) => cb({ __error: String(e) }));`);
         if (r?.__error) throw new Error(r.__error);
+        tagNetwork(r, await driver.executeScript('return window.__argusNet || []').catch(() => []));
         r.control = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${CONTROL}.then(cb, () => cb(false));`).catch(() => false);
         return r;
       }));
