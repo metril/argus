@@ -1,26 +1,47 @@
-//! Caching DNS resolution for upstream connections.
+//! Name resolution for Argus's own upstream connections.
+//!
+//! Every hostname Argus connects to (the wreq client, CONNECT and transparent tunnels,
+//! WebSockets, the upstream proxy, control-plane fetches) goes through one [`Resolver`]
+//! (a [`CachedResolver`] over the upstream-DNS [`engine`]). Argus is not a DNS server.
 //!
 //! The cache stores only resolved addresses (clamped to the configured TTL bounds). Only
 //! definite negative answers (NXDOMAIN, or a name with no address records) are cached, briefly;
 //! transport failures (timeouts, SERVFAIL, I/O errors) never are, and a timed-out lookup is
-//! retried once. It never decides policy: callers apply the destination policy to the addresses
-//! returned on every lookup, hit or miss, and connect to exactly those addresses.
+//! retried once. With optimistic caching an expired answer is served at once while a refresh runs
+//! in the background. The cache never decides policy: callers apply the destination policy to the
+//! addresses returned on every lookup, hit or miss, and connect to exactly those addresses.
 //!
-//! Names hickory cannot resolve but the operating system can (mDNS `.local`, NSS sources) are
-//! looked up through the OS resolver whenever hickory answers "does not exist". This happens in
-//! the shared backend, so every path (MITM HTTP, CONNECT, WebSocket, transparent, control-plane
-//! fetches) behaves the same, and the policy still judges whatever either resolver returned.
+//! With no upstream configured the engine uses the system resolver (hickory, then the OS for
+//! names hickory cannot resolve, such as mDNS `.local` or NSS sources); the policy still judges
+//! whatever either returned.
 
 use common::config::DnsSettings;
 use moka::Expiry;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod dnscrypt;
+pub mod engine;
+pub mod upstream;
+
+#[cfg(test)]
+mod engine_tests;
+#[cfg(test)]
+mod stub;
+
+pub use engine::{Engine, EngineResolver, EngineSpec, ProbeResult, RaceOpts};
+pub use upstream::UpstreamStats;
+
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// How long an expired answer may still be served by the optimistic cache.
+const OPTIMISTIC_STALE_MAX: Duration = Duration::from_secs(24 * 3600);
+/// After a failed background refresh, how long the stale answer is treated as fresh again.
+const REFRESH_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Why a lookup failed; decides whether the failure may be cached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +52,8 @@ pub enum FailKind {
     Timeout,
     /// SERVFAIL, I/O or other transport failure: never cached.
     Transient,
+    /// DNSSEC validation failed: never cached, never retried elsewhere.
+    Dnssec,
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +74,76 @@ impl DnsFailure {
 /// A resolved name: addresses with their (unclamped) TTL, or the failure.
 pub type BackendResult = Result<(Vec<IpAddr>, Duration), DnsFailure>;
 
-/// Source of truth behind the cache.
-pub trait DnsBackend: Send + Sync + 'static {
+/// The one resolution interface: the engine, the system resolver and test doubles implement it,
+/// and the cache wraps it.
+pub trait Resolver: Send + Sync + 'static {
+    /// Addresses of `name` (A and AAAA).
     fn lookup(&self, name: &str) -> BoxFut<BackendResult>;
+
+    /// Host names of `ip` (PTR).
+    fn lookup_ptr(&self, _ip: IpAddr) -> BoxFut<Result<Vec<String>, DnsFailure>> {
+        Box::pin(async {
+            Err(DnsFailure::new(
+                FailKind::Transient,
+                "reverse lookups are not supported by this resolver",
+            ))
+        })
+    }
+
+    /// Per-upstream health and RTT figures (empty when there are no upstreams to report).
+    fn stats(&self) -> Vec<UpstreamStats> {
+        Vec::new()
+    }
+}
+
+/// Old name of [`Resolver`].
+pub use Resolver as DnsBackend;
+
+// ---- DNS message helpers shared by the engine and the upstreams ----
+
+/// A recursive query for `name`/`rtype` with EDNS (and ECS when given).
+pub(crate) fn query_message(
+    name: &str,
+    rtype: hickory_resolver::proto::rr::RecordType,
+    ecs: Option<hickory_resolver::proto::rr::rdata::opt::ClientSubnet>,
+) -> hickory_resolver::proto::op::Message {
+    use hickory_resolver::proto::op::{Edns, Message, Query};
+    use hickory_resolver::proto::rr::rdata::opt::EdnsOption;
+    use hickory_resolver::proto::rr::Name;
+    let mut m = Message::query();
+    m.metadata.id = rand::random();
+    m.metadata.recursion_desired = true;
+    let n = Name::from_ascii(format!("{}.", name.trim_end_matches('.'))).unwrap_or_default();
+    m.add_query(Query::query(n, rtype));
+    let mut e = Edns::new();
+    e.set_max_payload(1232);
+    if let Some(c) = ecs {
+        e.options_mut().insert(EdnsOption::Subnet(c));
+    }
+    m.set_edns(e);
+    m
+}
+
+/// Addresses in the answer section and the smallest TTL among them (seconds).
+pub(crate) fn addresses(m: &hickory_resolver::proto::op::Message) -> (Vec<IpAddr>, u32) {
+    use hickory_resolver::proto::rr::RData;
+    let mut ips = Vec::new();
+    let mut ttl = u32::MAX;
+    for r in &m.answers {
+        match &r.data {
+            RData::A(a) => ips.push(IpAddr::V4(a.0)),
+            RData::AAAA(a) => ips.push(IpAddr::V6(a.0)),
+            _ => continue,
+        }
+        ttl = ttl.min(r.ttl);
+    }
+    (ips, ttl)
+}
+
+/// Whether DNSSEC validation marked any answer record bogus.
+pub(crate) fn has_bogus(m: &hickory_resolver::proto::op::Message) -> bool {
+    use hickory_resolver::proto::dnssec::Proof;
+    m.answers.iter().any(|r| r.proof == Proof::Bogus)
 }
 
 /// Cache bounds.
@@ -63,6 +153,20 @@ pub struct DnsCacheConfig {
     pub min_ttl: Duration,
     pub max_ttl: Duration,
     pub negative_ttl: Duration,
+    /// Serve expired answers while refreshing in the background.
+    pub optimistic: bool,
+}
+
+impl Default for DnsCacheConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 4096,
+            min_ttl: Duration::from_secs(10),
+            max_ttl: Duration::from_secs(300),
+            negative_ttl: Duration::from_secs(10),
+            optimistic: false,
+        }
+    }
 }
 
 impl From<&DnsSettings> for DnsCacheConfig {
@@ -73,6 +177,7 @@ impl From<&DnsSettings> for DnsCacheConfig {
             min_ttl: min,
             max_ttl: Duration::from_secs(s.max_ttl_secs).max(min),
             negative_ttl: Duration::from_secs(s.negative_ttl_secs),
+            optimistic: s.optimistic_cache,
         }
     }
 }
@@ -80,13 +185,25 @@ impl From<&DnsSettings> for DnsCacheConfig {
 #[derive(Clone)]
 struct Entry {
     result: Result<Arc<[IpAddr]>, Arc<str>>,
-    ttl: Duration,
+    /// Until when the answer is fresh.
+    fresh_until: Instant,
+    /// How long the cache keeps the entry (longer than `fresh_until` for optimistic hits).
+    keep: Duration,
 }
 
 struct PerEntry;
 impl Expiry<Arc<str>, Entry> for PerEntry {
     fn expire_after_create(&self, _k: &Arc<str>, v: &Entry, _now: Instant) -> Option<Duration> {
-        Some(v.ttl)
+        Some(v.keep)
+    }
+    fn expire_after_update(
+        &self,
+        _k: &Arc<str>,
+        v: &Entry,
+        _now: Instant,
+        _d: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(v.keep)
     }
 }
 
@@ -97,17 +214,21 @@ pub struct CachedResolver {
     inner: arc_swap::ArcSwap<Inner>,
     lookups: AtomicU64,
     /// Lookups that went to the backend.
-    misses: AtomicU64,
+    misses: Arc<AtomicU64>,
+    /// Whether fastest-address mode may dial the answers directly (off behind an upstream proxy).
+    direct_probes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct Inner {
-    backend: Arc<dyn DnsBackend>,
+    backend: Arc<dyn Resolver>,
     cache: moka::future::Cache<Arc<str>, Entry>,
     cfg: DnsCacheConfig,
+    /// Names being refreshed in the background.
+    refreshing: parking_lot::Mutex<std::collections::HashSet<Arc<str>>>,
 }
 
 impl Inner {
-    fn new(backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) -> Self {
+    fn new(backend: Arc<dyn Resolver>, cfg: DnsCacheConfig) -> Self {
         let cache = moka::future::Cache::builder()
             .max_capacity(cfg.capacity)
             .expire_after(PerEntry)
@@ -116,45 +237,102 @@ impl Inner {
             backend,
             cache,
             cfg,
+            refreshing: Default::default(),
+        }
+    }
+
+    /// Ask the backend (one retry on timeout) and turn the answer into a cache entry. Transport
+    /// failures are errors, not entries.
+    async fn fetch(&self, name: &str) -> Result<Entry, DnsFailure> {
+        let cfg = &self.cfg;
+        let mut r = self.backend.lookup(name).await;
+        if matches!(&r, Err(f) if f.kind == FailKind::Timeout) {
+            r = self.backend.lookup(name).await;
+        }
+        let now = Instant::now();
+        let neg = |msg: Arc<str>| Entry {
+            result: Err(msg),
+            fresh_until: now + cfg.negative_ttl,
+            keep: cfg.negative_ttl,
+        };
+        match r {
+            Ok((addrs, ttl)) if !addrs.is_empty() => {
+                let ttl = ttl.clamp(cfg.min_ttl, cfg.max_ttl);
+                Ok(Entry {
+                    result: Ok(addrs.into()),
+                    fresh_until: now + ttl,
+                    keep: if cfg.optimistic {
+                        ttl + OPTIMISTIC_STALE_MAX
+                    } else {
+                        ttl
+                    },
+                })
+            }
+            Ok(_) => Ok(neg("no addresses".into())),
+            Err(f) if f.kind == FailKind::NotFound => Ok(neg(f.message.into())),
+            Err(f) => Err(f),
         }
     }
 }
 
+/// The resolver for the system's own configuration: hickory, then the OS for names hickory
+/// cannot resolve.
+pub fn system_resolver() -> Arc<dyn Resolver> {
+    Arc::new(FallbackBackend {
+        primary: Arc::new(HickoryBackend::system()),
+        secondary: Arc::new(OsBackend),
+    })
+}
+
 impl CachedResolver {
-    pub fn new(backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) -> Self {
+    pub fn new(backend: Arc<dyn Resolver>, cfg: DnsCacheConfig) -> Self {
         Self {
             inner: arc_swap::ArcSwap::from_pointee(Inner::new(backend, cfg)),
             lookups: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
+            misses: Arc::new(AtomicU64::new(0)),
+            direct_probes: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
-    /// Resolver for `settings`: hickory (system config or the configured servers) behind the cache.
+    /// The upstream-DNS engine for `settings` behind the cache.
     pub fn from_settings(settings: &DnsSettings) -> Self {
-        Self::new(
-            Arc::new(FallbackBackend {
-                primary: Arc::new(HickoryBackend::new(settings)),
-                secondary: Arc::new(OsBackend),
-            }),
-            DnsCacheConfig::from(settings),
-        )
+        Self::from_settings_with(settings, &[])
     }
 
-    /// Switch to new settings. The servers are re-read and the cache starts empty (cached
-    /// answers from the old servers must not outlive them); lookups already in flight finish
-    /// on the old state.
+    /// [`Self::from_settings`] with the lines of `upstreams_source` already loaded.
+    pub fn from_settings_with(settings: &DnsSettings, extra_lines: &[String]) -> Self {
+        let me = Self::new(
+            system_resolver(),
+            DnsCacheConfig::from(settings),
+        );
+        me.reconfigure_lines(settings, extra_lines);
+        me
+    }
+
+    /// Allow or forbid dialing returned addresses to find the fastest (forbidden when an
+    /// upstream proxy is configured: a direct dial would reveal this host's address).
+    pub fn set_direct_probes(&self, on: bool) {
+        self.direct_probes
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Switch to new settings. The upstreams are rebuilt and the cache starts empty (cached
+    /// answers from the old servers must not outlive them); lookups already in flight finish on
+    /// the old state.
     pub fn reconfigure(&self, settings: &DnsSettings) {
+        self.reconfigure_lines(settings, &[]);
+    }
+
+    /// [`Self::reconfigure`] with the lines of `upstreams_source` already loaded.
+    pub fn reconfigure_lines(&self, settings: &DnsSettings, extra_lines: &[String]) {
         self.reconfigure_with(
-            Arc::new(FallbackBackend {
-                primary: Arc::new(HickoryBackend::new(settings)),
-                secondary: Arc::new(OsBackend),
-            }),
+            backend_for(settings, extra_lines, self.direct_probes.clone()),
             DnsCacheConfig::from(settings),
         );
     }
 
     /// [`Self::reconfigure`] with a ready backend.
-    pub fn reconfigure_with(&self, backend: Arc<dyn DnsBackend>, cfg: DnsCacheConfig) {
+    pub fn reconfigure_with(&self, backend: Arc<dyn Resolver>, cfg: DnsCacheConfig) {
         self.inner.store(Arc::new(Inner::new(backend, cfg)));
     }
 
@@ -163,6 +341,11 @@ impl CachedResolver {
         let inner = self.inner.load_full();
         inner.cache.run_pending_tasks().await;
         inner.cache.entry_count()
+    }
+
+    /// Names in the cache right now (not waiting for pending maintenance).
+    pub fn cached_names_approx(&self) -> u64 {
+        self.inner.load().cache.entry_count()
     }
 
     /// Cache hits and backend lookups so far.
@@ -174,10 +357,21 @@ impl CachedResolver {
         (l.saturating_sub(m), m)
     }
 
+    /// Health and RTT of every configured upstream.
+    pub fn upstream_stats(&self) -> Vec<UpstreamStats> {
+        self.inner.load().backend.stats()
+    }
+
     /// Drop the cached answer for `name`, so the next lookup asks again.
     pub async fn forget(&self, name: &str) {
         let key: Arc<str> = name.trim_end_matches('.').to_ascii_lowercase().into();
         self.inner.load_full().cache.invalidate(&key).await;
+    }
+
+    /// Host names of `ip` (uncached).
+    pub async fn resolve_ptr(&self, ip: IpAddr) -> Result<Vec<String>, String> {
+        let b = self.inner.load().backend.clone();
+        b.lookup_ptr(ip).await.map_err(|f| f.message)
     }
 
     /// Addresses for `name` (cached). Policy is the caller's job.
@@ -185,35 +379,26 @@ impl CachedResolver {
         self.lookups.fetch_add(1, Ordering::Relaxed);
         let key: Arc<str> = name.trim_end_matches('.').to_ascii_lowercase().into();
         let inner = self.inner.load_full();
-        let backend = inner.backend.clone();
-        let cfg = inner.cfg.clone();
-        let misses = &self.misses;
-        let k2 = key.clone();
+        if let Some(e) = inner.cache.get(&key).await {
+            if Instant::now() < e.fresh_until {
+                return e.result.map_err(|e| e.to_string());
+            }
+            // Expired but still held: only optimistic answers (successes) are.
+            if let Ok(a) = &e.result {
+                Self::refresh_later(inner.clone(), key.clone(), e.clone());
+                return Ok(a.clone());
+            }
+            inner.cache.invalidate(&key).await;
+        }
+        let misses = self.misses.clone();
+        let (i2, k2) = (inner.clone(), key.clone());
         // `try_get_with` stores only `Ok`: transport failures are returned, not cached, and
         // concurrent callers of one lookup share its outcome.
         let entry = inner
             .cache
             .try_get_with(key, async move {
                 misses.fetch_add(1, Ordering::Relaxed);
-                let mut r = backend.lookup(&k2).await;
-                if matches!(&r, Err(f) if f.kind == FailKind::Timeout) {
-                    r = backend.lookup(&k2).await;
-                }
-                match r {
-                    Ok((addrs, ttl)) if !addrs.is_empty() => Ok(Entry {
-                        result: Ok(addrs.into()),
-                        ttl: ttl.clamp(cfg.min_ttl, cfg.max_ttl),
-                    }),
-                    Ok(_) => Ok(Entry {
-                        result: Err("no addresses".into()),
-                        ttl: cfg.negative_ttl,
-                    }),
-                    Err(f) if f.kind == FailKind::NotFound => Ok(Entry {
-                        result: Err(f.message.into()),
-                        ttl: cfg.negative_ttl,
-                    }),
-                    Err(f) => Err(f),
-                }
+                i2.fetch(&k2).await
             })
             .await;
         let out = match entry {
@@ -225,6 +410,188 @@ impl CachedResolver {
         }
         out
     }
+
+    /// Refresh `key` in the background (once at a time), keeping the stale answer if it fails.
+    fn refresh_later(inner: Arc<Inner>, key: Arc<str>, stale: Entry) {
+        if !inner.refreshing.lock().insert(key.clone()) {
+            return;
+        }
+        tokio::spawn(async move {
+            match inner.fetch(&key).await {
+                Ok(e) => inner.cache.insert(key.clone(), e).await,
+                Err(_) => {
+                    // Keep serving the stale answer, and look again shortly.
+                    let mut e = stale;
+                    e.fresh_until = Instant::now() + REFRESH_BACKOFF;
+                    inner.cache.insert(key.clone(), e).await;
+                }
+            }
+            inner.refreshing.lock().remove(&key);
+        });
+    }
+}
+
+/// The backend for `settings`: the upstream-DNS engine, or the system resolver if the settings
+/// cannot be built (they are validated before they get here).
+fn backend_for(
+    settings: &DnsSettings,
+    extra_lines: &[String],
+    direct_probes: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<dyn Resolver> {
+    match Engine::new(EngineSpec {
+        settings,
+        extra_lines,
+        tls: None,
+        system: system_resolver(),
+        race: RaceOpts {
+            enabled: direct_probes,
+            ..Default::default()
+        },
+    }) {
+        Ok(e) => Arc::new(EngineResolver(Arc::new(e))),
+        Err(e) => {
+            tracing::warn!("DNS: {e}; using the system resolver");
+            system_resolver()
+        }
+    }
+}
+
+/// Read at most `max` bytes from a stream of chunks; more is an error (the rest is not read).
+async fn read_capped<S, E>(mut s: S, max: usize) -> Result<Vec<u8>, String>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use futures_util::StreamExt;
+    let mut out = Vec::new();
+    while let Some(c) = s.next().await {
+        let c = c.map_err(|e| format!("dns.upstreams_source: {e}"))?;
+        if out.len() + c.len() > max {
+            return Err("dns.upstreams_source is larger than 1 MiB".into());
+        }
+        out.extend_from_slice(&c);
+    }
+    Ok(out)
+}
+
+const SOURCE_MAX: usize = 1 << 20;
+
+/// Lines from `settings.upstreams_source`; empty when unset. A file must lie inside
+/// `<data_dir>/dns/` (after resolving symlinks and `..`); a URL must be https and resolve only
+/// to public addresses, with no redirects. Errors never repeat the content of the source.
+pub async fn load_upstream_lines(
+    settings: &DnsSettings,
+    data_dir: &std::path::Path,
+) -> Result<Vec<String>, String> {
+    let src = settings.upstreams_source.trim();
+    if src.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = if src.contains("://") {
+        fetch_source_url(src).await?
+    } else {
+        read_source_file(src, data_dir).await?
+    };
+    let lines: Vec<String> = text.lines().map(|l| l.trim().to_string()).collect();
+    dns_syntax::parse_upstreams(&lines).map_err(|e| {
+        format!(
+            "dns.upstreams_source, line {}: not a valid upstream line",
+            e[0].0
+        )
+    })?;
+    Ok(lines)
+}
+
+async fn read_source_file(src: &str, data_dir: &std::path::Path) -> Result<String, String> {
+    use tokio::io::AsyncReadExt;
+    let base = data_dir.join("dns");
+    let _ = tokio::fs::create_dir_all(&base).await;
+    let base = tokio::fs::canonicalize(&base)
+        .await
+        .map_err(|_| "dns.upstreams_source: the data directory has no dns folder".to_string())?;
+    let p = std::path::Path::new(src);
+    let cand = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    let real = tokio::fs::canonicalize(&cand)
+        .await
+        .map_err(|_| "dns.upstreams_source: file not found".to_string())?;
+    if !real.starts_with(&base) {
+        return Err("dns.upstreams_source must be a file inside the data directory's dns folder".into());
+    }
+    let f = tokio::fs::File::open(&real)
+        .await
+        .map_err(|_| "dns.upstreams_source: cannot read the file".to_string())?;
+    let mut buf = Vec::new();
+    f.take(SOURCE_MAX as u64 + 1)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|_| "dns.upstreams_source: cannot read the file".to_string())?;
+    if buf.len() > SOURCE_MAX {
+        return Err("dns.upstreams_source is larger than 1 MiB".into());
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+async fn fetch_source_url(src: &str) -> Result<String, String> {
+    let url = url::Url::parse(src).map_err(|_| "dns.upstreams_source is not a valid URL".to_string())?;
+    if url.scheme() != "https" {
+        return Err("dns.upstreams_source URLs must be https".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or("dns.upstreams_source has no host")?
+        .to_string();
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| "dns.upstreams_source: the host does not resolve".to_string())?
+        .collect();
+    // Every address must be public: the fetch must not reach internal services.
+    if addrs.is_empty()
+        || addrs
+            .iter()
+            .any(|a| common::net_policy::classify(a.ip()) != common::net_policy::Class::Public)
+    {
+        return Err("dns.upstreams_source resolves to a non-public address".into());
+    }
+    let client = wreq::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(wreq::redirect::Policy::none())
+        .resolve(host.clone(), addrs[0])
+        .build()
+        .map_err(|_| "dns.upstreams_source: cannot build the client".to_string())?;
+    let resp = client
+        .get(url.as_str())
+        .send()
+        .await
+        .map_err(|_| "dns.upstreams_source: the request failed".to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("dns.upstreams_source: HTTP {}", resp.status()));
+    }
+    if resp.content_length().is_some_and(|l| l > SOURCE_MAX as u64) {
+        return Err("dns.upstreams_source is larger than 1 MiB".into());
+    }
+    let body = read_capped(Box::pin(resp.bytes_stream()), SOURCE_MAX).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Probe every upstream in `settings` (plus `extra_lines`) once with a fresh engine; nothing in
+/// force changes.
+pub async fn test_upstreams(
+    settings: &DnsSettings,
+    extra_lines: &[String],
+) -> Result<Vec<ProbeResult>, String> {
+    let e = Engine::new(EngineSpec {
+        settings,
+        extra_lines,
+        tls: None,
+        system: system_resolver(),
+        race: Default::default(),
+    })?;
+    Ok(e.probe("example.com").await)
 }
 
 /// A [`CachedResolver`] as the address source of destination policies (`NetPolicy`).
@@ -253,7 +620,7 @@ impl std::fmt::Debug for CachedResolver {
 /// Operating-system resolver (`getaddrinfo`).
 pub struct OsBackend;
 
-impl DnsBackend for OsBackend {
+impl Resolver for OsBackend {
     fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
         let name = name.to_string();
         Box::pin(async move {
@@ -289,11 +656,11 @@ fn classify_io(e: &std::io::Error) -> FailKind {
 
 /// Asks `secondary` only when `primary` says the name does not exist.
 pub struct FallbackBackend {
-    pub primary: Arc<dyn DnsBackend>,
-    pub secondary: Arc<dyn DnsBackend>,
+    pub primary: Arc<dyn Resolver>,
+    pub secondary: Arc<dyn Resolver>,
 }
 
-impl DnsBackend for FallbackBackend {
+impl Resolver for FallbackBackend {
     fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
         let first = self.primary.lookup(name);
         let secondary = self.secondary.clone();
@@ -311,10 +678,14 @@ impl DnsBackend for FallbackBackend {
             }
         })
     }
+
+    fn lookup_ptr(&self, ip: IpAddr) -> BoxFut<Result<Vec<String>, DnsFailure>> {
+        self.primary.lookup_ptr(ip)
+    }
 }
 
-/// Hickory-backed lookups; falls back to the OS resolver if the system configuration cannot be
-/// read.
+/// Hickory lookups with the system resolver configuration (`/etc/resolv.conf`); uses the OS
+/// resolver if that configuration cannot be read.
 pub struct HickoryBackend {
     resolver: Option<hickory_resolver::TokioResolver>,
 }
@@ -325,43 +696,11 @@ impl HickoryBackend {
         self.resolver.is_some()
     }
 
-    pub fn new(settings: &DnsSettings) -> Self {
-        use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
-        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    /// The system resolver configuration.
+    pub fn system() -> Self {
+        use hickory_resolver::config::LookupIpStrategy;
         use hickory_resolver::Resolver;
-
-        let servers: Vec<SocketAddr> = settings
-            .servers
-            .iter()
-            .filter_map(|s| {
-                s.parse::<SocketAddr>()
-                    .ok()
-                    .or_else(|| s.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 53)))
-                    .or_else(|| {
-                        tracing::warn!("ignoring invalid DNS server {s:?}");
-                        None
-                    })
-            })
-            .collect();
-        let builder = if servers.is_empty() {
-            Resolver::builder_tokio().ok()
-        } else {
-            let ns = servers
-                .iter()
-                .map(|a| {
-                    let mut n = NameServerConfig::udp_and_tcp(a.ip());
-                    for c in &mut n.connections {
-                        c.port = a.port();
-                    }
-                    n
-                })
-                .collect();
-            Some(Resolver::builder_with_config(
-                ResolverConfig::from_name_servers(ns),
-                TokioRuntimeProvider::default(),
-            ))
-        };
-        let resolver = builder.and_then(|mut b| {
+        let resolver = Resolver::builder_tokio().ok().and_then(|mut b| {
             let o = b.options_mut();
             // Caching happens in `CachedResolver`, which owns the TTL clamps.
             o.cache_size = 0;
@@ -369,7 +708,7 @@ impl HickoryBackend {
             b.build().ok()
         });
         if resolver.is_none() {
-            tracing::warn!("DNS: resolver setup failed, using the OS resolver");
+            tracing::warn!("DNS: system resolver setup failed, using the OS resolver");
         }
         Self { resolver }
     }
@@ -388,7 +727,7 @@ fn classify_hickory(e: &hickory_resolver::net::NetError) -> FailKind {
     }
 }
 
-impl DnsBackend for HickoryBackend {
+impl Resolver for HickoryBackend {
     fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
         let name = name.to_string();
         let resolver = self.resolver.clone();
@@ -406,11 +745,34 @@ impl DnsBackend for HickoryBackend {
             }
         })
     }
+
+    fn lookup_ptr(&self, ip: IpAddr) -> BoxFut<Result<Vec<String>, DnsFailure>> {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let r = resolver.ok_or_else(|| {
+                DnsFailure::new(FailKind::Transient, "no system resolver configuration")
+            })?;
+            let l = r
+                .reverse_lookup(ip)
+                .await
+                .map_err(|e| DnsFailure::new(classify_hickory(&e), e.to_string()))?;
+            Ok(l.answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    hickory_resolver::proto::rr::RData::PTR(p) => {
+                        Some(p.0.to_utf8().trim_end_matches('.').to_string())
+                    }
+                    _ => None,
+                })
+                .collect())
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::sync::Mutex;
 
     struct Fake {
@@ -419,7 +781,7 @@ mod tests {
         /// Answers handed out first, in order, before `answer`.
         script: Mutex<Vec<BackendResult>>,
     }
-    impl DnsBackend for Fake {
+    impl Resolver for Fake {
         fn lookup(&self, _name: &str) -> BoxFut<BackendResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut sc = self.script.lock().unwrap();
@@ -451,6 +813,7 @@ mod tests {
             min_ttl: Duration::from_millis(min),
             max_ttl: Duration::from_millis(max),
             negative_ttl: Duration::from_millis(min),
+            optimistic: false,
         }
     }
 
@@ -599,6 +962,7 @@ mod tests {
             min_ttl_secs: 1,
             max_ttl_secs: 60,
             negative_ttl_secs: 1,
+            ..Default::default()
         }
     }
 
@@ -649,9 +1013,7 @@ mod tests {
         let (addr, queries) = fake_dns_server();
         assert_ne!(addr.port(), 53);
         let st = settings(vec![addr.to_string()]);
-        let b = HickoryBackend::new(&st);
-        assert!(b.uses_hickory());
-        let r = CachedResolver::new(Arc::new(b), DnsCacheConfig::from(&st));
+        let r = CachedResolver::from_settings(&st);
         let a = r.resolve("host.example.test").await.unwrap();
         assert_eq!(a[0], "192.0.2.77".parse::<IpAddr>().unwrap());
         let before = queries.load(Ordering::SeqCst);
@@ -668,13 +1030,10 @@ mod tests {
     async fn hickory_caches_nxdomain_but_not_servfail() {
         let (addr, queries) = fake_dns_server();
         let st = settings(vec![addr.to_string()]);
-        let r = CachedResolver::new(
-            Arc::new(HickoryBackend::new(&st)),
-            DnsCacheConfig {
-                negative_ttl: Duration::from_secs(30),
-                ..DnsCacheConfig::from(&st)
-            },
-        );
+        let r = CachedResolver::from_settings(&DnsSettings {
+            negative_ttl_secs: 30,
+            ..st
+        });
         assert!(r.resolve("nx.example.test").await.is_err());
         let n = queries.load(Ordering::SeqCst);
         assert!(r.resolve("nx.example.test").await.is_err());
@@ -691,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn system_config_resolves_localhost() {
-        let b = HickoryBackend::new(&settings(vec![]));
+        let b = HickoryBackend::system();
         assert!(
             b.uses_hickory(),
             "system resolver configuration was not usable"

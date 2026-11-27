@@ -47,7 +47,6 @@ enum Kind {
     },
     Switch,
     Cidr,
-    Ip,
     /// Host names (`example.com`, `*.example.com`).
     Hosts,
     /// Free text, not validated here (the server checks it).
@@ -148,64 +147,6 @@ const SECTIONS: &[Section] = &[
                 label: "Web UI port",
                 desc: "Changing it moves this page. You confirm first.",
                 kind: Kind::Port,
-                dep: None,
-            },
-        ],
-    },
-    Section {
-        id: "dns",
-        title: "Upstream DNS",
-        sub: "Resolvers the proxy uses for upstream connections.",
-        fields: &[
-            Def {
-                key: "dns_servers",
-                label: "Servers",
-                desc: "Tried in order. IPv4, IPv6, or ip:port. Empty uses the system resolver.",
-                kind: Kind::Ip,
-                dep: None,
-            },
-            Def {
-                key: "dns_cache",
-                label: "Cache size",
-                desc: "0 turns the cache off.",
-                kind: Kind::Num {
-                    unit: "entries",
-                    min: 0,
-                    max: 10_000_000,
-                },
-                dep: None,
-            },
-            Def {
-                key: "dns_min_ttl",
-                label: "Minimum TTL",
-                desc: "Short upstream TTLs are raised to this.",
-                kind: Kind::Num {
-                    unit: "s",
-                    min: 0,
-                    max: 86400,
-                },
-                dep: None,
-            },
-            Def {
-                key: "dns_max_ttl",
-                label: "Maximum TTL",
-                desc: "Long upstream TTLs are capped at this.",
-                kind: Kind::Num {
-                    unit: "s",
-                    min: 1,
-                    max: 604800,
-                },
-                dep: None,
-            },
-            Def {
-                key: "dns_neg_ttl",
-                label: "Failed lookup TTL",
-                desc: "How long failed lookups are cached.",
-                kind: Kind::Num {
-                    unit: "s",
-                    min: 0,
-                    max: 86400,
-                },
                 dep: None,
             },
         ],
@@ -649,8 +590,6 @@ fn defaults(key: &str) -> Val {
         "st_referer_custom" | "st_ua_custom" | "st_ip_addr" => Val::S(String::new()),
         "st_c3p_min" => Val::S("2880".into()),
         "st_c1p_min" => Val::S("4320".into()),
-        "dns_servers" => Val::T(Vec::new()),
-        "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => Val::S("0".into()),
         _ => Val::S("24".into()),
     }
 }
@@ -705,11 +644,6 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("update_every", Val::S(c.update_interval_hours.to_string())),
         ("lists_url", Val::S(c.bypass.lists_base_url.clone())),
         ("lists_key", Val::S(c.bypass.lists_public_key.clone())),
-        ("dns_servers", Val::T(c.dns.servers.clone())),
-        ("dns_cache", Val::S(c.dns.cache_size.to_string())),
-        ("dns_min_ttl", Val::S(c.dns.min_ttl_secs.to_string())),
-        ("dns_max_ttl", Val::S(c.dns.max_ttl_secs.to_string())),
-        ("dns_neg_ttl", Val::S(c.dns.negative_ttl_secs.to_string())),
         ("st_on", Val::B(c.stealth.enabled)),
         ("st_search", Val::B(c.stealth.hide_search_queries)),
         ("st_dnt", Val::B(c.stealth.send_dnt)),
@@ -767,7 +701,6 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "up_on" | "up_kind" | "up_host" | "up_port" | "up_user" | "up_pass" => &["upstream_proxy"],
         "auto_update" => &["auto_update"],
         "lists_url" | "lists_key" => &["bypass"],
-        "dns_servers" | "dns_cache" | "dns_min_ttl" | "dns_max_ttl" | "dns_neg_ttl" => &["dns"],
         k if k.starts_with("st_") => &["stealth"],
         _ => &["update_interval_hours"],
     }
@@ -790,10 +723,6 @@ fn log_cap_hint(v: &str) -> String {
 
 fn host_ok(s: &str) -> bool {
     s == "localhost" || s.parse::<IpAddr>().is_ok()
-}
-
-fn dns_ok(s: &str) -> bool {
-    s.parse::<IpAddr>().is_ok() || s.parse::<std::net::SocketAddr>().is_ok()
 }
 
 fn cidr_ok(s: &str) -> bool {
@@ -935,11 +864,6 @@ fn error_of(f: &F, all: &[F]) -> Option<String> {
                 if n < min || n > max {
                     return Some(format!("Use {min} to {max}."));
                 }
-                if f.def.key == "dns_max_ttl"
-                    && n < get("dns_min_ttl").trim().parse::<u64>().unwrap_or(0)
-                {
-                    return Some("Must be at least the minimum TTL.".into());
-                }
             } else {
                 if !(1..=65535).contains(&n) {
                     return Some("Use a port from 1 to 65535.".into());
@@ -1069,34 +993,6 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
             lists_base_url: dirty("lists_url").then(|| val("lists_url").s()),
             lists_public_key: dirty("lists_key").then(|| val("lists_key").s()),
         });
-    }
-    if [
-        "dns_servers",
-        "dns_cache",
-        "dns_min_ttl",
-        "dns_max_ttl",
-        "dns_neg_ttl",
-    ]
-    .iter()
-    .any(|k| dirty(k))
-    {
-        let mut d = api_types::DnsUpdate::default();
-        if dirty("dns_servers") {
-            d.servers = Some(val("dns_servers").t());
-        }
-        if dirty("dns_cache") {
-            d.cache_size = Some(num("dns_cache"));
-        }
-        if dirty("dns_min_ttl") {
-            d.min_ttl_secs = Some(num("dns_min_ttl"));
-        }
-        if dirty("dns_max_ttl") {
-            d.max_ttl_secs = Some(num("dns_max_ttl"));
-        }
-        if dirty("dns_neg_ttl") {
-            d.negative_ttl_secs = Some(num("dns_neg_ttl"));
-        }
-        r.dns = Some(d);
     }
     if [
         "st_on",
@@ -1649,8 +1545,7 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 on_change=Callback::new(move |v: String| { f.cur.set(Val::S(v)); f.msg.set(None); })
             />
         }.into_any(),
-        Kind::Cidr | Kind::Ip | Kind::Hosts => {
-            let is_ip = d.kind == Kind::Ip;
+        Kind::Cidr | Kind::Hosts => {
             let is_hosts = d.kind == Kind::Hosts;
             let tags = RwSignal::new(f.cur.get_untracked().t());
             Effect::new(move |_| { let t = f.cur.get().t(); if tags.get_untracked() != t { tags.set(t); } });
@@ -1659,12 +1554,10 @@ fn row(f: F, all: Vec<F>) -> impl IntoView {
                 <TagInput
                     tags=tags
                     label=d.label
-                    placeholder=if is_ip { "1.1.1.1, then Enter" } else if is_hosts { "example.com, then Enter" } else { "192.168.1.0/24, then Enter" }
+                    placeholder=if is_hosts { "example.com, then Enter" } else { "192.168.1.0/24, then Enter" }
                     validate=Callback::new(move |v: String| if is_hosts {
                         let b = v.trim().strip_prefix("*.").unwrap_or(v.trim());
                         if !b.is_empty() && !b.contains(|c: char| c.is_whitespace() || matches!(c, '/' | '*' | ':')) { None } else { Some(format!("\"{v}\" is not a host. Use example.com or *.example.com.")) }
-                    } else if is_ip {
-                        if dns_ok(&v) { None } else { Some(format!("\"{v}\" is not an IP address. Use 1.1.1.1 or 1.1.1.1:53.")) }
                     } else if cidr_ok(&v) { None } else { Some(format!("\"{v}\" is not a CIDR range. Use a form like 192.168.1.0/24.")) })
                     on_change=Callback::new(move |t: Vec<String>| { f.cur.set(Val::T(t)); f.msg.set(None); })
                     error=terr

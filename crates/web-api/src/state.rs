@@ -228,6 +228,17 @@ pub trait RuntimeControl: Send + Sync {
     ) -> Result<std::time::Duration, String> {
         Err("this build cannot test the upstream proxy".into())
     }
+    /// Health and RTT of the upstream resolvers in force, and the cache counters.
+    fn dns_stats(&self) -> Option<api_types::DnsStatsResponse> {
+        None
+    }
+    /// Probe every upstream of `settings` (not necessarily the saved ones) once.
+    async fn test_dns(
+        &self,
+        _settings: &common::config::DnsSettings,
+    ) -> Result<Vec<api_types::DnsTestResult>, String> {
+        Err("this build cannot test the DNS upstreams".into())
+    }
     /// Issue the web UI's HTTPS certificate from the Argus CA for `sans` (DNS names and IP
     /// literals). Returns `(certificate PEM, key PEM)`.
     async fn issue_webui_cert(&self, _sans: &[String]) -> Result<(String, String), String> {

@@ -1779,13 +1779,43 @@
         "type": "object"
       },
       "DnsDto": {
-        "description": "Upstream DNS settings.",
+        "description": "Upstream DNS settings: what Argus uses to resolve names for its own connections.",
         "properties": {
+          "bootstrap": {
+            "description": "Plain-IP resolvers for the host names of encrypted upstreams.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "cache_size": {
             "description": "Maximum cached names.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "dnssec": {
+            "description": "Validate DNSSEC and refuse answers that fail.",
+            "type": "boolean"
+          },
+          "ecs": {
+            "description": "`off`, `auto` or `custom`.",
+            "type": "string"
+          },
+          "ecs_subnet": {
+            "description": "Subnet for `ecs = custom`, e.g. `203.0.113.0/24`.",
+            "type": "string"
+          },
+          "fallback": {
+            "description": "Used only when every upstream fails.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ipv6": {
+            "description": "Resolve AAAA records.",
+            "type": "boolean"
           },
           "max_ttl_secs": {
             "description": "Upper clamp on cached TTLs, seconds.",
@@ -1799,22 +1829,50 @@
             "minimum": 0,
             "type": "integer"
           },
+          "mode": {
+            "description": "`load_balance`, `parallel` or `fastest_ip`.",
+            "type": "string"
+          },
           "negative_ttl_secs": {
             "description": "How long failed lookups are cached, seconds.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
-          "servers": {
-            "description": "`ip` or `ip:port`; empty uses the system resolver.",
+          "optimistic_cache": {
+            "description": "Serve expired answers while refreshing them in the background.",
+            "type": "boolean"
+          },
+          "private_rdns": {
+            "description": "Send PTR lookups and LAN names to the private resolvers.",
+            "type": "boolean"
+          },
+          "private_resolvers": {
+            "description": "Plain-IP resolvers for those; empty uses the system resolver.",
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "servers": {
+            "description": "Upstream lines in AdGuard syntax (`1.1.1.1`, `tls://...`, `https://...`, `h3://...`,\n`quic://...`, `sdns://...`, `[/domain/]upstream`); empty uses the system resolver.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "timeout_ms": {
+            "description": "Per-upstream query timeout, milliseconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upstreams_source": {
+            "description": "File path or http(s) URL with more upstream lines.",
+            "type": "string"
           }
         },
         "required": [
-          "servers",
           "cache_size",
           "min_ttl_secs",
           "max_ttl_secs",
@@ -1822,14 +1880,154 @@
         ],
         "type": "object"
       },
+      "DnsStatsResponse": {
+        "description": "Live upstream-DNS figures.",
+        "properties": {
+          "cache_hits": {
+            "description": "Lookups answered from the cache.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_misses": {
+            "description": "Lookups that went to the upstreams.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cached_names": {
+            "description": "Names in the cache.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upstreams": {
+            "items": {
+              "$ref": "#/components/schemas/DnsUpstreamStat"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "upstreams",
+          "cached_names",
+          "cache_hits",
+          "cache_misses"
+        ],
+        "type": "object"
+      },
+      "DnsTestResponse": {
+        "description": "Result of probing every upstream once.",
+        "properties": {
+          "name": {
+            "description": "The name that was looked up.",
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/DnsTestResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "results"
+        ],
+        "type": "object"
+      },
+      "DnsTestResult": {
+        "description": "Outcome of one upstream in \"Test upstreams\".",
+        "properties": {
+          "answers": {
+            "description": "Addresses returned for the probe name.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latency_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "role": {
+            "description": "`upstream`, `fallback`, `bootstrap`, `private` or `system`.",
+            "type": "string"
+          },
+          "upstream": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "upstream",
+          "role",
+          "ok",
+          "answers"
+        ],
+        "type": "object"
+      },
       "DnsUpdate": {
         "description": "Partial DNS update; omitted fields keep their value.",
         "properties": {
+          "bootstrap": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "cache_size": {
             "format": "int64",
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "dnssec": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ecs": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ecs_subnet": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fallback": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "ipv6": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -1849,11 +2047,38 @@
               "null"
             ]
           },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "negative_ttl_secs": {
             "format": "int64",
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "optimistic_cache": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "private_rdns": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "private_resolvers": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -1865,8 +2090,97 @@
               "array",
               "null"
             ]
+          },
+          "timeout_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "upstreams_source": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
+        "type": "object"
+      },
+      "DnsUpstreamStat": {
+        "description": "Health and speed of one configured upstream.",
+        "properties": {
+          "consecutive_failures": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failures": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "healthy": {
+            "type": "boolean"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok_secs_ago": {
+            "description": "Seconds since the last good answer.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_rtt_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "queries": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "description": "`upstream`, `fallback`, `bootstrap` or `private`.",
+            "type": "string"
+          },
+          "rtt_ms": {
+            "description": "Smoothed round-trip time, milliseconds.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "transport": {
+            "description": "`udp`, `tcp`, `tls`, `https`, `h3`, `quic` or `dnscrypt`.",
+            "type": "string"
+          },
+          "upstream": {
+            "description": "Short label of the upstream (`tls://dns.google:853`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upstream",
+          "role",
+          "transport",
+          "queries",
+          "failures",
+          "consecutive_failures",
+          "healthy"
+        ],
         "type": "object"
       },
       "DomainCount": {
@@ -11221,6 +11535,162 @@
           }
         ],
         "summary": "The built-in default of every setting, in the shape of `GET /config` (what \"reset to\ndefault\" in the UI restores). The shipped `config/default.toml` and the settings overlay are\nnot consulted.",
+        "tags": [
+          "config"
+        ]
+      }
+    },
+    "/api/v1/config/dns/stats": {
+      "get": {
+        "operationId": "get_dns_stats",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsStatsResponse"
+                }
+              }
+            },
+            "description": "Per-upstream figures"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "config:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:read"
+            ]
+          }
+        ],
+        "summary": "Health and RTT of every configured upstream, plus the cache counters.",
+        "tags": [
+          "config"
+        ]
+      }
+    },
+    "/api/v1/config/dns/test": {
+      "post": {
+        "operationId": "test_dns",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DnsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DnsTestResponse"
+                }
+              }
+            },
+            "description": "One result per upstream"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Probe every upstream once, for the saved settings with the given fields applied (nothing is\nsaved). Reports each upstream's latency or why it failed.",
         "tags": [
           "config"
         ]

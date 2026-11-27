@@ -40,6 +40,13 @@ pub const PROTECTION: &[NavItem] = &[
         scope: None,
     },
     NavItem {
+        path: "/dns",
+        label: "DNS",
+        icon: "proxy",
+        sub: "Upstream resolvers",
+        scope: None,
+    },
+    NavItem {
         path: "/bypass",
         label: "Bypass",
         icon: "bypass",

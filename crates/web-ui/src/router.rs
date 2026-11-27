@@ -20,6 +20,7 @@ pub fn AppRouter() -> impl IntoView {
                 // Protected routes
                 <Route path=path!("/") view=|| view! { <Protected><DashboardPage /></Protected> } />
                 <Route path=path!("/proxy") view=|| view! { <Protected><ProxyPage /></Protected> } />
+                <Route path=path!("/dns") view=|| view! { <Protected><DnsPage /></Protected> } />
                 <Route path=path!("/bypass") view=|| view! { <Protected><BypassPage /></Protected> } />
                 <Route path=path!("/filters") view=|| view! { <Protected><FiltersPage /></Protected> } />
                 <Route path=path!("/logs") view=|| view! { <Protected><LogsPage /></Protected> } />

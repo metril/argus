@@ -271,6 +271,17 @@ impl web_api::RuntimeControl for ProxyRuntime {
         self.0.test_upstream_proxy(cfg, host, port).await
     }
 
+    fn dns_stats(&self) -> Option<api_types::DnsStatsResponse> {
+        self.0.dns_stats()
+    }
+
+    async fn test_dns(
+        &self,
+        settings: &common::config::DnsSettings,
+    ) -> Result<Vec<api_types::DnsTestResult>, String> {
+        self.0.test_dns(settings).await
+    }
+
     async fn issue_webui_cert(&self, sans: &[String]) -> Result<(String, String), String> {
         self.0
             .issue_webui_cert(sans.to_vec())

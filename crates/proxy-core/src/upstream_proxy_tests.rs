@@ -1,7 +1,7 @@
 //! Upstream proxy: stub CONNECT and SOCKS5 proxies record what Argus asks them for.
 
 use super::*;
-use crate::dns::{BackendResult, DnsBackend, DnsCacheConfig, DnsFailure, DnsHandle, FailKind};
+use crate::dns::{BackendResult, Resolver, DnsCacheConfig, DnsFailure, DnsHandle, FailKind};
 use crate::upstream::{build_upstream_client, UpstreamOptions};
 use common::config::UpstreamProxyKind::{Http, Socks5};
 use rcgen::{
@@ -22,7 +22,7 @@ const PUBLIC: &str = "93.184.216.34";
 
 struct Fixed(HashMap<String, IpAddr>);
 
-impl DnsBackend for Fixed {
+impl Resolver for Fixed {
     fn lookup(
         &self,
         name: &str,
@@ -54,6 +54,7 @@ fn dns() -> Arc<CachedResolver> {
             min_ttl: Duration::from_secs(60),
             max_ttl: Duration::from_secs(60),
             negative_ttl: Duration::from_secs(1),
+            optimistic: false,
         },
     ))
 }

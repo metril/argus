@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api_types::{
-    BindResult, DnsDto, ListenerFlagsView, MessageResponse, ProxyConfigResponse,
+    BindResult, ListenerFlagsView, MessageResponse, ProxyConfigResponse,
     UpdateProxyConfigRequest, UpdateProxyConfigResponse, UpstreamProxyDto, UpstreamProxyTestResult,
     UpstreamProxyUpdate,
 };
@@ -51,13 +51,7 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         upstream_proxy: upstream_proxy_dto(&config.proxy.upstream.proxy),
         allowed_destinations: config.proxy.allowed_destinations.clone(),
         allowed_clients: config.proxy.allowed_clients.clone(),
-        dns: DnsDto {
-            servers: config.dns.servers.clone(),
-            cache_size: config.dns.cache_size,
-            min_ttl_secs: config.dns.min_ttl_secs,
-            max_ttl_secs: config.dns.max_ttl_secs,
-            negative_ttl_secs: config.dns.negative_ttl_secs,
-        },
+        dns: super::dns::dns_dto(&config.dns),
         explicit: flags_view(config, false),
         transparent: flags_view(config, true),
         webui_host: config.webui.host.clone(),
@@ -723,22 +717,7 @@ async fn apply_update_locked(
     );
     if let Some(d) = req.dns {
         let before = config.dns.clone();
-        if let Some(v) = d.servers {
-            config.dns.servers = v.into_iter().map(|s| s.trim().to_string()).collect();
-        }
-        if let Some(v) = d.cache_size {
-            config.dns.cache_size = v;
-        }
-        if let Some(v) = d.min_ttl_secs {
-            config.dns.min_ttl_secs = v;
-        }
-        if let Some(v) = d.max_ttl_secs {
-            config.dns.max_ttl_secs = v;
-        }
-        if let Some(v) = d.negative_ttl_secs {
-            config.dns.negative_ttl_secs = v;
-        }
-        config.dns.validate().map_err(ApiError::ValidationError)?;
+        super::dns::merge_dns(&mut config.dns, d).map_err(ApiError::ValidationError)?;
         let changed = format!("{before:?}") != format!("{:?}", config.dns);
         live("dns", changed, can_proxy, &mut applied);
     }

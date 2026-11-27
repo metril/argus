@@ -8,7 +8,7 @@ use proxy_core::{
     config::ProxyConfig, filtering::ProxyContext, server::ProxyServer, upstream::UpstreamOptions,
     Error, Result,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
@@ -65,6 +65,12 @@ async fn main() -> Result<()> {
     // The same caching resolver also serves the control plane (list and resource fetches); each
     // fetch still applies its own, stricter policy to the addresses.
     if let Some(dns) = &upstream_opts.dns {
+        // Upstream lines from the optional file or URL (a failure leaves the inline ones).
+        match proxy_core::dns::load_upstream_lines(&config.dns, &config.adblock.data_dir).await {
+            Ok(lines) if !lines.is_empty() => dns.reconfigure_lines(&config.dns, &lines),
+            Ok(_) => {}
+            Err(e) => warn!("{e}"),
+        }
         common::net_policy::install_shared_resolver(Arc::new(proxy_core::dns::DnsHandle(
             dns.clone(),
         )));

@@ -1,0 +1,11 @@
+[package]
+name = "dns-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AdGuard-style upstream DNS syntax (plain/tcp/tls/https/h3/quic/sdns, [/domain/] routing); pure, wasm-safe"
+
+[dependencies]
+base64 = "0.22"
