@@ -14,7 +14,8 @@ impl ListStore {
     /// Ids of the `default`-profile lists already offered (never offered again).
     pub fn default_offered(&self) -> Result<BTreeSet<String>> {
         Ok(match self.get_meta(KEY)? {
-            Some(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Some(b) => serde_json::from_slice(&b)
+                .map_err(|e| crate::Error::Storage(format!("corrupt {KEY} metadata: {e}")))?,
             None => BTreeSet::new(),
         })
     }
@@ -101,6 +102,30 @@ mod tests {
         s.upsert(&mine).unwrap();
         assert!(s.default_offer(vec![base()]).unwrap().is_empty());
         assert!(!s.get("argus-base").unwrap().unwrap().enabled);
+        assert!(s.default_offered().unwrap().contains("argus-base"));
+    }
+
+    #[test]
+    fn corrupt_offered_value_errors_and_is_left_untouched() {
+        let (s, _d) = store();
+        s.put_meta(KEY, b"{not json").unwrap();
+        assert!(matches!(
+            s.default_offer(vec![base()]),
+            Err(crate::Error::Storage(_))
+        ));
+        assert!(s.get("argus-base").unwrap().is_none());
+        assert_eq!(s.get_meta(KEY).unwrap().unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn a_list_with_the_same_url_under_another_id_is_skipped_but_recorded() {
+        let (s, _d) = store();
+        let mut mine = FilterList::new("mine".into(), "Mine".into(), base().url);
+        mine.enabled = false;
+        s.upsert(&mine).unwrap();
+        assert!(s.default_offer(vec![base()]).unwrap().is_empty());
+        assert!(s.get("argus-base").unwrap().is_none());
+        assert!(!s.get("mine").unwrap().unwrap().enabled);
         assert!(s.default_offered().unwrap().contains("argus-base"));
     }
 
