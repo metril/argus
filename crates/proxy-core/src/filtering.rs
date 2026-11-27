@@ -670,6 +670,12 @@ impl ProxyContext {
         let mut opts = opts.clone();
         let roots = opts.roots_handle()?;
         opts.roots = Some(roots.clone());
+        // One resolver for the dial and for CNAME uncloaking: both read the same cached answer.
+        if opts.dns.is_none() {
+            opts.dns = Some(Arc::new(crate::dns::CachedResolver::from_settings(
+                &Default::default(),
+            )));
+        }
         let opts = &opts;
         let mut ctx = Self::with_clients(
             engine,
@@ -1330,6 +1336,7 @@ impl ProxyContext {
         // Set when the request passed the engine and may still be judged by its canonical name:
         // the page it belongs to, and whether an exception matched it.
         let mut cname_probe: Option<(String, bool)> = None;
+        let mut defer_allowed = false;
         {
             let profile = rctx.profile.load();
             let engine = &profile.engine;
@@ -1350,16 +1357,23 @@ impl ProxyContext {
                         log_outcome(block_mode, rtype)
                     }
                 });
-                let verdict = engine.record_verdict_meta(
-                    verdict,
-                    &url,
-                    source,
-                    rtype.as_str(),
-                    &profile.label,
-                    method.as_str(),
-                    event_mode(rctx),
-                    outcome,
-                );
+                // An allowed verdict is counted once the CNAME check has had its say, so a request
+                // it blocks is not counted as allowed as well.
+                defer_allowed = !verdict.blocked && self.cname.enabled();
+                let verdict = if defer_allowed {
+                    verdict
+                } else {
+                    engine.record_verdict_meta(
+                        verdict,
+                        &url,
+                        source,
+                        rtype.as_str(),
+                        &profile.label,
+                        method.as_str(),
+                        event_mode(rctx),
+                        outcome,
+                    )
+                };
                 generation = Some(gen_);
                 if verdict.blocked {
                     debug!("Blocked {} ({})", url, rtype.as_str());
@@ -1415,6 +1429,9 @@ impl ProxyContext {
                     }
                     if new_url != url {
                         if navigation {
+                            if defer_allowed {
+                                engine.stats_handle().record_allowed();
+                            }
                             log_local(
                                 rctx,
                                 filter_engine::EventAction::Allowed,
@@ -1557,6 +1574,9 @@ impl ProxyContext {
             {
                 return r;
             }
+        }
+        if defer_allowed {
+            rctx.profile.load().engine.stats_handle().record_allowed();
         }
 
         ext::apply_request_edits(&mut headers, &request_edits);
