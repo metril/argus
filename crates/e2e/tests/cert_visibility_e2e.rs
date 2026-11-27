@@ -58,8 +58,14 @@ e2e_test!(
         env.origin.route("/", MockResponse::ok("never served"));
         let resp = env
             .client()
-            .get(&env.origin.https_url("expired-a.test", "/"))
-            .await;
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("expired-a.test", "/"),
+            )
+            .header("sec-fetch-dest", "document")
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 502);
         assert_eq!(
             resp.headers().get("x-adblock").map(|v| v.as_bytes()),

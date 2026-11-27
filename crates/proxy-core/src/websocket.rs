@@ -308,10 +308,19 @@ async fn upgrade(
     let sent = match tokio::time::timeout(ws.dial_timeout, rb.send_upgrade()).await {
         Ok(r) => r,
         Err(_) => {
+            common::faults::note(common::faults::Fault::UpstreamTimeout, &target.host);
+            // A direct connection would fail the handshake: no 504 for the page to read.
+            if crate::redirect::aborts_upstream_failure(
+                ctx.block_response(),
+                crate::request_type::RequestType::Websocket,
+                req.headers(),
+            ) {
+                return Err(Error::upstream_unreachable());
+            }
             return Ok(status_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "WebSocket upstream timeout",
-            ))
+            ));
         }
     };
     let (resp, upgraded) = match sent {
@@ -330,6 +339,13 @@ async fn upgrade(
         Err(e) => {
             common::faults::note(common::faults::Fault::UpstreamError, &target.host);
             debug!("WebSocket upstream to {} failed: {}", check_url, e);
+            if crate::redirect::aborts_upstream_failure(
+                ctx.block_response(),
+                crate::request_type::RequestType::Websocket,
+                req.headers(),
+            ) {
+                return Err(Error::upstream_unreachable());
+            }
             return Ok(status_response(
                 StatusCode::BAD_GATEWAY,
                 "WebSocket upstream unavailable",

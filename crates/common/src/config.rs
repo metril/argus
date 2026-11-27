@@ -414,10 +414,13 @@ pub enum BlockResponse {
     /// The request fails like a network error, as in an extension blocker: xhr/fetch, scripts,
     /// styles, pings, media, fonts, objects, other and WebSockets are aborted (HTTP/2: that one
     /// stream is reset with CANCEL; HTTP/1: the connection is closed). Documents still get the
-    /// block page, subdocuments a blank page and images a 1x1 GIF.
+    /// block page, subdocuments a blank page and images a 1x1 GIF. Upstream failures (no DNS
+    /// answer, refused, TLS failure, timeout) fail the same way for every non-document request,
+    /// as on a direct connection; documents get the 502/504 error page.
     #[default]
     Fail,
-    /// Every block gets a well-formed success response (204, empty 200, GIF).
+    /// Every block gets a well-formed success response (204, empty 200, GIF), and upstream
+    /// failures get a synthesized 502/504 for every type (debugging).
     Synthetic,
 }
 

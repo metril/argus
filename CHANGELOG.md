@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+* Upstream failures now look like a direct connection's. A host that does not resolve, refuses or
+  resets the connection, fails its TLS handshake or times out used to get a synthesized 502/504
+  inside the intercepted tunnel, so a page's `fetch` resolved and counted the dead host as
+  reachable (ad-block tests scored Audio Ads, OEM Vendors and Mix too low). With
+  `proxy.block_response = "fail"` (the default) every non-document request, WebSockets included,
+  now fails as a network error (HTTP/2: that stream is reset; HTTP/1: the connection is closed).
+  Documents keep the error page, fault counters and the circuit breaker still count the failure,
+  and the request log keeps the entry with its reason. A plain `CONNECT` to a name that does not
+  resolve gets a 502 (the browser reports a tunnel failure). `"synthetic"` restores the 502/504
+  answers for every type, for debugging.
+* Under `block_response = "fail"`, a `$redirect` match on a `no-cors` fetch/XHR/beacon
+  (`Sec-Fetch-Mode: no-cors`, `Sec-Fetch-Dest: empty`) is aborted (logged as aborted) instead of
+  answered with the stub: the response is opaque to the page, and uBO on Firefox ends up failing
+  these. Cors-mode fetch/XHR and script, image and other element loads still get the stub.
+
 ## 0.8.0 — 2026-11-27
 
 * Blocked requests now fail like a network error (`proxy.block_response = "fail"`, the default;

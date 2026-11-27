@@ -158,10 +158,19 @@ async fn proxy_with_dns(
     mode: BlockResponse,
     answers: Vec<(&'static str, IpAddr)>,
 ) -> (u16, Arc<ProxyContext>, Arc<SharedEngine>) {
+    proxy_with_dns_cfg(mode, answers, |_| {}).await
+}
+
+async fn proxy_with_dns_cfg(
+    mode: BlockResponse,
+    answers: Vec<(&'static str, IpAddr)>,
+    tweak: impl FnOnce(&mut ProxyConfig),
+) -> (u16, Arc<ProxyContext>, Arc<SharedEngine>) {
     let mut config = ProxyConfig::default();
     config.proxy.host = "127.0.0.1".into();
     config.proxy.block_response = mode;
     config.mitm.enabled = false;
+    tweak(&mut config);
     let engine = Arc::new(SharedEngine::new());
     let ctx = Arc::new(
         ProxyContext::with_upstream(
@@ -373,5 +382,174 @@ fn sinkhole_classification() {
     assert_eq!(
         Refusal::Private.for_resolved_name("x.example.com", ip("0.0.0.0")),
         Refusal::Private
+    );
+}
+
+// ---- Upstream failures look like a direct connection's: a network error, not a 502/504 -------
+
+/// A port with nothing listening.
+async fn closed_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// An origin that accepts and never answers.
+async fn silent_origin() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    port
+}
+
+async fn raw_dest(p: u16, url: &str, dest: &str) -> String {
+    let host = url.split('/').nth(2).unwrap();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p))
+        .await
+        .unwrap();
+    s.write_all(
+        format!("GET {url} HTTP/1.1\r\nHost: {host}\r\nSec-Fetch-Dest: {dest}\r\nSec-Fetch-Mode: cors\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    String::from_utf8_lossy(&out).to_ascii_lowercase()
+}
+
+async fn failing_proxy(mode: BlockResponse) -> (u16, Arc<ProxyContext>, Arc<SharedEngine>) {
+    proxy_with_dns_cfg(
+        mode,
+        vec![("gone.test", "127.0.0.1".parse().unwrap())],
+        |c| c.proxy.allowed_destinations = vec!["127.0.0.0/8".into()],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn unresolvable_and_refused_fetches_are_aborted_documents_get_the_error_page() {
+    let (p, _ctx, engine) = failing_proxy(BlockResponse::Fail).await;
+    let dead = closed_port().await;
+    for (what, url) in [
+        ("nxdomain", "http://nx.test/x".to_string()),
+        ("refused", format!("http://gone.test:{dead}/x")),
+    ] {
+        for dest in ["empty", "script", "image", "audio", "iframe"] {
+            let out = raw_dest(p, &url, dest).await;
+            assert!(out.is_empty(), "{what}/{dest}: {out}");
+        }
+        let doc = raw_dest(p, &url, "document").await;
+        assert!(doc.starts_with("http/1.1 502"), "{what}: {doc}");
+    }
+    // Logged as an upstream error with its reason, not as a block; an abort has no status.
+    let ev: Vec<_> = engine
+        .recent_requests(100)
+        .into_iter()
+        .filter(|e| e.url.contains("nx.test") && e.request_type != "document")
+        .collect();
+    assert!(!ev.is_empty());
+    assert!(
+        ev.iter()
+            .all(|e| e.action == filter_engine::EventAction::Error
+                && e.status.is_none()
+                && e.error_kind.is_some()),
+        "{ev:?}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_timeout_aborts_a_fetch_and_documents_get_a_504() {
+    let (p, ctx, _) = failing_proxy(BlockResponse::Fail).await;
+    ctx.set_request_timeout(Duration::from_millis(200));
+    let silent = silent_origin().await;
+    let url = format!("http://gone.test:{silent}/x");
+    assert!(raw_dest(p, &url, "empty").await.is_empty());
+    let doc = raw_dest(p, &url, "document").await;
+    assert!(doc.starts_with("http/1.1 504"), "{doc}");
+}
+
+#[tokio::test]
+async fn synthetic_mode_keeps_the_502_for_every_type() {
+    let (p, _, _) = failing_proxy(BlockResponse::Synthetic).await;
+    for dest in ["empty", "document"] {
+        let out = raw_dest(p, "http://nx.test/x", dest).await;
+        assert!(out.starts_with("http/1.1 502"), "{dest}: {out}");
+    }
+}
+
+#[tokio::test]
+async fn connect_to_an_unresolvable_name_gets_a_502() {
+    let (p, _, _) = failing_proxy(BlockResponse::Fail).await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p))
+        .await
+        .unwrap();
+    s.write_all(b"CONNECT nx.test:443 HTTP/1.1\r\nHost: nx.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 502"), "{text}");
+}
+
+#[tokio::test]
+async fn non_browser_clients_keep_the_502() {
+    // No `Sec-Fetch-Mode`: curl, apt and the like read the status.
+    let (p, _, _) = failing_proxy(BlockResponse::Fail).await;
+    let out = raw_get(p, "http://nx.test/x").await;
+    assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 502"));
+}
+
+#[tokio::test]
+async fn immediate_retry_of_an_aborted_request_fails_fast_without_a_second_dial() {
+    let (p, ctx, engine) = failing_proxy(BlockResponse::Fail).await;
+    ctx.set_request_timeout(Duration::from_millis(1500));
+    let silent = silent_origin().await;
+    let url = format!("http://gone.test:{silent}/x");
+    let t = std::time::Instant::now();
+    assert!(raw_dest(p, &url, "empty").await.is_empty());
+    assert!(t.elapsed() >= Duration::from_millis(1400));
+    // The retry (Chrome re-sends on a reused socket) does not wait the timeout out again.
+    let t = std::time::Instant::now();
+    assert!(raw_dest(p, &url, "empty").await.is_empty());
+    assert!(
+        t.elapsed() < Duration::from_millis(700),
+        "{:?}",
+        t.elapsed()
+    );
+    let ev: Vec<_> = engine
+        .recent_requests(100)
+        .into_iter()
+        .filter(|e| e.url.contains(&format!(":{silent}/x")))
+        .collect();
+    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert!(ev
+        .iter()
+        .all(|e| e.error_kind == Some(filter_engine::ErrorKind::UpstreamTimeout)));
+}
+
+#[tokio::test]
+async fn synthetic_mode_connect_to_an_unresolvable_name_keeps_the_old_behaviour() {
+    let (p, _, _) = failing_proxy(BlockResponse::Synthetic).await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p))
+        .await
+        .unwrap();
+    s.write_all(b"CONNECT nx.test:443 HTTP/1.1\r\nHost: nx.test:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&buf[..n])
     );
 }

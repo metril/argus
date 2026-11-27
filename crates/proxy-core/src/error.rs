@@ -36,6 +36,14 @@ pub enum Error {
     #[error("request blocked: aborted")]
     Blocked(#[source] h2::Error),
 
+    /// An upstream failure (no DNS answer, refused, reset, TLS failure, timeout) on a
+    /// non-document request, surfaced as a network error like a direct connection would give,
+    /// instead of a synthesized 502/504 the page would read as "reachable". Aborts the request
+    /// like [`Error::Blocked`] (HTTP/2: stream reset; HTTP/1: connection closed) but is a real
+    /// upstream fault, never a block.
+    #[error("upstream unreachable: aborted")]
+    UpstreamUnreachable(#[source] h2::Error),
+
     #[error("Timeout error")]
     Timeout,
 
@@ -57,9 +65,29 @@ impl Error {
         Error::Blocked(h2::Error::from(h2::Reason::CANCEL))
     }
 
+    /// The abort answering an unreachable upstream (HTTP/2: RST_STREAM CONNECT_ERROR).
+    pub fn upstream_unreachable() -> Self {
+        Error::UpstreamUnreachable(h2::Error::from(h2::Reason::CONNECT_ERROR))
+    }
+
     /// Whether this is a deliberate block abort, not a failure.
     pub fn is_blocked(&self) -> bool {
         matches!(self, Error::Blocked(_))
+    }
+
+    /// Whether this error carries any deliberate abort (block or unreachable upstream).
+    pub fn chain_is_abort(err: &(dyn std::error::Error + 'static)) -> bool {
+        let mut cur = Some(err);
+        while let Some(e) = cur {
+            if matches!(
+                e.downcast_ref::<Error>(),
+                Some(Error::Blocked(_) | Error::UpstreamUnreachable(_))
+            ) {
+                return true;
+            }
+            cur = e.source();
+        }
+        false
     }
 
     /// Whether this error carries a deliberate block abort anywhere in its source chain.

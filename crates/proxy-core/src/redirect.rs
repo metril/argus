@@ -184,6 +184,30 @@ pub fn aborts(mode: BlockResponse, ty: RequestType) -> bool {
         )
 }
 
+/// Whether an upstream failure (no DNS answer, refused, reset, TLS failure, timeout) for a
+/// request of `ty` is surfaced as a network error, as a direct connection would give. Documents
+/// keep their error page, and so do clients that are not browsers (no `Sec-Fetch-Mode`: curl,
+/// apt, ...), which read the status. `block_response = synthetic` restores the synthesized
+/// 502/504 for every type (debugging).
+pub fn aborts_upstream_failure(
+    mode: BlockResponse,
+    ty: RequestType,
+    headers: &hyper::HeaderMap,
+) -> bool {
+    mode == BlockResponse::Fail
+        && ty != RequestType::Document
+        && headers.contains_key("sec-fetch-mode")
+}
+
+/// Whether a `$redirect` match is aborted instead of served: under `fail`, a `no-cors`
+/// fetch/XHR/beacon (`Sec-Fetch-Mode: no-cors`, `Sec-Fetch-Dest: empty`). Its response is opaque,
+/// so the page cannot read the stub, and uBO on Firefox ends up failing it (Firefox rejects the
+/// redirect to an extension resource). Cors-mode fetches and element loads keep the stub.
+pub fn aborts_redirect(mode: BlockResponse, headers: &hyper::HeaderMap) -> bool {
+    let is = |n: &str, v: &str| headers.get(n).is_some_and(|h| h.as_bytes() == v.as_bytes());
+    mode == BlockResponse::Fail && is("sec-fetch-mode", "no-cors") && is("sec-fetch-dest", "empty")
+}
+
 /// The outcome recorded in the request log for a block of `ty` under `mode`.
 pub fn log_outcome(mode: BlockResponse, ty: RequestType) -> filter_engine::EventOutcome {
     if aborts(mode, ty) {

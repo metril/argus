@@ -58,7 +58,14 @@ async fn live_timeout_yields_504(mode: EntryMode) {
     let proxy = TestProxy::start(mode, &origin, &[]).await.unwrap();
     proxy.ctx.set_request_timeout(Duration::from_millis(150));
     let c = client(&proxy);
-    let slow = c.get(&origin.https_url("t.test", "/slow")).await;
+    // A document gets the 504; a fetch fails like a network error (see block_response_e2e).
+    let slow = c
+        .request(reqwest::Method::GET, &origin.https_url("t.test", "/slow"))
+        .header("sec-fetch-dest", "document")
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(slow.status(), 504);
     let fast = c.get(&origin.https_url("t.test", "/fast")).await;
     assert_eq!(fast.status(), 200);
