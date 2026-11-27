@@ -1,0 +1,40 @@
+{
+  "adguard-desktop": {
+    "windows": {
+      "version": "8.0.5595",
+      "url": "https://static.adtidy.org/windows/setup64-8.0.5595.msi",
+      "sha256": "d168697c36b3df7273113c4c19e37d4801a1642ad224329164ebb7ddbbda8247",
+      "kind": "msi"
+    }
+  },
+  "ubol": {
+    "chrome": {
+      "version": "2026.1124.1811",
+      "url": "https://github.com/uBlockOrigin/uBOL-home/releases/download/2026.1124.1811/uBOLite_2026.1124.1811.chromium.zip",
+      "kind": "zip",
+      "sha256": "b0472c07028ced638cc0ae7c57403dd95ad6cdfc7391a37f9fa7aaf6239dfc55"
+    }
+  },
+  "ubo": {
+    "firefox": {
+      "version": "1.77.2",
+      "url": "https://addons.mozilla.org/firefox/downloads/file/5308235/ublock_origin-1.77.2.xpi",
+      "sha256": "c9186bcbb5ef542465187ce52aa7d76b5315e8a020c360e3e701f678ad47d776",
+      "kind": "xpi"
+    }
+  },
+  "adguard-ext": {
+    "chrome": {
+      "version": "5.6.1",
+      "url": "https://github.com/AdguardTeam/AdguardBrowserExtension/releases/download/v5.6.1/chrome-mv3.zip",
+      "kind": "zip",
+      "sha256": "083ba35a2d00fd8d71dca13aa81fd59f92cc418484ed7c45070ceaf48ea25676"
+    },
+    "firefox": {
+      "version": "5.5.4.55",
+      "url": "https://addons.mozilla.org/firefox/downloads/file/5229923/adguard_adblocker-5.5.4.55.xpi",
+      "sha256": "937dd8130b119dd8fcaa1bf486452880e63a69b57047ba448d13fa1d75064cee",
+      "kind": "xpi"
+    }
+  }
+}
