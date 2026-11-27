@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.0 — 2026-11-27
+
 * Blocked requests now fail like a network error (`proxy.block_response = "fail"`, the default;
   Settings, applied live), as with an extension blocker, so page scripts and ad-block tests no
   longer count a blocked resource as loaded. Scripts, fetch/XHR, styles, pings, media, fonts,
@@ -10,6 +12,24 @@
   `"synthetic"` restores the old always-succeeds answers. A public name that resolves to 0.0.0.0,
   `::` or loopback (a DNS sinkhole) is aborted too and logged as `sinkholed-upstream`. The request
   log shows each block's outcome (`aborted` or `synthetic`).
+* Upstream DNS (new DNS page): AdGuard Home-style upstreams with plain, TCP, DoT, DoH, DoH3, DoQ
+  and DNSCrypt (`sdns://`), per-domain `[/domain/]` rules, load-balance/parallel/fastest-IP modes,
+  bootstrap, fallback and private reverse resolvers, a cache with TTL bounds and optimistic
+  serve-stale, DNSSEC, ECS and an AAAA toggle. Live RTT/health and a Test upstreams button. Empty
+  keeps the system resolver.
+* Trusted lists: the signed catalogue marks the uBlock Origin lists and AdGuard Base as trusted, so
+  `trusted-*` scriptlets (YouTube, anti-adblock `rpnt` rules) now run. Existing installs are
+  migrated by URL. Fresh installs get uBO Lite's default lists.
+* Scriptlets: AdGuard scriptlet names map to uBO's (about 550 more rules work); generic `#%#` and
+  `#$#` rules inject instead of being treated as CSS; `:style(remove: true)` removes. Scriptlets and
+  hiding now reach about:blank, srcdoc and blob frames. No-transform pages are filtered and the
+  service-worker guard is on by default.
+* `$popup` rules apply to new tabs the extension reports; `@@` exceptions override extended block
+  rules (except `$important`); CSS-initiated requests are attributed to their page.
+* Extension: the popup's "Intercepted" status now reflects whether this tab actually went through
+  Argus (needs the new `webNavigation` permission).
+* CI: an adblock parity harness scores Argus against uBO Lite, uBlock Origin and AdGuard on five
+  test sites (weekly); faster CI and image builds.
 
 ## 0.7.0 — 2026-11-26
 
