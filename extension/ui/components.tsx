@@ -1,6 +1,7 @@
 import type { ComponentChildren } from 'preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { type ErrorKind, type Interception } from '../lib/api';
+import { type ErrorKind } from '../lib/api';
+import type { Route } from '../lib/route';
 import { bannerCopy, issuerName, daysUntil, invalidReason, type Site } from '../lib/state';
 import { statusKind, type Listener } from '../lib/proxy';
 import { bundledUrl, normalizeUrl, signIn, useToken } from '../lib/auth';
@@ -81,7 +82,7 @@ export function CertDetails({ cert }: { cert: NonNullable<Extract<Site, { kind: 
   );
 }
 
-export function SiteCard({ host, site, interception }: { host: string; site: Site; interception?: Interception | undefined }) {
+export function SiteCard({ host, site, route }: { host: string; site: Site; route?: Route | undefined }) {
   const [open, setOpen] = useState(false);
   if (site.kind === 'loading') return <Skeleton />;
   if (site.kind === 'none') {
@@ -94,22 +95,28 @@ export function SiteCard({ host, site, interception }: { host: string; site: Sit
   }
   const cert = site.kind === 'cert' ? site.cert : null;
   const bad = cert?.verdict === 'invalid';
-  const route =
-    interception === 'direct' ? <Chip tone="pass" icon="arrow">Direct</Chip>
+  // The certificate is what Argus saw for the host; it describes this tab only when the tab's
+  // traffic really went through Argus (the proxy's marker header, observed per tab).
+  const direct = route === 'direct';
+  const routeChip =
+    direct ? <Chip tone="pass" icon="arrow">Direct, not intercepted</Chip>
+    : route === 'system' ? <Chip tone="pass" icon="shield">Extension off, still intercepted via system proxy</Chip>
+    : route === 'argus' ? <Chip tone={bad ? 'block' : 'allow'} icon={bad ? 'shieldX' : 'shield'}>Intercepted</Chip>
     : site.kind === 'unseen' ? <Chip tone="pass" icon="arrow">Not filtered</Chip>
-    : cert ? <Chip tone={bad ? 'block' : 'allow'} icon={bad ? 'shieldX' : 'shield'}>Intercepted</Chip>
+    : cert ? <Chip tone="pass" icon="arrow">Reload to check</Chip>
     : null;
+  const showCert = !!cert && !direct;
   return (
     <section class={`card${bad ? ' t-block' : ''}`}>
       <div class="host">{host}</div>
       <div class="chips">
-        {route}
-        {cert && (bad
+        {routeChip}
+        {showCert && (bad
           ? <Chip tone="block" icon="shieldX">Cert invalid</Chip>
           : <Chip tone="allow" icon="lock">{cert.ev ? 'Cert valid · EV' : 'Cert valid'}</Chip>)}
       </div>
-      {cert && bad && <div style="font-size:12px">{invalidReason(cert)}</div>}
-      {cert && (
+      {showCert && bad && <div style="font-size:12px">{invalidReason(cert)}</div>}
+      {showCert && cert && (
         <>
           <dl>
             <dt>Issuer</dt><dd class="mono">{issuerName(cert.issuer)}</dd>

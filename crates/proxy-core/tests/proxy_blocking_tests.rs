@@ -273,3 +273,40 @@ async fn blocked_host_with_unresolvable_dns_is_blocked_not_reset_when_ev_tunnell
         .expect("the blocked host gets the block response, not a reset");
     assert_eq!(r.headers().get("x-adblock").unwrap(), "blocked");
 }
+
+#[tokio::test]
+async fn x_argus_marker_only_on_document_navigations() {
+    let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = origin_listener.local_addr().unwrap().port();
+    spawn_html_origin(origin_listener).await;
+    let engine = Arc::new(SharedEngine::new());
+    engine.install(compile_engine(&["##.sponsored\n".to_string()]));
+    let ctx = Arc::new(ProxyContext::new(engine, true).with_policy(Arc::new(
+        proxy_core::policy::DestPolicy::new(false, &["127.0.0.0/8".to_string()]).unwrap(),
+    )));
+    let proxy_port = spawn_proxy(ctx).await;
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://127.0.0.1:{proxy_port}")).unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{origin_port}/");
+    for (dest, marked) in [
+        ("document", true),
+        ("iframe", true),
+        ("empty", false),
+        ("script", false),
+    ] {
+        let r = client
+            .get(&url)
+            .header("sec-fetch-dest", dest)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.headers().contains_key("x-argus"),
+            marked,
+            "sec-fetch-dest {dest}"
+        );
+    }
+}

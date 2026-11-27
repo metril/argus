@@ -1,10 +1,11 @@
-import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
+import { cachedLookup, clearCache, getSettings, hostOf, type Lookup } from '../lib/api';
 import { signOutInBackground } from '../lib/auth';
 import { Bridge } from '../lib/bridge';
 import { FriendlyFrames } from '../lib/friendly-frames';
 import { onStorageChanged } from '../lib/changes';
 import { respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
+import { RouteTracker } from '../lib/route';
 import { StoreRelay } from '../lib/storerelay';
 
 /** The toolbar badge is a colored dot for the site state; nothing when there is nothing to say. */
@@ -19,7 +20,7 @@ function badgeFor(v: Lookup): { text: string; color: string } {
 
 export default defineBackground(() => {
   const action = browser.action;
-  const intercepted = new Map<number, Interception>();
+  const routes = new RouteTracker();
 
   async function update(tabId: number, url?: string) {
     // Argus is on but unreachable: the browser is blocked (not direct); say so on every tab.
@@ -80,39 +81,32 @@ export default defineBackground(() => {
     if (info.status === 'complete' || info.url) void update(tabId, tab.url);
   });
   browser.storage.onChanged.addListener((changes: Record<string, unknown>) => onStorageChanged(changes, { clearCache, bridge, proxy }));
-  browser.tabs.onRemoved.addListener((id) => intercepted.delete(id));
+  browser.tabs.onRemoved.addListener((id) => routes.forget(id));
   // New tabs / windows opened by a page: the proxy learns the opener (for `$popup`).
   b.webNavigation?.onCreatedNavigationTarget?.addListener((d: { url?: string; sourceTabId?: number }) => {
     if (d.url && d.sourceTabId !== undefined && d.sourceTabId >= 0) void bridge.reportPopup(d.url, d.sourceTabId);
   });
 
-  // Firefox only: inspect the certificate the browser actually received.
+  // Whether a tab's document came through Argus: the proxy marks document responses it relays.
   const wr = (browser as any).webRequest;
-  if (wr && typeof wr.getSecurityInfo === 'function') {
-    wr.onHeadersReceived.addListener(
-      async (d: { requestId: string; tabId: number }) => {
-        try {
-          const info = await wr.getSecurityInfo(d.requestId, {});
-          const issuer: string = info?.certificates?.[0]?.issuer ?? '';
-          if (info?.state === 'insecure' || !issuer) return {};
-          intercepted.set(d.tabId, issuer.includes('Argus Proxy CA') ? 'intercepted' : 'direct');
-        } catch { /* ignore */ }
-        return {};
-      },
-      { urls: ['<all_urls>'], types: ['main_frame'] },
-      ['blocking'],
-    );
-  }
+  wr?.onHeadersReceived?.addListener(
+    (d: { tabId: number; fromCache?: boolean; responseHeaders?: { name: string }[] }) => {
+      if (!d.fromCache) routes.record(d.tabId, d.responseHeaders);
+    },
+    { urls: ['<all_urls>'], types: ['main_frame'] },
+    ['responseHeaders'],
+  );
 
   browser.runtime.onMessage.addListener(respondAsync((msg: { type?: string; tabId?: number }, sender: { id?: string }) => {
     if (msg?.type === 'interception' && msg.tabId !== undefined) {
-      return Promise.resolve((intercepted.get(msg.tabId) ?? 'unknown') as Interception);
+      const enabled = proxy.getState().enabled;
+      return Promise.resolve({ route: routes.route(msg.tabId, enabled), enabled });
     }
     if (msg?.type === 'proxy-get' || msg?.type === 'proxy-set' || msg?.type === 'store-token') {
       if (sender?.id !== browser.runtime.id) return undefined;
       const m = msg as { type: string; state?: ProxyState; storeId?: string };
       if (m.type === 'store-token') return Promise.resolve(proxy.tokenFor(m.storeId));
-      if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => ({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox }));
+      if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => (routes.reset(), { state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox }));
       return Promise.resolve({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox });
     }
     if (msg?.type === 'bridge-reconnect') {

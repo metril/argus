@@ -2,7 +2,8 @@ import { render } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import '../../ui/tokens.css';
 import '../../ui/ui.css';
-import { cachedLookup, clearCache, hostOf, type Interception, type Lookup } from '../../lib/api';
+import { cachedLookup, clearCache, hostOf, type Lookup } from '../../lib/api';
+import type { Route } from '../../lib/route';
 import { signOut } from '../../lib/auth';
 import { loadMenu, type MenuState } from '../../lib/menudata';
 import { Scripts } from '../../ui/scripts';
@@ -24,7 +25,7 @@ function App() {
   const s = settings.value;
   const [tab, setTab] = useState<Tab | null | undefined>(undefined);
   const [lookup, setLookup] = useState<Lookup>();
-  const [inter, setInter] = useState<Interception>();
+  const [inter, setInter] = useState<Route>();
   const [menu, setMenu] = useState<MenuState>({ kind: 'none' });
   const [live, setLive] = useState(false);
   const [more, setMore] = useState(false);
@@ -42,13 +43,18 @@ function App() {
   useEffect(() => {
     if (tab === undefined || !signed) return;
     setLookup(undefined);
+    let timer: ReturnType<typeof setInterval> | undefined;
     const host = hostOf(tab?.url);
     if (host) void cachedLookup(host).then(setLookup);
     if (tab?.id !== undefined) {
-      void browser.runtime.sendMessage({ type: 'interception', tabId: tab.id }).then((i) => setInter(i as Interception), () => {});
+      const ask = () => void browser.runtime.sendMessage({ type: 'interception', tabId: tab.id }).then((i) => setInter((i as { route?: Route } | undefined)?.route), () => {});
+      ask();
+      // The toggle can change while the popup is open: re-read this tab's routing.
+      timer = setInterval(ask, 2000);
     }
     void loadMenu(tab ?? undefined).then(setMenu);
     void browser.runtime.sendMessage({ type: 'bridge-status' }).then((b) => setLive(!!(b as { connected?: boolean } | undefined)?.connected), () => {});
+    return () => { if (timer) clearInterval(timer); };
   }, [tab, signed, s?.token, n]);
 
   if (s === null || tab === undefined) return <div class="pop"><Header /><div class="main"><Skeleton /></div></div>;
@@ -71,7 +77,7 @@ function App() {
             else { clearCache(); setN(n + 1); }
           }} />
         )}
-        <SiteCard host={host} site={r.site} interception={inter} />
+        <SiteCard host={host} site={r.site} route={inter} />
         <Scripts state={menu} reload={() => setN(n + 1)} />
         <section class="sec">
           <div class="lbl">This browser</div>
