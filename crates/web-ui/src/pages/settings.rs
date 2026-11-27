@@ -252,6 +252,66 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        id: "cname",
+        title: "CNAME uncloaking",
+        sub: "Catch trackers hidden behind a site's own sub-domain, as uBlock Origin does on Firefox. A request that is not blocked is checked again under the name its host really points to. Applied at once.",
+        fields: &[
+            Def {
+                key: "cname_on",
+                label: "Uncloak CNAMEs",
+                desc: "Resolves each host once (the answer Argus connects with, so no extra lookup) and blocks the request when the name it is an alias of is blocked.",
+                kind: Kind::Switch,
+                dep: None,
+            },
+            Def {
+                key: "cname_ignore",
+                label: "Never uncloak these names",
+                desc: "Canonical names left alone, with their subdomains: example.com or *.example.com.",
+                kind: Kind::Hosts,
+                dep: Some("cname_on"),
+            },
+            Def {
+                key: "cname_1p",
+                label: "Ignore same-site aliases",
+                desc: "Skip an alias on the same site as the host (static.example.com pointing to cdn.example.com).",
+                kind: Kind::Switch,
+                dep: Some("cname_on"),
+            },
+            Def {
+                key: "cname_exc",
+                label: "Respect exceptions",
+                desc: "Skip requests an exception rule (@@) already allows.",
+                kind: Kind::Switch,
+                dep: Some("cname_on"),
+            },
+            Def {
+                key: "cname_root",
+                label: "Ignore the page itself",
+                desc: "Skip page loads and requests to the page's own host.",
+                kind: Kind::Switch,
+                dep: Some("cname_on"),
+            },
+            Def {
+                key: "cname_ttl",
+                label: "Remember aliases for",
+                desc: "Longest time an alias is trusted. The DNS record's own lifetime still caps it.",
+                kind: Kind::Num {
+                    unit: "s",
+                    min: 1,
+                    max: 86_400,
+                },
+                dep: Some("cname_on"),
+            },
+            Def {
+                key: "cname_full",
+                label: "Check the full URL",
+                desc: "Off checks only the scheme and host of the alias with a root path, as uBlock Origin does. On also tries the original path and query.",
+                kind: Kind::Switch,
+                dep: Some("cname_on"),
+            },
+        ],
+    },
+    Section {
         id: "upstream",
         title: "Upstream proxy",
         sub: "Send everything Argus connects to through another proxy. DNS lookups stay on Argus: it resolves and vets each address itself and gives the proxy only that address.",
@@ -577,6 +637,10 @@ fn defaults(key: &str) -> Val {
         "block_response" => Val::S("fail".into()),
         "guard_sw" => Val::B(false),
         "guard_sw_exempt" => Val::T(Vec::new()),
+        "cname_on" | "cname_1p" | "cname_exc" | "cname_root" => Val::B(true),
+        "cname_full" => Val::B(false),
+        "cname_ignore" => Val::T(Vec::new()),
+        "cname_ttl" => Val::S("600".into()),
         "up_on" => Val::B(false),
         "up_kind" => Val::S("http".into()),
         "up_host" | "up_user" | "up_pass" => Val::S(String::new()),
@@ -624,6 +688,13 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
             "guard_sw_exempt",
             Val::T(c.guard_service_workers_exempt.clone()),
         ),
+        ("cname_on", Val::B(c.cname.enabled)),
+        ("cname_ignore", Val::T(c.cname.ignore_list.clone())),
+        ("cname_1p", Val::B(c.cname.ignore_first_party)),
+        ("cname_exc", Val::B(c.cname.ignore_exceptions)),
+        ("cname_root", Val::B(c.cname.ignore_root_document)),
+        ("cname_ttl", Val::S(c.cname.max_ttl_secs.to_string())),
+        ("cname_full", Val::B(c.cname.replay_full_url)),
         ("up_on", Val::B(c.upstream_proxy.enabled)),
         (
             "up_kind",
@@ -702,6 +773,7 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "auto_update" => &["auto_update"],
         "lists_url" | "lists_key" => &["bypass"],
         k if k.starts_with("st_") => &["stealth"],
+        k if k.starts_with("cname_") => &["cname"],
         _ => &["update_interval_hours"],
     }
 }
@@ -980,6 +1052,28 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("guard_sw") {
         r.guard_service_workers = Some(val("guard_sw").b());
+    }
+    if [
+        "cname_on",
+        "cname_ignore",
+        "cname_1p",
+        "cname_exc",
+        "cname_root",
+        "cname_ttl",
+        "cname_full",
+    ]
+    .iter()
+    .any(|k| dirty(k))
+    {
+        r.cname = Some(api_types::CnameUpdate {
+            enabled: dirty("cname_on").then(|| val("cname_on").b()),
+            ignore_list: dirty("cname_ignore").then(|| val("cname_ignore").t()),
+            ignore_first_party: dirty("cname_1p").then(|| val("cname_1p").b()),
+            ignore_exceptions: dirty("cname_exc").then(|| val("cname_exc").b()),
+            ignore_root_document: dirty("cname_root").then(|| val("cname_root").b()),
+            max_ttl_secs: dirty("cname_ttl").then(|| num("cname_ttl")),
+            replay_full_url: dirty("cname_full").then(|| val("cname_full").b()),
+        });
     }
     r.upstream_proxy = upstream_update(&|k| val(k).s(), &dirty);
     if dirty("auto_update") {

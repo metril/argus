@@ -74,11 +74,22 @@ impl DnsFailure {
 /// A resolved name: addresses with their (unclamped) TTL, or the failure.
 pub type BackendResult = Result<(Vec<IpAddr>, Duration), DnsFailure>;
 
+/// A resolved name with the canonical name its CNAME chain ends in (`None`: no CNAME, or the
+/// resolver cannot tell).
+pub type CanonResult = Result<(Vec<IpAddr>, Duration, Option<String>), DnsFailure>;
+
 /// The one resolution interface: the engine, the system resolver and test doubles implement it,
 /// and the cache wraps it.
 pub trait Resolver: Send + Sync + 'static {
     /// Addresses of `name` (A and AAAA).
     fn lookup(&self, name: &str) -> BoxFut<BackendResult>;
+
+    /// [`Self::lookup`] plus the last CNAME target of the answer, read from the same response
+    /// (no extra query). Resolvers that cannot see the chain report `None`.
+    fn lookup_canon(&self, name: &str) -> BoxFut<CanonResult> {
+        let f = self.lookup(name);
+        Box::pin(async move { f.await.map(|(a, t)| (a, t, None)) })
+    }
 
     /// Host names of `ip` (PTR).
     fn lookup_ptr(&self, _ip: IpAddr) -> BoxFut<Result<Vec<String>, DnsFailure>> {
@@ -140,6 +151,55 @@ pub(crate) fn addresses(m: &hickory_resolver::proto::op::Message) -> (Vec<IpAddr
     (ips, ttl)
 }
 
+/// The end of the CNAME chain of `name` in the answer section (`None` when `name` has no CNAME).
+pub(crate) fn canonical_name<'a>(
+    name: &str,
+    messages: impl IntoIterator<Item = &'a hickory_resolver::proto::op::Message>,
+) -> Option<String> {
+    canonical_from_records(
+        name,
+        messages
+            .into_iter()
+            .flat_map(|m| m.answers.iter().map(|r| (&r.name, &r.data))),
+    )
+}
+
+/// The last CNAME target reached from `name` through `(owner, data)` records. A chain is followed
+/// record by record, so a CNAME to a CNAME yields the last target.
+pub(crate) fn canonical_from_records<'a>(
+    name: &str,
+    records: impl IntoIterator<
+        Item = (
+            &'a hickory_resolver::proto::rr::Name,
+            &'a hickory_resolver::proto::rr::RData,
+        ),
+    >,
+) -> Option<String> {
+    use hickory_resolver::proto::rr::RData;
+    let lower = |n: &hickory_resolver::proto::rr::Name| {
+        n.to_utf8().trim_end_matches('.').to_ascii_lowercase()
+    };
+    let mut links: std::collections::HashMap<String, String> = Default::default();
+    for (owner, data) in records {
+        if let RData::CNAME(c) = data {
+            links.insert(lower(owner), lower(&c.0));
+        }
+    }
+    let mut cur = name.trim_end_matches('.').to_ascii_lowercase();
+    let mut out = None;
+    // Bounded: a looping chain must not spin.
+    for _ in 0..16 {
+        match links.get(&cur) {
+            Some(next) if *next != cur => {
+                out = Some(next.clone());
+                cur = next.clone();
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
 /// Whether DNSSEC validation marked any answer record bogus.
 pub(crate) fn has_bogus(m: &hickory_resolver::proto::op::Message) -> bool {
     use hickory_resolver::proto::dnssec::Proof;
@@ -185,6 +245,10 @@ impl From<&DnsSettings> for DnsCacheConfig {
 #[derive(Clone)]
 struct Entry {
     result: Result<Arc<[IpAddr]>, Arc<str>>,
+    /// The last CNAME target of the answer, when there was a chain.
+    cname: Option<Arc<str>>,
+    /// When the answer was fetched (bounds how long `cname` is trusted).
+    fetched: Instant,
     /// Until when the answer is fresh.
     fresh_until: Instant,
     /// How long the cache keeps the entry (longer than `fresh_until` for optimistic hits).
@@ -217,6 +281,17 @@ pub struct CachedResolver {
     misses: Arc<AtomicU64>,
     /// Whether fastest-address mode may dial the answers directly (off behind an upstream proxy).
     direct_probes: Arc<std::sync::atomic::AtomicBool>,
+    /// `adblock.cname.max_ttl_secs`: how long a canonical name is trusted, live.
+    cname_max_ttl_secs: AtomicU64,
+}
+
+/// Addresses of a name and its canonical name (see [`CachedResolver::resolve_canon`]).
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub addrs: Arc<[IpAddr]>,
+    /// The last CNAME target, when the name is an alias and the answer is younger than the
+    /// CNAME bound.
+    pub canonical: Option<Arc<str>>,
 }
 
 struct Inner {
@@ -245,21 +320,25 @@ impl Inner {
     /// failures are errors, not entries.
     async fn fetch(&self, name: &str) -> Result<Entry, DnsFailure> {
         let cfg = &self.cfg;
-        let mut r = self.backend.lookup(name).await;
+        let mut r = self.backend.lookup_canon(name).await;
         if matches!(&r, Err(f) if f.kind == FailKind::Timeout) {
-            r = self.backend.lookup(name).await;
+            r = self.backend.lookup_canon(name).await;
         }
         let now = Instant::now();
         let neg = |msg: Arc<str>| Entry {
             result: Err(msg),
+            cname: None,
+            fetched: now,
             fresh_until: now + cfg.negative_ttl,
             keep: cfg.negative_ttl,
         };
         match r {
-            Ok((addrs, ttl)) if !addrs.is_empty() => {
+            Ok((addrs, ttl, cname)) if !addrs.is_empty() => {
                 let ttl = ttl.clamp(cfg.min_ttl, cfg.max_ttl);
                 Ok(Entry {
                     result: Ok(addrs.into()),
+                    cname: cname.map(Into::into),
+                    fetched: now,
                     fresh_until: now + ttl,
                     keep: if cfg.optimistic {
                         ttl + OPTIMISTIC_STALE_MAX
@@ -291,7 +370,13 @@ impl CachedResolver {
             lookups: AtomicU64::new(0),
             misses: Arc::new(AtomicU64::new(0)),
             direct_probes: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            cname_max_ttl_secs: AtomicU64::new(600),
         }
+    }
+
+    /// Bound how long a cached canonical name is trusted (`adblock.cname.max_ttl_secs`).
+    pub fn set_cname_max_ttl(&self, secs: u64) {
+        self.cname_max_ttl_secs.store(secs, Ordering::Relaxed);
     }
 
     /// The upstream-DNS engine for `settings` behind the cache.
@@ -373,17 +458,41 @@ impl CachedResolver {
 
     /// Addresses for `name` (cached). Policy is the caller's job.
     pub async fn resolve(&self, name: &str) -> Result<Arc<[IpAddr]>, String> {
+        self.resolve_canon(name).await.map(|r| r.addrs)
+    }
+
+    /// [`Self::resolve`] with the canonical name from the same cached answer: no query beyond
+    /// the one that resolves the name for dialing. The canonical name is dropped once the answer
+    /// is older than the CNAME bound.
+    pub async fn resolve_canon(&self, name: &str) -> Result<Resolved, String> {
+        self.resolve_canon_with(name, true).await
+    }
+
+    /// [`Self::resolve_canon`] for a caller that only peeks (the dial that follows reports a
+    /// failure itself): a failed lookup is not counted as a fault.
+    pub async fn peek_canon(&self, name: &str) -> Result<Resolved, String> {
+        self.resolve_canon_with(name, false).await
+    }
+
+    async fn resolve_canon_with(&self, name: &str, note: bool) -> Result<Resolved, String> {
         self.lookups.fetch_add(1, Ordering::Relaxed);
         let key: Arc<str> = name.trim_end_matches('.').to_ascii_lowercase().into();
         let inner = self.inner.load_full();
+        let max = Duration::from_secs(self.cname_max_ttl_secs.load(Ordering::Relaxed));
+        let shape = |e: Entry| -> Result<Resolved, String> {
+            let canonical = e.cname.filter(|_| e.fetched.elapsed() < max);
+            e.result
+                .map(|addrs| Resolved { addrs, canonical })
+                .map_err(|e| e.to_string())
+        };
         if let Some(e) = inner.cache.get(&key).await {
             if Instant::now() < e.fresh_until {
-                return e.result.map_err(|e| e.to_string());
+                return shape(e);
             }
             // Expired but still held: only optimistic answers (successes) are.
-            if let Ok(a) = &e.result {
+            if e.result.is_ok() {
                 Self::refresh_later(inner.clone(), key.clone(), e.clone());
-                return Ok(a.clone());
+                return shape(e);
             }
             inner.cache.invalidate(&key).await;
         }
@@ -399,10 +508,10 @@ impl CachedResolver {
             })
             .await;
         let out = match entry {
-            Ok(e) => e.result.map_err(|e| e.to_string()),
+            Ok(e) => shape(e),
             Err(f) => Err(f.message.clone()),
         };
-        if out.is_err() {
+        if note && out.is_err() {
             common::faults::note(common::faults::Fault::DnsFailure, name);
         }
         out
@@ -679,6 +788,23 @@ impl Resolver for FallbackBackend {
         })
     }
 
+    fn lookup_canon(&self, name: &str) -> BoxFut<CanonResult> {
+        let first = self.primary.lookup_canon(name);
+        let secondary = self.secondary.clone();
+        let name = name.to_string();
+        Box::pin(async move {
+            match first.await {
+                Err(f) if f.kind == FailKind::NotFound => match secondary.lookup_canon(&name).await
+                {
+                    Ok(r) => Ok(r),
+                    Err(g) if g.kind == FailKind::NotFound => Err(f),
+                    Err(g) => Err(g),
+                },
+                other => other,
+            }
+        })
+    }
+
     fn lookup_ptr(&self, ip: IpAddr) -> BoxFut<Result<Vec<String>, DnsFailure>> {
         self.primary.lookup_ptr(ip)
     }
@@ -729,6 +855,11 @@ fn classify_hickory(e: &hickory_resolver::net::NetError) -> FailKind {
 
 impl Resolver for HickoryBackend {
     fn lookup(&self, name: &str) -> BoxFut<BackendResult> {
+        let f = self.lookup_canon(name);
+        Box::pin(async move { f.await.map(|(a, t, _)| (a, t)) })
+    }
+
+    fn lookup_canon(&self, name: &str) -> BoxFut<CanonResult> {
         let name = name.to_string();
         let resolver = self.resolver.clone();
         Box::pin(async move {
@@ -739,9 +870,13 @@ impl Resolver for HickoryBackend {
                         .await
                         .map_err(|e| DnsFailure::new(classify_hickory(&e), e.to_string()))?;
                     let ttl = l.valid_until().saturating_duration_since(Instant::now());
-                    Ok((l.iter().collect(), ttl))
+                    let canon = canonical_from_records(
+                        &name,
+                        l.as_lookup().answers().iter().map(|r| (&r.name, &r.data)),
+                    );
+                    Ok((l.iter().collect(), ttl, canon))
                 }
-                None => OsBackend.lookup(&name).await,
+                None => OsBackend.lookup(&name).await.map(|(a, t)| (a, t, None)),
             }
         })
     }

@@ -270,6 +270,9 @@ pub struct ProxyConfigResponse {
     /// Stealth Mode.
     #[serde(default)]
     pub stealth: StealthDto,
+    /// CNAME uncloaking.
+    #[serde(default)]
+    pub cname: CnameDto,
     /// Entries kept by the request log (per ring, about 1 KB each).
     #[serde(default = "default_request_log_capacity")]
     pub request_log_capacity: u32,
@@ -507,6 +510,49 @@ pub struct BypassSourceUpdate {
     pub lists_public_key: Option<String>,
 }
 
+/// CNAME uncloaking (uBlock Origin's `cname*` advanced settings): a request that is not blocked is
+/// judged again under the canonical name its host resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CnameDto {
+    pub enabled: bool,
+    /// Canonical names (and their subdomains) never uncloaked; `*` matches everything.
+    pub ignore_list: Vec<String>,
+    pub ignore_first_party: bool,
+    pub ignore_exceptions: bool,
+    pub ignore_root_document: bool,
+    /// Seconds a canonical name is remembered (1 to 86400).
+    pub max_ttl_secs: u64,
+    pub replay_full_url: bool,
+}
+
+impl Default for CnameDto {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ignore_list: Vec::new(),
+            ignore_first_party: true,
+            ignore_exceptions: true,
+            ignore_root_document: true,
+            max_ttl_secs: 600,
+            replay_full_url: false,
+        }
+    }
+}
+
+/// Partial update of [`CnameDto`]; omitted fields keep their value. Applied live.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CnameUpdate {
+    pub enabled: Option<bool>,
+    pub ignore_list: Option<Vec<String>>,
+    pub ignore_first_party: Option<bool>,
+    pub ignore_exceptions: Option<bool>,
+    pub ignore_root_document: Option<bool>,
+    pub max_ttl_secs: Option<u64>,
+    pub replay_full_url: Option<bool>,
+}
+
 /// Stealth Mode settings (AdGuard parity). Off as a whole until `enabled`; each option then
 /// follows its own switch. See the Settings page for what each one does and may break.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,6 +743,8 @@ pub struct UpdateProxyConfigRequest {
     pub guard_service_workers_exempt: Option<Vec<String>>,
     /// Stealth Mode settings; applied live.
     pub stealth: Option<StealthUpdate>,
+    /// CNAME uncloaking settings; applied live.
+    pub cname: Option<CnameUpdate>,
     /// Entries kept by the request log (100 to 500000); applied live, keeping the newest when
     /// it shrinks.
     #[cfg_attr(feature = "server", validate(range(min = 100, max = 500000)))]

@@ -276,6 +276,56 @@ impl ConnectionHandler {
         true
     }
 
+    /// [`Self::host_blocked`] for the canonical name `target.host` resolves to (CNAME
+    /// uncloaking, see [`crate::cname`]): the hostname-level check of a tunnel that is not
+    /// intercepted. A block is recorded with the rule `cname:<canonical>`.
+    async fn host_cname_blocked(&self, target: &ConnectionTarget) -> bool {
+        let ctx = &self.shared.ctx;
+        let host = target.host.to_ascii_lowercase();
+        let Some(cn) = ctx.uncloaked_name(&host, "", false).await else {
+            return false;
+        };
+        let rctx = self
+            .conn
+            .current(ctx.profiles(), ctx.require_device_token());
+        let profile = rctx.profile.load();
+        if !profile.engine.is_enabled() || !rctx.adblock_on() {
+            return false;
+        }
+        let probe = format!("https://{host}/");
+        let first = profile
+            .engine
+            .check_deferred_q(&filter_engine::Query::new(&probe, "", "other"));
+        if first.exception_rule.is_some() && ctx.cname_ignores_exceptions() {
+            return false;
+        }
+        let url = format!("https://{cn}/");
+        let verdict = profile
+            .engine
+            .check_deferred_q(&filter_engine::Query::new(&url, "", "other"));
+        if !verdict.blocked {
+            return false;
+        }
+        let mut logged = verdict;
+        logged.matched_rule = Some(format!("cname:{cn}"));
+        logged.list_id = None;
+        profile.engine.record_verdict_meta(
+            logged,
+            &probe,
+            "",
+            "other",
+            &profile.label,
+            "CONNECT",
+            if rctx.transparent {
+                filter_engine::EventMode::Transparent
+            } else {
+                filter_engine::EventMode::Explicit
+            },
+            Some(filter_engine::EventOutcome::Aborted),
+        );
+        true
+    }
+
     /// Record a CONNECT-level event (opaque tunnel, failed handshake) in the request log.
     fn log_connection(
         &self,
@@ -826,23 +876,26 @@ impl ConnectionHandler {
     {
         let t = **self.shared.timeouts.load();
         let bypass = self.shared.ctx.bypass();
-        match bypass.mode_of(&target.host) {
-            Some(common::bypass::BypassMode::Full) => bypass.note_bypassed(),
-            // No interception, but a host the engine blocks stays blocked.
-            Some(common::bypass::BypassMode::NoDecrypt) if self.host_blocked(target) => {
-                return Err(Error::Connection(format!(
-                    "{} is blocked (host-level rule)",
-                    target.host
-                )));
-            }
-            // Fail-safe: everything is tunnelled, so hostname (SNI) blocking is all that is left.
-            None if bypass.failsafe_active() && self.host_blocked(target) => {
-                return Err(Error::Connection(format!(
-                    "{} is blocked (host-level rule)",
-                    target.host
-                )));
-            }
-            _ => {}
+        let mode = bypass.mode_of(&target.host);
+        if mode == Some(common::bypass::BypassMode::Full) {
+            bypass.note_bypassed();
+        }
+        // No interception (`no_decrypt`), or the fail-safe tunnelling everything: only the host
+        // name is visible, and a host the engine blocks, by its own name or by the canonical name
+        // it resolves to, stays blocked.
+        let failsafe = mode.is_none() && bypass.failsafe_active();
+        let opaque = mode == Some(common::bypass::BypassMode::NoDecrypt) || failsafe;
+        // The canonical name is judged only in the fail-safe: a `no_decrypt` host is one the user
+        // or a list chose to leave alone (banking, health), and a refused CONNECT would take the
+        // whole site down.
+        if opaque
+            && (self.host_blocked(target)
+                || (connect_checks_cname(mode, failsafe) && self.host_cname_blocked(target).await))
+        {
+            return Err(Error::Connection(format!(
+                "{} is blocked (host-level rule)",
+                target.host
+            )));
         }
         // Resolve once, check the policy on the resolved address and connect to exactly that
         // address (DNS rebinding cannot swap it afterwards).
@@ -1434,10 +1487,26 @@ mod io {
     }
 }
 
+/// Whether a tunnel that is not intercepted is also judged by its canonical name: only in the
+/// fail-safe. A `no_decrypt` host was left alone on purpose (banking, health), and a refused
+/// CONNECT would take the whole site down.
+fn connect_checks_cname(mode: Option<common::bypass::BypassMode>, failsafe: bool) -> bool {
+    mode.is_none() && failsafe
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::pin::Pin;
+
+    #[test]
+    fn connect_time_cname_check_is_for_the_failsafe_only() {
+        use common::bypass::BypassMode;
+        assert!(connect_checks_cname(None, true));
+        assert!(!connect_checks_cname(None, false));
+        assert!(!connect_checks_cname(Some(BypassMode::NoDecrypt), true));
+        assert!(!connect_checks_cname(Some(BypassMode::NoDecrypt), false));
+    }
     use std::task::{Context, Poll};
     use tokio::io::ReadBuf;
 

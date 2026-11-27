@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+* CNAME uncloaking, as uBlock Origin does on Firefox. A request that passes the filters is judged
+  again under the canonical name its host resolves to, so `cmp.osano.com` (a CNAME of a
+  CloudFront host EasyPrivacy blocks) is blocked. The name comes from the answer Argus already
+  fetches to connect (no extra lookup) and is cached with the addresses. Skipped, as in uBO, for
+  the page's own host and documents, aliases on the same site, requests an exception rule
+  allowed, and names on the ignore list. Blocks are logged with the rule `cname:<name>` and
+  answered per `block_response`. Opaque tunnels (no-decrypt bypass, fail-safe) are checked by
+  canonical name too. New Settings section "CNAME uncloaking" (`[adblock.cname]` in
+  settings.toml, live): on/off, ignore list, same-site, exceptions, page itself, TTL (uBO's
+  `dnsCacheTTL`, 600 s) and full-URL replay (off). Every default matches uBO's.
+
 ## 0.8.2 — 2026-11-27
 
 * Fresh installs now also enable AdGuard's recommended lists (Base, Tracking Protection, URL

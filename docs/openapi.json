@@ -1364,6 +1364,102 @@
         ],
         "type": "object"
       },
+      "CnameDto": {
+        "description": "CNAME uncloaking (uBlock Origin's `cname*` advanced settings): a request that is not blocked is\njudged again under the canonical name its host resolves to.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "ignore_exceptions": {
+            "type": "boolean"
+          },
+          "ignore_first_party": {
+            "type": "boolean"
+          },
+          "ignore_list": {
+            "description": "Canonical names (and their subdomains) never uncloaked; `*` matches everything.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ignore_root_document": {
+            "type": "boolean"
+          },
+          "max_ttl_secs": {
+            "description": "Seconds a canonical name is remembered (1 to 86400).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replay_full_url": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled",
+          "ignore_list",
+          "ignore_first_party",
+          "ignore_exceptions",
+          "ignore_root_document",
+          "max_ttl_secs",
+          "replay_full_url"
+        ],
+        "type": "object"
+      },
+      "CnameUpdate": {
+        "description": "Partial update of [`CnameDto`]; omitted fields keep their value. Applied live.",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ignore_exceptions": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ignore_first_party": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "ignore_list": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "ignore_root_document": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_ttl_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "replay_full_url": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ConfirmPlanRequest": {
         "description": "Confirm a plan.",
         "properties": {
@@ -4909,6 +5005,10 @@
             "$ref": "#/components/schemas/BypassSourceDto",
             "description": "Source of the signed first-party lists."
           },
+          "cname": {
+            "$ref": "#/components/schemas/CnameDto",
+            "description": "CNAME uncloaking."
+          },
           "connection_timeout_secs": {
             "format": "int64",
             "minimum": 0,
@@ -6799,6 +6899,17 @@
               {
                 "$ref": "#/components/schemas/BypassSourceUpdate",
                 "description": "Source of the signed first-party lists; applied live."
+              }
+            ]
+          },
+          "cname": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CnameUpdate",
+                "description": "CNAME uncloaking settings; applied live."
               }
             ]
           },
