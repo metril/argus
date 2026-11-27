@@ -120,6 +120,9 @@ pub struct ResponseTransforms {
     pub block: Option<String>,
     /// JavaScript from trusted rules (`#%#`, scriptlets, snippets), run before page scripts.
     pub scripts: Vec<String>,
+    /// Scriptlet calls (name, arguments) to resolve against the resource library: uBO code when
+    /// it has the scriptlet, else the page runtime's own implementation.
+    pub scriptlets: Vec<(String, Vec<String>, bool)>,
     /// Procedural CSS for the in-page evaluator: selector and optional style declarations.
     pub procedural: Vec<(String, Option<String>)>,
     /// Content-dependent element removals.
@@ -140,6 +143,7 @@ impl ResponseTransforms {
     pub fn is_empty(&self) -> bool {
         self.block.is_none()
             && self.scripts.is_empty()
+            && self.scriptlets.is_empty()
             && self.procedural.is_empty()
             && self.element_filters.is_empty()
             && self.remove_selectors.is_empty()
@@ -152,6 +156,7 @@ impl ResponseTransforms {
     /// Whether any HTML-body work is requested.
     pub fn touches_html(&self) -> bool {
         !self.scripts.is_empty()
+            || !self.scriptlets.is_empty()
             || !self.procedural.is_empty()
             || !self.element_filters.is_empty()
             || !self.remove_selectors.is_empty()

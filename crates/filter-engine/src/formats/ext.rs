@@ -136,7 +136,11 @@ const ALIASES: &[(&str, &str)] = &[
     ("adjust-setTimeout", "nano-setTimeout-booster"),
     ("close-window", "close-window"),
     ("disable-newtab-links", "disable-newtab-links"),
+    ("evaldata-prune", "evaldata-prune"),
+    ("href-sanitizer", "href-sanitizer"),
     ("json-prune", "json-prune"),
+    ("json-prune-fetch-response", "json-prune-fetch-response"),
+    ("json-prune-xhr-response", "json-prune-xhr-response"),
     ("log-addEventListener", "addEventListener-logger"),
     ("log-eval", "log-eval"),
     ("log-on-stack-trace", "log-on-stack-trace"),
@@ -144,7 +148,12 @@ const ALIASES: &[(&str, &str)] = &[
     ("no-topics", "no-topics"),
     ("nowebrtc", "nowebrtc"),
     ("prevent-addEventListener", "addEventListener-defuser"),
+    ("prevent-bab", "prevent-bab"),
+    ("prevent-canvas", "prevent-canvas"),
+    ("prevent-clipboard-write", "prevent-clipboard-write"),
     ("prevent-eval-if", "noeval-if"),
+    ("prevent-innerHTML", "prevent-innerHTML"),
+    ("prevent-navigation", "prevent-navigation"),
     ("prevent-fetch", "no-fetch-if"),
     ("prevent-refresh", "refresh-defuser"),
     (
@@ -167,6 +176,25 @@ const ALIASES: &[(&str, &str)] = &[
     ("set-session-storage-item", "set-session-storage-item"),
     ("spoof-css", "spoof-css"),
     ("trusted-click-element", "trusted-click-element"),
+    ("trusted-json-edit", "trusted-json-edit"),
+    (
+        "trusted-json-edit-fetch-response",
+        "trusted-json-edit-fetch-response",
+    ),
+    (
+        "trusted-json-edit-xhr-response",
+        "trusted-json-edit-xhr-response",
+    ),
+    (
+        "trusted-prune-inbound-object",
+        "trusted-prune-inbound-object",
+    ),
+    ("trusted-replace-argument", "trusted-replace-argument"),
+    ("trusted-replace-node-text", "trusted-replace-node-text"),
+    (
+        "trusted-replace-outbound-text",
+        "trusted-replace-outbound-text",
+    ),
     (
         "trusted-replace-fetch-response",
         "trusted-replace-fetch-response",
@@ -175,10 +203,21 @@ const ALIASES: &[(&str, &str)] = &[
         "trusted-replace-xhr-response",
         "trusted-replace-xhr-response",
     ),
+    ("trusted-set-attr", "trusted-set-attr"),
+    ("trusted-set-constant", "trusted-set-constant"),
     ("trusted-set-cookie", "trusted-set-cookie"),
+    ("trusted-set-cookie-reload", "trusted-set-cookie-reload"),
     (
         "trusted-set-local-storage-item",
         "trusted-set-local-storage-item",
+    ),
+    (
+        "trusted-set-session-storage-item",
+        "trusted-set-session-storage-item",
+    ),
+    (
+        "trusted-suppress-native-method",
+        "trusted-suppress-native-method",
     ),
     ("xml-prune", "xml-prune"),
 ];
@@ -188,7 +227,16 @@ pub fn scriptlet_alias_table() -> &'static [(&'static str, &'static str)] {
     ALIASES
 }
 
-pub(crate) fn ubo_scriptlet_name(adguard: &str) -> Option<&'static str> {
-    let n = adguard.trim_end_matches(".js");
-    ALIASES.iter().find(|(a, _)| *a == n).map(|(_, u)| *u)
+/// uBO scriptlet name for an AdGuard one. `ubo-<name>[.js]` is AdGuard's compatibility prefix
+/// for uBO's own names and goes through unprefixed. `None` for AdGuard scriptlets uBO has no
+/// equivalent of: the page runtime (`assets/natives.js`) implements those.
+pub(crate) fn ubo_scriptlet_name(adguard: &str) -> Option<std::borrow::Cow<'static, str>> {
+    let n = adguard.trim().trim_end_matches(".js");
+    if let Some(u) = n.strip_prefix("ubo-").filter(|u| !u.is_empty()) {
+        return Some(std::borrow::Cow::Owned(u.to_string()));
+    }
+    ALIASES
+        .iter()
+        .find(|(a, _)| *a == n)
+        .map(|(_, u)| std::borrow::Cow::Borrowed(*u))
 }

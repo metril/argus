@@ -546,13 +546,37 @@ fn split_args(s: &str) -> Vec<String> {
     args
 }
 
+/// `remove: true` (any spacing, case, trailing `;`): AdGuard's "remove the element" declaration.
+fn is_remove_decl(style: &str) -> bool {
+    let n: String = style
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ';')
+        .collect();
+    n.eq_ignore_ascii_case("remove:true")
+}
+
+/// The selector of `sel:style(remove: true)`, or `None` for any other body.
+fn remove_form(body: &str) -> Option<&str> {
+    let b = body.trim_end();
+    let i = b.rfind(":style(")?;
+    let inner = b[i + 7..].strip_suffix(')')?;
+    (is_remove_decl(inner) && !b[..i].trim().is_empty()).then(|| b[..i].trim_end())
+}
+
 fn cosmetic_rule(t: &str, c: &Cosmetic<'_>) -> Rule {
     let exception = c.sep.starts_with("#@");
     let ext = |k: ExtKind| Rule::Ext(ExtRule::new(k, t));
     match c.sep {
         "$$" => ext(ExtKind::HtmlFilter),
         "##" | "#@#" if c.body.starts_with('^') => ext(ExtKind::HtmlFilter),
-        "##" | "#@#" | "#?#" | "#@?#" => Rule::Emit(vec![t.to_string()], false),
+        "##" | "#@#" | "#?#" | "#@?#" => match remove_form(c.body) {
+            // `sel:style(remove: true)` is the remove action, not a style declaration.
+            Some(sel) => Rule::Emit(
+                vec![format!("{}{}{sel}:remove()", c.domains, c.sep)],
+                true,
+            ),
+            None => Rule::Emit(vec![t.to_string()], false),
+        },
         "#$#" | "#@$#" | "#$?#" | "#@$?#" => {
             let body = c.body.trim();
             match (body.find('{'), body.ends_with('}')) {
@@ -560,10 +584,12 @@ fn cosmetic_rule(t: &str, c: &Cosmetic<'_>) -> Rule {
                     let sel = body[..open].trim();
                     let style = body[open + 1..body.len() - 1].trim().trim_end_matches(';');
                     let sep = if exception { "#@#" } else { "##" };
-                    Rule::Emit(
-                        vec![format!("{}{sep}{sel}:style({style})", c.domains)],
-                        true,
-                    )
+                    let action = if is_remove_decl(style) {
+                        ":remove()".to_string()
+                    } else {
+                        format!(":style({style})")
+                    };
+                    Rule::Emit(vec![format!("{}{sep}{sel}{action}", c.domains)], true)
                 }
                 _ => ext(ExtKind::Snippet),
             }

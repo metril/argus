@@ -364,7 +364,15 @@ e2e_test!(
         env.origin
             .route("/sw.js", MockResponse::ok("// real worker"));
         env.origin.route("/", MockResponse::html(PAGE));
-        // Opt-in: off by default, documents are exactly what they were without the feature.
+        // On by default: the worker script is the no-op one.
+        assert!(sw_script(&env, "app.test")
+            .await
+            .text()
+            .await
+            .unwrap()
+            .contains("registration.unregister"));
+        // Off: documents are exactly what they were without the feature.
+        env.proxy.ctx.set_guard_service_workers(false);
         assert_eq!(
             sw_script(&env, "app.test").await.text().await.unwrap(),
             "// real worker"
@@ -388,7 +396,7 @@ e2e_test!(
         );
         assert!(env.origin.requests_for("/sw.js").len() == 1);
         let shim = logged_with(&env, "/sw.js", "service worker neutralised");
-        assert_eq!(shim.len(), 1, "{shim:?}");
+        assert_eq!(shim.len(), 2, "{shim:?}");
         assert_eq!(shim[0].status, Some(200));
         // Documents get the boot script with the unregister flag.
         let html = get_as(&env, &env.origin.https_url("app.test", "/"), "document")

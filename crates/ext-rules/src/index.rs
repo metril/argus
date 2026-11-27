@@ -128,14 +128,14 @@ fn needs_trust(r: &ParsedRule) -> bool {
     if let Action::Permissions(v) = &r.action {
         return !r.exception && !crate::permissions::is_restrictive(v);
     }
+    // Scriptlets are gated where they are resolved, by the resource's own trust requirement
+    // (the rule's `trusted` flag travels with the injection); never by name, aliases exist.
     !r.exception
         && matches!(
             r.action,
             Action::Replace(_)
                 | Action::UrlTransform(_)
-                | Action::Inject(
-                    Injection::Script(_) | Injection::Scriptlet { .. } | Injection::Snippet(_)
-                )
+                | Action::Inject(Injection::Script(_) | Injection::Snippet(_))
         )
 }
 

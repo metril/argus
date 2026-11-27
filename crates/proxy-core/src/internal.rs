@@ -39,12 +39,16 @@ const SCRIPTLET_CACHE: u64 = 2048;
 
 /// The boot script: the procedural engine (`procedural.js`) and the boot logic (`boot.js`) in one
 /// function scope, so neither leaks a global into the page.
+/// The page runs `argusBoot()`; friendly frames get the function's own source with their
+/// arguments filled in (see `boot.js`).
 const BOOT_JS: &str = concat!(
-    "(function(){\n",
+    "(function(){\nfunction argusBoot(cfg0,nonce0,base0,css0){\n",
     include_str!("../assets/procedural.js"),
     "\n",
+    include_str!("../assets/natives.js"),
+    "\n",
     include_str!("../assets/boot.js"),
-    "\n})();\n"
+    "\n}\nargusBoot();\n})();\n"
 );
 
 static BOOT: LazyLock<(String, String)> = LazyLock::new(|| {
@@ -99,6 +103,85 @@ fn short_hash(data: &[u8]) -> String {
     d[..12].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Write `data` to `path` readable by the owner only (atomically: temp file, then rename).
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp{:x}", rand::random::<u32>()));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+fn parse_key(t: &str) -> Option<[u8; 32]> {
+    let t = t.trim();
+    if t.len() != 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (i, b) in key.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&t[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(key)
+}
+
+/// The 32-byte HMAC key stored (hex) at `path`: read when valid, else generated once and written
+/// with mode 0600 (an existing file with looser permissions is tightened).
+pub(crate) fn load_or_create_key(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if let Some(key) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| parse_key(&t))
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        return Ok(key);
+    }
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    match write_private(path, hex.as_bytes()) {
+        Ok(()) => Ok(key),
+        Err(e) => std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| parse_key(&t))
+            .ok_or(e),
+    }
+}
+
+/// Delete files in `dir` not modified for `max_age` (best effort).
+fn prune_dir(dir: &std::path::Path, max_age: Duration) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|a| a > max_age);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 64];
     k[..key.len().min(64)].copy_from_slice(&key[..key.len().min(64)]);
@@ -129,6 +212,9 @@ fn now_secs() -> u64 {
 /// State behind the internal endpoints: the token key and the scriptlet bundles by hash.
 pub struct Internal {
     key: [u8; 32],
+    /// Where generated scriptlet bundles are kept so HTML cached by the browser keeps working
+    /// across restarts (the URLs are keyed hashes, stable while the key is).
+    scriptlet_dir: Option<std::path::PathBuf>,
     scriptlets: moka::sync::Cache<String, Arc<str>>,
     unsupported: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
     /// Userscript delivery and backend state.
@@ -156,8 +242,34 @@ impl Internal {
     pub fn new() -> Self {
         let mut key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut key);
+        Self::from_key(key, None)
+    }
+
+    /// Like [`Self::new`], with the HMAC key kept in `dir` (generated once, mode 0600) so page
+    /// tokens and scriptlet-bundle URLs stay valid across restarts: open tabs keep their beacon,
+    /// cached HTML keeps its scripts. Falls back to a random per-process key when the directory
+    /// cannot be used.
+    pub fn with_state_dir(dir: &std::path::Path) -> Self {
+        match load_or_create_key(&dir.join("internal.key")) {
+            Ok(key) => {
+                let sdir = dir.join("scriptlets");
+                let ok = std::fs::create_dir_all(&sdir).is_ok();
+                if ok {
+                    prune_dir(&sdir, Duration::from_secs(30 * 24 * 3600));
+                }
+                Self::from_key(key, ok.then_some(sdir))
+            }
+            Err(e) => {
+                tracing::warn!("internal key not persisted ({e}); tokens end with this process");
+                Self::new()
+            }
+        }
+    }
+
+    fn from_key(key: [u8; 32], scriptlet_dir: Option<std::path::PathBuf>) -> Self {
         Self {
             key,
+            scriptlet_dir,
             scriptlets: moka::sync::Cache::builder()
                 .max_capacity(SCRIPTLET_CACHE)
                 .time_to_idle(Duration::from_secs(3600))
@@ -377,8 +489,28 @@ impl Internal {
             .collect();
         if !self.scriptlets.contains_key(&hash) {
             self.scriptlets.insert(hash.clone(), Arc::from(code));
+            if let Some(dir) = &self.scriptlet_dir {
+                let f = dir.join(format!("{hash}.js"));
+                if !f.exists() {
+                    let _ = write_private(&f, code.as_bytes());
+                }
+            }
         }
         format!("{}s/{hash}.js", crate::csp::INTERNAL_PREFIX)
+    }
+
+    /// A bundle from an earlier run (the URL's hash is a keyed MAC of its content, so a file
+    /// under that name is the bundle); only well-formed hashes ever touch the filesystem.
+    fn stored_scriptlet(&self, hash: &str) -> Option<Bytes> {
+        if hash.len() != 24 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let code = std::fs::read(self.scriptlet_dir.as_ref()?.join(format!("{hash}.js"))).ok()?;
+        let mac: String = hmac_sha256(&self.key, &code)[..12]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        (mac == hash.to_ascii_lowercase()).then(|| Bytes::from(code))
     }
 
     /// Count one "unsupported scriptlet <name>" report (names bounded in number and length).
@@ -479,6 +611,7 @@ impl Internal {
             self.scriptlets
                 .get(h)
                 .map(|code| (Bytes::copy_from_slice(code.as_bytes()), "immutable"))
+                .or_else(|| self.stored_scriptlet(h).map(|b| (b, "immutable")))
         } else {
             None
         };
@@ -776,6 +909,114 @@ mod tests {
         assert_ne!(a.put_scriptlet("a()"), b.put_scriptlet("a()"));
         let unkeyed = format!("{}s/{}.js", crate::csp::INTERNAL_PREFIX, short_hash(b"a()"));
         assert_ne!(a.put_scriptlet("a()"), unkeyed);
+    }
+
+    #[test]
+    fn key_is_generated_once_private_and_reused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("sub/internal.key");
+        let a = load_or_create_key(&f).unwrap();
+        assert_eq!(load_or_create_key(&f).unwrap(), a, "reused, not regenerated");
+        assert_ne!(a, [0u8; 32]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+            // A file left world-readable is tightened, and keeps its key.
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(load_or_create_key(&f).unwrap(), a);
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // A damaged file is replaced by a fresh key.
+        std::fs::write(&f, "not a key").unwrap();
+        let b = load_or_create_key(&f).unwrap();
+        assert_ne!(b, a);
+        assert_eq!(load_or_create_key(&f).unwrap(), b);
+    }
+
+    #[test]
+    fn tokens_and_bundles_survive_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let first = Internal::with_state_dir(d.path());
+        let tok = first.token_for("x.test");
+        let doc = first.doc_token("x.test");
+        let path = first.put_scriptlet("window.a=1;");
+        drop(first);
+        let second = Internal::with_state_dir(d.path());
+        assert!(second.token_valid(&tok, "x.test"));
+        assert!(second.doc_token_valid(&doc, "x.test").is_some());
+        assert!(!second.token_valid(&tok, "y.test"));
+        assert_eq!(second.put_scriptlet("window.a=1;"), path, "same URL after restart");
+        // The bundle itself comes back from disk when memory has none.
+        let third = Internal::with_state_dir(d.path());
+        let hash = path.rsplit('/').next().unwrap().trim_end_matches(".js");
+        assert_eq!(third.stored_scriptlet(hash).unwrap(), "window.a=1;");
+        // Without a state dir every process has its own key.
+        assert!(!Internal::new().token_valid(&tok, "x.test"));
+    }
+
+    #[test]
+    fn stored_bundles_are_checked_before_serving() {
+        let d = tempfile::tempdir().unwrap();
+        let i = Internal::with_state_dir(d.path());
+        let path = i.put_scriptlet("good()");
+        let hash = path.rsplit('/').next().unwrap().trim_end_matches(".js").to_string();
+        let file = d.path().join("scriptlets").join(format!("{hash}.js"));
+        std::fs::write(&file, "evil()").unwrap();
+        assert!(i.stored_scriptlet(&hash).is_none(), "content must match its keyed hash");
+        for bad in ["../internal.key", "..%2f", "short", &"g".repeat(24), &"a".repeat(25)] {
+            assert!(i.stored_scriptlet(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unusable_state_dir_falls_back_to_a_process_key() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        // A directory path that is a file: nothing can be created under it.
+        let i = Internal::with_state_dir(&file);
+        assert!(i.token_valid(&i.token_for("a.test"), "a.test"));
+    }
+
+    #[test]
+    fn boot_function_is_self_contained_and_carries_every_adguard_only_scriptlet() {
+        assert!(BOOT_JS.contains("function argusBoot(cfg0,nonce0,base0,css0)"));
+        assert!(BOOT_JS.contains("\nargusBoot();\n"));
+        // Every scriptlet the alias table has no uBO name for is implemented in the page runtime.
+        let table: std::collections::HashSet<&str> = filter_engine::formats::scriptlet_alias_table()
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
+        for name in [
+            "debug-current-inline-script",
+            "debug-on-property-read",
+            "debug-on-property-write",
+            "dir-string",
+            "google-ima3",
+            "hide-in-shadow-dom",
+            "log",
+            "metrika-yandex-archive",
+            "metrika-yandex-tag",
+            "no-floc",
+            "no-protected-audience",
+            "noeval",
+            "prevent-adfly",
+            "prevent-element-src-loading",
+            "prevent-fab-3.2.0",
+            "prevent-popads-net",
+            "prevent-textContent",
+            "remove-in-shadow-dom",
+            "set-popads-dummy",
+            "trusted-create-element",
+            "trusted-dispatch-event",
+        ] {
+            assert!(!table.contains(name), "{name} has a uBO name; drop the native");
+            assert!(
+                BOOT_JS.contains(&format!("'{name}':")),
+                "{name} is neither aliased nor implemented"
+            );
+        }
     }
 
     #[test]

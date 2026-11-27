@@ -310,6 +310,13 @@ impl TransformSource for ExtTransformSource {
                 ext_rules::Injection::ProceduralCss { selector, style } => {
                     t.procedural.push((selector.clone(), style.clone()));
                 }
+                ext_rules::Injection::Scriptlet {
+                    name,
+                    args,
+                    trusted,
+                } => {
+                    t.scriptlets.push((name.clone(), args.clone(), *trusted));
+                }
                 other => {
                     if let Some(js) = other.script_body() {
                         t.scripts.push(js);

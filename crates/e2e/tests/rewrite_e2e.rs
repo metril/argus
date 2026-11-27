@@ -697,7 +697,7 @@ e2e_test!(
             .unwrap()
             .starts_with("text/javascript"));
         let js = body_text(r).await;
-        assert!(js.contains("__abBoot") && !js.contains("evil"));
+        assert!(js.contains("argus.boot") && !js.contains("evil"));
 
         // A stale or invented hash is not served; nothing is reflected.
         for p in [

@@ -1,6 +1,7 @@
 import { cachedLookup, clearCache, getSettings, hostOf, type Interception, type Lookup } from '../lib/api';
 import { signOutInBackground } from '../lib/auth';
 import { Bridge } from '../lib/bridge';
+import { FriendlyFrames } from '../lib/friendly-frames';
 import { onStorageChanged } from '../lib/changes';
 import { respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
@@ -46,7 +47,7 @@ export default defineBackground(() => {
   const firefox = typeof (browser as any).contextualIdentities !== 'undefined' || /Firefox\//.test(navigator.userAgent);
   const argusHost = async () => { try { return new URL((await getSettings()).argusUrl).hostname; } catch { return ''; } };
   const proxy: ProxyController = new ProxyController({ browser, firefox, argusHost, onStatus: () => void refreshBadges() });
-  const bridge = new Bridge({ WebSocketCtor: WebSocket, browser, getSettings, proxy, storeRelay: new StoreRelay(browser) });
+  const bridge = new Bridge({ WebSocketCtor: WebSocket, browser, getSettings, proxy, storeRelay: new StoreRelay(browser), frames: new FriendlyFrames(browser) });
   void proxy.init().then(() => bridge.connect());
   const b: any = browser;
   if (firefox && b.proxy?.onRequest) {

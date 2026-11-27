@@ -244,7 +244,7 @@ allowed_fetch_destinations = []   # e.g. ["192.168.1.0/24", "nas.lan"]
 build_threads = 0               # list-build pool threads (parse/compile on a rebuild, low priority); 0 = half the cores
 recent_blocked_keep_query = false # strip query strings from the recent-blocked list (they can hold tokens)
 request_log_capacity = 1000 # request-log entries per ring (100 to 500000, about 1 KB each); live in Settings
-respect_no_transform = true # skip body rewriting when the origin sends Cache-Control: no-transform
+respect_no_transform = false # true: skip body rewriting when the origin sends Cache-Control: no-transform
 
 [userscripts]
 enabled = true
@@ -389,8 +389,8 @@ document, `$replace` runs on the decoded text, and the HTML stages (content-depe
 `##^`, cosmetic and script injection) see its result; non-HTML bodies go decode, transform
 (`$replace`, `$jsonprune`, `$xmlprune`, `$hls`, in list order), re-encode. Bodies over a
 transform's cap (or documents over 4 MiB when buffering is needed) pass through untouched and are
-counted. `Cache-Control: no-transform` skips all body work (header edits still apply) unless
-`adblock.respect_no_transform = false`. Documents are recognised from `Sec-Fetch-Dest`, else from
+counted. By default `Cache-Control: no-transform` is ignored (many CDNs send it on everything); with
+`adblock.respect_no_transform = true` it skips all body work (header edits still apply). Documents are recognised from `Sec-Fetch-Dest`, else from
 `Sec-Fetch-Mode: navigate`, `Upgrade-Insecure-Requests: 1` or an `Accept` listing `text/html`.
 
 ## AdGuard Filter Syntax

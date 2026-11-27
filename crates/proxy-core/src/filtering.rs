@@ -221,6 +221,13 @@ fn document_excepted(engine: &filter_engine::SharedEngine, url: &str) -> bool {
     engine.document_excepted(url).0
 }
 
+/// Scriptlet names that run arbitrary code and so need a trusted list (also via `ubo-`).
+fn is_trusted_name(name: &str) -> bool {
+    name.strip_prefix("ubo-")
+        .unwrap_or(name)
+        .starts_with("trusted-")
+}
+
 /// AdGuard's `#$?#sel { remove: true }`: the style block that means "remove the element".
 fn is_remove_style(style: &str) -> bool {
     let n: String = style
@@ -363,8 +370,8 @@ impl ProxyContext {
             resolve_all_to: None,
             internal: Arc::new(Internal::new()),
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
-            respect_no_transform: std::sync::atomic::AtomicBool::new(true),
-            guard_service_workers: std::sync::atomic::AtomicBool::new(false),
+            respect_no_transform: std::sync::atomic::AtomicBool::new(false),
+            guard_service_workers: std::sync::atomic::AtomicBool::new(true),
             guard_exempt: ArcSwap::from_pointee(Vec::new()),
             stealth: Arc::default(),
             certs: Default::default(),
@@ -512,6 +519,14 @@ impl ProxyContext {
         ctx.certs = opts.certs.clone();
         ctx.prober = Some(Arc::new(crate::upstream::CertProber::new(opts)?));
         Ok(ctx)
+    }
+
+    /// Keep the page-token key (and generated scriptlet bundles) under `dir`, so open tabs and
+    /// cached HTML still work after a restart. Call before the context is shared.
+    #[must_use]
+    pub fn with_state_dir(mut self, dir: &std::path::Path) -> Self {
+        self.internal = Arc::new(Internal::with_state_dir(dir));
+        self
     }
 
     /// The live trusted root set, or a fresh compiled-in set with `extra_ca_paths` for a context
@@ -1827,6 +1842,7 @@ impl ProxyContext {
                     != 0
                 {
                     transforms.scripts.clear();
+                    transforms.scriptlets.clear();
                 }
                 if let Some(js) = &stealth_js {
                     // Runs first, before any page script (the scriptlet slot).
@@ -1843,6 +1859,31 @@ impl ProxyContext {
                         serde_json::json!({"selector": [{"type": "css-selector", "arg": selector}], "action": action})
                             .to_string(),
                     );
+                }
+                // Scriptlet calls from extended rules (generic `##+js()`, AdGuard-only ones): the
+                // resource library's code when it has the scriptlet, else the page runtime's own.
+                for (name, args, trusted) in std::mem::take(&mut transforms.scriptlets) {
+                    let code = rctx
+                        .profile
+                        .load()
+                        .engine
+                        .scriptlet_script(&name, &args, trusted);
+                    match code {
+                        Some(js) => {
+                            cos.injected_script.push('\n');
+                            cos.injected_script.push_str(&js);
+                        }
+                        // The page runtime's own `trusted-*` ones need a trusted list too.
+                        None if !trusted && is_trusted_name(&name) => {}
+                        None => transforms.scripts.extend(
+                            ext_rules::Injection::Scriptlet {
+                                name,
+                                args,
+                                trusted,
+                            }
+                            .script_body(),
+                        ),
+                    }
                 }
                 let ext_script = transforms.scripts.join(";\n");
                 // Userscripts: matched against the profile's index (one atomic load and an

@@ -545,14 +545,14 @@ pub struct AdblockSettings {
     /// Leave response bodies alone when the origin sends `Cache-Control: no-transform`
     /// (header-only edits still apply). Many CDNs set it on everything; turn this off to rewrite
     /// those pages anyway.
-    #[serde(default = "default_true")]
-    pub respect_no_transform: bool,
-    /// Opt in: keep service workers from serving documents without Argus's injection. On filtered
-    /// sites a worker script is answered with a self-unregistering no-op worker and existing
-    /// workers are unregistered by the page, so offline apps and push notifications stop working
-    /// there. Full-bypass hosts, `guard_service_workers_exempt` hosts and sites with blocking off
-    /// (or a `@@$document` / `$elemhide` / `$jsinject` exception) are never touched.
     #[serde(default)]
+    pub respect_no_transform: bool,
+    /// On by default: keep service workers from serving documents without Argus's injection. On
+    /// filtered sites a worker script is answered with a self-unregistering no-op worker and
+    /// existing workers are unregistered by the page, so offline apps and push notifications stop
+    /// working there. Full-bypass hosts, `guard_service_workers_exempt` hosts and sites with
+    /// blocking off (or a `@@$document` / `$elemhide` / `$jsinject` exception) are never touched.
+    #[serde(default = "default_true")]
     pub guard_service_workers: bool,
     /// Hosts (exact, or `*.suffix` for subdomains) the service-worker guard leaves alone.
     #[serde(default)]
@@ -635,8 +635,8 @@ impl Default for AdblockSettings {
             allowed_fetch_destinations: Vec::new(),
             recent_blocked_keep_query: false,
             request_log_capacity: default_request_log_capacity(),
-            respect_no_transform: true,
-            guard_service_workers: false,
+            respect_no_transform: false,
+            guard_service_workers: true,
             guard_service_workers_exempt: Vec::new(),
         }
     }

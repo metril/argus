@@ -339,7 +339,11 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             );
             head.has_script = true;
         }
+        // The boot script also carries the page's work into about:blank / srcdoc / blob: frames
+        // (never fetched through the proxy), so anything it could carry needs it.
+        let frames = scriptlet.is_some() || !plain.is_empty() || !spec.ext_script.is_empty();
         if observer
+            || frames
             || !proc_items.is_empty()
             || !spec.ext_script.is_empty()
             || spec.panel.is_some()
@@ -350,6 +354,9 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
                 "o": observer,
                 "t": spec.internal.token_for(spec.host),
             });
+            if frames || !proc_items.is_empty() || observer {
+                cfg["f"] = serde_json::Value::from(1);
+            }
             if spec.unregister_sw {
                 cfg["sw"] = serde_json::Value::from(1);
             }
@@ -367,7 +374,7 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
             head.has_script = true;
             head.observer = observer;
             if !spec.ext_script.is_empty() {
-                let path = spec.internal.put_scriptlet(spec.ext_script);
+                let path = spec.internal.put_scriptlet(&wrap_ext_script(spec.ext_script));
                 let _ = write!(
                     head.html,
                     "<script src=\"{path}\" nonce=\"{nonce}\"></script>"
@@ -406,8 +413,25 @@ pub fn build_head(spec: &PageSpec<'_>) -> PageHead {
 /// `scriptletGlobals` (state shared by the page's scriptlets; `safeSelf` and others read it and
 /// throw without it). The scope also keeps the helper functions (`safeSelf`, `setConstant`, ...)
 /// off the page's global object.
+///
+/// The bundle is a function the boot script can hand to friendly frames (about:blank, srcdoc,
+/// blob:): it is exposed as `__argusRuntime.sl` before it runs.
+/// The page runtime object, made fresh when `window.__argusRuntime` is anything but a plain
+/// object (markup can clobber it with an element or collection it controls).
+const RT_JS: &str = "(function(){var r=self.__argusRuntime;return Object.prototype.toString.call(r)==='[object Object]'?r:(self.__argusRuntime={});})()";
+
 fn wrap_scriptlets(js: &str) -> String {
-    format!("(function(){{\nconst scriptletGlobals = {{}};\n{js}\n}})();")
+    format!(
+        "(function(){{\nvar sl=function(){{\nconst scriptletGlobals = {{}};\n{js}\n}};\n\
+try{{{RT_JS}.sl=sl;}}catch(e){{}}\nsl();\n}})();"
+    )
+}
+
+/// The extended-rule script, run as is (global scope, as AdGuard's `#%#` rules expect), with
+/// its text exposed as `__argusRuntime.xs` so friendly frames can run it too.
+fn wrap_ext_script(js: &str) -> String {
+    let text = json_ascii(&serde_json::Value::from(js).to_string());
+    format!("try{{{RT_JS}.xs={text};}}catch(e){{}}\n{js}")
 }
 
 #[cfg(test)]
@@ -506,6 +530,51 @@ mod tests {
             .contains(&format!("src=\"{}\" nonce=\"NONCE\"", boot_path())));
         assert!(h.has_style && h.has_script && h.observer);
         assert!(h.html.is_ascii());
+    }
+
+    #[test]
+    fn anything_a_frame_could_need_loads_the_boot_with_the_frames_flag() {
+        let i = Internal::new();
+        // Plain hides alone (no observer, no procedural items): the boot still loads, to carry
+        // them into about:blank / srcdoc / blob: frames.
+        let cos = Cosmetics {
+            hide_selectors: vec![".ad".into()],
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(h.contains(&format!("src=\"{}\"", boot_path())), "{h}");
+        assert!(h.contains("\"f\":1"), "{h}");
+        // Scriptlets too, and the extended-rule script.
+        let cos = Cosmetics {
+            injected_script: "a();".into(),
+            generichide: true,
+            ..Default::default()
+        };
+        let h = build_head(&spec(&cos, &i)).html;
+        assert!(h.contains(&format!("src=\"{}\"", boot_path())) && h.contains("\"f\":1"));
+        let cos = Cosmetics::default();
+        let mut s = spec(&cos, &i);
+        s.ext_script = "b();";
+        let h = build_head(&s).html;
+        assert!(h.contains("\"f\":1"));
+        // Nothing to carry: nothing loads.
+        let cos = Cosmetics {
+            generichide: true,
+            ..Default::default()
+        };
+        assert!(build_head(&spec(&cos, &i)).html.is_empty());
+    }
+
+    #[test]
+    fn bundles_expose_their_text_for_friendly_frames() {
+        let w = wrap_scriptlets("a();");
+        assert!(w.contains("var sl=function(){") && w.contains(".sl=sl;") && w.contains("sl();"));
+        // Exposed before it runs, so a throwing scriptlet still reaches frames.
+        assert!(w.find(".sl=sl;") < w.find("\nsl();"));
+        let x = wrap_ext_script("window.q = \"</script>\";");
+        assert!(x.ends_with("window.q = \"</script>\";"), "runs as is, in global scope");
+        assert!(x.contains(".xs=\"window.q = \\\"\\u003c/script\\u003e\\\";\";"), "{x}");
     }
 
     #[test]

@@ -69,11 +69,14 @@ async fn main() -> Result<()> {
             dns.clone(),
         )));
     }
-    let ctx = Arc::new(ProxyContext::with_upstream(
-        shared_engine.clone(),
-        &upstream_opts,
-        config.adblock.enabled,
-    )?);
+    let ctx = Arc::new(
+        ProxyContext::with_upstream(
+            shared_engine.clone(),
+            &upstream_opts,
+            config.adblock.enabled,
+        )?
+        .with_state_dir(&config.adblock.data_dir),
+    );
 
     ctx.set_respect_no_transform(config.adblock.respect_no_transform);
     ctx.set_guard_service_workers(config.adblock.guard_service_workers);

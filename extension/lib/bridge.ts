@@ -15,6 +15,8 @@ export interface BridgeDeps {
   proxy?: ProxyController;
   /** Relays for non-default cookie stores (Firefox containers, private windows). */
   storeRelay?: StoreRelay;
+  /** Content script for about:blank / srcdoc / blob: frames, present while connected. */
+  frames?: { sync(connected: boolean): Promise<void> };
 }
 
 const MAX_JOBS = 8;
@@ -104,6 +106,7 @@ export class Bridge {
     if (ws && closeSocket) { try { ws.close(); } catch { /* ignore */ } }
     // Disconnected: the proxy setting stays (fail closed) and the last sid is kept to resume.
     await this.d.proxy?.setSid(null);
+    await this.d.frames?.sync(false);
   }
 
   private async onClose() {
@@ -149,6 +152,7 @@ export class Bridge {
         this.sid = m.sid;
         this.backoff = 1000;
         await this.d.proxy?.setSid(m.sid);
+        void this.d.frames?.sync(true);
         this.pingTimer = setInterval(() => { try { this.ws?.send('{"t":"ping"}'); } catch { /* ignore */ } }, PING_MS);
         await this.sendPerms();
       } else if (m?.t === 'proxy' && this.sid) {

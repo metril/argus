@@ -515,7 +515,7 @@ fn untrusted_code_rules_are_dropped_and_counted() {
         "||s.example^$replace=/a/b/",
         "||s.example/*$urltransform=/a/b/",
         "s.example#%#x()",
-        "s.example#%#//scriptlet('n')",
+        "s.example#%#//scriptlet('trusted-set-cookie', 'a', 'b')",
         "s.example#$#log hi",
         "s.example##^script",
         "||s.example^$jsonprune=\\$.x",

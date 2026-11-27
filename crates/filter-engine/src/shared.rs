@@ -93,6 +93,9 @@ pub struct SharedEngine {
     resources: ArcSwap<Vec<Resource>>,
     /// What the last [`Self::set_resources_from_json`] kept and dropped.
     resource_report: ArcSwap<ResourceReport>,
+    /// Generated scriptlet code per call (empty when the library has no such scriptlet); cleared
+    /// whenever the library changes. See [`Self::scriptlet_script`].
+    scriptlet_cache: Mutex<std::collections::HashMap<String, Arc<str>>>,
     /// Serializes writers (install / resource load); never taken on the request path.
     write_lock: Mutex<()>,
     /// Shared, thread-safe blocking statistics.
@@ -274,6 +277,7 @@ impl SharedEngine {
             enabled,
             resources: ArcSwap::new(Arc::new(Vec::new())),
             resource_report: ArcSwap::new(Arc::new(ResourceReport::default())),
+            scriptlet_cache: Mutex::default(),
             write_lock: Mutex::new(()),
             stats,
         }
@@ -307,6 +311,10 @@ impl SharedEngine {
             dropped: v.dropped,
         }));
         self.resources.store(Arc::new(resources));
+        self.scriptlet_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let cur = self.engine.load_full();
         crate::reaper::retire(self.engine.swap(Arc::new(Generation {
             engine: build_engine(&self.blob.load(), &self.resources.load()),
@@ -315,6 +323,62 @@ impl SharedEngine {
         })));
         info!("Loaded {n} scriptlet/redirect resources");
         Ok(n)
+    }
+
+    /// JavaScript for one scriptlet call (`name` and its arguments, uBO spelling) from the loaded
+    /// resource library, as the engine would emit it for a rule on a host; `None` when the
+    /// library has no such scriptlet. Used for rules the engine cannot hold (generic
+    /// `##+js(...)`). Trust is the caller's business: the extended-rule index only hands over
+    /// `trusted-*` scriptlets from trusted lists.
+    pub fn scriptlet_script(&self, name: &str, args: &[String], trusted: bool) -> Option<String> {
+        let mut call = name.trim().trim_end_matches(".js").to_string();
+        for a in args {
+            call.push_str(", ");
+            call.push_str(&a.replace(',', "\\,"));
+        }
+        let key = format!("{}{call}", if trusted { "T" } else { "U" });
+        {
+            let c = self
+                .scriptlet_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = c.get(&key) {
+                return (!v.is_empty()).then(|| v.to_string());
+            }
+        }
+        let rule = format!("argus-scriptlet.invalid##+js({call})");
+        let mut set = adblock::lists::FilterSet::new(false);
+        let js = set
+            .add_filter(
+                &rule,
+                adblock::lists::ParseOptions {
+                    // The resource says whether it needs trust; adblock-rust withholds it
+                    // from rules parsed without the permission.
+                    permissions: if trusted {
+                        crate::scriptlet_resources::TRUSTED_PERMISSION
+                    } else {
+                        Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .ok()
+            .map(|_| {
+                let mut e = AdblockEngine::from_filter_set(set, false);
+                e.use_resources(self.resources.load().iter().cloned());
+                e.url_cosmetic_resources("https://argus-scriptlet.invalid/")
+                    .injected_script
+            })
+            .unwrap_or_default();
+        let mut c = self
+            .scriptlet_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if c.len() >= 1024 {
+            c.clear();
+        }
+        c.insert(key, Arc::from(js.as_str()));
+        (!js.is_empty()).then_some(js)
     }
 
     /// What the last resource-library load kept and dropped.

@@ -576,6 +576,7 @@ async fn blocking_off_with_stealth_on_injects_only_the_shim() {
     env.proxy.ctx.set_adblock_enabled(false);
     let body = page_body(&env, "page.test").await;
     assert!(shim_of(&env, &body).await.is_some(), "{body}");
-    assert!(!body.contains("__ab_cfg") && !body.contains("sw:1") && !body.contains("\"sw\""));
+    // (The boot may load to carry the shim into frames; no sw cleanup, no cosmetics.)
+    assert!(!body.contains("sw:1") && !body.contains("\"sw\""));
     assert!(!body.contains("__adblock_cosmetic"), "{body}");
 }
