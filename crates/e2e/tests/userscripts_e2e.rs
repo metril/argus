@@ -1170,6 +1170,7 @@ e2e_test!(
         assert_eq!(r.status(), 200);
         // allow: nothing is refused and nothing is unregistered.
         env.proxy.ctx.set_service_worker_policy(P::Allow);
+        env.proxy.ctx.set_guard_service_workers(false);
         assert_eq!(sw_fetch("/sw.js").await, 200);
         assert!(!load_page(&env, &c, "app.test", "/p")
             .await

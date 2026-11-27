@@ -220,7 +220,13 @@ pub enum Injection {
     /// Raw JavaScript (`#%#`).
     Script(String),
     /// AdGuard scriptlet with no uBO equivalent.
-    Scriptlet { name: String, args: Vec<String> },
+    /// `trusted`: the rule comes from a trusted list (decides whether a scriptlet that
+    /// requires trust may run; the resource itself says which do).
+    Scriptlet {
+        name: String,
+        args: Vec<String>,
+        trusted: bool,
+    },
     /// ABP snippet calls (`#$#a 1; b 2`).
     Snippet(Vec<(String, Vec<String>)>),
     /// Extended / procedural CSS the engine rejected: selector (+ optional style declarations)
@@ -263,7 +269,7 @@ impl Injection {
         };
         match self {
             Self::Script(s) => Some(s.clone()),
-            Self::Scriptlet { name, args } => Some(call("scriptlet", name, args)),
+            Self::Scriptlet { name, args, .. } => Some(call("scriptlet", name, args)),
             Self::Snippet(calls) => Some(
                 calls
                     .iter()
@@ -471,6 +477,9 @@ pub fn parse_rule(r: &ExtRule) -> Result<ParsedRule, RuleError> {
     rule.src_kind = r.kind;
     rule.list = r.list.clone();
     rule.trusted = r.trusted;
+    if let Action::Inject(Injection::Scriptlet { trusted, .. }) = &mut rule.action {
+        *trusted = r.trusted;
+    }
     Ok(rule)
 }
 
@@ -983,6 +992,27 @@ fn parse_adguard_html(body: &str) -> Result<HtmlRemoval, RuleError> {
     Ok(out)
 }
 
+/// Split a trailing `:remove()` / `:style(...)` action off a selector: the selector, and the
+/// declarations (`remove: true` for the remove action).
+fn split_action(body: &str) -> (String, Option<String>) {
+    let t = body.trim();
+    if let Some(sel) = t.strip_suffix(":remove()").map(str::trim_end) {
+        if !sel.is_empty() {
+            return (sel.to_string(), Some("remove: true".to_string()));
+        }
+    }
+    if let (Some(i), true) = (t.rfind(":style("), t.ends_with(')')) {
+        let sel = t[..i].trim_end();
+        if !sel.is_empty() {
+            return (
+                sel.to_string(),
+                Some(t[i + 7..t.len() - 1].trim().to_string()),
+            );
+        }
+    }
+    (t.to_string(), None)
+}
+
 fn parse_cosmetic(
     raw: &str,
     domains: &str,
@@ -1051,6 +1081,7 @@ fn parse_cosmetic(
                         Action::Inject(Injection::Scriptlet {
                             name: name.clone(),
                             args: rest.to_vec(),
+                            trusted: false,
                         }),
                         body_t.to_string(),
                     )
@@ -1105,6 +1136,33 @@ fn parse_cosmetic(
                 )
             }
         }
+        // uBO scriptlet call that adblock-rust would not take (it rejects generic ones): `##+js(...)`.
+        "##" | "#@#" if body_t.starts_with("+js(") && body_t.ends_with(')') => {
+            if exception {
+                (Action::Disable { mask: SCRIPTLET }, body_t.to_string())
+            } else {
+                let inner = &body_t[4..body_t.len() - 1];
+                let mut args: Vec<String> = split_top(inner, ',')
+                    .into_iter()
+                    .map(|a| unquote_arg(&a.replace("\\,", ",")))
+                    .collect();
+                while args.last().is_some_and(String::is_empty) {
+                    args.pop();
+                }
+                let name = args.first().map(|n| n.trim_end_matches(".js").to_string());
+                match name {
+                    Some(n) if !n.is_empty() => (
+                        Action::Inject(Injection::Scriptlet {
+                            name: n,
+                            args: args[1..].to_vec(),
+                            trusted: false,
+                        }),
+                        body_t.to_string(),
+                    ),
+                    _ => return inv("scriptlet without a name"),
+                }
+            }
+        }
         "#?#" | "#@?#" | "#$?#" | "#@$?#" | "##" | "#@#" => {
             if exception {
                 (Action::Disable { mask: PCSS }, body_t.to_string())
@@ -1115,7 +1173,7 @@ fn parse_cosmetic(
                             body_t[..o].trim().to_string(),
                             Some(body_t[o + 1..body_t.len() - 1].trim().to_string()),
                         ),
-                        _ => (body_t.to_string(), None),
+                        _ => split_action(body_t),
                     };
                 if selector.is_empty() {
                     return inv("empty selector");
@@ -1234,7 +1292,7 @@ mod tests {
         let r = p("example.com#@#^script:has-text(x)").unwrap();
         assert!(r.exception && r.value == "script:has-text(x)");
         let r = p("a.com#%#//scriptlet('foo', 'x', 'y')").unwrap();
-        let Action::Inject(Injection::Scriptlet { name, args }) = &r.action else {
+        let Action::Inject(Injection::Scriptlet { name, args, .. }) = &r.action else {
             panic!()
         };
         assert_eq!((name.as_str(), args.len()), ("foo", 2));

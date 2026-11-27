@@ -350,6 +350,63 @@ e2e_test!(
     }
 );
 
+e2e_test!(
+    generic_scriptlets_and_remove_forms_are_injected_not_filed_as_css,
+    rules = [
+        "#%#//scriptlet('prevent-element-src-loading', 'script', 'ads.example')",
+        "##+js(no-topics)",
+        "#$#.promo { remove: true }",
+        "##.gone:style(remove: true)",
+    ],
+    |env| {
+        env.origin.route(
+            "/p",
+            MockResponse::html("<html><head></head><body>x</body></html>"),
+        );
+        for v in VERSIONS {
+            let html = text(get(&env, v, "/p", "document", &[])).await;
+            assert!(html.contains("/__adblock__/boot."), "{html}");
+            let b = bundles(&env, &html).await;
+            // Both run (the page runtime has no resource library in this test).
+            assert!(b.contains("\"prevent-element-src-loading\""), "{b}");
+            assert!(b.contains("\"no-topics\""), "{b}");
+            // No selector made of the scriptlet call or of the action.
+            assert!(!html.contains("+js("), "{html}");
+            assert!(
+                !html.contains(":remove()") && !html.contains(":style("),
+                "{html}"
+            );
+            assert!(html.contains("\"a\":\"remove\""), "{html}");
+            assert!(html.contains(".promo") && html.contains(".gone"), "{html}");
+        }
+    }
+);
+
+e2e_test!(
+    pages_with_injections_carry_them_into_friendly_frames,
+    rules = ["ext.test##.ad", "ext.test#%#window.__m=1;"],
+    |env| {
+        env.origin.route(
+            "/p",
+            MockResponse::html("<html><head></head><body>x</body></html>"),
+        );
+        let html = text(get(&env, HttpVersion::Http1, "/p", "document", &[])).await;
+        assert!(
+            html.contains("\"f\":1"),
+            "frames flag in the config: {html}"
+        );
+        let i = html.find("src=\"/__adblock__/boot.").unwrap();
+        let r = &html[i + 5..];
+        let boot_path = &r[..r.find('"').unwrap()];
+        let boot = text(env.client().get(&env.origin.https_url(H, boot_path))).await;
+        assert!(boot.contains("function argusBoot(cfg0,nonce0,base0,css0)"));
+        assert!(boot.contains("'prevent-element-src-loading':"));
+        // The extended-rule script exposes its text for frames and still runs as written.
+        let b = bundles(&env, &html).await;
+        assert!(b.contains(".xs=") && b.contains("window.__m=1;"), "{b}");
+    }
+);
+
 // ---- exceptions ------------------------------------------------------------------------------
 
 e2e_test!(
@@ -465,7 +522,9 @@ fn nt_page() -> MockResponse {
 #[tokio::test]
 async fn no_transform_keeps_the_body_but_header_edits_still_apply() {
     for mode in [EntryMode::Explicit, EntryMode::Transparent] {
-        let env = TestEnv::start(mode, &NT_RULES).await;
+        let env =
+            TestEnv::start_tweaked(mode, &NT_RULES, &|c| c.adblock.respect_no_transform = true)
+                .await;
         env.origin.route("/nt", nt_page());
         let r = get(&env, HttpVersion::Http1, "/nt", "document", &[]).await;
         assert!(r.headers().get("x-secret").is_none(), "header edit applies");
@@ -478,11 +537,8 @@ async fn no_transform_keeps_the_body_but_header_edits_still_apply() {
 }
 
 #[tokio::test]
-async fn no_transform_can_be_overridden_by_config() {
-    let env = TestEnv::start_tweaked(EntryMode::Explicit, &NT_RULES, &|c| {
-        c.adblock.respect_no_transform = false
-    })
-    .await;
+async fn no_transform_is_ignored_by_default() {
+    let env = TestEnv::start(EntryMode::Explicit, &NT_RULES).await;
     env.origin.route("/nt", nt_page());
     let body = text(get(&env, HttpVersion::Http1, "/nt", "document", &[])).await;
     assert!(
