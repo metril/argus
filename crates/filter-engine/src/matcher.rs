@@ -71,6 +71,31 @@ impl MatchResult {
         }
     }
 
+    /// A block without a stub takes the stub of `script`, the verdict for the same URL as a
+    /// script. A page that loaded a `$script` redirect and then `fetch`es the URL gets the same
+    /// answer instead of a network error, so the pair cannot be told from an original that is
+    /// merely small.
+    #[must_use]
+    pub fn with_sibling_stub(mut self, url: &str, script: &MatchResult) -> Self {
+        let path = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(url)
+            .to_ascii_lowercase();
+        let is_js = path.ends_with(".js") || path.ends_with(".mjs");
+        if is_js
+            && self.blocked
+            && self.redirect.is_none()
+            && script.blocked
+            && script.redirect.is_some()
+        {
+            self.redirect = script.redirect.clone();
+            self.matched_rule = script.matched_rule.clone();
+            self.list_id = script.list_id.clone();
+        }
+        self
+    }
+
     /// Decode the `$redirect` data URI into its MIME type and body.
     pub fn redirect_resource(&self) -> Option<RedirectResource> {
         use base64::Engine as _;
@@ -291,6 +316,42 @@ mod tests {
         assert_eq!(RequestMatcher::host_of("http://u:p@h.test/"), "h.test");
         assert_eq!(RequestMatcher::host_of("http://[::1]:80/"), "::1");
         assert_eq!(RequestMatcher::host_of("https://h.test?q"), "h.test");
+    }
+
+    #[test]
+    fn block_adopts_the_script_stub_only_when_it_has_none() {
+        let mut stub = MatchResult::redirect("data:application/javascript;base64,AA==", "s");
+        stub.list_id = Some("L".into());
+        let js = "https://a.test/t.js?x=1.json";
+        let adopted = MatchResult::blocked("b").with_sibling_stub(js, &stub);
+        assert_eq!(adopted.redirect, stub.redirect);
+        assert_eq!(adopted.matched_rule.as_deref(), Some("s"));
+        assert_eq!(adopted.list_id.as_deref(), Some("L"));
+        let m = MatchResult::blocked("b").with_sibling_stub("https://a.test/T.MJS#f", &stub);
+        assert!(m.redirect.is_some());
+        for u in [
+            "https://a.test/api.json",
+            "https://a.test/api?u=t.js",
+            "https://a.test/",
+        ] {
+            let r = MatchResult::blocked("b").with_sibling_stub(u, &stub);
+            assert!(
+                r.redirect.is_none() && r.matched_rule.as_deref() == Some("b"),
+                "{u}"
+            );
+        }
+        let own = MatchResult::redirect("data:image/gif;base64,AA==", "o");
+        assert_eq!(
+            own.clone().with_sibling_stub(js, &stub).redirect,
+            own.redirect
+        );
+        let plain = MatchResult::blocked("b");
+        assert!(plain
+            .clone()
+            .with_sibling_stub(js, &plain)
+            .redirect
+            .is_none());
+        assert!(!MatchResult::allowed().with_sibling_stub(js, &stub).blocked);
     }
 
     #[test]
