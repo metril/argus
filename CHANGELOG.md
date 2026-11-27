@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.1 — 2026-11-27
+
 * Upstream failures now look like a direct connection's. A host that does not resolve, refuses or
   resets the connection, fails its TLS handshake or times out used to get a synthesized 502/504
   inside the intercepted tunnel, so a page's `fetch` resolved and counted the dead host as
