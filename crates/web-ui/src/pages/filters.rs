@@ -15,7 +15,7 @@ use crate::api::filters::{
     ListReport, TestUrlResponse,
 };
 use crate::api::ApiClient;
-use crate::components::{ConfirmButton, Drawer, Icon, Layout, Modal, Pill, Switch};
+use crate::components::{ConfirmButton, Drawer, Icon, Layout, Modal, Pill, Segmented, Switch};
 use crate::state::use_app_state;
 use crate::utils::format_number;
 use std::rc::Rc;
@@ -60,6 +60,52 @@ pub fn FiltersPage() -> impl IntoView {
     let row_h = Signal::derive(move || if is_narrow() { 104.0 } else { 62.0 });
 
     let build = RwSignal::new(Option::<BuildSummary>::None);
+    // Blocking profile: "default" or "strict"; `profile_busy` while a switch is applied.
+    let profile = RwSignal::new("default".to_string());
+    let profile_busy = RwSignal::new(false);
+    {
+        let app_state = app_state.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().get_blocking_profile().await {
+                Ok(p) => {
+                    profile.set(p.mode.clone());
+                    // Strict was switched on before the signed catalogue loaded: add the rest now.
+                    if p.mode == "strict"
+                        && !p.pending.is_empty()
+                        && ApiClient::new()
+                            .set_blocking_profile("strict")
+                            .await
+                            .is_ok()
+                    {
+                        reload.update(|n| *n += 1);
+                    }
+                }
+                Err(e) => app_state.error(format!("Failed to load blocking profile: {e}")),
+            }
+        });
+    }
+    let set_profile = {
+        let app_state = app_state.clone();
+        Callback::new(move |mode: String| {
+            if profile_busy.get_untracked() || profile.get_untracked() == mode {
+                return;
+            }
+            profile_busy.set(true);
+            let app_state = app_state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match ApiClient::new().set_blocking_profile(&mode).await {
+                    Ok(p) => {
+                        profile.set(p.mode);
+                        reload.update(|n| *n += 1);
+                        nudge_build_poll();
+                        app_state.success("Blocking profile applied");
+                    }
+                    Err(e) => app_state.error(format!("Failed to switch profile: {e}")),
+                }
+                profile_busy.set(false);
+            });
+        })
+    };
     let show_catalogue = RwSignal::new(false);
     let catalogue = RwSignal::new(Vec::<CatalogueEntryResponse>::new());
     let catalogue_add = RwSignal::new(Option::<String>::None);
@@ -403,6 +449,30 @@ pub fn FiltersPage() -> impl IntoView {
 
             <div class="card">
                 <div class="card-h">
+                    <h3>"Blocking profile"</h3>
+                    <div class="r">
+                        <Segmented
+                            options=vec![("default".to_string(), "Default".to_string()), ("strict".to_string(), "Strict".to_string())]
+                            value=profile
+                            on_change=set_profile
+                            label="Blocking profile"
+                            disabled=profile_busy
+                        />
+                    </div>
+                </div>
+                <div class="card-b">
+                    <p class="hint box">
+                        {move || if profile.get() == "strict" {
+                            "Strict is on: on top of the default lists it also blocks cookie banners, social widgets, chat and A/B-testing scripts and extra trackers. This may break some sites; fix one with a per-site allow rule in the custom rules below. Switching back to Default removes only the lists Strict added; lists you added yourself are not touched."
+                        } else {
+                            "Default blocks ads, trackers, malware and the common annoyances. Strict adds the AdGuard Annoyances and Social Media, EasyList Cookie, Fanboy Social and uBO Annoyances lists plus Argus Extra Trackers: it blocks more (cookie banners, social widgets, chat and A/B-testing scripts) and may break some sites, which you can fix with per-site allow rules in the custom rules below."
+                        }}
+                    </p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-h">
                     <h3>"Filter lists"</h3>
                     <span class="sub">{move || format!("{} lists", format_number(counts.get().map(|c| c.all).unwrap_or(0) as u64))}</span>
                     <div class="r">
@@ -685,6 +755,7 @@ pub fn FiltersPage() -> impl IntoView {
                                         <div class="nm">
                                             {e.name.clone()}" "
                                             <span class="badge">{if e.source == "signed" { "signed" } else { "built-in" }}</span>
+                                            {e.profile.as_deref().is_some_and(|p| p == "strict").then(|| view! { " " <span class="badge" title="Added by the Strict profile: blocks more and may break some sites">"strict - may break sites"</span> })}
                                             {e.noncommercial.then(|| view! { " " <span class="badge" title=tip.clone()>"non-commercial"</span> })}
                                         </div>
                                         <div class="url">

@@ -850,11 +850,14 @@ impl ListService {
                 warn!("Failed to persist report for {id}: {e}");
             }
             if id != CUSTOM_REPORT_ID {
-                if let Ok(Some(mut list)) = self.store.get(id) {
-                    list.rule_count = report.network + report.cosmetic + report.ext;
-                    list.duplicate_count = Some(report.duplicates);
-                    let _ = self.store.upsert(&list);
-                }
+                let (rc, dc) = (
+                    report.network + report.cosmetic + report.ext,
+                    report.duplicates,
+                );
+                let _ = self.store.update_list(id, |l| {
+                    l.rule_count = rc;
+                    l.duplicate_count = Some(dc);
+                });
             }
         }
         if built.reports.len() < ids.len() {
@@ -1091,7 +1094,15 @@ impl ListService {
                     if let Err(e) = store.put_content(&l.id, &t) {
                         warn!("Failed to cache content for {}: {e}", l.name);
                     }
-                    if let Err(e) = store.upsert(&l) {
+                    // Fetch metadata only, on the list as stored now: never `enabled`, and a
+                    // list deleted meanwhile stays deleted.
+                    let res = store.update_list(&l.id, |cur| {
+                        cur.etag = l.etag.clone();
+                        cur.rule_count = l.rule_count;
+                        cur.duplicate_count = l.duplicate_count;
+                        cur.last_updated = l.last_updated;
+                    });
+                    if let Err(e) = res {
                         warn!("Failed to persist metadata for {}: {e}", l.name);
                     }
                     if let Err(e) = store.set_status(&l.id, &st) {

@@ -14,6 +14,7 @@ mod sets;
 mod signed;
 pub mod site_exceptions;
 mod store;
+mod strict;
 
 pub use argus::{
     check_public_key, verify as verify_minisign, verify_trusted, ArgusConfig, ArgusLists,
@@ -27,6 +28,7 @@ pub use sets::SetKey;
 pub use signed::testkit;
 pub use signed::{CatalogueDoc, FilterCatalogueEntry, Loaded, SignedDoc, UserscriptCatalogueEntry};
 pub use store::{ListStatus, ListStore};
+pub use strict::{StrictProfile, StrictState};
 
 /// Re-exported so API code needs no direct `filter-engine` dependency for these.
 pub use filter_engine::{

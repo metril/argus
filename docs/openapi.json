@@ -479,6 +479,35 @@
         ],
         "type": "object"
       },
+      "BlockingProfileResponse": {
+        "description": "The blocking profile: `default` or `strict`.",
+        "properties": {
+          "added": {
+            "description": "Lists Strict created (removed again on switching back).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "description": "`default` or `strict`.",
+            "type": "string"
+          },
+          "pending": {
+            "description": "Strict lists not added yet (the signed `argus-extra` list until the signed catalogue loads).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode",
+          "added",
+          "pending"
+        ],
+        "type": "object"
+      },
       "BuildState": {
         "description": "Where the build pipeline is.",
         "oneOf": [
@@ -1106,6 +1135,13 @@
           "noncommercial": {
             "description": "The licence forbids commercial use.",
             "type": "boolean"
+          },
+          "profile": {
+            "description": "`strict`: added by the Strict profile; blocks more and may break sites.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "region": {
             "description": "Language/region the list targets (`de`, `fr`, ...).",
@@ -5626,6 +5662,19 @@
           "id",
           "created_at",
           "last_activity"
+        ],
+        "type": "object"
+      },
+      "SetBlockingProfileRequest": {
+        "description": "Switch the blocking profile.",
+        "properties": {
+          "mode": {
+            "description": "`default` or `strict`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
         ],
         "type": "object"
       },
@@ -13539,6 +13588,160 @@
           }
         ],
         "summary": "Add a catalogue entry as an enabled list and rebuild the engine.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/profile": {
+      "get": {
+        "operationId": "get_blocking_profile",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlockingProfileResponse"
+                }
+              }
+            },
+            "description": "Profile"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:read"
+            ]
+          }
+        ],
+        "summary": "The blocking profile in effect: `default` or the opt-in `strict`.",
+        "tags": [
+          "lists"
+        ]
+      },
+      "put": {
+        "operationId": "put_blocking_profile",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetBlockingProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BlockingProfileResponse"
+                }
+              }
+            },
+            "description": "Profile"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Switch the blocking profile. Strict adds extra annoyance, social and tracker lists on top of\nthe default set; switching back removes only what Strict added. Applied live and persisted.",
         "tags": [
           "lists"
         ]

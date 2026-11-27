@@ -67,10 +67,17 @@ pub fn is_known_trusted_source(url: &str) -> bool {
         let name = f.trim_end_matches(".txt").trim_end_matches(".min");
         return matches!(
             name,
-            "filters" | "privacy" | "badware" | "quick-fixes" | "unbreak" | "resource-abuse"
+            "filters"
+                | "privacy"
+                | "badware"
+                | "quick-fixes"
+                | "unbreak"
+                | "resource-abuse"
+                | "annoyances"
         );
     }
-    // AdGuard's own numbered filters: 2 Base, 3 Tracking Protection, 11 Mobile Ads, 17 URL Tracking.
+    // AdGuard's own numbered filters: 2 Base, 3 Tracking Protection, 11 Mobile Ads, 17 URL
+    // Tracking, 4 Social Media, 14 Annoyances.
     u.strip_prefix("https://filters.adtidy.org/")
         .is_some_and(|r| {
             let Some((_, f)) = r.rsplit_once("/filters/") else {
@@ -78,7 +85,13 @@ pub fn is_known_trusted_source(url: &str) -> bool {
             };
             matches!(
                 f,
-                "2.txt" | "2_without_easylist.txt" | "3.txt" | "11.txt" | "17.txt"
+                "2.txt"
+                    | "2_without_easylist.txt"
+                    | "3.txt"
+                    | "4.txt"
+                    | "11.txt"
+                    | "14.txt"
+                    | "17.txt"
             )
         })
 }
@@ -184,6 +197,8 @@ pub struct CatalogueEntry {
     pub licence: &'static str,
     /// The licence forbids commercial use.
     pub noncommercial: bool,
+    /// `Some("strict")`: part of the opt-in Strict profile (never seeded, may break sites).
+    pub profile: Option<&'static str>,
 }
 
 impl CatalogueEntry {
@@ -197,9 +212,29 @@ impl CatalogueEntry {
     }
 }
 
+/// The `profile` value of catalogue entries that belong to the opt-in Strict profile.
+pub const PROFILE_STRICT: &str = "strict";
+
+/// Id of the signed argus-lists entry ("Argus Extra Trackers", `profile: strict`); reported as
+/// pending while the signed catalogue has not loaded.
+pub const STRICT_ARGUS_EXTRA_ID: &str = "argus-extra";
+
+/// Enabled lists of every built-in catalogue entry with `profile == "strict"`.
+pub fn strict_catalogue_lists() -> Vec<FilterList> {
+    catalogue()
+        .iter()
+        .filter(|e| e.profile == Some(PROFILE_STRICT))
+        .map(|e| {
+            let mut l = e.to_filter_list();
+            l.enabled = true;
+            l
+        })
+        .collect()
+}
+
 /// Default-disabled catalogue of well-known hosts-format, domain-format and IP lists.
 pub fn catalogue() -> Vec<CatalogueEntry> {
-    use ListFormat::{Domains, Hosts, IpList};
+    use ListFormat::{Abp, Domains, Hosts, IpList, Ubo};
     let e = |id, name, url, format, category, licence| CatalogueEntry {
         id,
         name,
@@ -208,9 +243,14 @@ pub fn catalogue() -> Vec<CatalogueEntry> {
         category,
         licence,
         noncommercial: false,
+        profile: None,
     };
     let nc = |mut e: CatalogueEntry| {
         e.noncommercial = true;
+        e
+    };
+    let strict = |mut e: CatalogueEntry| {
+        e.profile = Some(PROFILE_STRICT);
         e
     };
     vec![
@@ -226,6 +266,11 @@ pub fn catalogue() -> Vec<CatalogueEntry> {
         nc(e("phishing-army", "Phishing Army", "https://phishing.army/download/phishing_army_blocklist.txt", Domains, "phishing", "CC BY-NC 4.0")),
         nc(e("spamhaus-drop", "Spamhaus DROP (IP ranges)", "https://www.spamhaus.org/drop/drop.txt", IpList, "malware", "free for non-commercial use")),
         e("feodo-ips", "Feodo Tracker IP Blocklist", "https://feodotracker.abuse.ch/downloads/ipblocklist.txt", IpList, "malware", "CC0"),
+        strict(e("adguard-annoyances", "AdGuard Annoyances filter", "https://filters.adtidy.org/extension/ublock/filters/14.txt", Ubo, "annoyances", "GPL-3.0")),
+        strict(e("adguard-social", "AdGuard Social Media filter", "https://filters.adtidy.org/extension/ublock/filters/4.txt", Ubo, "social", "GPL-3.0")),
+        strict(e("easylist-cookie", "EasyList Cookie List", "https://secure.fanboy.co.nz/fanboy-cookiemonster.txt", Abp, "annoyances", "GPL-3.0 / CC BY-SA 3.0")),
+        strict(e("fanboy-social", "Fanboy's Social Blocking List", "https://easylist.to/easylist/fanboy-social.txt", Abp, "social", "GPL-3.0 / CC BY-SA 3.0")),
+        strict(e("ublock-annoyances", "uBlock filters - Annoyances", "https://ublockorigin.github.io/uAssets/filters/annoyances.min.txt", Ubo, "annoyances", "GPL-3.0")),
     ]
 }
 

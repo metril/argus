@@ -233,6 +233,25 @@ impl ApiClient {
         self.get("/lists/catalogue").await
     }
 
+    /// The blocking profile (`default` or `strict`).
+    pub async fn get_blocking_profile(
+        &self,
+    ) -> Result<api_types::BlockingProfileResponse, ApiError> {
+        self.get("/lists/profile").await
+    }
+
+    /// Switch the blocking profile; applied live.
+    pub async fn set_blocking_profile(
+        &self,
+        mode: &str,
+    ) -> Result<api_types::BlockingProfileResponse, ApiError> {
+        self.put(
+            "/lists/profile",
+            &api_types::SetBlockingProfileRequest { mode: mode.into() },
+        )
+        .await
+    }
+
     /// Add a catalogue entry as a list
     pub async fn add_from_catalogue(&self, id: &str) -> Result<FilterList, ApiError> {
         self.post(&format!("/lists/catalogue/{}", id), &()).await

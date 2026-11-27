@@ -776,6 +776,9 @@ pub struct CatalogueEntryResponse {
     /// Adding it makes the list trusted (extended rules may run).
     #[serde(default)]
     pub trusted: bool,
+    /// `strict`: added by the Strict profile; blocks more and may break sites.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// `signed` (verified argus-lists catalogue) or `builtin`.
     #[serde(default)]
     pub source: String,
@@ -816,4 +819,24 @@ pub struct ExtRuleResponse {
     /// Why the rule is unsupported / invalid.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// The blocking profile: `default` or `strict`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BlockingProfileResponse {
+    /// `default` or `strict`.
+    pub mode: String,
+    /// Lists Strict created (removed again on switching back).
+    pub added: Vec<String>,
+    /// Strict lists not added yet (the signed `argus-extra` list until the signed catalogue loads).
+    pub pending: Vec<String>,
+}
+
+/// Switch the blocking profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SetBlockingProfileRequest {
+    /// `default` or `strict`.
+    pub mode: String,
 }
