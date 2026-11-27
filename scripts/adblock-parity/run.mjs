@@ -45,8 +45,8 @@ const notFiltering = `blocker not filtering: canary ad host still reachable afte
 // (Check e.name, not instanceof: under Firefox/Marionette the TypeError comes from another realm.)
 // Argus only: a cors fetch whose response carries `x-adblock: blocked|redirected` also counts as a blocked
 // fetch, and a script that loads (Argus may serve a redirect stub) is tolerated. Extensions stay strict.
-const canaryFor = (isArgus) => `(async () => {
-  const FAST = ${FAST_MS}, ARGUS = ${isArgus};
+const canaryFor = (isArgus, scriptOnly = false) => `(async () => {
+  const FAST = ${FAST_MS}, ARGUS = ${isArgus}, SCRIPT_ONLY = ${scriptOnly};
   const urls = ['https://ads.pubmatic.com/AdServer/js/showad.js', 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js', 'https://adservice.google.com/ddm/fls/z'];
   const one = async (u) => {
     const q = (k) => u + (u.includes('?') ? '&' : '?') + k + '=' + Date.now();
@@ -64,12 +64,15 @@ const canaryFor = (isArgus) => `(async () => {
       el.onerror = () => done(Date.now() - t0 <= FAST ? 'blocked' : 'error'); el.onload = () => done('reached');
       el.src = q('s'); document.head.appendChild(el); });
     const [fv, sv] = await Promise.all([f, sc]);
-    return { host: new URL(u).host, fetch: fv, script: sv, blocked: fv === 'blocked' && (sv === 'blocked' || (ARGUS && sv === 'reached')) };
+    return { host: new URL(u).host, fetch: fv, script: sv, blocked: (SCRIPT_ONLY ? sv === 'blocked' : fv === 'blocked') && (sv === 'blocked' || (ARGUS && sv === 'reached')) };
   };
   const hosts = await Promise.all(urls.map(one));
   return { ok: hosts.filter((h) => h.blocked).length * 2 > urls.length, hosts };
 })()`;
-const CANARY = canaryFor(blocker === 'argus');
+// AdGuard's Firefox extension (MV2) filters <script> loads on these hosts but, in CI, let no-cors fetches through
+// (pubmatic blocked; googlesyndication/adservice fetch 'reached' for the full 120s). Its engine is up when the
+// script probe is blocked, so judge readiness on the script probe there; per-site scoring is unaffected.
+const CANARY = canaryFor(blocker === 'argus', blocker === 'adguard-ext' && browser === 'firefox');
 // Control request: must keep working on every site run, else the run is discarded and retried once. It is a
 // same-origin fetch of the test page's own URL: no list can scope a rule to "third-party requests from this
 // site" onto it (AdGuard Base ships `*$3p,domain=adblock.turtlecute.org|paileactivist.github.io`, which blocks any
