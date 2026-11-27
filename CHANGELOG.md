@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.3 — 2026-11-27
+
 - Domain-set compression: a plain `||host^` rule is dropped at build time when a shorter suffix rule from any list already covers it (exact `|scheme://host^` rules are never touched). Decisions and attribution are unchanged; the count is reported per list as `compressed` (list report, build summary, Filters page). On HaGeZi Pro+Ultimate with EasyList and EasyPrivacy the set shrinks from 338k to 311k entries.
 
 ## 0.9.2 — 2026-11-27
