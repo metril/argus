@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # Branches get CI through their PR (pull_request); pushing branches too would run everything twice.
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -53,6 +56,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: clippy
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
@@ -67,6 +72,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: test
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
@@ -87,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -104,7 +111,7 @@ jobs:
           cargo nextest run
           --archive-file nextest-archive.tar.zst
           --workspace-remap .
-          --partition count:${{ matrix.shard }}/4
+          --partition count:${{ matrix.shard }}/6
 
   e2e:
     runs-on: ubuntu-latest
@@ -116,6 +123,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: e2e
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
@@ -133,6 +142,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: browser
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
@@ -157,6 +168,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: kernel
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
@@ -187,6 +200,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: ext-e2e
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
@@ -266,6 +281,8 @@ jobs:
       - uses: ./.github/actions/build-deps
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          # Only main saves; PRs restore main's cache (less upload time, no cache-cap thrash).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: wreq-patches
           workspaces: vendor/wreq
       - name: Unit tests of the Argus patches in vendored wreq

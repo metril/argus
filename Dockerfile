@@ -70,14 +70,18 @@ FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 # Vendored wreq/wreq-util are [patch.crates-io] path dependencies; cook needs their sources.
 COPY vendor ./vendor
-RUN cargo chef cook --release --recipe-path recipe.json -p proxy-core --features full
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --release --recipe-path recipe.json -p proxy-core --features full
 
 # Now copy source and build (only our code compiles; deps are cached)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY vendor ./vendor
 # `cargo rustc` passes the extra flags to the final binary only, so build scripts stay dynamic.
-RUN cargo rustc --release -p proxy-core --bin argus --features full -- \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo rustc --release -p proxy-core --bin argus --features full -- \
       -C link-arg=-s -C target-feature=+crt-static
 
 # Copy binary to a known location and verify
