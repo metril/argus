@@ -604,6 +604,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "compressed": {
+            "minimum": 0,
+            "type": "integer"
+          },
           "cosmetic": {
             "minimum": 0,
             "type": "integer"
@@ -3379,6 +3383,11 @@
         "properties": {
           "allowlist": {
             "type": "boolean"
+          },
+          "compressed": {
+            "description": "Domain rules dropped because a shorter suffix rule already covers them.",
+            "minimum": 0,
+            "type": "integer"
           },
           "content_sha": {
             "description": "SHA-256 of the list content (and includes) the report was built from.",

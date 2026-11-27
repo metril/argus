@@ -1201,12 +1201,13 @@ fn ReportSummary(id: String, reports: RwSignal<HashMap<String, ListReport>>) -> 
     move || {
         reports.get().get(&id).map(|r| {
             let counts = format!(
-                "{} network, {} cosmetic, {} handed off, {} skipped, {} deduped, {} rejected",
+                "{} network, {} cosmetic, {} handed off, {} skipped, {} deduped, {} compressed, {} rejected",
                 format_number(r.network as u64),
                 format_number(r.cosmetic as u64),
                 format_number(r.ext as u64),
                 format_number(r.skipped as u64),
                 format_number(r.deduped as u64),
+                format_number(r.compressed as u64),
                 format_number(r.rejected as u64)
             );
             let issues = r.issues.clone();

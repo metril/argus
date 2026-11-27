@@ -843,6 +843,7 @@ impl ListService {
             summary.rejected += report.rejected;
             summary.ip_ranges += report.ip_ranges;
             summary.duplicates += report.duplicates;
+            summary.compressed += report.compressed;
             let mut report = report.clone();
             crate::report::sanitize_report(&mut report);
             let report = &report;
@@ -851,7 +852,7 @@ impl ListService {
             }
             if id != CUSTOM_REPORT_ID {
                 let (rc, dc) = (
-                    report.network + report.cosmetic + report.ext,
+                    report.network + report.cosmetic + report.ext + report.compressed,
                     report.duplicates,
                 );
                 let _ = self.store.update_list(id, |l| {
@@ -872,9 +873,9 @@ impl ListService {
             Arc::new(built.domains),
         );
         info!(
-            "Compiled {} list(s): {} network, {} cosmetic, {} extended, {} rejected, {} duplicate rules dropped in {} ms",
+            "Compiled {} list(s): {} network, {} cosmetic, {} extended, {} rejected, {} duplicate and {} compressed rules dropped in {} ms",
             summary.lists, summary.network, summary.cosmetic, summary.ext, summary.rejected,
-            summary.duplicates, summary.duration_ms
+            summary.duplicates, summary.compressed, summary.duration_ms
         );
         // Engine and extended-rule index are one generation: swapped together.
         self.engine.install_set_with(

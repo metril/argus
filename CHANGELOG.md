@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Domain-set compression: a plain `||host^` rule is dropped at build time when a shorter suffix rule from any list already covers it (exact `|scheme://host^` rules are never touched). Decisions and attribution are unchanged; the count is reported per list as `compressed` (list report, build summary, Filters page). On HaGeZi Pro+Ultimate with EasyList and EasyPrivacy the set shrinks from 338k to 311k entries.
+
 ## 0.9.2 — 2026-11-27
 
 - Signed catalogue entries with `profile: "default"` (Argus Base) are added and enabled once on every install after the verified catalogue loads; the offered ids are kept, so a list you remove or disable stays that way. Strict never touches them. The Filters page badges them "Argus default".
