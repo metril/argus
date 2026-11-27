@@ -35,7 +35,20 @@ if (!['chrome', 'firefox'].includes(browser)) throw new Error('--browser chrome|
 // Canary: an ad host every blocker in the matrix blocks. Resolves true once a no-cors fetch from a normal
 // http origin is rejected, i.e. the blocker's engine is loaded and filtering. Polled, not slept.
 const notFiltering = `blocker not filtering: canary ad host still reachable after ${readyTimeoutMs / 1000}s (never scored)`;
-const CANARY = `(async () => { try { await fetch('https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?c=' + Date.now(), { mode: 'no-cors', cache: 'no-store' }); return false; } catch (e) { return true; } })()`;
+// Pure `||host^` tracker hosts (no $redirect stub), so a filtering blocker aborts them. A majority must reject.
+// Argus only: a response carrying `x-adblock: blocked|redirected` (headers readable via a cors fetch) also counts
+// as blocked. Extension baselines stay strict (reject only).
+const canaryFor = (isArgus) => `(async () => {
+  const urls = ['https://adservice.google.com/ddm/fls/z', 'https://ads.pubmatic.com/AdServer/js/showad.js', 'https://www.googleadservices.com/pagead/conversion.js'];
+  const one = async (u) => {
+    const q = u + (u.includes('?') ? '&' : '?') + 'c=' + Date.now();
+    try { await fetch(q, { mode: 'no-cors', cache: 'no-store' }); } catch (e) { return true; }
+    ${isArgus ? "try { const r = await fetch(q, { mode: 'cors', cache: 'no-store' }); return /^(blocked|redirected)$/.test(r.headers.get('x-adblock') || ''); } catch (e) { return true; }" : 'return false;'}
+  };
+  const n = (await Promise.all(urls.map(one))).filter(Boolean).length;
+  return n * 2 > urls.length;
+})()`;
+const CANARY = canaryFor(blocker === 'argus');
 
 function nssImport(dbDir, ca) {
   if (spawnSync('certutil', ['-V']).error) return false;
