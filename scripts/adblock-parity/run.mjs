@@ -38,23 +38,25 @@ if (!['chrome', 'firefox'].includes(browser)) throw new Error('--browser chrome|
 // Ready = both blocked on 2 consecutive polls. Verdicts: 'blocked' | 'reached' | 'error'.
 const FAST_MS = 3000;
 const notFiltering = `blocker not filtering: canary ad host still reachable after ${readyTimeoutMs / 1000}s (never scored)`;
-// Three pure `||host^` tracker hosts (no $redirect stub), probed in parallel; a majority must be blocked.
+// Three pure `||host^` ad hosts, probed in parallel; a majority (2 of 3) must be blocked. No single host is
+// blocked by every blocker (uBO stubs googlesyndication via $redirect, AdGuard may not list adservice/googleadservices).
 // Per host two probes: fetch(no-cors) must reject with a TypeError within FAST_MS (timeout/abort = 'error'),
 // and a <script src> must fire onerror within FAST_MS (onload = 'reached'). Both must be blocked.
+// (Check e.name, not instanceof: under Firefox/Marionette the TypeError comes from another realm.)
 // Argus only: a cors fetch whose response carries `x-adblock: blocked|redirected` also counts as a blocked
 // fetch, and a script that loads (Argus may serve a redirect stub) is tolerated. Extensions stay strict.
 const canaryFor = (isArgus) => `(async () => {
   const FAST = ${FAST_MS}, ARGUS = ${isArgus};
-  const urls = ['https://adservice.google.com/ddm/fls/z', 'https://ads.pubmatic.com/AdServer/js/showad.js', 'https://www.googleadservices.com/pagead/conversion.js'];
+  const urls = ['https://ads.pubmatic.com/AdServer/js/showad.js', 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js', 'https://adservice.google.com/ddm/fls/z'];
   const one = async (u) => {
     const q = (k) => u + (u.includes('?') ? '&' : '?') + k + '=' + Date.now();
     const f = (async () => {
       const c = new AbortController(); const t = setTimeout(() => c.abort(), 8000); const t0 = Date.now();
       try { await fetch(q('c'), { mode: 'no-cors', cache: 'no-store', signal: c.signal }); }
-      catch (e) { return e instanceof TypeError && Date.now() - t0 <= FAST ? 'blocked' : 'error'; } finally { clearTimeout(t); }
+      catch (e) { return e && e.name === 'TypeError' && Date.now() - t0 <= FAST ? 'blocked' : 'error'; } finally { clearTimeout(t); }
       if (!ARGUS) return 'reached';
       try { const r = await fetch(q('m'), { mode: 'cors', cache: 'no-store' }); return /^(blocked|redirected)$/.test(r.headers.get('x-adblock') || '') ? 'blocked' : 'reached'; }
-      catch (e) { return e instanceof TypeError ? 'blocked' : 'error'; }
+      catch (e) { return e && e.name === 'TypeError' ? 'blocked' : 'error'; }
     })();
     const sc = new Promise((res) => { const t0 = Date.now(); const el = document.createElement('script');
       const done = (v) => { clearTimeout(to); el.remove(); res(v); };
