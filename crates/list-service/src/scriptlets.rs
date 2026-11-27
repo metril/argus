@@ -69,28 +69,76 @@ fn split_raw_github(url: &str) -> Option<(&str, &str, &str, &str)> {
     Some((p.next()?, p.next()?, p.next()?, p.next()?))
 }
 
+/// Find `gitref` (`HEAD`, a branch or a tag) in a git ref advertisement (pkt-lines of
+/// `<sha> <ref>[\0capabilities]`) and return its commit id (peeled for annotated tags).
+fn parse_ref_advertisement(adv: &str, gitref: &str) -> Option<String> {
+    let names = if gitref == "HEAD" {
+        vec!["HEAD".to_string()]
+    } else {
+        vec![
+            format!("refs/heads/{gitref}"),
+            format!("refs/tags/{gitref}"),
+        ]
+    };
+    let sha_of = |name: &str| -> Option<String> {
+        let suffix = format!(" {name}");
+        adv.split('\n').find_map(|line| {
+            let line = line.split('\0').next().unwrap_or(line);
+            let head = line.strip_suffix(&suffix)?;
+            let sha = head.get(head.len().checked_sub(40)?..)?;
+            is_commit_sha(sha).then(|| sha.to_string())
+        })
+    };
+    names
+        .iter()
+        .find_map(|n| sha_of(&format!("{n}^{{}}")).or_else(|| sha_of(n)))
+}
+
 fn is_commit_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
+
+const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 impl ListService {
     /// Pin a raw GitHub base URL (branch or `HEAD`) to the commit it points at now, so the
     /// scriptlets, the redirect map and the redirect files all come from one commit. Other URLs
     /// (and ones already naming a commit) are returned unchanged.
-    async fn pin_commit(&self, url: &str) -> Result<String, String> {
+    ///
+    /// The commit is read from the git smart-HTTP ref advertisement, which unlike the REST API
+    /// is not rate limited per IP (shared CI runners get 403 from the API); the API is only a
+    /// fallback.
+    #[doc(hidden)]
+    pub async fn pin_commit(&self, url: &str) -> Result<String, String> {
         let Some((owner, repo, gitref, path)) = split_raw_github(url) else {
             return Ok(url.to_string());
         };
         if is_commit_sha(gitref) {
             return Ok(url.to_string());
         }
-        let api = format!("https://api.github.com/repos/{owner}/{repo}/commits/{gitref}");
-        let sha = self
-            .get_text_accept(&api, "application/vnd.github.sha")
-            .await
-            .map_err(|e| format!("cannot resolve `{gitref}` to a commit: {e}"))?;
-        let sha = sha.trim();
-        if !is_commit_sha(sha) {
+        let git = format!(
+            "{}/{owner}/{repo}.git/info/refs?service=git-upload-pack",
+            self.cfg.git_host_url.trim_end_matches('/')
+        );
+        let via_git = match self.get_text_capped(&git, 16 * 1024 * 1024).await {
+            Ok(adv) => parse_ref_advertisement(&adv, gitref)
+                .ok_or_else(|| format!("`{gitref}` not found in {owner}/{repo} refs")),
+            Err(e) => Err(e),
+        };
+        let sha = match via_git {
+            Ok(s) => s,
+            Err(git_err) => {
+                let api = format!("https://api.github.com/repos/{owner}/{repo}/commits/{gitref}");
+                let s = self
+                    .get_text_accept(&api, "application/vnd.github.sha")
+                    .await
+                    .map_err(|e| {
+                        format!("cannot resolve `{gitref}` to a commit: {git_err}; {e}")
+                    })?;
+                s.trim().to_string()
+            }
+        };
+        if !is_commit_sha(&sha) {
             return Err(format!("`{gitref}` resolved to an invalid commit id"));
         }
         info!("Resource source pinned to {owner}/{repo}@{}", &sha[..8]);
@@ -106,6 +154,9 @@ impl ListService {
         if self.cfg.scriptlet_resources_url.trim().is_empty() {
             return;
         }
+        // Bundled snapshot (if any) first, so scriptlets work before and without the network;
+        // a cached or fetched copy then replaces it.
+        self.load_bundled_resources().await;
         let mut delay = self.cfg.scriptlet_retry_initial;
         loop {
             match self.load_scriptlets_once().await {
@@ -113,9 +164,16 @@ impl ListService {
                     self.scriptlets_tx.send_replace(true);
                     return;
                 }
-                Err(e) => warn!("Scriptlet resources unavailable: {e}; retrying in {delay:?}"),
+                Err(e) => {
+                    // A rate-limited source says when to come back: honour it (bounded).
+                    let hint = self.rate_limit_hint.lock().take();
+                    let wait = hint
+                        .map_or(delay, |h| h.max(delay))
+                        .min(MAX_RATE_LIMIT_WAIT);
+                    warn!("Scriptlet resources unavailable: {e}; retrying in {wait:?}");
+                    tokio::time::sleep(wait).await;
+                }
             }
-            tokio::time::sleep(delay).await;
             delay = (delay * 2).min(self.cfg.scriptlet_retry_max);
         }
     }

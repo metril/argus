@@ -47,6 +47,9 @@ pub struct ListServiceConfig {
     pub max_list_bytes: usize,
     pub scriptlet_retry_initial: Duration,
     pub scriptlet_retry_max: Duration,
+    /// Origin of the git host used to resolve a branch to a commit (smart-HTTP ref advertisement,
+    /// which is not subject to the REST API's unauthenticated rate limit).
+    pub git_host_url: String,
     /// Persist the compiled engine to `<data_dir>/engine.bin` and load it at startup. Off by
     /// default so ad-hoc services (tests) never write to a relative default directory;
     /// [`Self::from_adblock`] turns it on.
@@ -73,6 +76,7 @@ impl Default for ListServiceConfig {
             max_list_bytes: 50 * 1024 * 1024,
             scriptlet_retry_initial: Duration::from_secs(5),
             scriptlet_retry_max: Duration::from_secs(15 * 60),
+            git_host_url: "https://github.com".into(),
             persist_engine: false,
             allowed_fetch_destinations: Vec::new(),
             build_threads: 0,
@@ -182,6 +186,8 @@ pub struct ListService {
     /// `true` once a fetched/cached resource library was applied (it then outranks the bundled one).
     fetched_resources: Arc<Mutex<bool>>,
     pub(crate) bundled_tried: AtomicBool,
+    /// Wait requested by the last 403/429 response (`Retry-After` / `x-ratelimit-reset`).
+    pub(crate) rate_limit_hint: Mutex<Option<Duration>>,
     /// Live auto-update schedule: `(auto_update, interval)`.
     schedule: watch::Sender<(bool, Duration)>,
     /// Lists some profile enables: downloaded and refreshed like globally enabled ones, but only
@@ -427,6 +433,7 @@ impl ListService {
             scriptlets_tx: watch::channel(false).0,
             fetched_resources: Arc::new(Mutex::new(false)),
             bundled_tried: AtomicBool::new(false),
+            rate_limit_hint: Mutex::new(None),
             #[cfg(test)]
             panic_next: AtomicBool::new(false),
             #[cfg(test)]
@@ -1231,6 +1238,16 @@ impl ListService {
             .await
     }
 
+    /// [`Self::get_text`] with an explicit size cap.
+    pub(crate) async fn get_text_capped(
+        &self,
+        url: &str,
+        cap: usize,
+    ) -> std::result::Result<String, String> {
+        let b = self.fetch_bytes(url, None, cap).await?;
+        Ok(String::from_utf8_lossy(&b).into_owned())
+    }
+
     /// GET `url` with an explicit `Accept` header (the GitHub API's commit-SHA form).
     pub(crate) async fn get_text_accept(
         &self,
@@ -1271,6 +1288,11 @@ impl ListService {
         self.vet_response(&resp, origin)
             .map_err(|e| format!("{url}: {e}"))?;
         if !resp.status().is_success() {
+            if matches!(resp.status().as_u16(), 403 | 429) {
+                if let Some(d) = rate_limit_wait(resp.headers()) {
+                    *self.rate_limit_hint.lock() = Some(d);
+                }
+            }
             return Err(format!("{url}: HTTP {}", resp.status()));
         }
         read_capped(resp, cap).await
@@ -1329,6 +1351,29 @@ enum Fetched {
         etag: Option<String>,
         last_modified: Option<String>,
     },
+}
+
+/// How long a rate-limited (403/429) response asks us to wait: `Retry-After` (seconds or an HTTP
+/// date) or GitHub's `x-ratelimit-reset` (epoch seconds, only when the quota is exhausted).
+pub(crate) fn rate_limit_wait(h: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(str::trim);
+    if let Some(v) = get("retry-after") {
+        if let Ok(s) = v.parse::<u64>() {
+            return Some(Duration::from_secs(s));
+        }
+        if let Ok(d) = chrono::DateTime::parse_from_rfc2822(v) {
+            let s = (d.with_timezone(&Utc) - Utc::now()).num_seconds().max(0);
+            return Some(Duration::from_secs(s as u64));
+        }
+    }
+    if get("x-ratelimit-remaining") == Some("0") {
+        if let Some(reset) = get("x-ratelimit-reset").and_then(|v| v.parse::<i64>().ok()) {
+            return Some(Duration::from_secs(
+                (reset - Utc::now().timestamp()).max(0) as u64
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
