@@ -135,7 +135,8 @@ fn auto_subnet() -> Option<hickory_resolver::proto::rr::rdata::opt::ClientSubnet
         s.connect(target).ok()?;
         s.local_addr().ok().map(|a| a.ip())
     };
-    let ip = local("1.1.1.1:53", "0.0.0.0:0").or_else(|| local("[2606:4700:4700::1111]:53", "[::]:0"))?;
+    let ip = local("1.1.1.1:53", "0.0.0.0:0")
+        .or_else(|| local("[2606:4700:4700::1111]:53", "[::]:0"))?;
     if !probeable(ip) {
         return None;
     }
@@ -175,18 +176,25 @@ impl Engine {
                 .map(|b| Upstream::new(b, Role::Bootstrap, plain_env.clone()))
                 .collect(),
         );
-        let env = Arc::new(Env::new(timeout, s.dnssec, s.ipv6, tls.clone(), bootstrap.clone()));
+        let env = Arc::new(Env::new(
+            timeout,
+            s.dnssec,
+            s.ipv6,
+            tls.clone(),
+            bootstrap.clone(),
+        ));
         // Private resolvers are local plain servers; they are not DNSSEC-validated.
         let private_env = plain_env.clone();
 
         let mut shared: HashMap<(String, u8), Arc<Upstream>> = HashMap::new();
-        let mut get = |sp: &dns_syntax::UpstreamSpec, role: Role, env: &Arc<Env>| -> Arc<Upstream> {
-            let key = (format!("{}|{:?}", sp.label(), sp.ips), role as u8);
-            shared
-                .entry(key)
-                .or_insert_with(|| Upstream::new(sp.clone(), role, env.clone()))
-                .clone()
-        };
+        let mut get =
+            |sp: &dns_syntax::UpstreamSpec, role: Role, env: &Arc<Env>| -> Arc<Upstream> {
+                let key = (format!("{}|{:?}", sp.label(), sp.ips), role as u8);
+                shared
+                    .entry(key)
+                    .or_insert_with(|| Upstream::new(sp.clone(), role, env.clone()))
+                    .clone()
+            };
         let default: Vec<_> = rules
             .default
             .iter()
@@ -195,9 +203,17 @@ impl Engine {
         let rule_groups = rules
             .rules
             .iter()
-            .map(|r| r.upstreams.iter().map(|u| get(u, Role::Primary, &env)).collect())
+            .map(|r| {
+                r.upstreams
+                    .iter()
+                    .map(|u| get(u, Role::Primary, &env))
+                    .collect()
+            })
             .collect();
-        let fallback = fallback.iter().map(|u| get(u, Role::Fallback, &env)).collect();
+        let fallback = fallback
+            .iter()
+            .map(|u| get(u, Role::Fallback, &env))
+            .collect();
         let private = private
             .iter()
             .map(|u| get(u, Role::Private, &private_env))
@@ -428,7 +444,9 @@ impl Engine {
                 ),
             });
         }
-        if self.mode == DnsMode::FastestIp && self.race.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.mode == DnsMode::FastestIp
+            && self.race.enabled.load(std::sync::atomic::Ordering::Relaxed)
+        {
             ips = fastest_first(ips, &self.race).await;
         }
         let ttl = if ttl == u32::MAX { 30 } else { ttl };

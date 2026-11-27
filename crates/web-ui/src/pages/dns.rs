@@ -61,7 +61,8 @@ fn num_ok(s: &str, min: u64, max: u64) -> bool {
 }
 
 fn ms(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.1} ms")).unwrap_or_else(|| "-".into())
+    v.map(|v| format!("{v:.1} ms"))
+        .unwrap_or_else(|| "-".into())
 }
 
 /// A textarea with per-line validation messages below it.
@@ -170,7 +171,11 @@ impl Form {
             ("Upstreams", ListKind::Upstreams, self.servers.get()),
             ("Bootstrap", ListKind::Plain, self.bootstrap.get()),
             ("Fallback", ListKind::Flat, self.fallback.get()),
-            ("Private resolvers", ListKind::Plain, self.private_resolvers.get()),
+            (
+                "Private resolvers",
+                ListKind::Plain,
+                self.private_resolvers.get(),
+            ),
         ] {
             if let Some((n, e)) = list_errors(kind, &text).first() {
                 return Some(format!("{what}, line {n}: {e}"));
@@ -510,7 +515,9 @@ mod tests {
         let ups = "# note\n1.1.1.1\ntls://dns.google\n[/lan/]#\nnope\n[/a.com/]";
         let e = list_errors(ListKind::Upstreams, ups);
         assert_eq!(e.iter().map(|x| x.0).collect::<Vec<_>>(), [5]);
-        assert!(list_errors(ListKind::Flat, "[/a.com/]1.1.1.1")[0].1.contains("rules"));
+        assert!(list_errors(ListKind::Flat, "[/a.com/]1.1.1.1")[0]
+            .1
+            .contains("rules"));
         assert!(list_errors(ListKind::Flat, "tls://dns.google").is_empty());
         assert!(list_errors(ListKind::Plain, "1.1.1.1\n8.8.8.8:53").is_empty());
         assert_eq!(list_errors(ListKind::Plain, "tls://dns.google").len(), 1);

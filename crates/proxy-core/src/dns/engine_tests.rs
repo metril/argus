@@ -207,7 +207,11 @@ async fn dnscrypt_upstream_from_a_stamp_both_suites() {
         let srv = dnscrypt::testserver::start(es, Ipv4Addr::new(192, 0, 2, 40)).await;
         let stamp = stamp_dnscrypt(srv.addr, srv.provider_pk, &srv.provider_name);
         let e = engine(&settings(&[&stamp]));
-        assert_eq!(first(&e, "crypt.example").await, ip("192.0.2.40"), "es {es}");
+        assert_eq!(
+            first(&e, "crypt.example").await,
+            ip("192.0.2.40"),
+            "es {es}"
+        );
         assert_eq!(EngineResolver(e).stats()[0].transport, "dnscrypt");
     }
 }
@@ -219,7 +223,10 @@ async fn dnscrypt_rejects_a_certificate_signed_by_another_key() {
     let stamp = stamp_dnscrypt(srv.addr, [9u8; 32], &srv.provider_name);
     let e = engine(&settings(&[&stamp]));
     let err = e.lookup_name("crypt.example").await.unwrap_err();
-    assert!(err.message.to_lowercase().contains("certificate"), "{err:?}");
+    assert!(
+        err.message.to_lowercase().contains("certificate"),
+        "{err:?}"
+    );
 }
 
 // ---- routing ----
@@ -242,7 +249,11 @@ async fn per_domain_rules_pick_the_upstream() {
     assert_eq!(first(&e, "corp.test").await, ip("192.0.2.2"));
     assert_eq!(first(&e, "other.test").await, ip("192.0.2.1"));
     assert_eq!(first(&e, "h.sub.test").await, ip("192.0.2.3"));
-    assert_eq!(first(&e, "sub.test").await, ip("192.0.2.1"), "`*.` excludes the apex");
+    assert_eq!(
+        first(&e, "sub.test").await,
+        ip("192.0.2.1"),
+        "`*.` excludes the apex"
+    );
     // `#` sends the name to the default upstreams (and not the private resolvers).
     assert_eq!(first(&e, "printer.lan").await, ip("192.0.2.1"));
     assert!(!corp.names().contains(&"other.test".to_string()));
@@ -272,7 +283,11 @@ async fn private_names_and_ptr_go_to_the_private_resolvers() {
     let (def, private) = (
         stub::start(Behavior::answering("192.0.2.1")).await,
         stub::start(Behavior {
-            ptr: [("5.1.168.192.in-addr.arpa".to_string(), "nas.lan".to_string())].into(),
+            ptr: [(
+                "5.1.168.192.in-addr.arpa".to_string(),
+                "nas.lan".to_string(),
+            )]
+            .into(),
             ..Behavior::answering("10.0.0.5")
         })
         .await,
@@ -388,7 +403,11 @@ async fn a_lone_dead_upstream_turns_unhealthy_and_errors() {
         assert_eq!(err.kind, FailKind::Timeout);
     }
     let s = EngineResolver(e).stats();
-    assert!(!s[0].healthy && s[0].consecutive_failures >= 3, "{:?}", s[0]);
+    assert!(
+        !s[0].healthy && s[0].consecutive_failures >= 3,
+        "{:?}",
+        s[0]
+    );
 }
 
 #[tokio::test]
@@ -407,7 +426,11 @@ async fn parallel_mode_returns_the_first_answer() {
     let e = engine(&st);
     let t = std::time::Instant::now();
     assert_eq!(first(&e, "p.example").await, ip("192.0.2.1"));
-    assert!(t.elapsed() < Duration::from_millis(450), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() < Duration::from_millis(450),
+        "{:?}",
+        t.elapsed()
+    );
     // Both were asked.
     assert!(slow.count() >= 1 && fast.count() >= 1);
 }
@@ -512,7 +535,11 @@ async fn bootstrap_resolves_the_host_of_an_encrypted_upstream() {
     assert_eq!(first(&e, "viaboot.example").await, ip("192.0.2.50"));
     assert!(bs.names().contains(&"dns.test".to_string()));
     // The bootstrap server is asked about the upstream's host and nothing else.
-    assert!(bs.names().iter().all(|n| n == "dns.test"), "{:?}", bs.names());
+    assert!(
+        bs.names().iter().all(|n| n == "dns.test"),
+        "{:?}",
+        bs.names()
+    );
     // The address is kept: a second name does not ask again.
     let n = bs.count();
     first(&e, "second.example").await;
@@ -537,7 +564,10 @@ async fn bootstrap_failure_is_reported() {
     };
     let e = build(&st, Some(t.client), RaceOpts::default());
     let err = e.lookup_name("nobootstrap.example").await.unwrap_err();
-    assert!(err.message.contains("cannot resolve its address"), "{err:?}");
+    assert!(
+        err.message.contains("cannot resolve its address"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -670,7 +700,10 @@ async fn dnssec_validation_failure_is_an_error_and_is_not_cached_or_fallen_back_
 
     // The same server resolves fine with validation off.
     let off = CachedResolver::from_settings(&settings(&[&addr(&s)]));
-    assert_eq!(off.resolve("bogus.example").await.unwrap()[0], ip("192.0.2.66"));
+    assert_eq!(
+        off.resolve("bogus.example").await.unwrap()[0],
+        ip("192.0.2.66")
+    );
 }
 
 // ---- cache ----
@@ -823,7 +856,10 @@ async fn in_flight_lookups_finish_on_the_old_upstreams_during_a_swap() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     r.reconfigure(&settings(&[&addr(&new)]));
     assert_eq!(h.await.unwrap().unwrap()[0], ip("192.0.2.1"));
-    assert_eq!(r.resolve("after.example").await.unwrap()[0], ip("192.0.2.2"));
+    assert_eq!(
+        r.resolve("after.example").await.unwrap()[0],
+        ip("192.0.2.2")
+    );
 }
 
 #[tokio::test]
@@ -877,7 +913,10 @@ async fn upstream_lines_load_from_a_file_in_the_data_dns_folder() {
     assert_eq!(r.resolve("x.other.test").await.unwrap()[0], ip("192.0.2.1"));
     // An absolute path inside the folder works too.
     let abs = source(&f.display().to_string());
-    assert!(!load_upstream_lines(&abs, d.path()).await.unwrap().is_empty());
+    assert!(!load_upstream_lines(&abs, d.path())
+        .await
+        .unwrap()
+        .is_empty());
     assert!(load_upstream_lines(&settings(&[]), d.path())
         .await
         .unwrap()
@@ -897,7 +936,9 @@ async fn a_source_file_outside_the_dns_folder_is_refused() {
         "/etc/passwd".to_string(),
         outside.path().join("o.txt").display().to_string(),
     ] {
-        let e = load_upstream_lines(&source(&src), d.path()).await.unwrap_err();
+        let e = load_upstream_lines(&source(&src), d.path())
+            .await
+            .unwrap_err();
         assert!(!e.contains("SECRET") && !e.contains("root:"), "{src}: {e}");
     }
     // A symlink inside the folder pointing out is followed to its target and refused.
@@ -965,12 +1006,15 @@ async fn source_urls_must_be_https_and_public() {
 async fn downloads_stop_at_the_size_cap() {
     use bytes::Bytes;
     let chunks = |n: usize| {
-        futures_util::stream::iter((0..n).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 400]))))
+        futures_util::stream::iter(
+            (0..n).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; 400]))),
+        )
     };
     assert_eq!(read_capped(chunks(2), 1000).await.unwrap().len(), 800);
     assert!(read_capped(chunks(3), 1000).await.is_err());
     // An endless stream is cut off, not read to the end.
-    let endless = futures_util::stream::repeat_with(|| Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 4096])));
+    let endless =
+        futures_util::stream::repeat_with(|| Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 4096])));
     assert!(read_capped(Box::pin(endless), 1 << 20).await.is_err());
 }
 
@@ -1065,5 +1109,12 @@ async fn sinkholed_answers_still_reach_the_policy() {
     let policy = crate::policy::DestPolicy::new(false, &[])
         .unwrap()
         .with_resolver(Arc::new(DnsHandle(r)));
-    assert!(policy.resolve("ads.example", 443, None).await.is_err());
+    let e = policy.resolve("ads.example", 443, None).await.unwrap_err();
+    assert!(
+        e.to_string()
+            .contains(common::net_policy::Refusal::SINKHOLE_REASON),
+        "{e}"
+    );
+    // A sinkholed answer is never a candidate for the fastest-address race either.
+    assert!(!engine::probeable(ip("0.0.0.0")) && !engine::probeable(ip("127.0.0.1")));
 }

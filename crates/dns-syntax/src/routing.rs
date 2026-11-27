@@ -34,7 +34,10 @@ pub fn is_private_name(name: &str) -> bool {
 /// is padded with zeros, so it is judged by its leading part.
 pub fn reverse_ip(n: &str) -> Option<IpAddr> {
     if let Some(p) = n.strip_suffix(".in-addr.arpa") {
-        let o: Vec<u8> = p.split('.').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        let o: Vec<u8> = p
+            .split('.')
+            .map(|x| x.parse().ok())
+            .collect::<Option<_>>()?;
         if o.is_empty() || o.len() > 4 {
             return None;
         }

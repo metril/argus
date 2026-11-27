@@ -42,7 +42,9 @@ impl Role {
 /// A connection to one upstream, as a plain `DnsHandle` regardless of transport, so DNSSEC
 /// validation wraps all of them the same way.
 #[derive(Clone)]
-pub(crate) struct AnyHandle(Arc<dyn Fn(DnsRequest) -> BoxFut<Result<DnsResponse, NetError>> + Send + Sync>);
+pub(crate) struct AnyHandle(
+    Arc<dyn Fn(DnsRequest) -> BoxFut<Result<DnsResponse, NetError>> + Send + Sync>,
+);
 
 impl AnyHandle {
     pub(crate) fn new<F>(f: F) -> Self
@@ -85,7 +87,12 @@ impl Env {
         let mut opts = ResolverOpts::default();
         opts.timeout = timeout;
         opts.attempts = 1;
-        let pool = Arc::new(PoolContext::new(opts, TlsConfig { config: tls.clone() }));
+        let pool = Arc::new(PoolContext::new(
+            opts,
+            TlsConfig {
+                config: tls.clone(),
+            },
+        ));
         Self {
             timeout,
             dnssec,
@@ -261,7 +268,11 @@ impl Upstream {
         let c = &self.counters;
         let us = (rtt.as_micros() as u64).max(1);
         let old = c.rtt_us.load(Ordering::Relaxed);
-        let new = if old == 0 { us } else { (old * 7 + us * 3) / 10 };
+        let new = if old == 0 {
+            us
+        } else {
+            (old * 7 + us * 3) / 10
+        };
         c.rtt_us.store(new, Ordering::Relaxed);
         c.last_rtt_us.store(us, Ordering::Relaxed);
         c.consecutive.store(0, Ordering::Relaxed);
@@ -287,7 +298,8 @@ impl Upstream {
         Box::pin(async move {
             self.counters.queries.fetch_add(1, Ordering::Relaxed);
             let t0 = Instant::now();
-            let r = match tokio::time::timeout(self.env.timeout * 3, self.exchange_inner(msg)).await {
+            let r = match tokio::time::timeout(self.env.timeout * 3, self.exchange_inner(msg)).await
+            {
                 Ok(r) => r,
                 Err(_) => Err(DnsFailure::new(
                     FailKind::Timeout,
@@ -407,7 +419,10 @@ impl Upstream {
         };
         let spec = &self.spec;
         if spec.transport == Transport::DnsCrypt {
-            let info = spec.dnscrypt.clone().ok_or_else(|| fail(&"no stamp data"))?;
+            let info = spec
+                .dnscrypt
+                .clone()
+                .ok_or_else(|| fail(&"no stamp data"))?;
             let client = Arc::new(super::dnscrypt::DnsCrypt::new(
                 std::net::SocketAddr::new(ip, spec.port),
                 info,
@@ -454,9 +469,11 @@ impl Upstream {
                 let udp = connect(ProtocolConfig::Udp).await?;
                 let tcp: Arc<tokio::sync::OnceCell<DnsExchange<TokioRuntimeProvider>>> =
                     Arc::default();
-                let (pool, port, provider) = (self.env.pool.clone(), spec.port, self.env.provider.clone());
+                let (pool, port, provider) =
+                    (self.env.pool.clone(), spec.port, self.env.provider.clone());
                 return Ok(AnyHandle::new(move |req| {
-                    let (udp, tcp, pool, provider) = (udp.clone(), tcp.clone(), pool.clone(), provider.clone());
+                    let (udp, tcp, pool, provider) =
+                        (udp.clone(), tcp.clone(), pool.clone(), provider.clone());
                     Box::pin(async move {
                         let r = udp.send(req.clone()).first_answer().await?;
                         if !r.metadata.truncation {
@@ -466,9 +483,7 @@ impl Upstream {
                             .get_or_try_init(|| async {
                                 let mut cc = ConnectionConfig::new(ProtocolConfig::Tcp);
                                 cc.port = port;
-                                provider
-                                    .new_connection(ip, &cc, &pool)?
-                                    .await
+                                provider.new_connection(ip, &cc, &pool)?.await
                             })
                             .await?;
                         ex.send(req).first_answer().await
@@ -534,7 +549,10 @@ fn net_failure(label: &str, e: &NetError) -> DnsFailure {
     let l = s.to_ascii_lowercase();
     let kind = if matches!(e, NetError::Timeout) {
         FailKind::Timeout
-    } else if l.contains("dnssec") || l.contains("nsec") || l.contains("proof") || l.contains("bogus")
+    } else if l.contains("dnssec")
+        || l.contains("nsec")
+        || l.contains("proof")
+        || l.contains("bogus")
     {
         FailKind::Dnssec
     } else {

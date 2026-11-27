@@ -122,10 +122,16 @@ impl Core {
         let b = self.behavior.lock().clone();
         self.queries.fetch_add(1, Ordering::SeqCst);
         let qq = q.queries.first()?.clone();
-        let name = qq.name().to_utf8().trim_end_matches('.').to_ascii_lowercase();
+        let name = qq
+            .name()
+            .to_utf8()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         self.log.lock().push((name.clone(), qq.query_type()));
         if let Some(e) = &q.edns {
-            if let Some(EdnsOption::Subnet(s)) = e.option(hickory_resolver::proto::rr::rdata::opt::EdnsCode::Subnet) {
+            if let Some(EdnsOption::Subnet(s)) =
+                e.option(hickory_resolver::proto::rr::rdata::opt::EdnsCode::Subnet)
+            {
                 *self.last_ecs.lock() = Some((s.addr(), s.source_prefix()));
             }
         }
@@ -166,7 +172,11 @@ impl Core {
             RecordType::PTR => match b.ptr.get(&name) {
                 Some(h) => {
                     let n = Name::from_ascii(format!("{h}.")).unwrap();
-                    r.add_answer(Record::from_rdata(qq.name().clone(), b.ttl, RData::PTR(PTR(n))));
+                    r.add_answer(Record::from_rdata(
+                        qq.name().clone(),
+                        b.ttl,
+                        RData::PTR(PTR(n)),
+                    ));
                 }
                 None => r.metadata.response_code = ResponseCode::NXDomain,
             },
@@ -397,7 +407,8 @@ pub async fn start_h3(b: Behavior, t: &Tls) -> Stub {
             let c = core.clone();
             tokio::spawn(async move {
                 let Ok(conn) = inc.await else { return };
-                let Ok(mut h3c) = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await
+                let Ok(mut h3c) =
+                    h3::server::Connection::new(h3_quinn::Connection::new(conn)).await
                 else {
                     return;
                 };

@@ -6,9 +6,9 @@
 //! for truncated answers. Both authenticated-encryption suites are supported:
 //! X25519-XSalsa20Poly1305 (es-version 1) and X25519-XChaCha20Poly1305 (es-version 2).
 
-use dns_syntax::DnsCryptInfo;
 use crypto_box::aead::{generic_array::GenericArray, Aead};
 use crypto_box::{ChaChaBox, PublicKey, SalsaBox, SecretKey};
+use dns_syntax::DnsCryptInfo;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hickory_resolver::net::NetError;
 use hickory_resolver::proto::op::{Message, Query};
@@ -119,7 +119,9 @@ impl Cert {
     fn open(&self, nonce: &[u8; 24], boxed: &[u8]) -> Result<Vec<u8>, String> {
         let n = GenericArray::from_slice(nonce);
         match &self.suite {
-            Suite::Salsa(b) => b.decrypt(n, boxed).map_err(|_| err("authentication failed")),
+            Suite::Salsa(b) => b
+                .decrypt(n, boxed)
+                .map_err(|_| err("authentication failed")),
             Suite::ChaCha(b) => {
                 if boxed.len() < 16 {
                     return Err(err("short response"));
@@ -169,7 +171,9 @@ impl DnsCrypt {
         } else {
             "[::]:0"
         };
-        let s = tokio::net::UdpSocket::bind(bind).await.map_err(|e| e.to_string())?;
+        let s = tokio::net::UdpSocket::bind(bind)
+            .await
+            .map_err(|e| e.to_string())?;
         s.connect(self.addr).await.map_err(|e| e.to_string())?;
         s.send(packet).await.map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; 4096];
@@ -208,9 +212,10 @@ impl DnsCrypt {
         m.add_query(Query::query(name, RecordType::TXT));
         m.metadata.id = rand::random();
         let bytes = m.to_vec().map_err(|e| e.to_string())?;
-        let mut resp = self.udp(&bytes).await.and_then(|b| {
-            Message::from_vec(&b).map_err(|e| e.to_string())
-        })?;
+        let mut resp = self
+            .udp(&bytes)
+            .await
+            .and_then(|b| Message::from_vec(&b).map_err(|e| e.to_string()))?;
         if resp.metadata.truncation {
             let b = self.tcp(&bytes).await?;
             resp = Message::from_vec(&b).map_err(|e| e.to_string())?;
@@ -245,7 +250,10 @@ impl DnsCrypt {
     }
 
     /// Exchange one DNS message.
-    pub async fn exchange(&self, msg: Message) -> Result<hickory_resolver::proto::op::DnsResponse, DnsCryptError> {
+    pub async fn exchange(
+        &self,
+        msg: Message,
+    ) -> Result<hickory_resolver::proto::op::DnsResponse, DnsCryptError> {
         self.exchange_inner(msg).await.map_err(DnsCryptError)
     }
 

@@ -36,19 +36,34 @@ fn stamp(proto: u8, parts: &[Vec<u8>]) -> String {
 #[test]
 fn plain_and_scheme_forms() {
     let s = parse_upstream("1.1.1.1").unwrap();
-    assert_eq!((s.transport, s.host.as_str(), s.port), (Transport::Udp, "1.1.1.1", 53));
+    assert_eq!(
+        (s.transport, s.host.as_str(), s.port),
+        (Transport::Udp, "1.1.1.1", 53)
+    );
     let s = parse_upstream("9.9.9.9:5353").unwrap();
     assert_eq!(s.port, 5353);
     let s = parse_upstream("[2606:4700::1111]:5353").unwrap();
     assert_eq!((s.host.as_str(), s.port), ("2606:4700::1111", 5353));
     let s = parse_upstream("2606:4700::1111").unwrap();
     assert_eq!((s.host.as_str(), s.port), ("2606:4700::1111", 53));
-    assert_eq!(parse_upstream("tcp://8.8.8.8").unwrap().transport, Transport::Tcp);
-    assert_eq!(parse_upstream("udp://8.8.8.8:53").unwrap().transport, Transport::Udp);
+    assert_eq!(
+        parse_upstream("tcp://8.8.8.8").unwrap().transport,
+        Transport::Tcp
+    );
+    assert_eq!(
+        parse_upstream("udp://8.8.8.8:53").unwrap().transport,
+        Transport::Udp
+    );
     let s = parse_upstream("tls://dns.google").unwrap();
-    assert_eq!((s.transport, s.host.as_str(), s.port), (Transport::Tls, "dns.google", 853));
+    assert_eq!(
+        (s.transport, s.host.as_str(), s.port),
+        (Transport::Tls, "dns.google", 853)
+    );
     let s = parse_upstream("https://dns.google/dns-query").unwrap();
-    assert_eq!((s.transport, s.port, s.path.as_str()), (Transport::Https, 443, "/dns-query"));
+    assert_eq!(
+        (s.transport, s.port, s.path.as_str()),
+        (Transport::Https, 443, "/dns-query")
+    );
     let s = parse_upstream("https://dns.google:8443").unwrap();
     assert_eq!((s.port, s.path.as_str()), (8443, "/dns-query"));
     let s = parse_upstream("h3://dns.google/dns-query").unwrap();
@@ -63,7 +78,9 @@ fn bootstrap_pin_suffix() {
     assert_eq!(s.host, "dns.google");
     assert_eq!(s.ips.len(), 2);
     assert!(!s.needs_bootstrap());
-    assert!(parse_upstream("tls://dns.google").unwrap().needs_bootstrap());
+    assert!(parse_upstream("tls://dns.google")
+        .unwrap()
+        .needs_bootstrap());
     assert!(parse_upstream("tls://dns.google#nope").is_err());
     assert!(parse_upstream("1.1.1.1#8.8.8.8").is_err());
 }
@@ -111,7 +128,10 @@ fn domain_rules() {
         let Line::Rule(r) = parse_line(tail).unwrap().unwrap() else {
             panic!()
         };
-        assert!(r.upstreams.is_empty(), "{tail}: `#` means the default upstreams");
+        assert!(
+            r.upstreams.is_empty(),
+            "{tail}: `#` means the default upstreams"
+        );
     }
     let Line::Rule(r) = parse_line("[//]192.168.1.1").unwrap().unwrap() else {
         panic!()
@@ -134,12 +154,19 @@ fn rule_lookup_prefers_the_most_specific_domain() {
         "[//]10.0.0.4",
     ])
     .unwrap();
-    let up = |n: &str| u.rule_for(n).map(|r| r.upstreams.first().map(|s| s.host.clone()));
+    let up = |n: &str| {
+        u.rule_for(n)
+            .map(|r| r.upstreams.first().map(|s| s.host.clone()))
+    };
     assert_eq!(up("a.example.com"), Some(Some("10.0.0.1".into())));
     assert_eq!(up("example.com"), Some(Some("10.0.0.1".into())));
     assert_eq!(up("x.internal.example.com"), Some(Some("10.0.0.2".into())));
     assert_eq!(up("example.org"), None);
-    assert_eq!(up("notexample.com"), None, "suffix match is on label boundaries");
+    assert_eq!(
+        up("notexample.com"),
+        None,
+        "suffix match is on label boundaries"
+    );
     assert_eq!(up("a.wild.test"), Some(Some("10.0.0.3".into())));
     assert_eq!(up("wild.test"), None, "`*.` excludes the apex");
     assert_eq!(up("printer.lan"), Some(None), "`#` rule: default upstreams");
@@ -165,7 +192,10 @@ fn flat_and_plain_lists() {
 #[test]
 fn stamps_plain_doh_dot_doq() {
     let s = parse_upstream(&stamp(0x00, &[lp(b"8.8.4.4:5353")])).unwrap();
-    assert_eq!((s.transport, s.host.as_str(), s.port), (Transport::Udp, "8.8.4.4", 5353));
+    assert_eq!(
+        (s.transport, s.host.as_str(), s.port),
+        (Transport::Udp, "8.8.4.4", 5353)
+    );
 
     let doh = stamp(
         0x02,
@@ -177,16 +207,30 @@ fn stamps_plain_doh_dot_doq() {
         ],
     );
     let s = parse_upstream(&doh).unwrap();
-    assert_eq!((s.transport, s.host.as_str(), s.port, s.path.as_str()), (Transport::Https, "cloudflare-dns.com", 443, "/dns-query"));
+    assert_eq!(
+        (s.transport, s.host.as_str(), s.port, s.path.as_str()),
+        (Transport::Https, "cloudflare-dns.com", 443, "/dns-query")
+    );
     assert_eq!(s.ips, ["1.0.0.1".parse::<IpAddr>().unwrap()]);
     assert!(!s.needs_bootstrap());
 
     let dot = stamp(0x03, &[lp(b""), vlp(&[]), lp(b"dns.example:8853")]);
     let s = parse_upstream(&dot).unwrap();
-    assert_eq!((s.transport, s.host.as_str(), s.port), (Transport::Tls, "dns.example", 8853));
+    assert_eq!(
+        (s.transport, s.host.as_str(), s.port),
+        (Transport::Tls, "dns.example", 8853)
+    );
     assert!(s.needs_bootstrap());
 
-    let doq = stamp(0x04, &[lp(b""), vlp(&[]), lp(b"q.example"), vlp(&[b"9.9.9.9", b"149.112.112.112"])]);
+    let doq = stamp(
+        0x04,
+        &[
+            lp(b""),
+            vlp(&[]),
+            lp(b"q.example"),
+            vlp(&[b"9.9.9.9", b"149.112.112.112"]),
+        ],
+    );
     let s = parse_upstream(&doq).unwrap();
     assert_eq!(s.transport, Transport::Quic);
     assert_eq!(s.ips.len(), 2);
@@ -197,7 +241,11 @@ fn stamp_dnscrypt() {
     let pk = [7u8; 32];
     let st = stamp(
         0x01,
-        &[lp(b"[2001:db8::1]:5443"), lp(&pk), lp(b"2.dnscrypt-cert.example.com")],
+        &[
+            lp(b"[2001:db8::1]:5443"),
+            lp(&pk),
+            lp(b"2.dnscrypt-cert.example.com"),
+        ],
     );
     let s = parse_upstream(&st).unwrap();
     assert_eq!(s.transport, Transport::DnsCrypt);
@@ -211,26 +259,53 @@ fn stamp_dnscrypt() {
 
 #[test]
 fn stamp_errors() {
-    assert!(parse_upstream(&stamp(0x05, &[lp(b"x")])).unwrap_err().contains("Oblivious"));
+    assert!(parse_upstream(&stamp(0x05, &[lp(b"x")]))
+        .unwrap_err()
+        .contains("Oblivious"));
     assert!(parse_upstream(&stamp(0x81, &[lp(b"x")])).is_err());
     assert!(parse_upstream(&stamp(0x7f, &[])).is_err());
-    assert!(parse_upstream(&stamp(0x02, &[lp(b"1.1.1.1")])).unwrap_err().contains("truncated"));
+    assert!(parse_upstream(&stamp(0x02, &[lp(b"1.1.1.1")]))
+        .unwrap_err()
+        .contains("truncated"));
 }
 
 #[test]
 fn real_world_stamp() {
     // Cloudflare's published DoH stamp.
-    let s = parse_upstream("sdns://AgcAAAAAAAAABzEuMC4wLjEAEmNsb3VkZmxhcmUtZG5zLmNvbQovZG5zLXF1ZXJ5").unwrap();
-    assert_eq!((s.transport, s.host.as_str()), (Transport::Https, "cloudflare-dns.com"));
+    let s =
+        parse_upstream("sdns://AgcAAAAAAAAABzEuMC4wLjEAEmNsb3VkZmxhcmUtZG5zLmNvbQovZG5zLXF1ZXJ5")
+            .unwrap();
+    assert_eq!(
+        (s.transport, s.host.as_str()),
+        (Transport::Https, "cloudflare-dns.com")
+    );
     assert_eq!(s.path, "/dns-query");
 }
 
 #[test]
 fn private_names() {
-    for n in ["printer.lan", "nas.local", "x.home.arpa", "router", "a.b.internal", "1.0.0.10.in-addr.arpa", "10.in-addr.arpa", "5.1.168.192.in-addr.arpa", "1.0.16.172.in-addr.arpa", "1.0.0.127.in-addr.arpa", "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"] {
+    for n in [
+        "printer.lan",
+        "nas.local",
+        "x.home.arpa",
+        "router",
+        "a.b.internal",
+        "1.0.0.10.in-addr.arpa",
+        "10.in-addr.arpa",
+        "5.1.168.192.in-addr.arpa",
+        "1.0.16.172.in-addr.arpa",
+        "1.0.0.127.in-addr.arpa",
+        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+    ] {
         assert!(is_private_name(n), "{n}");
     }
-    for n in ["example.com", "8.8.8.8.in-addr.arpa", "1.0.32.172.in-addr.arpa", "localhost.example.com", "2.0.0.192.in-addr.arpa"] {
+    for n in [
+        "example.com",
+        "8.8.8.8.in-addr.arpa",
+        "1.0.32.172.in-addr.arpa",
+        "localhost.example.com",
+        "2.0.0.192.in-addr.arpa",
+    ] {
         assert!(!is_private_name(n), "{n}");
     }
     assert_eq!(
@@ -238,6 +313,10 @@ fn private_names() {
         "5.1.168.192.in-addr.arpa"
     );
     assert!(private_reverse_zone("fd00::1".parse().unwrap()).ends_with(".ip6.arpa"));
-    assert!(is_private_name(&private_reverse_zone("fd00::1".parse().unwrap())));
-    assert!(!is_private_name(&private_reverse_zone("2606:4700::1111".parse().unwrap())));
+    assert!(is_private_name(&private_reverse_zone(
+        "fd00::1".parse().unwrap()
+    )));
+    assert!(!is_private_name(&private_reverse_zone(
+        "2606:4700::1111".parse().unwrap()
+    )));
 }

@@ -320,7 +320,13 @@ impl DnsSettings {
         dns_syntax::parse_plain(&self.bootstrap).map_err(|e| fmt_errs("dns.bootstrap", e))?;
         dns_syntax::parse_plain(&self.private_resolvers)
             .map_err(|e| fmt_errs("dns.private_resolvers", e))?;
-        if self.servers.len().max(self.fallback.len()).max(self.bootstrap.len()) > 256 {
+        if self
+            .servers
+            .len()
+            .max(self.fallback.len())
+            .max(self.bootstrap.len())
+            > 256
+        {
             return Err("dns: at most 256 lines per list".into());
         }
         if self.cache_size == 0 || self.cache_size > 10_000_000 {
@@ -1634,11 +1640,17 @@ mod tests {
         c.dns.ecs = DnsEcs::Auto;
         c.save_overlay(&b, &o).unwrap();
         let text = std::fs::read_to_string(&o).unwrap();
-        assert!(text.contains("fastest_ip") && text.contains("optimistic_cache"), "{text}");
+        assert!(
+            text.contains("fastest_ip") && text.contains("optimistic_cache"),
+            "{text}"
+        );
         let back = ProxyConfig::load_layered(&b, &o).unwrap();
         assert_eq!(back.dns.servers, c.dns.servers);
         assert_eq!(back.dns.mode, DnsMode::FastestIp);
         assert!(back.dns.optimistic_cache && back.dns.ecs == DnsEcs::Auto);
-        assert!(back.dns.ipv6 && back.dns.private_rdns, "untouched defaults stay");
+        assert!(
+            back.dns.ipv6 && back.dns.private_rdns,
+            "untouched defaults stay"
+        );
     }
 }

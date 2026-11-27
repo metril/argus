@@ -142,8 +142,9 @@ impl DomainPattern {
     /// Specificity of a match (label count), `None` if `name` is not covered.
     pub fn matches(&self, name: &str) -> Option<usize> {
         match self {
-            DomainPattern::Suffix(d) => (name == d || name.ends_with(&format!(".{d}")))
-                .then(|| d.matches('.').count() + 1),
+            DomainPattern::Suffix(d) => {
+                (name == d || name.ends_with(&format!(".{d}"))).then(|| d.matches('.').count() + 1)
+            }
             DomainPattern::Subdomains(d) => name
                 .ends_with(&format!(".{d}"))
                 .then(|| d.matches('.').count() + 1),
@@ -260,7 +261,9 @@ pub fn parse_line(raw: &str) -> Result<Option<Line>, String> {
         return Ok(None);
     }
     if let Some(rest) = line.strip_prefix("[/") {
-        let end = rest.find("/]").ok_or("missing `/]` after the domain list")?;
+        let end = rest
+            .find("/]")
+            .ok_or("missing `/]` after the domain list")?;
         let domains = parse_domains(&rest[..end])?;
         let tail = rest[end + 2..].trim();
         let upstreams = if tail.is_empty() || tail == "#" {

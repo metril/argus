@@ -301,10 +301,7 @@ impl CachedResolver {
 
     /// [`Self::from_settings`] with the lines of `upstreams_source` already loaded.
     pub fn from_settings_with(settings: &DnsSettings, extra_lines: &[String]) -> Self {
-        let me = Self::new(
-            system_resolver(),
-            DnsCacheConfig::from(settings),
-        );
+        let me = Self::new(system_resolver(), DnsCacheConfig::from(settings));
         me.reconfigure_lines(settings, extra_lines);
         me
     }
@@ -519,7 +516,9 @@ async fn read_source_file(src: &str, data_dir: &std::path::Path) -> Result<Strin
         .await
         .map_err(|_| "dns.upstreams_source: file not found".to_string())?;
     if !real.starts_with(&base) {
-        return Err("dns.upstreams_source must be a file inside the data directory's dns folder".into());
+        return Err(
+            "dns.upstreams_source must be a file inside the data directory's dns folder".into(),
+        );
     }
     let f = tokio::fs::File::open(&real)
         .await
@@ -536,7 +535,8 @@ async fn read_source_file(src: &str, data_dir: &std::path::Path) -> Result<Strin
 }
 
 async fn fetch_source_url(src: &str) -> Result<String, String> {
-    let url = url::Url::parse(src).map_err(|_| "dns.upstreams_source is not a valid URL".to_string())?;
+    let url =
+        url::Url::parse(src).map_err(|_| "dns.upstreams_source is not a valid URL".to_string())?;
     if url.scheme() != "https" {
         return Err("dns.upstreams_source URLs must be https".into());
     }

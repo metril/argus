@@ -1,7 +1,7 @@
 //! Upstream proxy: stub CONNECT and SOCKS5 proxies record what Argus asks them for.
 
 use super::*;
-use crate::dns::{BackendResult, Resolver, DnsCacheConfig, DnsFailure, DnsHandle, FailKind};
+use crate::dns::{BackendResult, DnsCacheConfig, DnsFailure, DnsHandle, FailKind, Resolver};
 use crate::upstream::{build_upstream_client, UpstreamOptions};
 use common::config::UpstreamProxyKind::{Http, Socks5};
 use rcgen::{

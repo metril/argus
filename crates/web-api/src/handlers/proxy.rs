@@ -5,9 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api_types::{
-    BindResult, ListenerFlagsView, MessageResponse, ProxyConfigResponse,
-    UpdateProxyConfigRequest, UpdateProxyConfigResponse, UpstreamProxyDto, UpstreamProxyTestResult,
-    UpstreamProxyUpdate,
+    BindResult, ListenerFlagsView, MessageResponse, ProxyConfigResponse, UpdateProxyConfigRequest,
+    UpdateProxyConfigResponse, UpstreamProxyDto, UpstreamProxyTestResult, UpstreamProxyUpdate,
 };
 use axum::{
     extract::State,
