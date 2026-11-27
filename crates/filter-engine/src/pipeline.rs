@@ -153,6 +153,29 @@ pub(crate) fn strip_redirects(rules: &str) -> String {
     out
 }
 
+/// Drop AdGuard's bare-host exceptions `@@://host^|` (no options). AdGuard ships them to keep
+/// DNS-level / HTTPS-filtering-off setups from breaking hosts like googleadservices.com, where the
+/// full URL is never seen. Here every URL is visible and matched, so such an exception would only
+/// unblock the host's root URL (`https://host/`) while `||host^` blocks everything else.
+pub(crate) fn strip_host_only_exceptions(rules: &str) -> String {
+    let mut out = String::with_capacity(rules.len());
+    for line in rules.lines() {
+        let host_only = line
+            .strip_prefix("@@://")
+            .and_then(|r| r.strip_suffix("^|"))
+            .is_some_and(|h| {
+                !h.is_empty()
+                    && h.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            });
+        if !host_only {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Convert, dedupe and compile `inputs`.
 pub fn build_set(inputs: &[ListInput]) -> BuiltSet {
     build_set_checked(inputs, None)
@@ -183,7 +206,7 @@ pub fn build_set_checked(
     // blocks. Keep the block, drop the stub.
     for (c, i) in converted.iter_mut().zip(inputs) {
         if is_adguard_origin(i) {
-            c.rules = strip_redirects(&c.rules);
+            c.rules = strip_host_only_exceptions(&strip_redirects(&c.rules));
         }
     }
 
@@ -360,6 +383,23 @@ mod tests {
         assert_eq!(e.network + e.cosmetic, 0);
         assert_eq!(e.duplicates, 6);
         assert_eq!(e.rejected, 0);
+    }
+
+    #[test]
+    fn adguard_host_only_exceptions_do_not_unblock_the_host_root() {
+        let rules = "||googleadservices.com^\n@@://googleadservices.com^|\n\
+                     @@://www.googleadservices.com^|\n@@://ok.test/x^|\n@@||keep.test^\n";
+        assert_eq!(
+            strip_host_only_exceptions(rules),
+            "||googleadservices.com^\n@@://ok.test/x^|\n@@||keep.test^\n"
+        );
+        let built = build_set(&[input("adguard-mobile", rules, ListFormat::Ubo, false)]);
+        let engine = crate::SharedEngine::default();
+        built.install_into(&engine);
+        for ty in ["xhr", "other"] {
+            let r = engine.check("https://googleadservices.com/", "https://page.test/", ty);
+            assert!(r.blocked, "{ty}: {r:?}");
+        }
     }
 
     #[test]
