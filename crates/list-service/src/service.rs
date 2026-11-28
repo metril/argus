@@ -1167,14 +1167,18 @@ impl ListService {
                 // Store writes (content file, metadata, status) are blocking IO: off the async
                 // threads.
                 let store = self.store.clone();
+                let changed = cached.as_deref() != Some(text.as_str());
                 let (l, st, t) = (list.clone(), status.clone(), text.clone());
                 let res = tokio::task::spawn_blocking(move || {
-                    // The stored digest describes the text being replaced: drop it so the lines
-                    // viewer re-keys on the new text (the next build input stores the new one).
                     let mut st = st;
-                    st.content_sha = None;
-                    if let Err(e) = store.put_content(&l.id, &t) {
-                        warn!("Failed to cache content for {}: {e}", l.name);
+                    if changed {
+                        // The stored digest describes the text being replaced: drop it so the
+                        // lines viewer re-keys on the new text (the next build input stores the
+                        // new one). Identical text keeps its digest and its file.
+                        st.content_sha = None;
+                        if let Err(e) = store.put_content(&l.id, &t) {
+                            warn!("Failed to cache content for {}: {e}", l.name);
+                        }
                     }
                     // Fetch metadata only, on the list as stored now: never `enabled`, and a
                     // list deleted meanwhile stays deleted.

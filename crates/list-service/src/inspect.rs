@@ -659,6 +659,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_identical_refetch_keeps_the_digest_and_does_not_rebuild_a_set() {
+        use axum::{routing::get, Router};
+        let app = Router::new().route("/a.txt", get(|| async { "||a.test^\n" }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let (svc, _d) = service(&[("a", "||a.test^\n", true, false)]);
+        let mut list = svc.store().get("a").unwrap().unwrap();
+        list.url = format!("http://{addr}/a.txt");
+        svc.store().upsert(&list).unwrap();
+        svc.reload_now().await;
+        let key = crate::sets::SetKey::new(&["a".to_string()]);
+        svc.engine_for(&["a".to_string()]).await.unwrap();
+        let (digest, builds) = (
+            svc.store().get_status("a").unwrap().content_sha,
+            svc.set_build_count(),
+        );
+        assert!(digest.is_some());
+        svc.fetch_one(list, true).await.expect("fetched");
+        assert_eq!(svc.store().get_status("a").unwrap().content_sha, digest);
+        assert!(svc.set_is_current(&key));
+        svc.reload_now().await;
+        assert_eq!(svc.set_build_count(), builds, "no rebuild for equal text");
+    }
+
+    #[tokio::test]
     async fn a_classification_waits_for_a_running_build() {
         let (svc, _d) = service(&[("off", "||a.test^\n", false, false)]);
         svc.busy.send_replace(true);
