@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 
 const P: &str = "/api/v1/profiles";
 const D: &str = "/api/v1/devices";
-const ALL_PROFILE_SCOPES: [&str; 11] = [
+const ALL_PROFILE_SCOPES: [&str; 12] = [
+    "lists:read",
     "profiles:read",
     "profiles:write",
     "devices:read",

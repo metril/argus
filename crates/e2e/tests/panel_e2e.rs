@@ -174,6 +174,47 @@ e2e_test!(
     }
 );
 
+// The per-site switch stops blocking, not what the user asked for separately: the panel is still
+// injected, but without the cosmetic observer, and the policy is adapted only for what was added.
+e2e_test!(
+    panel_is_the_only_injection_when_the_site_switch_is_off,
+    rules = [
+        "app.test##.ad",
+        "||adblock.invalid^",
+        "@@||adblock.invalid^$domain=app.test"
+    ],
+    |env| {
+        setup(&env, PanelAuth::None);
+        env.origin.route(
+            "/p",
+            MockResponse::html(PAGE).header(
+                "content-security-policy",
+                "script-src 'nonce-page'; connect-src 'self'",
+            ),
+        );
+        let html = env
+            .client()
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("app.test", "/p"),
+            )
+            .header("sec-fetch-dest", "document")
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(html.contains("/__adblock__/boot."), "{html}");
+        let i = html.find("id=\"__ab_cfg\">").expect("cfg") + "id=\"__ab_cfg\">".len();
+        let cfg: Value = serde_json::from_str(&html[i..i + html[i..].find('<').unwrap()]).unwrap();
+        assert_eq!(cfg["o"], json!(false), "no cosmetic observer: {cfg}");
+        assert!(cfg.get("k").is_some(), "panel hotkey present: {cfg}");
+        assert!(!html.contains("__adblock_cosmetic"), "{html}");
+    }
+);
+
 e2e_test!(confirm_and_apply_with_the_pin, rules = [], |env| {
     let store = setup(&env, PanelAuth::Pin);
     let c = env.client();

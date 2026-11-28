@@ -257,7 +257,9 @@ impl RewriteStage {
                     let apply = match rule.when {
                         HtmlWhen::Always => true,
                         HtmlWhen::UrlDenied { attr, cap } => {
-                            el.get_attribute(attr).is_some_and(|v| {
+                            el.get_attribute(attr).is_some_and(|raw| {
+                                // Judge what the browser will fetch, not the raw markup.
+                                let v = decode_attr_entities(&raw);
                                 let page = ph.compiled.decide(&ph.scheme, &ph.host, ph.port);
                                 if attr == "ping" {
                                     v.split_whitespace().any(|u| !page.allows_url(cap, u))
@@ -322,10 +324,14 @@ impl RewriteStage {
         if meta_csp.is_some() || transcode {
             handlers.push(element!("meta", move |el| {
                 if let Some(he) = el.get_attribute("http-equiv") {
+                    let he = decode_attr_entities(&he);
                     if he.eq_ignore_ascii_case("content-security-policy") {
                         if let (Some(f), Some(c)) = (&meta_csp, el.get_attribute("content")) {
-                            if let Some(new) = f(&c) {
-                                el.set_attribute("content", &new)?;
+                            // The attribute comes raw: the browser decodes character references
+                            // (`&#39;none&#39;` is `'none'`) before it parses the policy, so the
+                            // adapter sees the decoded text and its result is encoded back.
+                            if let Some(new) = f(&decode_attr_entities(&c)) {
+                                el.set_attribute("content", &encode_attr(&new))?;
                             }
                         }
                     } else if transcode && he.eq_ignore_ascii_case("content-type") {
@@ -591,4 +597,256 @@ pub fn apply_element_filters(
     Ok(Rc::try_unwrap(out)
         .map(RefCell::into_inner)
         .unwrap_or_default())
+}
+
+/// Named references the HTML spec also accepts without the closing `;` (legacy names).
+const LEGACY_NAMES: &[&str] = &[
+    "AElig", "AMP", "Aacute", "Acirc", "Agrave", "Aring", "Atilde", "Auml", "COPY", "Ccedil",
+    "ETH", "Eacute", "Ecirc", "Egrave", "Euml", "GT", "Iacute", "Icirc", "Igrave", "Iuml", "LT",
+    "Ntilde", "Oacute", "Ocirc", "Ograve", "Oslash", "Otilde", "Ouml", "QUOT", "REG", "THORN",
+    "Uacute", "Ucirc", "Ugrave", "Uuml", "Yacute", "aacute", "acirc", "acute", "aelig", "agrave",
+    "amp", "aring", "atilde", "auml", "brvbar", "ccedil", "cedil", "cent", "copy", "curren", "deg",
+    "divide", "eacute", "ecirc", "egrave", "eth", "euml", "frac12", "frac14", "frac34", "gt",
+    "iacute", "icirc", "iexcl", "igrave", "iquest", "iuml", "laquo", "lt", "macr", "micro",
+    "middot", "nbsp", "not", "ntilde", "oacute", "ocirc", "ograve", "ordf", "ordm", "oslash",
+    "otilde", "ouml", "para", "plusmn", "pound", "quot", "raquo", "reg", "sect", "shy", "sup1",
+    "sup2", "sup3", "szlig", "thorn", "times", "uacute", "ucirc", "ugrave", "uml", "uuml",
+    "yacute", "yen", "yuml",
+];
+
+/// The HTML spec's remapping of numeric references in the C1 range (`&#150;` is an en dash).
+fn c1_remap(n: u32) -> Option<char> {
+    let c = match n {
+        0x80 => 0x20AC,
+        0x82 => 0x201A,
+        0x83 => 0x0192,
+        0x84 => 0x201E,
+        0x85 => 0x2026,
+        0x86 => 0x2020,
+        0x87 => 0x2021,
+        0x88 => 0x02C6,
+        0x89 => 0x2030,
+        0x8A => 0x0160,
+        0x8B => 0x2039,
+        0x8C => 0x0152,
+        0x8E => 0x017D,
+        0x91 => 0x2018,
+        0x92 => 0x2019,
+        0x93 => 0x201C,
+        0x94 => 0x201D,
+        0x95 => 0x2022,
+        0x96 => 0x2013,
+        0x97 => 0x2014,
+        0x98 => 0x02DC,
+        0x99 => 0x2122,
+        0x9A => 0x0161,
+        0x9B => 0x203A,
+        0x9C => 0x0153,
+        0x9E => 0x017E,
+        0x9F => 0x0178,
+        _ => return None,
+    };
+    char::from_u32(c)
+}
+
+/// The text of the named reference `&name;`, if the HTML spec defines it.
+fn named_reference(name: &str) -> Option<String> {
+    let probe = format!("&{name};");
+    let out = html_escape::decode_html_entities(&probe);
+    (out != probe).then(|| out.into_owned())
+}
+
+/// Decode character references in an attribute value the way a browser does: numeric references
+/// with or without the `;` (any number of digits, `&#0;`, surrogates and values past U+10FFFF
+/// become U+FFFD, the C1 range is remapped), every named reference of the spec, and the legacy
+/// names without `;` except, as the spec says for attribute values, when followed by `=` or an
+/// ASCII letter or digit. Text is decoded once: `&amp;#39;` is `&#39;`.
+fn decode_attr_entities(v: &str) -> std::borrow::Cow<'_, str> {
+    if !v.contains('&') {
+        return v.into();
+    }
+    let mut out = String::with_capacity(v.len());
+    let mut rest = v;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let after = &rest[1..];
+        // Some((decoded text, bytes consumed from `rest`)).
+        let hit: Option<(String, usize)> = if let Some(num) = after.strip_prefix('#') {
+            let (hex, digits) = match num.strip_prefix(['x', 'X']) {
+                Some(h) => (true, h),
+                None => (false, num),
+            };
+            let len = digits
+                .bytes()
+                .take_while(|b| {
+                    if hex {
+                        b.is_ascii_hexdigit()
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
+                .count();
+            if len == 0 {
+                None
+            } else {
+                let value = digits[..len]
+                    .bytes()
+                    .try_fold(0u32, |a, b| {
+                        let d = (b as char).to_digit(if hex { 16 } else { 10 })?;
+                        a.checked_mul(if hex { 16 } else { 10 })?.checked_add(d)
+                    })
+                    .unwrap_or(u32::MAX);
+                let c = c1_remap(value).unwrap_or_else(|| match value {
+                    0 => '\u{FFFD}',
+                    _ => char::from_u32(value).unwrap_or('\u{FFFD}'),
+                });
+                let semi = usize::from(digits[len..].starts_with(';'));
+                let consumed = 2 + usize::from(hex) + len + semi;
+                Some((c.to_string(), consumed))
+            }
+        } else {
+            let run = after.bytes().take_while(u8::is_ascii_alphanumeric).count();
+            let name = &after[..run];
+            let next = after[run..].chars().next();
+            if run > 0 && next == Some(';') {
+                named_reference(name)
+                    .map(|t| (t, 1 + run + 1))
+                    .or_else(|| legacy_prefix(name, next, after, run))
+            } else if run > 0 {
+                legacy_prefix(name, next, after, run)
+            } else {
+                None
+            }
+        };
+        match hit {
+            Some((text, used)) => {
+                out.push_str(&text);
+                rest = &rest[used..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.into()
+}
+
+/// The longest legacy name that starts `name` (no `;`). In an attribute value it only counts
+/// when the character after it is neither `=` nor an ASCII letter or digit.
+fn legacy_prefix(
+    name: &str,
+    next: Option<char>,
+    after: &str,
+    run: usize,
+) -> Option<(String, usize)> {
+    let best = LEGACY_NAMES
+        .iter()
+        .filter(|n| name.starts_with(**n))
+        .max_by_key(|n| n.len())?;
+    let following = if best.len() == run {
+        next
+    } else {
+        after[best.len()..].chars().next()
+    };
+    if following.is_some_and(|c| c == '=' || c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    named_reference(best).map(|t| (t, 1 + best.len()))
+}
+
+/// Escape text for a double-quoted attribute value.
+fn encode_attr(v: &str) -> String {
+    v.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod attr_entity_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_numeric_and_named_references() {
+        assert_eq!(
+            decode_attr_entities(
+                "default-src &#39;none&#39;; a=&#x27;b&#X27; &amp;&quot;&lt;&gt;&apos;"
+            ),
+            "default-src 'none'; a='b' &\"<>'"
+        );
+    }
+
+    #[test]
+    fn leaves_unknown_and_malformed_references() {
+        assert_eq!(
+            decode_attr_entities("a &foo; &# &#xZZ; & b"),
+            "a &foo; &# &#xZZ; & b"
+        );
+        assert_eq!(decode_attr_entities("plain"), "plain");
+    }
+
+    #[test]
+    fn encode_round_trips_quotes_and_ampersands() {
+        let s = "report-uri /r?a=1&b=2; x=\"y\"";
+        assert_eq!(decode_attr_entities(&encode_attr(s)), s);
+    }
+
+    fn d(s: &str) -> String {
+        decode_attr_entities(s).into_owned()
+    }
+
+    #[test]
+    fn numeric_references_without_semicolon_and_with_any_length() {
+        assert_eq!(d("&#39none&#39;"), "'none'");
+        assert_eq!(d("&#x27none&#X27;"), "'none'");
+        assert_eq!(d("&#x0000027;"), "'");
+        assert_eq!(d("&#0000000000000000039;"), "'");
+        assert_eq!(d("&#104ttps"), "https");
+    }
+
+    #[test]
+    fn invalid_numeric_references_become_the_replacement_character() {
+        assert_eq!(d("&#0;"), "\u{FFFD}");
+        assert_eq!(d("&#xD800;"), "\u{FFFD}");
+        assert_eq!(d("&#xDFFF;"), "\u{FFFD}");
+        assert_eq!(d("&#x110000;"), "\u{FFFD}");
+        assert_eq!(d("&#99999999999999999999;"), "\u{FFFD}");
+        // The C1 range is remapped as the spec says.
+        assert_eq!(d("&#150;"), "\u{2013}");
+    }
+
+    #[test]
+    fn named_references_are_complete_and_case_sensitive() {
+        assert_eq!(
+            d("&AMP;&LT;&GT;&QUOT;&apos;&nbsp;&colon;&Tab;"),
+            "&<>\"'\u{a0}:\t"
+        );
+        assert_eq!(d("&Aacute;&hellip;&rarr;"), "\u{c1}\u{2026}\u{2192}");
+        assert_eq!(d("&Amp;&foo;"), "&Amp;&foo;");
+    }
+
+    #[test]
+    fn legacy_names_without_semicolon_follow_the_attribute_rule() {
+        assert_eq!(d("a&amp b"), "a& b");
+        assert_eq!(d("a&ampb"), "a&ampb");
+        assert_eq!(d("a&amp=b"), "a&amp=b");
+        assert_eq!(d("?x=1&copy=2"), "?x=1&copy=2");
+        assert_eq!(d("&notit;"), "&notit;");
+        assert_eq!(d("&lt"), "<");
+        assert_eq!(d("&nbspx"), "&nbspx");
+        // Names that are not legacy need the semicolon.
+        assert_eq!(d("&colon"), "&colon");
+    }
+
+    #[test]
+    fn decoding_happens_once_and_breakouts_stay_inert() {
+        assert_eq!(d("&amp;#39;"), "&#39;");
+        assert_eq!(d("&amp;amp;"), "&amp;");
+        let out = d("&quot;&gt;<script>");
+        assert_eq!(out, "\"><script>");
+        // Encoded back for a double-quoted attribute, nothing can close it.
+        let enc = encode_attr(&out);
+        assert_eq!(enc, "&quot;><script>");
+        assert!(!enc.contains('"'));
+    }
 }
