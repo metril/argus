@@ -4569,6 +4569,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "hickory-resolver",
+ "html-escape",
  "http-body-util",
  "http2",
  "httpdate",
