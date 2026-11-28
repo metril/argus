@@ -857,6 +857,7 @@ impl ExtHub {
 
     /// Forget a session: its jobs fail, its documents stop being served by it.
     pub fn close(&self, id: u64) {
+        filter_engine::session_log().forget(id);
         let mut g = self.inner.lock();
         if let Some(s) = g.sessions.remove(&id) {
             for (tx, _) in s.jobs.values() {

@@ -35,6 +35,9 @@ pub fn filter_stats(state: &AppState) -> FilterStatsResponse {
             .into_iter()
             .map(|(domain, count)| DomainCount { domain, count })
             .collect(),
+        lifetime_blocked: 0,
+        lifetime_total: 0,
+        lifetime_by_category: Default::default(),
     }
 }
 
@@ -101,7 +104,17 @@ pub async fn get_filter_stats(
     State(state): State<Arc<AppState>>,
     Extension(p): Extension<Principal>,
 ) -> Json<FilterStatsResponse> {
+    // Fold in what happened since the last sampler tick, so the lifetime totals are current.
+    crate::server::sample_stats(&state).await;
     let mut s = filter_stats(&state);
+    let (total, blocked, cats) = state.daily.lifetime();
+    s.lifetime_total = total;
+    s.lifetime_blocked = blocked;
+    s.lifetime_by_category = crate::daily::CATEGORIES
+        .iter()
+        .zip(cats)
+        .map(|(n, c)| (n.to_string(), c))
+        .collect();
     if p.profiles.is_some() {
         // The domain histogram spans every profile's browsing: not for a restricted token.
         s.top_blocked_domains.clear();
@@ -120,6 +133,7 @@ pub async fn reset_filter_stats(
     Extension(p): Extension<Principal>,
 ) -> Json<MessageResponse> {
     state.timeseries.note_reset();
+    state.daily.note_reset();
     state.filter_stats.reset();
     info!("Filter statistics reset by {}", p.username);
     Json(MessageResponse {
@@ -349,7 +363,9 @@ fn log_entry(e: RequestEvent) -> RequestLogEntry {
         cert_fp: e.cert_fp,
         outcome: e.outcome.map(|o| match o {
             filter_engine::EventOutcome::Aborted => api_types::LogOutcome::Aborted,
-            filter_engine::EventOutcome::Synthetic => api_types::LogOutcome::Synthetic,
+            filter_engine::EventOutcome::Synthetic | filter_engine::EventOutcome::Redirected => {
+                api_types::LogOutcome::Synthetic
+            }
         }),
         error_kind: e.error_kind.map(|k| match k {
             filter_engine::ErrorKind::ClientRejectedCert => {
@@ -515,11 +531,14 @@ fn request_events(
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct TimeseriesQuery {
-    /// `6h`, `24h` (30-minute buckets) or `7d` (6-hour buckets). Default `6h`.
+    /// `6h`, `24h` (30-minute buckets) or `7d` (6-hour buckets) from the in-memory history, or
+    /// the persisted history by category: `d7`, `d30` (UTC days) and `m12` (calendar months,
+    /// kept 400 days). Default `6h`.
     pub range: Option<String>,
 }
 
-/// Requests and blocked requests per bucket, from the in-memory history (since the last start).
+/// Requests and blocked requests per bucket. `6h`, `24h` and `7d` come from the in-memory history
+/// (since the last start); `d7`, `d30` and `m12` from the persisted daily history, by category.
 #[utoipa::path(
     get, path = "/stats/timeseries", tag = "stats",
     security(("bearer_auth" = ["stats:read"])),
@@ -531,13 +550,40 @@ pub async fn get_timeseries(
     ApiQuery(q): ApiQuery<TimeseriesQuery>,
 ) -> ApiResult<Json<TimeseriesResponse>> {
     let range = q.range.unwrap_or_else(|| "6h".into());
+    if matches!(range.as_str(), "d7" | "d30" | "m12") {
+        crate::server::sample_stats(&state).await;
+        let now = chrono::Utc::now().timestamp();
+        let (step, pts) = match range.as_str() {
+            "d7" => (86_400, state.daily.days(now, 7)),
+            "d30" => (86_400, state.daily.days(now, 30)),
+            _ => (30 * 86_400, state.daily.months(now, 12)),
+        };
+        let points = pts
+            .into_iter()
+            .map(|b| TimeseriesPoint {
+                ts: b.ts,
+                requests: b.requests,
+                blocked: b.blocked,
+                by_category: crate::daily::CATEGORIES
+                    .iter()
+                    .zip(b.cats)
+                    .map(|(n, c)| (n.to_string(), c))
+                    .collect(),
+            })
+            .collect();
+        return Ok(Json(TimeseriesResponse {
+            range,
+            bucket_secs: step,
+            points,
+        }));
+    }
     let (step, n) = match range.as_str() {
         "6h" => (crate::timeseries::BUCKET_SECS, 12),
         "24h" => (crate::timeseries::BUCKET_SECS, 48),
         "7d" => (6 * 3600, 28),
         o => {
             return Err(ApiError::ValidationError(format!(
-                "unknown range '{o}' (6h, 24h, 7d)"
+                "unknown range '{o}' (6h, 24h, 7d, d7, d30, m12)"
             )))
         }
     };
@@ -555,6 +601,7 @@ pub async fn get_timeseries(
             ts: b.ts,
             requests: b.requests,
             blocked: b.blocked,
+            by_category: Default::default(),
         })
         .collect();
     Ok(Json(TimeseriesResponse {

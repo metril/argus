@@ -354,6 +354,10 @@ pub struct AppState {
 
     /// Request / block counts over time (fed by a sampler started with the server).
     pub timeseries: crate::timeseries::Timeseries,
+    /// Persisted lifetime totals and daily history by category.
+    pub daily: crate::daily::DailyStats,
+    /// Serializes [`crate::server::sample_stats`].
+    pub sample_lock: tokio::sync::Mutex<()>,
 
     /// Live control of the proxy listeners and access lists (`None` without a proxy).
     pub runtime: OnceLock<Arc<dyn RuntimeControl>>,
@@ -878,6 +882,10 @@ pub async fn build_state_full(
         api_config.network.auth_requests_per_minute as u64,
     ));
 
+    let daily = crate::daily::DailyStats::open(Some(
+        proxy_config.adblock.data_dir.join("stats-history.json"),
+    ));
+
     // Create proxy state
     let mitm_enabled = proxy_config.mitm.enabled;
     let proxy_state = Arc::new(ProxyState {
@@ -928,6 +936,8 @@ pub async fn build_state_full(
         upstream_tests: UpstreamTestGate::new(10, std::time::Duration::from_secs(60)),
         log_streams: Arc::new(LogStreamLimits::new(64, 5)),
         timeseries: Default::default(),
+        daily,
+        sample_lock: tokio::sync::Mutex::new(()),
         runtime: OnceLock::new(),
         ext: OnceLock::new(),
         web_server: OnceLock::new(),

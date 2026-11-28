@@ -7,7 +7,7 @@ import { registrableDomain, type TabStats } from '../lib/stats';
 import { Scripts } from './scripts';
 import { resolveState } from '../lib/state';
 import { AccountBar, ErrorBanner, Header, Icon, SignInForm, SiteCard, Skeleton, BrowserCard } from './components';
-import { GlobalStats, PageStats, ScopeNotice, SiteSwitch } from './pagestats';
+import { PageStats, StatsView, ScopeNotice, SiteSwitch } from './pagestats';
 import { hostLabel, isSignedIn, settings } from './store';
 
 type Tab = { id?: number; url?: string; cookieStoreId?: string };
@@ -34,6 +34,7 @@ export function App() {
   const [n, setN] = useState(0);
   const [switching, setSwitching] = useState(false);
   const [needScope, setNeedScope] = useState(false);
+  const [view, setView] = useState<'actions' | 'stats'>('actions');
 
   // The popup follows the active tab: a navigation or a tab switch re-derives every card.
   useEffect(() => {
@@ -107,15 +108,21 @@ export function App() {
           }} />
         )}
         {needScope && <ScopeNotice onSignIn={() => setSwitching(true)} />}
+        <div class="seg" role="group" aria-label="View">
+          <button type="button" aria-pressed={view === 'actions'} onClick={() => setView('actions')}>Actions</button>
+          <button type="button" aria-pressed={view === 'stats'} onClick={() => setView('stats')}>Statistics</button>
+        </div>
+        {view === 'stats' ? <StatsView key={s.token} settings={s} onScope={() => setNeedScope(true)} /> : <>
         <SiteCard host={host} site={r.site} route={inter} />
         <PageStats stats={stats} />
+        {tabId !== undefined && <button type="button" class="btn" data-testid="open-logger" onClick={() => { void browser.tabs.create({ url: `${browser.runtime.getURL('/logger.html' as any)}#tab=${tabId}` }); window.close(); }}>Open logger</button>}
         {site && <SiteSwitch key={`${tabId}|${site}`} settings={s} site={site} onScope={() => setNeedScope(true)} reload={() => { if (tabId !== undefined) void browser.tabs.reload(tabId); window.close(); }} />}
         <Scripts state={menu} reload={() => setN(n + 1)} />
-        <GlobalStats key={s.token} settings={s} onScope={() => setNeedScope(true)} />
         <section class="sec">
           <div class="lbl">This browser</div>
           <BrowserCard />
         </section>
+        </>}
       </main>
       <AccountBar user={s.user ?? ''} url={s.argusUrl} onSignOut={() => void signOut()} />
     </div>

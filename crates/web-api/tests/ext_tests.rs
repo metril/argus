@@ -474,3 +474,342 @@ async fn revoking_a_token_closes_its_live_channels_and_a_ping_backstop_catches_t
         m => panic!("expected a close, got {m:?}"),
     }
 }
+
+fn log_event(
+    ctx: &TestContext,
+    session: u64,
+    url: &str,
+    action: filter_engine::EventAction,
+    rule: &str,
+) {
+    ctx.state
+        .shared_engine
+        .record_request(&filter_engine::EventRef {
+            action,
+            method: "GET",
+            url,
+            source_host: "page.test",
+            request_type: "script",
+            rule,
+            list_id: None,
+            client: None,
+            status: None,
+            mode: filter_engine::EventMode::Explicit,
+            error_kind: None,
+            cert_fp: None,
+            outcome: None,
+            session: Some(session),
+        });
+}
+
+#[tokio::test]
+async fn the_log_is_session_scoped_paged_and_needs_a_session() {
+    use filter_engine::EventAction::{Allowed, Blocked};
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let server = ws_server(&ctx);
+    let good = ctx
+        .token(&admin, &["userscripts:bridge", "logs:read"])
+        .await;
+    let other = ctx.token(&admin, &["logs:read"]).await;
+    let no_scope = ctx.token(&admin, &["userscripts:bridge"]).await;
+    let mut ws = hello(&server, &good).await;
+    let _: Value = ws.receive_json().await;
+
+    log_event(
+        &ctx,
+        7,
+        "https://ads.test/a.js?id=1",
+        Blocked,
+        "||ads.test^",
+    );
+    log_event(&ctx, 7, "https://page.test/b.js", Allowed, "");
+    log_event(&ctx, 7, "https://cdn.test/c.js", Allowed, "");
+    // Another session's traffic never shows.
+    log_event(&ctx, 99, "https://secret.test/x", Blocked, "||secret.test^");
+
+    let get = |tok: &str, q: &str, sid: Option<&str>| {
+        let mut r = ctx.bearer("GET", &format!("/api/v1/ext/log{q}"), tok);
+        if let Some(s) = sid {
+            r = r.add_header("x-argus-session", s);
+        }
+        r
+    };
+    let r = get(&good, "", Some(SID)).await;
+    r.assert_status_ok();
+    let v: Value = r.json();
+    let urls: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            // The query is dropped unless the request log keeps queries.
+            "https://ads.test/a.js",
+            "https://page.test/b.js",
+            "https://cdn.test/c.js"
+        ]
+    );
+    let first = &v["entries"][0];
+    assert_eq!(first["outcome"], "blocked");
+    assert_eq!(first["rule"], "||ads.test^");
+    assert_eq!(first["third_party"], true);
+    assert_eq!(first["type"], "script");
+    assert_eq!(first["source_host"], "page.test");
+    assert_eq!(v["entries"][1]["third_party"], false);
+    assert_eq!(v["entries"][1]["outcome"], "allowed");
+    assert!(!v.to_string().contains("secret.test"));
+
+    // paging by `since`
+    let s1 = first["seq"].as_u64().unwrap();
+    let v: Value = get(&good, &format!("?since={s1}"), Some(SID)).await.json();
+    assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+    let next = v["next"].as_u64().unwrap();
+    let v: Value = get(&good, &format!("?since={next}"), Some(SID))
+        .await
+        .json();
+    assert!(v["entries"].as_array().unwrap().is_empty());
+    assert_eq!(v["next"], next);
+    log_event(&ctx, 7, "https://later.test/d.js", Allowed, "");
+    let v: Value = get(&good, &format!("?since={next}"), Some(SID))
+        .await
+        .json();
+    assert_eq!(v["entries"][0]["url"], "https://later.test/d.js");
+
+    // no session, a wrong session, another token's session, and a missing scope
+    get(&good, "", None)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    get(&good, "", Some("ffffffffffffffffffffffffffffffff"))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    get(&other, "", Some(SID))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    get(&no_scope, "", Some(SID))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn ext_rules_need_their_scope_and_accept_one_valid_line() {
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let ext = ctx.token(&admin, &["rules:ext"]).await;
+    let site = ctx.token(&admin, &["rules:site", "rules:read"]).await;
+    let post = |tok: &str, op: &str, rule: &str| {
+        ctx.bearer("POST", "/api/v1/ext/rules", tok)
+            .json(&json!({"op": op, "rule": rule}))
+    };
+    // A token without rules:ext is refused.
+    post(&site, "add", "||a.com^")
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer("GET", "/api/v1/ext/rules?site=a.com", &site)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    // rules:ext opens nothing else in the rules.
+    ctx.bearer("PUT", "/api/v1/rules/custom", &ext)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer("GET", "/api/v1/rules/custom", &ext)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    // Rejected input.
+    let long = format!("||{}.test^", "a".repeat(2100));
+    for bad in [
+        "||a.com^\n||b.com^",
+        "||a.com^\r||b.com^",
+        "!#include other.txt",
+        "!#if env_firefox",
+        "! comment",
+        "",
+        "   ",
+        "example.com##+js(abort-on-property-read, x)",
+        "example.com###ad",
+        "||a.com^$replace=/a/b/",
+        "||a.com^$csp=script-src 'none'",
+        long.as_str(),
+    ] {
+        let r = post(&ext, "add", bad).await;
+        r.assert_status(StatusCode::BAD_REQUEST);
+    }
+    post(&ext, "toggle", "||a.com^")
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(ctx.state.filter_store.get_custom_rules().unwrap(), "");
+
+    // add -> list -> remove round trip
+    let rule = "||ads.a.com^$script,third-party,domain=a.com";
+    let v: Value = post(&ext, "add", rule).await.json();
+    assert_eq!(v, json!({"rule_count": 1, "changed": true}));
+    let v: Value = post(&ext, "add", rule).await.json();
+    assert_eq!(v, json!({"rule_count": 1, "changed": false}));
+    assert!(ctx
+        .state
+        .filter_store
+        .get_custom_rules()
+        .unwrap()
+        .contains(rule));
+    post(&ext, "add", "@@||other.com^$domain=b.com")
+        .await
+        .assert_status_ok();
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/ext/rules?site=A.com", &ext)
+        .await
+        .json();
+    assert_eq!(v["site"], "a.com");
+    assert_eq!(v["rules"], json!([rule]));
+    ctx.bearer("GET", "/api/v1/ext/rules?site=a.com/x", &ext)
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+    let v: Value = post(&ext, "remove", rule).await.json();
+    assert_eq!(v, json!({"rule_count": 1, "changed": true}));
+    let v: Value = post(&ext, "remove", rule).await.json();
+    assert_eq!(v["changed"], false);
+    assert_eq!(
+        ctx.state.filter_store.get_custom_rules().unwrap(),
+        "@@||other.com^$domain=b.com\n"
+    );
+    // Audited with the rule text.
+    assert_eq!(audit_rows(&ctx.state, "ext/rules#add"), 2);
+    assert_eq!(audit_rows(&ctx.state, "ext/rules#remove"), 1);
+    // The host's case does not matter on add or remove.
+    post(&ext, "add", "||Example.com^").await.assert_status_ok();
+    let v: Value = post(&ext, "remove", "||example.com^").await.json();
+    assert_eq!(v["changed"], true);
+}
+
+#[tokio::test]
+async fn lifetime_totals_and_daily_categories_are_served() {
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let tok = ctx.token(&admin, &["stats:read"]).await;
+    let stats = ctx.state.filter_stats.clone();
+    stats.record_blocked_by("script", "a.com", None, Some("||a.com^"));
+    stats.record_blocked_by("image", "b.com", Some("easylist"), None);
+    stats.record_allowed();
+    let v: Value = ctx.bearer("GET", "/api/v1/stats/filter", &tok).await.json();
+    assert_eq!(v["lifetime_total"], 3);
+    assert_eq!(v["lifetime_blocked"], 2);
+    let cats = &v["lifetime_by_category"];
+    assert_eq!(
+        cats["ads"].as_u64().unwrap() + cats["other"].as_u64().unwrap(),
+        2
+    );
+    // A reset of the counters keeps the lifetime totals.
+    stats.reset();
+    ctx.state.daily.note_reset();
+    let v: Value = ctx.bearer("GET", "/api/v1/stats/filter", &tok).await.json();
+    assert_eq!(v["lifetime_blocked"], 2);
+    assert_eq!(v["blocked_requests"], 0);
+    for (range, n) in [("d7", 7), ("d30", 30), ("m12", 12)] {
+        let v: Value = ctx
+            .bearer(
+                "GET",
+                &format!("/api/v1/stats/timeseries?range={range}"),
+                &tok,
+            )
+            .await
+            .json();
+        let pts = v["points"].as_array().unwrap();
+        assert_eq!(pts.len(), n, "{range}");
+        let blocked: u64 = pts.iter().map(|p| p["blocked"].as_u64().unwrap()).sum();
+        assert_eq!(blocked, 2, "{range}");
+        let last = pts.last().unwrap();
+        assert!(last["by_category"]["other"].as_u64().is_some());
+    }
+}
+
+#[tokio::test]
+async fn the_session_log_keeps_the_query_only_when_asked_and_ignores_log_capacity() {
+    use filter_engine::EventAction::Allowed;
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let server = ws_server(&ctx);
+    let good = ctx
+        .token(&admin, &["userscripts:bridge", "logs:read"])
+        .await;
+    let mut ws = hello(&server, &good).await;
+    let _: Value = ws.receive_json().await;
+    // A request log of size zero still feeds the extension's own log.
+    ctx.state.shared_engine.set_event_capacity(0);
+    log_event(&ctx, 7, "https://a.test/p?token=secret#f", Allowed, "");
+    ctx.state.shared_engine.set_recent_keep_query(true);
+    log_event(&ctx, 7, "https://a.test/q?x=1", Allowed, "");
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/ext/log", &good)
+        .add_header("x-argus-session", SID)
+        .await
+        .json();
+    let urls: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(urls, ["https://a.test/p", "https://a.test/q?x=1"]);
+}
+
+#[tokio::test]
+async fn removing_a_rule_is_held_to_the_same_allowlist_and_site_lookup_respects_boundaries() {
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let ext = ctx.token(&admin, &["rules:ext"]).await;
+    let post = |op: &str, rule: &str| {
+        ctx.bearer("POST", "/api/v1/ext/rules", &ext)
+            .json(&json!({"op": op, "rule": rule}))
+    };
+    // A line the extension could never have added cannot be removed by it.
+    ctx.state
+        .filter_store
+        .set_custom_rules("##.mine\n@@*$document\n||ba.com^\n||a.com^$script\n")
+        .unwrap();
+    for line in ["##.mine", "@@*$document"] {
+        let r = post("remove", line).await;
+        r.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            r.text().contains("accepted") || r.text().contains("rule"),
+            "{}",
+            r.text()
+        );
+    }
+    assert!(ctx
+        .state
+        .filter_store
+        .get_custom_rules()
+        .unwrap()
+        .contains("##.mine"));
+    // Only whole hosts / subdomains match the site.
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/ext/rules?site=a.com", &ext)
+        .await
+        .json();
+    assert_eq!(v["rules"], json!(["||a.com^$script"]));
+    post("remove", "||a.com^$script").await.assert_status_ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_samples_neither_lose_nor_double_count_blocks() {
+    let (ctx, _f) = with_bridge().await;
+    let stats = ctx.state.filter_stats.clone();
+    for _ in 0..500 {
+        stats.record_blocked_by("script", "a.test", Some("easylist"), None);
+        stats.record_allowed();
+    }
+    let runs: Vec<_> = (0..8)
+        .map(|_| {
+            let st = ctx.state.clone();
+            tokio::spawn(async move { st.flush_stats().await })
+        })
+        .collect();
+    for r in runs {
+        r.await.unwrap();
+    }
+    let (total, blocked, cats) = ctx.state.daily.lifetime();
+    assert_eq!((total, blocked), (1000, 500));
+    assert_eq!(cats.iter().sum::<u64>(), 500);
+}

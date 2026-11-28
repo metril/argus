@@ -82,21 +82,51 @@ export function hostOf(url?: string): string | null {
   } catch { return null; }
 }
 
-export type FilterStats = components['schemas']['FilterStatsResponse'];
+export const CATEGORIES = ['ads', 'trackers', 'social', 'annoyances', 'security', 'other'] as const;
+export type Category = (typeof CATEGORIES)[number];
+export type CategoryCounts = Record<Category, number>;
+export const CATEGORY_LABELS: Record<Category, string> = {
+  ads: 'Ads', trackers: 'Trackers', social: 'Social', annoyances: 'Annoyances', security: 'Malware / Security', other: 'Other',
+};
+
+export type FilterStats = components['schemas']['FilterStatsResponse'] & {
+  lifetime_blocked?: number; lifetime_total?: number; lifetime_by_category?: Partial<CategoryCounts>;
+};
+export type SeriesRange = 'd7' | 'd30' | 'm12';
+export interface SeriesPoint { ts: number; requests: number; blocked: number; by_category?: Partial<CategoryCounts> }
+export interface Series { range: string; bucket_secs: number; points: SeriesPoint[] }
+
+/** One request the proxy logged for this extension session (`GET /ext/log`). */
+export type Outcome = 'blocked' | 'allowed' | 'redirected' | 'modified' | 'aborted';
+export interface LogEntry {
+  seq: number; time: string; url: string; method: string; type: string; third_party: boolean | null;
+  outcome: Outcome; rule: string | null; list_id: string | null; list_name: string | null; user_rule: boolean; source_host: string;
+}
 
 /** Result of an authenticated JSON call; `scope` means the token lacks a scope (an older extension token). */
-export type Call<T> = { ok: true; value: T } | { ok: false; scope: boolean; status: number };
+/** `message` is the server's error text (the body of a JSON error), when it sent one. */
+export type Call<T> = { ok: true; value: T } | { ok: false; scope: boolean; status: number; message?: string };
 
-async function call<T>(s: Settings, method: string, path: string, signal?: AbortSignal): Promise<Call<T>> {
+async function call<T>(s: Settings, method: string, path: string, signal?: AbortSignal, extra?: { headers?: Record<string, string>; body?: unknown }): Promise<Call<T>> {
   if (!s.argusUrl || !s.token) return { ok: false, scope: false, status: 0 };
   try {
-    const res = await fetch(`${s.argusUrl}/api/v1${path}`, { method, headers: { Authorization: `Bearer ${s.token}` }, ...(signal ? { signal } : {}) });
+    const headers: Record<string, string> = { Authorization: `Bearer ${s.token}`, ...extra?.headers };
+    if (extra?.body !== undefined) headers['Content-Type'] = 'application/json';
+    const res = await fetch(`${s.argusUrl}/api/v1${path}`, {
+      method, headers, ...(extra?.body !== undefined ? { body: JSON.stringify(extra.body) } : {}), ...(signal ? { signal } : {}),
+    });
     if (res.ok) return { ok: true, value: (await res.json()) as T };
     let scope = false;
-    if (res.status === 403 && isJson(res)) {
-      try { scope = (await res.json())?.error?.code === 'insufficient_scope'; } catch { /* not the envelope */ }
+    let message: string | undefined;
+    if (isJson(res) && !isRefused(res)) {
+      // Read the body once: the envelope carries the scope code and the reason of a 400.
+      try {
+        const err = (await res.json())?.error;
+        scope = res.status === 403 && err?.code === 'insufficient_scope';
+        if (typeof err?.message === 'string' && err.message) message = err.message.slice(0, 300);
+      } catch { /* not the envelope */ }
     }
-    return { ok: false, scope, status: res.status };
+    return { ok: false, scope, status: res.status, ...(message ? { message } : {}) };
   } catch {
     return { ok: false, scope: false, status: 0 };
   }
@@ -109,3 +139,12 @@ export const getSiteState = (s: Settings, site: string, signal?: AbortSignal) =>
 /** `off` switches ad blocking off for the site (PUT), otherwise back on (DELETE). */
 export const setSiteOff = (s: Settings, site: string, off: boolean) => call<{ sites: string[] }>(s, off ? 'PUT' : 'DELETE', siteUrl(site));
 
+export const fetchTimeseries = (s: Settings, range: SeriesRange, signal?: AbortSignal) => call<Series>(s, 'GET', `/stats/timeseries?range=${range}`, signal);
+
+/** The proxy's log of this session's requests after `since`; `sid` is the bridge session. Unavailable (old proxy, no session) is `ok: false`. */
+export const fetchExtLog = (s: Settings, sid: string, since: number) =>
+  call<{ next: number; entries: LogEntry[] }>(s, 'GET', `/ext/log?since=${since}`, undefined, { headers: { 'X-Argus-Session': sid } });
+export const postExtRule = (s: Settings, op: 'add' | 'remove', rule: string) =>
+  call<{ rule_count: number; changed: boolean }>(s, 'POST', '/ext/rules', undefined, { body: { op, rule } });
+export const fetchSiteRules = (s: Settings, site: string) =>
+  call<{ site: string; rules: string[] }>(s, 'GET', `/ext/rules?site=${encodeURIComponent(site)}`);

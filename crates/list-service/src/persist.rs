@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::report::BuildSummary;
 
-const MAGIC: &[u8; 6] = b"ABENG\x03";
+const MAGIC: &[u8; 6] = b"ABENG\x05";
 pub(crate) const FILE_NAME: &str = "engine.bin";
 
 pub(crate) type Key = [u8; 32];
@@ -87,17 +87,20 @@ struct Sidecar {
 pub(crate) struct Persisted {
     pub blob: Vec<u8>,
     pub domains: DomainSet,
+    pub origins: filter_engine::origins::RuleOrigins,
     pub ext: Vec<ExtRule>,
     pub ip: IpFilter,
     pub summary: BuildSummary,
 }
 
 /// Atomically write the engine: temp file in the same directory, fsync, rename.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn save(
     path: &Path,
     key: &Key,
     blob: &[u8],
     domains: &DomainSet,
+    origins: &filter_engine::origins::RuleOrigins,
     ext: &[ExtRule],
     ip: &IpFilter,
     summary: &BuildSummary,
@@ -110,11 +113,14 @@ pub(crate) fn save(
     })
     .map_err(std::io::Error::other)?;
     let dom = domains.to_bytes();
-    let mut body = Vec::with_capacity(16 + blob.len() + dom.len() + sidecar.len());
+    let org = origins.to_bytes();
+    let mut body = Vec::with_capacity(24 + blob.len() + dom.len() + org.len() + sidecar.len());
     body.extend_from_slice(&(blob.len() as u64).to_le_bytes());
     body.extend_from_slice(blob);
     body.extend_from_slice(&(dom.len() as u64).to_le_bytes());
     body.extend_from_slice(&dom);
+    body.extend_from_slice(&(org.len() as u64).to_le_bytes());
+    body.extend_from_slice(&org);
     body.extend_from_slice(&sidecar);
 
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -173,12 +179,15 @@ pub(crate) fn load(path: &Path, key: &Key) -> Result<Persisted, String> {
         return Err("checksum mismatch".into());
     }
     let (blob, rest) = split_chunk(body).ok_or("short engine blob")?;
-    let (dom, side_bytes) = split_chunk(rest).ok_or("short domain set")?;
+    let (dom, rest) = split_chunk(rest).ok_or("short domain set")?;
+    let (org, side_bytes) = split_chunk(rest).ok_or("short rule origins")?;
     let domains = DomainSet::from_bytes(dom)?;
+    let origins = filter_engine::origins::RuleOrigins::from_bytes(org)?;
     let side: Sidecar = serde_json::from_slice(side_bytes).map_err(|e| format!("sidecar: {e}"))?;
     Ok(Persisted {
         blob: blob.to_vec(),
         domains,
+        origins,
         ext: side.ext,
         ip: IpFilter::from_ranges(&side.ip_block, &side.ip_allow),
         summary: side.summary,
@@ -210,6 +219,7 @@ mod tests {
             &key(1),
             b"engine-bytes",
             &domains,
+            &Default::default(),
             &[],
             &ip,
             &summary,
@@ -291,6 +301,7 @@ mod tests {
             &k,
             &built.blob,
             &built.domains,
+            &built.origins,
             &[],
             &IpFilter::default(),
             &BuildSummary::default(),

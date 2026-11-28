@@ -735,16 +735,48 @@ fn spawn_bypass_refresher(state: Arc<AppState>) {
     });
 }
 
+impl AppState {
+    /// Take a last sample and write the statistics history (shutdown: the sampler task keeps the
+    /// state alive, so nothing is saved by a drop).
+    pub async fn flush_stats(self: &Arc<Self>) {
+        // `sample_stats` flushes the history under `sample_lock`.
+        sample_stats(self).await;
+    }
+}
+
+/// Fold the counters into the in-memory series and the persisted daily history, and save the
+/// history when it changed. Serialized: the sampler and the stats endpoints call it, and two
+/// overlapping runs would split a category drain or race on the history file.
+pub async fn sample_stats(state: &Arc<AppState>) {
+    let _one = state.sample_lock.lock().await;
+    let now = chrono::Utc::now().timestamp();
+    state.timeseries.sample(now, || {
+        let s = state.filter_stats.snapshot();
+        (s.total_requests, s.blocked_requests)
+    });
+    let st = state.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let cats = st.take_category_counts();
+        st.daily.sample(
+            now,
+            || {
+                let s = st.filter_stats.snapshot();
+                (s.total_requests, s.blocked_requests)
+            },
+            cats,
+        );
+        st.daily.flush();
+    })
+    .await;
+}
+
 /// Feed the request/block counters into the time series every 15 seconds.
 fn spawn_timeseries_sampler(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
         loop {
             tick.tick().await;
-            state.timeseries.sample(chrono::Utc::now().timestamp(), || {
-                let s = state.filter_stats.snapshot();
-                (s.total_requests, s.blocked_requests)
-            });
+            sample_stats(&state).await;
         }
     });
 }

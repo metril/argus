@@ -553,14 +553,14 @@ impl ProxyContext {
         let outcome = if abort_redirect {
             filter_engine::EventOutcome::Aborted
         } else if verdict.redirect_resource().is_some() {
-            filter_engine::EventOutcome::Synthetic
+            filter_engine::EventOutcome::Redirected
         } else {
             log_outcome(block_mode, rtype)
         };
-        // The reason shown in the log is the canonical name, not the rule that matched it.
+        // The log shows the canonical name as the reason; statistics keep the rule and list that
+        // matched it.
         let mut logged = verdict;
-        logged.matched_rule = Some(format!("cname:{cn}"));
-        logged.list_id = None;
+        logged.via_cname = Some(cn.to_string());
         let logged = profile.engine.record_verdict_meta(
             logged,
             url,
@@ -570,6 +570,7 @@ impl ProxyContext {
             method.as_str(),
             event_mode(rctx),
             Some(outcome),
+            rctx.ext,
         );
         if let Some(sc) = &profile.script_control {
             count_page_block(sc, source);
@@ -1073,6 +1074,7 @@ impl ProxyContext {
                     "",
                     filter_engine::EventMode::Explicit,
                     outcome,
+                    None,
                 )
                 .blocked
         }
@@ -1358,7 +1360,7 @@ impl ProxyContext {
                     if abort_redirect {
                         filter_engine::EventOutcome::Aborted
                     } else if verdict.redirect_resource().is_some() {
-                        filter_engine::EventOutcome::Synthetic
+                        filter_engine::EventOutcome::Redirected
                     } else {
                         log_outcome(block_mode, rtype)
                     }
@@ -1378,6 +1380,7 @@ impl ProxyContext {
                         method.as_str(),
                         event_mode(rctx),
                         outcome,
+                        rctx.ext,
                     )
                 };
                 generation = Some(gen_);
@@ -1481,7 +1484,12 @@ impl ProxyContext {
                                     source_url_hinted(&headers, &url, rtype, page_hint.as_deref()),
                                 );
                             }
-                            engine.stats_handle().record_blocked(rtype.as_str(), &host);
+                            engine.stats_handle().record_blocked_by(
+                                rtype.as_str(),
+                                &host,
+                                parsed.map(|r| r.list.as_str()),
+                                Some(&rule),
+                            );
                             // Borrowed straight into the ring: no event struct, no clock read here.
                             engine.record_request(&filter_engine::EventRef {
                                 action: filter_engine::EventAction::Blocked,
@@ -1497,6 +1505,7 @@ impl ProxyContext {
                                 error_kind: None,
                                 cert_fp: None,
                                 outcome: Some(log_outcome(self.block_response(), rtype)),
+                                session: rctx.ext,
                             });
                             let v = filter_engine::MatchResult::blocked(rule);
                             return block_outcome(self.block_response(), rtype, &v, &url)
@@ -2961,6 +2970,7 @@ fn log_request(
         error_kind,
         cert_fp,
         outcome: None,
+        session: rctx.ext,
     });
 }
 
@@ -3022,6 +3032,7 @@ fn log_local_with(
         error_kind: None,
         cert_fp: None,
         outcome,
+        session: rctx.ext,
     });
 }
 

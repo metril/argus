@@ -80,6 +80,7 @@ pub fn install_rules_text(engine: &SharedEngine, text: String, trusted: bool) {
         Arc::new(ext),
         Arc::new(built.ip),
         Arc::new(built.domains),
+        Arc::new(built.origins),
     );
 }
 

@@ -1,10 +1,12 @@
-import { cachedLookup, clearCache, fetchRecentBlocked, getSettings, hostOf, type Lookup } from '../lib/api';
+import { cachedLookup, clearCache, fetchExtLog, fetchRecentBlocked, getSettings, hostOf, type Lookup } from '../lib/api';
 import { blockedTotal, classify, hostnameOf, StatsStore } from '../lib/stats';
+import { joinEntries, LogStore, ReqLog, type LogRow } from '../lib/logs';
+import { LogFeed } from '../lib/logfeed';
 import { signOutInBackground } from '../lib/auth';
 import { Bridge } from '../lib/bridge';
 import { FriendlyFrames } from '../lib/friendly-frames';
 import { onStorageChanged } from '../lib/changes';
-import { respondAsync } from '../lib/messages';
+import { fromExtensionPage, respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
 import { RouteTracker } from '../lib/route';
 import { StoreRelay } from '../lib/storerelay';
@@ -131,6 +133,7 @@ export default defineBackground(() => {
       // Each redirect hop reports its own response; only the final one is a request of the page.
       if (d.statusCode !== undefined && d.statusCode >= 300 && d.statusCode <= 399) return;
       void stats.dispatch({ t: 'response', tabId: d.tabId, main: d.type === 'main_frame', kind: classify(d.responseHeaders), host: hostnameOf(d.url) });
+      schedulePoll();
     },
     { urls: ['<all_urls>'] },
     ['responseHeaders'],
@@ -151,9 +154,68 @@ export default defineBackground(() => {
     },
     { urls: ['<all_urls>'] },
   );
+  // The proxy's own log of this session's requests (`/ext/log`): exact attribution of aborted
+  // blocks, and the rows of the logger page. Joined to tabs by URL and time (webRequest).
+  const logs = new LogStore((browser.storage as any).session);
+  const reqs = new ReqLog();
+  wr?.onBeforeRequest?.addListener(
+    (d: { tabId: number; url: string }) => { if (d.tabId >= 0) reqs.add({ tabId: d.tabId, url: d.url, at: Date.now() }); },
+    { urls: ['<all_urls>'] },
+  );
+  const feed = new LogFeed((browser.storage as any).session);
+  const ports = new Set<{ postMessage(m: unknown): void }>();
+  let polling: Promise<boolean> = Promise.resolve(false);
+  /** One poll at a time; true when the proxy answered (false: no session, older proxy, no scope). */
+  function pollLog(): Promise<boolean> {
+    polling = polling.then(pollOnce, pollOnce);
+    return polling;
+  }
+  async function pollOnce(): Promise<boolean> {
+    const sid = bridge.status().sid;
+    if (!sid) return false;
+    const from = await feed.begin(sid);
+    const r = await fetchExtLog(await getSettings(), sid, from);
+    if (!r.ok) return false;
+    const entries = feed.accept(sid, r.value.next, r.value.entries ?? []);
+    if (entries.length === 0) return true;
+    const pages: Record<number, string> = {};
+    try {
+      for (const t of await browser.tabs.query({})) {
+        const h = t.id !== undefined ? (await stats.tab(t.id)).pageHost : undefined;
+        if (t.id !== undefined && h) pages[t.id] = h;
+      }
+    } catch { /* no tab hints */ }
+    const rows = joinEntries(entries, reqs.all(), pages);
+    await logs.add(rows);
+    for (const p of ports) { try { p.postMessage({ t: 'rows', rows }); } catch { /* port gone */ } }
+    return true;
+  }
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  /** History for tabs without a logger page open: poll shortly after activity. */
+  function schedulePoll() {
+    if (pollTimer) return;
+    pollTimer = setTimeout(() => { pollTimer = undefined; void pollLog(); }, 2000);
+  }
+  let liveTimer: ReturnType<typeof setInterval> | undefined;
+  browser.runtime.onConnect.addListener((port: any) => {
+    if (port.name !== 'logger' || !fromExtensionPage(port.sender, browser.runtime.id, browser.runtime.getURL('/' as any))) { try { port.disconnect(); } catch { /* ignore */ } return; }
+    ports.add(port);
+    if (!liveTimer) liveTimer = setInterval(() => void pollLog(), 1000);
+    void pollLog();
+    port.onDisconnect.addListener(() => {
+      ports.delete(port);
+      if (ports.size === 0 && liveTimer) { clearInterval(liveTimer); liveTimer = undefined; }
+    });
+  });
+
   const timers = new Map<number, ReturnType<typeof setTimeout>>();
   async function reconcileTab(tabId: number) {
     if ((await stats.tab(tabId)).pending.length === 0) return;
+    // Exact: the proxy's log of this session. An older proxy (or no session): the heuristic.
+    if (await pollLog()) {
+      await stats.dispatch({ t: 'attribute', tabId, entries: feed.recent, used: feed.used, now: Date.now() });
+      return;
+    }
     const r = await fetchRecentBlocked(await getSettings());
     // Unreachable or without the scope: nothing is attributed, so the errors expire as "failed".
     await stats.dispatch({ t: 'reconcile', tabId, blocked: r.ok ? r.value.entries.map((e) => ({ url: e.url, at: Date.parse(e.time), source: e.source_host })) : [], now: Date.now() });
@@ -163,7 +225,7 @@ export default defineBackground(() => {
     timers.set(tabId, setTimeout(() => { timers.delete(tabId); void reconcileTab(tabId); }, 1500));
   }
 
-  browser.runtime.onMessage.addListener(respondAsync((msg: { type?: string; tabId?: number }, sender: { id?: string }) => {
+  browser.runtime.onMessage.addListener(respondAsync((msg: { type?: string; tabId?: number }, sender: { id?: string; url?: string }) => {
     if (msg?.type === 'interception' && msg.tabId !== undefined) {
       const enabled = proxy.getState().enabled;
       return Promise.resolve({ route: routes.route(msg.tabId, enabled), enabled });
@@ -172,6 +234,14 @@ export default defineBackground(() => {
       if (sender?.id !== browser.runtime.id) return undefined;
       const id = msg.tabId;
       return reconcileTab(id).then(() => stats.tab(id)).then((st) => ({ stats: { ...st, pending: [] } }));
+    }
+    if (msg?.type === 'log-rows' || msg?.type === 'log-clear' || msg?.type === 'log-counts') {
+      if (!fromExtensionPage(sender, browser.runtime.id, browser.runtime.getURL('/' as any))) return undefined;
+      const id = msg.tabId;
+      if (msg.type === 'log-counts') return logs.counts().then((counts) => ({ counts }));
+      if (id === undefined) return undefined;
+      if (msg.type === 'log-clear') return logs.clear(id).then(() => true);
+      return logs.rows(id).then((rows: LogRow[]) => ({ rows }));
     }
     if (msg?.type === 'proxy-get' || msg?.type === 'proxy-set' || msg?.type === 'store-token') {
       if (sender?.id !== browser.runtime.id) return undefined;

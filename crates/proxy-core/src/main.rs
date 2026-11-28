@@ -293,10 +293,13 @@ async fn main() -> Result<()> {
 
     // Cleanup web UI server if running
     #[cfg(feature = "webui")]
-    if let Some(handle) = webui_handle {
+    if let Some((handle, state)) = webui_handle {
         handle.abort();
         // Wait for the task to wind down so it no longer holds the database.
         let _ = handle.await;
+        // The sampler task holds the state for the life of the process, so the statistics
+        // history is not saved by a drop: write it now.
+        state.flush_stats().await;
     }
 
     // Commit queued background writes and fsync before exiting; do not rely on the drop order
@@ -331,7 +334,7 @@ async fn start_webui_server(
         Arc<list_service::SignedDoc<list_service::FilterCatalogueEntry>>,
         Arc<list_service::SignedDoc<list_service::UserscriptCatalogueEntry>>,
     ),
-) -> Result<tokio::task::JoinHandle<()>> {
+) -> Result<(tokio::task::JoinHandle<()>, Arc<web_api::AppState>)> {
     use web_api::{start_server, ApiConfig};
 
     info!("Initializing Web UI server...");
@@ -424,13 +427,14 @@ async fn start_webui_server(
     );
 
     // Spawn the web server in a background task
+    let kept = state.clone();
     let handle = tokio::spawn(async move {
         if let Err(e) = start_server(state, api_config).await {
             error!("Web UI API server error: {}", e);
         }
     });
 
-    Ok(handle)
+    Ok((handle, kept))
 }
 
 /// Initialize tracing. Info, debug and trace lines go through a lossy non-blocking writer, so a

@@ -94,8 +94,34 @@ export function applyError(s: TabStats, url: string, now: number, error?: string
 /** The proxy stores blocked URLs without query string and fragment, so compare that way. */
 const noFragment = (u: string) => u.split(/[?#]/)[0]!;
 
+/** Just the fields of a `/ext/log` entry that attribution needs (`at` is epoch ms). */
+export interface LogRef { key: string; seq: number; url: string; at: number; outcome: string; source?: string | null }
+
 /**
- * Resolves pending failures against the proxy's recent-blocked ring. An entry matches by URL
+ * Exact attribution: the proxy tagged each request of this session, so an unexplained network
+ * error is a block when the log holds an `aborted` entry for the same URL (the proxy drops the
+ * query unless its request log keeps queries, so it is not compared), not
+ * older than the error minus a little slack, and for the same page host. Each entry explains at
+ * most one error; `used` (`sid:seq` keys) is shared across calls and updated here.
+ */
+export function attribute(s: TabStats, entries: LogRef[], now: number, used: Set<string>): TabStats {
+  if (s.pending.length === 0) return s;
+  let n: TabStats = { ...s, pending: [] };
+  for (const p of s.pending) {
+    const e = entries.find((r) =>
+      r.outcome === 'aborted' && !used.has(r.key) && noFragment(r.url) === noFragment(p.url)
+      && (Number.isNaN(r.at) || r.at >= p.at - MATCH_SLACK_MS)
+      && (!p.page || !r.source || r.source.toLowerCase() === p.page.toLowerCase()));
+    if (e) { used.add(e.key); n = applyResponse(n, 'blocked', p.host); }
+    else if (now - p.at >= PENDING_TTL_MS) n = { ...n, failed: n.failed + 1 };
+    else n = { ...n, pending: [...n.pending, p] };
+  }
+  return n;
+}
+
+/**
+ * Fallback for a proxy without `/ext/log`: resolves pending failures against the proxy's
+ * recent-blocked ring. An entry matches by URL
  * (without query), not older than the failure minus a little slack, and for the same page host;
  * each entry is consumed by at most one failure.
  */
@@ -119,6 +145,7 @@ export type StatsEvent =
   | { t: 'response'; tabId: number; main: boolean; kind: Kind; host: string }
   | { t: 'error'; tabId: number; main: boolean; url: string; now: number; error?: string }
   | { t: 'reconcile'; tabId: number; blocked: BlockedRef[]; now: number }
+  | { t: 'attribute'; tabId: number; entries: LogRef[]; used: Set<string>; now: number }
   | { t: 'close'; tabId: number };
 
 export type StatsMap = Record<number, TabStats>;
@@ -132,6 +159,7 @@ export function reduce(m: StatsMap, e: StatsEvent): StatsMap {
     return rest;
   }
   let cur = m[e.tabId] ?? emptyStats();
+  if (e.t === 'attribute') return e.tabId in m ? { ...m, [e.tabId]: attribute(cur, e.entries, e.now, e.used) } : m;
   if (e.t === 'reconcile') return e.tabId in m ? { ...m, [e.tabId]: reconcile(cur, e.blocked, e.now) } : m;
   // A new page starts on a main-frame response or a real main-frame error, not on a cancel
   // (a download, a 204, a stopped navigation keeps the page it left).

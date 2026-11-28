@@ -84,6 +84,7 @@ mod tests {
             Arc::default(),
             Arc::default(),
             Arc::default(),
+            Arc::default(),
         );
         let held = shared
             .check_gen("https://a.test/x", "https://b.test/", "script", "c")

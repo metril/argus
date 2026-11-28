@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'preact/hooks';
-import { fetchFilterStats, getSiteState, setSiteOff, type FilterStats, type Settings } from '../lib/api';
+import { CATEGORIES, CATEGORY_LABELS, fetchFilterStats, fetchTimeseries, getSiteState, setSiteOff, type FilterStats, type Series, type SeriesRange, type Settings } from '../lib/api';
+import { chartData, type CategoryPick } from '../lib/chart';
 import { blockedTotal, percent, totalRequests, type TabStats } from '../lib/stats';
 import { Banner, Switch } from './components';
 
@@ -18,7 +19,7 @@ export function PageStats({ stats }: { stats: TabStats | undefined }) {
       </div>
       {hosts.length > 0 && (
         <details class="cont">
-          <summary>{hosts.length} domains connected</summary>
+          <summary data-testid="domains-summary">{hosts.filter(([, c]) => c.blocked > 0).length} of {hosts.length} domains blocked</summary>
           <table class="hosts">
             <tbody>
               {hosts.map(([h, c]) => (
@@ -36,9 +37,27 @@ export function PageStats({ stats }: { stats: TabStats | undefined }) {
   );
 }
 
-/** Blocked since start and total requests, from the proxy. */
-export function GlobalStats({ settings, onScope }: { settings: Settings; onScope: () => void }) {
+const RANGES: { id: SeriesRange; label: string }[] = [{ id: 'd7', label: '7 days' }, { id: 'd30', label: '30 days' }, { id: 'm12', label: '12 months' }];
+
+/** Line chart of blocked requests over time (inline SVG), for one category or all. */
+export function BlockedChart({ series, range, cat }: { series: Series | undefined; range: SeriesRange; cat: CategoryPick }) {
+  if (!series) return <div class="note">Loading</div>;
+  const W = 320, H = 90;
+  const d = chartData(series.points, cat, range, W, H);
+  return (
+    <svg class="chart" viewBox={`0 0 ${W} ${H + 14}`} role="img" aria-label={`Blocked requests: ${nf(d.total)}`} data-testid="chart">
+      <path d={d.path} />
+      {d.labels.map((l) => <text key={l.x} class="ax" x={l.x} y={H + 11} text-anchor={l.x < 20 ? 'start' : l.x > W - 20 ? 'end' : 'middle'}>{l.text}</text>)}
+    </svg>
+  );
+}
+
+/** "Statistics" view: blocked since install, by category, and over time. */
+export function StatsView({ settings, onScope }: { settings: Settings; onScope: () => void }) {
   const [g, setG] = useState<FilterStats>();
+  const [range, setRange] = useState<SeriesRange>('d7');
+  const [cat, setCat] = useState<CategoryPick>('all');
+  const [series, setSeries] = useState<Series>();
   useEffect(() => {
     const ac = new AbortController();
     setG(undefined);
@@ -48,15 +67,40 @@ export function GlobalStats({ settings, onScope }: { settings: Settings; onScope
     });
     return () => ac.abort();
   }, [settings.argusUrl, settings.token]);
+  useEffect(() => {
+    const ac = new AbortController();
+    setSeries(undefined);
+    void fetchTimeseries(settings, range, ac.signal).then((r) => { if (!ac.signal.aborted && r.ok) setSeries(r.value); });
+    return () => ac.abort();
+  }, [settings.argusUrl, settings.token, range]);
   if (!g) return null;
+  const blocked = g.lifetime_blocked ?? g.blocked_requests;
+  const total = g.lifetime_total ?? g.total_requests;
+  const by = g.lifetime_by_category;
   return (
-    <section class="card" data-testid="global-stats">
-      <div class="lbl">Since Argus started</div>
-      <dl>
-        <dt>Blocked</dt><dd data-testid="global-blocked">{nf(g.blocked_requests)}</dd>
-        <dt>Total</dt><dd data-testid="global-total">{nf(g.total_requests)}</dd>
-      </dl>
-    </section>
+    <>
+      <section class="card" data-testid="global-stats">
+        <div class="lbl">Blocked since install</div>
+        <div class="stat"><span class="big" data-testid="global-blocked">{nf(blocked)}</span><span class="muted" data-testid="global-total">of {nf(total)} requests</span></div>
+        {by && (
+          <table class="cats" data-testid="categories">
+            <tbody>{CATEGORIES.map((c) => <tr key={c}><td>{CATEGORY_LABELS[c]}</td><td data-cat={c}>{nf(by[c] ?? 0)}</td></tr>)}</tbody>
+          </table>
+        )}
+      </section>
+      <section class="card" data-testid="chart-card">
+        <div class="seg" role="group" aria-label="Range">
+          {RANGES.map((r) => <button key={r.id} type="button" aria-pressed={range === r.id} onClick={() => setRange(r.id)}>{r.label}</button>)}
+        </div>
+        <div class="chart-bar">
+          <select class="in" aria-label="Category" value={cat} onChange={(e) => setCat((e.target as HTMLSelectElement).value as CategoryPick)}>
+            <option value="all">All</option>
+            {CATEGORIES.map((c) => <option key={c} value={c}>{CATEGORY_LABELS[c]}</option>)}
+          </select>
+        </div>
+        <BlockedChart series={series} range={range} cat={cat} />
+      </section>
+    </>
   );
 }
 

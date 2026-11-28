@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Extension logger page (popup button "Open logger"): the requests of a tab with time, status, URL, type, rule and list; tab selector, search, filters (first/third party, blocked, allowed, redirected/modified, your rules, type), pause, clear and copy as text; recent history per tab is kept in `storage.session`. A row opens "create rule": block or unblock, this site or everywhere, exact URL, path prefix or whole host, third-party only, important, with the rule text editable before saving.
+- New `GET /ext/log?since=` (scope `logs:read`, `X-Argus-Session`): the extension session's own requests with full URL, outcome, matched rule and list; bounded ring per session, never another session's. Blocked requests the proxy aborts are now attributed exactly from it; `GET /stats/blocked/recent` stays as the fallback for an older proxy.
+- New scope `rules:ext` (User role, extension tokens): `POST /ext/rules` adds or removes one validated network rule in the custom rules (audited, rebuilds the engine) and `GET /ext/rules?site=` lists the rules that mention a site. It cannot read or replace the custom rules. Extension tokens now also carry `rules:ext`; an older token needs signing in again.
+- Extension popup "Actions | Statistics": blocked since install, blocks by category (Ads, Trackers, Social, Annoyances, Malware/Security, Other) and a 7 days / 30 days / 12 months chart with a category picker; the domains card reads "N of M domains blocked".
+- `GET /stats/filter` adds `lifetime_total`, `lifetime_blocked` and `lifetime_by_category`; `GET /stats/timeseries` adds `d7`, `d30` and `m12` (UTC days and calendar months, by category). The history is persisted in `stats-history.json` in the filter data directory (saved every 15 s when it changed and at shutdown, 400 days of daily buckets) and survives restarts and statistics resets. Categories come from the signed catalogue; blocks by your own rules, or whose list cannot be found, count as Other.
+
 ## 0.10.0 — 2026-11-27
 
 - Extension popup: "Blocked on this page" (count and share of requests), the domains the page connected to with blocked/allowed counts, and the proxy's blocked/total since start. The toolbar badge shows the page's blocked count (its colour still shows the certificate state; `!` for a problem). Counters are per tab, reset on navigation, kept in `storage.session`. Requests the proxy aborts (default `block_response = fail`) are attributed through `GET /stats/blocked/recent`; unexplained network errors are not counted as blocks.

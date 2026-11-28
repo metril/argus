@@ -43,6 +43,7 @@ scopes! {
     RulesRead => "rules:read", "Read custom rules; validate rules and test URLs against the engine (no changes).";
     RulesWrite => "rules:write", "Replace the custom rules.";
     RulesSite => "rules:site", "Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules.";
+    RulesExt => "rules:ext", "Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules.";
     EngineReload => "engine:reload", "Trigger a rebuild of the blocking engine.";
     StatsRead => "stats:read", "Read blocking, proxy and engine statistics.";
     LogsRead => "logs:read", "Read the request log, live and recent (full browsing history of every client the token may see).";
@@ -97,6 +98,7 @@ impl Scope {
                 Scope::ListsWrite
                     | Scope::RulesWrite
                     | Scope::RulesSite
+                    | Scope::RulesExt
                     | Scope::ScriptsWrite
                     | Scope::UserscriptsBridge
                     | Scope::PolicyWrite
@@ -144,6 +146,7 @@ pub const RESOURCES: &[Resource] = &[
         levels: &[
             lv("Read", &[Scope::RulesRead]),
             lv("Per-site switch", &[Scope::RulesSite]),
+            lv("Extension rules", &[Scope::RulesExt]),
             lv("Read & write", &[Scope::RulesWrite]),
         ],
     },
@@ -292,6 +295,7 @@ pub const TEMPLATE_BROWSER_EXTENSION: &[Scope] = &[
     Scope::UserscriptsBridge,
     Scope::StatsRead,
     Scope::RulesSite,
+    Scope::RulesExt,
 ];
 pub const TEMPLATE_MONITORING: &[Scope] = &[Scope::StatsRead, Scope::SystemRead];
 

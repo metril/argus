@@ -243,8 +243,10 @@ fn domain_set_path_equals_full_engine() {
                 if got.important {
                     assert_eq!(want.matched_rule, got.matched_rule, "important rule: {ctx}");
                 }
-                if got.list_id.is_some() {
-                    assert!(is_pure_rule(rule), "list id only on set rules: {ctx}");
+                // Every compiled rule names its list: set rules through the set, the others
+                // through the build's rule table.
+                assert!(got.list_id.is_some(), "block without a list: {ctx}");
+                if is_pure_rule(rule) {
                     stats[5] += 1;
                 }
             }

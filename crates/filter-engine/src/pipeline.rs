@@ -91,6 +91,8 @@ pub struct BuiltSet {
     pub ip: IpFilter,
     /// One report per input, in order.
     pub reports: Vec<ListReport>,
+    /// The list of each compiled engine rule, keyed by the converted rule text.
+    pub origins: crate::origins::RuleOrigins,
 }
 
 impl BuiltSet {
@@ -98,12 +100,14 @@ impl BuiltSet {
     /// rules, IP filter) into `engine`. Returns the per-list reports. CPU-bound.
     pub fn install_into(self, engine: &crate::SharedEngine) -> Vec<ListReport> {
         let live = crate::build_engine(&self.blob, &engine.resources());
-        engine.install_set(
+        engine.install_set_with(
             std::sync::Arc::new(self.blob),
             live,
+            None,
             std::sync::Arc::new(self.ext),
             std::sync::Arc::new(self.ip),
             std::sync::Arc::new(self.domains),
+            std::sync::Arc::new(self.origins),
         );
         self.reports
     }
@@ -231,6 +235,13 @@ pub fn build_set_checked(
         deduped.push(dedupe(t, &mut seen));
     }
     drop(seen);
+    let origins = crate::origins::RuleOrigins::build(
+        inputs.iter().map(|i| i.id.clone()).collect(),
+        deduped
+            .iter()
+            .enumerate()
+            .flat_map(|(li, (t, _))| t.lines().map(move |l| (li, l))),
+    );
     let domain_routed = routed.routed;
     drop(routed.engine_text);
 
@@ -323,6 +334,7 @@ pub fn build_set_checked(
         ext,
         ip: IpFilter::from_ranges(&ip_block, &ip_allow),
         reports,
+        origins,
     }
 }
 
@@ -415,6 +427,43 @@ mod tests {
             .domains
             .lookup("a.other.net", crate::domainset::Scheme::Https)
             .is_some());
+    }
+
+    #[test]
+    fn engine_hits_name_their_list_even_when_the_rule_was_translated() {
+        let built = build_set(&[
+            input(
+                "a",
+                "||ads.test/x.js^$script\n||ok.test/y.js^$script\n",
+                ListFormat::Abp,
+                false,
+            ),
+            // The AdGuard stub is stripped at build time: the compiled text is not the source.
+            input(
+                "adguard-b",
+                "||m.test/a.js$script,redirect=noop.js\n",
+                ListFormat::Ubo,
+                false,
+            ),
+            input("c", "@@||ok.test/y.js^$script\n", ListFormat::Abp, false),
+        ]);
+        let engine = crate::SharedEngine::default();
+        built.install_into(&engine);
+        let q = |u: &str| {
+            engine
+                .check_gen_deferred(u, "https://page.test/", "script")
+                .0
+        };
+        let r = q("https://ads.test/x.js");
+        assert!(r.blocked && r.list_id.as_deref() == Some("a"), "{r:?}");
+        let r = q("https://m.test/a.js");
+        assert!(
+            r.blocked && r.list_id.as_deref() == Some("adguard-b"),
+            "{r:?}"
+        );
+        let r = q("https://ok.test/y.js");
+        assert!(!r.blocked && r.list_id.as_deref() == Some("c"), "{r:?}");
+        assert_eq!(q("https://none.test/").list_id, None);
     }
 
     #[test]

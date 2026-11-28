@@ -91,6 +91,8 @@ pub enum EventOutcome {
     Aborted,
     /// The requester got a well-formed answer (block page, blank frame, GIF, 204, redirect resource).
     Synthetic,
+    /// A `$redirect` resource answered it (a synthetic answer; the API reports it as such).
+    Redirected,
 }
 
 impl EventOutcome {
@@ -101,6 +103,7 @@ impl EventOutcome {
         match c {
             1 => Some(Self::Aborted),
             2 => Some(Self::Synthetic),
+            3 => Some(Self::Redirected),
             _ => None,
         }
     }
@@ -186,6 +189,9 @@ pub struct EventRef<'a> {
     pub error_kind: Option<ErrorKind>,
     pub cert_fp: Option<&'a str>,
     pub outcome: Option<EventOutcome>,
+    /// The extension session the connection is bound to; the event also enters that session's
+    /// log ([`crate::session_log`]).
+    pub session: Option<u64>,
 }
 
 const FIELDS: usize = 8;
@@ -402,19 +408,25 @@ impl RequestLog {
             error_kind: None,
             cert_fp: None,
             outcome: None,
+            session: None,
         });
     }
 
     /// Record any event. Blocked events also enter the blocked-only ring.
     pub fn record_event(&self, e: &EventRef<'_>) {
-        if self.capacity() == 0 {
-            return;
-        }
         let url = if self.keep_query.load(Ordering::Relaxed) {
             e.url
         } else {
             strip_query(e.url)
         };
+        // The extension's session log does not depend on the request log's capacity (which the
+        // user may set to 0), and honours the same query setting.
+        if let Some(sid) = e.session {
+            crate::session_log::session_log().push(sid, e, url);
+        }
+        if self.capacity() == 0 {
+            return;
+        }
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
@@ -555,6 +567,7 @@ mod tests {
             error_kind: None,
             cert_fp: None,
             outcome: None,
+            session: None,
         }
     }
 

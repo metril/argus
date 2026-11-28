@@ -10,6 +10,9 @@ publish.workspace = true
 # Async runtime
 tokio = { workspace = true }
 
+# Registrable domains (extension rule scoping)
+psl = "2"
+
 # Web framework
 axum = { workspace = true }
 tower = { workspace = true }

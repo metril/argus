@@ -201,6 +201,7 @@ impl ListService {
             Arc::new(built.ext),
             Arc::new(built.ip),
             Arc::new(built.domains),
+            Arc::new(built.origins),
         );
         self.sets.builds.fetch_add(1, Ordering::AcqRel);
         Ok(sig)

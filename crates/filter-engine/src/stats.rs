@@ -24,6 +24,12 @@ const TYPES: [&str; 14] = [
     "other",
 ];
 
+/// Block counts by source key.
+pub type SourceCounts = Vec<(String, u64)>;
+
+/// Cap on distinct block sources (list ids, rule texts) awaiting attribution to a category.
+const MAX_SOURCES: usize = 5_000;
+
 /// Cap on distinct tracked domains, so hostile traffic cannot grow the map without bound.
 const MAX_DOMAINS: usize = 10_000;
 
@@ -61,6 +67,10 @@ pub struct FilterStats {
     allowed_requests: Arc<AtomicU64>,
     blocked_by_type: Arc<[AtomicU64; TYPES.len()]>,
     blocked_domains: Arc<DashMap<String, u64>>,
+    /// Blocks since the last [`FilterStats::take_sources`], by source list id.
+    by_list: Arc<DashMap<String, u64>>,
+    /// The same for blocks whose list is unknown, by matched rule text.
+    by_rule: Arc<DashMap<String, u64>>,
 }
 
 impl Default for FilterStats {
@@ -78,6 +88,8 @@ impl FilterStats {
             allowed_requests: Arc::new(AtomicU64::new(0)),
             blocked_by_type: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             blocked_domains: Arc::new(DashMap::new()),
+            by_list: Arc::new(DashMap::new()),
+            by_rule: Arc::new(DashMap::new()),
         }
     }
 
@@ -93,6 +105,38 @@ impl FilterStats {
         } else if self.blocked_domains.len() < MAX_DOMAINS {
             *self.blocked_domains.entry(domain.to_string()).or_insert(0) += 1;
         }
+    }
+
+    /// [`Self::record_blocked`] that also remembers what blocked it (the source list, else the
+    /// matched rule), so the blocks can later be attributed to list categories.
+    pub fn record_blocked_by(
+        &self,
+        resource_type: &str,
+        domain: &str,
+        list_id: Option<&str>,
+        rule: Option<&str>,
+    ) {
+        self.record_blocked(resource_type, domain);
+        let (map, key) = match (list_id, rule) {
+            (Some(l), _) => (&self.by_list, l),
+            (None, Some(r)) if !r.is_empty() => (&self.by_rule, r),
+            _ => return,
+        };
+        if let Some(mut v) = map.get_mut(key) {
+            *v += 1;
+        } else if map.len() < MAX_SOURCES {
+            *map.entry(key.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Hand over (and clear) the block sources tallied since the last call: `(by list id,
+    /// by rule text)`.
+    pub fn take_sources(&self) -> (SourceCounts, SourceCounts) {
+        let drain = |m: &DashMap<String, u64>| -> Vec<(String, u64)> {
+            let keys: Vec<String> = m.iter().map(|e| e.key().clone()).collect();
+            keys.into_iter().filter_map(|k| m.remove(&k)).collect()
+        };
+        (drain(&self.by_list), drain(&self.by_rule))
     }
 
     /// Record an allowed request
@@ -138,6 +182,8 @@ impl FilterStats {
             c.store(0, Ordering::Relaxed);
         }
         self.blocked_domains.clear();
+        self.by_list.clear();
+        self.by_rule.clear();
     }
 }
 
@@ -165,6 +211,20 @@ mod tests {
         assert_eq!(snapshot.blocked_by_type.get("script"), Some(&2));
         assert_eq!(snapshot.blocked_by_type.get("image"), Some(&1));
         assert_eq!(snapshot.top_blocked_domains.len(), 2);
+    }
+
+    #[test]
+    fn block_sources_are_tallied_and_drained() {
+        let stats = FilterStats::new();
+        stats.record_blocked_by("script", "a.test", Some("easylist"), Some("||a.test^"));
+        stats.record_blocked_by("script", "a.test", Some("easylist"), None);
+        stats.record_blocked_by("image", "b.test", None, Some("||b.test^"));
+        stats.record_blocked_by("image", "c.test", None, None);
+        let (l, r) = stats.take_sources();
+        assert_eq!(l, vec![("easylist".to_string(), 2)]);
+        assert_eq!(r, vec![("||b.test^".to_string(), 1)]);
+        assert_eq!(stats.take_sources(), (vec![], vec![]));
+        assert_eq!(stats.snapshot().blocked_requests, 4);
     }
 
     #[test]
