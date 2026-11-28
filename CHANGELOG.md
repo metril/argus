@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.0 — 2026-11-27
+
 - Extension element picker ("Block an element" in the popup): hover to highlight, click to select; a panel in a closed shadow root offers selectors from specific to broad with a slider, a live preview with a match count, this site or all sites, and for images, frames, media and scripts a network rule for the resource. Saves `site##selector` or `##selector`. Esc cancels. Injected on demand with `scripting` and `activeTab`; the script never holds the token and the background accepts a save only from the armed tab (expires after 5 minutes or when the picker closes) with a trusted click.
 - Extension zapper ("Zap elements"): click to remove elements for this page view only; nothing is saved; Undo, Esc exits.
 - Extension popup lists your rules for the site with Remove and "Reset all rules for this site", and each third-party domain in "Blocked on this page" gets Block / Default / Allow (`||host^$domain=site`, `@@||host^$domain=site`).
