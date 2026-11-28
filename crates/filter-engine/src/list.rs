@@ -36,6 +36,14 @@ pub struct FilterList {
     /// `$urltransform`, `#%#`, ...). Off unless the user opts the list in.
     #[serde(default)]
     pub trusted: bool,
+    /// The last build found more problems in this list than it tolerates (see
+    /// [`crate::ListReport::attention`]).
+    #[serde(default)]
+    pub report_attention: bool,
+    /// The last build found every rule of this list already provided elsewhere (see
+    /// [`crate::ListReport::redundant`]).
+    #[serde(default)]
+    pub redundant: bool,
 }
 
 impl FilterList {
@@ -53,6 +61,8 @@ impl FilterList {
             format: ListFormat::Auto,
             allowlist: false,
             trusted: false,
+            report_attention: false,
+            redundant: false,
         }
     }
 }

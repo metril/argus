@@ -87,6 +87,7 @@ pub(crate) fn convert_surge(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     let mut in_rules = true;
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = raw.trim();
         if line.is_empty() || line.starts_with(['#', ';']) || line.starts_with("//") {
             continue;
@@ -118,6 +119,7 @@ pub(crate) fn convert_surge(content: &str, opts: &ConvertOptions) -> Converted {
 pub(crate) fn convert_clash(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;

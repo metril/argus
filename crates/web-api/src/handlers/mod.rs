@@ -14,6 +14,7 @@ pub mod dns;
 pub mod downloads;
 pub mod ext;
 pub mod health;
+pub mod lines;
 pub mod lists;
 pub mod paging;
 pub mod policy;

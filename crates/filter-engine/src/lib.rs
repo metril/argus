@@ -14,6 +14,7 @@ pub mod domainset;
 pub mod error;
 pub mod events;
 pub mod formats;
+pub mod inspect;
 pub mod list;
 pub mod matcher;
 pub mod origins;
@@ -48,7 +49,10 @@ pub use formats::{
 };
 pub use list::{is_known_trusted_source, FilterList};
 pub use matcher::{MatchResult, RedirectResource, RequestMatcher};
-pub use pipeline::{build_set, build_set_checked, BuiltSet, ListInput, ListReport, ReportIssue};
+pub use pipeline::{
+    build_set, build_set_checked, BuiltSet, IssueStage, ListInput, ListReport, ReportIssue,
+    ATTENTION_PERCENT,
+};
 pub use redirect_resources::builtin_redirect_resources;
 pub use scriptlet_resources::{
     convert_ubo_scriptlets, convert_ubo_sources, ubo_scriptlets_to_json, ubo_sources_to_json,

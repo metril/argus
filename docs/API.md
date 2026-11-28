@@ -41,8 +41,11 @@ old secret is still accepted, `prev_valid_until`.
 `PATCH /tokens/{id}` (`tokens:self`; `PATCH /admin/tokens/{id}` with `tokens:admin`) changes
 `name`, `scopes`, `profiles` (or `clear_profiles`), `purpose` and expiry (`expires_in_days`,
 `expires_at` or `never_expires`; one of them). Absent fields stay. Scopes and profiles are checked
-like on creation: the caller must hold every scope and cannot widen the profile restriction, so a
-token can be narrowed but never widened beyond what the caller holds.
+like on creation: the caller must hold every scope it adds and cannot widen the profile
+restriction, so a token can be narrowed but never widened beyond what the caller holds. Scopes the
+token already has may stay in a `scopes` list even when the caller no longer holds them (an owner
+who lost a role can still rename or narrow the token); adding one they do not hold is 403
+`scope_escalation`.
 
 `POST /tokens/{id}/regenerate` `{grace_secs?}` (0 to 604800, default 0) issues a new secret for the
 same token id and settings and returns it once. The old secret keeps working for `grace_secs`, then
@@ -179,7 +182,29 @@ disabled or the password is wrong.
   `requiresTrust` (uBO's `trusted-*`) only run for rules of trusted lists.
 - `GET /lists/{id}/report`, `GET /rules/custom/report`: `ListReport` of the last build (detected
   format, network/cosmetic/ext/skipped/deduped/rejected counts, first parse issues, header metadata,
-  content SHA).
+  content SHA). `conversion_errors` (lines that are not rules) and `rejected` (rules the engine's
+  compiler refused) are separate; `error_count` is their deprecated sum. Each `issues` entry has
+  the source `line` (the `!#include` line for included rules), the `rule` text, the `reason` and
+  the `stage` (`conversion` or `compile`). `ext_states` splits the extended rules by what the
+  extended-rule index made of them (`ext_enforced`, `ext_unsupported`, `ext_invalid`,
+  `ext_needs_trust` are the usual four). `redundant_count` (`deduped + compressed`) and
+  `redundant` say a list adds nothing of its own. `attention` is set only by invalid rules
+  (conversion errors, compiler rejections, malformed extended rules) reaching 1% of the list's
+  rules, rounded up, at least one; unsupported, not-enforced and needs-trust rules are counted
+  apart and never set it; the list feed's `attention` also covers a failed fetch and a stale or never fetched list.
+- `GET /lists/{id}/lines?status=&q=&cursor=&limit=&profile=` (and `GET /rules/custom/lines`, which
+  needs `rules:read` like `GET /rules/custom`): every source line of the list's cached text with
+  the build's verdict: `comment`, `inactive` (false `!#if` branch),
+  `network`, `cosmetic`, `extended` (with `kind`, `state`, `reason`), `duplicate` / `covered`
+  (with the `list` that already provides it), `disabled` (a domain rule a `$badfilter` rule switches off; for engine rules the build keeps no
+  per-rule record of `$badfilter`, so those show as `network`), `unsupported`, `invalid` (with
+  `stage`). `profile` judges against that profile's engine and list set (its own rules for the
+  custom route). `q` is at most 256 characters. Extended rules are judged per list. Line numbers
+  are source lines; an `!#include`'s rules carry the include line. `status` is a comma-separated
+  set (the names above, extended-rule states, or the groups `issues`, `applied`, `ignored`), `q` a
+  case-insensitive substring of the rule. `counts` covers the whole list whatever the filter.
+  A list that is disabled or changed since the last build is judged on its own (`in_build`
+  false). The cursor names the build and the text; a stale one gets `409 lines_changed`.
 - `GET /engine/build`: `BuildSummary` with the build state (`idle`, `fetching`, `compiling`,
   `failed` with the error; a failed build leaves the previous engine serving), last build duration
   and time, domain-set size and handed-off rule counts per kind. `ext_stats` reports what the
@@ -196,8 +221,11 @@ disabled or the password is wrong.
 - `GET /rules/ext?kind=`: paginated read-only listing of handed-off rules, each with its source
   `list` and `state`: `active`, `dropped_untrusted`, `unsupported` (with `reason`), `invalid`,
   `badfiltered`, `badfilter`, or `unknown` while a rebuild is being installed.
-- `POST /rules/validate`: `{rules, format?, allowlist?}` runs the real conversion pipeline and
-  reports each line as `translated`, `accepted`, `handed_off`, `skipped` or `rejected`.
+- `POST /rules/validate`: `{rules, format?, allowlist?, trusted?}` runs the same classifier as
+  `/lists/{id}/lines`, standalone, so each line gets the verdict a build would give it
+  (`!#if` branches, duplicates among the lines and trust included): `translated`, `accepted`,
+  `handed_off` (with its `state`), `duplicate`, `skipped` or `rejected`. `trusted` defaults to
+  false; pass `true` to judge the custom rules, which are built trusted.
 
 ## Per-site no-decrypt (browser extension)
 

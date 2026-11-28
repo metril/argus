@@ -836,7 +836,7 @@ pub fn check_ext_rule(rule: &str) -> Result<String, String> {
                 .into(),
         );
     }
-    let v = super::rules::validate_rules(r, filter_engine::ListFormat::Abp, false);
+    let v = super::rules::validate_rules(r, filter_engine::ListFormat::Abp, false, false);
     match v.lines.as_slice() {
         [l] if l.outcome == "accepted" || l.outcome == "translated" => Ok(lower_host(r)),
         [l] => Err(l
@@ -1121,7 +1121,7 @@ fn check_ext_cosmetic(r: &str, c: &filter_engine::formats::Cosmetic<'_>) -> Resu
         }
     }
     let rule = format!("{}##{sel}", domains.to_ascii_lowercase());
-    let v = super::rules::validate_rules(&rule, filter_engine::ListFormat::Abp, false);
+    let v = super::rules::validate_rules(&rule, filter_engine::ListFormat::Abp, false, false);
     match v.lines.as_slice() {
         [l] if l.outcome == "accepted" => Ok(rule),
         [l] => Err(l

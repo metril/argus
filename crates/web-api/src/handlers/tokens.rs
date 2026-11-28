@@ -25,11 +25,14 @@ type Grant = (Vec<Scope>, Option<Vec<String>>);
 
 /// The one grant check, shared by creation and edit: every scope must be held by the caller, a
 /// restricted caller cannot widen the profile restriction, and every profile id must exist.
-/// Narrowing always passes. `profiles: None` inherits the caller's own restriction.
+/// Narrowing always passes. `profiles: None` inherits the caller's own restriction. `keep` are
+/// the scopes the target token already stores (an edit; empty on create): leaving those in
+/// place is not a grant, so the caller need not hold them. It never comes from the request.
 async fn check_grant(
     state: &Arc<AppState>,
     p: &Principal,
     scopes: &[Scope],
+    keep: &[Scope],
     profiles: Option<Vec<String>>,
 ) -> ApiResult<Grant> {
     if scopes.is_empty() {
@@ -37,7 +40,7 @@ async fn check_grant(
             "A token needs at least one scope".into(),
         ));
     }
-    if let Some(s) = scopes.iter().find(|s| !p.has(**s)) {
+    if let Some(s) = scopes.iter().find(|s| !p.has(**s) && !keep.contains(s)) {
         return Err(ApiError::coded(
             StatusCode::FORBIDDEN,
             "scope_escalation",
@@ -128,7 +131,7 @@ pub async fn create_token(
     ApiJson(req): ApiJson<CreateTokenRequest>,
 ) -> ApiResult<(StatusCode, Json<CreatedTokenResponse>)> {
     req.validate()?;
-    let (scopes, profiles) = check_grant(&state, &p, &req.scopes, req.profiles).await?;
+    let (scopes, profiles) = check_grant(&state, &p, &req.scopes, &[], req.profiles).await?;
     let expires = parse_expiry(req.expires_in_days, req.expires_at.as_deref(), false)?.flatten();
     let purpose = req.purpose.unwrap_or_default();
     let st = state.clone();
@@ -222,7 +225,11 @@ async fn apply_update(
     let target = find_target(state, &id, owner)?;
     require_within(p, &target.stored)?;
     let scopes = match req.scopes {
-        Some(s) => Some(check_grant(state, p, &s, None).await?.0),
+        Some(s) => Some(
+            check_grant(state, p, &s, &target.stored.scopes, None)
+                .await?
+                .0,
+        ),
         None => None,
     };
     let profiles = if req.clear_profiles {
