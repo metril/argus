@@ -84,7 +84,11 @@ async fn paging_to_the_end_returns_every_line_once_with_true_numbers() {
     assert!(ext
         .iter()
         .any(|l| l["kind"] == "replace" && l["line"] == 11));
-    assert!(ext.iter().any(|l| l["state"] == "unsupported"), "{ext:?}");
+    assert!(
+        ext.iter()
+            .any(|l| l["line"] == 12 && l["state"] == "not_applicable"),
+        "$popunder is meaningless for a proxy: {ext:?}"
+    );
     let bad = find("invalid");
     assert_eq!(bad[0]["line"], 13);
     assert_eq!(bad[0]["rule"], "||bad$$");

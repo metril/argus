@@ -22,6 +22,7 @@ mod headers;
 mod hls;
 mod index;
 mod jsonprune;
+mod location;
 mod parse;
 mod pattern;
 mod permissions;
@@ -32,6 +33,7 @@ mod replace;
 pub mod stealth;
 mod style;
 mod types;
+mod urlskip;
 mod util;
 mod xmlprune;
 
@@ -41,7 +43,7 @@ pub use cookie::{
 pub use filter_engine::formats::{ExtKind, ExtRule};
 pub use headers::{is_removable_header, HeaderEdit};
 pub use hls::{apply_hls, HlsPrune, MAX_HLS_BYTES};
-pub use index::{BuildOptions, ExtIndex, ExtStats, KindStats, RuleIssue, RuleState};
+pub use index::{BuildOptions, CnameDecision, ExtIndex, ExtStats, KindStats, RuleIssue, RuleState};
 pub use jsonprune::{apply_jsonprune, JsonPrune, MAX_JSON_BYTES};
 pub use parse::{
     parse_rule, target, Action, HeaderMatch, HtmlRemoval, Injection, ParsedRule, RuleError,
@@ -53,4 +55,5 @@ pub use style::is_safe_style;
 pub use types::{
     BodyTransform, RequestDecision, RequestInfo, ResourceType, ResponseInfo, ResponsePlan, RuleId,
 };
+pub use urlskip::UrlSkip;
 pub use xmlprune::{apply_xmlprune, XmlPrune, MAX_XML_BYTES};

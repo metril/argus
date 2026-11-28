@@ -219,6 +219,8 @@ pub struct Internal {
     unsupported: parking_lot::Mutex<std::collections::BTreeMap<String, u64>>,
     /// Userscript delivery and backend state.
     pub gm: Arc<crate::gm::GmHost>,
+    /// Live master switch for userscripts: off, nothing is injected and `us/`, `gm/v1/` refuse.
+    pub us_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// The in-page panel's state endpoint and the reserved confirmation host.
     pub panel: Arc<crate::panel::PanelHost>,
     /// Policy-violation reports accepted so far per document (rate limit).
@@ -276,6 +278,7 @@ impl Internal {
                 .build(),
             unsupported: Default::default(),
             gm: Arc::new(crate::gm::GmHost::new()),
+            us_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panel: Arc::default(),
             pages: Default::default(),
             pv_counts: moka::sync::Cache::builder()
@@ -566,8 +569,9 @@ impl Internal {
         if rest == "cc" {
             return self.cc(req, host, &profile).await;
         }
+        let us_on = self.us_enabled.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(r) = rest.strip_prefix("us/") {
-            return match profile.userscript_manager() {
+            return match profile.userscript_manager().filter(|_| us_on) {
                 Some(m) => self.gm.serve_chunk(
                     m,
                     &crate::gm::Caller {
@@ -585,7 +589,7 @@ impl Internal {
             };
         }
         if let Some(r) = rest.strip_prefix("gm/v1/") {
-            return match profile.userscript_manager() {
+            return match profile.userscript_manager().filter(|_| us_on) {
                 Some(m) => {
                     let caller = crate::gm::Caller {
                         manager: m,

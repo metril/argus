@@ -265,6 +265,49 @@ fn production_lists_match_their_build_report() {
 }
 
 #[test]
+fn trust_dependent_branches_and_location_cosmetics_match_the_build() {
+    use filter_engine::inspect::Kind;
+    let text = "!#if cap_html_filtering\n||trusted-branch.test^\n!#else\n||untrusted-branch.test^\n!#endif\n\
+        [$path=/search]a.test##.ad\n/^h[0-9]+\\.x\\.test$/##.ad\n||r.test^$replace=/a,b/c/,script\n";
+    for trusted in [false, true] {
+        let mut i = input("t", text, ListFormat::Abp);
+        i.trusted = trusted;
+        assert_parity(&[i.clone()]);
+        let c = classify_list(&i, None, &enforce);
+        let kinds = |line: u32| -> Vec<Kind> {
+            c.records
+                .iter()
+                .filter(|r| r.line == line)
+                .map(|r| r.kind)
+                .collect()
+        };
+        // Exactly one branch of the `!#if` is active for the list's trust.
+        assert_eq!(
+            kinds(2),
+            [if trusted {
+                Kind::Network
+            } else {
+                Kind::Inactive
+            }]
+        );
+        assert_eq!(
+            kinds(4),
+            [if trusted {
+                Kind::Inactive
+            } else {
+                Kind::Network
+            }]
+        );
+        // Location-scoped cosmetics always go to the extended-rule index.
+        for line in [6, 7] {
+            let r = c.records.iter().find(|r| r.line == line).unwrap();
+            assert_eq!(r.kind, Kind::Extended, "line {line}");
+            assert_eq!(r.ext_kind.map(|k| k.as_str()), Some("cosmetic-location"));
+        }
+    }
+}
+
+#[test]
 fn badfilter_covered_and_exact_scheme_cases_are_attributed() {
     use filter_engine::inspect::Kind;
     let all = fixtures();

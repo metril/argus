@@ -18,6 +18,7 @@
 //! one list. A `||host^` rule disabled by a `$badfilter` rule counts as a network rule, as the
 //! build counts it.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -469,28 +470,29 @@ impl Classified {
 // ---- stage A: source line -> emitted rules -------------------------------------------------------
 
 /// What one source line (or one rule of it) turned into during conversion.
-enum What {
+enum What<'a> {
     Comment,
     Inactive,
     /// An emitted rule; `translated` on the first rule of a rewritten line.
+    /// Borrowed from the source or the converted text when conversion left the line as it was.
     Rule {
-        rule: String,
+        rule: Cow<'a, str>,
         translated: bool,
     },
     /// An emitted IP range.
     Ip,
     /// Dropped on purpose after conversion (AdGuard stubs).
     Stripped(&'static str),
-    Ext(ExtRule),
-    Skip(String),
-    Invalid(String),
+    Ext(Box<ExtRule>),
+    Skip(Box<str>),
+    Invalid(Box<str>),
 }
 
-struct Item {
+struct Item<'a> {
     line: u32,
     /// The rule text when it is not the source line (an included rule).
-    extra: Option<String>,
-    what: What,
+    extra: Option<Box<str>>,
+    what: What<'a>,
 }
 
 fn is_in(content: &str, s: &str) -> bool {
@@ -500,14 +502,17 @@ fn is_in(content: &str, s: &str) -> bool {
 
 /// Fold the AdGuard-origin rewrites into an emitted rule: `None` keeps it (maybe rewritten),
 /// `Some(reason)` drops it.
-fn strip(adguard: bool, rule: &mut String) -> Option<&'static str> {
+fn strip(adguard: bool, rule: &mut Cow<'_, str>) -> Option<&'static str> {
     if !adguard {
         return None;
     }
-    match strip_redirects_line(rule) {
+    let owned = match strip_redirects_line(rule) {
         None => return Some(STRIPPED_REDIRECT),
-        Some(std::borrow::Cow::Owned(l)) => *rule = l,
-        Some(std::borrow::Cow::Borrowed(_)) => {}
+        Some(Cow::Owned(l)) => Some(l),
+        Some(Cow::Borrowed(_)) => None,
+    };
+    if let Some(l) = owned {
+        *rule = Cow::Owned(l);
     }
     is_host_only_exception(rule).then_some(STRIPPED_HOST_ONLY)
 }
@@ -520,7 +525,11 @@ fn stripped_reason(reason: &str) -> String {
 }
 
 /// Stage A: the format and the items, in source order.
-fn items_of(input: &ListInput, content: &str) -> (ListFormat, Vec<Item>) {
+fn items_of<'a>(
+    input: &'a ListInput,
+    content: &'a str,
+    converted: &'a mut String,
+) -> (ListFormat, Vec<Item<'a>>) {
     let format = if input.format == ListFormat::Auto {
         detect(content)
     } else {
@@ -533,8 +542,8 @@ fn items_of(input: &ListInput, content: &str) -> (ListFormat, Vec<Item>) {
             .par_iter()
             .flat_map_iter(|&(line, raw, p)| {
                 let line = line as u32;
-                let extra = (!is_in(content, raw)).then(|| raw.trim().to_string());
-                let mut out: Vec<Item> = Vec::new();
+                let extra = (!is_in(content, raw)).then(|| raw.trim().into());
+                let mut out: Vec<Item<'a>> = Vec::new();
                 let one = |what| Item {
                     line,
                     extra: extra.clone(),
@@ -545,10 +554,16 @@ fn items_of(input: &ListInput, content: &str) -> (ListFormat, Vec<Item>) {
                     Pre::Inactive => out.push(one(What::Inactive)),
                     Pre::Active => match convert_line(raw, input.allowlist) {
                         None => out.push(one(What::Comment)),
-                        Some(Rule::Error(e)) => out.push(one(What::Invalid(e.to_string()))),
-                        Some(Rule::Ext(e)) => out.push(one(What::Ext(e))),
+                        Some(Rule::Error(e)) => out.push(one(What::Invalid(e.into()))),
+                        Some(Rule::Ext(e)) => out.push(one(What::Ext(Box::new(e)))),
                         Some(Rule::Emit(rules, translated)) => {
-                            for (k, mut rule) in rules.into_iter().enumerate() {
+                            for (k, rule) in rules.into_iter().enumerate() {
+                                // Most lines convert to themselves: borrow, drop the copy.
+                                let mut rule = if rule == raw.trim() {
+                                    Cow::Borrowed(raw.trim())
+                                } else {
+                                    Cow::Owned(rule)
+                                };
                                 out.push(one(match strip(adguard, &mut rule) {
                                     Some(r) => What::Stripped(r),
                                     None => What::Rule {
@@ -575,17 +590,19 @@ fn items_of(input: &ListInput, content: &str) -> (ListFormat, Vec<Item>) {
             trace: true,
         },
     );
-    let mut rules = c.rules.lines();
+    *converted = c.rules;
+    let converted: &'a String = converted;
+    let mut rules = converted.lines();
     let events = c.stats.trace.unwrap_or_default();
     let n_lines = content.lines().count();
     let mut seen = vec![false; n_lines + 2];
-    let mut items: Vec<Item> = Vec::with_capacity(events.len() + n_lines);
+    let mut items: Vec<Item<'a>> = Vec::with_capacity(events.len() + n_lines);
     for (line, ev) in events {
         let line = line.clamp(1, n_lines.max(1));
         seen[line] = true;
         let what = match ev {
             crate::formats::Ev::Rule => {
-                let mut rule = rules.next().unwrap_or("").to_string();
+                let mut rule = Cow::Borrowed(rules.next().unwrap_or(""));
                 match strip(adguard, &mut rule) {
                     Some(r) => What::Stripped(r),
                     None => What::Rule {
@@ -595,8 +612,8 @@ fn items_of(input: &ListInput, content: &str) -> (ListFormat, Vec<Item>) {
                 }
             }
             crate::formats::Ev::Ip => What::Ip,
-            crate::formats::Ev::Skip(r) => What::Skip(r),
-            crate::formats::Ev::Error(r) => What::Invalid(r),
+            crate::formats::Ev::Skip(r) => What::Skip(r.into()),
+            crate::formats::Ev::Error(r) => What::Invalid(r.into()),
         };
         items.push(Item {
             line: line as u32,
@@ -624,18 +641,22 @@ pub fn locate(input: &ListInput, wanted: &HashSet<&str>) -> HashMap<String, (usi
         .content
         .strip_prefix('\u{feff}')
         .unwrap_or(&input.content);
-    let (_, items) = items_of(input, content);
+    let mut converted = String::new();
+    let (_, items) = items_of(input, content, &mut converted);
     let lines: Vec<&str> = content.lines().collect();
     let mut found = HashMap::new();
     for it in items {
         if let What::Rule { rule, .. } = &it.what {
             if wanted.contains(rule.trim()) && !found.contains_key(rule.trim()) {
-                let text = it.extra.clone().unwrap_or_else(|| {
-                    lines
-                        .get(it.line as usize - 1)
-                        .map_or("", |l| l.trim())
-                        .to_string()
-                });
+                let text: String = it.extra.as_deref().map_or_else(
+                    || {
+                        lines
+                            .get(it.line as usize - 1)
+                            .map_or("", |l| l.trim())
+                            .to_string()
+                    },
+                    str::to_string,
+                );
                 found.insert(rule.trim().to_string(), (it.line as usize, text));
             }
         }
@@ -648,8 +669,8 @@ pub fn locate(input: &ListInput, wanted: &HashSet<&str>) -> HashMap<String, (usi
 enum Parsed {
     Network,
     Cosmetic,
-    Ext(ExtRule),
-    Invalid(String),
+    Ext(Box<ExtRule>),
+    Invalid(Box<str>),
 }
 
 fn parse_rule(rule: &str, trusted: bool) -> Parsed {
@@ -667,8 +688,8 @@ fn parse_rule(rule: &str, trusted: bool) -> Parsed {
         // An empty rule never reaches the build's parser either.
         Err(adblock::lists::FilterParseError::Empty) => Parsed::Network,
         Err(e) => match classify_rejected(rule) {
-            Some(x) => Parsed::Ext(x),
-            None => Parsed::Invalid(e.to_string()),
+            Some(x) => Parsed::Ext(Box::new(x)),
+            None => Parsed::Invalid(e.to_string().into()),
         },
     }
 }
@@ -718,7 +739,8 @@ pub fn classify_list(input: &ListInput, live: Option<Live<'_>>, judge: Judge<'_>
         Some(l) => l.origins.ids().to_vec(),
         None => vec![input.id.clone()],
     };
-    let (format, mut items) = items_of(input, content);
+    let mut converted = String::new();
+    let (format, mut items) = items_of(input, content, &mut converted);
 
     // Stage B (parallel): engine-path rules, judged against the owner and the parser.
     let engine: Vec<Option<Engine>> = items
@@ -790,7 +812,7 @@ pub fn classify_list(input: &ListInput, live: Option<Live<'_>>, judge: Judge<'_>
         let mut r = record(it.line, Kind::Comment);
         if let Some(x) = it.extra.take() {
             r.extra = extras.len() as u32;
-            extras.push(x);
+            extras.push(x.into());
         }
         match std::mem::replace(&mut it.what, What::Comment) {
             What::Comment => counts.comment += 1,
@@ -823,7 +845,7 @@ pub fn classify_list(input: &ListInput, live: Option<Live<'_>>, judge: Judge<'_>
                 r.kind = Kind::Extended;
                 r.ext_kind = Some(e.kind);
                 ext_at.push(records.len());
-                ext_rules.push(e);
+                ext_rules.push(*e);
             }
             What::Rule { rule, translated } => {
                 if translated {
@@ -858,7 +880,7 @@ pub fn classify_list(input: &ListInput, live: Option<Live<'_>>, judge: Judge<'_>
                                     r.kind = Kind::Extended;
                                     r.ext_kind = Some(e.kind);
                                     ext_at.push(records.len());
-                                    ext_rules.push(e);
+                                    ext_rules.push(*e);
                                 }
                                 Parsed::Invalid(reason) => {
                                     r.kind = Kind::Invalid;

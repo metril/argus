@@ -279,6 +279,12 @@ impl ListService {
             if let Some(hit) = self.class_cache.get(&key) {
                 return Ok(Some((hit, key.generation)));
             }
+            // A classification and a build each peak at hundreds of MB on the largest lists:
+            // never at once. Wait for the build, then judge against what it installed.
+            if self.is_building() {
+                self.wait_idle().await;
+                continue;
+            }
             let Some(input) = self.inspect_input(id).await? else {
                 return Ok(None);
             };
@@ -327,6 +333,7 @@ impl ListService {
             return Ok((hit, 0));
         }
         let _one = self.class_lock.lock().await;
+        self.wait_idle().await;
         let input = ListInput {
             id: key.id.clone(),
             content: rules,
@@ -594,6 +601,81 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fetch_re_keys_the_cache_before_any_rebuild() {
+        use axum::{routing::get, Router};
+        let body = Arc::new(parking_lot::Mutex::new("||old.test^\n".to_string()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route(
+                "/a.txt",
+                get({
+                    let b = body.clone();
+                    move || async move { b.lock().clone() }
+                }),
+            )
+            .route(
+                "/inc.txt",
+                get({
+                    let g = gate.clone();
+                    move || async move {
+                        g.notified().await;
+                        "||inc.test^\n"
+                    }
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+
+        let (svc, _d) = service(&[("a", "||old.test^\n", true, false)]);
+        let mut list = svc.store().get("a").unwrap().unwrap();
+        list.url = format!("http://{addr}/a.txt");
+        svc.store().upsert(&list).unwrap();
+        svc.reload_now().await;
+        assert!(cl(&svc, "a").await.in_build);
+
+        // The new text pulls an include that is held back, so the fetch is between storing the
+        // text and building its input while the viewer is asked.
+        *body.lock() = "||new.test^\n||new2.test^\n!#include inc.txt\n".into();
+        let fetch = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.fetch_one(list, true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while svc.store().get_content("a").unwrap().as_deref() == Some("||old.test^\n") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fetch stored the new text");
+        let c = cl(&svc, "a").await;
+        assert!(!c.in_build, "new text is not what the build has");
+        assert_eq!(c.counts.network, 2, "the new text is served");
+        gate.notify_one();
+        fetch.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_classification_waits_for_a_running_build() {
+        let (svc, _d) = service(&[("off", "||a.test^\n", false, false)]);
+        svc.busy.send_replace(true);
+        let task = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.classified("off", &Scope::Global).await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!task.is_finished(), "must not classify while a build runs");
+        svc.busy.send_replace(false);
+        let (c, _) = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("classified after the build")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.counts.network, 1);
     }
 
     #[tokio::test]

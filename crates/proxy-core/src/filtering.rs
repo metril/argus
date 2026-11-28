@@ -320,6 +320,8 @@ pub struct ProxyContext {
     respect_no_transform: std::sync::atomic::AtomicBool,
     /// Neutralise service workers on filtered sites (see `AdblockSettings::guard_service_workers`).
     guard_service_workers: std::sync::atomic::AtomicBool,
+    /// `privacy.cookie_provenance`, live; read by the cookie recorder.
+    cookie_provenance: Arc<std::sync::atomic::AtomicBool>,
     /// `proxy.block_response` (0 = fail, 1 = synthetic), live.
     block_response: std::sync::atomic::AtomicU8,
     /// CNAME uncloaking (`[adblock.cname]`), live.
@@ -384,6 +386,7 @@ impl ProxyContext {
             transform_source: ArcSwap::from_pointee(Some(Arc::new(ext::ExtTransformSource))),
             respect_no_transform: std::sync::atomic::AtomicBool::new(false),
             guard_service_workers: std::sync::atomic::AtomicBool::new(true),
+            cookie_provenance: Arc::default(),
             block_response: std::sync::atomic::AtomicU8::new(0),
             cname: Default::default(),
             recent_unreachable: Default::default(),
@@ -403,6 +406,27 @@ impl ProxyContext {
             slot.load()
                 .with(|p| *p = p.clone().with_userscripts(manager)),
         ));
+    }
+
+    /// Live master switch for userscript injection (and the `us/`, `gm/v1/` routes). The next
+    /// document sees it.
+    pub fn set_userscripts_enabled(&self, on: bool) {
+        self.internal.us_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// The live userscript switch, for the web API to flip on save.
+    pub fn userscripts_enabled_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.internal.us_enabled.clone()
+    }
+
+    /// Live switch for cookie provenance recording.
+    pub fn set_cookie_provenance(&self, on: bool) {
+        self.cookie_provenance.store(on, Ordering::Relaxed);
+    }
+
+    /// The live cookie-provenance switch, for the web API to flip on save.
+    pub fn cookie_provenance_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.cookie_provenance.clone()
     }
 
     /// What to do about service workers on sites that get userscripts.
@@ -2103,6 +2127,8 @@ impl ProxyContext {
         let mut text_changed = false;
         // Public id of a document that got userscripts (`Server-Timing: argus`).
         let mut server_timing: Option<String> = None;
+        // The document carries single-use bundle tags: it must never be reused from a cache.
+        let mut us_bundled = false;
         let body: ProxyBody = match (kind, codings) {
             (BodyKind::Html, Ok(codings))
                 if (enabled || spol.is_some() || stealth_js.is_some()) && body_allowed =>
@@ -2195,7 +2221,10 @@ impl ProxyContext {
                 let ext_script = transforms.scripts.join(";\n");
                 // Userscripts: matched against the profile's index (one atomic load and an
                 // emptiness check when there are none); nothing at all under `sandbox`.
-                let us = if blocks_scripts || !enabled {
+                let us = if blocks_scripts
+                    || !enabled
+                    || !self.internal.us_enabled.load(Ordering::Relaxed)
+                {
                     None
                 } else {
                     let prof = rctx.profile.load();
@@ -2224,6 +2253,7 @@ impl ProxyContext {
                 };
                 server_timing = us.as_ref().and_then(|p| p.mdoc.clone());
                 let us_srcs: &[String] = us.as_ref().map_or(&[], |p| &p.srcs);
+                us_bundled = !us_srcs.is_empty();
                 let panel_key = if enabled && !blocks_scripts {
                     self.internal.panel.hotkey(rctx)
                 } else {
@@ -2466,6 +2496,21 @@ impl ProxyContext {
         let mut response = builder
             .body(body)
             .map_err(|e| Error::Connection(format!("build response: {e}")))?;
+        if us_bundled && rewritten {
+            // Bundle ids are single use: a cached copy (or a conditional hit on it) would carry
+            // a consumed one, so the browser must fetch the document again.
+            let h = response.headers_mut();
+            let origin: Vec<&str> = h
+                .get_all(hyper::header::CACHE_CONTROL)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if let Some(v) = bundle_cache_control(&origin) {
+                h.insert(hyper::header::CACHE_CONTROL, v);
+            }
+            h.remove(hyper::header::ETAG);
+            h.remove(hyper::header::LAST_MODIFIED);
+        }
         // Document navigations only (`Sec-Fetch-Dest: document`/`iframe`): page script cannot read
         // its own document's headers, so the extension can tell a tab is filtered without a
         // fetch()/XHR ever seeing a marker. Removed otherwise so an origin cannot fake it.
@@ -3072,6 +3117,38 @@ mod error_chain_tests {
         assert_eq!(
             error_chain(&top),
             "error sending request: connection error: connection reset"
+        );
+    }
+}
+
+/// `Cache-Control` for a document that carries single-use bundle tags: the origin's own value
+/// when it already says `no-store`, else `private, no-cache` (bundle ids are per user). Never
+/// weaker than what the origin sent. `None`: leave the header as it is.
+fn bundle_cache_control(origin: &[&str]) -> Option<HeaderValue> {
+    let no_store = origin
+        .iter()
+        .flat_map(|v| v.split(','))
+        .any(|d| d.trim().eq_ignore_ascii_case("no-store"));
+    (!no_store).then(|| HeaderValue::from_static("private, no-cache"))
+}
+
+#[cfg(test)]
+mod bundle_cache_tests {
+    use super::bundle_cache_control;
+
+    #[test]
+    fn never_weaker_than_the_origin() {
+        let v = |o: &[&str]| bundle_cache_control(o).map(|h| h.to_str().unwrap().to_string());
+        assert_eq!(v(&["no-store"]), None);
+        assert_eq!(v(&["private, No-Store"]), None);
+        assert_eq!(v(&[]).as_deref(), Some("private, no-cache"));
+        assert_eq!(
+            v(&["public, max-age=600"]).as_deref(),
+            Some("private, no-cache")
+        );
+        assert_eq!(
+            v(&["private, max-age=600"]).as_deref(),
+            Some("private, no-cache")
         );
     }
 }

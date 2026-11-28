@@ -93,7 +93,7 @@
     {
       "kind": "filters",
       "file": "filters.json",
-      "sha256": "ed0de50e9fd60b596c1eabdd33c9de65f2480bdf8512d7fde6ae280e17b56895",
+      "sha256": "ce85a7cdb43163349ec09d9e0b4825f2ff5023164079c24267c03ad2ef9a0ac4",
       "entries": 41
     },
     {
@@ -103,5 +103,5 @@
       "entries": 37
     }
   ],
-  "version": "v2026.11.27.4"
+  "version": "v2026.11.28"
 }

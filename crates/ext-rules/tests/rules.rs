@@ -545,7 +545,7 @@ fn stats_and_errors() {
         ExtRule::new(ExtKind::Replace, "||a^$replace=/x/y/"),
         ExtRule::new(ExtKind::Replace, "||a^$replace=/(?=x)/y/"),
         ExtRule::new(ExtKind::Replace, "||a^$replace"),
-        ExtRule::new(ExtKind::Method, "||a^$method=get,redirect=x"),
+        ExtRule::new(ExtKind::Method, "||a^$method=get,app=x.exe"),
         ExtRule::new(ExtKind::RemoveHeader, "||a^$removeheader=content-length"),
     ];
     let mut r2 = rules.clone();

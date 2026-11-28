@@ -1103,6 +1103,8 @@ fn rule_state_label(state: &str) -> String {
         "invalid" => "invalid",
         "badfiltered" => "disabled by $badfilter",
         "badfilter" => "$badfilter",
+        "not_enforced" => "matched, not enforced yet",
+        "not_applicable" => "not applicable to a proxy",
         "unknown" => "unknown (index rebuilt)",
         other => return other.replace('_', " "),
     }

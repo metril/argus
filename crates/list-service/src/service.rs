@@ -170,7 +170,7 @@ pub struct ListService {
     /// [`ListService::new`] (tests), which fetch from anywhere.
     guard: Option<Arc<NetPolicy>>,
     flight: Mutex<Flight>,
-    busy: watch::Sender<bool>,
+    pub(crate) busy: watch::Sender<bool>,
     builds: AtomicU64,
     installed_once: AtomicBool,
     /// Fetched `meta.json` shared by the catalogues and the bypass lists.
@@ -1169,6 +1169,10 @@ impl ListService {
                 let store = self.store.clone();
                 let (l, st, t) = (list.clone(), status.clone(), text.clone());
                 let res = tokio::task::spawn_blocking(move || {
+                    // The stored digest describes the text being replaced: drop it so the lines
+                    // viewer re-keys on the new text (the next build input stores the new one).
+                    let mut st = st;
+                    st.content_sha = None;
                     if let Err(e) = store.put_content(&l.id, &t) {
                         warn!("Failed to cache content for {}: {e}", l.name);
                     }

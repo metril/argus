@@ -182,7 +182,7 @@ fn identify(state: &AppState, token: &str) -> Result<ExtIdent, u16> {
     if !ok {
         return Err(CLOSE_NO_SCOPE);
     }
-    state.tokens.mark_used(&cached);
+    state.tokens.mark_used(&cached, None);
     Ok(ExtIdent {
         token_id: cached.stored.id.clone(),
         user: user.username,

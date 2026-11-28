@@ -57,15 +57,22 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         ))
         // tokens
         .routes(routes!(tokens::list_tokens, tokens::create_token))
-        .routes(routes!(tokens::revoke_token))
+        .routes(routes!(tokens::revoke_token, tokens::update_token))
+        .routes(routes!(tokens::regenerate_token))
         .routes(routes!(tokens::revoke_self))
         .routes(routes!(tokens::admin_list_tokens))
-        .routes(routes!(tokens::admin_revoke_token))
+        .routes(routes!(
+            tokens::admin_revoke_token,
+            tokens::admin_update_token
+        ))
         // lists
         .routes(routes!(lists::list_filter_lists, lists::add_filter_list))
         .routes(routes!(lists::refresh_all_lists))
         .routes(routes!(lists::get_catalogue))
         .routes(routes!(lists::add_from_catalogue))
+        .routes(routes!(lists::refresh_catalogue))
+        .routes(routes!(lists::apply_collection))
+        .routes(routes!(lists::disable_collection))
         .routes(routes!(lists::get_schedule, lists::put_schedule))
         .routes(routes!(
             lists::get_filter_list,

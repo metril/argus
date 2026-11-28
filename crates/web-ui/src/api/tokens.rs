@@ -38,6 +38,7 @@ impl ApiClient {
             expires_in_days,
             expires_at,
             profiles: None,
+            purpose: None,
         };
         self.post("/tokens", &req).await
     }

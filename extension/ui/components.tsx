@@ -82,7 +82,7 @@ export function CertDetails({ cert }: { cert: NonNullable<Extract<Site, { kind: 
   );
 }
 
-export function SiteCard({ host, site, route }: { host: string; site: Site; route?: Route | undefined }) {
+export function SiteCard({ host, site, route, right, foot, children }: { host: string; site: Site; route?: Route | undefined; right?: ComponentChildren; foot?: ComponentChildren; children?: ComponentChildren }) {
   const [open, setOpen] = useState(false);
   if (site.kind === 'loading') return <Skeleton />;
   if (site.kind === 'none') {
@@ -90,6 +90,7 @@ export function SiteCard({ host, site, route }: { host: string; site: Site; rout
       <section class="card dashed">
         <Icon n="ban" size={18} />
         <div><div style="font-weight:500">Not inspectable</div><div class="muted" style="font-size:12px">{site.reason === 'insecure' ? 'Not HTTPS' : 'Browser page'}</div></div>
+        {right && <span class="sp">{right}</span>}
       </section>
     );
   }
@@ -108,21 +109,23 @@ export function SiteCard({ host, site, route }: { host: string; site: Site; rout
   const showCert = !!cert && !direct;
   return (
     <section class={`card${bad ? ' t-block' : ''}`}>
-      <div class="host">{host}</div>
+      <div class="phd"><div class="host">{host}</div>{right}</div>
       <div class="chips">
         {routeChip}
         {showCert && (bad
           ? <Chip tone="block" icon="shieldX">Cert invalid</Chip>
           : <Chip tone="allow" icon="lock">{cert.ev ? 'Cert valid · EV' : 'Cert valid'}</Chip>)}
       </div>
+      {foot}
       {showCert && bad && <div style="font-size:12px">{invalidReason(cert)}</div>}
+      {children}
       {showCert && cert && (
         <>
-          <dl>
-            <dt>Issuer</dt><dd class="mono">{issuerName(cert.issuer)}</dd>
-            <dt>Expires</dt><dd class="mono">{day(cert.not_after)} · {daysUntil(cert.not_after)} days</dd>
+          <dl class="pdl">
+            <dt>Issuer</dt><dd>{issuerName(cert.issuer)}</dd>
+            <dt>Expires</dt><dd>{day(cert.not_after)} · {daysUntil(cert.not_after)} days</dd>
           </dl>
-          <button type="button" class="lnk" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? '▾' : '▸'} Details</button>
+          <button type="button" class="disc" aria-expanded={open} onClick={() => setOpen(!open)}>{open ? '▾' : '▸'} Details</button>
           {open && <CertDetails cert={cert} />}
         </>
       )}

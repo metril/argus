@@ -452,20 +452,20 @@ async fn token_profile_restriction_is_enforced_by_the_hook() {
     let admin = ctx.admin().await;
     let r = admin
         .post("/api/v1/tokens")
-        .json(&json!({"name": "kids", "scopes": ["tokens:self"], "profiles": ["kids"]}))
+        .json(&json!({"name": "kids", "scopes": ["tokens:self"], "profiles": ["0"]}))
         .await;
     r.assert_status(StatusCode::CREATED);
     let secret = r.json::<Value>()["secret"].as_str().unwrap().to_string();
     // A restricted token cannot mint a token for other profiles, and inherits its restriction.
     ctx.bearer("POST", "/api/v1/tokens", &secret)
-        .json(&json!({"name": "x", "scopes": ["tokens:self"], "profiles": ["adults"]}))
+        .json(&json!({"name": "x", "scopes": ["tokens:self"], "profiles": ["1"]}))
         .await
         .assert_status_forbidden();
     let child = ctx
         .bearer("POST", "/api/v1/tokens", &secret)
         .json(&json!({"name": "x", "scopes": ["tokens:self"]}))
         .await;
-    assert_eq!(child.json::<Value>()["token"]["profiles"], json!(["kids"]));
+    assert_eq!(child.json::<Value>()["token"]["profiles"], json!(["0"]));
     let p = web_api::auth::Principal {
         user_id: uuid::Uuid::new_v4(),
         username: "u".into(),
@@ -474,9 +474,9 @@ async fn token_profile_restriction_is_enforced_by_the_hook() {
         actor: web_api::auth::Actor::Token {
             token_id: "t".into(),
         },
-        profiles: Some(vec!["kids".into()]),
+        profiles: Some(vec!["0".into()]),
     };
-    assert!(p.may_access_profile("kids") && !p.may_access_profile("adults"));
+    assert!(p.may_access_profile("0") && !p.may_access_profile("1"));
 }
 
 // ------------------------------------------------------------------ (e) CSRF
@@ -609,7 +609,7 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
         Err((::common::certstore::FailReason::NameMismatch, "bad".into())),
         &|| false,
     );
-    ctx.state.certs().note_seen("o.test", "kids");
+    ctx.state.certs().note_seen("o.test", "0");
     let admin = ctx.admin().await;
     let secret = ctx.token(&admin, &["logs:read"]).await;
     let a = ctx
@@ -648,7 +648,7 @@ async fn cert_endpoints_serve_the_store_to_tokens_and_allow_extension_origins_on
     // A profile-restricted token sees only hosts its profiles visited; the rest is a plain 404.
     let r = admin
         .post("/api/v1/tokens")
-        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
+        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["0"]}))
         .await;
     let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
     ctx.bearer("GET", "/api/v1/certs/by-host/o.test", &kid)
@@ -751,7 +751,7 @@ async fn leaf_only_records_are_upgraded_to_the_full_chain_on_lookup() {
     // The proxy knows only the leaf of o.test and of r.test (which has since rotated).
     let fp = store.record_ok("o.test", &full[0], &|| false).unwrap();
     let old = store.record_ok("r.test", &rotated[0], &|| false).unwrap();
-    store.note_seen("o.test", "kids");
+    store.note_seen("o.test", "0");
     let fake = std::sync::Arc::new(FakeProbe {
         store: store.clone(),
         // r.test now serves a different certificate than the one on record.
@@ -765,7 +765,7 @@ async fn leaf_only_records_are_upgraded_to_the_full_chain_on_lookup() {
     // A restricted token for a host it has not seen: 404 and no probe.
     let r = admin
         .post("/api/v1/tokens")
-        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["kids"]}))
+        .json(&json!({"name": "kids", "scopes": ["logs:read"], "profiles": ["0"]}))
         .await;
     let kid = r.json::<Value>()["secret"].as_str().unwrap().to_string();
     ctx.bearer("GET", "/api/v1/certs/by-host/r.test", &kid)
@@ -895,6 +895,7 @@ async fn revoked_and_expired_tokens_fail_immediately() {
             user.id,
             user.username.clone(),
             Some(chrono::Utc::now() - chrono::Duration::seconds(1)),
+            api_types::TokenPurpose::Custom,
         )
         .unwrap();
     ctx.bearer("GET", "/api/v1/lists", &expired)
