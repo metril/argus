@@ -247,6 +247,10 @@ pub trait RuntimeControl: Send + Sync {
 }
 
 pub struct AppState {
+    /// Test hook: make the n-th list write of a collection apply/disable fail (`usize::MAX`: off).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fail_collection_write_at: std::sync::atomic::AtomicUsize,
+
     /// Proxy state wrapper
     pub proxy_state: Arc<ProxyState>,
 
@@ -322,6 +326,10 @@ pub struct AppState {
 
     /// The proxy's live Stealth Mode settings; saved changes are swapped in here.
     pub stealth: OnceLock<Arc<arc_swap::ArcSwap<common::config::StealthSettings>>>,
+    /// The proxy's userscript-injection switch, set once the proxy runs.
+    pub userscripts_enabled: OnceLock<Arc<std::sync::atomic::AtomicBool>>,
+    /// The proxy's cookie-provenance switch, set once the proxy runs.
+    pub cookie_provenance: OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 
     /// Status of the trusted root set (installed by the proxy; absent otherwise).
     pub roots: OnceLock<Arc<common::certstore::RootsStatusCell>>,
@@ -900,6 +908,8 @@ pub async fn build_state_full(
     let filter_stats = shared_engine.stats_handle();
 
     Ok(Arc::new(AppState {
+        #[cfg(any(test, feature = "test-hooks"))]
+        fail_collection_write_at: std::sync::atomic::AtomicUsize::new(usize::MAX),
         proxy_state,
         filter_stats,
         shared_engine,
@@ -925,6 +935,8 @@ pub async fn build_state_full(
         bypass: OnceLock::new(),
         certs: OnceLock::new(),
         stealth: OnceLock::new(),
+        userscripts_enabled: OnceLock::new(),
+        cookie_provenance: OnceLock::new(),
         roots: OnceLock::new(),
         chain_probe: OnceLock::new(),
         argus: OnceLock::new(),

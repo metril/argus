@@ -308,7 +308,11 @@ pub fn refresh_cookie(headers: &HeaderMap) -> Option<String> {
 
 /// Resolve credentials to a principal. `Authorization: Bearer` wins; no fallback to cookies when
 /// a bearer credential is present but invalid.
-pub fn resolve(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(Principal, Via), ApiError> {
+pub fn resolve(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    addr: Option<std::net::IpAddr>,
+) -> Result<(Principal, Via), ApiError> {
     if let Some(h) = headers.get(header::AUTHORIZATION) {
         let raw = h
             .to_str()
@@ -335,7 +339,7 @@ pub fn resolve(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(Principal,
             .copied()
             .filter(|s| creator.contains(s))
             .collect();
-        state.tokens.mark_used(&cached);
+        state.tokens.mark_used(&cached, addr);
         return Ok((
             Principal {
                 user_id: user.id,
@@ -406,7 +410,13 @@ fn check(
     if *rule == RouteAuth::Public {
         return Ok(None);
     }
-    let (principal, via) = resolve(state, req.headers())?;
+    let (principal, via) = resolve(
+        state,
+        req.headers(),
+        req.extensions()
+            .get::<crate::middleware::ClientInfo>()
+            .and_then(|c| c.ip),
+    )?;
     meta.principal = Some(principal.clone());
 
     if via == Via::Cookie && is_unsafe(req.method()) && state.api_config.security.enable_csrf {

@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
     });
 
     // Userscripts: one manager (one database, one live index) shared by the proxy's injection
-    // and GM endpoints and by the management API. The proxy only uses it when enabled.
+    // and GM endpoints and by the management API. The live `userscripts.enabled` switch gates injection.
     #[cfg(feature = "webui")]
     let need_manager = config.userscripts.enabled || config.webui.enabled;
     #[cfg(not(feature = "webui"))]
@@ -185,10 +185,12 @@ async fn main() -> Result<()> {
         None
     };
     ctx.set_service_worker_policy(config.userscripts.service_worker_policy);
-    if config.userscripts.enabled {
-        ctx.set_userscripts(userscript_manager.clone());
-    } else {
-        info!("Userscripts disabled: scripts are managed but never injected");
+    // Always attached; the live switch decides whether anything is injected.
+    ctx.set_userscripts(userscript_manager.clone());
+    ctx.set_userscripts_enabled(config.userscripts.enabled);
+    ctx.set_cookie_provenance(config.privacy.cookie_provenance);
+    if !config.userscripts.enabled {
+        info!("Userscript injection is off (turn it on in the web UI)");
     }
 
     // One database file per process; profiles, devices and script policy live in it.
