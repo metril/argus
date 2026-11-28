@@ -211,6 +211,191 @@ e2e_test!(
 );
 
 e2e_test!(
+    the_master_switch_gates_injection_and_the_bundle_routes_live,
+    rules = [],
+    |env| {
+        env.proxy
+            .install_userscript(&script("sw", "// @grant none"));
+        let c = env.client();
+        // On: tags in the page, and the document must not be cached.
+        env.origin.route("/on", MockResponse::html(PAGE));
+        let r = c
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("app.test", "/on"),
+            )
+            .header("sec-fetch-dest", "document")
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["cache-control"], "private, no-cache");
+        let html = r.text().await.unwrap();
+        let s = srcs(&html);
+        assert_eq!(s.len(), 1, "{html}");
+
+        // Off: the already-issued bundle URL is refused, and new documents get no tags.
+        env.proxy.ctx.set_userscripts_enabled(false);
+        assert_eq!(
+            fetch_bundle(&env, &c, "app.test", &s[0]).await.status(),
+            404
+        );
+        let html = load_page(&env, &c, "app.test", "/off").await;
+        assert!(srcs(&html).is_empty(), "{html}");
+        assert!(!html.contains("/__adblock__/us/"), "{html}");
+
+        // On again: the next document works end to end.
+        env.proxy.ctx.set_userscripts_enabled(true);
+        let html = load_page(&env, &c, "app.test", "/again").await;
+        let s = srcs(&html);
+        assert_eq!(s.len(), 1, "{html}");
+        let b = fetch_bundle(&env, &c, "app.test", &s[0]).await;
+        assert_eq!(b.status(), 200);
+        assert!(b.text().await.unwrap().contains("window.__sw = 1"));
+    }
+);
+
+e2e_test!(
+    put_config_flips_the_running_proxys_injection_and_shares_its_handles,
+    rules = [],
+    |env| {
+        env.proxy
+            .install_userscript(&script("api", "// @grant none"));
+        let api = env.proxy.api().await;
+        env.proxy.profiles().sync().await;
+        // The API's switches are the proxy's own cells.
+        assert!(std::sync::Arc::ptr_eq(
+            api.state.userscripts_enabled.get().unwrap(),
+            &env.proxy.ctx.userscripts_enabled_handle()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            api.state.cookie_provenance.get().unwrap(),
+            &env.proxy.ctx.cookie_provenance_handle()
+        ));
+        let put = |v: bool| {
+            let api = &api;
+            async move {
+                let etag = api
+                    .get("/config")
+                    .await
+                    .header("etag")
+                    .to_str()
+                    .unwrap()
+                    .to_string();
+                let r = api
+                    .put("/config")
+                    .add_header("if-match", etag)
+                    .json(&json!({"userscripts_enabled": v, "cookie_provenance": v}))
+                    .await;
+                assert_eq!(r.status_code(), 200, "{}", r.text());
+            }
+        };
+        let c = env.client();
+        put(true).await;
+        assert!(env
+            .proxy
+            .ctx
+            .cookie_provenance_handle()
+            .load(std::sync::atomic::Ordering::Relaxed));
+        let html = load_page(&env, &c, "app.test", "/a").await;
+        assert_eq!(srcs(&html).len(), 1, "{html}");
+        put(false).await;
+        let html = load_page(&env, &c, "app.test", "/b").await;
+        assert!(srcs(&html).is_empty(), "{html}");
+        put(true).await;
+        let html = load_page(&env, &c, "app.test", "/c").await;
+        assert_eq!(srcs(&html).len(), 1, "{html}");
+    }
+);
+
+e2e_test!(
+    bundle_documents_never_get_a_weaker_cache_policy_than_the_origin_sent,
+    rules = [],
+    |env| {
+        env.proxy
+            .install_userscript(&script("cc", "// @grant none"));
+        let c = env.client();
+        // (path, origin's Cache-Control, expected after injection)
+        let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+            (
+                "/private",
+                Some("private, max-age=600"),
+                Some("private, no-cache"),
+            ),
+            ("/nostore", Some("no-store"), Some("no-store")),
+            (
+                "/public",
+                Some("public, max-age=600"),
+                Some("private, no-cache"),
+            ),
+            ("/none", None, Some("private, no-cache")),
+        ];
+        for (path, sent, want) in cases {
+            let mut m = MockResponse::html(PAGE).header("etag", "\"v1\"");
+            if let Some(v) = sent {
+                m = m.header("cache-control", v);
+            }
+            env.origin.route(path, m);
+            let r = c
+                .request(
+                    reqwest::Method::GET,
+                    &env.origin.https_url("app.test", path),
+                )
+                .header("sec-fetch-dest", "document")
+                .header("accept", "text/html")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.headers()
+                    .get("cache-control")
+                    .and_then(|v| v.to_str().ok()),
+                want,
+                "{path}"
+            );
+            assert!(
+                r.headers().get("etag").is_none(),
+                "{path}: validators dropped"
+            );
+            let html = r.text().await.unwrap();
+            assert_eq!(srcs(&html).len(), 1, "{path}: {html}");
+        }
+    }
+);
+
+e2e_test!(
+    html_without_bundle_tags_keeps_its_own_cache_headers,
+    rules = [],
+    |env| {
+        env.proxy
+            .install_userscript(&script("nc", "// @grant none"));
+        env.origin.route(
+            "/cached",
+            MockResponse::html(PAGE).header("cache-control", "max-age=600"),
+        );
+        let c = env.client();
+        let get = |host: &'static str| {
+            let c = &c;
+            let url = env.origin.https_url(host, "/cached");
+            async move {
+                c.request(reqwest::Method::GET, &url)
+                    .header("sec-fetch-dest", "document")
+                    .header("accept", "text/html")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        // No script matches this host: no tags, the origin's header stays.
+        let r = get("other.test").await;
+        assert_eq!(r.headers()["cache-control"], "max-age=600");
+        // A matching host carries tags, so the header is replaced.
+        let r = get("app.test").await;
+        assert_eq!(r.headers()["cache-control"], "private, no-cache");
+    }
+);
+
+e2e_test!(
     non_matching_pages_and_subframes_get_nothing,
     rules = [],
     |env| {

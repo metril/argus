@@ -15,8 +15,10 @@ pub mod scopes;
 pub use scopes::{scope_table_markdown, Scope};
 
 mod bypass;
+mod catalogue;
 mod more;
 pub use bypass::*;
+pub use catalogue::*;
 pub use more::*;
 
 mod policy;
@@ -276,6 +278,12 @@ pub struct ProxyConfigResponse {
     /// Entries kept by the request log (per ring, about 1 KB each).
     #[serde(default = "default_request_log_capacity")]
     pub request_log_capacity: u32,
+    /// Inject userscripts into pages. Off: installed scripts are kept but never run.
+    #[serde(default)]
+    pub userscripts_enabled: bool,
+    /// Record cookie names and attributes seen in transit (never values).
+    #[serde(default)]
+    pub cookie_provenance: bool,
     /// Where the listeners are actually bound right now (absent without a running proxy).
     #[serde(default)]
     pub bind: Option<BindResult>,
@@ -749,6 +757,10 @@ pub struct UpdateProxyConfigRequest {
     /// it shrinks.
     #[cfg_attr(feature = "server", validate(range(min = 100, max = 500000)))]
     pub request_log_capacity: Option<u32>,
+    /// Inject userscripts into pages; applied live, from the next document.
+    pub userscripts_enabled: Option<bool>,
+    /// Record cookie names and attributes seen in transit; applied live.
+    pub cookie_provenance: Option<bool>,
 }
 
 fn default_block_response() -> String {

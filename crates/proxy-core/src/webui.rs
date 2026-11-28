@@ -198,6 +198,10 @@ pub async fn build_api_state(ctx: &Arc<ProxyContext>, i: ApiInputs) -> ApiResult
         }
     }
     let _ = state.stealth.set(ctx.stealth_handle());
+    let _ = state
+        .userscripts_enabled
+        .set(ctx.userscripts_enabled_handle());
+    let _ = state.cookie_provenance.set(ctx.cookie_provenance_handle());
     let _ = state.certs.set(ctx.certs().clone());
     if let Some(r) = ctx.roots() {
         let _ = state.roots.set(r.cell.clone());

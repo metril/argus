@@ -390,6 +390,33 @@ impl ListStore {
         })
     }
 
+    /// Like [`Self::update_list`], durably (user-initiated; call from a blocking context).
+    pub fn update_list_durable(&self, id: &str, f: impl FnOnce(&mut FilterList)) -> Result<bool> {
+        self.wtx(Durability::Immediate, |t| {
+            let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
+            let cur = tb.get(id).map_err(db_err)?.map(|g| g.value().to_vec());
+            let Some(cur) = cur else { return Ok(false) };
+            let mut l: FilterList = de(&cur)?;
+            f(&mut l);
+            tb.insert(id, ser(&l)?.as_slice()).map_err(db_err)?;
+            Ok(true)
+        })
+    }
+
+    /// Store a new list durably unless one with its id exists (one transaction); whether it was
+    /// inserted. Call from a blocking context.
+    pub fn insert_if_absent_durable(&self, list: &FilterList) -> Result<bool> {
+        self.wtx(Durability::Immediate, |t| {
+            let mut tb = t.open_table(tables::LISTS).map_err(db_err)?;
+            if tb.get(list.id.as_str()).map_err(db_err)?.is_some() {
+                return Ok(false);
+            }
+            tb.insert(list.id.as_str(), ser(list)?.as_slice())
+                .map_err(db_err)?;
+            Ok(true)
+        })
+    }
+
     /// Store a list definition durably (user-initiated; call from a blocking context).
     pub fn upsert_durable(&self, list: &FilterList) -> Result<()> {
         self.put_raw(tables::LISTS, &list.id, &ser(list)?, Durability::Immediate)

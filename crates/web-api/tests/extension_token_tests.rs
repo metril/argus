@@ -42,6 +42,7 @@ async fn mints_a_token_with_exactly_the_extension_scopes_and_no_session() {
     assert_eq!(
         scopes,
         [
+            "bypass:site",
             "logs:read",
             "rules:ext",
             "rules:site",

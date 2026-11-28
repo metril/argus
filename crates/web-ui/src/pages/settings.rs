@@ -228,6 +228,13 @@ const SECTIONS: &[Section] = &[
                 dep: Some("guard_sw"),
             },
             Def {
+                key: "us_on",
+                label: "Inject userscripts",
+                desc: "Installed userscripts run on the pages they match. Off: they stay installed but never run.",
+                kind: Kind::Switch,
+                dep: None,
+            },
+            Def {
                 key: "max_conns",
                 label: "Max connections",
                 desc: "Across both listeners. 0 means automatic.",
@@ -579,6 +586,18 @@ const SECTIONS: &[Section] = &[
         ],
     },
     Section {
+        id: "privacy",
+        title: "Privacy records",
+        sub: "What Argus keeps to show you where things come from. Applied at once.",
+        fields: &[Def {
+            key: "cookie_prov",
+            label: "Cookie provenance",
+            desc: "Records cookie names and attributes seen in transit so the extension can show where cookies come from. Values are never recorded. Off by default.",
+            kind: Kind::Switch,
+            dep: None,
+        }],
+    },
+    Section {
         id: "updates",
         title: "Filter list updates",
         sub: "Background fetch of all enabled lists.",
@@ -635,7 +654,7 @@ fn defaults(key: &str) -> Val {
         "block_private" => Val::B(false),
         "browser_like" => Val::B(true),
         "block_response" => Val::S("fail".into()),
-        "guard_sw" => Val::B(false),
+        "guard_sw" | "us_on" | "cookie_prov" => Val::B(false),
         "guard_sw_exempt" => Val::T(Vec::new()),
         "cname_on" | "cname_1p" | "cname_exc" | "cname_root" => Val::B(true),
         "cname_full" => Val::B(false),
@@ -684,6 +703,8 @@ fn from_config(c: &ProxyConfigResponse) -> Vec<(&'static str, Val)> {
         ("browser_like", Val::B(c.browser_like_upstream)),
         ("block_response", Val::S(c.block_response.clone())),
         ("guard_sw", Val::B(c.guard_service_workers)),
+        ("us_on", Val::B(c.userscripts_enabled)),
+        ("cookie_prov", Val::B(c.cookie_provenance)),
         (
             "guard_sw_exempt",
             Val::T(c.guard_service_workers_exempt.clone()),
@@ -768,6 +789,8 @@ fn backend_names(key: &str) -> &'static [&'static str] {
         "browser_like" => &["browser_like_upstream"],
         "block_response" => &["block_response"],
         "guard_sw" => &["guard_service_workers"],
+        "us_on" => &["userscripts_enabled"],
+        "cookie_prov" => &["cookie_provenance"],
         "guard_sw_exempt" => &["guard_service_workers_exempt"],
         "up_on" | "up_kind" | "up_host" | "up_port" | "up_user" | "up_pass" => &["upstream_proxy"],
         "auto_update" => &["auto_update"],
@@ -1049,6 +1072,12 @@ fn build_request(all: &[F]) -> UpdateProxyConfigRequest {
     }
     if dirty("guard_sw_exempt") {
         r.guard_service_workers_exempt = Some(val("guard_sw_exempt").t());
+    }
+    if dirty("us_on") {
+        r.userscripts_enabled = Some(val("us_on").b());
+    }
+    if dirty("cookie_prov") {
+        r.cookie_provenance = Some(val("cookie_prov").b());
     }
     if dirty("guard_sw") {
         r.guard_service_workers = Some(val("guard_sw").b());

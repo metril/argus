@@ -69,6 +69,13 @@
           "id": {
             "type": "string"
           },
+          "last_used_addr": {
+            "description": "Address of the last request made with the token.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "last_used_at": {
             "type": [
               "string",
@@ -77,6 +84,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "prev_valid_until": {
+            "description": "While in the future, the previous secret still works until then.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "profiles": {
             "items": {
@@ -87,6 +101,9 @@
               "null"
             ]
           },
+          "purpose": {
+            "$ref": "#/components/schemas/TokenPurpose"
+          },
           "revoked": {
             "type": "boolean"
           },
@@ -95,6 +112,23 @@
               "$ref": "#/components/schemas/Scope"
             },
             "type": "array"
+          },
+          "secret_hint": {
+            "description": "Non-secret display form, e.g. `abk_1a2b3c4d5e6f7a8b_…9f3e`; never enough to rebuild the secret.",
+            "type": "string"
+          },
+          "unknown_scopes": {
+            "description": "Scope names this release does not know (set by a newer one); shown as-is, grant nothing.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -105,6 +139,67 @@
           "created_by_name",
           "created_at",
           "revoked"
+        ],
+        "type": "object"
+      },
+      "ApplyCollectionRequest": {
+        "description": "Request of `POST /lists/catalogue/collections/{id}/apply`.",
+        "properties": {
+          "dry_run": {
+            "description": "Only report what would change.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "ApplyCollectionResponse": {
+        "description": "What applying a collection does (or did).",
+        "properties": {
+          "add": {
+            "description": "Lists added from the catalogue (enabled).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "already": {
+            "description": "Lists already installed and on, left alone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "conflict": {
+            "description": "Installed lists that reuse a catalogue id with another URL: never changed by apply.",
+            "items": {
+              "$ref": "#/components/schemas/CollectionConflict"
+            },
+            "type": "array"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "enable": {
+            "description": "Installed lists that get turned on.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "trust": {
+            "description": "Lists whose trust changes to what the catalogue says (among those added or enabled).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dry_run",
+          "add",
+          "enable",
+          "trust",
+          "already"
         ],
         "type": "object"
       },
@@ -1144,6 +1239,13 @@
       "CatalogueResponse": {
         "description": "The catalogue and where it came from.",
         "properties": {
+          "collections": {
+            "description": "Named groups of lists, with counts for this install.",
+            "items": {
+              "$ref": "#/components/schemas/CollectionResponse"
+            },
+            "type": "array"
+          },
           "entries": {
             "items": {
               "$ref": "#/components/schemas/CatalogueEntryResponse"
@@ -1161,6 +1263,10 @@
             "description": "`signed` for a fetched argus-lists release, `snapshot` for the signed copy built into the\nbinary (no release fetched yet), `signed` with no entries while none has loaded.",
             "type": "string"
           },
+          "status": {
+            "$ref": "#/components/schemas/CatalogueStatus",
+            "description": "The subscription: source, release in force, outcome of the checks."
+          },
           "version": {
             "description": "Release of the signed copy.",
             "type": [
@@ -1171,7 +1277,68 @@
         },
         "required": [
           "source",
-          "entries"
+          "entries",
+          "status"
+        ],
+        "type": "object"
+      },
+      "CatalogueStatus": {
+        "description": "The signed catalogue subscription (`filters.json` of argus-lists).",
+        "properties": {
+          "fetched_at": {
+            "description": "When the copy in force was fetched (RFC 3339); absent for `snapshot`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_checked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the last check failed; absent after a success.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok": {
+            "description": "Last successful check.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_check": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "description": "`snapshot` (built into the binary), `cache` (loaded from disk at start) or `fetched`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "Where the catalogue is fetched from.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Release in force (`vYYYY.MM.DD[.N]`); absent while none has loaded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "url"
         ],
         "type": "object"
       },
@@ -1464,6 +1631,73 @@
         },
         "type": "object"
       },
+      "CollectionConflict": {
+        "description": "A list that clashes with a catalogue entry of the same id.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "CollectionResponse": {
+        "description": "A named group of catalogue lists with its state on this install, computed from the lists.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Lists of the collection that are installed and enabled.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "installed": {
+            "description": "Lists of the collection that are installed.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lists": {
+            "description": "Catalogue ids of its lists.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warning": {
+            "description": "What turning the collection on may break.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "lists",
+          "installed",
+          "enabled",
+          "total"
+        ],
+        "type": "object"
+      },
       "ConfirmPlanRequest": {
         "description": "Confirm a plan.",
         "properties": {
@@ -1645,6 +1879,17 @@
             "type": [
               "array",
               "null"
+            ]
+          },
+          "purpose": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenPurpose",
+                "description": "What the token is for (a label for the UI; grants nothing). Default `custom`."
+              }
             ]
           },
           "scopes": {
@@ -1875,6 +2120,22 @@
           "counts",
           "limit",
           "has_more"
+        ],
+        "type": "object"
+      },
+      "DisableCollectionResponse": {
+        "description": "Result of `POST /lists/catalogue/collections/{id}/disable`.",
+        "properties": {
+          "disabled": {
+            "description": "Lists turned off (they stay installed).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "disabled"
         ],
         "type": "object"
       },
@@ -3934,6 +4195,13 @@
                 "id": {
                   "type": "string"
                 },
+                "last_used_addr": {
+                  "description": "Address of the last request made with the token.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "last_used_at": {
                   "type": [
                     "string",
@@ -3942,6 +4210,13 @@
                 },
                 "name": {
                   "type": "string"
+                },
+                "prev_valid_until": {
+                  "description": "While in the future, the previous secret still works until then.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "profiles": {
                   "items": {
@@ -3952,6 +4227,9 @@
                     "null"
                   ]
                 },
+                "purpose": {
+                  "$ref": "#/components/schemas/TokenPurpose"
+                },
                 "revoked": {
                   "type": "boolean"
                 },
@@ -3960,6 +4238,23 @@
                     "$ref": "#/components/schemas/Scope"
                   },
                   "type": "array"
+                },
+                "secret_hint": {
+                  "description": "Non-secret display form, e.g. `abk_1a2b3c4d5e6f7a8b_…9f3e`; never enough to rebuild the secret.",
+                  "type": "string"
+                },
+                "unknown_scopes": {
+                  "description": "Scope names this release does not know (set by a newer one); shown as-is, grant nothing.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "updated_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -5217,6 +5512,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "cookie_provenance": {
+            "description": "Record cookie names and attributes seen in transit (never values).",
+            "type": "boolean"
+          },
           "dns": {
             "$ref": "#/components/schemas/DnsDto",
             "description": "Upstream DNS resolution."
@@ -5314,6 +5613,10 @@
           "upstream_proxy": {
             "$ref": "#/components/schemas/UpstreamProxyDto",
             "description": "Another proxy Argus's own upstream traffic goes through."
+          },
+          "userscripts_enabled": {
+            "description": "Inject userscripts into pages. Off: installed scripts are kept but never run.",
+            "type": "boolean"
           },
           "webui_host": {
             "description": "Address the web API listens on.",
@@ -5426,6 +5729,38 @@
           "has_more",
           "entries"
         ],
+        "type": "object"
+      },
+      "RegenerateTokenRequest": {
+        "description": "Issue a new secret for a token.",
+        "properties": {
+          "expires_at": {
+            "description": "New absolute expiry (RFC 3339, in the future).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_in_days": {
+            "description": "New lifetime in days. Required (one of the three) for an expired token; on a live token\nit replaces the expiry when given.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "grace_secs": {
+            "description": "Seconds the old secret keeps working (0 to 7 days, default 0).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "never_expires": {
+            "description": "Remove the expiry.",
+            "type": "boolean"
+          }
+        },
         "type": "object"
       },
       "RegisterRequest": {
@@ -5764,6 +6099,7 @@
           "RulesWrite",
           "RulesSite",
           "RulesExt",
+          "BypassSite",
           "EngineReload",
           "StatsRead",
           "LogsRead",
@@ -6768,6 +7104,18 @@
         ],
         "type": "object"
       },
+      "TokenPurpose": {
+        "description": "What a token was made for. A presentation label only; the scopes decide access.",
+        "enum": [
+          "extension",
+          "monitoring",
+          "script",
+          "full",
+          "read_only",
+          "custom"
+        ],
+        "type": "string"
+      },
       "TransparentStatus": {
         "allOf": [
           {
@@ -7154,6 +7502,13 @@
               "null"
             ]
           },
+          "cookie_provenance": {
+            "description": "Record cookie names and attributes seen in transit; applied live.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "dns": {
             "oneOf": [
               {
@@ -7325,6 +7680,13 @@
               }
             ]
           },
+          "userscripts_enabled": {
+            "description": "Inject userscripts into pages; applied live, from the next document.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "webui_host": {
             "description": "Web API listen address; the listener is rebound live.",
             "type": [
@@ -7388,6 +7750,72 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateTokenRequest": {
+        "description": "Change a token. Absent fields stay as they are. Scopes and profiles are checked like on\ncreation: nothing can be widened beyond what the caller holds, and narrowing is always fine.",
+        "properties": {
+          "clear_profiles": {
+            "description": "Remove the profile restriction (only for a caller who is not restricted).",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "description": "New absolute expiry (RFC 3339, in the future).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_in_days": {
+            "description": "New lifetime in days from now. Exclusive with `expires_at` and `never_expires`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "never_expires": {
+            "description": "Remove the expiry.",
+            "type": "boolean"
+          },
+          "profiles": {
+            "description": "Replaces the profile restriction (ids of existing profiles).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "purpose": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenPurpose"
+              }
+            ]
+          },
+          "scopes": {
+            "description": "Replaces the scopes; a non-empty subset of the caller's own.",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "type": [
+              "array",
               "null"
             ]
           }
@@ -8438,6 +8866,7 @@
     },
     "x-scopes": {
       "audit:read": "Read the audit log.",
+      "bypass:site": "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists.",
       "ca:admin": "Manage the CA certificate (reserved).",
       "ca:read": "Read CA certificate details (fingerprint, expiry, subject).",
       "config:read": "Read the proxy configuration.",
@@ -8873,6 +9302,98 @@
           }
         ],
         "summary": "Revoke any user's token.",
+        "tags": [
+          "tokens"
+        ]
+      },
+      "patch": {
+        "operationId": "admin_update_token",
+        "parameters": [
+          {
+            "description": "Token id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenInfo"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "tokens:admin"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "tokens:admin"
+            ]
+          }
+        ],
+        "summary": "Change any user's token. Scopes and profiles are still limited to what the caller holds.",
         "tags": [
           "tokens"
         ]
@@ -13940,6 +14461,257 @@
           }
         ],
         "summary": "The catalogue of well-known lists, from the verified signed argus-lists release (or the\nsigned snapshot shipped with the binary); empty only if none has verified.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/collections/{id}/apply": {
+      "post": {
+        "operationId": "apply_collection",
+        "parameters": [
+          {
+            "description": "Collection id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyCollectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyCollectionResponse"
+                }
+              }
+            },
+            "description": "What changes"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Add the collection's missing lists, turn on the disabled ones and align their trust with the\ncatalogue, with one engine rebuild; or, with `dry_run`, only report that.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/collections/{id}/disable": {
+      "post": {
+        "operationId": "disable_collection",
+        "parameters": [
+          {
+            "description": "Collection id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisableCollectionResponse"
+                }
+              }
+            },
+            "description": "Lists turned off"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Turn off every list of a collection that is on; the lists stay installed.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/refresh": {
+      "post": {
+        "operationId": "refresh_catalogue",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogueStatus"
+                }
+              }
+            },
+            "description": "Status after the check"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Check the signed catalogue now (it is otherwise checked every six hours). A failed check is\nnot an HTTP error: it is reported in `last_error` of the returned status.",
         "tags": [
           "lists"
         ]
@@ -19595,7 +20367,7 @@
             ]
           }
         ],
-        "summary": "Create an API token. The secret is returned once and cannot be retrieved again. Requested\nscopes must all be held by the caller (a token can never mint more than it has).",
+        "summary": "Create an API token. The secret is returned once and cannot be retrieved again. Requested\nscopes must all be held by the caller (a token can never mint more than it has), and\n`profiles` must name existing profiles within the caller's own restriction.",
         "tags": [
           "tokens"
         ]
@@ -19752,6 +20524,192 @@
           }
         ],
         "summary": "Revoke one of your own tokens; it stops working immediately.",
+        "tags": [
+          "tokens"
+        ]
+      },
+      "patch": {
+        "operationId": "update_token",
+        "parameters": [
+          {
+            "description": "Token id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenInfo"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "tokens:self"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "tokens:self"
+            ]
+          }
+        ],
+        "summary": "Change one of your own tokens: name, scopes, profiles or expiry. Scopes and profiles are\nchecked like on creation; a token can be narrowed but never widened beyond what you hold.\nA token caller can only edit tokens within its own grant and cannot extend a lifetime past\nits own. An expired token cannot be edited (409): regenerate it with a new expiry.",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
+    "/api/v1/tokens/{id}/regenerate": {
+      "post": {
+        "operationId": "regenerate_token",
+        "parameters": [
+          {
+            "description": "Token id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegenerateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedTokenResponse"
+                }
+              }
+            },
+            "description": "New secret; shown only here"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "tokens:self"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "tokens:self"
+            ]
+          }
+        ],
+        "summary": "Issue a new secret for one of your own tokens (same id and settings). The new secret is\nreturned once. The old secret keeps working for `grace_secs` (0 to 7 days, default 0), then\nstops; revoking the token ends both. An expired token needs a new expiry in the request\n(`expires_in_days`, `expires_at` or `never_expires`), else 409; on a live token they are\noptional and replace the expiry. A token caller can only regenerate a token within its own\ngrant, with a lifetime no longer than its own.",
         "tags": [
           "tokens"
         ]

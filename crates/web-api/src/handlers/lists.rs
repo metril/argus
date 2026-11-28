@@ -4,10 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use api_types::{
-    AddFilterListRequest, BuildState, BuildSummary, CatalogueEntryResponse, CatalogueResponse,
-    EngineStatusResponse, ExtRuleResponse, FilterListCounts, FilterListResponse, FilterListsPage,
-    ListMetaDto, ListReport, ListStatusResponse, MessageResponse, Page, ReportIssueDto,
-    ScheduleResponse, UpdateFilterListRequest, UpdateProxyConfigRequest, UpdateScheduleRequest,
+    AddFilterListRequest, ApplyCollectionRequest, ApplyCollectionResponse, BuildState,
+    BuildSummary, CatalogueEntryResponse, CatalogueResponse, CatalogueStatus, CollectionConflict,
+    CollectionResponse, DisableCollectionResponse, EngineStatusResponse, ExtRuleResponse,
+    FilterListCounts, FilterListResponse, FilterListsPage, ListMetaDto, ListReport,
+    ListStatusResponse, MessageResponse, Page, ReportIssueDto, ScheduleResponse,
+    UpdateFilterListRequest, UpdateProxyConfigRequest, UpdateScheduleRequest,
 };
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::Deserialize;
@@ -661,13 +663,50 @@ fn ext_stats_dto(s: &ext_rules::ExtStats) -> api_types::ExtStatsDto {
 pub async fn get_catalogue(
     State(state): State<Arc<AppState>>,
 ) -> ApiResult<Json<CatalogueResponse>> {
-    let have: std::collections::HashSet<String> = state
-        .filter_store
-        .get_all()?
-        .into_iter()
-        .map(|l| l.id)
-        .collect();
+    let all = state.filter_store.get_all()?;
+    let have: std::collections::HashSet<String> = all.iter().map(|l| l.id.clone()).collect();
     let doc = state.filter_catalogue().get();
+    // A collection counts an installed list only if it is the catalogue's (same id and URL).
+    let entry_url: std::collections::HashMap<&str, &str> = doc
+        .iter()
+        .flat_map(|d| d.entries.iter())
+        .map(|e| (e.id.as_str(), e.url.as_str()))
+        .collect();
+    let ours: std::collections::HashMap<&str, bool> = all
+        .iter()
+        .filter(|l| {
+            entry_url
+                .get(l.id.as_str())
+                .is_some_and(|u| same_url(u, &l.url))
+        })
+        .map(|l| (l.id.as_str(), l.enabled))
+        .collect();
+    let collections = doc
+        .iter()
+        .flat_map(|d| d.collections.iter())
+        .map(|c| {
+            let installed = c
+                .lists
+                .iter()
+                .filter(|i| ours.contains_key(i.as_str()))
+                .count();
+            let enabled = c
+                .lists
+                .iter()
+                .filter(|i| ours.get(i.as_str()) == Some(&true))
+                .count();
+            CollectionResponse {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                description: c.description.clone(),
+                warning: c.warning.clone(),
+                lists: c.lists.clone(),
+                installed,
+                enabled,
+                total: c.lists.len(),
+            }
+        })
+        .collect();
     let entries = doc
         .iter()
         .flat_map(|d| d.entries.iter())
@@ -700,7 +739,385 @@ pub async fn get_catalogue(
         fetched_at: doc.as_ref().and_then(|d| d.fetched_at.clone()),
         version: doc.as_ref().map(|d| d.version.clone()),
         entries,
+        status: catalogue_status(&state),
+        collections,
     }))
+}
+
+fn catalogue_status(state: &AppState) -> CatalogueStatus {
+    use list_service::Origin;
+    let s = state.filter_catalogue().status();
+    CatalogueStatus {
+        url: s.url,
+        version: s.version,
+        origin: s.origin.map(|o| {
+            match o {
+                Origin::Snapshot => "snapshot",
+                Origin::Cache => "cache",
+                Origin::Fetched => "fetched",
+            }
+            .to_string()
+        }),
+        fetched_at: s.fetched_at,
+        last_checked: s.last_checked,
+        next_check: s.next_check,
+        last_ok: s.last_ok,
+        last_error: s.last_error,
+    }
+}
+
+/// Check the signed catalogue now (it is otherwise checked every six hours). A failed check is
+/// not an HTTP error: it is reported in `last_error` of the returned status.
+#[utoipa::path(
+    post, path = "/lists/catalogue/refresh", tag = "lists",
+    security(("bearer_auth" = ["lists:write"])),
+    responses((status = 200, description = "Status after the check", body = CatalogueStatus))
+)]
+pub async fn refresh_catalogue(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<CatalogueStatus>> {
+    info!("Catalogue check requested by {}", p.username);
+    let _ = state.filter_catalogue().refresh().await;
+    Ok(Json(catalogue_status(&state)))
+}
+
+/// A new, enabled list for a catalogue entry.
+fn list_from_entry(e: &list_service::FilterCatalogueEntry) -> ApiResult<filter_engine::FilterList> {
+    let format = e.list_format().ok_or_else(|| {
+        ApiError::ValidationError(format!("Unsupported list format '{}'", e.format))
+    })?;
+    let mut l = filter_engine::FilterList::new(e.id.clone(), e.name.clone(), e.url.clone());
+    l.format = format;
+    l.trusted = e.trusted;
+    l.enabled = true;
+    Ok(l)
+}
+
+/// One list a collection apply may write: the catalogue's id, URL and trust, and the list to
+/// create if it is missing.
+struct Change {
+    id: String,
+    url: String,
+    trusted: bool,
+    new_list: Option<filter_engine::FilterList>,
+}
+
+/// What applying a collection would change (a preview; the write re-reads every list).
+struct CollectionPlan {
+    add: Vec<Change>,
+    enable: Vec<Change>,
+    trust: Vec<String>,
+    already: Vec<String>,
+    conflict: Vec<CollectionConflict>,
+}
+
+/// Whether two list URLs are the same address: parsed (scheme and host case, default port and
+/// empty path normalised), or equal as text when either does not parse.
+fn same_url(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+fn url_conflict(id: &str) -> CollectionConflict {
+    CollectionConflict {
+        id: id.to_string(),
+        reason: "A list with this id but another URL is installed; it is left unchanged".into(),
+    }
+}
+
+fn plan_collection(state: &AppState, id: &str) -> ApiResult<CollectionPlan> {
+    let not_found = || ApiError::NotFound(format!("Collection '{id}' not found"));
+    let doc = state.filter_catalogue().get().ok_or_else(not_found)?;
+    let c = doc
+        .collections
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(not_found)?;
+    let mut plan = CollectionPlan {
+        add: vec![],
+        enable: vec![],
+        trust: vec![],
+        already: vec![],
+        conflict: vec![],
+    };
+    for lid in &c.lists {
+        let Some(e) = doc.entries.iter().find(|e| &e.id == lid) else {
+            continue;
+        };
+        let change = |new_list| Change {
+            id: e.id.clone(),
+            url: e.url.clone(),
+            trusted: e.trusted,
+            new_list,
+        };
+        match state.filter_store.get(lid)? {
+            None => {
+                let l = list_from_entry(e)?;
+                if l.trusted {
+                    plan.trust.push(l.id.clone());
+                }
+                plan.add.push(change(Some(l)));
+            }
+            Some(l) if !same_url(&l.url, &e.url) => plan.conflict.push(url_conflict(lid)),
+            Some(l) if !l.enabled => {
+                if l.trusted != e.trusted {
+                    plan.trust.push(lid.clone());
+                }
+                plan.enable.push(change(None));
+            }
+            Some(_) => plan.already.push(lid.clone()),
+        }
+    }
+    Ok(plan)
+}
+
+/// What one write did.
+struct Written {
+    id: String,
+    added: bool,
+    /// The new trust value, when it changed.
+    trust: Option<bool>,
+}
+
+/// Apply the changes one by one, re-reading each list so that only `enabled` and `trusted` of a
+/// list that still is the catalogue's are touched. Stops at the first failure and returns what
+/// was written before it, and the lists found to clash with the catalogue's.
+fn write_changes(
+    store: &list_service::ListStore,
+    changes: &[Change],
+    fail_at: Option<usize>,
+) -> (Vec<Written>, Vec<CollectionConflict>, Option<String>) {
+    enum Out {
+        Skip,
+        Conflict,
+        Enabled(Option<bool>),
+    }
+    let mut done = Vec::new();
+    let mut clash = Vec::new();
+    for (n, c) in changes.iter().enumerate() {
+        if fail_at == Some(n) {
+            return (done, clash, Some("write failed".into()));
+        }
+        let mut out = Out::Skip;
+        let r = store.update_list_durable(&c.id, |l| {
+            if !same_url(&l.url, &c.url) {
+                out = Out::Conflict;
+            } else if !l.enabled {
+                l.enabled = true;
+                out = Out::Enabled((l.trusted != c.trusted).then_some(c.trusted));
+                l.trusted = c.trusted;
+            }
+        });
+        match r {
+            Ok(true) => match out {
+                Out::Enabled(trust) => done.push(Written {
+                    id: c.id.clone(),
+                    added: false,
+                    trust,
+                }),
+                Out::Conflict => clash.push(url_conflict(&c.id)),
+                Out::Skip => {}
+            },
+            // Deleted since the plan: recreated only if the plan said add, and only if the id is
+            // still free (one transaction); a list created in the gap is left alone.
+            Ok(false) => {
+                if let Some(l) = &c.new_list {
+                    match store.insert_if_absent_durable(l) {
+                        Ok(true) => done.push(Written {
+                            id: c.id.clone(),
+                            added: true,
+                            trust: l.trusted.then_some(true),
+                        }),
+                        Ok(false) => clash.push(url_conflict(&c.id)),
+                        Err(e) => return (done, clash, Some(e.to_string())),
+                    }
+                }
+            }
+            Err(e) => return (done, clash, Some(e.to_string())),
+        }
+    }
+    (done, clash, None)
+}
+
+fn fail_hook(state: &AppState) -> Option<usize> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let n = state
+            .fail_collection_write_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        return (n != usize::MAX).then_some(n);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = state;
+        None
+    }
+}
+
+/// The error for a write that failed midway: it names the lists that were changed.
+fn partial_error(changed: &[String], err: &str) -> ApiError {
+    ApiError::coded(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "collection_partial",
+        format!("{err}; lists changed before the failure: {changed:?}"),
+    )
+}
+
+/// Add the collection's missing lists, turn on the disabled ones and align their trust with the
+/// catalogue, with one engine rebuild; or, with `dry_run`, only report that.
+#[utoipa::path(
+    post, path = "/lists/catalogue/collections/{id}/apply", tag = "lists",
+    security(("bearer_auth" = ["lists:write"])),
+    params(("id" = String, Path, description = "Collection id")),
+    request_body = ApplyCollectionRequest,
+    responses((status = 200, description = "What changes", body = ApplyCollectionResponse))
+)]
+pub async fn apply_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(req): ApiJson<ApplyCollectionRequest>,
+) -> ApiResult<Json<ApplyCollectionResponse>> {
+    let plan = plan_collection(&state, &id)?;
+    let ids = |v: &[Change]| v.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+    if req.dry_run {
+        return Ok(Json(ApplyCollectionResponse {
+            dry_run: true,
+            add: ids(&plan.add),
+            enable: ids(&plan.enable),
+            trust: plan.trust,
+            already: plan.already,
+            conflict: plan.conflict,
+        }));
+    }
+    for c in &plan.add {
+        if let Some(l) = &c.new_list {
+            validate_filter_url(&state, &l.url).await?;
+        }
+    }
+    let changes: Vec<Change> = plan.add.into_iter().chain(plan.enable).collect();
+    let (st, fail_at) = (state.clone(), fail_hook(&state));
+    let (written, clash, err) =
+        blocking(move || Ok(write_changes(&st.filter_store, &changes, fail_at))).await?;
+    let mut conflict = plan.conflict;
+    for c in clash {
+        if !conflict.iter().any(|x| x.id == c.id) {
+            conflict.push(c);
+        }
+    }
+    // Whatever the outcome, what was written is logged, audited and rebuilt once.
+    if !written.is_empty() {
+        let ids_of = |added: bool| {
+            written
+                .iter()
+                .filter(|w| w.added == added)
+                .map(|w| w.id.clone())
+                .collect::<Vec<_>>()
+        };
+        info!(
+            "Collection '{id}' applied by {}: added {:?}, enabled {:?}",
+            p.username,
+            ids_of(true),
+            ids_of(false)
+        );
+        for w in &written {
+            if let Some(t) = w.trust {
+                audit_trust_change(&state, &p, &w.id, t);
+            }
+        }
+        state.list_service.trigger();
+    }
+    if let Some(e) = err {
+        let changed: Vec<String> = written.iter().map(|w| w.id.clone()).collect();
+        return Err(partial_error(&changed, &e));
+    }
+    Ok(Json(ApplyCollectionResponse {
+        dry_run: false,
+        add: written
+            .iter()
+            .filter(|w| w.added)
+            .map(|w| w.id.clone())
+            .collect(),
+        enable: written
+            .iter()
+            .filter(|w| !w.added)
+            .map(|w| w.id.clone())
+            .collect(),
+        trust: written
+            .iter()
+            .filter(|w| w.trust.is_some())
+            .map(|w| w.id.clone())
+            .collect(),
+        already: plan.already,
+        conflict,
+    }))
+}
+
+/// Turn off every list of a collection that is on; the lists stay installed.
+#[utoipa::path(
+    post, path = "/lists/catalogue/collections/{id}/disable", tag = "lists",
+    security(("bearer_auth" = ["lists:write"])),
+    params(("id" = String, Path, description = "Collection id")),
+    responses((status = 200, description = "Lists turned off", body = DisableCollectionResponse))
+)]
+pub async fn disable_collection(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    ApiPath(id): ApiPath<String>,
+) -> ApiResult<Json<DisableCollectionResponse>> {
+    let not_found = || ApiError::NotFound(format!("Collection '{id}' not found"));
+    let doc = state.filter_catalogue().get().ok_or_else(not_found)?;
+    let c = doc
+        .collections
+        .iter()
+        .find(|c| c.id == id)
+        .ok_or_else(not_found)?;
+    let targets: Vec<(String, String)> = c
+        .lists
+        .iter()
+        .filter_map(|l| doc.entries.iter().find(|e| &e.id == l))
+        .map(|e| (e.id.clone(), e.url.clone()))
+        .collect();
+    let (st, fail_at) = (state.clone(), fail_hook(&state));
+    let (disabled, err) = blocking(move || {
+        let mut off = Vec::new();
+        for (n, (lid, url)) in targets.iter().enumerate() {
+            if fail_at == Some(n) {
+                return Ok((off, Some("write failed".to_string())));
+            }
+            let mut did = false;
+            let r = st.filter_store.update_list_durable(lid, |l| {
+                if same_url(&l.url, url) && l.enabled {
+                    l.enabled = false;
+                    did = true;
+                }
+            });
+            match r {
+                Ok(_) => {
+                    if did {
+                        off.push(lid.clone());
+                    }
+                }
+                Err(e) => return Ok((off, Some(e.to_string()))),
+            }
+        }
+        Ok((off, None))
+    })
+    .await?;
+    if !disabled.is_empty() {
+        info!(
+            "Collection '{id}' turned off by {}: {disabled:?}",
+            p.username
+        );
+        state.list_service.trigger();
+    }
+    if let Some(e) = err {
+        return Err(partial_error(&disabled, &e));
+    }
+    Ok(Json(DisableCollectionResponse { disabled }))
 }
 
 /// Add a catalogue entry as an enabled list and rebuild the engine.
@@ -716,26 +1133,19 @@ pub async fn add_from_catalogue(
     ApiPath(id): ApiPath<String>,
 ) -> ApiResult<(StatusCode, Json<FilterListResponse>)> {
     let not_found = || ApiError::NotFound(format!("Catalogue entry '{id}' not found"));
-    let mut list = {
+    let list = {
         let doc = state.filter_catalogue().get().ok_or_else(not_found)?;
         let e = doc
             .entries
             .iter()
             .find(|e| e.id == id)
             .ok_or_else(not_found)?;
-        let format = e.list_format().ok_or_else(|| {
-            ApiError::ValidationError(format!("Unsupported list format '{}'", e.format))
-        })?;
-        let mut l = filter_engine::FilterList::new(e.id.clone(), e.name.clone(), e.url.clone());
-        l.format = format;
-        l.trusted = e.trusted;
-        l
+        list_from_entry(e)?
     };
     if state.filter_store.exists(&id)? {
         return Err(ApiError::AlreadyExists(format!("Filter list '{id}'")));
     }
     validate_filter_url(&state, &list.url).await?;
-    list.enabled = true;
     let (st, l) = (state.clone(), list.clone());
     blocking(move || Ok(st.filter_store.upsert_durable(&l)?)).await?;
     info!(
@@ -975,5 +1385,116 @@ mod ext_totals_tests {
             c.put(1, (i.to_string(), String::new(), String::new()), i);
         }
         assert!(c.map.as_ref().unwrap().len() <= EXT_TOTALS_CAP);
+    }
+}
+
+#[cfg(test)]
+mod collection_write_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, list_service::ListStore) {
+        let d = tempfile::tempdir().unwrap();
+        let s = list_service::ListStore::new(d.path()).unwrap();
+        (d, s)
+    }
+
+    fn list(id: &str, url: &str, enabled: bool) -> filter_engine::FilterList {
+        let mut l = filter_engine::FilterList::new(id.into(), format!("name {id}"), url.into());
+        l.enabled = enabled;
+        l
+    }
+
+    fn change(id: &str, url: &str, trusted: bool, new: bool) -> Change {
+        Change {
+            id: id.into(),
+            url: url.into(),
+            trusted,
+            new_list: new.then(|| {
+                let mut l = list(id, url, true);
+                l.trusted = trusted;
+                l
+            }),
+        }
+    }
+
+    #[test]
+    fn a_write_changes_only_enabled_and_trusted_of_a_freshly_read_list() {
+        let (_d, s) = store();
+        // The list was disabled when planned; a concurrent edit has since renamed it.
+        let mut l = list("a", "https://x/a", false);
+        l.name = "renamed meanwhile".into();
+        l.allowlist = true;
+        s.upsert(&l).unwrap();
+        let (w, _, e) = write_changes(&s, &[change("a", "https://x/a", true, false)], None);
+        assert!(e.is_none());
+        assert_eq!((w.len(), w[0].trust), (1, Some(true)));
+        let got = s.get("a").unwrap().unwrap();
+        assert!(got.enabled && got.trusted);
+        assert_eq!(got.name, "renamed meanwhile");
+        assert!(got.allowlist);
+    }
+
+    #[test]
+    fn a_list_deleted_in_the_gap_is_recreated_only_if_the_plan_said_add() {
+        let (_d, s) = store();
+        let (w, _, _) = write_changes(&s, &[change("gone", "https://x/g", true, false)], None);
+        assert!(w.is_empty() && s.get("gone").unwrap().is_none());
+        let (w, _, _) = write_changes(&s, &[change("new", "https://x/n", true, true)], None);
+        assert!(w[0].added && s.get("new").unwrap().unwrap().trusted);
+    }
+
+    #[test]
+    fn a_list_created_in_the_gap_is_never_overwritten_by_an_add() {
+        let (_d, s) = store();
+        // Planned as add; by the write someone has created their own list under that id.
+        s.upsert(&list("new", "https://mine/n", false)).unwrap();
+        let c = change("new", "https://x/n", true, true);
+        let (w, clash, e) = write_changes(&s, &[c], None);
+        assert!(w.is_empty() && e.is_none());
+        assert_eq!(clash.len(), 1);
+        let got = s.get("new").unwrap().unwrap();
+        assert_eq!(got.url, "https://mine/n");
+        assert!(!got.enabled && !got.trusted);
+        // The store primitive itself refuses to overwrite.
+        let again = list("new", "https://x/n", true);
+        assert!(!s.insert_if_absent_durable(&again).unwrap());
+        assert_eq!(s.get("new").unwrap().unwrap().url, "https://mine/n");
+    }
+
+    #[test]
+    fn urls_compare_normalised_and_fall_back_to_text() {
+        assert!(same_url(
+            "HTTPS://Example.COM:443/a.txt",
+            "https://example.com/a.txt"
+        ));
+        assert!(same_url("https://example.com", "https://example.com/"));
+        assert!(!same_url(
+            "https://example.com/a.txt",
+            "https://example.com/b.txt"
+        ));
+        assert!(!same_url("https://example.com/a", "http://example.com/a"));
+        assert!(same_url("not a url", "not a url"));
+        assert!(!same_url("not a url", "not  a url"));
+    }
+
+    #[test]
+    fn a_cosmetically_different_url_is_still_the_catalogues_list() {
+        let (_d, s) = store();
+        s.upsert(&list("a", "HTTPS://X.example:443/a", false))
+            .unwrap();
+        let c = change("a", "https://x.example/a", false, false);
+        let (w, clash, _) = write_changes(&s, &[c], None);
+        assert_eq!(w.len(), 1);
+        assert!(clash.is_empty() && s.get("a").unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn a_list_whose_url_changed_in_the_gap_is_left_alone() {
+        let (_d, s) = store();
+        s.upsert(&list("a", "https://elsewhere/a", false)).unwrap();
+        let (w, clash, e) = write_changes(&s, &[change("a", "https://x/a", true, false)], None);
+        assert!(w.is_empty() && e.is_none() && clash.len() == 1);
+        let got = s.get("a").unwrap().unwrap();
+        assert!(!got.enabled && !got.trusted);
     }
 }

@@ -25,7 +25,10 @@ pub use service::{ListService, ListServiceConfig};
 pub use sets::SetKey;
 #[cfg(any(test, feature = "testkit"))]
 pub use signed::testkit;
-pub use signed::{CatalogueDoc, FilterCatalogueEntry, Loaded, SignedDoc, UserscriptCatalogueEntry};
+pub use signed::{
+    CatalogueDoc, Collection, FilterCatalogueEntry, Loaded, Origin, SignedDoc, SignedStatus,
+    UserscriptCatalogueEntry,
+};
 pub use store::{ListStatus, ListStore};
 
 /// Re-exported so API code needs no direct `filter-engine` dependency for these.
