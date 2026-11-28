@@ -44,7 +44,7 @@ scopes! {
     RulesWrite => "rules:write", "Replace the custom rules.";
     RulesSite => "rules:site", "Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules.";
     RulesExt => "rules:ext", "Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules.";
-    BypassSite => "bypass:site", "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists.";
+    BypassSite => "bypass:site", "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. A profile-restricted token can only read it, unless it includes the default profile.";
     EngineReload => "engine:reload", "Trigger a rebuild of the blocking engine.";
     StatsRead => "stats:read", "Read blocking, proxy and engine statistics.";
     LogsRead => "logs:read", "Read the request log, live and recent (full browsing history of every client the token may see).";

@@ -203,6 +203,7 @@ pub(crate) fn parses_as_ip_entry(line: &str) -> bool {
 pub(crate) fn convert_ip_list(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = strip_comment(raw);
         if line.is_empty() {
             continue;

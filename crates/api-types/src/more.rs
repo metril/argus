@@ -317,6 +317,11 @@ pub struct ValidateRulesRequest {
     /// Validate as an allowlist (every rule becomes an exception).
     #[serde(default)]
     pub allowlist: Option<bool>,
+    /// Judge the rules as a trusted list. Default false: untrusted rules cannot use `$replace`,
+    /// `#%#` scripts, snippets and the like, which is the safe reading of third-party text. The
+    /// custom rules are built trusted, so validate those with `true`.
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,8 +331,12 @@ pub struct RuleLineResult {
     pub line: usize,
     pub rule: String,
     /// `translated` (rewritten into engine syntax), `accepted` (used as written), `handed_off`
-    /// (parsed but not enforced yet), `skipped` (recognised, inexpressible) or `rejected`.
+    /// (extended rule; see `state`), `duplicate` (already provided by an earlier rule),
+    /// `skipped` (recognised, inexpressible) or `rejected`.
     pub outcome: String,
+    /// For `handed_off`: `enforced`, `unsupported`, `invalid` or `needs_trust`.
+    #[serde(default)]
+    pub state: Option<String>,
     /// False only for `rejected`.
     pub accepted: bool,
     /// Why the line was rejected or skipped, or the kind of a handed-off rule.
@@ -346,6 +355,11 @@ pub struct ValidateRulesResponse {
     pub translated: usize,
     #[serde(default)]
     pub handed_off: usize,
+    /// Handed-off rules that would not be enforced (unsupported, invalid or needs trust).
+    #[serde(default)]
+    pub handed_off_issues: usize,
+    #[serde(default)]
+    pub duplicates: usize,
     #[serde(default)]
     pub skipped: usize,
     pub rejected: usize,
@@ -717,8 +731,17 @@ pub struct UserscriptSourceResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ReportIssueDto {
+    /// 1-based line in the source text (the `!#include` line for an included rule); 0 when the
+    /// rule could not be traced to a line.
     pub line: usize,
+    /// The rule as written in the source.
+    #[serde(default)]
+    pub rule: String,
     pub reason: String,
+    /// Where it failed: `conversion` (the line is not a rule) or `compile` (the engine rejected
+    /// the converted rule).
+    #[serde(default)]
+    pub stage: String,
 }
 
 /// Header metadata (`! Title:`, `! Expires:` ...) found in a list.
@@ -745,9 +768,24 @@ pub struct ListReport {
     pub total_lines: usize,
     pub network: usize,
     pub cosmetic: usize,
-    /// Parsed but not enforced yet (see `GET /rules/ext`).
+    /// Extended rules handed to the extended-rule index (see `GET /rules/ext`); the four fields
+    /// below split them by what the index made of them.
     pub ext: usize,
-    /// Recognised but inexpressible lines.
+    #[serde(default)]
+    pub ext_enforced: usize,
+    #[serde(default)]
+    pub ext_unsupported: usize,
+    #[serde(default)]
+    pub ext_invalid: usize,
+    /// Dropped because the list is not trusted.
+    #[serde(default)]
+    pub ext_needs_trust: usize,
+    /// Extended rules per state, every state included (`enforced`, `unsupported`, `invalid`,
+    /// `needs_trust`, and any the extended-rule index adds). The four fields above are the same
+    /// figures for the states listed first.
+    #[serde(default)]
+    pub ext_states: std::collections::BTreeMap<String, usize>,
+    /// Recognised but inexpressible lines (and AdGuard stubs dropped on purpose).
     pub skipped: usize,
     /// Rules dropped as duplicates.
     pub deduped: usize,
@@ -756,11 +794,31 @@ pub struct ListReport {
     pub compressed: usize,
     /// Rules rewritten into engine syntax.
     pub translated: usize,
+    /// Rules the engine's compiler rejected.
     pub rejected: usize,
+    /// Domain rules a `$badfilter` rule disables (not counted in `network`).
+    #[serde(default)]
+    pub disabled: usize,
     pub ip_ranges: usize,
+    /// Deprecated: `conversion_errors + rejected`. Use the two fields separately.
     pub error_count: usize,
-    /// First parse issues.
+    /// Lines that could not be converted into a rule (not counting `rejected`).
+    #[serde(default)]
+    pub conversion_errors: usize,
+    /// First parse issues, conversion errors first.
     pub issues: Vec<ReportIssueDto>,
+    /// Rules already provided by an earlier rule or a shorter domain rule
+    /// (`deduped + compressed`).
+    #[serde(default)]
+    pub redundant_count: usize,
+    /// Everything in the list is already provided elsewhere: it contributes no rule of its own.
+    #[serde(default)]
+    pub redundant: bool,
+    /// Invalid rules (conversion errors, compiler rejections, malformed extended rules) reach 1%
+    /// of the list's rules, rounded up, at least one. Unsupported, not-enforced and needs-trust
+    /// rules never set it.
+    #[serde(default)]
+    pub attention: bool,
     pub ext_counts: std::collections::BTreeMap<String, usize>,
     pub skipped_reasons: std::collections::BTreeMap<String, usize>,
     pub meta: ListMetaDto,
@@ -832,6 +890,12 @@ pub struct ExtKindStatsDto {
     pub unsupported: usize,
     pub parse_errors: usize,
     pub badfiltered: usize,
+    /// Matched by the index but not yet applied by the proxy (not counted in `active`).
+    #[serde(default)]
+    pub not_enforced: usize,
+    /// Meaningless for a proxy (`$popunder`).
+    #[serde(default)]
+    pub not_applicable: usize,
 }
 
 /// A handed-off rule that could not be used.
@@ -877,4 +941,66 @@ pub struct ExtRuleResponse {
     /// Why the rule is unsupported / invalid.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// One rule of a source line, as the build treats it (`GET /lists/{id}/lines`). A line that
+/// emits several rules, or a `!#include`, appears once per rule with the same `line`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListLine {
+    /// 1-based line in the source text (the `!#include` line for an included rule).
+    pub line: usize,
+    /// `comment` (blank, header, comment, directive), `inactive` (in a false `!#if` branch),
+    /// `network`, `cosmetic`, `extended`, `duplicate`, `covered`, `disabled` (a domain rule a
+    /// `$badfilter` rule switches off), `unsupported` or `invalid`.
+    pub status: String,
+    /// The rule as written.
+    pub rule: String,
+    /// For `extended`: the rule kind (`replace`, `html-filter`, ...).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// For `extended`: the state the extended-rule index gave it: `enforced`, `unsupported`,
+    /// `invalid`, `needs_trust`, and any state the index adds.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Why, for `unsupported`, `invalid` and the unenforced extended states.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// For `invalid`: `conversion` or `compile`.
+    #[serde(default)]
+    pub stage: Option<String>,
+    /// For `duplicate` and `covered`: the list (id) that already provides the rule.
+    #[serde(default)]
+    pub list: Option<String>,
+    /// A `network` line that is an IP or CIDR range.
+    #[serde(default)]
+    pub ip: bool,
+}
+
+/// A page of [`ListLine`]s with the filter counts of the whole list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListLinesPage {
+    pub items: Vec<ListLine>,
+    /// Records matching `status` and `q`.
+    pub total: usize,
+    pub limit: u32,
+    pub has_more: bool,
+    /// Opaque; pass it back as `cursor`. A cursor from another build or text is refused with 409
+    /// `lines_changed`.
+    pub next_cursor: Option<String>,
+    /// Records per status for the whole list, whatever `status` and `q` are: `all`, `comment`,
+    /// `inactive`, `network`, `cosmetic`, `extended`, `duplicate`, `covered`, `disabled`, `unsupported`,
+    /// `invalid`, one per extended-rule state (`enforced`, `needs_trust`, `not_enforced`,
+    /// `not_applicable`), and the groups `issues` (unsupported, invalid, needs_trust,
+    /// not_enforced), `applied` (network, cosmetic, enforced) and `ignored` (inactive,
+    /// disabled, not_applicable). `unsupported` and `invalid` include extended rules in that state.
+    pub counts: std::collections::BTreeMap<String, usize>,
+    /// The format used (detected when the list's override is `auto`).
+    pub format: String,
+    /// The list was judged inside the live build. When false (disabled, or changed since the
+    /// last build) it was judged on its own: nothing is `duplicate` or `covered` by another list.
+    pub in_build: bool,
+    /// Lines in the source text.
+    pub total_lines: usize,
 }

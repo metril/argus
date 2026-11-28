@@ -700,6 +700,10 @@ body.noscroll,body.noscroll .main{overflow:hidden}
 .menu-item[aria-disabled=true]{opacity:.6;cursor:progress}
 .menu-div{height:1px;background:var(--line);margin:4px 0}
 .us-head{display:flex;align-items:center;gap:var(--s2) var(--s4);flex-wrap:wrap}
+.us-master-row{display:flex;align-items:flex-start;gap:var(--s3)}
+.us-master-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.us-master-label{font-weight:600}
+.us-master .hint.warn{display:flex;align-items:center;gap:var(--s1)}
 .us-head .acts{margin-left:auto;display:flex;gap:var(--s2);align-items:center}
 .lbl-short{display:none}
 .us-panel{display:flex;flex-direction:column;gap:var(--s4)}

@@ -77,6 +77,7 @@ fn paths(name: &str) -> &'static str {
         "chev-r" => r#"<path d="m6 3 5 5-5 5"/>"#,
         "chev-l" => r#"<path d="m10 3-5 5 5 5"/>"#,
         "alert" => r#"<path d="M8 2 1.5 13.5h13z"/><path d="M8 6.5v3M8 11.5v.5"/>"#,
+        "info" => r#"<circle cx="8" cy="8" r="6"/><path d="M8 7.5v3.5M8 5v.5"/>"#,
         "download" => r#"<path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M2.5 13.5h11"/>"#,
         "upload" => r#"<path d="M8 10V2M4.5 5.5 8 2l3.5 3.5M2.5 13.5h11"/>"#,
         "refresh" => {

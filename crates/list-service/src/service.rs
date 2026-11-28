@@ -170,7 +170,7 @@ pub struct ListService {
     /// [`ListService::new`] (tests), which fetch from anywhere.
     guard: Option<Arc<NetPolicy>>,
     flight: Mutex<Flight>,
-    busy: watch::Sender<bool>,
+    pub(crate) busy: watch::Sender<bool>,
     builds: AtomicU64,
     installed_once: AtomicBool,
     /// Fetched `meta.json` shared by the catalogues and the bypass lists.
@@ -195,6 +195,12 @@ pub struct ListService {
     profile_lists: Mutex<std::collections::HashSet<String>>,
     /// Per-list-set engines (see [`ListService::engine_for`]).
     pub(crate) sets: crate::sets::SetRegistry,
+    /// What the installed engine was built from, per list id.
+    pub(crate) installed: Mutex<HashMap<String, crate::inspect::Installed>>,
+    /// Classified lists for the line viewer.
+    pub(crate) class_cache: crate::inspect::ClassCache,
+    /// Serializes classification, so paging requests share one pass.
+    pub(crate) class_lock: tokio::sync::Mutex<()>,
     /// Dedicated rayon pool for list builds, created on first use.
     pool: std::sync::OnceLock<Arc<rayon::ThreadPool>>,
     /// Test hook: make the next build panic.
@@ -352,7 +358,7 @@ fn is_cosmetic_hash_line(l: &str) -> bool {
         .any(|p| l.starts_with(p))
 }
 
-fn sorted_includes(m: &HashMap<String, String>) -> Vec<(&String, &String)> {
+pub(crate) fn sorted_includes(m: &HashMap<String, String>) -> Vec<(&String, &String)> {
     let mut v: Vec<_> = m.iter().collect();
     v.sort();
     v
@@ -414,6 +420,12 @@ impl ListService {
             schedule,
             pool: Default::default(),
             sets: Default::default(),
+            installed: Mutex::default(),
+            class_cache: crate::inspect::ClassCache::new(
+                crate::inspect::CACHE_BYTES,
+                crate::inspect::CACHE_IDLE,
+            ),
+            class_lock: tokio::sync::Mutex::new(()),
             profile_lists: Mutex::default(),
             cfg,
             store,
@@ -680,6 +692,10 @@ impl ListService {
 
     // ---- build -----------------------------------------------------------------------------
 
+    pub(crate) fn custom_rules_text(&self) -> Option<String> {
+        self.custom_rules()
+    }
+
     fn custom_rules(&self) -> Option<String> {
         self.store
             .get_custom_rules()
@@ -798,9 +814,23 @@ impl ListService {
         let resources = self.engine.resources();
         let pool = self.build_pool();
         let started = Instant::now();
+        let installed_now: HashMap<String, crate::inspect::Installed> = inputs
+            .iter()
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    crate::inspect::Installed {
+                        digest: i.digest.clone(),
+                        format: i.format,
+                        allowlist: i.allowlist,
+                        trusted: i.trusted,
+                    },
+                )
+            })
+            .collect();
         #[cfg(test)]
         let fail = self.fail_compile.swap(false, Ordering::AcqRel);
-        let (built, engine, index) = tokio::task::spawn_blocking(move || {
+        let (built, engine, index, ext_states) = tokio::task::spawn_blocking(move || {
             let list_inputs: Vec<ListInput> = inputs
                 .into_iter()
                 .map(|i| ListInput {
@@ -824,7 +854,18 @@ impl ListService {
             }
             let engine = try_build_engine(&built.blob, &resources).map_err(Error::Other)?;
             let index = build_ext_index(&built.ext, &trusted_lists);
-            Ok::<_, Error>((built, engine, index))
+            // How the index judged each list's extended rules, per state name.
+            let mut states: HashMap<String, std::collections::BTreeMap<String, usize>> =
+                HashMap::new();
+            for (i, e) in built.ext.iter().enumerate() {
+                let v = crate::inspect::verdict_of(index.state_of(i));
+                *states
+                    .entry(e.list.clone())
+                    .or_default()
+                    .entry(v.state.as_str().to_string())
+                    .or_default() += 1;
+            }
+            Ok::<_, Error>((built, engine, index, states))
         })
         .await
         .map_err(|e| Error::Other(format!("compile task failed: {e}")))??;
@@ -846,6 +887,7 @@ impl ListService {
             summary.duplicates += report.duplicates;
             summary.compressed += report.compressed;
             let mut report = report.clone();
+            report.apply_ext_states(ext_states.get(id).cloned().unwrap_or_default());
             crate::report::sanitize_report(&mut report);
             let report = &report;
             if let Err(e) = self.store.set_report(id, report) {
@@ -856,9 +898,12 @@ impl ListService {
                     report.network + report.cosmetic + report.ext + report.compressed,
                     report.duplicates,
                 );
+                let (attention, redundant) = (report.attention, report.redundant);
                 let _ = self.store.update_list(id, |l| {
                     l.rule_count = rc;
                     l.duplicate_count = Some(dc);
+                    l.report_attention = attention;
+                    l.redundant = redundant;
                 });
             }
         }
@@ -891,6 +936,7 @@ impl ListService {
         );
         self.installed_once.store(true, Ordering::Release);
         *self.installed_key.lock() = Some(key);
+        *self.installed.lock() = installed_now;
         if let Err(e) = self.store.set_summary(&summary) {
             warn!("Failed to persist build summary: {e}");
         }
@@ -912,7 +958,7 @@ impl ListService {
     }
 
     /// Install the persisted engine if its key matches the store's current state.
-    async fn try_load_persisted(&self, key: persist::Key) -> bool {
+    async fn try_load_persisted(&self, key: persist::Key, enabled: &[FilterList]) -> bool {
         let path = self.cfg.data_dir.join(persist::FILE_NAME);
         let resources = self.engine.resources();
         let res = tokio::task::spawn_blocking(move || {
@@ -946,6 +992,33 @@ impl ListService {
                 );
                 self.installed_once.store(true, Ordering::Release);
                 *self.installed_key.lock() = Some(key);
+                // The key matched, so the stored digests are what the engine was built from.
+                let mut installed: HashMap<String, crate::inspect::Installed> = enabled
+                    .iter()
+                    .filter_map(|l| {
+                        Some((
+                            l.id.clone(),
+                            crate::inspect::Installed {
+                                digest: self.store.get_status(&l.id).ok()?.content_sha?,
+                                format: l.format,
+                                allowlist: l.allowlist,
+                                trusted: l.trusted,
+                            },
+                        ))
+                    })
+                    .collect();
+                if let Some(c) = self.custom_rules() {
+                    installed.insert(
+                        CUSTOM_REPORT_ID.to_string(),
+                        crate::inspect::Installed {
+                            digest: Self::custom_digest(Some(&c)),
+                            format: ListFormat::Abp,
+                            allowlist: false,
+                            trusted: true,
+                        },
+                    );
+                }
+                *self.installed.lock() = installed;
                 *self.summary.lock() = summary;
                 true
             }
@@ -988,7 +1061,7 @@ impl ListService {
                 .persist_engine
                 .then(|| self.key_from_store(&enabled))
             {
-                Some(Some(key)) => self.try_load_persisted(key).await,
+                Some(Some(key)) => self.try_load_persisted(key, &enabled).await,
                 _ => false,
             };
             if !loaded {
@@ -1094,10 +1167,18 @@ impl ListService {
                 // Store writes (content file, metadata, status) are blocking IO: off the async
                 // threads.
                 let store = self.store.clone();
+                let changed = cached.as_deref() != Some(text.as_str());
                 let (l, st, t) = (list.clone(), status.clone(), text.clone());
                 let res = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = store.put_content(&l.id, &t) {
-                        warn!("Failed to cache content for {}: {e}", l.name);
+                    let mut st = st;
+                    if changed {
+                        // The stored digest describes the text being replaced: drop it so the
+                        // lines viewer re-keys on the new text (the next build input stores the
+                        // new one). Identical text keeps its digest and its file.
+                        st.content_sha = None;
+                        if let Err(e) = store.put_content(&l.id, &t) {
+                            warn!("Failed to cache content for {}: {e}", l.name);
+                        }
                     }
                     // Fetch metadata only, on the list as stored now: never `enabled`, and a
                     // list deleted meanwhile stays deleted.

@@ -737,7 +737,7 @@ fn Wizard(init: Init) -> impl IntoView {
                         </div>
                         <div class="sec-t">"Permissions"</div>
                         {permissions_note(hidden_row_count(&held_sv.get_value()), dropped).map(|n| view! {
-                            <div class="banner info"><Icon name="alert" /><span class="bt">{n}</span></div>
+                            <div class="banner info"><Icon name="info" /><span class="bt">{n}</span></div>
                         })}
                         {err_for(Field::Access)}
                         <div class="tk-tw">

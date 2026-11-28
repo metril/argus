@@ -89,7 +89,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `rules:write` | - | yes | yes | Replace the custom rules. |
 | `rules:site` | - | yes | yes | Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules. |
 | `rules:ext` | - | yes | yes | Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules. |
-| `bypass:site` | - | yes | yes | Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. |
+| `bypass:site` | - | yes | yes | Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. A profile-restricted token can only read it, unless it includes the default profile. |
 | `engine:reload` | - | - | yes | Trigger a rebuild of the blocking engine. |
 | `stats:read` | yes | yes | yes | Read blocking, proxy and engine statistics. |
 | `logs:read` | - | yes | yes | Read the request log, live and recent (full browsing history of every client the token may see). |
@@ -182,7 +182,29 @@ disabled or the password is wrong.
   `requiresTrust` (uBO's `trusted-*`) only run for rules of trusted lists.
 - `GET /lists/{id}/report`, `GET /rules/custom/report`: `ListReport` of the last build (detected
   format, network/cosmetic/ext/skipped/deduped/rejected counts, first parse issues, header metadata,
-  content SHA).
+  content SHA). `conversion_errors` (lines that are not rules) and `rejected` (rules the engine's
+  compiler refused) are separate; `error_count` is their deprecated sum. Each `issues` entry has
+  the source `line` (the `!#include` line for included rules), the `rule` text, the `reason` and
+  the `stage` (`conversion` or `compile`). `ext_states` splits the extended rules by what the
+  extended-rule index made of them (`ext_enforced`, `ext_unsupported`, `ext_invalid`,
+  `ext_needs_trust` are the usual four). `redundant_count` (`deduped + compressed`) and
+  `redundant` say a list adds nothing of its own. `attention` is set only by invalid rules
+  (conversion errors, compiler rejections, malformed extended rules) reaching 1% of the list's
+  rules, rounded up, at least one; unsupported, not-enforced and needs-trust rules are counted
+  apart and never set it; the list feed's `attention` also covers a failed fetch and a stale or never fetched list.
+- `GET /lists/{id}/lines?status=&q=&cursor=&limit=&profile=` (and `GET /rules/custom/lines`, which
+  needs `rules:read` like `GET /rules/custom`): every source line of the list's cached text with
+  the build's verdict: `comment`, `inactive` (false `!#if` branch),
+  `network`, `cosmetic`, `extended` (with `kind`, `state`, `reason`), `duplicate` / `covered`
+  (with the `list` that already provides it), `disabled` (a domain rule a `$badfilter` rule switches off; for engine rules the build keeps no
+  per-rule record of `$badfilter`, so those show as `network`), `unsupported`, `invalid` (with
+  `stage`). `profile` judges against that profile's engine and list set (its own rules for the
+  custom route). `q` is at most 256 characters. Extended rules are judged per list. Line numbers
+  are source lines; an `!#include`'s rules carry the include line. `status` is a comma-separated
+  set (the names above, extended-rule states, or the groups `issues`, `applied`, `ignored`), `q` a
+  case-insensitive substring of the rule. `counts` covers the whole list whatever the filter.
+  A list that is disabled or changed since the last build is judged on its own (`in_build`
+  false). The cursor names the build and the text; a stale one gets `409 lines_changed`.
 - `GET /engine/build`: `BuildSummary` with the build state (`idle`, `fetching`, `compiling`,
   `failed` with the error; a failed build leaves the previous engine serving), last build duration
   and time, domain-set size and handed-off rule counts per kind. `ext_stats` reports what the
@@ -199,8 +221,38 @@ disabled or the password is wrong.
 - `GET /rules/ext?kind=`: paginated read-only listing of handed-off rules, each with its source
   `list` and `state`: `active`, `dropped_untrusted`, `unsupported` (with `reason`), `invalid`,
   `badfiltered`, `badfilter`, or `unknown` while a rebuild is being installed.
-- `POST /rules/validate`: `{rules, format?, allowlist?}` runs the real conversion pipeline and
-  reports each line as `translated`, `accepted`, `handed_off`, `skipped` or `rejected`.
+- `POST /rules/validate`: `{rules, format?, allowlist?, trusted?}` runs the same classifier as
+  `/lists/{id}/lines`, standalone, so each line gets the verdict a build would give it
+  (`!#if` branches, duplicates among the lines and trust included): `translated`, `accepted`,
+  `handed_off` (with its `state`), `duplicate`, `skipped` or `rejected`. `trusted` defaults to
+  false; pass `true` to judge the custom rules, which are built trusted.
+
+## Per-site no-decrypt (browser extension)
+
+`GET|PUT|DELETE /bypass/sites/{host}` back the extension's "Don't decrypt this site". Each needs
+`bypass:site` or `config:write` (`config:read` alone is refused with 403 `insufficient_scope`). The
+bypass list is global, so a profile-restricted token may only `GET`; `PUT` and `DELETE` give 403
+`profile_restricted` unless its profiles include the default profile `0`. `bypass:site` opens
+nothing else in the bypass list. At most 1000 extension entries exist: past that, `PUT` is `409`
+`site_bypass_limit` (remove entries on the Bypass page).
+
+- The host is normalised (lowercase, trailing dot dropped, IDNA to ASCII) and must be a registrable
+  host name or an IP address: no scheme, port, path, wildcard or empty label, no single label or
+  public suffix, no loopback, link-local, `localhost`, `.local`, `.internal` or `.arpa`, and not
+  Argus's own host. Anything else is `400`.
+- `GET` answers `{host, bypassed, mode, source, name, removable, ev_auto_tunnel}`. `source` is
+  `extension`, `manual`, `category` (`name` is its title), `subscription` (its name), `failsafe`
+  (the Argus lists have not loaded: HTTPS is tunnelled) or `none`. It is the lookup the proxy uses
+  for that host. Extended Validation sites are tunnelled on top of this when `ev_auto_tunnel` is
+  on; the certificate is only known at connection time.
+- `PUT` adds a `no_decrypt` entry with source `extension` for exactly that host. A plain entry does
+  not cover subdomains (`*.host` does, and is not made here). Idempotent; a host something else
+  already bypasses gets no duplicate and the current state is returned.
+- `DELETE` removes only that extension entry (200 with the state afterwards, also when there is
+  none). If a manual entry, subscription or category is what bypasses the host: `409`
+  `not_extension_entry`.
+- Changes apply live like `/bypass/entries`; open connections are not dropped. They are audited
+  (actor, token, host as target), and the entry's note names who added it.
 
 ## Recently blocked requests
 

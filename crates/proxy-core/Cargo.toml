@@ -105,6 +105,8 @@ api-types = { workspace = true }
 tokio-tungstenite = { workspace = true, optional = true }
 webpki-roots = "1.0"
 webpki-root-certs = "=1.0.8"
+# Character-reference table for decoding attribute values the way a browser does.
+html-escape = "0.2"
 
 # Filter engine (always on — request filtering is the core of the proxy)
 filter-engine = { path = "../filter-engine", default-features = false }

@@ -26,8 +26,8 @@ type Grant = (Vec<Scope>, Option<Vec<String>>);
 /// The one grant check, shared by creation and edit: every scope must be held by the caller, a
 /// restricted caller cannot widen the profile restriction, and every profile id must exist.
 /// Narrowing always passes. `profiles: None` inherits the caller's own restriction. `keep` are
-/// scopes the token already has (an edit): leaving those in place is not a grant, so they need
-/// not be held by the caller.
+/// the scopes the target token already stores (an edit; empty on create): leaving those in
+/// place is not a grant, so the caller need not hold them. It never comes from the request.
 async fn check_grant(
     state: &Arc<AppState>,
     p: &Principal,

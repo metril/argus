@@ -73,6 +73,7 @@ fn config(port: u16, require_token: bool) -> ProxyConfig {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     }
 }
 

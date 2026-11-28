@@ -6,18 +6,16 @@
 @font-face{font-family:"IBM Plex Sans Condensed";font-style:normal;font-weight:600;font-display:swap;src:url("/fonts/ibm-plex-sans-condensed-latin-600-normal.woff2") format("woff2")}
 @font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:400;font-display:swap;src:url("/fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2")}
 @font-face{font-family:"IBM Plex Mono";font-style:normal;font-weight:500;font-display:swap;src:url("/fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2")}
-/* Layout: framed ops console. Fixed sidebar rail + top bar + scrolling work area, dense 13px base; spec sheet follows the frame. Dark-first. */
+/* Layout: framed ops console. Dark-first; light follows the system or data-theme. */
 :root{
   color-scheme: dark;
-  /* neutrals: blue-slate bias */
   --bg:#0c0f13; --bg-sunk:#080a0d; --surface:#12161c; --surface-2:#181d25; --surface-3:#1f2530;
-  --line:#232a34; --line-strong:#323b48;
-  --text:#e2e7ee; --text-2:#a1abb9; --text-3:#7d8797;
-  /* accent: periwinkle "signal" */
+  --line:#232a34; --line-strong:#323b48; --ctl:#6b7686;
+  /* three text tones: primary, secondary, disabled (contrast-audited, see tests/contrast.test.ts) */
+  --text:#e2e7ee; --text-2:#b8c1ce; --text-3:#7f8998;
   --accent:#8f9dff; --accent-ink:#0c0f13; --accent-soft:rgba(143,157,255,.14);
-  /* semantic: request outcomes */
-  --allow:#4fc48d; --block:#f2695f; --pass:#4cc2d9; --error:#e6a94c;
-  --allow-soft:rgba(79,196,141,.13); --block-soft:rgba(242,105,95,.14); --pass-soft:rgba(76,194,217,.13); --error-soft:rgba(230,169,76,.14);
+  --allow:#4fc48d; --block:#ff857c; --pass:#4cc2d9; --error:#e6a94c;
+  --allow-soft:rgba(79,196,141,.13); --block-soft:rgba(255,133,124,.14); --pass-soft:rgba(76,194,217,.13); --error-soft:rgba(230,169,76,.14);
   --focus:#b7c0ff; --scrim:rgba(4,6,9,.62); --shadow:0 12px 40px rgba(0,0,0,.5);
   /* type */
   --font-ui:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -31,13 +29,34 @@
 }
 @media (prefers-color-scheme: light){
   :root:not([data-theme="dark"]){
-    color-scheme: light;
-    --bg:#f3f5f8; --bg-sunk:#e9edf2; --surface:#ffffff; --surface-2:#f6f8fb; --surface-3:#eceff4;
-    --line:#dce1e8; --line-strong:#c5ccd6;
-    --text:#131922; --text-2:#465161; --text-3:#5f6a7a;
-    --accent:#4555d1; --accent-ink:#ffffff; --accent-soft:rgba(69,85,209,.1);
-    --allow:#17804f; --block:#c3352b; --pass:#0b7a90; --error:#9a5d00;
-    --allow-soft:rgba(23,128,79,.1); --block-soft:rgba(195,53,43,.09); --pass-soft:rgba(11,122,144,.1); --error-soft:rgba(154,93,0,.1);
-    --focus:#4555d1; --scrim:rgba(20,26,34,.38); --shadow:0 12px 40px rgba(20,30,50,.16);
+  color-scheme: light;
+  --bg:#f3f5f8; --bg-sunk:#e9edf2; --surface:#ffffff; --surface-2:#f6f8fb; --surface-3:#eceff4;
+  --line:#dce1e8; --line-strong:#c5ccd6; --ctl:#6f7a89;
+  --text:#131922; --text-2:#3d4757; --text-3:#6f7a8a;
+  --accent:#3a49bf; --accent-ink:#ffffff; --accent-soft:rgba(58,73,191,.1);
+  --allow:#126b41; --block:#a82a21; --pass:#0a6679; --error:#855000;
+  --allow-soft:rgba(18,107,65,.1); --block-soft:rgba(168,42,33,.09); --pass-soft:rgba(10,102,121,.1); --error-soft:rgba(133,80,0,.1);
+  --focus:#3a49bf; --scrim:rgba(20,26,34,.38); --shadow:0 12px 40px rgba(20,30,50,.16);
   }
+}
+:root[data-theme="light"]{
+  color-scheme: light;
+  --bg:#f3f5f8; --bg-sunk:#e9edf2; --surface:#ffffff; --surface-2:#f6f8fb; --surface-3:#eceff4;
+  --line:#dce1e8; --line-strong:#c5ccd6; --ctl:#6f7a89;
+  --text:#131922; --text-2:#3d4757; --text-3:#6f7a8a;
+  --accent:#3a49bf; --accent-ink:#ffffff; --accent-soft:rgba(58,73,191,.1);
+  --allow:#126b41; --block:#a82a21; --pass:#0a6679; --error:#855000;
+  --allow-soft:rgba(18,107,65,.1); --block-soft:rgba(168,42,33,.09); --pass-soft:rgba(10,102,121,.1); --error-soft:rgba(133,80,0,.1);
+  --focus:#3a49bf; --scrim:rgba(20,26,34,.38); --shadow:0 12px 40px rgba(20,30,50,.16);
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --bg:#0c0f13; --bg-sunk:#080a0d; --surface:#12161c; --surface-2:#181d25; --surface-3:#1f2530;
+  --line:#232a34; --line-strong:#323b48; --ctl:#6b7686;
+  /* three text tones: primary, secondary, disabled (contrast-audited, see tests/contrast.test.ts) */
+  --text:#e2e7ee; --text-2:#b8c1ce; --text-3:#7f8998;
+  --accent:#8f9dff; --accent-ink:#0c0f13; --accent-soft:rgba(143,157,255,.14);
+  --allow:#4fc48d; --block:#ff857c; --pass:#4cc2d9; --error:#e6a94c;
+  --allow-soft:rgba(79,196,141,.13); --block-soft:rgba(255,133,124,.14); --pass-soft:rgba(76,194,217,.13); --error-soft:rgba(230,169,76,.14);
+  --focus:#b7c0ff; --scrim:rgba(4,6,9,.62); --shadow:0 12px 40px rgba(0,0,0,.5);
 }
