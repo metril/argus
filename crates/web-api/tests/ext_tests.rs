@@ -629,7 +629,8 @@ async fn ext_rules_need_their_scope_and_accept_one_valid_line() {
         "",
         "   ",
         "example.com##+js(abort-on-property-read, x)",
-        "example.com###ad",
+        "example.com##.a:has-text(x)",
+        "##div",
         "||a.com^$replace=/a/b/",
         "||a.com^$csp=script-src 'none'",
         long.as_str(),
@@ -662,7 +663,7 @@ async fn ext_rules_need_their_scope_and_accept_one_valid_line() {
         .await
         .json();
     assert_eq!(v["site"], "a.com");
-    assert_eq!(v["rules"], json!([rule]));
+    assert_eq!(v["rules"], json!([{"rule": rule, "exclusive": true}]));
     ctx.bearer("GET", "/api/v1/ext/rules?site=a.com/x", &ext)
         .await
         .assert_status(StatusCode::BAD_REQUEST);
@@ -681,6 +682,37 @@ async fn ext_rules_need_their_scope_and_accept_one_valid_line() {
     post(&ext, "add", "||Example.com^").await.assert_status_ok();
     let v: Value = post(&ext, "remove", "||example.com^").await.json();
     assert_eq!(v["changed"], true);
+}
+
+#[tokio::test]
+async fn cosmetic_rule_round_trip() {
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let ext = ctx.token(&admin, &["rules:ext"]).await;
+    let post = |op: &str, rule: &str| {
+        ctx.bearer("POST", "/api/v1/ext/rules", &ext)
+            .json(&json!({"op": op, "rule": rule}))
+    };
+    let rule = "a.com##.promo-banner";
+    let v: Value = post("add", rule).await.json();
+    assert_eq!(v, json!({"rule_count": 1, "changed": true}));
+    let v: Value = post("add", "A.com##.promo-banner").await.json();
+    assert_eq!(v["changed"], false);
+    post("add", "##.sticky-ad").await.assert_status_ok();
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/ext/rules?site=a.com", &ext)
+        .await
+        .json();
+    assert_eq!(v["rules"], json!([{"rule": rule, "exclusive": true}]));
+    post("remove", "##.sticky-ad").await.assert_status_ok();
+    let v: Value = post("remove", rule).await.json();
+    assert_eq!(v["changed"], true);
+    assert_eq!(ctx.state.filter_store.get_custom_rules().unwrap(), "");
+    for bad in ["a.com#@#.x", "a.com##.x:xpath(//a)", "##body", "com##.x"] {
+        post("add", bad)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]
@@ -766,9 +798,9 @@ async fn removing_a_rule_is_held_to_the_same_allowlist_and_site_lookup_respects_
     // A line the extension could never have added cannot be removed by it.
     ctx.state
         .filter_store
-        .set_custom_rules("##.mine\n@@*$document\n||ba.com^\n||a.com^$script\n")
+        .set_custom_rules("##.a:has-text(x)\n@@*$document\n||ba.com^\n||a.com^$script\n")
         .unwrap();
-    for line in ["##.mine", "@@*$document"] {
+    for line in ["##.a:has-text(x)", "@@*$document"] {
         let r = post("remove", line).await;
         r.assert_status(StatusCode::BAD_REQUEST);
         assert!(
@@ -782,13 +814,16 @@ async fn removing_a_rule_is_held_to_the_same_allowlist_and_site_lookup_respects_
         .filter_store
         .get_custom_rules()
         .unwrap()
-        .contains("##.mine"));
+        .contains("##.a:has-text(x)"));
     // Only whole hosts / subdomains match the site.
     let v: Value = ctx
         .bearer("GET", "/api/v1/ext/rules?site=a.com", &ext)
         .await
         .json();
-    assert_eq!(v["rules"], json!(["||a.com^$script"]));
+    assert_eq!(
+        v["rules"],
+        json!([{"rule": "||a.com^$script", "exclusive": true}])
+    );
     post("remove", "||a.com^$script").await.assert_status_ok();
 }
 
@@ -812,4 +847,77 @@ async fn concurrent_samples_neither_lose_nor_double_count_blocks() {
     let (total, blocked, cats) = ctx.state.daily.lifetime();
     assert_eq!((total, blocked), (1000, 500));
     assert_eq!(cats.iter().sum::<u64>(), 500);
+}
+
+#[tokio::test]
+async fn site_rules_are_only_those_scoped_to_the_site() {
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let ext = ctx.token(&admin, &["rules:ext"]).await;
+    for r in [
+        "a.com##.only-a",
+        "a.com,b.com##.shared",
+        "b.com##.other-b",
+        "##.everywhere-ad",
+        "||ads.a.com^",
+        "||x.com^$domain=a.com|b.com",
+        "||x.com^$domain=a.com,third-party",
+        "||y.com^$domain=b.com",
+        "||ba.com^",
+        "||a.com^$domain=b.com",
+    ] {
+        ctx.bearer("POST", "/api/v1/ext/rules", &ext)
+            .json(&json!({"op": "add", "rule": r}))
+            .await
+            .assert_status_ok();
+    }
+    let v: Value = ctx
+        .bearer("GET", "/api/v1/ext/rules?site=a.com", &ext)
+        .await
+        .json();
+    assert_eq!(
+        v["rules"],
+        json!([
+            {"rule": "a.com##.only-a", "exclusive": true},
+            {"rule": "a.com,b.com##.shared", "exclusive": false},
+            {"rule": "||ads.a.com^", "exclusive": true},
+            {"rule": "||x.com^$domain=a.com|b.com", "exclusive": false},
+            {"rule": "||x.com^$domain=a.com,third-party", "exclusive": true},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn all_sites_hiding_cannot_blank_pages_or_hit_argus_ui() {
+    let (ctx, _f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let ext = ctx.token(&admin, &["rules:ext"]).await;
+    let add = |r: &str| {
+        ctx.bearer("POST", "/api/v1/ext/rules", &ext)
+            .json(&json!({"op": "add", "rule": r}))
+    };
+    for bad in [
+        "##html.dark",
+        "##body.x",
+        "##.a > body.x",
+        "##:root.x",
+        "##[data-x*=\"abcd\"]",
+        "##[data-x~=\"abcd\"]",
+        "##[data-x=\"ab\"]",
+        "##[lang=\"en-US\"]",
+        "##[dir=\"ltr\"]",
+        "##[style=\"display:none\"]",
+        "##[class=\"abcd\"]",
+        "##[id=\"abcd\"]",
+        "##.x\\",
+        "a.com##.x\\",
+        "a.com##[id^=\"__argus\"]",
+        "a.com##.argus-panel",
+        "a.com##\\#__ab_cfg",
+    ] {
+        add(bad).await.assert_status(StatusCode::BAD_REQUEST);
+    }
+    for good in ["##.ad-slot", "##[data-ad=\"slot1\"]", "a.com##body.x"] {
+        add(good).await.assert_status_ok();
+    }
 }

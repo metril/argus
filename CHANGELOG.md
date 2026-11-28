@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Extension element picker ("Block an element" in the popup): hover to highlight, click to select; a panel in a closed shadow root offers selectors from specific to broad with a slider, a live preview with a match count, this site or all sites, and for images, frames, media and scripts a network rule for the resource. Saves `site##selector` or `##selector`. Esc cancels. Injected on demand with `scripting` and `activeTab`; the script never holds the token and the background accepts a save only from the armed tab (expires after 5 minutes or when the picker closes) with a trusted click.
+- Extension zapper ("Zap elements"): click to remove elements for this page view only; nothing is saved; Undo, Esc exits.
+- Extension popup lists your rules for the site with Remove and "Reset all rules for this site", and each third-party domain in "Blocked on this page" gets Block / Default / Allow (`||host^$domain=site`, `@@||host^$domain=site`).
+- `POST /ext/rules` also accepts one plain element-hiding rule `domain##selector` (registrable domains) or `##selector` for all sites, at most 1 KB. No procedural or extended syntax (`:has-text`, `:xpath`, `:style`, `:remove`, `:upward`, `:matches-css`, `:-abp-*`, `:has`), exceptions, scriptlets or HTML filters; an all-sites selector needs an id, a class or an attribute value on its last compound and cannot be a bare tag or `*`. Removal is held to the same check.
+
 ## 0.11.0 — 2026-11-27
 
 - Extension logger page (popup button "Open logger"): the requests of a tab with time, status, URL, type, rule and list; tab selector, search, filters (first/third party, blocked, allowed, redirected/modified, your rules, type), pause, clear and copy as text; recent history per tab is kept in `storage.session`. A row opens "create rule": block or unblock, this site or everywhere, exact URL, path prefix or whole host, third-party only, important, with the rule text editable before saving.

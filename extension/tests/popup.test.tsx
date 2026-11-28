@@ -20,6 +20,7 @@ let calls: { method: string; path: string }[];
 let deferred: Record<string, (r: Response) => void>;
 let hold: Set<string>;
 let scopeless: boolean;
+let extRules: string[];
 
 beforeEach(() => {
   (globalThis as any).browser = fakeBrowser;
@@ -30,7 +31,7 @@ beforeEach(() => {
   page = { id: 1, url: 'https://www.a.example/' };
   tabStats = { 1: stat(3, 5, { 'ads.a.example': { blocked: 3, allowed: 0 }, 'www.a.example': { blocked: 0, allowed: 5 } }) };
   exceptions = new Set();
-  calls = []; deferred = {}; hold = new Set(); scopeless = false;
+  extRules = []; calls = []; deferred = {}; hold = new Set(); scopeless = false;
   settings.value = { argusUrl: 'https://argus.lan', token: 'tok' };
   const b: any = fakeBrowser;
   b.tabs.query = async () => [{ id: page.id, url: page.url }];
@@ -54,6 +55,14 @@ beforeEach(() => {
     if (scopeless && (path.startsWith('/stats') || path.startsWith('/rules'))) return Promise.resolve(json(403, { error: { code: 'insufficient_scope' } }));
     if (path === '/stats/filter') return Promise.resolve(json(200, { total_requests: 12345, blocked_requests: 678, allowed_requests: 11667, lifetime_blocked: 900, lifetime_total: 20000, lifetime_by_category: { ads: 500, trackers: 300, social: 0, annoyances: 0, security: 0, other: 100 } }));
     if (path === '/stats/timeseries') return Promise.resolve(json(200, { range: 'd7', bucket_secs: 86400, points: [0, 1, 2].map((i) => ({ ts: 1_700_000_000 + i * 86400, requests: 10, blocked: i, by_category: { ads: i } })) }));
+    if (path === '/ext/rules') {
+      if (method === 'GET') return Promise.resolve(json(200, { site: u.searchParams.get('site'), rules: extRules.map((rule) => ({ rule, exclusive: true })) }));
+      const b = JSON.parse(String(init?.body));
+      const had = extRules.includes(b.rule);
+      if (b.op === 'add' && !had) extRules.push(b.rule);
+      if (b.op === 'remove') extRules = extRules.filter((r) => r !== b.rule);
+      return Promise.resolve(json(200, { rule_count: extRules.length, changed: true }));
+    }
     const m = path.match(/^\/rules\/site-exceptions\/(.+)$/);
     if (m) {
       const site = decodeURIComponent(m[1]!);
@@ -75,7 +84,7 @@ describe('popup stats', () => {
     expect(text('page-blocked')).toBe('3');
     expect(text('page-percent')).toBe('38% of 8 requests');
     expect(root.querySelector('[data-host="ads.a.example"]')?.textContent).toContain('3');
-    expect(root.querySelector('[data-host="www.a.example"] td:last-child')?.textContent).toBe('5');
+    expect(root.querySelector('[data-host="www.a.example"] td:nth-child(3)')?.textContent).toBe('5');
     expect(text('domains-summary')).toBe('1 of 2 domains blocked');
     expect(root.textContent).toContain('This browser');
     expect(root.textContent).toContain('A-CA');
@@ -154,5 +163,53 @@ describe('following the active tab', () => {
     await tick(); await tick();
     expect(root.querySelector('.host')?.textContent).toBe('www.b.example');
     expect(text('page-blocked')).toBe('1');
+  });
+});
+
+describe('per-domain grid and site rules', () => {
+  beforeEach(() => { tabStats[1] = stat(4, 2, { 'ads.t.example': { blocked: 4, allowed: 0 }, 'cdn.u.example': { blocked: 0, allowed: 2 }, 'www.a.example': { blocked: 0, allowed: 0 } }); });
+  const state = (h: string) => root.querySelector(`[data-host="${h}"] [aria-pressed="true"]`)?.getAttribute('data-state');
+  const btn = (h: string, st: string) => root.querySelector<HTMLButtonElement>(`[data-host="${h}"] [data-state="${st}"]`)!;
+
+  it('shows the state of existing rules, only for third-party hosts', async () => {
+    extRules = ['||ads.t.example^$domain=a.example', '@@||cdn.u.example^$domain=a.example'];
+    await mount();
+    expect(state('ads.t.example')).toBe('block');
+    expect(state('cdn.u.example')).toBe('allow');
+    expect(root.querySelector('[data-host="www.a.example"] [data-testid="grid"]')).toBeNull();
+  });
+
+  it('writes block, allow and removes on default', async () => {
+    await mount();
+    expect(state('ads.t.example')).toBe('default');
+    await act(async () => { btn('ads.t.example', 'block').click(); }); await tick();
+    expect(extRules).toEqual(['||ads.t.example^$domain=a.example']);
+    expect(state('ads.t.example')).toBe('block');
+    await act(async () => { btn('ads.t.example', 'allow').click(); }); await tick(); await tick();
+    expect(extRules).toEqual(['@@||ads.t.example^$domain=a.example']);
+    await act(async () => { btn('ads.t.example', 'default').click(); }); await tick(); await tick();
+    expect(extRules).toEqual([]);
+    expect(state('ads.t.example')).toBe('default');
+  });
+
+  it('lists the site rules, removes one, and resets all', async () => {
+    extRules = ['a.example##.promo', '||ads.t.example^$domain=a.example'];
+    await mount();
+    expect(root.querySelector('[data-testid="site-rules"]')?.textContent).toContain('a.example##.promo');
+    await act(async () => { root.querySelector<HTMLButtonElement>('[aria-label="Remove a.example##.promo"]')!.click(); }); await tick();
+    expect(extRules).toEqual(['||ads.t.example^$domain=a.example']);
+    await act(async () => { root.querySelector<HTMLButtonElement>('[data-testid="reset-site"]')!.click(); });
+    expect(extRules.length).toBe(1);
+    await act(async () => { root.querySelector<HTMLButtonElement>('[data-testid="reset-yes"]')!.click(); }); await tick(); await tick();
+    expect(extRules).toEqual([]);
+    expect(root.querySelector('[data-testid="site-rules"]')).toBeNull();
+  });
+
+  it('arms the picker for the active tab', async () => {
+    const sent: any[] = [];
+    (fakeBrowser.runtime as any).sendMessage = async (m: any) => { sent.push(m); return m.type === 'picker-arm' ? { ok: true } : m.type === 'tab-stats' ? { stats: tabStats[1] } : { route: 'argus' }; };
+    await mount();
+    await act(async () => { root.querySelector<HTMLButtonElement>('[data-testid="pick"]')!.click(); }); await tick();
+    expect(sent).toContainEqual({ type: 'picker-arm', tabId: 1, mode: 'picker' });
   });
 });

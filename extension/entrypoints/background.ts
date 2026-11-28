@@ -1,4 +1,4 @@
-import { cachedLookup, clearCache, fetchExtLog, fetchRecentBlocked, getSettings, hostOf, type Lookup } from '../lib/api';
+import { cachedLookup, clearCache, fetchExtLog, postExtRule, fetchRecentBlocked, getSettings, hostOf, type Lookup } from '../lib/api';
 import { blockedTotal, classify, hostnameOf, StatsStore } from '../lib/stats';
 import { joinEntries, LogStore, ReqLog, type LogRow } from '../lib/logs';
 import { LogFeed } from '../lib/logfeed';
@@ -10,6 +10,8 @@ import { fromExtensionPage, respondAsync } from '../lib/messages';
 import { ProxyController, type ProxyState } from '../lib/proxy';
 import { RouteTracker } from '../lib/route';
 import { StoreRelay } from '../lib/storerelay';
+import { Arming, type PickerMode } from '../lib/arming';
+import { handlePickerMessage } from '../lib/pickerbg';
 
 /** The toolbar badge is a colored dot for the site state; nothing when there is nothing to say. */
 /** Compact count for the badge (it holds about four characters). */
@@ -32,6 +34,29 @@ export default defineBackground(() => {
 
   // Per-tab request counters, kept in storage.session so they survive the service worker sleeping.
   const stats = new StatsStore((browser.storage as any).session, (tabId) => refreshBadge(tabId));
+
+  // The tab the user armed the picker/zapper on (kept in storage.session; expires after 5 minutes).
+  const arming = new Arming((browser.storage as any).session);
+  browser.tabs.onRemoved?.addListener((id: number) => { void arming.disarm(id); });
+  browser.tabs.onUpdated?.addListener(((id: number, info: { status?: string }) => { if (info.status === 'loading') void arming.disarm(id); }) as never);
+  const picker = {
+    arming,
+    ownId: browser.runtime.id,
+    save: async (rule: string) => {
+      const r = await postExtRule(await getSettings(), 'add', rule);
+      return r.ok ? { ok: true } : { ok: false, scope: r.scope, error: r.message ?? (r.scope ? 'sign in again' : `error ${r.status}`) };
+    },
+  };
+  async function armPicker(tabId: number, mode: PickerMode) {
+    await arming.arm(tabId, mode);
+    try {
+      await browser.scripting.executeScript({ target: { tabId }, files: [`/${mode}.js`] as any });
+      return { ok: true };
+    } catch (e) {
+      await arming.disarm(tabId);
+      return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 200) };
+    }
+  }
 
   const badgeTimers = new Map<number, ReturnType<typeof setTimeout>>();
   /** Debounced per tab: a page can produce hundreds of counter changes a second. */
@@ -249,6 +274,15 @@ export default defineBackground(() => {
       if (m.type === 'store-token') return Promise.resolve(proxy.tokenFor(m.storeId));
       if (m.type === 'proxy-set' && m.state) return proxy.setState(m.state).then(() => (routes.reset(), { state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox }));
       return Promise.resolve({ state: proxy.getState(), active: proxy.active(), listener: proxy.listener(), unreachable: proxy.unreachable(), firefox });
+    }
+    if (msg?.type === 'picker-arm') {
+      const m = msg as { tabId?: number; mode?: string };
+      if (!fromExtensionPage(sender, browser.runtime.id, browser.runtime.getURL('/' as any))) return undefined;
+      if (typeof m.tabId !== 'number' || (m.mode !== 'picker' && m.mode !== 'zapper')) return undefined;
+      return armPicker(m.tabId, m.mode);
+    }
+    if (msg?.type === 'picker-save' || msg?.type === 'picker-close') {
+      return handlePickerMessage(picker, msg as never, sender as never);
     }
     if (msg?.type === 'bridge-reconnect') {
       if (sender?.id !== browser.runtime.id) return undefined;

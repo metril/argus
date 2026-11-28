@@ -8,6 +8,7 @@ import { Scripts } from './scripts';
 import { resolveState } from '../lib/state';
 import { AccountBar, ErrorBanner, Header, Icon, SignInForm, SiteCard, Skeleton, BrowserCard } from './components';
 import { PageStats, StatsView, ScopeNotice, SiteSwitch } from './pagestats';
+import { SiteRulesCard, useSiteRules } from './siterules';
 import { hostLabel, isSignedIn, settings } from './store';
 
 type Tab = { id?: number; url?: string; cookieStoreId?: string };
@@ -34,6 +35,7 @@ export function App() {
   const [n, setN] = useState(0);
   const [switching, setSwitching] = useState(false);
   const [needScope, setNeedScope] = useState(false);
+  const [armErr, setArmErr] = useState(false);
   const [view, setView] = useState<'actions' | 'stats'>('actions');
 
   // The popup follows the active tab: a navigation or a tab switch re-derives every card.
@@ -61,6 +63,12 @@ export function App() {
     return () => removeEventListener('keydown', esc);
   }, [more]);
 
+  const arm = async (id: number, mode: 'picker' | 'zapper') => {
+    setArmErr(false);
+    const r = (await browser.runtime.sendMessage({ type: 'picker-arm', tabId: id, mode }).catch(() => undefined)) as { ok?: boolean } | undefined;
+    if (r?.ok) window.close(); else setArmErr(true);
+  };
+
   const signed = isSignedIn(s);
   const tabId = tab?.id;
   const tabUrl = tab?.url;
@@ -86,6 +94,8 @@ export function App() {
     return () => { cancelled = true; if (timer) clearInterval(timer); };
   }, [tabId, tabUrl, signed, s?.token, n]);
 
+  const siteKey = registrableDomain(plainHost(tabUrl));
+  const sr = useSiteRules(signed ? s : null, siteKey, () => setNeedScope(true));
   if (s === null || tab === undefined) return <div class="pop"><Header /><div class="main"><Skeleton /></div></div>;
   const r = resolveState({ configured: signed, ...(tabUrl ? { tabUrl } : {}), ...(lookup ? { lookup } : {}) });
   if (r.view === 'signin' || switching) {
@@ -114,8 +124,16 @@ export function App() {
         </div>
         {view === 'stats' ? <StatsView key={s.token} settings={s} onScope={() => setNeedScope(true)} /> : <>
         <SiteCard host={host} site={r.site} route={inter} />
-        <PageStats stats={stats} />
+        <PageStats stats={stats} site={site} sr={sr} />
         {tabId !== undefined && <button type="button" class="btn" data-testid="open-logger" onClick={() => { void browser.tabs.create({ url: `${browser.runtime.getURL('/logger.html' as any)}#tab=${tabId}` }); window.close(); }}>Open logger</button>}
+        {tabId !== undefined && site && (
+          <div class="seg" role="group" aria-label="Pick elements">
+            <button type="button" data-testid="pick" onClick={() => void arm(tabId, 'picker')}>Block an element</button>
+            <button type="button" data-testid="zap" onClick={() => void arm(tabId, 'zapper')}>Zap elements</button>
+          </div>
+        )}
+        {armErr && <div class="note" data-testid="arm-error">Could not start on this page.</div>}
+        {site && <SiteRulesCard site={site} sr={sr} />}
         {site && <SiteSwitch key={`${tabId}|${site}`} settings={s} site={site} onScope={() => setNeedScope(true)} reload={() => { if (tabId !== undefined) void browser.tabs.reload(tabId); window.close(); }} />}
         <Scripts state={menu} reload={() => setN(n + 1)} />
         <section class="sec">

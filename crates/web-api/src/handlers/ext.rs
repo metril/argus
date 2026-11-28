@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use api_types::{
     AuditEntry, ExtAuditEvent, ExtError, ExtIdent, ExtLogEntry, ExtLogResponse, ExtMenuResponse,
-    ExtOut, ExtRuleRequest, ExtRuleResult, ExtSiteRules, ExtTriggerRequest, ExtTriggerResponse,
-    Scope, UserRole,
+    ExtOut, ExtRuleRequest, ExtRuleResult, ExtSiteRule, ExtSiteRules, ExtTriggerRequest,
+    ExtTriggerResponse, Scope, UserRole,
 };
 use axum::{
     extract::{
@@ -669,7 +669,7 @@ fn check_options(opts: &str) -> Result<ExtOptions, String> {
 /// must either anchor a registrable host (`||example.com^`, `|https://example.com/x`) or, when it
 /// is broader, be limited with `$domain=` to specific registrable domains. This holds for block
 /// and `@@` exception rules alike, so one line cannot switch blocking off, or on, beyond a site.
-/// Cosmetic, scriptlet, redirect, rewrite, header, `$badfilter` and every other rule form fail
+/// Plain `domain##selector` hiding rules are checked by `check_ext_cosmetic`. Exception, scriptlet, redirect, rewrite, header, `$badfilter` and every other rule form fail
 /// the allowlist.
 pub fn check_ext_rule(rule: &str) -> Result<String, String> {
     if rule.len() > RULE_MAX {
@@ -684,6 +684,9 @@ pub fn check_ext_rule(rule: &str) -> Result<String, String> {
     }
     if r.starts_with('!') || r.starts_with('[') {
         return Err("Comments, includes and preprocessor lines are not accepted".into());
+    }
+    if let Some(c) = filter_engine::formats::split_cosmetic(r) {
+        return check_ext_cosmetic(r, &c);
     }
     let body = r.strip_prefix("@@").unwrap_or(r);
     let (pat, opts) = match body.split_once('$') {
@@ -716,6 +719,291 @@ pub fn check_ext_rule(rule: &str) -> Result<String, String> {
             .error
             .clone()
             .unwrap_or_else(|| "The rule is not accepted".into())),
+        _ => Err("Not a rule".into()),
+    }
+}
+
+/// Cosmetic selector length limit (the whole rule is held to 1 KB).
+const COSMETIC_MAX: usize = 1024;
+
+/// Pseudo-classes a plain hide selector may use; everything else (`:has-text`, `:xpath`, `:style`,
+/// `:remove`, `:upward`, `:matches-css`, `:-abp-*`, `:has`, ...) is procedural or extended.
+const PLAIN_PSEUDOS: &[&str] = &[
+    "not",
+    "is",
+    "where",
+    "nth-child",
+    "nth-of-type",
+    "nth-last-child",
+    "nth-last-of-type",
+    "first-child",
+    "last-child",
+    "first-of-type",
+    "last-of-type",
+    "only-child",
+    "only-of-type",
+];
+
+/// Split `s` at top-level commas (outside parentheses, brackets and quotes).
+fn split_top_commas(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut quote, mut start) = (Vec::new(), 0i32, None::<char>, 0usize);
+    let mut esc = false;
+    for (i, ch) in s.char_indices() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match (ch, quote) {
+            ('\\', _) => esc = true,
+            (c, Some(q)) if c == q => quote = None,
+            (_, Some(_)) => {}
+            ('"' | '\'', None) => quote = Some(ch),
+            ('(' | '[', None) => depth += 1,
+            (')' | ']', None) => depth -= 1,
+            (',', None) if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// `s` with every parenthesised group and quoted string removed (so `:not(.a)` carries nothing).
+fn strip_groups(s: &str) -> String {
+    let (mut out, mut depth, mut quote, mut esc) = (String::new(), 0i32, None::<char>, false);
+    for ch in s.chars() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        match (ch, quote) {
+            ('\\', _) => esc = true,
+            (c, Some(q)) if c == q => quote = None,
+            (_, Some(_)) => {}
+            ('"' | '\'', None) => quote = Some(ch),
+            ('(', None) => depth += 1,
+            (')', None) => depth -= 1,
+            (c, None) if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Plain-syntax check of one hide selector: no declarations, comments or extended pseudos.
+fn check_plain_selector(sel: &str) -> Result<(), String> {
+    if sel.is_empty() {
+        return Err("The selector is empty".into());
+    }
+    if sel.contains(['{', '}', ';', '`', '<']) {
+        return Err("The selector contains characters a CSS selector cannot".into());
+    }
+    if sel.contains("/*") || sel.contains("url(") || sel.contains("expression(") {
+        return Err("The selector is not a plain CSS selector".into());
+    }
+    if sel.starts_with('^') || sel.contains("+js(") {
+        return Err("Only plain element hiding is accepted".into());
+    }
+    if sel.ends_with('\\') {
+        return Err("The selector ends with a backslash".into());
+    }
+    let low = sel.to_ascii_lowercase();
+    if ["__ab", "__adblock", "__argus", "argus"]
+        .iter()
+        .any(|n| low.contains(n))
+    {
+        return Err("The selector could target Argus's own interface".into());
+    }
+    // Every pseudo must be on the plain list.
+    let b = sel.as_bytes();
+    let (mut quote, mut esc, mut i) = (None::<u8>, false, 0);
+    while i < b.len() {
+        let c = b[i];
+        if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = Some(c);
+        } else if c == b':' {
+            let rest = &sel[i + 1..];
+            if rest.starts_with(':') {
+                return Err("Pseudo-elements are not accepted".into());
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !PLAIN_PSEUDOS.contains(&name.to_ascii_lowercase().as_str()) {
+                return Err(format!(
+                    "':{name}' is procedural or extended syntax, not accepted here"
+                ));
+            }
+        }
+        i += 1;
+    }
+    if quote.is_some() {
+        return Err("Unbalanced quotes in the selector".into());
+    }
+    let mut d = 0i32;
+    for ch in sel.chars() {
+        match ch {
+            '(' | '[' => d += 1,
+            ')' | ']' => d -= 1,
+            _ => {}
+        }
+        if d < 0 {
+            return Err("Unbalanced brackets in the selector".into());
+        }
+    }
+    if d != 0 {
+        return Err("Unbalanced brackets in the selector".into());
+    }
+    Ok(())
+}
+
+/// Attribute groups `[...]` of `s` (quote-aware), without the brackets.
+fn attr_groups(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quote, mut esc) = (Vec::new(), None::<String>, None::<char>, false);
+    for ch in s.chars() {
+        match (&mut cur, quote) {
+            (None, _) => {
+                if ch == '[' {
+                    cur = Some(String::new());
+                }
+            }
+            (Some(c), q) => {
+                if esc {
+                    esc = false;
+                } else if ch == '\\' {
+                    esc = true;
+                } else if let Some(q) = q {
+                    if ch == q {
+                        quote = None;
+                    }
+                } else if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                } else if ch == ']' {
+                    out.push(std::mem::take(c));
+                    cur = None;
+                    continue;
+                }
+                c.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// An attribute selector too loose for an all-sites rule: `*=`/`~=`, a value under 3 characters,
+/// or one of the attributes every page has (`lang`, `dir`, `style`, `class`, `id`).
+fn loose_attr(inner: &str) -> bool {
+    let Some(eq) = inner.find('=') else {
+        return false;
+    };
+    let head = &inner[..eq];
+    let (name, op) = match head.chars().last() {
+        Some(c @ ('*' | '~' | '^' | '$' | '|')) => (&head[..head.len() - 1], Some(c)),
+        _ => (head, None),
+    };
+    if matches!(op, Some('*' | '~')) {
+        return true;
+    }
+    if matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "lang" | "dir" | "style" | "class" | "id"
+    ) {
+        return true;
+    }
+    let v = inner[eq + 1..].trim();
+    let v = v
+        .strip_suffix(" i")
+        .or_else(|| v.strip_suffix(" s"))
+        .unwrap_or(v)
+        .trim()
+        .trim_matches(['"', '\'']);
+    v.chars().count() < 3
+}
+
+/// Is the last compound selector of `part` specific: an id, a class or a valued attribute (not
+/// a bare tag, `*`, or something only named inside `:not()`), and not one that can hide a whole
+/// page (html, body, :root, loose or universal attributes)?
+fn specific_compound(part: &str) -> bool {
+    if attr_groups(part).iter().any(|a| loose_attr(a)) {
+        return false;
+    }
+    let flat = strip_groups(part);
+    // Attribute groups are bracketed, not parenthesised: take out their bodies but note a value.
+    let last = flat
+        .rsplit([' ', '>', '+', '~', '\t'])
+        .find(|c| !c.is_empty())
+        .unwrap_or("");
+    let tag = last
+        .split(['#', '.', '[', ':'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if tag == "html" || tag == "body" || last.to_ascii_lowercase().contains(":root") {
+        return false;
+    }
+    let has_id_class = last.contains(['#', '.']);
+    // An attribute selector counts only with a comparison (`[id]`/`[class]` alone match everything).
+    let has_valued_attr = last.split('[').skip(1).any(|a| {
+        let inner = a.split(']').next().unwrap_or("");
+        inner.contains('=') && !inner.starts_with('=')
+    });
+    has_id_class || has_valued_attr
+}
+
+fn check_ext_cosmetic(r: &str, c: &filter_engine::formats::Cosmetic<'_>) -> Result<String, String> {
+    if r.len() > COSMETIC_MAX {
+        return Err("A cosmetic rule is limited to 1 KB".into());
+    }
+    if c.sep != "##" {
+        return Err(
+            "Only plain element hiding (domain##selector) is accepted; exceptions, procedural, \
+             style, scriptlet and HTML-filter rules are not"
+                .into(),
+        );
+    }
+    let sel = c.body.trim();
+    check_plain_selector(sel)?;
+    let domains = c.domains;
+    if domains.is_empty() {
+        // Everywhere: every comma-separated selector must pin something specific.
+        for part in split_top_commas(sel) {
+            if !specific_compound(part.trim()) {
+                return Err(
+                    "A selector for all sites needs an id, a class or an attribute value on \
+                     the element (not a bare tag or *)"
+                        .into(),
+                );
+            }
+        }
+    } else {
+        for d in domains.split(',') {
+            if !registrable_host(d) {
+                return Err(format!(
+                    "'{d}' must be a registrable domain such as example.com"
+                ));
+            }
+        }
+    }
+    let rule = format!("{}##{sel}", domains.to_ascii_lowercase());
+    let v = super::rules::validate_rules(&rule, filter_engine::ListFormat::Abp, false);
+    match v.lines.as_slice() {
+        [l] if l.outcome == "accepted" => Ok(rule),
+        [l] => Err(l
+            .error
+            .clone()
+            .unwrap_or_else(|| "The selector is not accepted".into())),
         _ => Err("Not a rule".into()),
     }
 }
@@ -779,8 +1067,8 @@ fn audit_rule(state: &AppState, p: &Principal, op: &str, rule: &str) {
 }
 
 /// Add or remove one line of the custom rules and rebuild the engine. The line is validated with
-/// the rule parser: one network rule only (no comments, includes, preprocessor lines, cosmetic,
-/// scriptlet or response-rewriting rules), at most 2 KB.
+/// the rule parser: one network rule or plain element-hiding rule (no comments, includes, preprocessor lines,
+/// procedural, scriptlet or response-rewriting rules), at most 2 KB (1 KB for hiding rules).
 #[utoipa::path(
     post, path = "/ext/rules", tag = "ext",
     security(("bearer_auth" = ["rules:ext"])),
@@ -847,18 +1135,50 @@ pub async fn post_rule(
     }))
 }
 
-/// Does `line` name `site` as a whole host (or the parent of a subdomain): `a.com` is in
-/// `||a.com^` and `domain=x.com|sub.a.com`, not in `ba.com` or `a.company`.
-fn mentions_host(line: &str, site: &str) -> bool {
-    let name = |b: u8| b.is_ascii_alphanumeric() || b == b'-';
-    let lb = line.as_bytes();
-    line.match_indices(site).any(|(i, _)| {
-        let before = i == 0 || !name(lb[i - 1]);
-        let after = lb
-            .get(i + site.len())
-            .is_none_or(|b| !name(*b) && *b != b'.');
-        before && after
-    })
+/// Is `d` the site or a subdomain of it (`a.a.com` for `a.com`)?
+fn is_site(d: &str, site: &str) -> bool {
+    d == site || d.strip_suffix(site).is_some_and(|p| p.ends_with('.'))
+}
+
+/// How a custom rule is scoped to `site`: `None` when it is not, else `Some(exclusive)`, true when
+/// it applies to this site only. Only rules scoped to the site count: a cosmetic rule whose domain
+/// list has it, a network rule whose `$domain=` list has it or whose host anchor is it (and has no
+/// `$domain=`). All-sites rules are not scoped to any site.
+fn site_scope(line: &str, site: &str) -> Option<bool> {
+    let line = line.to_ascii_lowercase();
+    if let Some(c) = filter_engine::formats::split_cosmetic(&line) {
+        let ds: Vec<&str> = c
+            .domains
+            .split(',')
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && !d.starts_with('~'))
+            .collect();
+        return ds
+            .iter()
+            .any(|d| is_site(d, site))
+            .then(|| ds.iter().all(|d| is_site(d, site)));
+    }
+    let body = line.strip_prefix("@@").unwrap_or(&line);
+    let (pat, opts) = body.split_once('$').unwrap_or((body, ""));
+    let doms: Vec<&str> = opts
+        .split(',')
+        .find_map(|o| o.strip_prefix("domain="))
+        .map(|l| l.split('|').filter(|d| !d.starts_with('~')).collect())
+        .unwrap_or_default();
+    if !doms.is_empty() {
+        return doms
+            .iter()
+            .any(|d| is_site(d, site))
+            .then(|| doms.iter().all(|d| is_site(d, site)));
+    }
+    let rest = pat.strip_prefix("||").or_else(|| {
+        pat.strip_prefix('|')
+            .and_then(|p| p.split_once("://").map(|x| x.1))
+    })?;
+    let end = rest
+        .find(['^', '/', ':', '|', '?', '*'])
+        .unwrap_or(rest.len());
+    is_site(&rest[..end], site).then_some(true)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -868,8 +1188,8 @@ pub struct SiteQuery {
     pub site: String,
 }
 
-/// The custom rules that mention a site (as a host or one of its subdomains, in the rule or in
-/// `$domain=`), for resetting that site's rules.
+/// The custom rules scoped to a site (cosmetic domain list, `$domain=` or host anchor), each
+/// marked `exclusive` when scoped to that site only, for resetting that site's rules.
 #[utoipa::path(
     get, path = "/ext/rules", tag = "ext",
     security(("bearer_auth" = ["rules:ext"])),
@@ -899,8 +1219,12 @@ pub async fn get_rules(
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('!'))
-            .filter(|l| mentions_host(&l.to_ascii_lowercase(), &site))
-            .map(str::to_string)
+            .filter_map(|l| {
+                site_scope(l, &site).map(|exclusive| ExtSiteRule {
+                    rule: l.to_string(),
+                    exclusive,
+                })
+            })
             .collect::<Vec<_>>())
     })
     .await?;
@@ -948,7 +1272,6 @@ mod tests {
             "*$domain=~example.com",
             "||example.com^$domain=com",
             "@@*$important,domain=example.com|co.uk",
-            "example.com##.ad",
             "example.com#@#.ad",
             "example.com#$#body{x:y}",
             "example.com#?#div:has(a)",
@@ -999,5 +1322,66 @@ mod tests {
             super::check_ext_rule("|https://Example.com/A|").unwrap(),
             "|https://example.com/A|"
         );
+    }
+
+    #[test]
+    fn ext_cosmetic_rules() {
+        use super::check_ext_rule as ok;
+        for good in [
+            "example.com##.ad-banner",
+            "example.com,example.org###sidebar",
+            "example.com##div[data-ad=\"x\"]",
+            "example.com##div.a > .b:nth-child(2)",
+            "example.com##div",
+            "example.com##.a:not(.b)",
+            "##.ad-banner",
+            "###promo",
+            "##a[href^=\"https://ads.\"]",
+            "##.a, .b",
+        ] {
+            assert!(ok(good).is_ok(), "{good}: {:?}", ok(good));
+        }
+        for bad in [
+            "##*",
+            "##body",
+            "##html",
+            "##div",
+            "##div > *",
+            "##.a *",
+            "##[class]",
+            "##div:not(.x)",
+            "##.a, div",
+            "##a:has-text(x)",
+            "example.com##.a:has-text(x)",
+            "example.com##:xpath(//a)",
+            "example.com##.a:style(color:red)",
+            "example.com##.a:remove()",
+            "example.com##.a:upward(2)",
+            "example.com##.a:matches-css(color: red)",
+            "example.com##.a:-abp-has(b)",
+            "example.com##.a:has(b)",
+            "example.com##.a::before",
+            "example.com##^script",
+            "example.com#@#.ad",
+            "example.com#?#.a",
+            "example.com#$#.a{x:y}",
+            "example.com#%#//scriptlet('x')",
+            "example.com##+js(aopr, x)",
+            "example.com##.a{color:red}",
+            "example.com##.a; b",
+            "example.com##",
+            "example.com##.a[",
+            "com##.a",
+            "localhost##.a",
+            "127.0.0.1##.a",
+            "*##.a",
+            "~example.com##.a",
+            "example.com$$script",
+        ] {
+            assert!(ok(bad).is_err(), "{bad} was accepted");
+        }
+        let long = format!("example.com##.{}", "a".repeat(1100));
+        assert!(ok(&long).is_err());
+        assert_eq!(ok("Example.COM##.Ad").unwrap(), "example.com##.Ad");
     }
 }

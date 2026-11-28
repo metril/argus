@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'preact/hooks';
 import { CATEGORIES, CATEGORY_LABELS, fetchFilterStats, fetchTimeseries, getSiteState, setSiteOff, type FilterStats, type Series, type SeriesRange, type Settings } from '../lib/api';
 import { chartData, type CategoryPick } from '../lib/chart';
-import { blockedTotal, percent, totalRequests, type TabStats } from '../lib/stats';
+import { blockedTotal, percent, registrableDomain, totalRequests, type TabStats } from '../lib/stats';
+import { isThirdParty } from '../lib/siterules';
+import { GridToggle, type SiteRules } from './siterules';
 import { Banner, Switch } from './components';
 
 const nf = (n: number) => n.toLocaleString('en-US');
 
 /** "Blocked on this page": the count, its share of the page's requests, and each connected domain. */
-export function PageStats({ stats }: { stats: TabStats | undefined }) {
+export function PageStats({ stats, site, sr }: { stats: TabStats | undefined; site?: string; sr?: SiteRules }) {
   if (!stats) return null;
   const hosts = Object.entries(stats.hosts).sort((a, b) => b[1].blocked - a[1].blocked || b[1].allowed - a[1].allowed || a[0].localeCompare(b[0]));
   return (
@@ -27,6 +29,7 @@ export function PageStats({ stats }: { stats: TabStats | undefined }) {
                   <td class="hn">{h}</td>
                   <td class={c.blocked ? 'bl' : 'muted'}>{c.blocked}</td>
                   <td class="muted">{c.allowed}</td>
+                  {sr && site && <td>{isThirdParty(h, site, registrableDomain) && <GridToggle host={h} site={site} sr={sr} />}</td>}
                 </tr>
               ))}
             </tbody>

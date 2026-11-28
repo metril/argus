@@ -155,10 +155,19 @@ pub struct ExtRuleResult {
     pub changed: bool,
 }
 
-/// The custom rules that mention a site.
+/// The custom rules scoped to a site.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ExtSiteRules {
     pub site: String,
-    pub rules: Vec<String>,
+    pub rules: Vec<ExtSiteRule>,
+}
+
+/// One custom rule scoped to a site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtSiteRule {
+    pub rule: String,
+    /// True when the rule is scoped to this site only (not shared with other domains).
+    pub exclusive: bool,
 }
