@@ -11,7 +11,7 @@
 # when the hash matches), (2) checks its SHA-256 against vendor/pristine/crates.sha256 AND against
 # the crates.io index checksum, (3) unpacks it and compares with vendor/<crate> using `diff -r`:
 # no file may exist on only one side except the allowed ones below, no symlink, no changed exec bit,
-# and the content differences of the common files must equal the committed vendor/pristine/<crate>.diff
+# and the content differences of the common files (plus the added files, as new-file diffs) must equal the committed vendor/pristine/<crate>.diff
 # (the reviewed patch). Anything else fails and the offending paths are printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -90,9 +90,14 @@ for crate in "${crates[@]}"; do
   # exec bit differences and content differences of the common files
   : > "$tmp/d"
   while IFS= read -r p; do
-    if [ -x "$P/$p" ] && [ ! -x "$V/$p" ] || [ ! -x "$P/$p" ] && [ -x "$V/$p" ]; then bad "exec bit differs: $p"; fi
+    xa=0; xb=0; [ -x "$P/$p" ] && xa=1; [ -x "$V/$p" ] && xb=1
+    [ "$xa" = "$xb" ] || bad "exec bit differs: $p (pristine $xa, vendored $xb)"
     cmp -s "$P/$p" "$V/$p" || diff -u --label "a/$p" --label "b/$p" "$P/$p" "$V/$p" >> "$tmp/d" || true
   done < <(comm -12 "$tmp/pl" "$tmp/vl")
+  # Files added by Argus are part of the reviewed diff too, as new-file diffs.
+  while IFS= read -r p; do
+    [ -n "$p" ] && { diff -u --label /dev/null --label "b/$p" /dev/null "$V/$p" >> "$tmp/d" || true; }
+  done <<<"$allowed_extra"
   exp="vendor/pristine/$crate.diff"
   if [ $update = 1 ]; then cp "$tmp/d" "$exp"; echo "updated $exp"; continue; fi
   if ! diff -u "$exp" "$tmp/d" > "$tmp/dd"; then

@@ -29,6 +29,8 @@ it with the vendored tree with `diff -r`:
   `vendor/pristine/<crate>.diff`, the reviewed patch. After an intended change run
   `scripts/verify-vendor.sh --update` and review the `.diff` in the commit.
 
+`vendor/pristine/` is the reviewed artifact: read its diffs (the patch contents are in them) on every change to `vendor/`.
+
 `--offline` skips the index cross-check. When updating a vendored crate, update the version and
 hash in `crates.sha256` (the hash is the one in `Cargo.lock` of a registry build, or the index
 `cksum`) and regenerate the `.diff`.
