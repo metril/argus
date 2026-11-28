@@ -8,7 +8,7 @@
 //! written lazily through the coalescing writer, as a read-modify-write inside the transaction
 //! that only touches an existing row, so it can neither lose nor undo a revocation.
 
-use api_types::{ApiTokenInfo, Scope};
+use api_types::{ApiTokenInfo, Scope, TokenPurpose};
 use chrono::{DateTime, Utc};
 use common::db::redb::{Durability, ReadableTable};
 use common::db::{tables, Db, DbError};
@@ -16,6 +16,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -41,28 +42,129 @@ pub struct StoredToken {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub purpose: TokenPurpose,
+    /// Non-secret display form: prefix, id and the last four characters.
+    #[serde(default)]
+    pub secret_hint: String,
+    /// Digest of the secret before the last regeneration; accepted until `prev_valid_until`.
+    #[serde(default)]
+    pub prev_digest: Option<String>,
+    #[serde(default)]
+    pub prev_valid_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_used_addr: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Scope names this release does not know (written by a newer one). Kept verbatim, ignored
+    /// for authorisation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_scopes: Vec<String>,
+}
+
+/// Parse a stored record, keeping scope names this release does not know in `unknown_scopes`
+/// instead of failing the whole record.
+fn parse_stored(bytes: &[u8]) -> Result<StoredToken, serde_json::Error> {
+    let mut v: serde_json::Value = serde_json::from_slice(bytes)?;
+    let mut unknown: Vec<String> = Vec::new();
+    if let Some(arr) = v.get_mut("scopes").and_then(|s| s.as_array_mut()) {
+        arr.retain(|s| match s.as_str() {
+            Some(n) if n.parse::<Scope>().is_err() => {
+                unknown.push(n.to_string());
+                false
+            }
+            _ => true,
+        });
+    }
+    let mut t: StoredToken = serde_json::from_value(v)?;
+    for u in unknown {
+        if !t.unknown_scopes.contains(&u) {
+            t.unknown_scopes.push(u);
+        }
+    }
+    // A scope kept as unknown by an earlier release may be known now: grant it again.
+    let names = std::mem::take(&mut t.unknown_scopes);
+    for n in names {
+        match n.parse::<Scope>() {
+            Ok(s) => {
+                if !t.scopes.contains(&s) {
+                    t.scopes.push(s);
+                }
+            }
+            Err(_) => t.unknown_scopes.push(n),
+        }
+    }
+    Ok(t)
+}
+
+fn expired_conflict(msg: &'static str) -> ApiError {
+    ApiError::coded(axum::http::StatusCode::CONFLICT, "token_expired", msg)
+}
+
+/// Changes to apply with [`TokenStore::update`]; `None` leaves a field as it is.
+#[derive(Debug, Default)]
+pub struct TokenUpdate {
+    pub name: Option<String>,
+    pub scopes: Option<Vec<Scope>>,
+    /// `Some(None)` removes the restriction.
+    pub profiles: Option<Option<Vec<String>>>,
+    pub purpose: Option<TokenPurpose>,
+    /// `Some(None)` removes the expiry.
+    pub expires_at: Option<Option<DateTime<Utc>>>,
 }
 
 /// In-memory view of a token.
 pub struct CachedToken {
     pub stored: StoredToken,
     digest: blake3::Hash,
+    prev_digest: Option<blake3::Hash>,
     /// Unix seconds of the last use seen in memory (0 = never).
     last_used: AtomicI64,
     /// Unix seconds of the last time `last_used_at` was written to disk.
     last_persisted: AtomicI64,
+    /// Address of the last use seen in memory.
+    last_addr: Mutex<Option<String>>,
 }
 
 impl CachedToken {
     fn new(stored: StoredToken) -> Self {
         let digest = blake3::Hash::from_hex(&stored.digest).unwrap_or(blake3::Hash::from([0; 32]));
+        let prev_digest = stored
+            .prev_digest
+            .as_deref()
+            .and_then(|h| blake3::Hash::from_hex(h).ok());
         let last = stored.last_used_at.map(|t| t.timestamp()).unwrap_or(0);
+        let addr = stored.last_used_addr.clone();
         Self {
             stored,
             digest,
+            prev_digest,
             last_used: AtomicI64::new(last),
             last_persisted: AtomicI64::new(last),
+            last_addr: Mutex::new(addr),
         }
+    }
+
+    /// The stored record with the in-memory last-use facts folded in.
+    fn snapshot(&self) -> StoredToken {
+        let mut s = self.stored.clone();
+        s.last_used_at = DateTime::from_timestamp(self.last_used.load(Ordering::Relaxed), 0)
+            .filter(|t| t.timestamp() > 0);
+        s.last_used_addr = self.last_addr.lock().clone();
+        s
+    }
+
+    /// A new cached entry for `stored` that keeps this one's last-use facts.
+    fn successor(&self, mut stored: StoredToken) -> CachedToken {
+        let snap = self.snapshot();
+        stored.last_used_at = snap.last_used_at;
+        stored.last_used_addr = snap.last_used_addr;
+        let next = CachedToken::new(stored);
+        next.last_persisted.store(
+            self.last_persisted.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        next
     }
 
     pub fn info(&self) -> ApiTokenInfo {
@@ -81,6 +183,19 @@ impl CachedToken {
                 .filter(|_| used > 0)
                 .map(|t| t.to_rfc3339()),
             revoked: s.revoked_at.is_some(),
+            unknown_scopes: s.unknown_scopes.clone(),
+            purpose: s.purpose,
+            secret_hint: if s.secret_hint.is_empty() {
+                format!("{TOKEN_PREFIX}_{}_…", s.id)
+            } else {
+                s.secret_hint.clone()
+            },
+            last_used_addr: self.last_addr.lock().clone(),
+            updated_at: s.updated_at.map(|t| t.to_rfc3339()),
+            prev_valid_until: s
+                .prev_valid_until
+                .filter(|t| s.prev_digest.is_some() && *t > Utc::now())
+                .map(|t| t.to_rfc3339()),
         }
     }
 }
@@ -111,6 +226,19 @@ fn digest_of(secret: &str) -> blake3::Hash {
     blake3::hash(secret.as_bytes())
 }
 
+/// Display form of a secret: prefix, id and the last four characters.
+fn hint_of(id: &str, full: &str) -> String {
+    let tail: String = full
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{TOKEN_PREFIX}_{id}_…{tail}")
+}
+
 fn json(t: &StoredToken) -> ApiResult<Vec<u8>> {
     serde_json::to_vec(t).map_err(|e| ApiError::Internal(e.to_string()))
 }
@@ -122,9 +250,14 @@ impl TokenStore {
         db.read::<_, ApiError>(|r| {
             let t = r.open_table(tables::API_TOKENS).map_err(DbError::from)?;
             for item in t.iter().map_err(DbError::from)? {
-                let (_, v) = item.map_err(DbError::from)?;
-                if let Ok(t) = serde_json::from_slice::<StoredToken>(v.value()) {
-                    cache.insert(t.id.clone(), Arc::new(CachedToken::new(t)));
+                let (key, v) = item.map_err(DbError::from)?;
+                match parse_stored(v.value()) {
+                    Ok(t) => {
+                        cache.insert(t.id.clone(), Arc::new(CachedToken::new(t)));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Skipping unreadable API token record {}: {e}", key.value())
+                    }
                 }
             }
             Ok(())
@@ -146,6 +279,7 @@ impl TokenStore {
         created_by: Uuid,
         created_by_name: String,
         expires_at: Option<DateTime<Utc>>,
+        purpose: TokenPurpose,
     ) -> ApiResult<(ApiTokenInfo, String)> {
         let id = random_hex(8);
         let secret = random_hex(32); // 256 bits
@@ -162,6 +296,13 @@ impl TokenStore {
             expires_at,
             last_used_at: None,
             revoked_at: None,
+            purpose,
+            secret_hint: hint_of(&id, &full),
+            prev_digest: None,
+            prev_valid_until: None,
+            last_used_addr: None,
+            updated_at: None,
+            unknown_scopes: Vec::new(),
         };
         let bytes = json(&stored)?;
         let _g = self.write_lock.lock();
@@ -188,6 +329,15 @@ impl TokenStore {
 
     /// Check a presented `abk_<id>_<secret>` string.
     pub fn verify(&self, presented: &str) -> Result<Arc<CachedToken>, TokenReject> {
+        self.verify_at(presented, Utc::now())
+    }
+
+    /// [`verify`](Self::verify) at an explicit time (the clock is injectable for tests).
+    pub fn verify_at(
+        &self,
+        presented: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Arc<CachedToken>, TokenReject> {
         let mut parts = presented.splitn(3, '_');
         let (prefix, id, secret) = (parts.next(), parts.next(), parts.next());
         let (Some(TOKEN_PREFIX), Some(id), Some(secret)) = (prefix, id, secret) else {
@@ -202,13 +352,18 @@ impl TokenStore {
             .map(|e| e.clone())
             .ok_or(TokenReject::Unknown)?;
         // `blake3::Hash` equality is constant-time.
-        if digest_of(presented) != entry.digest {
+        let given = digest_of(presented);
+        let current = given == entry.digest;
+        // The previous secret keeps working until its grace time ends.
+        let previous = entry.prev_digest.is_some_and(|p| given == p)
+            && entry.stored.prev_valid_until.is_some_and(|t| t > now);
+        if !(current | previous) {
             return Err(TokenReject::Unknown);
         }
         if entry.stored.revoked_at.is_some() {
             return Err(TokenReject::Revoked);
         }
-        if entry.stored.expires_at.is_some_and(|t| t <= Utc::now()) {
+        if entry.stored.expires_at.is_some_and(|t| t <= now) {
             return Err(TokenReject::Expired);
         }
         Ok(entry)
@@ -216,9 +371,13 @@ impl TokenStore {
 
     /// Note a use. The disk write happens at most once a minute per token, coalesced with
     /// other deferred writes, and never on the caller's thread.
-    pub fn mark_used(&self, token: &Arc<CachedToken>) {
+    pub fn mark_used(&self, token: &Arc<CachedToken>, addr: Option<IpAddr>) {
         let now = Utc::now().timestamp();
         token.last_used.store(now, Ordering::Relaxed);
+        let addr = addr.map(|a| a.to_string());
+        if addr.is_some() {
+            *token.last_addr.lock() = addr.clone();
+        }
         let last = token.last_persisted.load(Ordering::Relaxed);
         if now - last < LAST_USED_INTERVAL_SECS
             || token
@@ -232,8 +391,11 @@ impl TokenStore {
         self.db.defer(move |t| {
             let mut tb = t.open_table(tables::API_TOKENS)?;
             let cur = tb.get(id.as_str())?.map(|g| g.value().to_vec());
-            if let Some(mut s) = cur.and_then(|b| serde_json::from_slice::<StoredToken>(&b).ok()) {
+            if let Some(mut s) = cur.and_then(|b| parse_stored(&b).ok()) {
                 s.last_used_at = DateTime::from_timestamp(now, 0);
+                if addr.is_some() {
+                    s.last_used_addr = addr;
+                }
                 if let Ok(b) = serde_json::to_vec(&s) {
                     tb.insert(id.as_str(), b.as_slice())?;
                 }
@@ -303,10 +465,10 @@ impl TokenStore {
             .filter_map(|id| self.get(id))
             .filter(|c| c.stored.revoked_at.is_none())
             .map(|c| {
-                let mut s = c.stored.clone();
+                let mut s = c.snapshot();
                 s.revoked_at = Some(now);
-                s.last_used_at = DateTime::from_timestamp(c.last_used.load(Ordering::Relaxed), 0)
-                    .filter(|t| t.timestamp() > 0);
+                // The previous secret stays recorded, so it is answered "revoked" like the
+                // current one (verify checks revocation after the digest match).
                 s
             })
             .collect();
@@ -336,6 +498,98 @@ impl TokenStore {
         }
         self.revoke_many(&[id.to_string()])?;
         Ok(true)
+    }
+
+    /// Commit `stored` as the new record of token `id` and swap the cache entry (caller holds
+    /// `write_lock`).
+    fn commit(&self, old: &CachedToken, stored: StoredToken) -> ApiResult<Arc<CachedToken>> {
+        let bytes = json(&stored)?;
+        self.db.write::<_, ApiError>(Durability::Immediate, |t| {
+            t.open_table(tables::API_TOKENS)
+                .map_err(DbError::from)?
+                .insert(stored.id.as_str(), bytes.as_slice())
+                .map_err(DbError::from)?;
+            Ok(())
+        })?;
+        let next = Arc::new(old.successor(stored));
+        self.cache.insert(next.stored.id.clone(), next.clone());
+        Ok(next)
+    }
+
+    /// A live (not revoked) token, or the error to answer.
+    fn live_entry(&self, id: &str) -> ApiResult<Arc<CachedToken>> {
+        match self.get(id) {
+            Some(c) if c.stored.revoked_at.is_none() => Ok(c),
+            Some(_) => Err(ApiError::bad_request("Token is revoked")),
+            None => Err(ApiError::NotFound("Token not found".into())),
+        }
+    }
+
+    /// Apply `changes` to a token. The secret is untouched.
+    pub fn update(&self, id: &str, changes: TokenUpdate) -> ApiResult<ApiTokenInfo> {
+        let _g = self.write_lock.lock();
+        let old = self.live_entry(id)?;
+        if old.stored.expires_at.is_some_and(|t| t <= Utc::now()) {
+            return Err(expired_conflict(
+                "The token has expired. Regenerate it with a new expiry instead.",
+            ));
+        }
+        let mut s = old.snapshot();
+        if let Some(n) = changes.name {
+            s.name = n;
+        }
+        if let Some(sc) = changes.scopes {
+            s.scopes = sc;
+        }
+        if let Some(p) = changes.profiles {
+            s.profiles = p;
+        }
+        if let Some(p) = changes.purpose {
+            s.purpose = p;
+        }
+        if let Some(e) = changes.expires_at {
+            s.expires_at = e;
+        }
+        s.updated_at = Some(Utc::now());
+        Ok(self.commit(&old, s)?.info())
+    }
+
+    /// Issue a new secret for token `id` (same id and settings). The old secret keeps working
+    /// until `now + grace_secs`. Returns the metadata and the one-time secret string.
+    pub fn regenerate(
+        &self,
+        id: &str,
+        grace_secs: u32,
+        now: DateTime<Utc>,
+        new_expiry: Option<Option<DateTime<Utc>>>,
+    ) -> ApiResult<(ApiTokenInfo, String)> {
+        let _g = self.write_lock.lock();
+        let old = self.live_entry(id)?;
+        let expired = old.stored.expires_at.is_some_and(|t| t <= now);
+        if expired && new_expiry.is_none() {
+            return Err(expired_conflict(
+                "The token has expired. Give a new expiry to regenerate it.",
+            ));
+        }
+        // A revived token must not bring its old secret back.
+        let grace_secs = if expired { 0 } else { grace_secs };
+        let full = format!("{TOKEN_PREFIX}_{id}_{}", random_hex(32));
+        let mut s = old.snapshot();
+        if grace_secs > 0 {
+            s.prev_digest = Some(old.stored.digest.clone());
+            s.prev_valid_until = Some(now + chrono::Duration::seconds(grace_secs as i64));
+        } else {
+            s.prev_digest = None;
+            s.prev_valid_until = None;
+        }
+        s.digest = digest_of(&full).to_hex().to_string();
+        s.secret_hint = hint_of(id, &full);
+        if let Some(e) = new_expiry {
+            s.expires_at = e;
+        }
+        s.updated_at = Some(now);
+        let info = self.commit(&old, s)?.info();
+        Ok((info, full))
     }
 
     /// Revoke every token created by a user (account deleted), atomically.
@@ -369,6 +623,7 @@ mod tests {
                 Uuid::new_v4(),
                 "u".into(),
                 None,
+                TokenPurpose::Custom,
             )
             .unwrap()
     }
@@ -400,6 +655,7 @@ mod tests {
                 Uuid::new_v4(),
                 "u".into(),
                 Some(Utc::now() - chrono::Duration::seconds(1)),
+                TokenPurpose::Custom,
             )
             .unwrap();
         assert_eq!(store.verify(&secret).err(), Some(TokenReject::Expired));
@@ -505,6 +761,7 @@ mod tests {
                         user,
                         "u".into(),
                         None,
+                        TokenPurpose::Custom,
                     )
                     .unwrap()
                     .1
@@ -524,13 +781,217 @@ mod tests {
     }
 
     #[test]
+    fn old_records_without_new_fields_load() {
+        let old = serde_json::json!({
+            "id": "abc", "name": "n", "scopes": ["lists:read"], "profiles": null,
+            "digest": "00", "created_by": Uuid::nil(), "created_by_name": "u",
+            "created_at": "2026-01-01T00:00:00Z", "expires_at": null,
+            "last_used_at": null, "revoked_at": null
+        });
+        let s: StoredToken = serde_json::from_value(old).unwrap();
+        assert_eq!(s.purpose, TokenPurpose::Custom);
+        assert!(s.secret_hint.is_empty() && s.prev_digest.is_none() && s.updated_at.is_none());
+        let info = CachedToken::new(s).info();
+        assert_eq!(info.secret_hint, "abk_abc_…");
+        assert!(info.last_used_addr.is_none());
+    }
+
+    #[test]
+    fn hint_shows_id_and_tail_but_not_the_secret() {
+        let (store, _d) = store();
+        let (info, secret) = make(&store);
+        assert_eq!(
+            info.secret_hint,
+            format!("abk_{}_…{}", info.id, &secret[secret.len() - 4..])
+        );
+        assert!(!secret.contains(&info.secret_hint));
+        assert!(info.secret_hint.len() < 40);
+    }
+
+    #[test]
+    fn regenerate_grace_window_with_injected_clock() {
+        let (store, _d) = store();
+        let (info, old) = make(&store);
+        let t0 = Utc::now();
+        let (renewed, new) = store.regenerate(&info.id, 60, t0, None).unwrap();
+        assert_ne!(new, old);
+        assert_eq!(renewed.id, info.id);
+        assert!(renewed.prev_valid_until.is_some());
+        assert_ne!(renewed.secret_hint, info.secret_hint);
+        let at = |s: i64| t0 + chrono::Duration::seconds(s);
+        assert!(store.verify_at(&new, at(0)).is_ok());
+        assert!(store.verify_at(&old, at(30)).is_ok());
+        assert_eq!(
+            store.verify_at(&old, at(61)).err(),
+            Some(TokenReject::Unknown)
+        );
+        assert!(store.verify_at(&new, at(61)).is_ok());
+        // No grace: the old secret dies at once.
+        let (_, newer) = store.regenerate(&info.id, 0, t0, None).unwrap();
+        assert_eq!(store.verify_at(&new, t0).err(), Some(TokenReject::Unknown));
+        assert!(store.verify_at(&newer, t0).is_ok());
+    }
+
+    #[test]
+    fn revoke_kills_current_and_previous_secret_and_blocks_edits() {
+        let (store, _d) = store();
+        let (info, old) = make(&store);
+        let (_, new) = store.regenerate(&info.id, 3600, Utc::now(), None).unwrap();
+        assert!(store.verify(&old).is_ok());
+        store.revoke(&info.id).unwrap();
+        assert_eq!(store.verify(&old).err(), Some(TokenReject::Revoked));
+        assert_eq!(store.verify(&new).err(), Some(TokenReject::Revoked));
+        assert!(store.regenerate(&info.id, 0, Utc::now(), None).is_err());
+        assert!(store.update(&info.id, TokenUpdate::default()).is_err());
+    }
+
+    #[test]
+    fn unknown_scopes_survive_load_list_revoke_and_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let rec = serde_json::json!({
+            "id": "fut", "name": "n", "scopes": ["lists:read", "made:up"], "profiles": null,
+            "digest": "00", "created_by": Uuid::nil(), "created_by_name": "u",
+            "created_at": "2026-01-01T00:00:00Z", "expires_at": null,
+            "last_used_at": null, "revoked_at": null
+        });
+        let put = |id: &str, b: Vec<u8>| {
+            db.write::<_, ApiError>(Durability::Immediate, |t| {
+                t.open_table(tables::API_TOKENS)
+                    .map_err(DbError::from)?
+                    .insert(id, b.as_slice())
+                    .map_err(DbError::from)?;
+                Ok(())
+            })
+            .unwrap()
+        };
+        put("fut", serde_json::to_vec(&rec).unwrap());
+        put("bad", b"{not json".to_vec());
+        let s = TokenStore::new(db.clone()).unwrap();
+        let c = s.get("fut").expect("loads");
+        assert_eq!(c.stored.scopes, vec![Scope::ListsRead]);
+        assert!(s.get("bad").is_none());
+        let listed = s.list(None, false);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].unknown_scopes, vec!["made:up".to_string()]);
+        assert!(s.revoke("fut").unwrap());
+        drop(s);
+        let again = TokenStore::new(db).unwrap();
+        let c = again.get("fut").unwrap();
+        assert!(c.stored.revoked_at.is_some());
+        assert_eq!(c.stored.unknown_scopes, vec!["made:up".to_string()]);
+    }
+
+    #[test]
+    fn a_kept_unknown_scope_that_is_now_known_is_granted_again() {
+        let rec = serde_json::json!({
+            "id": "x", "name": "n", "scopes": ["lists:read"], "profiles": null,
+            "digest": "00", "created_by": Uuid::nil(), "created_by_name": "u",
+            "created_at": "2026-01-01T00:00:00Z", "expires_at": null,
+            "last_used_at": null, "revoked_at": null,
+            "unknown_scopes": ["bypass:site", "lists:read", "made:up"]
+        });
+        let t = parse_stored(&serde_json::to_vec(&rec).unwrap()).unwrap();
+        assert_eq!(t.scopes, vec![Scope::ListsRead, Scope::BypassSite]);
+        assert_eq!(t.unknown_scopes, vec!["made:up".to_string()]);
+    }
+
+    #[test]
+    fn expired_tokens_refuse_edits_and_regenerate_needs_a_new_expiry() {
+        let (store, _d) = store();
+        let (info, old) = make(&store);
+        age(&store, &info.id, |s| {
+            s.expires_at = Some(Utc::now() - chrono::Duration::seconds(5))
+        });
+        assert!(store.update(&info.id, TokenUpdate::default()).is_err());
+        assert!(store.regenerate(&info.id, 60, Utc::now(), None).is_err());
+        let exp = Utc::now() + chrono::Duration::days(1);
+        let (_, new) = store
+            .regenerate(&info.id, 60, Utc::now(), Some(Some(exp)))
+            .unwrap();
+        assert!(store.verify(&new).is_ok());
+        assert_eq!(store.verify(&old).err(), Some(TokenReject::Unknown));
+    }
+
+    #[test]
+    fn grace_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new) = {
+            let s = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
+            let (info, old) = make(&s);
+            let (_, new) = s.regenerate(&info.id, 600, Utc::now(), None).unwrap();
+            (old, new)
+        };
+        let s = TokenStore::new(Db::open(dir.path()).unwrap()).unwrap();
+        assert!(s.verify(&old).is_ok() && s.verify(&new).is_ok());
+    }
+
+    #[test]
+    fn update_changes_fields_keeps_secret_and_last_use() {
+        let (store, _d) = store();
+        let (info, secret) = make(&store);
+        let cached = store.verify(&secret).unwrap();
+        store.mark_used(&cached, Some("10.0.0.7".parse().unwrap()));
+        let exp = Utc::now() + chrono::Duration::days(3);
+        let out = store
+            .update(
+                &info.id,
+                TokenUpdate {
+                    name: Some("renamed".into()),
+                    scopes: Some(vec![Scope::StatsRead]),
+                    profiles: Some(Some(vec!["1".into()])),
+                    purpose: Some(TokenPurpose::Monitoring),
+                    expires_at: Some(Some(exp)),
+                },
+            )
+            .unwrap();
+        assert_eq!(out.name, "renamed");
+        assert_eq!(out.scopes, vec![Scope::StatsRead]);
+        assert_eq!(out.profiles, Some(vec!["1".to_string()]));
+        assert_eq!(out.purpose, TokenPurpose::Monitoring);
+        assert!(out.updated_at.is_some() && out.last_used_at.is_some());
+        assert_eq!(out.last_used_addr.as_deref(), Some("10.0.0.7"));
+        assert!(store.verify(&secret).is_ok());
+        let cleared = store
+            .update(
+                &info.id,
+                TokenUpdate {
+                    profiles: Some(None),
+                    expires_at: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(cleared.profiles.is_none() && cleared.expires_at.is_none());
+    }
+
+    #[test]
+    fn last_used_address_is_recorded_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let s = TokenStore::new(db.clone()).unwrap();
+        let (info, secret) = make(&s);
+        let cached = s.verify(&secret).unwrap();
+        assert!(cached.info().last_used_addr.is_none());
+        s.mark_used(&cached, Some("192.168.1.9".parse().unwrap()));
+        assert_eq!(cached.info().last_used_addr.as_deref(), Some("192.168.1.9"));
+        db.flush_deferred();
+        drop(s);
+        let s2 = TokenStore::new(db).unwrap();
+        assert_eq!(
+            s2.get(&info.id).unwrap().info().last_used_addr.as_deref(),
+            Some("192.168.1.9")
+        );
+    }
+
+    #[test]
     fn last_used_is_coalesced_and_never_undoes_revocation() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path()).unwrap();
         let s = TokenStore::new(db.clone()).unwrap();
         let (info, secret) = make(&s);
         let cached = s.verify(&secret).unwrap();
-        s.mark_used(&cached); // queues a deferred write
+        s.mark_used(&cached, None); // queues a deferred write
         s.revoke(&info.id).unwrap();
         db.flush_deferred();
         drop(s);

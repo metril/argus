@@ -368,6 +368,12 @@ mod tests {
             expires_at: None,
             last_used_at: used.then(|| "2026-01-01T00:00:00Z".to_string()),
             revoked,
+            unknown_scopes: vec![],
+            purpose: Default::default(),
+            secret_hint: String::new(),
+            last_used_addr: None,
+            updated_at: None,
+            prev_valid_until: None,
         }
     }
 
