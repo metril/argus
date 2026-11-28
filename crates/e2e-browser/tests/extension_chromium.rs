@@ -494,3 +494,188 @@ async fn the_real_extension_binds_pages_relays_with_real_cookies_and_goes_direct
     drop(browser);
     argus.stop().await;
 }
+
+/// The cookie manager page in real Chromium: it lists what a page set (a partitioned cookie
+/// included), edits one through the validated path, and exports Netscape text. No Argus needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cookie_manager_lists_edits_and_exports_a_pages_cookies() {
+    if !std::env::var("ARGUS_EXT_E2E").is_ok_and(|v| v == "1") {
+        skip("not asked");
+        return;
+    }
+    let ext_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extension/.output/chrome-mv3");
+    let Some(bin) = chromium_with_extensions() else {
+        if skip("no Chromium that honours --load-extension (set ARGUS_EXT_BROWSER)") {
+            return;
+        }
+        unreachable!()
+    };
+    let origin = TestOrigin::start().await;
+    let port = origin.https_port();
+    origin.route(
+        "/page",
+        MockResponse::html("<!doctype html><title>t</title><body>hi</body>"),
+    );
+    let profile = tempfile::tempdir().unwrap();
+    let ext = ext_dir.canonicalize().unwrap();
+    let args = [
+        "no-first-run",
+        "no-default-browser-check",
+        "disable-background-networking",
+        "disable-sync",
+        "disable-dev-shm-usage",
+        "disable-component-update",
+        "password-store=basic",
+        "mute-audio",
+        "ignore-certificate-errors",
+        "host-resolver-rules=MAP *.test 127.0.0.1",
+    ]
+    .map(String::from)
+    .into_iter()
+    .chain([
+        format!("load-extension={}", ext.display()),
+        format!("disable-extensions-except={}", ext.display()),
+    ]);
+    let cfg = BrowserConfig::builder()
+        .chrome_executable(&bin)
+        .user_data_dir(profile.path())
+        .new_headless_mode()
+        .no_sandbox()
+        .disable_default_args()
+        .launch_timeout(Duration::from_secs(60))
+        .args(args)
+        .build()
+        .unwrap();
+    let (mut browser, mut handler) = Browser::launch(cfg).await.expect("launch chromium");
+    let h = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    use sha2::{Digest, Sha256};
+    let id: String = Sha256::digest(ext.to_string_lossy().as_bytes())[..16]
+        .iter()
+        .flat_map(|b| [b >> 4, b & 15])
+        .map(|n| (b'a' + n) as char)
+        .collect();
+    until("the extension's service worker", async || {
+        browser
+            .fetch_targets()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.url.starts_with(&format!("chrome-extension://{id}/")))
+    })
+    .await;
+
+    // a page that sets a plain and a partitioned cookie itself
+    let page = browser.new_page("about:blank").await.unwrap();
+    page.goto(format!("https://app.test:{port}/page"))
+        .await
+        .expect("the page");
+    eval(
+        &page,
+        "document.cookie = 'plain=one; path=/; Secure; SameSite=Lax'; document.cookie = 'part=two; path=/; Secure; SameSite=None; Partitioned'; document.cookie",
+    )
+    .await;
+
+    // the cookie manager, opened for that tab as the popup does
+    let ext_page = browser
+        .new_page(format!("chrome-extension://{id}/options.html"))
+        .await
+        .unwrap();
+    until("the extension APIs on its page", async || {
+        eval(&ext_page, "typeof chrome !== 'undefined' && !!chrome.tabs").await == true
+    })
+    .await;
+    let tab_id = eval(
+        &ext_page,
+        "new Promise(r => chrome.tabs.query({}, ts => r((ts.find(t => (t.url || '').includes('app.test')) || {}).id)))",
+    )
+    .await
+    .as_u64()
+    .expect("the tab of the page");
+    let cm = browser
+        .new_page(format!("chrome-extension://{id}/cookies.html#tab={tab_id}"))
+        .await
+        .unwrap();
+    let names = "[...document.querySelectorAll('tr[data-row] td.nm .lnk')].map(e => e.textContent).join(',')";
+    until("the page's cookies in the table", async || {
+        let n = eval(&cm, names).await;
+        let s = n.as_str().unwrap_or_default();
+        s.contains("plain") && s.contains("part")
+    })
+    .await;
+    let row = eval(
+        &cm,
+        "[...document.querySelectorAll('tr[data-row]')].find(r => r.querySelector('.nm .lnk').textContent === 'part').textContent",
+    )
+    .await;
+    assert!(
+        row.as_str().unwrap().contains("Partitioned"),
+        "the partitioned cookie is flagged: {row}"
+    );
+
+    // edit the plain one through the drawer
+    eval(
+        &cm,
+        "[...document.querySelectorAll('tr[data-row] .nm .lnk')].find(e => e.textContent === 'plain').click()",
+    )
+    .await;
+    until("the drawer", async || {
+        eval(&cm, "!!document.querySelector('#dv')").await == true
+    })
+    .await;
+    eval(
+        &cm,
+        "(() => { const t = document.querySelector('#dv'); t.value = 'edited'; t.dispatchEvent(new Event('input', { bubbles: true })); })()",
+    )
+    .await;
+    until("Save to be enabled", async || {
+        eval(
+            &cm,
+            "!!document.querySelector('#dsave') && !document.querySelector('#dsave').disabled",
+        )
+        .await
+            == true
+    })
+    .await;
+    eval(&cm, "document.querySelector('#dsave').click()").await;
+    until("the edited value in the browser's jar", async || {
+        eval(
+            &ext_page,
+            "new Promise(r => chrome.cookies.getAll({ name: 'plain' }, cs => r(cs.some(c => c.value === 'edited'))))",
+        )
+        .await
+            == true
+    })
+    .await;
+
+    // export Netscape text for this site
+    until("the drawer to close", async || {
+        eval(
+            &cm,
+            "!document.querySelector('[data-testid=cookie-drawer]')",
+        )
+        .await
+            == true
+    })
+    .await;
+    eval(
+        &cm,
+        "[...document.querySelectorAll('button')].find(b => b.textContent === 'Export').click()",
+    )
+    .await;
+    until("the Netscape preview", async || {
+        let t = eval(
+            &cm,
+            "(document.querySelector('#exprev') || {}).textContent || ''",
+        )
+        .await;
+        let t = t.as_str().unwrap_or_default();
+        t.contains("# Netscape HTTP Cookie File")
+            && t.contains("plain\tedited")
+            && t.contains("app.test")
+    })
+    .await;
+
+    h.abort();
+    drop(browser);
+}
