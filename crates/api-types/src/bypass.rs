@@ -264,3 +264,43 @@ pub struct BypassCheckResponse {
     /// The pattern that matched.
     pub pattern: Option<String>,
 }
+
+/// Why a host is (or is not) left undecrypted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SiteBypassSource {
+    /// The extension's own per-site entry (removable through this API).
+    Extension,
+    /// A manual or migrated entry on the Bypass page.
+    Manual,
+    /// A first-party category (`name` is its title).
+    Category,
+    /// A subscribed exclusion list (`name` is its name).
+    Subscription,
+    /// The global fail-safe: the Argus lists have not loaded yet, so HTTPS is tunnelled.
+    Failsafe,
+    /// Nothing bypasses the host.
+    None,
+}
+
+/// Whether Argus leaves one host undecrypted, and why.
+///
+/// An entry made through this API covers that exact host only, never its subdomains. Extended
+/// Validation sites are tunnelled on top of this when `ev_auto_tunnel` is on; the certificate is
+/// only known at connection time, so it is not part of `source`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SiteBypassState {
+    /// The normalised host (lowercase, ASCII/punycode).
+    pub host: String,
+    pub bypassed: bool,
+    pub mode: Option<BypassMode>,
+    pub source: SiteBypassSource,
+    /// Category title, subscription name, matching pattern or fail-safe reason.
+    pub name: Option<String>,
+    /// The extension's own entry for this host exists and can be removed here.
+    pub removable: bool,
+    /// Extended Validation sites are tunnelled by the global setting.
+    pub ev_auto_tunnel: bool,
+}

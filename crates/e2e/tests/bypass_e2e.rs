@@ -405,3 +405,45 @@ e2e_test!(
         assert_eq!(ev.mode, expected_mode(&env));
     }
 );
+
+e2e_test!(
+    a_site_added_through_the_api_is_tunnelled_and_decrypted_again_after_removal,
+    rules = Vec::<&str>::new(),
+    |env| {
+        let api = env.proxy.api().await;
+        env.origin.route("/p", MockResponse::ok("direct"));
+        let url = env.origin.https_url("site-api.test", "/p");
+        // The origin-only client trusts no proxy CA: it works only while the proxy tunnels.
+        assert!(
+            origin_only_client(&env)
+                .request(reqwest::Method::GET, &url)
+                .send()
+                .await
+                .is_err(),
+            "decrypted before the entry: the proxy CA is not trusted"
+        );
+        let r = api.put("/bypass/sites/site-api.test").await;
+        r.assert_status_ok();
+        assert_eq!(r.json::<serde_json::Value>()["source"], "extension");
+        let before = env.proxy.mitm.as_ref().unwrap().generation_count();
+        let resp = origin_only_client(&env).get(&url).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "direct");
+        assert_eq!(
+            env.proxy.mitm.as_ref().unwrap().generation_count(),
+            before,
+            "tunnelled, not decrypted"
+        );
+        api.delete("/bypass/sites/site-api.test")
+            .await
+            .assert_status_ok();
+        assert!(
+            origin_only_client(&env)
+                .request(reqwest::Method::GET, &url)
+                .send()
+                .await
+                .is_err(),
+            "decrypted again after removal"
+        );
+    }
+);

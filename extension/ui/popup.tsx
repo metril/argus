@@ -9,6 +9,7 @@ import { resolveState } from '../lib/state';
 import { AccountBar, ErrorBanner, Header, Icon, SignInForm, SiteCard, Skeleton, BrowserCard } from './components';
 import { PageStats, StatsView, ScopeNotice, SiteNotes, SiteToggle, useSiteSwitch } from './pagestats';
 import { Segmented } from './cookies/kit';
+import { SiteBypassRow, useSiteBypass } from './sitebypass';
 import { SiteRulesCard, useSiteRules } from './siterules';
 import { hostLabel, isSignedIn, settings } from './store';
 
@@ -97,6 +98,7 @@ export function App() {
 
   const siteKey = registrableDomain(plainHost(tabUrl));
   const sr = useSiteRules(signed ? s : null, siteKey, () => setNeedScope(true));
+  const bp = useSiteBypass(s ?? { argusUrl: '', token: '' }, signed ? plainHost(tabUrl) : '');
   const sw = useSiteSwitch(s ?? { argusUrl: '', token: '' }, signed ? siteKey : '', () => setNeedScope(true));
   if (s === null || tab === undefined) return <div class="pop"><Header /><div class="main"><Skeleton /></div></div>;
   const r = resolveState({ configured: signed, ...(tabUrl ? { tabUrl } : {}), ...(lookup ? { lookup } : {}) });
@@ -136,14 +138,16 @@ export function App() {
           <button type="button" class="btn" data-testid="pick" disabled={tabId === undefined || !site} onClick={() => { if (tabId !== undefined) void arm(tabId, 'picker'); }}>Block an element</button>
           <button type="button" class="btn" data-testid="zap" disabled={tabId === undefined || !site} onClick={() => { if (tabId !== undefined) void arm(tabId, 'zapper'); }}>Zap elements</button>
         </div>
-        {/* Full-width rows that belong under the grid (such as "Don't decrypt this site") go here. */}
-        <div class="pslot" data-testid="actions-slot" />
+        {/* Full-width rows that belong under the grid go here. */}
+        <div class="pslot" data-testid="actions-slot">
+          {site && <SiteBypassRow st={bp} reload={() => { if (tabId !== undefined) void browser.tabs.reload(tabId); }} onSignIn={() => setSwitching(true)} />}
+        </div>
         {armErr && <div class="note" data-testid="arm-error">Could not start on this page.</div>}
         {site && <SiteRulesCard site={site} sr={sr} />}
         <Scripts state={menu} reload={() => setN(n + 1)} />
         <section class="sec">
           <div class="lbl">This browser</div>
-          <BrowserCard />
+          <BrowserCard inline />
         </section>
         </>}
       </main>
