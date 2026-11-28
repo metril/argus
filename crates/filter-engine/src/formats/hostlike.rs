@@ -78,6 +78,7 @@ pub(crate) fn is_hosts_line(line: &str) -> bool {
 pub(crate) fn convert_hosts(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = strip_hash_comment(raw.trim());
         if line.is_empty() {
             continue;
@@ -118,6 +119,7 @@ pub(crate) fn convert_hosts(content: &str, opts: &ConvertOptions) -> Converted {
 pub(crate) fn convert_domains(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let mut line = raw.trim();
         if line.is_empty() || line.starts_with(['#', '!', ';']) || line.starts_with("//") {
             continue;
@@ -139,6 +141,7 @@ pub(crate) fn convert_domains(content: &str, opts: &ConvertOptions) -> Converted
 pub(crate) fn convert_dnsmasq(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = strip_hash_comment(raw.trim());
         if line.is_empty() {
             continue;
@@ -193,6 +196,7 @@ fn unquote(s: &str) -> &str {
 pub(crate) fn convert_unbound(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = raw.trim();
         let line = line.split(" #").next().unwrap_or(line).trim();
         if line.is_empty() || line.starts_with('#') || line.eq_ignore_ascii_case("server:") {
@@ -250,6 +254,7 @@ pub(crate) fn convert_rpz(content: &str, opts: &ConvertOptions) -> Converted {
     let mut origin: Option<String> = None;
     let mut depth = 0i32;
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = raw.split(';').next().unwrap_or("");
         let in_paren = depth > 0;
         depth += line.matches('(').count() as i32 - line.matches(')').count() as i32;
@@ -441,6 +446,7 @@ pub(crate) fn host_regex_rule(re: &str) -> Result<String, String> {
 pub(crate) fn convert_pihole(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = strip_hash_comment(raw.trim());
         if line.is_empty() || line.starts_with(['!', ';']) {
             continue;
@@ -477,6 +483,7 @@ pub(crate) fn convert_pihole(content: &str, opts: &ConvertOptions) -> Converted 
 pub(crate) fn convert_agh(content: &str, opts: &ConvertOptions) -> Converted {
     let mut out = Out::new(content, opts);
     for (i, raw) in content.lines().enumerate() {
+        out.stats.cur = i + 1;
         let line = raw.trim();
         if line.is_empty() || line.starts_with(['!', '#']) {
             continue;

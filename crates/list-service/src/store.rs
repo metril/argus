@@ -35,7 +35,7 @@ const CATALOGUE_SEEDED_KEY: &str = "catalogue_seeded";
 /// META keys of the removed Strict / default blocking profiles.
 const OLD_PROFILE_KEYS: [&str; 2] = ["default_offered", "strict_profile"];
 /// Report key for the custom rules (not a list id: list ids cannot contain NUL).
-pub(crate) const CUSTOM_REPORT_ID: &str = "\0custom";
+pub const CUSTOM_REPORT_ID: &str = "\0custom";
 
 /// Fetch outcome of a list, surfaced through the filters API.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -306,7 +306,18 @@ impl ListStore {
         Ok(sha.and_then(|s| self.read_blob(&s)))
     }
 
+    /// Store the text of list `id`. The stored content digest describes the text being replaced,
+    /// so it is dropped BEFORE the text is written: a reader (or a crash) between the two steps
+    /// sees a missing digest, which is recomputed from the text, never the old digest paired with
+    /// the new text. Identical text changes nothing.
     pub fn put_content(&self, id: &str, content: &str) -> Result<()> {
+        if self.get_content(id)?.as_deref() == Some(content) {
+            return Ok(());
+        }
+        let mut status = self.get_status(id)?;
+        if status.content_sha.take().is_some() {
+            self.set_status(id, &status)?;
+        }
         self.put_blob_ref(tables::LIST_CONTENT, id, content)
     }
 

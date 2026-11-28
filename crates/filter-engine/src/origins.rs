@@ -47,11 +47,23 @@ impl RuleOrigins {
 
     /// The list id of the compiled rule `rule` (as adblock-rust reports it).
     pub fn lookup(&self, rule: &str) -> Option<&str> {
+        self.lookup_index(rule)
+            .and_then(|l| self.ids.get(l as usize))
+            .map(String::as_str)
+    }
+
+    /// Like [`Self::lookup`], as an index into [`Self::ids`].
+    pub fn lookup_index(&self, rule: &str) -> Option<u16> {
         if self.keys.is_empty() {
             return None;
         }
         let i = self.keys.binary_search(&hash(rule.trim())).ok()?;
-        self.ids.get(self.lists[i] as usize).map(String::as_str)
+        Some(self.lists[i])
+    }
+
+    /// The build's list ids, in build order (the indexes [`Self::lookup_index`] returns).
+    pub fn ids(&self) -> &[String] {
+        &self.ids
     }
 
     /// Serialized form: `n_ids u32 | (len u32, bytes)* | n u64 | keys u64* | lists u16*`.
