@@ -56,6 +56,7 @@ fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
 pub struct HandshakeSettings {
     no_ticket: bool,
     enable_ech_grease: bool,
+    server_padding_request: Option<u16>,
     verify_hostname: bool,
     tls_sni: bool,
     alpn_protocols: Option<Cow<'static, [AlpnProtocol]>>,
@@ -231,6 +232,15 @@ impl TlsConnector {
         // Remember the expected identity for the custom verify hook.
         let mut ssl = cfg.into_ssl(host)?;
         ssl.set_ex_data(host_index()?, host.to_string());
+
+        // Modified by Argus: the server_padding extension is per connection.
+        if let Some(bytes) = self.settings.server_padding_request {
+            use foreign_types::ForeignType;
+            #[allow(unsafe_code)]
+            unsafe {
+                btls_sys::SSL_set_server_padding_request(ssl.as_ptr(), bytes);
+            }
+        }
         Ok(ssl)
     }
 
@@ -416,6 +426,25 @@ impl TlsConnectorBuilder {
         // Set TLS permute extensions options
         set_option!(opts, permute_extensions, connector, set_permute_extensions);
 
+        // Modified by Argus: GREASE signature algorithm and trust anchors (patched BoringSSL).
+        #[allow(unsafe_code)]
+        unsafe {
+            btls_sys::SSL_CTX_set_grease_signature_algorithm(
+                connector.as_ptr(),
+                opts.grease_signature_algorithm as _,
+            );
+            if let Some(ref ids) = opts.requested_trust_anchors {
+                if btls_sys::SSL_CTX_set1_requested_trust_anchors(
+                    connector.as_ptr(),
+                    ids.as_ptr(),
+                    ids.len(),
+                ) != 1
+                {
+                    return Err(Error::tls(ErrorStack::get()));
+                }
+            }
+        }
+
         // Set TLS curves list
         set_option_ref_try!(opts, curves_list, connector, set_curves_list);
 
@@ -492,6 +521,7 @@ impl TlsConnectorBuilder {
             alps_protocols: opts.alps_protocols.clone(),
             alps_use_new_codepoint: opts.alps_use_new_codepoint,
             enable_ech_grease: opts.enable_ech_grease,
+            server_padding_request: opts.server_padding_request,
             key_shares: opts.key_shares.clone(),
             random_aes_hw_override: opts.random_aes_hw_override,
         };

@@ -147,6 +147,12 @@ COPY --from=webui-builder /build/crates/web-ui/dist /app/webui
 # Copy default configuration
 COPY config/default.toml /app/config/default.toml
 
+# Licences of the statically linked vendored code (BoringSSL via btls-sys, btls-sys, wreq, wreq-util).
+COPY --from=builder /build/vendor/btls-sys/deps/boringssl/LICENSE /app/licenses/boringssl-LICENSE
+COPY --from=builder /build/vendor/btls-sys/LICENSE-MIT /app/licenses/btls-sys-LICENSE-MIT
+COPY --from=builder /build/vendor/wreq/LICENSE /app/licenses/wreq-LICENSE
+COPY --from=builder /build/vendor/wreq-util/LICENSE /app/licenses/wreq-util-LICENSE
+
 # Create necessary directories with proper permissions
 RUN mkdir -p /app/certs /app/data /app/logs && \
     chown -R argus:argus /app

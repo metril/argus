@@ -1,0 +1,285 @@
+--- a/build/main.rs
++++ b/build/main.rs
+@@ -479,6 +479,11 @@
+     println!("cargo:warning=applying windows cross compile patch to boringssl");
+     apply_patch(config, "boringssl-windows.patch")?;
+ 
++    // Modified by Argus: ML-DSA signature algorithms, GREASE signature algorithm and the
++    // server_padding extension, as sent by current Chrome. See vendor/README.md.
++    println!("cargo:warning=applying Argus Chrome ClientHello patch to boringssl");
++    apply_patch(config, "argus-chrome-tls.patch")?;
++
+     if config.features.underscore_wildcards {
+         println!("cargo:warning=applying underscore wildcards patch to boringssl");
+         apply_patch(config, "underscore-wildcards.patch")?;
+--- /dev/null
++++ b/patches/argus-chrome-tls.patch
+@@ -0,0 +1,268 @@
++diff -ruN a/include/openssl/ssl.h b/include/openssl/ssl.h
++--- a/include/openssl/ssl.h
+++++ b/include/openssl/ssl.h
++@@ -1146,6 +1146,13 @@
++ #define SSL_SIGN_RSA_PSS_RSAE_SHA512 0x0806
++ #define SSL_SIGN_ED25519 0x0807
++ 
+++// SSL_SIGN_ML_DSA_* are the ML-DSA (FIPS 204) signature algorithms of
+++// draft-ietf-tls-mldsa. They are TLS 1.3 only. (Modified by Argus: backported
+++// from upstream BoringSSL.)
+++#define SSL_SIGN_ML_DSA_44 0x0904
+++#define SSL_SIGN_ML_DSA_65 0x0905
+++#define SSL_SIGN_ML_DSA_87 0x0906
+++
++ // SSL_SIGN_RSA_PKCS1_SHA256_LEGACY is a backport of RSASSA-PKCS1-v1_5 with
++ // SHA-256 to TLS 1.3. It is disabled by default and only defined for client
++ // certificates.
++@@ -5267,6 +5274,21 @@
++ // GREASE. See RFC 8701.
++ OPENSSL_EXPORT void SSL_CTX_set_grease_enabled(SSL_CTX *ctx, int enabled);
++ 
+++// SSL_CTX_set_grease_signature_algorithm configures whether sockets on |ctx|
+++// that have GREASE enabled also send a GREASE value first in the
+++// signature_algorithms extension (RFC 8701). Off by default. (Modified by
+++// Argus: upstream BoringSSL always does this when GREASE is enabled; older
+++// Chrome releases did not.)
+++OPENSSL_EXPORT void SSL_CTX_set_grease_signature_algorithm(SSL_CTX *ctx,
+++                                                           int enabled);
+++
+++// SSL_set_server_padding_request configures |ssl| as a client to send the
+++// server_padding extension (TLSEXT_TYPE_server_padding) requesting |num_bytes|
+++// of padding from the server in EncryptedExtensions. A server that answers must
+++// send exactly |num_bytes|. (Modified by Argus: backported from upstream
+++// BoringSSL, client side only.)
+++OPENSSL_EXPORT void SSL_set_server_padding_request(SSL *ssl, uint16_t num_bytes);
+++
++ // SSL_CTX_set_permute_extensions configures whether sockets on |ctx| should
++ // permute extensions. For now, this is only implemented for the ClientHello.
++ OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
++diff -ruN a/include/openssl/tls1.h b/include/openssl/tls1.h
++--- a/include/openssl/tls1.h
+++++ b/include/openssl/tls1.h
++@@ -140,6 +140,10 @@
++ // standardization completes.
++ #define TLSEXT_TYPE_trust_anchors 0xca34
++ 
+++// Extension allowing the server to add additional bytes of padding to
+++// EncryptedExtensions. This is not an IANA defined extension number.
+++#define TLSEXT_TYPE_server_padding 4832  // Modified by Argus: backported.
+++
++ // ExtensionType value from draft-ietf-tls-tlsflags.
++ #define TLSEXT_TYPE_tls_flags 62
++ 
++diff -ruN a/ssl/extensions.cc b/ssl/extensions.cc
++--- a/ssl/extensions.cc
+++++ b/ssl/extensions.cc
++@@ -313,8 +313,19 @@
++   return hs->config->verify_sigalgs;
++ }
++ 
+++static bool is_post_quantum_sigalg(uint16_t sigalg) {
+++  return sigalg == SSL_SIGN_ML_DSA_44 || sigalg == SSL_SIGN_ML_DSA_65 ||
+++         sigalg == SSL_SIGN_ML_DSA_87;
+++}
+++
++ bool tls12_add_verify_sigalgs(const SSL_HANDSHAKE *hs, CBB *out) {
+++  uint16_t max_version =
+++      hs->ssl->server ? ssl_protocol_version(hs->ssl) : hs->max_version;
++   for (uint16_t sigalg : tls12_get_verify_sigalgs(hs)) {
+++    // ML-DSA is TLS 1.3 only. (Modified by Argus: backported from upstream.)
+++    if (is_post_quantum_sigalg(sigalg) && max_version < TLS1_3_VERSION) {
+++      continue;
+++    }
++     if (!CBB_add_u16(out, sigalg)) {
++       return false;
++     }
++@@ -994,8 +1005,17 @@
++   CBB contents, sigalgs_cbb;
++   if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_signature_algorithms) ||
++       !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
++-      !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb) ||
++-      !tls12_add_verify_sigalgs(hs, &sigalgs_cbb) ||
+++      !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb)) {
+++    return false;
+++  }
+++  // Add a fake signature algorithm. See RFC 8701. (Modified by Argus: only when
+++  // |SSL_CTX_set_grease_signature_algorithm| is on.)
+++  if (hs->ssl->ctx->grease_enabled && hs->ssl->ctx->grease_signature_algorithm &&
+++      !CBB_add_u16(&sigalgs_cbb,
+++                   ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+++    return false;
+++  }
+++  if (!tls12_add_verify_sigalgs(hs, &sigalgs_cbb) ||
++       !CBB_flush(out_compressible)) {
++     return false;
++   }
++@@ -3584,6 +3604,52 @@
++ }
++ 
++ // kExtensions contains all the supported extensions.
+++// Server padding (Modified by Argus: client side backported from upstream).
+++//
+++// The client asks the server to add that many bytes of padding to
+++// EncryptedExtensions. The ClientHello carries the requested size.
+++
+++static bool ext_server_padding_add_clienthello(const SSL_HANDSHAKE *hs,
+++                                               CBB *out, CBB *out_compressible,
+++                                               ssl_client_hello_type_t type) {
+++  if (!hs->config->server_padding_request.has_value()) {
+++    return true;
+++  }
+++
+++  CBB contents;
+++  if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_server_padding) ||
+++      !CBB_add_u16_length_prefixed(out_compressible, &contents) ||
+++      !CBB_add_u16(&contents, hs->config->server_padding_request.value()) ||
+++      !CBB_flush(out_compressible)) {
+++    return false;
+++  }
+++
+++  return true;
+++}
+++
+++static bool ext_server_padding_parse_serverhello(SSL_HANDSHAKE *hs,
+++                                                 uint8_t *out_alert,
+++                                                 CBS *contents) {
+++  if (contents == nullptr) {
+++    return true;
+++  }
+++
+++  if (ssl_protocol_version(hs->ssl) < TLS1_3_VERSION ||
+++      !hs->config->server_padding_request) {
+++    OPENSSL_PUT_ERROR(SSL, SSL_R_UNEXPECTED_EXTENSION);
+++    *out_alert = SSL_AD_UNSUPPORTED_EXTENSION;
+++    return false;
+++  }
+++
+++  if (hs->config->server_padding_request.value() != CBS_len(contents)) {
+++    OPENSSL_PUT_ERROR(SSL, SSL_R_DECODE_ERROR);
+++    *out_alert = SSL_AD_DECODE_ERROR;
+++    return false;
+++  }
+++
+++  return true;
+++}
+++
++ static const struct tls_extension kExtensions[] = {
++     {
++         TLSEXT_TYPE_server_name,
++@@ -3788,6 +3854,13 @@
++         ext_trust_anchors_add_serverhello,
++     },
++     {
+++        TLSEXT_TYPE_server_padding,
+++        ext_server_padding_add_clienthello,
+++        ext_server_padding_parse_serverhello,
+++        ignore_parse_clienthello,
+++        dont_add_serverhello,
+++    },
+++    {
++       TLSEXT_TYPE_record_size_limit,
++       record_size_limit_add_clienthello,
++       record_size_limit_parse_serverhello,
++diff -ruN a/ssl/internal.h b/ssl/internal.h
++--- a/ssl/internal.h
+++++ b/ssl/internal.h
++@@ -1612,7 +1612,8 @@
++   ssl_grease_version,
++   ssl_grease_ticket_extension,
++   ssl_grease_ech_config_id,
++-  ssl_grease_last_index = ssl_grease_ech_config_id,
+++  ssl_grease_signature_algorithm,
+++  ssl_grease_last_index = ssl_grease_signature_algorithm,
++ };
++ 
++ enum tls12_server_hs_state_t {
++@@ -3304,6 +3305,10 @@
++   // Trust anchor IDs to be requested in the trust_anchors extension.
++   std::optional<Array<uint8_t>> requested_trust_anchors;
++ 
+++  // server_padding_request, if set, is the number of padding bytes requested
+++  // from the server with the server_padding extension. (Modified by Argus.)
+++  std::optional<uint16_t> server_padding_request;
+++
++   // Our list of supported groups. If this list is modified, for a client,
++   // |client_key_share_selections| must be reset if the key shares are no longer
++   // a valid subsequence of the supported group list.
++@@ -4046,6 +4051,10 @@
++   // grease_enabled is whether GREASE (RFC 8701) is enabled.
++   bool grease_enabled : 1;
++ 
+++  // grease_signature_algorithm is whether a GREASE value is also sent in the
+++  // signature_algorithms extension when |grease_enabled|. (Modified by Argus.)
+++  bool grease_signature_algorithm : 1;
+++
++   // permute_extensions is whether to permute extensions when sending messages.
++   bool permute_extensions : 1;
++ 
++diff -ruN a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
++--- a/ssl/ssl_lib.cc
+++++ b/ssl/ssl_lib.cc
++@@ -396,6 +396,7 @@
++       signed_cert_timestamps_enabled(false),
++       channel_id_enabled(false),
++       grease_enabled(false),
+++      grease_signature_algorithm(false),  // Modified by Argus.
++       permute_extensions(false),
++       disable_second_keyshare(false),
++       allow_unknown_alpn_protos(false),
++@@ -3152,6 +3153,17 @@
++   ctx->grease_enabled = !!enabled;
++ }
++ 
+++void SSL_CTX_set_grease_signature_algorithm(SSL_CTX *ctx, int enabled) {  // Modified by Argus.
+++  ctx->grease_signature_algorithm = !!enabled;
+++}
+++
+++void SSL_set_server_padding_request(SSL *ssl, uint16_t num_bytes) {  // Modified by Argus.
+++  if (!ssl->config) {
+++    return;
+++  }
+++  ssl->config->server_padding_request = num_bytes;
+++}
+++
++ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
++   ctx->permute_extensions = !!enabled;
++ }
++diff -ruN a/ssl/ssl_privkey.cc b/ssl/ssl_privkey.cc
++--- a/ssl/ssl_privkey.cc
+++++ b/ssl/ssl_privkey.cc
++@@ -98,6 +98,17 @@
++     {SSL_SIGN_ED25519, EVP_PKEY_ED25519, NID_undef, nullptr,
++      /*is_rsa_pss=*/false, /*tls12_ok=*/true, /*tls13_ok=*/true,
++      /*client_only=*/false},
+++
+++    // ML-DSA is TLS 1.3 only. (Modified by Argus: backported from upstream.)
+++    {SSL_SIGN_ML_DSA_44, EVP_PKEY_ML_DSA_44, NID_undef, nullptr,
+++     /*is_rsa_pss=*/false, /*tls12_ok=*/false, /*tls13_ok=*/true,
+++     /*client_only=*/false},
+++    {SSL_SIGN_ML_DSA_65, EVP_PKEY_ML_DSA_65, NID_undef, nullptr,
+++     /*is_rsa_pss=*/false, /*tls12_ok=*/false, /*tls13_ok=*/true,
+++     /*client_only=*/false},
+++    {SSL_SIGN_ML_DSA_87, EVP_PKEY_ML_DSA_87, NID_undef, nullptr,
+++     /*is_rsa_pss=*/false, /*tls12_ok=*/false, /*tls13_ok=*/true,
+++     /*client_only=*/false},
++ };
++ 
++ static const SSL_SIGNATURE_ALGORITHM *get_signature_algorithm(uint16_t sigalg) {
++@@ -116,7 +127,8 @@
++   // reachable from libssl.
++   const EVP_PKEY_ALG *const algs[] = {
++       EVP_pkey_rsa(),     EVP_pkey_ec_p256(), EVP_pkey_ec_p384(),
++-      EVP_pkey_ec_p521(), EVP_pkey_ed25519(),
+++      EVP_pkey_ec_p521(), EVP_pkey_ed25519(), EVP_pkey_ml_dsa_44(),
+++      EVP_pkey_ml_dsa_65(), EVP_pkey_ml_dsa_87(),
++   };
++   return bssl::UniquePtr<EVP_PKEY>(EVP_PKEY_from_subject_public_key_info(
++       spki.data(), spki.size(), algs, std::size(algs)));
++@@ -480,6 +492,9 @@
++     {SSL_SIGN_RSA_PSS_RSAE_SHA384, "rsa_pss_rsae_sha384"},
++     {SSL_SIGN_RSA_PSS_RSAE_SHA512, "rsa_pss_rsae_sha512"},
++     {SSL_SIGN_ED25519, "ed25519"},
+++    {SSL_SIGN_ML_DSA_44, "mldsa44"},
+++    {SSL_SIGN_ML_DSA_65, "mldsa65"},
+++    {SSL_SIGN_ML_DSA_87, "mldsa87"},
++ };
++ 
++ const char *SSL_get_signature_algorithm_name(uint16_t sigalg,

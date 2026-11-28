@@ -70,6 +70,7 @@ pub fn proxy_stats(state: &AppState) -> ProxyStatsResponse {
                 upstream_errors: f.upstream_errors,
                 dns_failures: f.dns_failures,
                 destination_refusals: f.policy_refusals,
+                trust_anchor_retries: f.trust_anchor_retries,
             }
         },
         mitm: state.proxy_state.mitm_enabled.then(|| MitmStats {

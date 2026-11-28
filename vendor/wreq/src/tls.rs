@@ -211,6 +211,26 @@ pub struct TlsOptions {
     /// **Default:** `None` (implementation default)
     pub permute_extensions: Option<bool>,
 
+    /// Sends a GREASE value first in the `signature_algorithms` extension (Chrome 153+), when
+    /// GREASE is enabled. Modified by Argus (patch 8, needs the patched BoringSSL of `btls-sys`).
+    ///
+    /// **Default:** `false`
+    pub grease_signature_algorithm: bool,
+
+    /// Sends the `server_padding` extension (0x12e0) requesting this many bytes of padding in
+    /// the server's EncryptedExtensions. Chrome sends `0` only while its field trial is on, so no
+    /// Argus profile enables it; the option exists to emulate such a build. Modified by Argus (patch 8).
+    ///
+    /// **Default:** `None` (extension not sent)
+    pub server_padding_request: Option<u16>,
+
+    /// Trust anchor identifiers for the `trust_anchors` extension (0xca34), in wire format (a
+    /// series of 8-bit length-prefixed strings). `Some(&[])` sends the extension with an empty
+    /// list. Modified by Argus (patch 8).
+    ///
+    /// **Default:** `None` (extension not sent)
+    pub requested_trust_anchors: Option<Cow<'static, [u8]>>,
+
     /// Controls whether GREASE extensions ([RFC 8701](https://datatracker.ietf.org/doc/html/rfc8701))
     /// are enabled in general.
     ///
@@ -368,6 +388,33 @@ impl TlsOptionsBuilder {
     #[inline]
     pub fn enable_ech_grease(mut self, enabled: bool) -> Self {
         self.config.enable_ech_grease = enabled;
+        self
+    }
+
+    /// Sends a GREASE signature algorithm first in `signature_algorithms`. Modified by Argus.
+    #[inline]
+    pub fn grease_signature_algorithm(mut self, enabled: bool) -> Self {
+        self.config.grease_signature_algorithm = enabled;
+        self
+    }
+
+    /// Sends the `server_padding` extension requesting `bytes` of padding. Modified by Argus.
+    #[inline]
+    pub fn server_padding_request<T>(mut self, bytes: T) -> Self
+    where
+        T: Into<Option<u16>>,
+    {
+        self.config.server_padding_request = bytes.into();
+        self
+    }
+
+    /// Sends the `trust_anchors` extension with this wire-format list. Modified by Argus.
+    #[inline]
+    pub fn requested_trust_anchors<T>(mut self, ids: T) -> Self
+    where
+        T: Into<Option<Cow<'static, [u8]>>>,
+    {
+        self.config.requested_trust_anchors = ids.into();
         self
     }
 
@@ -569,6 +616,9 @@ impl Default for TlsOptions {
             pre_shared_key: false,
             enable_ech_grease: false,
             permute_extensions: None,
+            grease_signature_algorithm: false,
+            server_padding_request: None,
+            requested_trust_anchors: None,
             grease_enabled: None,
             enable_ocsp_stapling: false,
             enable_signed_cert_timestamps: false,

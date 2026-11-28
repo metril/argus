@@ -1,0 +1,267 @@
+--- a/src/emulate/profile/chrome.rs
++++ b/src/emulate/profile/chrome.rs
+@@ -1795,6 +1795,111 @@
+     ]
+ );
+ 
++// Chrome 151, 153 and 156 differ from 149 in the ClientHello (ML-DSA signature algorithms; a GREASE
++// signature algorithm and the trust_anchors extension; a new trust anchor list). Captured from real
++// builds, see docs/UPSTREAM-TLS.md. Modified by Argus.
++mod_generator!(
++    v151,
++    tls_options!(8, CURVES_3),
++    http2_options!(3),
++    header_initializer_with_zstd_priority,
++    [
++        (
++            MacOS,
++            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
++            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
++        ),
++        (
++            Linux,
++            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
++            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
++        ),
++        (
++            Android,
++            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
++            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
++        ),
++        (
++            Windows,
++            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
++            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
++        ),
++        (
++            IOS,
++            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
++            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/151.0.0.0 Mobile/15E148 Safari/604.1"
++        )
++    ]
++);
++
++mod_generator!(
++    v153,
++    tls_options!(9, CURVES_3, TRUST_ANCHORS_153),
++    http2_options!(3),
++    header_initializer_with_zstd_priority,
++    [
++        (
++            MacOS,
++            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
++            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
++        ),
++        (
++            Linux,
++            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
++            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
++        ),
++        (
++            Android,
++            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
++            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
++        ),
++        (
++            Windows,
++            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
++            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
++        ),
++        (
++            IOS,
++            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
++            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/153.0.0.0 Mobile/15E148 Safari/604.1"
++        )
++    ]
++);
++
++mod_generator!(
++    v156,
++    tls_options!(9, CURVES_3, TRUST_ANCHORS_156),
++    http2_options!(3),
++    header_initializer_with_zstd_priority,
++    [
++        (
++            MacOS,
++            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
++            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
++        ),
++        (
++            Linux,
++            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
++            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
++        ),
++        (
++            Android,
++            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
++            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36"
++        ),
++        (
++            Windows,
++            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
++            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
++        ),
++        (
++            IOS,
++            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
++            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/156.0.0.0 Mobile/15E148 Safari/604.1"
++        )
++    ]
++);
++
+ mod_generator!(
+     edge143,
+     v132::build_emulation,
+--- a/src/emulate/profile/chrome/tls.rs
++++ b/src/emulate/profile/chrome/tls.rs
+@@ -40,6 +40,28 @@
+             .curves($curves)
+             .alps_use_new_codepoint(true))
+     };
++    // Chrome 151: ML-DSA signature algorithms (Modified by Argus).
++    (8, $curves:expr) => {
++        tls_options!(@build ChromeTlsConfig::builder()
++            .permute_extensions(true)
++            .enable_ech_grease(true)
++            .pre_shared_key(true)
++            .curves($curves)
++            .alps_use_new_codepoint(true)
++            .sigalgs_list(SIGALGS_LIST_ML_DSA))
++    };
++    // Chrome 153+: GREASE signature algorithm and the trust_anchors extension (Modified by Argus).
++    (9, $curves:expr, $trust_anchors:expr) => {
++        tls_options!(@build ChromeTlsConfig::builder()
++            .permute_extensions(true)
++            .enable_ech_grease(true)
++            .pre_shared_key(true)
++            .curves($curves)
++            .alps_use_new_codepoint(true)
++            .sigalgs_list(SIGALGS_LIST_ML_DSA)
++            .grease_signature_algorithm(true)
++            .requested_trust_anchors($trust_anchors))
++    };
+ }
+ 
+ pub const CURVES_1: &str = join!(":", "X25519", "P-256", "P-384");
+@@ -77,6 +99,87 @@
+     "rsa_pkcs1_sha512"
+ );
+ 
++/// Chrome 151+ also offers the ML-DSA signature algorithms (draft-ietf-tls-mldsa) first.
++pub const SIGALGS_LIST_ML_DSA: &str = join!(
++    ":",
++    "mldsa44",
++    "mldsa65",
++    "mldsa87",
++    "ecdsa_secp256r1_sha256",
++    "rsa_pss_rsae_sha256",
++    "rsa_pkcs1_sha256",
++    "ecdsa_secp384r1_sha384",
++    "rsa_pss_rsae_sha384",
++    "rsa_pkcs1_sha384",
++    "rsa_pss_rsae_sha512",
++    "rsa_pkcs1_sha512"
++);
++
++/// The `trust_anchors` extension list (trust anchor IDs, wire format) of Chrome 153, as captured.
++pub const TRUST_ANCHORS_153: &[u8] = &[
++    0x04, 0xd6, 0x79, 0x09, 0x0c,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0f,
++    0x04, 0xd6, 0x79, 0x09, 0x08,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x08,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x06,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x13,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x12,
++    0x04, 0xd6, 0x79, 0x09, 0x05,
++    0x04, 0xd6, 0x79, 0x09, 0x01,
++    0x04, 0xd6, 0x79, 0x09, 0x04,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x13,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0c,
++    0x04, 0xd6, 0x79, 0x09, 0x0a,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0b,
++    0x04, 0xd6, 0x79, 0x09, 0x07,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0d,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x12,
++    0x04, 0xd6, 0x79, 0x09, 0x06,
++    0x04, 0xd6, 0x79, 0x09, 0x0d,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x07,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0e,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0d,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0a,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x01,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x09,
++    0x04, 0xd6, 0x79, 0x09, 0x0b,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x14,
++    0x04, 0xd6, 0x79, 0x09, 0x0f,
++];
++
++/// The `trust_anchors` extension list of Chrome 156 and later, as captured (Chrome 159 sends the
++/// same).
++pub const TRUST_ANCHORS_156: &[u8] = &[
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x01,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x06,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0d,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0e,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x0f,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x12,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x13,
++    0x05, 0x82, 0xdf, 0x13, 0x02, 0x14,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x07,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x08,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x09,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0a,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0b,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0c,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x0d,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x12,
++    0x08, 0x83, 0x9a, 0x64, 0x8c, 0x9b, 0x2d, 0x01, 0x13,
++    0x04, 0xd6, 0x79, 0x09, 0x01,
++    0x04, 0xd6, 0x79, 0x09, 0x04,
++    0x04, 0xd6, 0x79, 0x09, 0x05,
++    0x04, 0xd6, 0x79, 0x09, 0x06,
++    0x04, 0xd6, 0x79, 0x09, 0x07,
++    0x04, 0xd6, 0x79, 0x09, 0x08,
++    0x04, 0xd6, 0x79, 0x09, 0x0a,
++    0x04, 0xd6, 0x79, 0x09, 0x0b,
++    0x04, 0xd6, 0x79, 0x09, 0x0c,
++    0x04, 0xd6, 0x79, 0x09, 0x0d,
++    0x04, 0xd6, 0x79, 0x09, 0x0f,
++];
++
+ pub const CERTIFICATE_COMPRESSORS: &[&'static dyn CertificateCompressor] = &[&BrotliCompressor];
+ 
+ #[derive(TypedBuilder)]
+@@ -104,6 +207,12 @@
+ 
+     #[builder(default = false, setter(into))]
+     pre_shared_key: bool,
++
++    #[builder(default = false)]
++    grease_signature_algorithm: bool,
++
++    #[builder(default = None, setter(into))]
++    requested_trust_anchors: Option<&'static [u8]>,
+ }
+ 
+ impl From<ChromeTlsConfig> for TlsOptions {
+@@ -122,6 +231,8 @@
+             .enable_ech_grease(val.enable_ech_grease)
+             .alps_protocols([val.alps_protos])
+             .alps_use_new_codepoint(val.alps_use_new_codepoint)
++            .grease_signature_algorithm(val.grease_signature_algorithm)
++            .requested_trust_anchors(val.requested_trust_anchors.map(std::borrow::Cow::Borrowed))
+             .aes_hw_override(true)
+             .certificate_compressors(CERTIFICATE_COMPRESSORS)
+             .build()
+--- a/src/emulate.rs
++++ b/src/emulate.rs
+@@ -60,6 +60,9 @@
+     Chrome147 => ("chrome_147", v147::emulation),
+     Chrome148 => ("chrome_148", v148::emulation),
+     Chrome149 => ("chrome_149", v149::emulation),
++    Chrome151 => ("chrome_151", v151::emulation),
++    Chrome153 => ("chrome_153", v153::emulation),
++    Chrome156 => ("chrome_156", v156::emulation),
+ 
+     // Edge versions
+     Edge101 => ("edge_101", edge101::emulation),

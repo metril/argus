@@ -50,6 +50,7 @@ pub mod server;
 pub mod stealth;
 pub mod tls;
 pub mod transparent;
+pub mod trust_anchor_retry;
 pub mod upstream;
 pub mod upstream_proxy;
 pub mod upstream_wreq;

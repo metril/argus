@@ -3625,6 +3625,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "trust_anchor_retries": {
+            "description": "Handshakes that failed certificate verification with the `trust_anchors` extension and\nwere retried once without it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "upstream_errors": {
             "format": "int64",
             "minimum": 0,

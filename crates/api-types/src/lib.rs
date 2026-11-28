@@ -806,6 +806,10 @@ pub struct FaultStats {
     pub dns_failures: u64,
     /// Connections refused by the destination policy.
     pub destination_refusals: u64,
+    /// Handshakes that failed certificate verification with the `trust_anchors` extension and
+    /// were retried once without it.
+    #[serde(default)]
+    pub trust_anchor_retries: u64,
 }
 
 /// Proxy statistics response.

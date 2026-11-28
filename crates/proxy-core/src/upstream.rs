@@ -603,7 +603,12 @@ impl wreq::dns::Resolve for PolicyResolver {
 #[derive(Clone)]
 pub enum UpstreamClient {
     /// Emulates the browser behind each request (TLS and HTTP/2 fingerprint).
-    Wreq(wreq::Client),
+    /// The memory holds, per host, whether the `trust_anchors` extension must be left out
+    /// (see [`crate::trust_anchor_retry`]).
+    Wreq(
+        wreq::Client,
+        Arc<crate::trust_anchor_retry::TrustAnchorMemory>,
+    ),
     /// The same client without a browser fingerprint (browser-like upstream off).
     WreqPlain(wreq::Client),
 }
@@ -611,7 +616,7 @@ pub enum UpstreamClient {
 impl std::fmt::Debug for UpstreamClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Wreq(_) => "UpstreamClient::Wreq",
+            Self::Wreq(..) => "UpstreamClient::Wreq",
             Self::WreqPlain(_) => "UpstreamClient::WreqPlain",
         })
     }
@@ -691,19 +696,19 @@ impl UpstreamClient {
 
     /// Drop the idle upstream connections pooled for downstream connection `conn_id`.
     pub fn evict_conn(&self, conn_id: u64) {
-        let (Self::Wreq(c) | Self::WreqPlain(c)) = self;
+        let (Self::Wreq(c, _) | Self::WreqPlain(c)) = self;
         c.evict_group(&wreq::Group::new(conn_id));
     }
 
     /// Drop the idle connections of the retry group `name` (see [`RETRY_SEQ`]).
     fn evict_named(&self, name: String) {
-        let (Self::Wreq(c) | Self::WreqPlain(c)) = self;
+        let (Self::Wreq(c, _) | Self::WreqPlain(c)) = self;
         c.evict_group(&wreq::Group::new(name));
     }
 
     /// Whether this is the browser-like client.
     pub fn is_browser_like(&self) -> bool {
-        matches!(self, Self::Wreq(_))
+        matches!(self, Self::Wreq(..))
     }
 }
 
@@ -770,7 +775,38 @@ impl UpstreamRequest {
             Some(_) => None,
         }
         .map(|b| (headers.clone(), b));
-        let first = send_once(&client, &method, &url, headers, body, scope.as_ref(), "").await;
+        let ta = TrustAnchors::new(&client, &url, &headers);
+        let first = send_once(
+            &client,
+            &method,
+            &url,
+            headers.clone(),
+            body,
+            scope.as_ref(),
+            "",
+            ta.plain_first,
+        )
+        .await;
+        // A certificate failure of a handshake that sent `trust_anchors` gets one more handshake
+        // without the extension, as Chrome does; the request was never sent, so any method may.
+        let first = match (first, &replay) {
+            (Err(e), Some((_, body))) if ta.should_retry(&e) => {
+                ta.note_retry(&e);
+                let r = send_once(
+                    &client,
+                    &method,
+                    &url,
+                    headers,
+                    body.clone().map(UpstreamBody::Bytes),
+                    scope.as_ref(),
+                    "",
+                    true,
+                )
+                .await;
+                return ta.finish(r);
+            }
+            (r, _) => r,
+        };
         match (first, replay) {
             (Err(e), Some((headers, body)))
                 if e.never_ran() || (idempotent(&method) && e.is_retryable()) =>
@@ -793,6 +829,7 @@ impl UpstreamRequest {
                     body.map(UpstreamBody::Bytes),
                     scope.as_ref(),
                     &suffix,
+                    ta.plain_first,
                 )
                 .await;
                 // Used once: its connection serves this response and is not pooled for others.
@@ -818,59 +855,192 @@ impl UpstreamRequest {
     pub async fn send_upgrade(
         self,
     ) -> std::result::Result<(UpstreamResponse, Option<wreq::Upgraded>), UpstreamError> {
-        use futures_util::StreamExt;
         if let Some(m) = self.bad_header {
             return Err(UpstreamError::Invalid(m));
         }
-        let (UpstreamClient::Wreq(c) | UpstreamClient::WreqPlain(c)) = &self.client;
-        let browser = matches!(self.client, UpstreamClient::Wreq(_));
-        let profile = crate::browser_profile::BrowserProfile::classify(&self.headers);
-        let orig = crate::browser_profile::orig_headers(&profile, self.headers.keys());
-        let mut rb = c.request(self.method.clone(), &self.url);
-        if let Some(s) = &self.scope {
-            rb = rb.group(s.group(""));
+        let ta = TrustAnchors::new(&self.client, &self.url, &self.headers);
+        let first = upgrade_once(
+            &self.client,
+            &self.method,
+            &self.url,
+            self.headers.clone(),
+            self.scope.as_ref(),
+            ta.plain_first,
+        )
+        .await;
+        match first {
+            Err(e) if ta.should_retry(&e) => {
+                ta.note_retry(&e);
+                ta.finish(
+                    upgrade_once(
+                        &self.client,
+                        &self.method,
+                        &self.url,
+                        self.headers,
+                        self.scope.as_ref(),
+                        true,
+                    )
+                    .await,
+                )
+            }
+            r => r,
         }
-        if browser {
-            rb = rb.emulation(profile.emulation());
-        }
-        let mut rb = rb
-            .version(wreq::Version::HTTP_11)
-            .default_headers(false)
-            .headers(self.headers);
-        if browser {
-            rb = rb.orig_headers(orig);
-        }
-        let mut r = rb.send().await.map_err(UpstreamError::Wreq)?;
-        let peer_cert = r
-            .extensions()
-            .get::<wreq::tls::TlsInfo>()
-            .and_then(|t| t.peer_certificate())
-            .map(<[u8]>::to_vec);
-        let (status, headers) = (r.status(), std::mem::take(r.headers_mut()));
-        if status == hyper::StatusCode::SWITCHING_PROTOCOLS {
-            let up = r.upgrade().await.map_err(UpstreamError::Wreq)?;
-            return Ok((
-                UpstreamResponse {
-                    status,
-                    headers,
-                    peer_cert,
-                    body: futures_util::stream::empty().boxed(),
-                },
-                Some(up),
-            ));
-        }
-        Ok((
+    }
+}
+
+/// One upgrade handshake attempt; `plain`: without the `trust_anchors` extension.
+async fn upgrade_once(
+    client: &UpstreamClient,
+    method: &hyper::Method,
+    url: &str,
+    headers: hyper::HeaderMap,
+    scope: Option<&UpstreamScope>,
+    plain: bool,
+) -> std::result::Result<(UpstreamResponse, Option<wreq::Upgraded>), UpstreamError> {
+    use futures_util::StreamExt;
+    let (UpstreamClient::Wreq(c, _) | UpstreamClient::WreqPlain(c)) = client;
+    let browser = matches!(client, UpstreamClient::Wreq(..));
+    let profile = crate::browser_profile::BrowserProfile::classify(&headers);
+    let orig = crate::browser_profile::orig_headers(&profile, headers.keys());
+    let mut rb = c.request(method.clone(), url);
+    if let Some(s) = scope {
+        rb = rb.group(s.group(""));
+    }
+    if browser {
+        rb = rb.emulation(profile_emulation(&profile, plain));
+    }
+    let mut rb = rb
+        .version(wreq::Version::HTTP_11)
+        .default_headers(false)
+        .headers(headers);
+    if browser {
+        rb = rb.orig_headers(orig);
+    }
+    let mut r = rb.send().await.map_err(UpstreamError::Wreq)?;
+    let peer_cert = r
+        .extensions()
+        .get::<wreq::tls::TlsInfo>()
+        .and_then(|t| t.peer_certificate())
+        .map(<[u8]>::to_vec);
+    let (status, headers) = (r.status(), std::mem::take(r.headers_mut()));
+    if status == hyper::StatusCode::SWITCHING_PROTOCOLS {
+        let up = r.upgrade().await.map_err(UpstreamError::Wreq)?;
+        return Ok((
             UpstreamResponse {
                 status,
                 headers,
                 peer_cert,
-                body: r
-                    .bytes_stream()
-                    .map(|c| c.map_err(std::io::Error::other))
-                    .boxed(),
+                body: futures_util::stream::empty().boxed(),
             },
-            None,
-        ))
+            Some(up),
+        ));
+    }
+    Ok((
+        UpstreamResponse {
+            status,
+            headers,
+            peer_cert,
+            body: r
+                .bytes_stream()
+                .map(|c| c.map_err(std::io::Error::other))
+                .boxed(),
+        },
+        None,
+    ))
+}
+
+/// The profile's emulation, without the `trust_anchors` extension when `plain`.
+fn profile_emulation(
+    profile: &crate::browser_profile::BrowserProfile,
+    plain: bool,
+) -> wreq::Emulation {
+    let e = profile.emulation();
+    if plain {
+        crate::trust_anchor_retry::without_trust_anchors(e)
+    } else {
+        e
+    }
+}
+
+/// State of the `trust_anchors` recovery of one request (see [`crate::trust_anchor_retry`]).
+struct TrustAnchors {
+    mem: Option<Arc<crate::trust_anchor_retry::TrustAnchorMemory>>,
+    key: String,
+    /// The first attempt is already made without the extension (remembered for this host).
+    plain_first: bool,
+    /// The first attempt sends the extension.
+    sends: bool,
+}
+
+impl TrustAnchors {
+    fn new(client: &UpstreamClient, url: &str, headers: &hyper::HeaderMap) -> Self {
+        let UpstreamClient::Wreq(_, mem) = client else {
+            return Self {
+                mem: None,
+                key: String::new(),
+                plain_first: false,
+                sends: false,
+            };
+        };
+        let key = url::Url::parse(url)
+            .ok()
+            .map(|u| {
+                format!(
+                    "{}:{}",
+                    u.host_str().unwrap_or_default().to_ascii_lowercase(),
+                    u.port_or_known_default().unwrap_or(0)
+                )
+            })
+            .unwrap_or_default();
+        let plain_first = mem.needs_plain(&key);
+        let sends = !plain_first
+            && crate::trust_anchor_retry::sends_trust_anchors(
+                &crate::browser_profile::BrowserProfile::classify(headers).emulation(),
+            );
+        Self {
+            mem: Some(mem.clone()),
+            key,
+            plain_first,
+            sends,
+        }
+    }
+
+    /// Whether `e` (of the first attempt) calls for the handshake without the extension.
+    fn should_retry(&self, e: &UpstreamError) -> bool {
+        let (true, Some(mem), UpstreamError::Wreq(w)) = (self.sends, &self.mem, e) else {
+            return false;
+        };
+        crate::trust_anchor_retry::is_cert_verify_failure(w) && mem.retry_worthwhile(&self.key)
+    }
+
+    fn note_retry(&self, e: &UpstreamError) {
+        common::faults::note(common::faults::Fault::TrustAnchorRetry, &self.key);
+        tracing::info!(
+            "Certificate verification of {} failed with trust_anchors, retrying once without the extension: {e}",
+            self.key
+        );
+    }
+
+    /// The outcome of the handshake without the extension, remembered per host.
+    fn finish<T>(
+        &self,
+        r: std::result::Result<T, UpstreamError>,
+    ) -> std::result::Result<T, UpstreamError> {
+        let Some(mem) = &self.mem else { return r };
+        match &r {
+            Ok(_) => {
+                tracing::info!(
+                    "{} verifies without trust_anchors only: dialling it without",
+                    self.key
+                );
+                mem.plain_was_needed(&self.key);
+            }
+            Err(UpstreamError::Wreq(w)) if crate::trust_anchor_retry::is_cert_verify_failure(w) => {
+                mem.plain_failed_too(&self.key);
+            }
+            Err(_) => {}
+        }
+        r
     }
 }
 
@@ -882,6 +1052,7 @@ fn idempotent(m: &hyper::Method) -> bool {
     matches!(*m, M::GET | M::HEAD | M::OPTIONS | M::PUT | M::DELETE)
 }
 
+#[allow(clippy::too_many_arguments)]
 /// One attempt. `suffix` names the connection group of a retry (never the failed connection's).
 async fn send_once(
     client: &UpstreamClient,
@@ -891,14 +1062,15 @@ async fn send_once(
     body: Option<UpstreamBody>,
     scope: Option<&UpstreamScope>,
     suffix: &str,
+    plain: bool,
 ) -> std::result::Result<UpstreamResponse, UpstreamError> {
     use futures_util::StreamExt;
     match client {
-        UpstreamClient::Wreq(c) | UpstreamClient::WreqPlain(c) => {
+        UpstreamClient::Wreq(c, _) | UpstreamClient::WreqPlain(c) => {
             // The profile is the browser's own (client hints, then User-Agent); its
             // transport fingerprint is used, but none of its headers: the browser's go
             // through as they came, in their order. The plain client has no fingerprint.
-            let browser = matches!(client, UpstreamClient::Wreq(_));
+            let browser = matches!(client, UpstreamClient::Wreq(..));
             let profile = crate::browser_profile::BrowserProfile::classify(&headers);
             let orig = crate::browser_profile::orig_headers(&profile, headers.keys());
             let mut rb = c.request(method.clone(), url);
@@ -908,7 +1080,7 @@ async fn send_once(
                 None => {}
             }
             if browser {
-                rb = rb.emulation(profile.emulation());
+                rb = rb.emulation(profile_emulation(&profile, plain));
             }
             let mut rb = rb.default_headers(false).headers(headers);
             if browser {
@@ -1117,10 +1289,12 @@ fn build_client(
     strict: bool,
     proxy: Option<Arc<crate::upstream_proxy::ProxyEndpoint>>,
 ) -> Result<UpstreamClient> {
-    build_wreq(opts, strict, proxy).map(if opts.browser_like {
-        UpstreamClient::Wreq
-    } else {
-        UpstreamClient::WreqPlain
+    build_wreq(opts, strict, proxy).map(|c| {
+        if opts.browser_like {
+            UpstreamClient::Wreq(c, Default::default())
+        } else {
+            UpstreamClient::WreqPlain(c)
+        }
     })
 }
 
