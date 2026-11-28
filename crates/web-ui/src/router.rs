@@ -36,6 +36,8 @@ pub fn AppRouter() -> impl IntoView {
                 <Route path=path!("/devices") view=|| view! { <Protected><DevicesPage /></Protected> } />
                 <Route path=path!("/extension") view=|| view! { <Protected><ExtensionPage /></Protected> } />
                 <Route path=path!("/tokens") view=|| view! { <Protected><TokensPage /></Protected> } />
+                <Route path=path!("/tokens/new") view=|| view! { <Protected><TokenNewPage /></Protected> } />
+                <Route path=path!("/tokens/:id/edit") view=|| view! { <Protected><TokenEditPage /></Protected> } />
                 <Route path=path!("/settings") view=|| view! { <Protected><SettingsPage /></Protected> } />
             </Routes>
         </Router>

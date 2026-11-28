@@ -1342,7 +1342,7 @@ fn SettingsInner() -> impl IntoView {
                     }
                     Err(e) => {
                         let (txt, bind) = match &e {
-                            ApiError::Conflict(m) => (m.clone(), true),
+                            ApiError::Conflict(m) => (m.text.clone(), true),
                             other => (other.to_string(), false),
                         };
                         for f in &dirty {

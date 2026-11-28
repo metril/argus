@@ -9,6 +9,41 @@ use web_sys::RequestCredentials;
 
 use crate::utils::api_base_url;
 
+/// A server message with the machine-readable `code` of the error envelope, when it had one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Msg {
+    pub code: Option<String>,
+    pub text: String,
+}
+
+impl std::fmt::Display for Msg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::ops::Deref for Msg {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<&str> for Msg {
+    fn from(text: &str) -> Self {
+        Self {
+            code: None,
+            text: text.to_string(),
+        }
+    }
+}
+
+impl From<String> for Msg {
+    fn from(text: String) -> Self {
+        Self { code: None, text }
+    }
+}
+
 /// API error types
 #[derive(Debug, Error, Clone)]
 pub enum ApiError {
@@ -19,16 +54,16 @@ pub enum ApiError {
     Unauthorized,
 
     #[error("Access denied: {0}")]
-    Forbidden(String),
+    Forbidden(Msg),
 
     #[error("Not found: {0}")]
-    NotFound(String),
+    NotFound(Msg),
 
     #[error("Validation error: {0}")]
-    Validation(String),
+    Validation(Msg),
 
     #[error("Conflict: {0}")]
-    Conflict(String),
+    Conflict(Msg),
 
     #[error("Rate limited - please try again later")]
     RateLimited,
@@ -38,6 +73,31 @@ pub enum ApiError {
 
     #[error("Parse error: {0}")]
     Parse(String),
+}
+
+impl ApiError {
+    /// The server's error code (`scope_escalation`, `token_expired`, ...), when it sent one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            ApiError::Forbidden(m)
+            | ApiError::NotFound(m)
+            | ApiError::Validation(m)
+            | ApiError::Conflict(m) => m.code.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The message without the "Access denied: " style prefix of `Display`.
+    pub fn text(&self) -> String {
+        match self {
+            ApiError::Forbidden(m)
+            | ApiError::NotFound(m)
+            | ApiError::Validation(m)
+            | ApiError::Conflict(m) => m.text.clone(),
+            ApiError::Network(m) | ApiError::Server(m) | ApiError::Parse(m) => m.clone(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Versioned API prefix; every path passed to the client is relative to it.
@@ -60,16 +120,22 @@ fn read_cookie(name: &str) -> Option<String> {
 
 /// Turn a response body into a readable message: the `error.message` of the standard envelope
 /// (with field details), or the raw text.
-fn error_message(text: &str) -> String {
+fn error_message(text: &str) -> Msg {
     match serde_json::from_str::<api_types::ErrorEnvelope>(text) {
         Ok(env) => {
             let mut msg = env.error.message;
             for d in env.error.details {
                 msg.push_str(&format!("; {}: {}", d.field, d.message));
             }
-            msg
+            Msg {
+                code: Some(env.error.code).filter(|c| !c.is_empty()),
+                text: msg,
+            }
         }
-        Err(_) => text.to_string(),
+        Err(_) => Msg {
+            code: None,
+            text: text.to_string(),
+        },
     }
 }
 
@@ -433,13 +499,13 @@ impl ApiClient {
             429 => Err(ApiError::RateLimited),
             500..=599 => {
                 let text = error_message(&response.text().await.unwrap_or_default());
-                Err(ApiError::Server(text))
+                Err(ApiError::Server(text.text))
             }
             _ => {
                 let text = error_message(&response.text().await.unwrap_or_default());
                 Err(ApiError::Network(format!(
                     "Unexpected status {}: {}",
-                    status, text
+                    status, text.text
                 )))
             }
         }
@@ -458,7 +524,7 @@ fn is_no_retry(path: &str) -> bool {
 
 #[cfg(test)]
 mod profile_scope_tests {
-    use super::scope_to_profile;
+    use super::{error_message, scope_to_profile, ApiError};
 
     #[test]
     fn only_profile_scoped_paths_get_the_parameter() {
@@ -478,5 +544,26 @@ mod profile_scope_tests {
         assert_eq!(scope_to_profile("/lists", "3"), "/lists");
         assert_eq!(scope_to_profile("/rules/custom", "3"), "/rules/custom");
         assert_eq!(scope_to_profile("/profiles", "3"), "/profiles");
+    }
+
+    #[test]
+    fn error_envelopes_keep_their_code_and_text() {
+        let body = r#"{"error":{"code":"token_expired","message":"Token has expired"}}"#;
+        let m = error_message(body);
+        assert_eq!(m.code.as_deref(), Some("token_expired"));
+        assert_eq!(m.text, "Token has expired");
+        let e = ApiError::Conflict(m);
+        assert_eq!(e.code(), Some("token_expired"));
+        assert_eq!(e.text(), "Token has expired");
+        assert_eq!(e.to_string(), "Conflict: Token has expired");
+        // Field details are appended to the text; a body that is not an envelope has no code.
+        let m = error_message(
+            r#"{"error":{"code":"validation_failed","message":"Invalid","details":[{"field":"name","code":"length","message":"too short"}]}}"#,
+        );
+        assert_eq!(m.text, "Invalid; name: too short");
+        let plain = error_message("gateway timeout");
+        assert_eq!((plain.code, plain.text.as_str()), (None, "gateway timeout"));
+        assert_eq!(ApiError::Network("x".into()).code(), None);
+        assert_eq!(ApiError::Forbidden("closed".into()).text(), "closed");
     }
 }

@@ -3,7 +3,10 @@
 use super::auth::MessageResponse;
 use super::client::{ApiClient, ApiError};
 
-pub use api_types::{ApiTokenInfo, CreateTokenRequest, CreatedTokenResponse, Page, Scope};
+pub use api_types::{
+    ApiTokenInfo, CreateTokenRequest, CreatedTokenResponse, Page, RegenerateTokenRequest, Scope,
+    TokenPurpose, UpdateTokenRequest,
+};
 
 impl ApiClient {
     /// List the current user's API tokens
@@ -24,23 +27,49 @@ impl ApiClient {
         .await
     }
 
+    /// Every token of the current user (revoked ones too), following the cursor to the end.
+    pub async fn list_all_tokens(&self) -> Result<Vec<ApiTokenInfo>, ApiError> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page: Page<ApiTokenInfo> = self
+                .get(&format!(
+                    "/tokens?limit=200&include_revoked=true{}",
+                    super::admin::cur(cursor.as_deref())
+                ))
+                .await?;
+            out.extend(page.items);
+            match page.next_cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => return Ok(out),
+            }
+        }
+    }
+
     /// Create a token; the returned secret is shown to the user once
     pub async fn create_token(
         &self,
-        name: &str,
-        scopes: Vec<Scope>,
-        expires_in_days: Option<u32>,
-        expires_at: Option<String>,
+        req: &CreateTokenRequest,
     ) -> Result<CreatedTokenResponse, ApiError> {
-        let req = CreateTokenRequest {
-            name: name.to_string(),
-            scopes,
-            expires_in_days,
-            expires_at,
-            profiles: None,
-            purpose: None,
-        };
-        self.post("/tokens", &req).await
+        self.post("/tokens", req).await
+    }
+
+    /// Change a token's name, access, profiles or expiry
+    pub async fn update_token(
+        &self,
+        id: &str,
+        req: &UpdateTokenRequest,
+    ) -> Result<ApiTokenInfo, ApiError> {
+        self.patch(&format!("/tokens/{id}"), req).await
+    }
+
+    /// Issue a new secret for a token; returned once
+    pub async fn regenerate_token(
+        &self,
+        id: &str,
+        req: &RegenerateTokenRequest,
+    ) -> Result<CreatedTokenResponse, ApiError> {
+        self.post(&format!("/tokens/{id}/regenerate"), req).await
     }
 
     /// Revoke a token
