@@ -41,8 +41,11 @@ old secret is still accepted, `prev_valid_until`.
 `PATCH /tokens/{id}` (`tokens:self`; `PATCH /admin/tokens/{id}` with `tokens:admin`) changes
 `name`, `scopes`, `profiles` (or `clear_profiles`), `purpose` and expiry (`expires_in_days`,
 `expires_at` or `never_expires`; one of them). Absent fields stay. Scopes and profiles are checked
-like on creation: the caller must hold every scope and cannot widen the profile restriction, so a
-token can be narrowed but never widened beyond what the caller holds.
+like on creation: the caller must hold every scope it adds and cannot widen the profile
+restriction, so a token can be narrowed but never widened beyond what the caller holds. Scopes the
+token already has may stay in a `scopes` list even when the caller no longer holds them (an owner
+who lost a role can still rename or narrow the token); adding one they do not hold is 403
+`scope_escalation`.
 
 `POST /tokens/{id}/regenerate` `{grace_secs?}` (0 to 604800, default 0) issues a new secret for the
 same token id and settings and returns it once. The old secret keeps working for `grace_secs`, then

@@ -116,6 +116,9 @@ pub fn Drawer(
     /// Extra classes on the panel (e.g. `wide`).
     #[prop(into, optional)]
     class: String,
+    /// Shown in the header right after the title (a status pill).
+    #[prop(optional)]
+    badge: Option<ChildrenFn>,
 ) -> impl IntoView {
     use_focus_return(open.into());
     use_body_scroll_lock(open.into());
@@ -151,6 +154,7 @@ pub fn Drawer(
             >
                 <div class="drawer-h">
                     <h3>{move || title.get()}</h3>
+                    {badge.clone().map(|b| b())}
                     <button type="button" class="icon-btn" aria-label="Close" on:click=move |_| open.set(false)>
                         <Icon name="x" />
                     </button>

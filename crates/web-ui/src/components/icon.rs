@@ -25,6 +25,9 @@ fn paths(name: &str) -> &'static str {
         "audit" => {
             r#"<path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3M5.5 8h5M5.5 10.5h5M5.5 13h3"/>"#
         }
+        "dots" => {
+            r#"<circle cx="3.5" cy="8" r="1"/><circle cx="8" cy="8" r="1"/><circle cx="12.5" cy="8" r="1"/>"#
+        }
         "plus" => r#"<path d="M8 3v10M3 8h10"/>"#,
         "search" => r#"<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3.5 3.5"/>"#,
         "x" => r#"<path d="M4 4l8 8M12 4l-8 8"/>"#,
@@ -41,6 +44,9 @@ fn paths(name: &str) -> &'static str {
             r#"<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.4 1.4M11.6 11.6 13 13M3 13l1.4-1.4M11.6 4.4 13 3"/>"#
         }
         "check" => r#"<path d="m3 8.5 3 3 7-7"/>"#,
+        "lock" => {
+            r#"<rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>"#
+        }
         "adblock" => {
             r#"<path d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/>"#
         }
@@ -71,6 +77,7 @@ fn paths(name: &str) -> &'static str {
         "chev-r" => r#"<path d="m6 3 5 5-5 5"/>"#,
         "chev-l" => r#"<path d="m10 3-5 5 5 5"/>"#,
         "alert" => r#"<path d="M8 2 1.5 13.5h13z"/><path d="M8 6.5v3M8 11.5v.5"/>"#,
+        "info" => r#"<circle cx="8" cy="8" r="6"/><path d="M8 7.5v3.5M8 5v.5"/>"#,
         "download" => r#"<path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M2.5 13.5h11"/>"#,
         "upload" => r#"<path d="M8 10V2M4.5 5.5 8 2l3.5 3.5M2.5 13.5h11"/>"#,
         "refresh" => {
