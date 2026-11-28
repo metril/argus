@@ -592,17 +592,46 @@ async fn the_cookie_manager_lists_edits_and_exports_a_pages_cookies() {
     .await
     .as_u64()
     .expect("the tab of the page");
-    let cm = browser
-        .new_page(format!("chrome-extension://{id}/cookies.html#tab={tab_id}"))
+    // Does this browser know partitioned cookies? (The page then must list the CHIPS cookie too.)
+    let partitioned = eval(
+        &ext_page,
+        "chrome.cookies.getAll({ partitionKey: {} }).then(() => true, () => false)",
+    )
+    .await
+        == true;
+    assert!(
+        partitioned,
+        "this Chromium rejects cookies.getAll({{partitionKey: {{}}}}); the page cannot list CHIPS cookies here"
+    );
+    // The page's own startup errors and port traffic are recorded so a failure explains itself.
+    let cm = browser.new_page("about:blank").await.unwrap();
+    cm.evaluate_on_new_document(
+        "window.__log = []; window.addEventListener('error', e => window.__log.push('error: ' + e.message)); window.addEventListener('unhandledrejection', e => window.__log.push('rejection: ' + e.reason));",
+    )
+    .await
+    .unwrap();
+    cm.goto(format!("chrome-extension://{id}/cookies.html#tab={tab_id}"))
         .await
         .unwrap();
     let names = "[...document.querySelectorAll('tr[data-row] td.nm .lnk')].map(e => e.textContent).join(',')";
-    until("the page's cookies in the table", async || {
+    let mut seen = false;
+    for _ in 0..400 {
         let n = eval(&cm, names).await;
         let s = n.as_str().unwrap_or_default();
-        s.contains("plain") && s.contains("part")
-    })
-    .await;
+        if s.contains("plain") && s.contains("part") {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !seen {
+        let diag = eval(
+            &cm,
+            "JSON.stringify({ url: location.href, log: window.__log, text: document.body.innerText.slice(0, 400) })",
+        )
+        .await;
+        panic!("the page's cookies never reached the table: {diag}");
+    }
     let row = eval(
         &cm,
         "[...document.querySelectorAll('tr[data-row]')].find(r => r.querySelector('.nm .lnk').textContent === 'part').textContent",

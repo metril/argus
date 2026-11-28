@@ -19,7 +19,7 @@ function useSite(): string {
   useEffect(() => {
     const id = tabFromHash();
     if (id === undefined) return;
-    void (globalThis as any).browser.tabs.get(id).then((t: { url?: string }) => {
+    void browser.tabs.get(id).then((t: { url?: string }) => {
       try { const u = new URL(t.url ?? ''); if (/^https?:$/.test(u.protocol)) setSite(siteOf(u.hostname)); } catch { /* not a web page */ }
     }, () => {});
   }, []);

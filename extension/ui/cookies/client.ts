@@ -89,7 +89,7 @@ export class CookieClient {
   /** `alive` says whether this extension context still exists: after an update or reload `runtime.id` is gone and no port can ever connect again. */
   constructor(private readonly connect: () => PortLike, private readonly o: { backoffMs?: number; maxBackoffMs?: number; alive?: () => boolean } = {}) {}
 
-  private isAlive(): boolean { return (this.o.alive ?? (() => !!(globalThis as any).browser?.runtime?.id))(); }
+  private isAlive(): boolean { return (this.o.alive ?? (() => !!browser.runtime?.id))(); }
 
   private markDead(): void {
     if (this.dead) return;
@@ -168,7 +168,7 @@ export class CookieClient {
   close(): void { this.closed = true; clearTimeout(this.timer); try { this.port?.disconnect(); } catch { /* gone */ } this.port = null; }
 }
 
-export const realClient = (): CookieClient => new CookieClient(() => (globalThis as any).browser.runtime.connect({ name: 'cookies' }));
+export const realClient = (): CookieClient => new CookieClient(() => browser.runtime.connect({ name: 'cookies' }));
 
 export const ClientCtx = createContext<CookieClient | null>(null);
 export function useClient(): CookieClient {

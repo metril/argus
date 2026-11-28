@@ -152,7 +152,7 @@ export function useProvenance(host: string): Provenance | undefined {
     if (fresh) { last.current = 0; have.current = new Map(); }
     let sid = '';
     try {
-      const st = (await (globalThis as any).browser.runtime.sendMessage({ type: 'bridge-status' })) as { sid?: string } | undefined;
+      const st = (await browser.runtime.sendMessage({ type: 'bridge-status' })) as { sid?: string } | undefined;
       sid = st?.sid ?? '';
     } catch { /* background not ready */ }
     const r = await fetchProvenance(s, sid, { since: Math.max(0, last.current - 1), ...(host ? { host } : {}) });
