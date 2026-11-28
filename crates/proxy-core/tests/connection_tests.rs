@@ -60,6 +60,7 @@ async fn test_server_with_mitm_enabled() {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -126,6 +127,7 @@ async fn test_server_with_mitm_disabled() {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     };
 
     // Create server with MITM disabled
@@ -184,6 +186,7 @@ async fn test_certificate_generation() {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     };
 
     // Clean up any existing CA files
@@ -273,6 +276,7 @@ async fn test_load_manager_integration() {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     };
 
     // Create server
