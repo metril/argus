@@ -105,7 +105,7 @@ export interface LogEntry {
 
 /** Result of an authenticated JSON call; `scope` means the token lacks a scope (an older extension token). */
 /** `message` is the server's error text (the body of a JSON error), when it sent one. */
-export type Call<T> = { ok: true; value: T } | { ok: false; scope: boolean; status: number; message?: string };
+export type Call<T> = { ok: true; value: T } | { ok: false; scope: boolean; status: number; message?: string; restricted?: true };
 
 async function call<T>(s: Settings, method: string, path: string, signal?: AbortSignal, extra?: { headers?: Record<string, string>; body?: unknown }): Promise<Call<T>> {
   if (!s.argusUrl || !s.token) return { ok: false, scope: false, status: 0 };
@@ -117,16 +117,18 @@ async function call<T>(s: Settings, method: string, path: string, signal?: Abort
     });
     if (res.ok) return { ok: true, value: (await res.json()) as T };
     let scope = false;
+    let restricted = false;
     let message: string | undefined;
     if (isJson(res) && !isRefused(res)) {
       // Read the body once: the envelope carries the scope code and the reason of a 400.
       try {
         const err = (await res.json())?.error;
         scope = res.status === 403 && err?.code === 'insufficient_scope';
+        restricted = res.status === 403 && err?.code === 'profile_restricted';
         if (typeof err?.message === 'string' && err.message) message = err.message.slice(0, 300);
       } catch { /* not the envelope */ }
     }
-    return { ok: false, scope, status: res.status, ...(message ? { message } : {}) };
+    return { ok: false, scope, status: res.status, ...(message ? { message } : {}), ...(restricted ? { restricted: true as const } : {}) };
   } catch {
     return { ok: false, scope: false, status: 0 };
   }
@@ -138,6 +140,16 @@ const siteUrl = (site: string) => `/rules/site-exceptions/${encodeURIComponent(s
 export const getSiteState = (s: Settings, site: string, signal?: AbortSignal) => call<{ site: string; disabled: boolean }>(s, 'GET', siteUrl(site), signal);
 /** `off` switches ad blocking off for the site (PUT), otherwise back on (DELETE). */
 export const setSiteOff = (s: Settings, site: string, off: boolean) => call<{ sites: string[] }>(s, off ? 'PUT' : 'DELETE', siteUrl(site));
+
+/** Whether Argus leaves a host undecrypted, and why (`GET /bypass/sites/{host}`). */
+export type SiteBypass = components['schemas']['SiteBypassState'];
+const bypassSiteUrl = (host: string) => `/bypass/sites/${encodeURIComponent(host)}`;
+/** A 403 with `scope: true` means the token predates `bypass:site`: offer to sign in again. */
+export const getSiteBypass = (s: Settings, host: string, signal?: AbortSignal) => call<SiteBypass>(s, 'GET', bypassSiteUrl(host), signal);
+/** Stop decrypting exactly this host; idempotent. */
+export const setSiteBypass = (s: Settings, host: string) => call<SiteBypass>(s, 'PUT', bypassSiteUrl(host));
+/** Decrypt the host again; only the extension's own entry is removed (409 for any other source). */
+export const clearSiteBypass = (s: Settings, host: string) => call<SiteBypass>(s, 'DELETE', bypassSiteUrl(host));
 
 export const fetchTimeseries = (s: Settings, range: SeriesRange, signal?: AbortSignal) => call<Series>(s, 'GET', `/stats/timeseries?range=${range}`, signal);
 

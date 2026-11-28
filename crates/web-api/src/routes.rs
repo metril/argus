@@ -135,6 +135,11 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
             bypass::update_bypass_settings
         ))
         .routes(routes!(bypass::check_host))
+        .routes(routes!(
+            bypass::get_site,
+            bypass::put_site,
+            bypass::delete_site
+        ))
         .routes(routes!(proxy::reload_config))
         // web UI HTTPS
         .routes(routes!(webui_tls::get_tls, webui_tls::put_tls))

@@ -132,7 +132,9 @@ const RESTRICTED_GLOBAL_READS: [Scope; 6] = [
 
 /// Rule for a profile-restricted token on a route that is not profile-aware (global state).
 ///
-/// - own-token and own-session management and plain authenticated routes: allowed (a token can
+/// - the per-site no-decrypt routes (`bypass:site`): reads always, writes only with access to
+///   profile `0` (the bypass list is global),
+///   own-token and own-session management and plain authenticated routes: allowed (a token can
 ///   never mint more than its parent holds, restriction included);
 /// - global reads of lists, stats, system status, CA info and the config: allowed;
 /// - custom rules are the default profile's overlay: readable only with access to profile `0`;
@@ -141,6 +143,7 @@ pub fn restricted_may_use(p: &Principal, rule: &RouteAuth, method: &Method) -> b
     if let RouteAuth::AnyOf(any) = rule {
         return any
             .iter()
+            .filter(|s| p.has(**s))
             .any(|s| restricted_may_use(p, &RouteAuth::Scopes(vec![*s]), method));
     }
     let RouteAuth::Scopes(required) = rule else {
@@ -153,6 +156,11 @@ pub fn restricted_may_use(p: &Principal, rule: &RouteAuth, method: &Method) -> b
         )
     }) {
         return true;
+    }
+    // The bypass list is global: a restricted token may read a site's state, and change it only
+    // when its profiles include the default profile.
+    if required.iter().all(|s| *s == Scope::BypassSite) {
+        return !is_unsafe(method) || p.may_access_profile("0");
     }
     if is_unsafe(method) {
         return false;
