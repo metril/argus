@@ -15,6 +15,10 @@ const P = {
   plug: 'M9 7V3M15 7V3M7 7h10v4a5 5 0 01-10 0zM12 16v5',
   copy: 'M9 9h11v11H9zM5 15V5h10',
   check: 'M5 12l5 5 9-10',
+  x: 'M6 6l12 12M18 6L6 18',
+  info: 'M3 12a9 9 0 1018 0 9 9 0 00-18 0M12 11v5M12 8v.5',
+  cookie: 'M12 3a9 9 0 109 9 4 4 0 01-4-4 4 4 0 01-5-5zM8.5 10h.01M12 15h.01M15.5 13.5h.01M9 15.5h.01',
+  back: 'M19 12H5M11 6l-6 6 6 6',
 } as const;
 
 export type IconName = keyof typeof P;

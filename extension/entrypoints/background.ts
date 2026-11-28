@@ -224,7 +224,9 @@ export default defineBackground(() => {
   }
   let liveTimer: ReturnType<typeof setInterval> | undefined;
   browser.runtime.onConnect.addListener((port: any) => {
-    if (port.name !== 'logger' || !fromExtensionPage(port.sender, browser.runtime.id, browser.runtime.getURL('/' as any))) { try { port.disconnect(); } catch { /* ignore */ } return; }
+    // Other ports (the cookie manager's) have their own listener below: never disconnect what is not ours.
+    if (port.name !== 'logger') return;
+    if (!fromExtensionPage(port.sender, browser.runtime.id, browser.runtime.getURL('/' as any))) { try { port.disconnect(); } catch { /* ignore */ } return; }
     ports.add(port);
     if (!liveTimer) liveTimer = setInterval(() => void pollLog(), 1000);
     void pollLog();
