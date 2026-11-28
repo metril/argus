@@ -240,15 +240,18 @@ async function runFirefox() {
     for (const h of await driver.getAllWindowHandles()) if (h !== home) { await driver.switchTo().window(h); await driver.close(); }
     await driver.switchTo().window(home);
     // Firefox/selenium has no addInitScript: a BiDi preload script runs the recorder before page scripts.
-    try { await (await getScriptManager([], driver)).addPreloadScript(NET_RECORDER_FN); } catch (e) { log('net recorder unavailable:', e.message.split('\n')[0]); }
+    // uBO on Firefox answers blocked no-cors fetches locally with an instant opaque response (the same host's
+    // <script> load still fails), so fetch-scored pages (turtlecute, toolz) read it as blocking nothing. For uBO only,
+    // an opaque no-cors result is confirmed with a script probe of the same URL: onerror = blocked (reject like a
+    // real block), onload/timeout = reached. Installed before the recorder so it records the verdict. Other blockers
+    // keep the unmodified fetch.
+    try {
+      const sm = await getScriptManager([], driver);
+      if (blocker === 'ubo') await sm.addPreloadScript(UBO_FF_FETCH_SHIM);
+      await sm.addPreloadScript(NET_RECORDER_FN);
+    } catch (e) { log('net recorder unavailable:', e.message.split('\n')[0]); }
     const results = [];
     for (const s of sites) {
-      if (blocker === 'ubo' && s.fetchProbe) {
-        // uBO on Firefox answers blocked no-cors fetches locally (opaque response in ~8ms, while script loads of the
-        // same host fail), so a page that scores by "fetch rejected" reads uBO as blocking nothing. Not measurable.
-        results.push({ site: s.id, url: s.url, ok: false, error: 'not measurable: uBO/Firefox resolves blocked no-cors fetches as opaque responses', score: { passed: 0, total: 0, percent: 0 }, categories: {}, tests: [], meta: {} });
-        continue;
-      }
       results.push(await measure(s, async () => {
         await driver.get(s.url);
         const r = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${extractorSource(s)}.then(cb, (e) => cb({ __error: String(e) }));`);
@@ -264,6 +267,28 @@ async function runFirefox() {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
+
+// Only an opaque response that resolved this fast was answered locally by uBO (~8 ms); a real network round trip on
+// the runner is far slower. Slower opaque responses are genuine "reached" and are never probed.
+const UBO_LOCAL_ANSWER_MS = 40;
+const UBO_FF_FETCH_SHIM = `() => {
+  const f = window.fetch;
+  if (!f || window.__argusFetchShim) return;
+  window.__argusFetchShim = true;
+  window.fetch = function (input, init) {
+    const t0 = performance.now();
+    const p = f.apply(this, arguments);
+    if (!init || init.mode !== 'no-cors') return p;
+    const url = String((input && input.url) || input);
+    return p.then((r) => r.type !== 'opaque' || performance.now() - t0 >= ${UBO_LOCAL_ANSWER_MS} ? r : new Promise((resolve, reject) => {
+      const el = document.createElement('script');
+      const done = (blocked) => { clearTimeout(to); el.remove(); blocked ? reject(new TypeError('NetworkError when attempting to fetch resource.')) : resolve(r); };
+      const to = setTimeout(() => done(false), 3000);
+      el.onerror = () => done(true); el.onload = () => done(false);
+      el.src = url; (document.head || document.documentElement).appendChild(el);
+    }));
+  };
+}`;
 
 // Each site runs PARITY_PASSES times (default 2). A run is valid only if the unblocked control host was
 // reachable; a failed or invalid run is discarded and retried once. A test counts as passed only if it passed in
