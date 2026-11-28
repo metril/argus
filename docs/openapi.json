@@ -2917,6 +2917,16 @@
             "minimum": 0,
             "type": "integer"
           },
+          "not_applicable": {
+            "description": "Meaningless for a proxy (`$popunder`).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "not_enforced": {
+            "description": "Matched by the index but not yet applied by the proxy (not counted in `active`).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "parse_errors": {
             "minimum": 0,
             "type": "integer"
@@ -6182,6 +6192,66 @@
         ],
         "type": "object"
       },
+      "SiteBypassSource": {
+        "description": "Why a host is (or is not) left undecrypted.",
+        "enum": [
+          "extension",
+          "manual",
+          "category",
+          "subscription",
+          "failsafe",
+          "none"
+        ],
+        "type": "string"
+      },
+      "SiteBypassState": {
+        "description": "Whether Argus leaves one host undecrypted, and why.\n\nAn entry made through this API covers that exact host only, never its subdomains. Extended\nValidation sites are tunnelled on top of this when `ev_auto_tunnel` is on; the certificate is\nonly known at connection time, so it is not part of `source`.",
+        "properties": {
+          "bypassed": {
+            "type": "boolean"
+          },
+          "ev_auto_tunnel": {
+            "description": "Extended Validation sites are tunnelled by the global setting.",
+            "type": "boolean"
+          },
+          "host": {
+            "description": "The normalised host (lowercase, ASCII/punycode).",
+            "type": "string"
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BypassMode"
+              }
+            ]
+          },
+          "name": {
+            "description": "Category title, subscription name, matching pattern or fail-safe reason.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "removable": {
+            "description": "The extension's own entry for this host exists and can be removed here.",
+            "type": "boolean"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SiteBypassSource"
+          }
+        },
+        "required": [
+          "host",
+          "bypassed",
+          "source",
+          "removable",
+          "ev_auto_tunnel"
+        ],
+        "type": "object"
+      },
       "SiteExceptionState": {
         "description": "Whether ad blocking is switched off for one site.",
         "properties": {
@@ -8866,7 +8936,7 @@
     },
     "x-scopes": {
       "audit:read": "Read the audit log.",
-      "bypass:site": "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists.",
+      "bypass:site": "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. A profile-restricted token can only read it, unless it includes the default profile.",
       "ca:admin": "Manage the CA certificate (reserved).",
       "ca:read": "Read CA certificate details (fingerprint, expiry, subject).",
       "config:read": "Read the proxy configuration.",
@@ -11319,6 +11389,287 @@
           }
         ],
         "summary": "Change the bypass-wide settings (applied live).",
+        "tags": [
+          "bypass"
+        ]
+      }
+    },
+    "/api/v1/bypass/sites/{host}": {
+      "delete": {
+        "operationId": "delete_site",
+        "parameters": [
+          {
+            "description": "Host name or IP address",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteBypassState"
+                }
+              }
+            },
+            "description": "The host's state after the call"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "409": {
+            "description": "Bypassed by something other than the extension's entry"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Decrypt this host again: removes only the entry the extension made. Idempotent when there is\nnone; 409 when a manual entry, subscription or category is what bypasses it.",
+        "tags": [
+          "bypass"
+        ]
+      },
+      "get": {
+        "operationId": "get_site",
+        "parameters": [
+          {
+            "description": "Host name or IP address",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteBypassState"
+                }
+              }
+            },
+            "description": "The host's state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Whether Argus leaves this host undecrypted, and why.",
+        "tags": [
+          "bypass"
+        ]
+      },
+      "put": {
+        "operationId": "put_site",
+        "parameters": [
+          {
+            "description": "Host name or IP address",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteBypassState"
+                }
+              }
+            },
+            "description": "The host's state after the call"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Stop decrypting exactly this host (not its subdomains): a no-decrypt entry marked as the\nextension's. Idempotent; a host something else already bypasses is left as it is.",
         "tags": [
           "bypass"
         ]

@@ -86,7 +86,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `rules:write` | - | yes | yes | Replace the custom rules. |
 | `rules:site` | - | yes | yes | Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules. |
 | `rules:ext` | - | yes | yes | Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules. |
-| `bypass:site` | - | yes | yes | Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. |
+| `bypass:site` | - | yes | yes | Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. A profile-restricted token can only read it, unless it includes the default profile. |
 | `engine:reload` | - | - | yes | Trigger a rebuild of the blocking engine. |
 | `stats:read` | yes | yes | yes | Read blocking, proxy and engine statistics. |
 | `logs:read` | - | yes | yes | Read the request log, live and recent (full browsing history of every client the token may see). |
@@ -198,6 +198,33 @@ disabled or the password is wrong.
   `badfiltered`, `badfilter`, or `unknown` while a rebuild is being installed.
 - `POST /rules/validate`: `{rules, format?, allowlist?}` runs the real conversion pipeline and
   reports each line as `translated`, `accepted`, `handed_off`, `skipped` or `rejected`.
+
+## Per-site no-decrypt (browser extension)
+
+`GET|PUT|DELETE /bypass/sites/{host}` back the extension's "Don't decrypt this site". Each needs
+`bypass:site` or `config:write` (`config:read` alone is refused with 403 `insufficient_scope`). The
+bypass list is global, so a profile-restricted token may only `GET`; `PUT` and `DELETE` give 403
+`profile_restricted` unless its profiles include the default profile `0`. `bypass:site` opens
+nothing else in the bypass list. At most 1000 extension entries exist: past that, `PUT` is `409`
+`site_bypass_limit` (remove entries on the Bypass page).
+
+- The host is normalised (lowercase, trailing dot dropped, IDNA to ASCII) and must be a registrable
+  host name or an IP address: no scheme, port, path, wildcard or empty label, no single label or
+  public suffix, no loopback, link-local, `localhost`, `.local`, `.internal` or `.arpa`, and not
+  Argus's own host. Anything else is `400`.
+- `GET` answers `{host, bypassed, mode, source, name, removable, ev_auto_tunnel}`. `source` is
+  `extension`, `manual`, `category` (`name` is its title), `subscription` (its name), `failsafe`
+  (the Argus lists have not loaded: HTTPS is tunnelled) or `none`. It is the lookup the proxy uses
+  for that host. Extended Validation sites are tunnelled on top of this when `ev_auto_tunnel` is
+  on; the certificate is only known at connection time.
+- `PUT` adds a `no_decrypt` entry with source `extension` for exactly that host. A plain entry does
+  not cover subdomains (`*.host` does, and is not made here). Idempotent; a host something else
+  already bypasses gets no duplicate and the current state is returned.
+- `DELETE` removes only that extension entry (200 with the state afterwards, also when there is
+  none). If a manual entry, subscription or category is what bypasses the host: `409`
+  `not_extension_entry`.
+- Changes apply live like `/bypass/entries`; open connections are not dropped. They are audited
+  (actor, token, host as target), and the entry's note names who added it.
 
 ## Recently blocked requests
 
