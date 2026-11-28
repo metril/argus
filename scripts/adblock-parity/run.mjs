@@ -256,6 +256,7 @@ async function runFirefox() {
         await driver.get(s.url);
         const r = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${extractorSource(s)}.then(cb, (e) => cb({ __error: String(e) }));`);
         if (r?.__error) throw new Error(r.__error);
+        if (blocker === 'ubo') await logShimStats(driver, s.id);
         tagNetwork(r, await driver.executeScript('return window.__argusNet || []').catch(() => []));
         r.control = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${CONTROL}.then(cb, () => cb(false));`).catch(() => false);
         return r;
@@ -268,27 +269,62 @@ async function runFirefox() {
   }
 }
 
-// Only an opaque response that resolved this fast was answered locally by uBO (~8 ms); a real network round trip on
-// the runner is far slower. Slower opaque responses are genuine "reached" and are never probed.
+// uBO answers a blocked no-cors fetch locally with an opaque response, so every opaque response is confirmed with
+// a script probe of the same host (cache-busted): onerror = candidate block, onload/timeout = reached. A server that
+// answers 4xx/non-JS also fires onerror, so an error only counts as a block when no network response was seen: Resource
+// Timing has no entry for the probe (network errors/extension cancels leave none, HTTP responses do). That
+// is checked against a calibration probe of a reached 404 (example.com); if the calibration probe leaves no entry the
+// signal is unusable and the old rule applies (opaque + onerror + answered faster than UBO_LOCAL_ANSWER_MS, which
+// under-counts when the page fires many fetches at once). Every decision is kept in window.__argusShimLog.
 const UBO_LOCAL_ANSWER_MS = 40;
 const UBO_FF_FETCH_SHIM = `() => {
   const f = window.fetch;
   if (!f || window.__argusFetchShim) return;
   window.__argusFetchShim = true;
+  const dlog = window.__argusShimLog = [];
+  try { performance.setResourceTimingBufferSize(5000); } catch (_) {}
+  const hasEntry = (u) => performance.getEntriesByName(u).length > 0;
+  const settle = () => new Promise((r) => setTimeout(r, 150));
+  const bust = (u) => u + (u.includes('?') ? '&' : '?') + '__argus_p=' + Math.random().toString(36).slice(2);
+  const probe = (u) => new Promise((resolve) => {
+    const el = document.createElement('script');
+    const done = (v) => { clearTimeout(to); el.remove(); resolve(v); };
+    const to = setTimeout(() => done('timeout'), 3000);
+    el.onerror = () => done('error'); el.onload = () => done('load');
+    el.src = u; (document.head || document.documentElement).appendChild(el);
+  });
+  let cal;
+  const calibrate = () => cal || (cal = (async () => {
+    const u = bust('https://example.com/__argus_cal.js');
+    const v = await probe(u); await settle();
+    return v === 'error' && hasEntry(u);
+  })());
   window.fetch = function (input, init) {
     const t0 = performance.now();
     const p = f.apply(this, arguments);
     if (!init || init.mode !== 'no-cors') return p;
     const url = String((input && input.url) || input);
-    return p.then((r) => r.type !== 'opaque' || performance.now() - t0 >= ${UBO_LOCAL_ANSWER_MS} ? r : new Promise((resolve, reject) => {
-      const el = document.createElement('script');
-      const done = (blocked) => { clearTimeout(to); el.remove(); blocked ? reject(new TypeError('NetworkError when attempting to fetch resource.')) : resolve(r); };
-      const to = setTimeout(() => done(false), 3000);
-      el.onerror = () => done(true); el.onload = () => done(false);
-      el.src = url; (document.head || document.documentElement).appendChild(el);
-    }));
+    return p.then(async (r) => {
+      if (r.type !== 'opaque') return r;
+      const ms = Math.round(performance.now() - t0);
+      const pu = bust(url);
+      const [v, ok] = await Promise.all([probe(pu), calibrate()]);
+      let blocked = false;
+      if (v === 'error') { await settle(); blocked = ok ? !hasEntry(pu) : ms < ${UBO_LOCAL_ANSWER_MS}; }
+      dlog.push({ host: new URL(url, location.href).host, ms, probe: v, cal: ok, blocked });
+      if (blocked) throw new TypeError('NetworkError when attempting to fetch resource.');
+      return r;
+    });
   };
 }`;
+// Logs what the shim decided on the current page (distribution of opaque-answer times, probe verdicts).
+async function logShimStats(driver, site) {
+  const d = await driver.executeScript('return window.__argusShimLog || []').catch(() => []);
+  if (!d.length) return;
+  const ms = d.map((x) => x.ms).sort((a, b) => a - b);
+  const q = (f) => ms[Math.min(ms.length - 1, Math.floor(f * ms.length))];
+  log(site, `uBO shim: ${d.length} opaque, ${d.filter((x) => x.blocked).length} converted to blocked, probe error/load/timeout ${['error', 'load', 'timeout'].map((k) => d.filter((x) => x.probe === k).length).join('/')}, calibration ${d[0].cal ? 'ok' : 'FAILED (timing fallback)'}, ms p50/p90/max ${q(0.5)}/${q(0.9)}/${ms[ms.length - 1]}`);
+}
 
 // Each site runs PARITY_PASSES times (default 2). A run is valid only if the unblocked control host was
 // reachable; a failed or invalid run is discarded and retried once. A test counts as passed only if it passed in
