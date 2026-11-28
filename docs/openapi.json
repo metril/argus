@@ -2917,6 +2917,16 @@
             "minimum": 0,
             "type": "integer"
           },
+          "not_applicable": {
+            "description": "Meaningless for a proxy (`$popunder`).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "not_enforced": {
+            "description": "Matched by the index but not yet applied by the proxy (not counted in `active`).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "parse_errors": {
             "minimum": 0,
             "type": "integer"
@@ -3457,7 +3467,7 @@
             "type": "boolean"
           },
           "attention": {
-            "description": "Needs a look: the last fetch failed, or an enabled list was never fetched or is more\nthan 7 days old.",
+            "description": "Needs a look: the last fetch failed, an enabled list was never fetched or is more than\n7 days old, or the last build found more problems in it than it tolerates (see\n`ListReport.attention`).",
             "type": "boolean"
           },
           "duplicate_count": {
@@ -3500,6 +3510,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "redundant": {
+            "description": "Every rule of the list is already provided by another rule: it adds nothing of its own.",
+            "type": "boolean"
           },
           "rule_count": {
             "minimum": 0,
@@ -3759,6 +3773,135 @@
         ],
         "type": "object"
       },
+      "ListLine": {
+        "description": "One rule of a source line, as the build treats it (`GET /lists/{id}/lines`). A line that\nemits several rules, or a `!#include`, appears once per rule with the same `line`.",
+        "properties": {
+          "ip": {
+            "description": "A `network` line that is an IP or CIDR range.",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "For `extended`: the rule kind (`replace`, `html-filter`, ...).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line": {
+            "description": "1-based line in the source text (the `!#include` line for an included rule).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "list": {
+            "description": "For `duplicate` and `covered`: the list (id) that already provides the rule.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why, for `unsupported`, `invalid` and the unenforced extended states.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rule": {
+            "description": "The rule as written.",
+            "type": "string"
+          },
+          "stage": {
+            "description": "For `invalid`: `conversion` or `compile`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "For `extended`: the state the extended-rule index gave it: `enforced`, `unsupported`,\n`invalid`, `needs_trust`, and any state the index adds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`comment` (blank, header, comment, directive), `inactive` (in a false `!#if` branch),\n`network`, `cosmetic`, `extended`, `duplicate`, `covered`, `disabled` (a domain rule a\n`$badfilter` rule switches off), `unsupported` or `invalid`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "line",
+          "status",
+          "rule"
+        ],
+        "type": "object"
+      },
+      "ListLinesPage": {
+        "description": "A page of [`ListLine`]s with the filter counts of the whole list.",
+        "properties": {
+          "counts": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Records per status for the whole list, whatever `status` and `q` are: `all`, `comment`,\n`inactive`, `network`, `cosmetic`, `extended`, `duplicate`, `covered`, `disabled`, `unsupported`,\n`invalid`, one per extended-rule state (`enforced`, `needs_trust`, `not_enforced`,\n`not_applicable`), and the groups `issues` (unsupported, invalid, needs_trust,\nnot_enforced), `applied` (network, cosmetic, enforced) and `ignored` (inactive,\ndisabled, not_applicable). `unsupported` and `invalid` include extended rules in that state.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "format": {
+            "description": "The format used (detected when the list's override is `auto`).",
+            "type": "string"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "in_build": {
+            "description": "The list was judged inside the live build. When false (disabled, or changed since the\nlast build) it was judged on its own: nothing is `duplicate` or `covered` by another list.",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ListLine"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "next_cursor": {
+            "description": "Opaque; pass it back as `cursor`. A cursor from another build or text is refused with 409\n`lines_changed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "total": {
+            "description": "Records matching `status` and `q`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_lines": {
+            "description": "Lines in the source text.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "limit",
+          "has_more",
+          "counts",
+          "format",
+          "in_build",
+          "total_lines"
+        ],
+        "type": "object"
+      },
       "ListMetaDto": {
         "description": "Header metadata (`! Title:`, `! Expires:` ...) found in a list.",
         "properties": {
@@ -3803,6 +3946,10 @@
           "allowlist": {
             "type": "boolean"
           },
+          "attention": {
+            "description": "Invalid rules (conversion errors, compiler rejections, malformed extended rules) reach 1%\nof the list's rules, rounded up, at least one. Unsupported, not-enforced and needs-trust\nrules never set it.",
+            "type": "boolean"
+          },
           "compressed": {
             "description": "Domain rules dropped because a shorter suffix rule already covers them.",
             "minimum": 0,
@@ -3815,6 +3962,11 @@
               "null"
             ]
           },
+          "conversion_errors": {
+            "description": "Lines that could not be converted into a rule (not counting `rejected`).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "cosmetic": {
             "minimum": 0,
             "type": "integer"
@@ -3824,12 +3976,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "disabled": {
+            "description": "Domain rules a `$badfilter` rule disables (not counted in `network`).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "error_count": {
+            "description": "Deprecated: `conversion_errors + rejected`. Use the two fields separately.",
             "minimum": 0,
             "type": "integer"
           },
           "ext": {
-            "description": "Parsed but not enforced yet (see `GET /rules/ext`).",
+            "description": "Extended rules handed to the extended-rule index (see `GET /rules/ext`); the four fields\nbelow split them by what the index made of them.",
             "minimum": 0,
             "type": "integer"
           },
@@ -3842,6 +4000,34 @@
               "type": "string"
             },
             "type": "object"
+          },
+          "ext_enforced": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext_invalid": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext_needs_trust": {
+            "description": "Dropped because the list is not trusted.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ext_states": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Extended rules per state, every state included (`enforced`, `unsupported`, `invalid`,\n`needs_trust`, and any the extended-rule index adds). The four fields above are the same\nfigures for the states listed first.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "ext_unsupported": {
+            "minimum": 0,
+            "type": "integer"
           },
           "format": {
             "description": "Format used (detected when the override is `auto`).",
@@ -3859,7 +4045,7 @@
             "type": "integer"
           },
           "issues": {
-            "description": "First parse issues.",
+            "description": "First parse issues, conversion errors first.",
             "items": {
               "$ref": "#/components/schemas/ReportIssueDto"
             },
@@ -3872,12 +4058,22 @@
             "minimum": 0,
             "type": "integer"
           },
+          "redundant": {
+            "description": "Everything in the list is already provided elsewhere: it contributes no rule of its own.",
+            "type": "boolean"
+          },
+          "redundant_count": {
+            "description": "Rules already provided by an earlier rule or a shorter domain rule\n(`deduped + compressed`).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "rejected": {
+            "description": "Rules the engine's compiler rejected.",
             "minimum": 0,
             "type": "integer"
           },
           "skipped": {
-            "description": "Recognised but inexpressible lines.",
+            "description": "Recognised but inexpressible lines (and AdGuard stubs dropped on purpose).",
             "minimum": 0,
             "type": "integer"
           },
@@ -5805,10 +6001,19 @@
         "description": "One problem found while building a list.",
         "properties": {
           "line": {
+            "description": "1-based line in the source text (the `!#include` line for an included rule); 0 when the\nrule could not be traced to a line.",
             "minimum": 0,
             "type": "integer"
           },
           "reason": {
+            "type": "string"
+          },
+          "rule": {
+            "description": "The rule as written in the source.",
+            "type": "string"
+          },
+          "stage": {
+            "description": "Where it failed: `conversion` (the line is not a rule) or `compile` (the engine rejected\nthe converted rule).",
             "type": "string"
           }
         },
@@ -6058,11 +6263,18 @@
             "type": "integer"
           },
           "outcome": {
-            "description": "`translated` (rewritten into engine syntax), `accepted` (used as written), `handed_off`\n(parsed but not enforced yet), `skipped` (recognised, inexpressible) or `rejected`.",
+            "description": "`translated` (rewritten into engine syntax), `accepted` (used as written), `handed_off`\n(extended rule; see `state`), `duplicate` (already provided by an earlier rule),\n`skipped` (recognised, inexpressible) or `rejected`.",
             "type": "string"
           },
           "rule": {
             "type": "string"
+          },
+          "state": {
+            "description": "For `handed_off`: `enforced`, `unsupported`, `invalid` or `needs_trust`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -6179,6 +6391,66 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "SiteBypassSource": {
+        "description": "Why a host is (or is not) left undecrypted.",
+        "enum": [
+          "extension",
+          "manual",
+          "category",
+          "subscription",
+          "failsafe",
+          "none"
+        ],
+        "type": "string"
+      },
+      "SiteBypassState": {
+        "description": "Whether Argus leaves one host undecrypted, and why.\n\nAn entry made through this API covers that exact host only, never its subdomains. Extended\nValidation sites are tunnelled on top of this when `ev_auto_tunnel` is on; the certificate is\nonly known at connection time, so it is not part of `source`.",
+        "properties": {
+          "bypassed": {
+            "type": "boolean"
+          },
+          "ev_auto_tunnel": {
+            "description": "Extended Validation sites are tunnelled by the global setting.",
+            "type": "boolean"
+          },
+          "host": {
+            "description": "The normalised host (lowercase, ASCII/punycode).",
+            "type": "string"
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BypassMode"
+              }
+            ]
+          },
+          "name": {
+            "description": "Category title, subscription name, matching pattern or fail-safe reason.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "removable": {
+            "description": "The extension's own entry for this host exists and can be removed here.",
+            "type": "boolean"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SiteBypassSource"
+          }
+        },
+        "required": [
+          "host",
+          "bypassed",
+          "source",
+          "removable",
+          "ev_auto_tunnel"
         ],
         "type": "object"
       },
@@ -8907,6 +9179,13 @@
           },
           "rules": {
             "type": "string"
+          },
+          "trusted": {
+            "description": "Judge the rules as a trusted list. Default false: untrusted rules cannot use `$replace`,\n`#%#` scripts, snippets and the like, which is the safe reading of third-party text. The\ncustom rules are built trusted, so validate those with `true`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [
@@ -8921,11 +9200,20 @@
             "minimum": 0,
             "type": "integer"
           },
+          "duplicates": {
+            "minimum": 0,
+            "type": "integer"
+          },
           "format": {
             "description": "Format used (detected when not given).",
             "type": "string"
           },
           "handed_off": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handed_off_issues": {
+            "description": "Handed-off rules that would not be enforced (unsupported, invalid or needs trust).",
             "minimum": 0,
             "type": "integer"
           },
@@ -9109,7 +9397,7 @@
     },
     "x-scopes": {
       "audit:read": "Read the audit log.",
-      "bypass:site": "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists.",
+      "bypass:site": "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. A profile-restricted token can only read it, unless it includes the default profile.",
       "ca:admin": "Manage the CA certificate (reserved).",
       "ca:read": "Read CA certificate details (fingerprint, expiry, subject).",
       "config:read": "Read the proxy configuration.",
@@ -11562,6 +11850,287 @@
           }
         ],
         "summary": "Change the bypass-wide settings (applied live).",
+        "tags": [
+          "bypass"
+        ]
+      }
+    },
+    "/api/v1/bypass/sites/{host}": {
+      "delete": {
+        "operationId": "delete_site",
+        "parameters": [
+          {
+            "description": "Host name or IP address",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteBypassState"
+                }
+              }
+            },
+            "description": "The host's state after the call"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "409": {
+            "description": "Bypassed by something other than the extension's entry"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Decrypt this host again: removes only the entry the extension made. Idempotent when there is\nnone; 409 when a manual entry, subscription or category is what bypasses it.",
+        "tags": [
+          "bypass"
+        ]
+      },
+      "get": {
+        "operationId": "get_site",
+        "parameters": [
+          {
+            "description": "Host name or IP address",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteBypassState"
+                }
+              }
+            },
+            "description": "The host's state"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Whether Argus leaves this host undecrypted, and why.",
+        "tags": [
+          "bypass"
+        ]
+      },
+      "put": {
+        "operationId": "put_site",
+        "parameters": [
+          {
+            "description": "Host name or IP address",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiteBypassState"
+                }
+              }
+            },
+            "description": "The host's state after the call"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "bearer_auth": [
+              "config:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "bypass:site"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "config:write"
+            ]
+          }
+        ],
+        "summary": "Stop decrypting exactly this host (not its subdomains): a no-decrypt entry marked as the\nextension's. Idempotent; a host something else already bypasses is left as it is.",
         "tags": [
           "bypass"
         ]
@@ -15529,6 +16098,144 @@
         ]
       }
     },
+    "/api/v1/lists/{id}/lines": {
+      "get": {
+        "description": "`profile` judges the list against that profile's engine and list set (default: the global\nengine). A list that is disabled, not in the profile, or changed since the last build is\njudged on its own (`in_build` false). Pages come from a cache of classified lists; a cursor\nfrom another build or text gets 409 `lines_changed`; `q` is at most 256 characters.\n\nLimits: `disabled` is reported for pure domain rules only (a `$badfilter` rule of another\nlist is invisible for engine rules: the build keeps rule texts as hashes and the engine\nresolves `$badfilter` on parsed filters, so such a rule is shown as `network`). The extended\nrules' state is judged per list, so a `$badfilter` in another list does not change it, and a\nrule in the same list that an `@@` exception of another list neutralises is still `enforced`.",
+        "operationId": "get_list_lines",
+        "parameters": [
+          {
+            "description": "List id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated statuses to keep: `comment`, `inactive`, `network`, `cosmetic`,\n`extended`, `duplicate`, `covered`, `unsupported`, `invalid`, an extended-rule state\n(`enforced`, `needs_trust`, `not_enforced`, `not_applicable`), or the groups `issues`\n(unsupported, invalid, needs_trust, not_enforced), `applied` (network, cosmetic, enforced)\nand `ignored` (inactive, not_applicable). Default: all.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the rule text.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, 1..=500 (default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListLinesPage"
+                }
+              }
+            },
+            "description": "A page of lines"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "404": {
+            "description": "No such list, or it has no text yet"
+          },
+          "409": {
+            "description": "The cursor belongs to another build (`lines_changed`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:read"
+            ]
+          }
+        ],
+        "summary": "Every line of a list's source text with the build's verdict: the rule's status (comment,\ninactive, network, cosmetic, extended, duplicate, covered, disabled, unsupported, invalid),\ntrue source line numbers, and counts per status for the whole list. The custom rules are\n`GET /rules/custom/lines` (they need `rules:read`).",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
     "/api/v1/lists/{id}/refresh": {
       "post": {
         "operationId": "refresh_list",
@@ -18752,6 +19459,131 @@
         ]
       }
     },
+    "/api/v1/rules/custom/lines": {
+      "get": {
+        "operationId": "get_custom_lines",
+        "parameters": [
+          {
+            "description": "Profile id (decimal). Omitted: the default profile, `0`.",
+            "in": "query",
+            "name": "profile",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated statuses to keep: `comment`, `inactive`, `network`, `cosmetic`,\n`extended`, `duplicate`, `covered`, `unsupported`, `invalid`, an extended-rule state\n(`enforced`, `needs_trust`, `not_enforced`, `not_applicable`), or the groups `issues`\n(unsupported, invalid, needs_trust, not_enforced), `applied` (network, cosmetic, enforced)\nand `ignored` (inactive, not_applicable). Default: all.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive substring of the rule text.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`next_cursor` of the previous page.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, 1..=500 (default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListLinesPage"
+                }
+              }
+            },
+            "description": "A page of lines"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "409": {
+            "description": "The cursor belongs to another build (`lines_changed`)"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:read"
+            ]
+          }
+        ],
+        "summary": "The lines of the custom rules (of the profile's own rules with `profile`), as\n`GET /lists/{id}/lines`. Needs `rules:read`, like `GET /rules/custom`.",
+        "tags": [
+          "rules"
+        ]
+      }
+    },
     "/api/v1/rules/custom/report": {
       "get": {
         "operationId": "get_custom_report",
@@ -19523,7 +20355,7 @@
             ]
           }
         ],
-        "summary": "Dry-run through the real conversion pipeline for `format`: per-line translated / handed off /\nskipped / rejected. Nothing is stored or installed.",
+        "summary": "Dry-run through the same per-line classifier as `GET /lists/{id}/lines`, standalone: per-line\ntranslated / accepted / handed off (with its state) / duplicate / skipped / rejected, as a\nbuild would treat the rules. `trusted` defaults to false (safe for third-party text); pass\n`true` to judge the user's own custom rules, which are built trusted.\nNothing is stored or installed.",
         "tags": [
           "rules"
         ]

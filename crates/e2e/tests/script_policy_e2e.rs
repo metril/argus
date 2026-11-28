@@ -288,6 +288,29 @@ e2e_test!(
     }
 );
 
+// The policy judges the URL the browser will fetch, not the raw markup: character references in
+// `src` do not hide a blocked script.
+e2e_test!(
+    strip_mode_decodes_character_references_in_urls,
+    rules = [],
+    |env| {
+        enable(&env, |s| s.strip_blocked_scripts = true);
+        env.origin.route(
+            "/p",
+            MockResponse::html(
+                "<!doctype html><html><head><script src=\"&#104;ttps://cdn.test/a.js\"></script><script src=\"https&#58;//cdn.test/b.js\"></script><script src=\"&#47;own.js\"></script></head><body>x</body></html>",
+            ),
+        );
+        let body = page(&env, &env.client(), "app.test", "/p")
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(!body.contains("cdn.test"), "{body}");
+        assert!(body.contains("own.js"), "first-party stays: {body}");
+    }
+);
+
 #[tokio::test]
 async fn temporary_grant_expiry_flips_behaviour_without_restart() {
     let origin = e2e::TestOrigin::start().await;

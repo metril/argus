@@ -130,6 +130,12 @@ impl ListService {
         self.sets.builds.load(Ordering::Acquire)
     }
 
+    /// Whether the live engine of `key` was built from the stored state of its lists as it is now.
+    pub(crate) fn set_is_current(&self, key: &SetKey) -> bool {
+        let built = self.sets.engines.lock().get(key).map(|e| e.sig.clone());
+        built.is_some_and(|s| s == self.current_sig(key))
+    }
+
     /// Signature of the stored state of each member list.
     fn current_sig(&self, key: &SetKey) -> Vec<String> {
         key.ids()

@@ -32,6 +32,8 @@ pub struct ListCompileStats {
     pub rejected: usize,
     /// First [`MAX_ERRORS`] rejections as `(line in the converted rule text, reason)`.
     pub errors: Vec<(usize, String)>,
+    /// The rejected rule text of each entry of [`Self::errors`].
+    pub error_rules: Vec<String>,
     pub ext_rules: Vec<ExtRule>,
     /// `$redirect` / `$redirect-rule` rules naming a resource that is not loaded (only counted
     /// when the known names were supplied, see [`compile_lists_checked`]). adblock-rust turns
@@ -128,6 +130,7 @@ fn parse_chunk(
                     out.stats.rejected += 1;
                     if out.stats.errors.len() < MAX_ERRORS {
                         out.stats.errors.push((first_line + i + 1, e.to_string()));
+                        out.stats.error_rules.push(line.to_string());
                     }
                 }
             },
@@ -194,9 +197,10 @@ pub fn compile_lists_checked(
             }
         }
         s.ext_rules.extend(o.stats.ext_rules);
-        for e in o.stats.errors {
+        for (e, r) in o.stats.errors.into_iter().zip(o.stats.error_rules) {
             if s.errors.len() < MAX_ERRORS {
                 s.errors.push(e);
+                s.error_rules.push(r);
             }
         }
         net.extend(o.net);
@@ -216,7 +220,7 @@ pub fn compile_lists_checked(
 
 /// Where a rule line goes.
 #[derive(Debug, PartialEq, Eq)]
-enum Route<'a> {
+pub(crate) enum Route<'a> {
     Suffix(&'a str),
     Exact(Scheme, &'a str),
     BadSuffix(&'a str),
@@ -235,7 +239,7 @@ fn split_tail(body: &str) -> Option<(&str, bool)> {
 /// Classify one trimmed rule line: `||host^` and `|scheme://host^` (optionally with only
 /// `$badfilter`) go to the domain set; everything else, including anything with another option,
 /// an exception, an uppercase or unusual host, stays with the engine.
-fn route(line: &str) -> Route<'_> {
+pub(crate) fn route(line: &str) -> Route<'_> {
     let Some(rest) = line.strip_prefix('|') else {
         return Route::Engine;
     };

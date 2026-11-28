@@ -25,7 +25,7 @@ use crate::state::{blocking, AppState};
 
 fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> FilterListResponse {
     let status = state.filter_store.get_status(&list.id).unwrap_or_default();
-    let attention = needs_attention(list, status.last_error.is_some());
+    let attention = needs_attention(list, status.last_error.is_some()) || list.report_attention;
     FilterListResponse {
         id: list.id.clone(),
         name: list.name.clone(),
@@ -40,10 +40,13 @@ fn filter_list_response(state: &AppState, list: &filter_engine::FilterList) -> F
         allowlist: list.allowlist,
         trusted: list.trusted,
         attention,
+        redundant: list.redundant,
     }
 }
 
-/// A fetch error, or an enabled list that was never fetched / is over 7 days old.
+/// A fetch error, or an enabled list that was never fetched / is over 7 days old. (The caller
+/// also flags a list whose last build found too many problems in it, see
+/// `filter_engine::ListReport::attention`.)
 fn needs_attention(list: &filter_engine::FilterList, has_error: bool) -> bool {
     has_error
         || (list.enabled
@@ -522,19 +525,35 @@ pub(crate) fn report_dto(
         network: r.network,
         cosmetic: r.cosmetic,
         ext: r.ext,
+        ext_enforced: r.ext_enforced,
+        ext_unsupported: r.ext_unsupported,
+        ext_invalid: r.ext_invalid,
+        ext_needs_trust: r.ext_needs_trust,
+        ext_states: r.ext_states.clone(),
         skipped: r.skipped,
         deduped: r.duplicates,
         compressed: r.compressed,
         translated: r.translated,
         rejected: r.rejected,
+        disabled: r.disabled,
         ip_ranges: r.ip_ranges,
-        error_count: r.error_count,
+        error_count: r.error_count + r.rejected,
+        conversion_errors: r.error_count,
+        redundant_count: r.redundant_count,
+        redundant: r.redundant,
+        attention: r.attention,
         issues: r
             .errors
             .iter()
             .map(|e| ReportIssueDto {
                 line: e.line,
+                rule: e.rule.clone(),
                 reason: e.reason.clone(),
+                stage: match e.stage {
+                    filter_engine::IssueStage::Conversion => "conversion",
+                    filter_engine::IssueStage::Compile => "compile",
+                }
+                .into(),
             })
             .collect(),
         ext_counts: r.ext_counts.clone(),
@@ -633,6 +652,8 @@ fn ext_stats_dto(s: &ext_rules::ExtStats) -> api_types::ExtStatsDto {
                         unsupported: v.unsupported,
                         parse_errors: v.parse_errors,
                         badfiltered: v.badfiltered,
+                        not_enforced: v.not_enforced,
+                        not_applicable: v.not_applicable,
                     },
                 )
             })

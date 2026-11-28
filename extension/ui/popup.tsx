@@ -7,7 +7,9 @@ import { registrableDomain, type TabStats } from '../lib/stats';
 import { Scripts } from './scripts';
 import { resolveState } from '../lib/state';
 import { AccountBar, ErrorBanner, Header, Icon, SignInForm, SiteCard, Skeleton, BrowserCard } from './components';
-import { PageStats, StatsView, ScopeNotice, SiteSwitch } from './pagestats';
+import { PageStats, StatsView, ScopeNotice, SiteNotes, SiteToggle, useSiteSwitch } from './pagestats';
+import { Segmented } from './cookies/kit';
+import { SiteBypassRow, useSiteBypass } from './sitebypass';
 import { SiteRulesCard, useSiteRules } from './siterules';
 import { hostLabel, isSignedIn, settings } from './store';
 
@@ -96,6 +98,8 @@ export function App() {
 
   const siteKey = registrableDomain(plainHost(tabUrl));
   const sr = useSiteRules(signed ? s : null, siteKey, () => setNeedScope(true));
+  const bp = useSiteBypass(s ?? { argusUrl: '', token: '' }, signed ? plainHost(tabUrl) : '');
+  const sw = useSiteSwitch(s ?? { argusUrl: '', token: '' }, signed ? siteKey : '', () => setNeedScope(true));
   if (s === null || tab === undefined) return <div class="pop"><Header /><div class="main"><Skeleton /></div></div>;
   const r = resolveState({ configured: signed, ...(tabUrl ? { tabUrl } : {}), ...(lookup ? { lookup } : {}) });
   if (r.view === 'signin' || switching) {
@@ -118,27 +122,32 @@ export function App() {
           }} />
         )}
         {needScope && <ScopeNotice onSignIn={() => setSwitching(true)} />}
-        <div class="seg" role="group" aria-label="View">
-          <button type="button" aria-pressed={view === 'actions'} onClick={() => setView('actions')}>Actions</button>
-          <button type="button" aria-pressed={view === 'stats'} onClick={() => setView('stats')}>Statistics</button>
-        </div>
+        <Segmented<'actions' | 'stats'> label="View" cls="wide" value={view} onChange={setView} options={[{ v: 'actions', l: 'Actions' }, { v: 'stats', l: 'Statistics' }]} />
         {view === 'stats' ? <StatsView key={s.token} settings={s} onScope={() => setNeedScope(true)} /> : <>
-        <SiteCard host={host} site={r.site} route={inter} />
-        <PageStats stats={stats} site={site} sr={sr} />
-        {tabId !== undefined && <button type="button" class="btn" data-testid="open-logger" onClick={() => { void browser.tabs.create({ url: `${browser.runtime.getURL('/logger.html' as any)}#tab=${tabId}` }); window.close(); }}>Open logger</button>}
-        {tabId !== undefined && site && (
-          <div class="seg" role="group" aria-label="Pick elements">
-            <button type="button" data-testid="pick" onClick={() => void arm(tabId, 'picker')}>Block an element</button>
-            <button type="button" data-testid="zap" onClick={() => void arm(tabId, 'zapper')}>Zap elements</button>
-          </div>
-        )}
+        <SiteCard
+          host={host} site={r.site} route={inter}
+          right={site ? <SiteToggle site={site} st={sw} /> : undefined}
+          foot={<SiteNotes st={sw} reload={() => { if (tabId !== undefined) void browser.tabs.reload(tabId); window.close(); }} />}
+        >
+          {r.site.kind !== 'none' && <PageStats stats={stats} site={site} sr={sr} bare />}
+        </SiteCard>
+        {r.site.kind === 'none' && <PageStats stats={stats} site={site} sr={sr} />}
+        <div class="pgrid" data-testid="actions">
+          <button type="button" class="btn" data-testid="open-logger" disabled={tabId === undefined} onClick={() => { if (tabId !== undefined) { void browser.tabs.create({ url: `${browser.runtime.getURL('/logger.html' as any)}#tab=${tabId}` }); window.close(); } }}>Open logger</button>
+          <button type="button" class="btn" data-testid="open-cookies" disabled={tabId === undefined} onClick={() => { if (tabId !== undefined) { void browser.tabs.create({ url: `${browser.runtime.getURL('/cookies.html' as any)}#tab=${tabId}` }); window.close(); } }}><Icon n="cookie" size={14} />Cookies</button>
+          <button type="button" class="btn" data-testid="pick" disabled={tabId === undefined || !site} onClick={() => { if (tabId !== undefined) void arm(tabId, 'picker'); }}>Block an element</button>
+          <button type="button" class="btn" data-testid="zap" disabled={tabId === undefined || !site} onClick={() => { if (tabId !== undefined) void arm(tabId, 'zapper'); }}>Zap elements</button>
+        </div>
+        {/* Full-width rows that belong under the grid go here. */}
+        <div class="pslot" data-testid="actions-slot">
+          {site && <SiteBypassRow st={bp} reload={() => { if (tabId !== undefined) void browser.tabs.reload(tabId); }} onSignIn={() => setSwitching(true)} />}
+        </div>
         {armErr && <div class="note" data-testid="arm-error">Could not start on this page.</div>}
         {site && <SiteRulesCard site={site} sr={sr} />}
-        {site && <SiteSwitch key={`${tabId}|${site}`} settings={s} site={site} onScope={() => setNeedScope(true)} reload={() => { if (tabId !== undefined) void browser.tabs.reload(tabId); window.close(); }} />}
         <Scripts state={menu} reload={() => setN(n + 1)} />
         <section class="sec">
           <div class="lbl">This browser</div>
-          <BrowserCard />
+          <BrowserCard inline />
         </section>
         </>}
       </main>

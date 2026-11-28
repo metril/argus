@@ -928,10 +928,14 @@ pub struct FilterListResponse {
     /// `#%#` scripts, snippets, unknown scriptlets); untrusted lists have those dropped.
     #[serde(default)]
     pub trusted: bool,
-    /// Needs a look: the last fetch failed, or an enabled list was never fetched or is more
-    /// than 7 days old.
+    /// Needs a look: the last fetch failed, an enabled list was never fetched or is more than
+    /// 7 days old, or the last build found more problems in it than it tolerates (see
+    /// `ListReport.attention`).
     #[serde(default)]
     pub attention: bool,
+    /// Every rule of the list is already provided by another rule: it adds nothing of its own.
+    #[serde(default)]
+    pub redundant: bool,
 }
 
 /// Filter lists per status, for the current search text.

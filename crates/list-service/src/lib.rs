@@ -6,6 +6,7 @@
 
 mod argus;
 mod error;
+pub mod inspect;
 mod persist;
 mod report;
 mod scriptlets;
@@ -29,7 +30,7 @@ pub use signed::{
     CatalogueDoc, Collection, FilterCatalogueEntry, Loaded, Origin, SignedDoc, SignedStatus,
     UserscriptCatalogueEntry,
 };
-pub use store::{ListStatus, ListStore};
+pub use store::{ListStatus, ListStore, CUSTOM_REPORT_ID};
 
 /// Re-exported so API code needs no direct `filter-engine` dependency for these.
 pub use filter_engine::{ExtKind, ExtRule, ListFormat, ListMeta, ListReport, ReportIssue};

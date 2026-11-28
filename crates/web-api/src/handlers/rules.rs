@@ -73,100 +73,100 @@ pub async fn update_custom_rules(
 /// Max rule lines dry-run in one request.
 const MAX_VALIDATE_LINES: usize = 20_000;
 
-/// Run each line through the real conversion pipeline for `format` (detected from the whole text
-/// when `Auto`) and the engine's rule compiler, without installing anything. Each non-comment
-/// line is reported as translated, accepted, handed off, skipped or rejected.
+/// Run `text` through the same classifier the line viewer uses, standalone: format detection (when
+/// `Auto`), the `!#if` preprocessor with the list's trust, conversion, the allowlist rewrite,
+/// duplicate and covered-host detection among the lines, and the engine's own parser, so each
+/// line gets the verdict a build would give it. `trusted` is how the rules are judged: the
+/// custom rules are built trusted, so callers validating those pass `true`. Comments, blank lines and lines in an
+/// inactive `!#if` branch are left out.
 pub fn validate_rules(
     text: &str,
     format: filter_engine::ListFormat,
     allowlist: bool,
+    trusted: bool,
 ) -> ValidateRulesResponse {
-    use filter_engine::{compile_lists, convert, detect, ConvertOptions, ListFormat};
-    let used = if format == ListFormat::Auto {
-        detect(text)
-    } else {
-        format
-    };
-    let opts = ConvertOptions {
-        format: used,
-        allowlist,
-        includes: Default::default(),
-    };
-    struct Row<'a> {
-        line: usize,
-        raw: &'a str,
-        conv: filter_engine::Converted,
-    }
-    let rows: Vec<Row> = text
+    use filter_engine::inspect::{ExtClass, ExtState, Kind};
+    let text: String = text
         .lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
         .take(MAX_VALIDATE_LINES)
-        .map(|(i, l)| Row {
-            line: i + 1,
-            raw: l.trim(),
-            conv: convert(l, &opts),
-        })
-        .collect();
-    let texts: Vec<&str> = rows.iter().map(|r| r.conv.rules.as_str()).collect();
-    let compiled = compile_lists(&texts);
+        .collect::<Vec<_>>()
+        .join("\n");
+    let c = list_service::inspect::classify_text(&text, format, allowlist, trusted);
     let mut lines = Vec::new();
-    for (r, cs) in rows.iter().zip(&compiled.per_list) {
-        let st = &r.conv.stats;
-        let (outcome, error): (&str, Option<String>) = if st.error_count > 0 {
-            (
-                "rejected",
-                st.errors
-                    .first()
-                    .map(|e| e.1.clone())
-                    .or(Some("invalid rule".into())),
-            )
-        } else if let Some(e) = r.conv.ext.first() {
-            ("handed_off", Some(e.kind.as_str().to_string()))
-        } else if cs.rejected > 0 {
-            (
-                "rejected",
-                cs.errors
-                    .first()
-                    .map(|e| e.1.clone())
-                    .or(Some("rejected by the engine".into())),
-            )
-        } else if let Some(e) = cs.ext_rules.first() {
-            ("handed_off", Some(e.kind.as_str().to_string()))
-        } else if !r.conv.ip_block.is_empty() || !r.conv.ip_allow.is_empty() {
-            ("accepted", None)
-        } else if r.conv.rules.trim().is_empty() {
-            if st.skipped == 0 {
-                continue; // comment or header line
+    for r in &c.records {
+        let reason = c.reason(r).map(str::to_string);
+        let (outcome, state, error): (&str, Option<&str>, Option<String>) = match r.kind {
+            Kind::Comment | Kind::Inactive => continue,
+            Kind::Network | Kind::Cosmetic if r.translated => ("translated", None, None),
+            Kind::Network | Kind::Cosmetic => ("accepted", None, None),
+            Kind::Extended => {
+                let st = r.ext_state().unwrap_or(ExtState::ENFORCED);
+                let kind = r.ext_kind.map_or("other", |k| k.as_str());
+                (
+                    "handed_off",
+                    Some(st.as_str()),
+                    Some(match &reason {
+                        Some(why) => format!("{kind}: {why}"),
+                        None => kind.to_string(),
+                    }),
+                )
             }
-            ("skipped", st.skipped_reasons.keys().next().cloned())
-        } else if st.translated > 0 {
-            ("translated", None)
-        } else {
-            ("accepted", None)
+            Kind::Duplicate | Kind::Covered => (
+                "duplicate",
+                None,
+                Some(if r.kind == Kind::Covered {
+                    "covered by a shorter domain rule".to_string()
+                } else {
+                    "already provided by an earlier rule".to_string()
+                }),
+            ),
+            Kind::Disabled => (
+                "skipped",
+                None,
+                Some("disabled by a $badfilter rule".to_string()),
+            ),
+            Kind::Unsupported => ("skipped", None, reason.or(Some("unsupported".into()))),
+            Kind::Invalid => ("rejected", None, reason.or(Some("invalid rule".into()))),
         };
+        let unusable = outcome == "rejected" || state == Some("invalid");
         lines.push(RuleLineResult {
-            line: r.line,
-            rule: r.raw.to_string(),
+            line: r.line as usize,
+            rule: c.rule(r).trim().to_string(),
             outcome: outcome.to_string(),
-            accepted: outcome != "rejected",
+            state: state.map(str::to_string),
+            accepted: !unusable,
             error,
         });
     }
     let count = |o: &str| lines.iter().filter(|l| l.outcome == o).count();
     ValidateRulesResponse {
-        format: used.as_str().to_string(),
+        format: c.format.as_str().to_string(),
         translated: count("translated"),
         handed_off: count("handed_off"),
+        handed_off_issues: lines
+            .iter()
+            .filter(|l| {
+                l.outcome == "handed_off"
+                    && l.state.as_deref().is_some_and(|s| {
+                        ExtState::from_name(s).is_none_or(|s| {
+                            matches!(s.class(), ExtClass::Problem | ExtClass::NotApplied)
+                        })
+                    })
+            })
+            .count(),
+        duplicates: count("duplicate"),
         skipped: count("skipped"),
         rejected: count("rejected"),
-        accepted: lines.len() - count("rejected"),
+        accepted: lines.iter().filter(|l| l.accepted).count(),
         lines,
     }
 }
 
-/// Dry-run through the real conversion pipeline for `format`: per-line translated / handed off /
-/// skipped / rejected. Nothing is stored or installed.
+/// Dry-run through the same per-line classifier as `GET /lists/{id}/lines`, standalone: per-line
+/// translated / accepted / handed off (with its state) / duplicate / skipped / rejected, as a
+/// build would treat the rules. `trusted` defaults to false (safe for third-party text); pass
+/// `true` to judge the user's own custom rules, which are built trusted.
+/// Nothing is stored or installed.
 #[utoipa::path(
     post, path = "/rules/validate", tag = "rules",
     security(("bearer_auth" = ["rules:read"])),
@@ -187,7 +187,8 @@ pub async fn validate(
         .map_err(ApiError::ValidationError)?
         .unwrap_or_default();
     let allow = req.allowlist.unwrap_or(false);
-    let out = blocking(move || Ok(validate_rules(&req.rules, format, allow))).await?;
+    let trusted = req.trusted.unwrap_or(false);
+    let out = blocking(move || Ok(validate_rules(&req.rules, format, allow, trusted))).await?;
     Ok(Json(out))
 }
 
@@ -243,6 +244,7 @@ mod tests {
             "! comment\n\n||ads.example.com^\nexample.com##.banner\n||bad$unknownoption=1\n",
             filter_engine::ListFormat::Auto,
             false,
+            true,
         );
         assert_eq!(r.accepted + r.rejected, r.lines.len());
         assert!(r.lines[0].accepted);

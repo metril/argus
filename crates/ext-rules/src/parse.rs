@@ -7,11 +7,14 @@ use crate::cookie::CookieSpec;
 use crate::headers::is_removable_header;
 use crate::hls::HlsPrune;
 use crate::jsonprune::JsonPrune;
+use crate::location::Location;
 use crate::pattern::Pattern;
 use crate::removeparam::RemoveParam;
 use crate::replace::ReplaceSpec;
-use crate::util::{host_is_or_under, DomainSet};
+use crate::urlskip::UrlSkip;
+use crate::util::{compile_slash_regex, host_is_or_under, DomainSet};
 use crate::xmlprune::XmlPrune;
+use std::net::IpAddr;
 
 /// Bit set of rule behaviours; exceptions carry a mask of what they disable.
 pub mod target {
@@ -36,7 +39,15 @@ pub mod target {
     /// Exception only: `$stealth`. Not part of [`ALL`] (a `$document` exception leaves Stealth
     /// Mode on).
     pub const STEALTH: u32 = 1 << 17;
-    pub const ALL: u32 = (1 << 17) - 1;
+    /// `$redirect=` / `$redirect-rule=` (and their exceptions).
+    pub const REDIRECT: u32 = 1 << 18;
+    /// `$urlskip=` (and its exceptions).
+    pub const URLSKIP: u32 = 1 << 19;
+    /// Exception only: `$generichide` switches off generic (not host-specific) cosmetics.
+    pub const GENERICHIDE: u32 = 1 << 20;
+    /// Exception only: `$genericblock` switches off generic network rules.
+    pub const GENERICBLOCK: u32 = 1 << 21;
+    pub const ALL: u32 = ((1 << 17) - 1) | REDIRECT | URLSKIP | GENERICHIDE | GENERICBLOCK;
 }
 
 /// Stage bits: when a rule is evaluated.
@@ -55,12 +66,14 @@ pub enum RuleError {
     Unsupported(String),
     /// A style block that could load resources or escape the declaration list.
     Unsafe(String),
+    /// Well-formed, but meaningless for a proxy (`$popunder`: needs the browser's window state).
+    NotApplicable(String),
 }
 
 impl RuleError {
     pub fn reason(&self) -> &str {
         match self {
-            Self::Invalid(s) | Self::Unsupported(s) | Self::Unsafe(s) => s,
+            Self::Invalid(s) | Self::Unsupported(s) | Self::Unsafe(s) | Self::NotApplicable(s) => s,
         }
     }
 }
@@ -71,6 +84,7 @@ impl std::fmt::Display for RuleError {
             Self::Invalid(s) => write!(f, "invalid: {s}"),
             Self::Unsupported(s) => write!(f, "unsupported: {s}"),
             Self::Unsafe(s) => write!(f, "unsafe: {s}"),
+            Self::NotApplicable(s) => write!(f, "not applicable: {s}"),
         }
     }
 }
@@ -305,6 +319,14 @@ pub enum Action {
     Header(HeaderMatch),
     HtmlRemove(HtmlRemoval),
     Inject(Injection),
+    /// `$redirect=name` (blocks and redirects) / `$redirect-rule=name` (`rule_only`: redirects a
+    /// request something else blocks).
+    Redirect {
+        resource: String,
+        rule_only: bool,
+    },
+    /// `$urlskip=`: navigate to the URL extracted from the matching URL.
+    UrlSkip(UrlSkip),
     /// An exception: disables rules whose [`target`] bit is in `mask` and whose
     /// [`ParsedRule::value`] equals the exception's (an empty value disables all of them).
     Disable {
@@ -333,6 +355,8 @@ impl Action {
             Self::Inject(Injection::Scriptlet { .. }) => SCRIPTLET,
             Self::Inject(Injection::Snippet(_)) => SNIPPET,
             Self::Inject(Injection::ProceduralCss { .. }) => PCSS,
+            Self::Redirect { .. } => REDIRECT,
+            Self::UrlSkip(_) => URLSKIP,
             Self::Disable { .. } => 0,
         }
     }
@@ -343,6 +367,75 @@ pub(crate) enum Party {
     Any,
     Third,
     First,
+    /// `$strict1p`: request and page share the exact hostname.
+    StrictFirst,
+    /// `$strict3p`: request and page hostnames differ.
+    StrictThird,
+}
+
+/// `$ipaddress=` condition on the resolved upstream address (uBO "Static filter syntax").
+#[derive(Debug, Clone)]
+pub(crate) enum IpCond {
+    Exact(IpAddr),
+    /// `1.2.*`: textual prefix.
+    Prefix(String),
+    Regex(regex::Regex),
+    /// `lan`: private / link-local / unique-local ranges.
+    Lan,
+    Loopback,
+}
+
+impl IpCond {
+    pub fn parse(v: &str) -> Result<Self, String> {
+        let v = v.trim();
+        match v {
+            "lan" => return Ok(Self::Lan),
+            "loopback" => return Ok(Self::Loopback),
+            _ => {}
+        }
+        if v.starts_with('/') {
+            return compile_slash_regex(v, false).map(Self::Regex);
+        }
+        if let Some(p) = v.strip_suffix('*') {
+            if p.is_empty()
+                || !p
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() || c == b'.' || c == b':')
+            {
+                return Err(format!("bad ipaddress prefix `{v}`"));
+            }
+            return Ok(Self::Prefix(p.to_ascii_lowercase()));
+        }
+        v.trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .map(|a| match a {
+                IpAddr::V6(x) => x.to_ipv4_mapped().map_or(a, IpAddr::V4),
+                v4 => v4,
+            })
+            .map(Self::Exact)
+            .map_err(|_| format!("bad ipaddress `{v}`"))
+    }
+
+    pub fn matches(&self, ip: IpAddr) -> bool {
+        // `::ffff:1.2.3.4` is judged as the IPv4 address it carries.
+        let ip = match ip {
+            IpAddr::V6(a) => a.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match self {
+            Self::Exact(a) => *a == ip,
+            Self::Prefix(p) => ip.to_string().starts_with(p.as_str()),
+            Self::Regex(r) => r.is_match(&ip.to_string()),
+            Self::Loopback => ip.is_loopback(),
+            Self::Lan => match ip {
+                IpAddr::V4(a) => a.is_private() || a.is_link_local(),
+                IpAddr::V6(a) => {
+                    let s = a.segments()[0];
+                    (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -356,6 +449,10 @@ pub(crate) struct NetMatch {
     pub methods_in: Vec<String>,
     pub methods_out: Vec<String>,
     pub popup: bool,
+    /// `$ipaddress=`: matches only with a known upstream address.
+    pub ip: Option<IpCond>,
+    /// `$cname`: matches the CNAME-uncloaked hostname, never the request's own.
+    pub cname: bool,
 }
 
 impl NetMatch {
@@ -390,9 +487,27 @@ pub struct ParsedRule {
     pub(crate) net: Option<NetMatch>,
     /// Page-domain scope of cosmetic rules.
     pub(crate) dom: Option<DomainSet>,
+    /// AdGuard `[$path=…]` / `[$domain=…]` prefix conditions of cosmetic rules (ANDed with `dom`).
+    pub(crate) loc: Option<Location>,
 }
 
 impl ParsedRule {
+    /// Does this page-scoped rule apply to the document at `host` with path plus query `pq`?
+    pub(crate) fn applies_to_page(&self, host: &str, pq: &str) -> bool {
+        self.dom.as_ref().is_some_and(|d| d.matches(host))
+            && self.loc.as_ref().is_none_or(|l| l.matches(host, pq))
+    }
+
+    /// A cosmetic / injection rule with no host or location restriction.
+    pub(crate) fn is_generic_cosmetic(&self) -> bool {
+        self.net.is_none()
+            && self.dom.as_ref().is_some_and(|d| d.include.is_empty())
+            && matches!(
+                self.action,
+                Action::Inject(Injection::ProceduralCss { .. }) | Action::HtmlRemove(_)
+            )
+    }
+
     /// Behaviour bit(s): the action's target, or the mask an exception disables.
     pub fn target_mask(&self) -> u32 {
         match &self.action {
@@ -402,21 +517,20 @@ impl ParsedRule {
     }
 }
 
-/// Split options on unescaped commas; `\,` becomes `,`.
+/// `'…'` -> `…` (uBO quotes a `replace=` value that holds commas).
+fn unquote_single(v: &str) -> &str {
+    v.strip_prefix('\'')
+        .and_then(|r| r.strip_suffix('\''))
+        .unwrap_or(v)
+}
+
+/// Split options on unescaped commas (`\,` becomes `,`), keeping regex values and
+/// `replace=/re/sub/flags` whole (shared with the filter converter).
 fn split_opts(opts: &str) -> Vec<String> {
-    let mut out = vec![String::new()];
-    let mut it = opts.chars().peekable();
-    while let Some(c) = it.next() {
-        match c {
-            '\\' if it.peek() == Some(&',') => {
-                it.next();
-                out.last_mut().unwrap().push(',');
-            }
-            ',' => out.push(String::new()),
-            _ => out.last_mut().unwrap().push(c),
-        }
-    }
-    out
+    filter_engine::formats::split_option_tokens(opts)
+        .into_iter()
+        .map(|t| t.replace("\\,", ","))
+        .collect()
 }
 
 fn type_bit(n: &str) -> Option<u16> {
@@ -469,8 +583,15 @@ pub fn parse_rule(r: &ExtRule) -> Result<ParsedRule, RuleError> {
         return inv("empty rule");
     }
     let mut rule = if let Some(c) = split_cosmetic(raw) {
-        let ex = raw[c.domains.len()..].starts_with("$@$") || c.sep.starts_with("#@");
-        parse_cosmetic(raw, c.domains, c.sep, c.body, ex)?
+        let ex =
+            raw[c.prefix.len() + c.domains.len()..].starts_with("$@$") || c.sep.starts_with("#@");
+        // A `[$…]` prefix is never dropped: every modifier is enforced or the rule is refused.
+        let loc = if c.prefix.is_empty() && c.modifiers.is_empty() {
+            None
+        } else {
+            Some(Location::parse(&c.modifiers)?)
+        };
+        parse_cosmetic(raw, c.domains, c.sep, c.body, ex, loc)?
     } else {
         parse_network(raw)?
     };
@@ -498,6 +619,7 @@ fn blank(raw: &str, action: Action, exception: bool) -> ParsedRule {
         key: raw.to_string(),
         net: None,
         dom: None,
+        loc: None,
     }
 }
 
@@ -524,6 +646,8 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
     let mut deny: Vec<String> = Vec::new();
     let (mut m_in, mut m_out) = (Vec::new(), Vec::new());
     let mut popup = false;
+    let mut ip: Option<IpCond> = None;
+    let mut cname = false;
     let mut scope_mask = 0u32;
     let mut stealth_val = String::new();
     // (target, value, compiled-lazily action builder input)
@@ -532,6 +656,10 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
     for t in &toks {
         let t = t.trim();
         if t.is_empty() {
+            continue;
+        }
+        // uBO ignores options made only of underscores (readability padding).
+        if t.bytes().all(|c| c == b'_') {
             continue;
         }
         let (neg, body) = match t.strip_prefix('~') {
@@ -550,9 +678,9 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
         };
         match name.as_str() {
             "domain" | "from" => {
-                src = DomainSet::parse(need("domain")?, '|').map_err(RuleError::Invalid)?
+                src = DomainSet::parse(need("domain")?, '|').map_err(unsupported_or_invalid)?
             }
-            "to" => to = DomainSet::parse(need("to")?, '|').map_err(RuleError::Invalid)?,
+            "to" => to = DomainSet::parse(need("to")?, '|').map_err(unsupported_or_invalid)?,
             "denyallow" => {
                 for d in need("denyallow")?.split('|') {
                     if d.starts_with('~') || d.is_empty() || d.contains('/') {
@@ -573,6 +701,40 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                     (if n { &mut m_out } else { &mut m_in }).push(m.to_ascii_uppercase());
                 }
             }
+            "strict1p" => {
+                party = if neg {
+                    Party::StrictThird
+                } else {
+                    Party::StrictFirst
+                }
+            }
+            "strict3p" => {
+                party = if neg {
+                    Party::StrictFirst
+                } else {
+                    Party::StrictThird
+                }
+            }
+            // `reason=` is a free-text note for list maintainers.
+            "reason" => {}
+            "popunder" => return Err(RuleError::NotApplicable(
+                "$popunder needs the browser's window and opener state, which a proxy cannot see"
+                    .into(),
+            )),
+            "ipaddress" => {
+                if neg {
+                    return inv("$ipaddress cannot be negated");
+                }
+                ip = Some(IpCond::parse(need("ipaddress")?).map_err(unsupported_or_invalid)?);
+            }
+            "cname" => {
+                if neg {
+                    return inv("$cname cannot be negated");
+                }
+                cname = true;
+            }
+            "generichide" | "ghide" if exception => scope_mask |= GENERICHIDE,
+            "genericblock" if exception => scope_mask |= GENERICBLOCK,
             "third-party" | "3p" => party = if neg { Party::First } else { Party::Third },
             "first-party" | "1p" => party = if neg { Party::Third } else { Party::First },
             "match-case" => match_case = !neg,
@@ -593,7 +755,8 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 scope_mask |= STEALTH;
             }
             "replace" | "jsonprune" | "xmlprune" | "hls" | "cookie" | "removeheader"
-            | "permissions" | "urltransform" | "header" | "removeparam" => {
+            | "permissions" | "urltransform" | "header" | "removeparam" | "redirect"
+            | "redirect-rule" | "urlskip" => {
                 if neg {
                     return inv("action modifiers cannot be negated");
                 }
@@ -655,11 +818,15 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 "permissions" => PERMISSIONS,
                 "urltransform" => URLTRANSFORM,
                 "removeparam" => REMOVEPARAM,
+                "redirect" | "redirect-rule" => REDIRECT,
+                "urlskip" => URLSKIP,
                 _ => HEADER,
             };
             let (req_side, resp_side) = match name.as_str() {
                 "cookie" => (true, true),
-                "urltransform" | "removeparam" => (true, false),
+                "urltransform" | "removeparam" | "redirect" | "redirect-rule" | "urlskip" => {
+                    (true, false)
+                }
                 "removeheader" => (
                     v.to_ascii_lowercase().starts_with("request:"),
                     !v.to_ascii_lowercase().starts_with("request:"),
@@ -681,11 +848,17 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                 match name.as_str() {
                     "replace" => {
                         need_val()?;
-                        Action::Replace(ReplaceSpec::parse(v).map_err(unsupported_or_invalid)?)
+                        Action::Replace(
+                            ReplaceSpec::parse(unquote_single(v))
+                                .map_err(unsupported_or_invalid)?,
+                        )
                     }
                     "urltransform" => {
                         need_val()?;
-                        Action::UrlTransform(ReplaceSpec::parse(v).map_err(unsupported_or_invalid)?)
+                        Action::UrlTransform(
+                            ReplaceSpec::parse(unquote_single(v))
+                                .map_err(unsupported_or_invalid)?,
+                        )
                     }
                     "removeparam" => {
                         Action::RemoveParam(RemoveParam::parse(v).map_err(unsupported_or_invalid)?)
@@ -697,6 +870,22 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
                         Action::XmlPrune(XmlPrune::parse(v).map_err(unsupported_or_invalid)?)
                     }
                     "hls" => Action::Hls(HlsPrune::parse(v).map_err(unsupported_or_invalid)?),
+                    "redirect" | "redirect-rule" => {
+                        need_val()?;
+                        // `name:priority`: the priority only orders competing redirects.
+                        let resource = v.split(':').next().unwrap_or("").trim().to_string();
+                        if resource.is_empty() || resource.contains(['/', ' ']) {
+                            return inv("bad $redirect resource name");
+                        }
+                        Action::Redirect {
+                            resource,
+                            rule_only: name == "redirect-rule",
+                        }
+                    }
+                    "urlskip" => {
+                        need_val()?;
+                        Action::UrlSkip(UrlSkip::parse(v).map_err(unsupported_or_invalid)?)
+                    }
                     "cookie" => Action::Cookie(CookieSpec::parse(v).map_err(RuleError::Invalid)?),
                     "permissions" => {
                         need_val()?;
@@ -727,7 +916,7 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
         }
     };
     // `$popup` only fires for popup navigations; it implies the document type.
-    let is_block = matches!(action, Action::Block)
+    let is_block = matches!(action, Action::Block | Action::Redirect { .. })
         || matches!(&action, Action::Disable { mask } if mask & BLOCK != 0);
     let types = if popup {
         T_DOC
@@ -758,6 +947,8 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
         methods_in: m_in,
         methods_out: m_out,
         popup,
+        ip,
+        cname,
     };
     let mut r = blank(raw, action, exception);
     r.important = important;
@@ -769,7 +960,7 @@ fn parse_network(raw: &str) -> Result<ParsedRule, RuleError> {
     Ok(r)
 }
 
-fn unsupported_or_invalid(e: String) -> RuleError {
+pub(crate) fn unsupported_or_invalid(e: String) -> RuleError {
     if e.contains("unsupported") {
         RuleError::Unsupported(e)
     } else {
@@ -1019,9 +1210,21 @@ fn parse_cosmetic(
     sep: &str,
     body: &str,
     exception: bool,
+    mut loc: Option<Location>,
 ) -> Result<ParsedRule, RuleError> {
     use target::*;
-    let dom = DomainSet::parse(domains, ',').map_err(RuleError::Invalid)?;
+    let mut dom = DomainSet::parse(domains, ',').map_err(unsupported_or_invalid)?;
+    // A `[$domain=…]` prefix is the rule's domain scope (bucketed like an ordinary domain list);
+    // AdGuard rejects it together with a domain list.
+    if let Some(l) = loc.as_mut() {
+        if let Some(d) = l.domain.take() {
+            if !dom.is_unrestricted() {
+                return inv("a [$domain=…] prefix cannot be combined with a domain list");
+            }
+            dom = d;
+        }
+    }
+    let loc = loc.filter(|l| l.path.is_some() || l.domain.is_some());
     let body_t = body.trim();
     let (action, value) = match sep {
         "$$" => {
@@ -1198,6 +1401,7 @@ fn parse_cosmetic(
     r.value = value;
     r.stage = 0;
     r.dom = Some(dom);
+    r.loc = loc;
     Ok(r)
 }
 
@@ -1251,7 +1455,7 @@ mod tests {
     #[test]
     fn errors_are_structured() {
         assert!(matches!(
-            p("||a^$redirect=x,method=get"),
+            p("||a^$app=x.exe"),
             Err(RuleError::Unsupported(_))
         ));
         assert!(matches!(
@@ -1303,5 +1507,26 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert!(p("a.com#?#div:-abp-has(.x)").is_ok());
         assert!(p("a.com#$?#div:xpath(//a) { display:none }").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    #[test]
+    fn regex_values_keep_their_commas() {
+        let t =
+            split_opts(r"script,1p,ipaddress=/^1(72\.104|39\.162)\.\d{3}\.\d{2,3}$/,match-case");
+        assert_eq!(t.len(), 4, "{t:?}");
+        assert_eq!(t[2], r"ipaddress=/^1(72\.104|39\.162)\.\d{3}\.\d{2,3}$/");
+        let r = parse_rule(&ExtRule::new(
+            ExtKind::UnsupportedOption,
+            r"/\/_static\/[a-z0-9]{12}\.js\?nonce=\d+$/$script,1p,match-case,ipaddress=/^1(72\.104|39\.162)\.\d{3}\.\d{2,3}$/",
+        ))
+        .unwrap();
+        assert!(r.net.unwrap().ip.is_some());
+        // Underscore padding is ignored.
+        assert!(parse_rule(&ExtRule::new(ExtKind::Other, "||a^$script,_____,3p")).is_ok());
     }
 }

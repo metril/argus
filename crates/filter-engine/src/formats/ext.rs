@@ -38,6 +38,9 @@ pub enum ExtKind {
     /// `$denyallow`: no exact native translation exists (an exception would also unblock the
     /// hosts for unrelated rules), so every such rule is handed off.
     DenyAllow,
+    /// Cosmetic rule scoped by page location rather than a hostname list: `[$path=…]`, regex
+    /// domains (`[$domain=/re/]`) and regex hostnames (`/re/##sel`).
+    CosmeticLocation,
     /// HTML filters (`##^`, `$$`).
     HtmlFilter,
     /// AdGuard `#%#` JavaScript rules.
@@ -69,6 +72,7 @@ impl ExtKind {
             Self::Header => "header",
             Self::To => "to",
             Self::DenyAllow => "denyallow",
+            Self::CosmeticLocation => "cosmetic-location",
             Self::HtmlFilter => "html-filter",
             Self::JsInject => "js-inject",
             Self::Snippet => "snippet",
@@ -115,7 +119,9 @@ impl ExtRule {
 pub fn classify_rejected(raw: &str) -> Option<ExtRule> {
     let raw = raw.trim();
     if let Some(c) = abp::split_cosmetic(raw) {
-        let kind = if c.sep.contains('?') {
+        let kind = if c.is_location() {
+            ExtKind::CosmeticLocation
+        } else if c.sep.contains('?') {
             ExtKind::ExtendedCss
         } else {
             ExtKind::Other

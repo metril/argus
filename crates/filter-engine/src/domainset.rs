@@ -403,6 +403,9 @@ pub struct DomainSetBuild {
     pub duplicates: Vec<usize>,
     /// Per list index: `||host^` rules dropped because a shorter suffix rule already covers them.
     pub compressed: Vec<usize>,
+    /// Per list index: rules (every occurrence) disabled by a `$badfilter` rule, which neither
+    /// block nor count as duplicates.
+    pub disabled: Vec<usize>,
 }
 
 impl DomainSetBuilder {
@@ -468,14 +471,11 @@ impl DomainSetBuilder {
         removals.dedup();
         entries.par_sort_unstable_by_key(|e| (e.key, e.bit, e.list));
         let mut duplicates = vec![0usize; lists.len().max(1)];
-        // Unique (key, mask, list) triples, in key order.
+        // Unique (key, mask, list) triples, in key order; a `$badfilter`-disabled rule is left out.
         let mut uniq: Vec<(u64, u8, u16)> = Vec::with_capacity(entries.len());
         let mut prev: Option<(u64, u8)> = None;
         for e in &entries {
             if prev == Some((e.key, e.bit)) {
-                if let Some(d) = duplicates.get_mut(e.list as usize) {
-                    *d += 1;
-                }
                 continue;
             }
             prev = Some((e.key, e.bit));
@@ -483,11 +483,14 @@ impl DomainSetBuilder {
                 continue;
             }
             match uniq.last_mut() {
-                Some(last) if last.0 == e.key => last.1 |= e.bit,
+                Some(last) if last.0 == e.key => {
+                    last.1 |= e.bit;
+                    // The host's table entry names the lowest list holding any scheme of it.
+                    last.2 = last.2.min(e.list);
+                }
                 _ => uniq.push((e.key, e.bit, e.list)),
             }
         }
-        drop(entries);
 
         // Compression: a `||host^` rule is redundant when a proper label suffix of it is also a
         // `||host^` rule (the lookup walks suffixes shortest first, so the ancestor already wins,
@@ -495,27 +498,65 @@ impl DomainSetBuilder {
         // `|scheme://host^` rules are never touched. Runs after `$badfilter` removal, so a disabled
         // ancestor absorbs nothing. O(n) with hash sets.
         let mut compressed = vec![0usize; lists.len().max(1)];
+        let mut disabled = vec![0usize; lists.len().max(1)];
+        let mut covered = KeySet::default();
         if !ancestors.is_empty() {
             let present: KeySet = uniq.iter().filter(|u| u.1 == 0).map(|u| u.0).collect();
-            let covered: KeySet = ancestors
+            covered = ancestors
                 .iter()
                 .filter(|(_, a)| present.contains(a))
                 .map(|(c, _)| *c)
                 .collect();
-            drop(present);
-            if !covered.is_empty() {
-                uniq.retain(|&(k, mask, list)| {
-                    let drop_it = mask == 0 && covered.contains(&k);
-                    if drop_it {
-                        if let Some(c) = compressed.get_mut(list as usize) {
-                            *c += 1;
-                        }
-                    }
-                    !drop_it
-                });
-            }
         }
         drop(ancestors);
+
+        // Accounting, per rule (every occurrence, so a rule can be attributed from the final set
+        // alone, see `crate::inspect`): a rule an ancestor covers is compressed whatever else
+        // holds; a rule disabled by `$badfilter` is neither; of the rest, every occurrence after
+        // the first of the same rule is a duplicate. Entries are in (key, bit, list) order, so the
+        // first is the one the table keeps (the lowest list).
+        let mut i = 0;
+        while i < entries.len() {
+            let mut j = i;
+            while j < entries.len() && entries[j].key == entries[i].key {
+                j += 1;
+            }
+            let group = &entries[i..j];
+            i = j;
+            let is_removed = |e: &Entry| removals.binary_search(&(e.key, e.bit)).is_ok();
+            // The lowest list holding the host (any scheme) is the one the table names.
+            let lowest = group
+                .iter()
+                .filter(|e| !is_removed(e))
+                .map(|e| e.list)
+                .min();
+            let mut prev: Option<u8> = None;
+            for e in group {
+                let slot = e.list as usize;
+                if e.bit == 0 && covered.contains(&e.key) {
+                    if let Some(c) = compressed.get_mut(slot) {
+                        *c += 1;
+                    }
+                    continue;
+                }
+                if is_removed(e) {
+                    if let Some(d) = disabled.get_mut(slot) {
+                        *d += 1;
+                    }
+                    continue;
+                }
+                if prev == Some(e.bit) || Some(e.list) > lowest {
+                    if let Some(d) = duplicates.get_mut(slot) {
+                        *d += 1;
+                    }
+                }
+                prev = Some(e.bit);
+            }
+        }
+        drop(entries);
+        if !covered.is_empty() {
+            uniq.retain(|&(k, mask, _)| !(mask == 0 && covered.contains(&k)));
+        }
 
         let n = uniq.len();
         let cap = if n == 0 { 0 } else { n * 5 / 3 + 8 };
@@ -546,6 +587,7 @@ impl DomainSetBuilder {
             },
             duplicates,
             compressed,
+            disabled,
         }
     }
 }
