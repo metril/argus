@@ -91,6 +91,8 @@ pub fn validate_rules(
         format: used,
         allowlist,
         includes: Default::default(),
+        // Pasted rules have no list identity; judge them as an untrusted list would.
+        trusted: false,
     };
     struct Row<'a> {
         line: usize,
