@@ -30,6 +30,8 @@ const SCOPES: [&str; 14] = [
 pub struct TestApi {
     server: TestServer,
     secret: String,
+    /// The id of the token (what an extension session of this token is bound to).
+    pub token_id: String,
     pub state: Arc<web_api::AppState>,
     _dir: tempfile::TempDir,
 }
@@ -94,10 +96,13 @@ impl TestProxy {
             .json(&json!({"name": "e2e", "scopes": SCOPES}))
             .await;
         assert_eq!(tok.status_code(), 201, "{}", tok.text());
-        let secret = tok.json::<Value>()["secret"].as_str().unwrap().to_string();
+        let body = tok.json::<Value>();
+        let secret = body["secret"].as_str().unwrap().to_string();
+        let token_id = body["token"]["id"].as_str().expect("token id").to_string();
         TestApi {
             server,
             secret,
+            token_id,
             state,
             _dir: dir,
         }

@@ -407,6 +407,9 @@ fn apply_live(state: &AppState, config: &ProxyConfig) {
     }
     if let Some(h) = state.cookie_provenance.get() {
         h.store(config.privacy.cookie_provenance, Ordering::Relaxed);
+        if !config.privacy.cookie_provenance {
+            filter_engine::cookie_log().clear();
+        }
     }
     state.list_service.set_schedule(
         config.adblock.auto_update,

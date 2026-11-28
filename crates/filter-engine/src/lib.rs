@@ -9,6 +9,7 @@ pub const ADBLOCK_CRATE_VERSION: &str = "0.12.5";
 
 pub mod bundled;
 pub mod compile;
+pub mod cookie_log;
 pub mod domainset;
 pub mod error;
 pub mod events;
@@ -35,6 +36,7 @@ pub use compile::{
     compile_lists, compile_lists_checked, compile_lists_with, route_domain_rules, Compiled,
     DomainRouted, ListCompileStats,
 };
+pub use cookie_log::{cookie_log, CookieLog};
 pub use domainset::{DomainHit, DomainSet, DomainSetBuilder, Scheme};
 pub use error::{Error, Result};
 pub use events::{

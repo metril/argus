@@ -1648,3 +1648,35 @@ async fn the_blocking_profile_endpoints_are_gone() {
         .await
         .assert_status_not_found();
 }
+
+/// Turning cookie provenance off empties every session's records at once.
+#[tokio::test]
+async fn switching_cookie_provenance_off_clears_the_records() {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let cp = Arc::new(AtomicBool::new(false));
+    ctx.state.cookie_provenance.set(cp.clone()).unwrap();
+    put_config(&admin, json!({"cookie_provenance": true}))
+        .await
+        .assert_status_ok();
+    for sid in [31, 32] {
+        filter_engine::cookie_log().open(sid);
+        filter_engine::cookie_log().record_response(
+            &cp,
+            sid,
+            &filter_engine::cookie_log::Context {
+                host: "a.test",
+                path: "/",
+                page_host: "",
+            },
+            [(b"a=1".as_slice(), true)].into_iter(),
+            &[],
+        );
+    }
+    assert_eq!(filter_engine::cookie_log().len(), 2);
+    put_config(&admin, json!({"cookie_provenance": false}))
+        .await
+        .assert_status_ok();
+    assert!(filter_engine::cookie_log().is_empty());
+}

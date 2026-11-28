@@ -34,27 +34,37 @@ export function seedFixture(fb: FakeBrowser, now = Date.now()): void {
   if (others[1]) fb.seed({ storeId: others[1], name: 'autoplay', value: 'off', domain: 'video.example.net', sameSite: 'lax' });
 }
 
-/** The wire records of `GET /ext/cookies/provenance` that go with the fixture. */
+/** The wire records of `GET /ext/cookies/provenance` that go with the fixture, shaped as the server sends them (every key present, no value). */
 export function fixtureWire(now = Date.now()): Record<string, unknown>[] {
   const at = (minAgo: number) => new Date(now - minAgo * 60_000).toISOString();
-  const rec = (time: string, name: string, host: string, path: string, attrs: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => ({ time, name, host, path, attrs, ...extra });
+  const attrs = (a: Record<string, unknown> = {}) => ({ domain: null, path: null, secure: false, http_only: false, same_site: null, max_age: null, expires: null, partitioned: false, ...a });
+  const dayRule = { rule: '||stackoverflow.com^$cookie=_ga;maxAge=604800', list_id: 'argus-base', list_name: 'Argus Base', user_rule: false };
+  const by = (r: typeof dayRule) => ({ rule: r.rule, list_id: r.list_id, list_name: r.list_name, user_rule: r.user_rule });
+  const gaRule = { rule: '||stackoverflow.com^$cookie=/^_ga_/;maxAge=604800', list_id: 'argus-base', list_name: 'Argus Base', user_rule: false };
+  const lax = { rule: '||stackoverflow.com^$cookie=/^_ga_/;sameSite=lax', list_id: 'custom', list_name: null as unknown as string, user_rule: true };
+  let seq = 0;
+  const rec = (time: string, name: string, host: string, path: string, a: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => ({
+    seq: ++seq, time, effect: 'set', name, host, path, page_host: 'www.stackoverflow.com', third_party: null, attrs: attrs(a), changes: [],
+    prefix: null, prefix_valid: null, rule: null, list_id: null, list_name: null, user_rule: false, ...extra,
+  });
   return [
-    rec(at(40), '__Host-sosid', 'stackoverflow.com', '/users/login', { path: '/', secure: true, http_only: true, same_site: 'lax', max_age: 30 * DAY }),
-    rec(at(40), 'acct', 'stackoverflow.com', '/', { domain: '.stackoverflow.com', secure: true, http_only: true, same_site: 'lax' }),
-    rec(at(40), '_ga', 'stackoverflow.com', '/', { domain: '.stackoverflow.com', max_age: 365 * DAY }, { effect: 'changed', rule: '||stackoverflow.com^$cookie=_ga;maxAge=604800', list_id: 'argus-base', list_name: 'Argus Base', line: 51 }),
-    rec(at(40), '_ga_9XK2LP', 'stackoverflow.com', '/', { domain: '.stackoverflow.com', max_age: 2 * 365 * DAY }, { effect: 'changed', rule: '||stackoverflow.com^$cookie=/^_ga_/;maxAge=604800', list_id: 'argus-base', list_name: 'Argus Base', line: 52 }),
-    rec(at(40), 'OptanonConsent', 'stackoverflow.com', '/', { domain: '.stackoverflow.com', same_site: 'lax', max_age: 365 * DAY }),
-    rec(at(28), '__cf_bm', 'stackoverflow.com', '/questions/11227809', { domain: '.stackoverflow.com', path: '/', secure: true, http_only: true, same_site: 'none', max_age: 1800 }),
-    rec(at(26), '__Secure-tp-embed', 'embed-widgets.example.net', '/widget/init', { domain: '.embed-widgets.example.net', path: '/', secure: true, same_site: 'none', max_age: 90 * DAY, partitioned: true }),
-    rec(at(40), '_gid', 'stackoverflow.com', '/', { domain: '.stackoverflow.com', max_age: DAY }, { effect: 'stripped', rule: '||stackoverflow.com^$cookie=_gid', list_id: 'easyprivacy', list_name: 'EasyPrivacy', line: 1204 }),
-    rec(at(27), '_pxid', 'pixel-sample.example', '/t.gif', { domain: '.pixel-sample.example', secure: true, same_site: 'none', max_age: 365 * DAY }, { effect: 'stripped', rule: '||pixel-sample.example^$cookie', list_id: 'adg-tracking', list_name: 'AdGuard Tracking Protection', line: 88211 }),
-    rec(at(90), 'session_id', 'news.example.org', '/login', { secure: true, http_only: true, same_site: 'lax' }),
+    rec(at(40), '__Host-sosid', 'stackoverflow.com', '/users/login', { path: '/', secure: true, http_only: true, same_site: 'lax', max_age: 30 * DAY }, { prefix: '__Host-', prefix_valid: true }),
+    rec(at(40), 'acct', 'stackoverflow.com', '/', { domain: 'stackoverflow.com', secure: true, http_only: true, same_site: 'lax' }),
+    rec(at(40), '_ga', 'stackoverflow.com', '/', { domain: 'stackoverflow.com', max_age: 365 * DAY }, { effect: 'changed', changes: [{ attr: 'max_age', from: String(365 * DAY), to: '604800', ...by(dayRule) }], ...dayRule }),
+    rec(at(40), '_ga_9XK2LP', 'stackoverflow.com', '/', { domain: 'stackoverflow.com', max_age: 2 * 365 * DAY, same_site: 'none' }, { effect: 'changed', changes: [{ attr: 'max_age', from: String(2 * 365 * DAY), to: '604800', ...by(gaRule) }, { attr: 'same_site', from: 'none', to: 'lax', ...by(lax) }], ...gaRule }),
+    rec(at(40), 'OptanonConsent', 'stackoverflow.com', '/', { domain: 'stackoverflow.com', same_site: 'lax', max_age: 365 * DAY }),
+    rec(at(28), '__cf_bm', 'stackoverflow.com', '/questions/11227809', { domain: 'stackoverflow.com', path: '/', secure: true, http_only: true, same_site: 'none', max_age: 1800 }),
+    rec(at(26), '__Secure-tp-embed', 'embed-widgets.example.net', '/widget/init', { domain: 'embed-widgets.example.net', path: '/', secure: true, same_site: 'none', max_age: 90 * DAY, partitioned: true }, { third_party: true, prefix: '__Secure-', prefix_valid: true }),
+    rec(at(40), '_gid', 'stackoverflow.com', '/', { domain: 'stackoverflow.com', max_age: DAY }, { effect: 'stripped', rule: '||stackoverflow.com^$cookie=_gid', list_id: 'easyprivacy', list_name: 'EasyPrivacy' }),
+    rec(at(27), '_pxid', 'pixel-sample.example', '/t.gif', { domain: 'pixel-sample.example', secure: true, same_site: 'none', max_age: 365 * DAY }, { effect: 'stripped', third_party: true, rule: '||pixel-sample.example^$cookie', list_id: 'adg-tracking', list_name: 'AdGuard Tracking Protection' }),
+    rec(at(90), 'session_id', 'news.example.org', '/login', { secure: true, http_only: true, same_site: 'lax' }, { page_host: 'news.example.org' }),
+    rec(at(12), 'paywall_count', 'news.example.org', '/story/1', {}, { effect: 'blocked_send', page_host: 'news.example.org', rule: '||news.example.org^$cookie=paywall_count', list_id: 'custom', list_name: null, user_rule: true }),
   ];
 }
 
 export interface ProvOpts { mode: 'on' | 'off' | '404'; records?: Record<string, unknown>[]; calls?: { path: string; sid: string | null; search: string }[] }
 
-/** A `fetch` answering the provenance route (and 404 for anything else). */
+/** A `fetch` answering the provenance route like the server: records after `since`, and `{ enabled: false }` while off (404 for anything else). */
 export function provenanceFetch(o: ProvOpts) {
   return (url: string, init?: RequestInit): Promise<Response> => {
     const u = new URL(url);
@@ -63,8 +73,12 @@ export function provenanceFetch(o: ProvOpts) {
       const h = new Headers(init?.headers as HeadersInit);
       o.calls?.push({ path: u.pathname, sid: h.get('x-argus-session'), search: u.search });
       if (o.mode === '404') return j(404, { error: { code: 'not_found' } });
-      if (o.mode === 'off') return j(200, { status: 'disabled' });
-      return j(200, { records: o.records ?? fixtureWire() });
+      const since = Number(u.searchParams.get('since') ?? 0);
+      if (o.mode === 'off') return j(200, { enabled: false, records: [], next_since: since, more: false });
+      const all = o.records ?? fixtureWire();
+      const records = all.filter((r) => (r['seq'] as number) > since);
+      const top = all.reduce((m, r) => Math.max(m, r['seq'] as number), 0);
+      return j(200, { enabled: true, records, next_since: Math.max(since, top), more: false });
     }
     return j(404, {});
   };

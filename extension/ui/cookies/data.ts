@@ -131,11 +131,11 @@ export function useCookieData(): CookieData {
 
 // -- provenance -----------------------------------------------------------------------------------
 const MAX_RECORDS = 5000;
-const recKey = (r: ProvenanceRecord) => `${r.at}|${r.name}|${r.host}|${r.path}|${r.effect ?? ''}`;
 
 /**
  * The proxy's records for this browser session; `{ enabled: false }` while capture is off or the proxy is older.
- * The first read takes the whole ring, later ones only what is newer than the last record.
+ * The first read takes the whole ring, later ones only what follows the server's `next_since` (a sequence, so no
+ * record is missed or read twice); records are kept by their sequence number.
  */
 export function useProvenance(host: string): Provenance | undefined {
   const client = useClient();
@@ -144,7 +144,7 @@ export function useProvenance(host: string): Provenance | undefined {
   const token = s?.token;
   const url = s?.argusUrl;
   const last = useRef(0);
-  const have = useRef<Map<string, ProvenanceRecord>>(new Map());
+  const have = useRef<Map<number, ProvenanceRecord>>(new Map());
   const gen = useRef(0);
   const load = useCallback(async (fresh: boolean) => {
     if (!s || !s.argusUrl || !s.token) { setP({ enabled: false, reason: 'unavailable' }); return; }
@@ -155,15 +155,18 @@ export function useProvenance(host: string): Provenance | undefined {
       const st = (await browser.runtime.sendMessage({ type: 'bridge-status' })) as { sid?: string } | undefined;
       sid = st?.sid ?? '';
     } catch { /* background not ready */ }
-    const r = await fetchProvenance(s, sid, { since: Math.max(0, last.current - 1), ...(host ? { host } : {}) });
+    const r = await fetchProvenance(s, sid, { since: last.current, ...(host ? { host } : {}) });
     if (my !== gen.current) return;
     if (!r.enabled) { last.current = 0; have.current = new Map(); setP(r); return; }
-    for (const rec of r.records) { have.current.set(recKey(rec), rec); if (rec.at > last.current) last.current = rec.at; }
+    // A cursor that moved back means the proxy restarted and numbers started over: what is held is from before.
+    if (r.nextSince < last.current) have.current = new Map();
+    last.current = r.nextSince;
+    for (const rec of r.records) have.current.set(rec.seq, rec);
     if (have.current.size > MAX_RECORDS) {
       const keep = [...have.current.entries()].sort((a, b) => b[1].at - a[1].at).slice(0, MAX_RECORDS);
       have.current = new Map(keep);
     }
-    setP({ enabled: true, records: [...have.current.values()] });
+    setP({ enabled: true, records: [...have.current.values()], nextSince: last.current });
   }, [url, token, host]);
   useEffect(() => { void load(true); }, [load]);
   useEffect(() => {

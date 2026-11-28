@@ -71,6 +71,9 @@ pub struct DecisionCtx<'a> {
     pub engine_exception: bool,
     /// The request is a popup navigation; the opener's URL (`""`: unknown).
     pub popup: Option<&'a str>,
+    /// Cookie provenance wants the names of cookies `$cookie` rules remove from the request
+    /// (the setting is on and the connection is bound to an extension session).
+    pub cookie_drops: bool,
 }
 
 /// Request-side verdict from the ext index. `None` (without building anything) when the index
@@ -87,6 +90,7 @@ pub fn request_decision(
     let DecisionCtx {
         engine_exception,
         popup,
+        cookie_drops,
     } = ctx;
     if !idx.has_request_rules() {
         return None;
@@ -111,6 +115,7 @@ pub fn request_decision(
         }
     }
     info.headers = &pairs;
+    info.want_cookie_drops = cookie_drops;
     let mut d = idx.request_decision(&info);
     if engine_exception {
         // The engine's `@@` exception wins over an ext block (as uBO does for `$denyallow`,
@@ -279,6 +284,28 @@ impl TransformSource for ExtTransformSource {
             ..Default::default()
         };
         response_edits(&plan.header_edits, &mut t.header_edits);
+        t.cookie_touches = plan
+            .cookie_touches
+            .iter()
+            .filter_map(|c| {
+                let src = |id| {
+                    let r = idx.rule(id)?;
+                    Some(crate::rewrite::CookieSource {
+                        rule: r.raw.clone(),
+                        list_id: (!r.list.is_empty()).then(|| r.list.clone()),
+                    })
+                };
+                let main = src(c.rule)?;
+                Some(crate::rewrite::CookieTouch {
+                    index: c.index,
+                    stripped: c.stripped,
+                    max_age: c.max_age.and_then(|(m, id)| Some((m, src(id)?))),
+                    same_site: c.same_site.and_then(|(s, id)| Some((s, src(id)?))),
+                    rule: main.rule,
+                    list_id: main.list_id,
+                })
+            })
+            .collect();
         if plan.needs_body() {
             let ids: Vec<RuleId> = plan
                 .matched
@@ -364,9 +391,45 @@ mod tests {
             DecisionCtx {
                 engine_exception: exc,
                 popup,
+                ..Default::default()
             },
         )
         .is_some_and(|d| d.block.is_some())
+    }
+
+    #[test]
+    fn cookie_drop_names_are_computed_only_when_provenance_wants_them() {
+        let i = idx(&["||site.test^$cookie"]);
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            "tracker=SECRETVALUE; NAMELESSVALUE".parse().unwrap(),
+        );
+        let ask = |cookie_drops| {
+            request_decision(
+                &i,
+                "https://site.test/",
+                "GET",
+                "",
+                RequestType::Document,
+                &h,
+                DecisionCtx {
+                    cookie_drops,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let (off, on) = (ask(false), ask(true));
+        // The header edit is the same either way; only the names differ.
+        assert_eq!(
+            format!("{:?}", off.header_edits),
+            format!("{:?}", on.header_edits)
+        );
+        assert!(off.cookie_drops.is_empty());
+        let names: Vec<&str> = on.cookie_drops.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["tracker", ""]);
+        assert!(!format!("{:?}", on.cookie_drops).contains("VALUE"));
     }
 
     #[test]

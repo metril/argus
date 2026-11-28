@@ -929,3 +929,176 @@ fn page_exempt_by_document_elemhide_jsinject() {
         ))
     );
 }
+
+// ---- $cookie touches: which line, which rule, what it set (cookie provenance) -----------------
+
+#[test]
+fn set_cookie_touches_name_the_line_the_rule_and_what_was_set() {
+    let i = idx(&[
+        "||site.example^$cookie=/^_ga/",
+        "||site.example^$cookie=sid;maxAge=60;sameSite=strict",
+    ]);
+    let r = get("https://site.example/", ResourceType::Document);
+    let p = plan(
+        &i,
+        &r,
+        "text/html",
+        &[
+            ("Set-Cookie", "_ga=1; Path=/"),
+            (
+                "Set-Cookie",
+                "sid=2; Path=/; Expires=Wed, 21 Oct 2099 07:28:00 GMT",
+            ),
+            ("Set-Cookie", "other=3"),
+        ],
+    );
+    let raw = |t: &CookieTouch| i.rule(t.rule).unwrap().raw.clone();
+    assert_eq!(p.cookie_touches.len(), 2);
+    let (a, b) = (&p.cookie_touches[0], &p.cookie_touches[1]);
+    assert_eq!((a.index, a.stripped), (0, true));
+    assert_eq!(raw(a), "||site.example^$cookie=/^_ga/");
+    assert_eq!((b.index, b.stripped), (1, false));
+    assert_eq!(
+        raw(b),
+        "||site.example^$cookie=sid;maxAge=60;sameSite=strict"
+    );
+    let (m, ss) = (b.max_age.unwrap(), b.same_site.unwrap());
+    assert_eq!((m.0, ss.0), (60, SameSite::Strict));
+    assert_eq!(
+        (i.rule(m.1).unwrap().raw.as_str(), m.1),
+        ("||site.example^$cookie=sid;maxAge=60;sameSite=strict", ss.1)
+    );
+    // No rule, no touch.
+    let none = plan(&i, &r, "text/html", &[("Set-Cookie", "other=3")]);
+    assert!(none.cookie_touches.is_empty());
+}
+
+#[test]
+fn an_untrusted_rule_that_does_not_tighten_leaves_no_touch() {
+    let i = ExtIndex::build(&[rule("||site.example^$cookie=c;sameSite=none", false)]);
+    let r = get("https://site.example/", ResourceType::Document);
+    let p = plan(
+        &i,
+        &r,
+        "text/html",
+        &[("Set-Cookie", "c=1; SameSite=Strict")],
+    );
+    assert!(p.cookie_touches.is_empty() && p.header_edits.is_empty());
+}
+
+#[test]
+fn request_cookie_drops_carry_names_only_and_the_rule() {
+    let i = idx(&[
+        "||site.example^$cookie=track",
+        "||site.example^$cookie=/^_ga/",
+    ]);
+    let hdrs = [(
+        "Cookie",
+        "a=SECRET1; track=SECRET2; _gid=SECRET3; _ga=SECRET4",
+    )];
+    let r = RequestInfo {
+        headers: &hdrs,
+        want_cookie_drops: true,
+        ..get("https://site.example/", ResourceType::Document)
+    };
+    let d = i.request_decision(&r);
+    let drops: Vec<(String, String)> = d
+        .cookie_drops
+        .iter()
+        .map(|(n, id)| (n.clone(), i.rule(*id).unwrap().raw.clone()))
+        .collect();
+    assert_eq!(
+        drops,
+        [
+            (
+                "track".to_string(),
+                "||site.example^$cookie=track".to_string()
+            ),
+            (
+                "_ga".to_string(),
+                "||site.example^$cookie=/^_ga/".to_string()
+            ),
+        ]
+    );
+    assert!(!format!("{:?}", d.cookie_drops).contains("SECRET"));
+    // Nothing removed, nothing reported.
+    let hdrs = [("Cookie", "a=1")];
+    let r = RequestInfo {
+        headers: &hdrs,
+        want_cookie_drops: true,
+        ..get("https://site.example/", ResourceType::Document)
+    };
+    assert!(i.request_decision(&r).cookie_drops.is_empty());
+}
+
+#[test]
+fn a_nameless_request_cookie_is_dropped_but_never_named_by_its_value() {
+    for rules in [
+        &["||site.example^$cookie"][..],
+        &["||site.example^$cookie=/^SECRET/"][..],
+        &["||site.example^$cookie=/value/i"][..],
+    ] {
+        let i = idx(rules);
+        let hdrs = [("Cookie", "SECRETVALUE; ok=1")];
+        let r = RequestInfo {
+            headers: &hdrs,
+            want_cookie_drops: true,
+            ..get("https://site.example/", ResourceType::Document)
+        };
+        let d = i.request_decision(&r);
+        // The rule behaviour is unchanged: the nameless pair is matched as a whole and dropped.
+        assert!(d
+            .header_edits
+            .iter()
+            .any(|e| format!("{e:?}").contains("cookie")));
+        assert!(!d.cookie_drops.is_empty(), "{rules:?}");
+        assert!(d.cookie_drops.iter().any(|(n, _)| n.is_empty()));
+        assert!(
+            !format!("{:?}", d.cookie_drops).contains("SECRET"),
+            "{rules:?}"
+        );
+    }
+}
+
+#[test]
+fn drops_are_not_computed_unless_asked_for() {
+    let i = idx(&["||site.example^$cookie=track"]);
+    let hdrs = [("Cookie", "a=1; track=2")];
+    let mut r = RequestInfo {
+        headers: &hdrs,
+        ..get("https://site.example/", ResourceType::Document)
+    };
+    let off = i.request_decision(&r);
+    assert!(off.cookie_drops.is_empty());
+    assert_eq!(off.header_edits.len(), 1, "the edit itself is unchanged");
+    r.want_cookie_drops = true;
+    let on = i.request_decision(&r);
+    assert_eq!(on.cookie_drops.len(), 1);
+    assert_eq!(
+        format!("{:?}", on.header_edits),
+        format!("{:?}", off.header_edits)
+    );
+}
+
+#[test]
+fn each_changed_attribute_is_attributed_to_the_rule_whose_value_won() {
+    let i = idx(&[
+        "||site.example^$cookie=c;maxAge=600;sameSite=lax",
+        "||site.example^$cookie=c;maxAge=60",
+        "||site.example^$cookie=c;sameSite=strict",
+    ]);
+    let r = get("https://site.example/", ResourceType::Document);
+    let p = plan(
+        &i,
+        &r,
+        "text/html",
+        &[("Set-Cookie", "c=1; Max-Age=86400; SameSite=None")],
+    );
+    let t = &p.cookie_touches[0];
+    let raw = |id| i.rule(id).unwrap().raw.clone();
+    let (m, s) = (t.max_age.unwrap(), t.same_site.unwrap());
+    assert_eq!(m.0, 60);
+    assert_eq!(raw(m.1), "||site.example^$cookie=c;maxAge=60");
+    assert_eq!(s.0, SameSite::Strict);
+    assert_eq!(raw(s.1), "||site.example^$cookie=c;sameSite=strict");
+}

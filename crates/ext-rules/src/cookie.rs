@@ -128,6 +128,28 @@ pub fn filter_request_cookie(header: &str, specs: &[&CookieSpec]) -> Option<Stri
     changed.then(|| kept.join("; "))
 }
 
+/// The cookies (names only, never values) a removing spec drops from a `Cookie` request header,
+/// each with the index of the spec that dropped it. Matching is exactly [`filter_request_cookie`]'s,
+/// on the whole pair when it has no `=`; but such a nameless cookie is reported with the name `""`,
+/// because its whole text is a value.
+pub fn removed_request_cookies(header: &str, specs: &[&CookieSpec]) -> Vec<(String, usize)> {
+    header
+        .split(';')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .filter_map(|c| {
+            let (name, reported) = match c.split_once('=') {
+                Some((n, _)) => (n.trim(), n.trim()),
+                None => (c, ""),
+            };
+            let i = specs
+                .iter()
+                .position(|s| !s.modifies() && s.matches_name(name))?;
+            Some((reported.to_string(), i))
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetCookie {
     Keep,
@@ -142,6 +164,23 @@ pub enum SetCookie {
 /// cookie already has (or 0), a `SameSite` stricter than the cookie's (an absent attribute counts
 /// as `Lax`, the browser default). `Secure` and `HttpOnly` are never touched.
 pub fn apply_set_cookie(line: &str, specs: &[&CookieSpec]) -> SetCookie {
+    apply_set_cookie_traced(line, specs).action
+}
+
+/// What [`apply_set_cookie_traced`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Applied {
+    pub action: SetCookie,
+    /// Index (into the specs) of the spec that removed the cookie.
+    pub by: Option<usize>,
+    /// The `Max-Age` a replaced line was given and the index of the spec whose value won.
+    pub max_age: Option<(u64, usize)>,
+    /// The `SameSite` a replaced line was given and the index of the spec whose value won.
+    pub same_site: Option<(SameSite, usize)>,
+}
+
+/// [`apply_set_cookie`] plus which spec did it and what it set.
+pub fn apply_set_cookie_traced(line: &str, specs: &[&CookieSpec]) -> Applied {
     let mut parts = line.split(';');
     let first = parts.next().unwrap_or("");
     let name = first.split_once('=').map_or(first, |x| x.0).trim();
@@ -158,22 +197,39 @@ pub fn apply_set_cookie(line: &str, specs: &[&CookieSpec]) -> SetCookie {
         Some("strict") => SameSite::Strict,
         _ => SameSite::Lax,
     };
-    let (mut max_age, mut same_site) = (None, None);
-    for s in specs.iter().filter(|s| s.matches_name(name)) {
+    let mut max_age: Option<(u64, usize)> = None;
+    let mut same_site: Option<(SameSite, usize)> = None;
+    for (i, s) in specs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.matches_name(name))
+    {
         if !s.modifies() {
-            return SetCookie::Remove;
+            return Applied {
+                action: SetCookie::Remove,
+                by: Some(i),
+                max_age: None,
+                same_site: None,
+            };
         }
         let m = s.max_age.filter(|&m| {
-            s.trusted || m == 0 || cur_max_age.is_some_and(|c| m < c.min(max_age.unwrap_or(c)))
+            s.trusted
+                || m == 0
+                || cur_max_age.is_some_and(|c| m < c.min(max_age.map_or(c, |x| x.0)))
         });
         let ss = s
             .same_site
-            .filter(|&n| s.trusted || n.rank() > same_site.unwrap_or(cur_same_site).rank());
-        max_age = m.or(max_age);
-        same_site = ss.or(same_site);
+            .filter(|&n| s.trusted || n.rank() > same_site.map_or(cur_same_site, |x| x.0).rank());
+        max_age = m.map(|m| (m, i)).or(max_age);
+        same_site = ss.map(|n| (n, i)).or(same_site);
     }
     if max_age.is_none() && same_site.is_none() {
-        return SetCookie::Keep;
+        return Applied {
+            action: SetCookie::Keep,
+            by: None,
+            max_age: None,
+            same_site: None,
+        };
     }
     let parts = attrs.into_iter();
     let mut out = String::from(first.trim_end());
@@ -190,13 +246,18 @@ pub fn apply_set_cookie(line: &str, specs: &[&CookieSpec]) -> SetCookie {
             out.push_str(attr.trim());
         }
     }
-    if let Some(m) = max_age {
+    if let Some((m, _)) = max_age {
         out.push_str(&format!("; Max-Age={m}"));
     }
-    if let Some(s) = same_site {
+    if let Some((s, _)) = same_site {
         out.push_str(&format!("; SameSite={}", s.as_str()));
     }
-    SetCookie::Replace(out)
+    Applied {
+        action: SetCookie::Replace(out),
+        by: None,
+        max_age,
+        same_site,
+    }
 }
 
 #[cfg(test)]
@@ -235,5 +296,35 @@ mod tests {
         assert_eq!(filter_request_cookie("c=1", &[&m]), None);
         assert!(CookieSpec::parse("a;sameSite=x").is_err());
         assert!(CookieSpec::parse("a;foo=1").is_err());
+    }
+
+    #[test]
+    fn nameless_request_cookies_match_as_a_whole_but_are_reported_without_a_name() {
+        let any = CookieSpec::parse("").unwrap();
+        let re = CookieSpec::parse("/^abc/").unwrap();
+        for spec in [&any, &re] {
+            let specs = [spec];
+            assert_eq!(
+                filter_request_cookie("abc123secret; k=v", &specs).as_deref(),
+                Some(if std::ptr::eq(spec, &any) { "" } else { "k=v" })
+            );
+            let r = removed_request_cookies("abc123secret; k=v", &specs);
+            assert!(r.iter().any(|(n, _)| n.is_empty()));
+            assert!(!format!("{r:?}").contains("abc123secret"));
+        }
+        // Named cookies keep their name.
+        let r = removed_request_cookies("k=v; z=1", &[&CookieSpec::parse("k").unwrap()]);
+        assert_eq!(r, [("k".to_string(), 0)]);
+    }
+
+    #[test]
+    fn the_last_spec_that_sets_an_attribute_is_the_one_named() {
+        let mut a = CookieSpec::parse("c;maxAge=600;sameSite=lax").unwrap();
+        let mut b = CookieSpec::parse("c;maxAge=60").unwrap();
+        a.trusted = true;
+        b.trusted = true;
+        let ap = apply_set_cookie_traced("c=1; Max-Age=999", &[&a, &b]);
+        assert_eq!(ap.max_age, Some((60, 1)));
+        assert_eq!(ap.same_site, Some((SameSite::Lax, 0)));
     }
 }

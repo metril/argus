@@ -221,6 +221,7 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(ext::menu))
         .routes(routes!(ext::trigger))
         .routes(routes!(ext::log))
+        .routes(routes!(ext::cookie_provenance))
         .routes(routes!(ext::post_rule, ext::get_rules))
         // audit
         .routes(routes!(audit::list_audit))

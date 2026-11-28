@@ -38,7 +38,8 @@ mod util;
 mod xmlprune;
 
 pub use cookie::{
-    apply_set_cookie, filter_request_cookie, CookieName, CookieSpec, SameSite, SetCookie,
+    apply_set_cookie, apply_set_cookie_traced, filter_request_cookie, removed_request_cookies,
+    Applied, CookieName, CookieSpec, SameSite, SetCookie,
 };
 pub use filter_engine::formats::{ExtKind, ExtRule};
 pub use headers::{is_removable_header, HeaderEdit};
@@ -53,7 +54,8 @@ pub use removeparam::{apply as apply_removeparam, restore_exempt, RemoveParam};
 pub use replace::{apply_replace, is_textual_content_type, ReplaceSpec, MAX_REPLACE_BYTES};
 pub use style::is_safe_style;
 pub use types::{
-    BodyTransform, RequestDecision, RequestInfo, ResourceType, ResponseInfo, ResponsePlan, RuleId,
+    BodyTransform, CookieTouch, RequestDecision, RequestInfo, ResourceType, ResponseInfo,
+    ResponsePlan, RuleId,
 };
 pub use urlskip::UrlSkip;
 pub use xmlprune::{apply_xmlprune, XmlPrune, MAX_XML_BYTES};

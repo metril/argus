@@ -921,3 +921,272 @@ async fn all_sites_hiding_cannot_blank_pages_or_hit_argus_ui() {
         add(good).await.assert_status_ok();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cookie provenance
+// ---------------------------------------------------------------------------
+
+const SECRET_VALUE: &str = "S3CR3T-d41d8cd98f00b204e9800998";
+
+fn record_cookies(session: u64, host: &str, lines: &[&str]) {
+    use std::sync::atomic::AtomicBool;
+    let on = AtomicBool::new(true);
+    filter_engine::cookie_log().open(session);
+    filter_engine::cookie_log().record_response(
+        &on,
+        session,
+        &filter_engine::cookie_log::Context {
+            host,
+            path: "/login",
+            page_host: "www.example.com",
+        },
+        lines.iter().map(|l| (l.as_bytes(), true)),
+        &[],
+    );
+}
+
+/// A bridge, a token with `logs:read`, the setting switched on.
+async fn provenance_ctx() -> (
+    TestContext,
+    String,
+    axum_test::TestWebSocket,
+    Arc<Fake>,
+    common::Sess,
+) {
+    let (ctx, f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let server = ws_server(&ctx);
+    let tok = ctx
+        .token(&admin, &["userscripts:bridge", "logs:read"])
+        .await;
+    let mut ws = hello(&server, &tok).await;
+    let _: Value = ws.receive_json().await;
+    ctx.state
+        .cookie_provenance
+        .set(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        .unwrap();
+    (ctx, tok, ws, f, admin)
+}
+
+#[tokio::test]
+async fn provenance_answers_enabled_false_while_the_setting_is_off() {
+    let (ctx, f) = with_bridge().await;
+    let admin = ctx.admin().await;
+    let server = ws_server(&ctx);
+    let tok = ctx
+        .token(&admin, &["userscripts:bridge", "logs:read"])
+        .await;
+    let mut ws = hello(&server, &tok).await;
+    let _: Value = ws.receive_json().await;
+    let _keep = f;
+    ctx.state
+        .cookie_provenance
+        .set(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .unwrap();
+    // Even records that exist (a ring that outlived a switch) are not served.
+    record_cookies(7, "a.test", &["x=1"]);
+    let r = ctx
+        .bearer("GET", "/api/v1/ext/cookies/provenance?since=5", &tok)
+        .add_header("x-argus-session", SID)
+        .await;
+    r.assert_status_ok();
+    assert_eq!(
+        r.json::<Value>(),
+        json!({"enabled": false, "records": [], "next_since": 5, "more": false})
+    );
+}
+
+#[tokio::test]
+async fn provenance_needs_the_scope_a_live_session_and_the_header() {
+    let (ctx, tok, _ws, _f, admin) = provenance_ctx().await;
+    let no_scope = ctx.token(&admin, &["userscripts:bridge"]).await;
+    let no_session = ctx.token(&admin, &["logs:read"]).await;
+    let path = "/api/v1/ext/cookies/provenance";
+    record_cookies(7, "a.test", &["x=1"]);
+    ctx.bearer("GET", path, &tok)
+        .add_header("x-argus-session", SID)
+        .await
+        .assert_status_ok();
+    // No header, a wrong session id, no scope, a token with no live session: all refused.
+    ctx.bearer("GET", path, &tok)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer("GET", path, &tok)
+        .add_header("x-argus-session", "ffffffffffffffffffffffffffffffff")
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer("GET", path, &no_scope)
+        .add_header("x-argus-session", SID)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.bearer("GET", path, &no_session)
+        .add_header("x-argus-session", SID)
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    ctx.server
+        .get(path)
+        .add_header("x-argus-session", SID)
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn provenance_is_session_scoped_and_never_carries_a_value() {
+    let (ctx, tok, _ws, _f, _admin) = provenance_ctx().await;
+    record_cookies(
+        7,
+        "Shop.Example.com",
+        &[
+            &format!("sid={SECRET_VALUE}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=3600"),
+            &format!("__Host-t=\"{SECRET_VALUE}\"; Secure; Path=/"),
+            SECRET_VALUE,
+        ],
+    );
+    // The request side: a nameless cookie is reported without a name, never with its text.
+    filter_engine::cookie_log().record_blocked_send(
+        &std::sync::atomic::AtomicBool::new(true),
+        7,
+        &filter_engine::cookie_log::Context {
+            host: "shop.example.com",
+            path: "/",
+            page_host: "",
+        },
+        &[("", "$cookie", None)],
+    );
+    // Another session's cookies never show.
+    record_cookies(99, "other.test", &["leak=1; Path=/"]);
+    let r = ctx
+        .bearer("GET", "/api/v1/ext/cookies/provenance", &tok)
+        .add_header("x-argus-session", SID)
+        .await;
+    r.assert_status_ok();
+    let text = r.text();
+    assert!(
+        !text.contains(SECRET_VALUE) && !text.contains("S3CR3T"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("leak") && !text.contains("other.test"),
+        "{text}"
+    );
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["enabled"], true);
+    assert_eq!(v["more"], false);
+    let recs = v["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 4);
+    assert_eq!(
+        (recs[3]["effect"].as_str(), recs[3]["name"].as_str()),
+        (Some("blocked_send"), Some(""))
+    );
+    let first = &recs[0];
+    assert_eq!(first["name"], "sid");
+    assert_eq!(first["effect"], "set");
+    assert_eq!(first["host"], "shop.example.com");
+    assert_eq!(first["path"], "/login");
+    assert_eq!(first["page_host"], "www.example.com");
+    assert_eq!(first["third_party"], false);
+    assert_eq!(
+        first["attrs"],
+        json!({"domain": null, "path": "/", "secure": true, "http_only": true,
+               "same_site": "lax", "max_age": 3600, "expires": null, "partitioned": false})
+    );
+    assert_eq!(recs[1]["prefix"], "__Host-");
+    assert_eq!(recs[1]["prefix_valid"], true);
+    assert_eq!(recs[2]["name"], "");
+    assert!(chrono::DateTime::parse_from_rfc3339(first["time"].as_str().unwrap()).is_ok());
+    assert_eq!(v["next_since"], recs[3]["seq"]);
+    // Every key a record can carry: nothing in the wire shape could hold a cookie value.
+    let keys = |o: &Value| {
+        let mut k: Vec<String> = o.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(
+        keys(first),
+        [
+            "attrs",
+            "changes",
+            "effect",
+            "host",
+            "list_id",
+            "list_name",
+            "name",
+            "page_host",
+            "path",
+            "prefix",
+            "prefix_valid",
+            "rule",
+            "seq",
+            "third_party",
+            "time",
+            "user_rule"
+        ]
+    );
+    assert_eq!(
+        keys(&first["attrs"]),
+        [
+            "domain",
+            "expires",
+            "http_only",
+            "max_age",
+            "partitioned",
+            "path",
+            "same_site",
+            "secure"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn provenance_pages_by_sequence_without_gaps_filters_by_site_and_limits() {
+    let (ctx, tok, _ws, _f, _admin) = provenance_ctx().await;
+    for i in 0..12 {
+        record_cookies(7, "www.example.com", &[&format!("e{i}=1")]);
+        record_cookies(7, "tracker.net", &[&format!("t{i}=1")]);
+    }
+    let get = |q: String| {
+        let (ctx, tok) = (&ctx, &tok);
+        async move {
+            ctx.bearer("GET", &format!("/api/v1/ext/cookies/provenance{q}"), tok)
+                .add_header("x-argus-session", SID)
+                .await
+                .json::<Value>()
+        }
+    };
+    // Paging by `next_since` with a small limit sees every record exactly once.
+    let (mut since, mut names) = (0u64, Vec::new());
+    loop {
+        let v = get(format!("?since={since}&limit=5")).await;
+        let recs = v["records"].as_array().unwrap();
+        assert!(recs.len() <= 5);
+        names.extend(recs.iter().map(|r| r["name"].as_str().unwrap().to_string()));
+        since = v["next_since"].as_u64().unwrap();
+        if !v["more"].as_bool().unwrap() {
+            break;
+        }
+    }
+    assert_eq!(names.len(), 24);
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 24);
+    // A record added after the cursor is the only thing the next poll returns.
+    record_cookies(7, "www.example.com", &["late=1"]);
+    let v = get(format!("?since={since}")).await;
+    assert_eq!(v["records"].as_array().unwrap().len(), 1);
+    assert_eq!(v["records"][0]["name"], "late");
+    // The host filter: the registrable domain and its subdomains.
+    let v = get("?host=shop.example.com".into()).await;
+    let recs = v["records"].as_array().unwrap();
+    assert_eq!(recs.len(), 13);
+    assert!(recs.iter().all(|r| r["host"] == "www.example.com"));
+    assert!(get("?host=nomatch.org".into()).await["records"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    // The limit is clamped to something sane.
+    let v = get("?limit=0".into()).await;
+    assert_eq!(v["records"].as_array().unwrap().len(), 1);
+    let v = get("?limit=999999".into()).await;
+    assert_eq!(v["records"].as_array().unwrap().len(), 25);
+}
