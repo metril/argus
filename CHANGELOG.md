@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.10.0 — 2026-11-27
+
 - Extension popup: "Blocked on this page" (count and share of requests), the domains the page connected to with blocked/allowed counts, and the proxy's blocked/total since start. The toolbar badge shows the page's blocked count (its colour still shows the certificate state; `!` for a problem). Counters are per tab, reset on navigation, kept in `storage.session`. Requests the proxy aborts (default `block_response = fail`) are attributed through `GET /stats/blocked/recent`; unexplained network errors are not counted as blocks.
 - Extension popup: "Argus on this site" switch (per registrable domain) using the site exceptions, with a reload offer. The popup now re-reads every card when the active tab navigates or changes (previously only the route line did), and drops late answers for the old page.
 - New scope `rules:site`: switch ad blocking off or on for one site (`GET`/`PUT`/`DELETE /rules/site-exceptions/{site}`, `GET` is new), without access to the rest of the rules. Part of the User role; `rules:write` still works on all three, `GET` also accepts `rules:read`.
