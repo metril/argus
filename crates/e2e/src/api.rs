@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use crate::TestProxy;
 
 const PASSWORD: &str = "SecurePassword123!";
-const SCOPES: [&str; 13] = [
+const SCOPES: [&str; 14] = [
+    "bypass:site",
     "config:read",
     "config:write",
     "logs:read",
@@ -74,6 +75,8 @@ impl TestProxy {
         )
         .await
         .expect("api state");
+        // As the binary does: the API edits the engine the proxy reads.
+        let _ = state.bypass.set(self.ctx.bypass().clone());
         let server = TestServer::new(web_api::create_router(state.clone(), &cfg)).expect("server");
         let resp = server
             .post("/api/v1/auth/register")

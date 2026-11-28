@@ -23,7 +23,7 @@
     const root = layer();
     root.querySelectorAll('*').forEach((e) => {
       if (!vis(e) || e.scrollWidth <= e.clientWidth + 1) return;
-      if (e.closest('.tw, .seg, pre, .cfm, .tbr') || e.matches('input, select, textarea, svg, .scrim')) return;
+      if (e.closest('.tw, .seg, pre, .cfm, .tbr') || e.matches('.sr') || e.matches('input, select, textarea, svg, .scrim')) return;
       const cs = getComputedStyle(e);
       if (cs.textOverflow === 'ellipsis' && (cs.overflow === 'hidden' || cs.overflowX === 'hidden')) return;
       if (cs.display === 'inline' || cs.display === 'table-cell' || cs.display === 'contents') return;
@@ -200,6 +200,36 @@
     const gap = R(f).top - R(last).bottom;
     return gap > 12.5 || gap < -0.5 ? ['gap between content and footer ' + gap.toFixed(1)] : [];
   }
+  // x1: the "Don't decrypt this site" row shares the grid's edges, its button is as tall as the grid's, and it stays within 23px of its resting height
+  function popupRow() {
+    const g = document.querySelector('.pgrid'), r = document.querySelector('[data-testid=site-bypass]');
+    if (!g || !r) return [];
+    const gr = R(g), out = [];
+    const e = [R(r), ...[...r.children].filter(vis).filter((c) => c.matches('.banner, .btn, .sbp-sk')).map(R)];
+    e.forEach((x, i) => { if (Math.abs(x.left - gr.left) > 1 || Math.abs(x.right - gr.right) > 1) out.push(`row part ${i} edges L${(x.left - gr.left).toFixed(1)} R${(x.right - gr.right).toFixed(1)}`); });
+    const b = r.querySelector('.btn');
+    const gh = Math.round(R(g.querySelector('.btn')).height);
+    if (b && Math.abs(Math.round(R(b).height) - gh) > 1) out.push(`button height ${Math.round(R(b).height)} vs grid ${gh}`);
+    const h = R(r).height;
+    if (h < 51.5 || h > 52 + 23) out.push('row height ' + h.toFixed(1));
+    return out;
+  }
+  // x1: Chrome caps a popup at 600px; nothing may be squeezed, so the tabs show whole (underline included)
+  function popupHeight() {
+    const pop = document.querySelector('.pop');
+    if (!pop) return [];
+    const out = [], h = R(pop).height;
+    if (h > 600.5) out.push('popup is ' + h.toFixed(1) + 'px tall');
+    const seg = document.querySelector('.pop .seg.wide');
+    if (seg) {
+      const r = R(seg), top = R(pop).top;
+      if (r.bottom - top > 600.5 || r.top < top - 0.5) out.push('tabs outside the popup');
+      if (r.height < 30) out.push('tabs squeezed to ' + r.height.toFixed(1));
+      const sel = seg.querySelector('[aria-checked=true]');
+      if (sel) { const b = R(sel); if (b.bottom > r.bottom + 0.5 || b.height < 24) out.push('active tab clipped ' + b.height.toFixed(1)); }
+    }
+    return out;
+  }
   // popup grid: equal buttons, two columns
   function popupGrid() {
     const g = document.querySelector('.pgrid');
@@ -247,7 +277,7 @@
   window.CK = {
     run(kind) {
       const all = { restoreWarn, armedPaint, dots, tables, edges, overflow, heights, primaries, fonts, hscroll, chips, rows, reach, rulesCards, removes, contrast };
-      if (kind === 'popup') return { overflow: overflow(), heights: heights(), fonts: fonts(), hscroll: hscroll(), popupGap: popupGap(), popupGrid: popupGrid(), contrast: contrast() };
+      if (kind === 'popup') return { overflow: overflow(), heights: heights(), fonts: fonts(), hscroll: hscroll(), popupGap: popupGap(), popupGrid: popupGrid(), popupRow: popupRow(), popupHeight: popupHeight(), contrast: contrast() };
       const res = {};
       for (const [k, f] of Object.entries(all)) { try { res[k] = f(); } catch (e) { res[k] = ['ERR ' + e.message]; } }
       return res;

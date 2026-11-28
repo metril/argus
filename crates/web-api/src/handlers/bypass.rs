@@ -8,15 +8,16 @@ use api_types::{
     ArgusCategoryDto, ArgusListsStatus, BypassCategoryDto, BypassCheckResponse, BypassEntriesPage,
     BypassEntryCounts, BypassEntryDto, BypassHostsResponse, BypassMode, BypassSettings,
     BypassSubscriptionDto, CreateBypassEntry, CreateBypassSubscription, FailsafeDto,
-    MessageResponse, SuggestedSubscription, UpdateBypassCategory, UpdateBypassEntry,
-    UpdateBypassSettings, UpdateBypassSubscription,
+    MessageResponse, SiteBypassSource, SiteBypassState, SuggestedSubscription,
+    UpdateBypassCategory, UpdateBypassEntry, UpdateBypassSettings, UpdateBypassSubscription,
 };
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use common::bypass as core;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
 use super::paging::{desc_key, natural_key, paginate, paginate_max, Keyed};
+use crate::auth::authz::{Actor, Principal};
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ApiResult};
 use crate::state::AppState;
 
@@ -1075,4 +1076,319 @@ pub async fn check_host(
         source: hit.as_ref().map(|h| h.source.clone()),
         pattern: hit.map(|h| h.pattern),
     }))
+}
+
+// ---- per-site entries (the browser extension's "Don't decrypt this site") ----
+
+/// Source of the entries the per-site routes own.
+const SITE_SOURCE: &str = "extension";
+
+/// Most entries the per-site route may own; more are made on the Bypass page.
+const MAX_SITE_ENTRIES: usize = 1000;
+
+/// Add the extension's entry for `pattern` unless one exists; refuses past `limit` entries.
+fn add_site_entry(
+    s: &mut core::BypassState,
+    pattern: String,
+    by: &str,
+    limit: usize,
+) -> Result<(), String> {
+    if s.entries.iter().any(|e| e.pattern == pattern) {
+        return Ok(());
+    }
+    if s.entries.iter().filter(|e| e.source == SITE_SOURCE).count() >= limit {
+        return Err("limit".into());
+    }
+    s.entries.push(core::Entry {
+        id: core::new_id(),
+        pattern,
+        mode: core::BypassMode::NoDecrypt,
+        source: SITE_SOURCE.into(),
+        note: Some(format!("Added from the browser extension by {by}")),
+        updated_at: core::now(),
+    });
+    Ok(())
+}
+
+/// Normalise a host for a per-site entry: lowercase ASCII (IDNA), no trailing dot, a registrable
+/// host name or an IP literal. `own` are the hosts of Argus itself (refused).
+fn site_host(raw: &str, own: &[String]) -> Result<String, String> {
+    let t = raw.trim().trim_end_matches('.');
+    if t.is_empty() || t.len() > 253 {
+        return Err("host: 1 to 253 characters".into());
+    }
+    let bracketed = t.starts_with('[') && t.ends_with(']');
+    let v6 = t
+        .trim_matches(['[', ']'])
+        .parse::<std::net::Ipv6Addr>()
+        .ok();
+    if v6.is_none()
+        && (bracketed
+            || t.contains([
+                '/', '\\', ':', '@', '?', '#', '*', '%', ' ', '\t', '[', ']', '<', '>', '"',
+            ])
+            || t.split('.').any(str::is_empty))
+    {
+        return Err(
+            "host: expected a bare host name (no scheme, port, path, wildcard or empty label)"
+                .into(),
+        );
+    }
+    let host = match v6 {
+        Some(ip) => ip.to_string(),
+        None => match url::Host::parse(t) {
+            Ok(url::Host::Domain(d)) => d.trim_end_matches('.').to_string(),
+            Ok(url::Host::Ipv4(ip)) => ip.to_string(),
+            Ok(url::Host::Ipv6(ip)) => ip.to_string(),
+            Err(_) => return Err("host: not a valid host name".into()),
+        },
+    };
+    let host = core::normalize_pattern(&host).map_err(|_| {
+        "host: expected a site (a registrable host name or an IP address)".to_string()
+    })?;
+    if host.starts_with("*.") {
+        return Err("host: wildcards are not allowed".into());
+    }
+    let reserved = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            let ip = match ip {
+                std::net::IpAddr::V6(v) => v
+                    .to_ipv4_mapped()
+                    .map_or(std::net::IpAddr::V6(v), std::net::IpAddr::V4),
+                v4 => v4,
+            };
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || match ip {
+                    std::net::IpAddr::V4(v) => v.is_link_local() || v.is_broadcast(),
+                    std::net::IpAddr::V6(v) => (v.segments()[0] & 0xffc0) == 0xfe80,
+                }
+        }
+        Err(_) => ["localhost", "local", "internal", "arpa"]
+            .iter()
+            .any(|r| host == *r || host.ends_with(&format!(".{r}"))),
+    };
+    if reserved {
+        return Err("host: a reserved or internal host cannot be bypassed here".into());
+    }
+    if own.iter().any(|o| o.eq_ignore_ascii_case(&host)) {
+        return Err("host: that is Argus itself".into());
+    }
+    Ok(host)
+}
+
+fn own_hosts(state: &AppState, headers: &axum::http::HeaderMap) -> Vec<String> {
+    let bare = |h: &str| {
+        let h = h.trim();
+        let h = match h.strip_prefix('[') {
+            Some(r) => r.split(']').next().unwrap_or(r),
+            None => h.rsplit_once(':').map_or(h, |(a, p)| {
+                if p.bytes().all(|b| b.is_ascii_digit()) && !a.contains(':') {
+                    a
+                } else {
+                    h
+                }
+            }),
+        };
+        h.trim_end_matches('.').to_ascii_lowercase()
+    };
+    let mut v = Vec::new();
+    if let Some(h) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    {
+        v.push(bare(h));
+    }
+    let c = state.proxy_state.config.read();
+    v.push(bare(&c.webui.host));
+    v.push(bare(&c.proxy.host));
+    v
+}
+
+/// What the proxy does for `host` right now: the lookup the connection path uses, the fail-safe
+/// when nothing matches, and whether the extension's own entry for the host exists.
+fn site_state(state: &AppState, host: &str) -> SiteBypassState {
+    let engine = state.bypass();
+    let hit = engine.lookup(host);
+    let (removable, category, sub_name) = engine.read(|s| {
+        let removable = s
+            .entries
+            .iter()
+            .any(|e| e.source == SITE_SOURCE && e.pattern == host);
+        let cat = hit
+            .as_ref()
+            .and_then(|h| h.source.strip_prefix("argus:"))
+            .and_then(|c| {
+                let title = core::FIRST_PARTY.iter().find(|(id, _)| *id == c)?.1;
+                Some(category_dto(s, c, title).title)
+            });
+        let sub = hit
+            .as_ref()
+            .and_then(|h| h.source.strip_prefix("sub:"))
+            .and_then(|id| s.subscriptions.iter().find(|x| x.id == id))
+            .map(|x| x.name.clone());
+        (removable, cat, sub)
+    });
+    let ev_auto_tunnel = engine.ev_no_decrypt();
+    let base = |source, mode, name| SiteBypassState {
+        host: host.to_string(),
+        bypassed: !matches!(source, SiteBypassSource::None),
+        mode,
+        source,
+        name,
+        removable,
+        ev_auto_tunnel,
+    };
+    if let Some(h) = hit {
+        let mode = Some(mode_out(h.mode));
+        return match h.source.as_str() {
+            SITE_SOURCE => base(SiteBypassSource::Extension, mode, Some(h.pattern)),
+            "custom" | "migrated" => base(SiteBypassSource::Manual, mode, Some(h.pattern)),
+            s if s.starts_with("argus:") => base(
+                SiteBypassSource::Category,
+                mode,
+                category.or(Some(h.source)),
+            ),
+            _ => base(
+                SiteBypassSource::Subscription,
+                mode,
+                sub_name.or(Some(h.source)),
+            ),
+        };
+    }
+    let fs = engine.failsafe();
+    if fs.active {
+        return base(
+            SiteBypassSource::Failsafe,
+            Some(BypassMode::NoDecrypt),
+            fs.reason,
+        );
+    }
+    base(SiteBypassSource::None, None, None)
+}
+
+/// Whether Argus leaves this host undecrypted, and why.
+#[utoipa::path(
+    get, path = "/bypass/sites/{host}", tag = "bypass",
+    security(("bearer_auth" = ["bypass:site"]), ("bearer_auth" = ["config:write"])),
+    params(("host" = String, Path, description = "Host name or IP address")),
+    responses((status = 200, description = "The host's state", body = SiteBypassState))
+)]
+pub async fn get_site(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    ApiPath(host): ApiPath<String>,
+) -> ApiResult<Json<SiteBypassState>> {
+    let host = site_host(&host, &own_hosts(&state, &headers)).map_err(bad)?;
+    Ok(Json(site_state(&state, &host)))
+}
+
+/// Stop decrypting exactly this host (not its subdomains): a no-decrypt entry marked as the
+/// extension's. Idempotent; a host something else already bypasses is left as it is.
+#[utoipa::path(
+    put, path = "/bypass/sites/{host}", tag = "bypass",
+    security(("bearer_auth" = ["bypass:site"]), ("bearer_auth" = ["config:write"])),
+    params(("host" = String, Path, description = "Host name or IP address")),
+    responses((status = 200, description = "The host's state after the call", body = SiteBypassState))
+)]
+pub async fn put_site(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    headers: axum::http::HeaderMap,
+    ApiPath(host): ApiPath<String>,
+) -> ApiResult<Json<SiteBypassState>> {
+    let host = site_host(&host, &own_hosts(&state, &headers)).map_err(bad)?;
+    if state.bypass().lookup(&host).is_none() {
+        let by = match &p.actor {
+            Actor::Token { token_id } => format!("{} (token {token_id})", p.username),
+            Actor::Session { .. } => p.username.clone(),
+        };
+        let pattern = host.clone();
+        state
+            .bypass()
+            .update_async(move |s| add_site_entry(s, pattern, &by, MAX_SITE_ENTRIES))
+            .await
+            .map_err(|m| {
+                if m == "limit" {
+                    ApiError::conflict(
+                        "site_bypass_limit",
+                        format!(
+                            "The extension already has {MAX_SITE_ENTRIES} sites that are not decrypted; remove some on the Bypass page"
+                        ),
+                    )
+                } else {
+                    ApiError::Internal(m)
+                }
+            })?;
+    }
+    Ok(Json(site_state(&state, &host)))
+}
+
+/// Decrypt this host again: removes only the entry the extension made. Idempotent when there is
+/// none; 409 when a manual entry, subscription or category is what bypasses it.
+#[utoipa::path(
+    delete, path = "/bypass/sites/{host}", tag = "bypass",
+    security(("bearer_auth" = ["bypass:site"]), ("bearer_auth" = ["config:write"])),
+    params(("host" = String, Path, description = "Host name or IP address")),
+    responses(
+        (status = 200, description = "The host's state after the call", body = SiteBypassState),
+        (status = 409, description = "Bypassed by something other than the extension's entry")
+    )
+)]
+pub async fn delete_site(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    ApiPath(host): ApiPath<String>,
+) -> ApiResult<Json<SiteBypassState>> {
+    let host = site_host(&host, &own_hosts(&state, &headers)).map_err(bad)?;
+    let cur = site_state(&state, &host);
+    if !cur.removable {
+        if matches!(
+            cur.source,
+            SiteBypassSource::Manual | SiteBypassSource::Category | SiteBypassSource::Subscription
+        ) {
+            return Err(ApiError::conflict(
+                "not_extension_entry",
+                format!(
+                    "{host} is bypassed by {}; change it on the Bypass page",
+                    cur.name.as_deref().unwrap_or("another entry")
+                ),
+            ));
+        }
+        return Ok(Json(cur));
+    }
+    let pattern = host.clone();
+    state
+        .bypass()
+        .update_async(move |s| {
+            s.entries
+                .retain(|e| !(e.source == SITE_SOURCE && e.pattern == pattern));
+            Ok(())
+        })
+        .await
+        .map_err(ApiError::Internal)?;
+    Ok(Json(site_state(&state, &host)))
+}
+
+#[cfg(test)]
+mod site_tests {
+    use super::*;
+
+    #[test]
+    fn the_cap_refuses_new_entries_but_not_repeats() {
+        let mut s = core::BypassState::default();
+        add_site_entry(&mut s, "a.test".into(), "u", 2).unwrap();
+        add_site_entry(&mut s, "b.test".into(), "u", 2).unwrap();
+        assert_eq!(
+            add_site_entry(&mut s, "c.test".into(), "u", 2),
+            Err("limit".into())
+        );
+        add_site_entry(&mut s, "a.test".into(), "u", 2).unwrap();
+        assert_eq!(s.entries.len(), 2);
+        // Entries of other sources do not count.
+        s.entries[0].source = "custom".into();
+        add_site_entry(&mut s, "c.test".into(), "u", 2).unwrap();
+        assert_eq!(s.entries.len(), 3);
+    }
 }
