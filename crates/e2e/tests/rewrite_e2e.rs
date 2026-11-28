@@ -668,6 +668,161 @@ e2e_test!(trusted_types_name_added, rules = AD, |env| {
     assert!(c.contains("trusted-types app adblock-proxy"), "{c}");
 });
 
+// ---- challenge pages and the per-site switch -----------------------------------------------
+
+/// A Cloudflare-style challenge: policy in a header and, with quotes as character references, in
+/// a `<meta>`, plus an inline script whose nonce the policy names.
+const CHALLENGE_PAGE: &str = "<!DOCTYPE html><html><head><meta http-equiv=\"content-security-policy\" content=\"default-src &#39;none&#39;; script-src &#39;nonce-abc&#39;\"><title>Just a moment...</title></head><body><div class=\"ad\">x</div><script nonce=\"abc\">1</script></body></html>";
+const CHALLENGE_CSP: &str = "default-src 'none'; script-src 'nonce-abc' 'unsafe-eval'";
+
+const CHALLENGE_RULES: [&str; 5] = [
+    "rw.test##.ad",
+    "||rw.test^$removeheader=x-secret",
+    "||rw.test^$csp=frame-src 'none'",
+    "/blk^$header=x-ad:yes",
+    "||ads.test^",
+];
+
+/// A navigation request of the given `Sec-Fetch-Dest` to `rw.test`.
+async fn nav(env: &TestEnv, path: &str, dest: &str) -> reqwest::Response {
+    env.client()
+        .request(reqwest::Method::GET, &env.origin.https_url("rw.test", path))
+        .header("sec-fetch-dest", dest)
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("request")
+}
+
+e2e_test!(
+    challenge_pages_are_passed_through_untouched,
+    rules = CHALLENGE_RULES,
+    |env| {
+        let gz = encode_stacked(&[Coding::Gzip], CHALLENGE_PAGE.as_bytes()).await;
+        let challenge = |status: u16| {
+            MockResponse::new(status, gz.clone())
+                .header("content-type", "text/html; charset=UTF-8")
+                .header("content-encoding", "gzip")
+                .header("etag", "\"chl-1\"")
+                .header("x-secret", "1")
+                .header("cf-mitigated", "challenge")
+                .header("content-security-policy", CHALLENGE_CSP)
+        };
+        env.origin.route("/c", challenge(403));
+        env.origin.route("/c503", challenge(503));
+        // The marker on a normal page, or on an ad iframe, switches nothing off.
+        env.origin.route(
+            "/ok",
+            MockResponse::new(200, CHALLENGE_PAGE)
+                .header("content-type", "text/html; charset=UTF-8")
+                .header("cf-mitigated", "challenge")
+                .header("content-security-policy", CHALLENGE_CSP),
+        );
+        env.origin.route(
+            "/frame",
+            MockResponse::new(403, CHALLENGE_PAGE)
+                .header("content-type", "text/html; charset=UTF-8")
+                .header("cf-mitigated", "challenge")
+                .header("content-security-policy", CHALLENGE_CSP),
+        );
+        env.origin
+            .route("/blk", challenge(403).header("x-ad", "yes"));
+
+        for path in ["/c", "/c503"] {
+            let r = nav(&env, path, "document").await;
+            assert!(matches!(r.status().as_u16(), 403 | 503));
+            let h = r.headers().clone();
+            // Byte for byte: same coding, length and validator, nothing decoded and re-encoded.
+            assert_eq!(h["content-encoding"], "gzip", "{path}");
+            assert_eq!(h["content-length"], gz.len().to_string().as_str(), "{path}");
+            assert_eq!(h["etag"], "\"chl-1\"", "{path}");
+            // What the lists asked for still applies: `$removeheader` and `$csp`.
+            assert!(h.get("x-secret").is_none(), "{path}");
+            let csp: Vec<_> = h
+                .get_all("content-security-policy")
+                .iter()
+                .map(|v| v.to_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                csp,
+                vec![CHALLENGE_CSP.to_string(), "frame-src 'none'".to_string()],
+                "{path}"
+            );
+            assert_eq!(r.bytes().await.unwrap().as_ref(), gz.as_slice(), "{path}");
+        }
+
+        // `$header=` response blocks still stop the page.
+        let r = nav(&env, "/blk", "document").await;
+        let body = body_text(r).await;
+        assert!(!body.contains("Just a moment"), "{body}");
+
+        // Not a top-level 403/503 document: filtered like any page.
+        for (path, dest) in [("/ok", "document"), ("/frame", "iframe")] {
+            let html = body_text(nav(&env, path, dest).await).await;
+            assert!(html.contains("/__adblock__/boot."), "{path}: {html}");
+        }
+
+        // The log marks the passed-through challenge as a note, never as a rule that blocked.
+        let log = env.proxy.engine.recent_requests(1000);
+        let noted: Vec<_> = log
+            .iter()
+            .filter(|e| e.rule.as_deref() == Some("note: challenge page passed through"))
+            .collect();
+        assert!(!noted.is_empty());
+        assert!(noted
+            .iter()
+            .all(|e| e.action == filter_engine::EventAction::Allowed
+                && !e.url.ends_with("/ok")
+                && !e.url.ends_with("/frame")
+                && matches!(e.status, Some(403 | 503))));
+    }
+);
+
+const OFF_RULES: [&str; 3] = [
+    "rw.test##.ad",
+    "||adblock.invalid^",
+    "@@||adblock.invalid^$domain=rw.test",
+];
+
+e2e_test!(
+    site_switch_off_sends_the_document_untouched,
+    rules = OFF_RULES,
+    |env| {
+        let csp = "script-src 'nonce-page'; connect-src 'self'";
+        env.origin.route(
+            "/p",
+            MockResponse::html(PAGE).header("content-security-policy", csp),
+        );
+        for v in VERSIONS {
+            let r = env
+                .client_with(v)
+                .request(reqwest::Method::GET, &env.origin.https_url("rw.test", "/p"))
+                .header("sec-fetch-dest", "document")
+                .header("accept", "text/html")
+                .send()
+                .await
+                .unwrap();
+            // Same bytes and the site's own policy: no boot script, observer or CSP allowance.
+            assert_eq!(csp_values(&r), vec![csp.to_string()], "{v:?}");
+            assert_eq!(body_text(r).await, PAGE, "{v:?}");
+            // A site the switch is not off for is still filtered.
+            let r = env
+                .client_with(v)
+                .request(
+                    reqwest::Method::GET,
+                    &env.origin.https_url("other.test", "/p"),
+                )
+                .header("sec-fetch-dest", "document")
+                .header("accept", "text/html")
+                .send()
+                .await
+                .unwrap();
+            let html = body_text(r).await;
+            assert!(html.contains("/__adblock__/boot."), "{v:?}: {html}");
+        }
+    }
+);
+
 // ---- /__adblock__/ ------------------------------------------------------------------------
 
 e2e_test!(

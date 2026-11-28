@@ -1944,6 +1944,8 @@ impl ProxyContext {
         };
 
         let status = resp.status();
+        // A bot-protection challenge document: relayed as it came (see `CHALLENGE_MARKERS`).
+        let challenge = is_challenge_response(rtype, status, resp.headers());
         if !bypass_full {
             // The certificate of the connection that served this very response.
             let cert_fp = resp.peer_certificate().and_then(|der| {
@@ -1955,7 +1957,7 @@ impl ProxyContext {
                 self.certs.note_seen(&hostport, &rctx.profile.load().label);
                 Some(fp)
             });
-            log_request(
+            log_request_rule(
                 cert_fp.as_deref(),
                 rctx,
                 filter_engine::EventAction::Allowed,
@@ -1965,6 +1967,7 @@ impl ProxyContext {
                 rtype,
                 Some(status.as_u16()),
                 None,
+                if challenge { CHALLENGE_NOTE } else { "" },
             );
         }
         // Moved out of the response (the body stream does not need them): no header-map copy.
@@ -2027,7 +2030,7 @@ impl ProxyContext {
                 None
             };
         // The in-page shim (WebRTC, Push, Location, DNT/GPC properties) goes into frames only.
-        let stealth_js = if rtype.is_frame() && kind == BodyKind::Html {
+        let stealth_js = if rtype.is_frame() && kind == BodyKind::Html && !challenge {
             stealth::script(&st, stealth_mask)
         } else {
             None
@@ -2045,6 +2048,13 @@ impl ProxyContext {
             kind = BodyKind::None;
         }
         if bypass_full {
+            kind = BodyKind::None;
+        }
+        if challenge {
+            // The body goes through byte for byte (nothing of ours is injected, the page's own
+            // policy is not rewritten). What needs no body stays: the script policy's headers,
+            // `$csp`, `$header=` blocks and `$removeheader` edits (the `kind == None` path below
+            // keeps header edits only).
             kind = BodyKind::None;
         }
         // HEAD / 1xx / 204 / 205 / 304 never carry a body, whatever the origin's length says.
@@ -2290,7 +2300,9 @@ impl ProxyContext {
                         host: &host,
                         nonce: &nonce,
                         script_ok: !blocks_scripts,
-                        observer_ok: !opaque && enabled,
+                        // The observer is the cosmetic-filter runtime: not with the site switch
+                        // off. Userscripts and the panel do not need it.
+                        observer_ok: !opaque && enabled && !page_off,
                     })
                 } else {
                     Default::default()
@@ -3000,6 +3012,25 @@ fn log_request(
     status: Option<u16>,
     error_kind: Option<filter_engine::ErrorKind>,
 ) {
+    log_request_rule(
+        cert_fp, rctx, action, method, url, source, rtype, status, error_kind, "",
+    );
+}
+
+/// [`log_request`] with the note the log shows in its rule column (empty for none).
+#[allow(clippy::too_many_arguments)]
+fn log_request_rule(
+    cert_fp: Option<&str>,
+    rctx: &RequestCtx,
+    action: filter_engine::EventAction,
+    method: &str,
+    url: &str,
+    source: &str,
+    rtype: RequestType,
+    status: Option<u16>,
+    error_kind: Option<filter_engine::ErrorKind>,
+    rule: &str,
+) {
     let profile = rctx.profile.load();
     profile.engine.record_request(&filter_engine::EventRef {
         action,
@@ -3007,7 +3038,7 @@ fn log_request(
         url,
         source_host: filter_engine::RequestMatcher::host_of(source),
         request_type: rtype.as_str(),
-        rule: "",
+        rule,
         list_id: None,
         client: Some(profile.label.as_ref()),
         status,
@@ -3017,6 +3048,38 @@ fn log_request(
         outcome: None,
         session: rctx.ext,
     });
+}
+
+/// Response headers by which a site's bot-protection service marks a document as a challenge or
+/// interstitial (`(name, value)`, value compared case-insensitively). Such a page is judged by
+/// scripts and a policy of its own, whose exact bytes the service verifies, so it is passed through
+/// untouched: nothing injected, no policy adapted. Add an entry only with a captured response.
+///
+/// - Cloudflare sends `cf-mitigated: challenge` on every managed-challenge and interstitial page
+///   (observed on stackoverflow.com, whose page carries a nonce'd inline script and a `<meta>`
+///   policy that the rewriting broke).
+const CHALLENGE_MARKERS: &[(&str, &str)] = &[("cf-mitigated", "challenge")];
+
+/// The note the request log shows for a challenge page that was passed through.
+const CHALLENGE_NOTE: &str = "note: challenge page passed through";
+
+/// A top-level document answered 403 or 503 with a challenge marker. Anything else (a 200 page,
+/// a sub-frame such as an ad iframe) is filtered normally whatever headers it sends.
+fn is_challenge_response(rtype: RequestType, status: StatusCode, headers: &HeaderMap) -> bool {
+    rtype == RequestType::Document
+        && matches!(status.as_u16(), 403 | 503)
+        && is_bot_challenge(headers)
+}
+
+/// Whether a response carries a bot-protection marker (see [`CHALLENGE_MARKERS`]).
+fn is_bot_challenge(headers: &HeaderMap) -> bool {
+    CHALLENGE_MARKERS.iter().any(|(name, value)| {
+        headers
+            .get_all(*name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.trim().eq_ignore_ascii_case(value))
+    })
 }
 
 /// Request type of Argus's own `/__adblock__/*` and panel traffic: lets the log UI and API
@@ -3130,6 +3193,56 @@ fn bundle_cache_control(origin: &[&str]) -> Option<HeaderValue> {
         .flat_map(|v| v.split(','))
         .any(|d| d.trim().eq_ignore_ascii_case("no-store"));
     (!no_store).then(|| HeaderValue::from_static("private, no-cache"))
+}
+
+#[cfg(test)]
+mod challenge_marker_tests {
+    use super::is_bot_challenge;
+    use hyper::header::HeaderMap;
+
+    fn map(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(*k, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn cloudflare_challenge_is_recognised_case_insensitively() {
+        assert!(is_bot_challenge(&map(&[("cf-mitigated", "challenge")])));
+        assert!(is_bot_challenge(&map(&[("CF-Mitigated", " Challenge ")])));
+        assert!(is_bot_challenge(&map(&[
+            ("cf-mitigated", "other"),
+            ("cf-mitigated", "challenge")
+        ])));
+    }
+
+    #[test]
+    fn only_a_top_level_403_or_503_document_counts() {
+        use super::{is_challenge_response, RequestType};
+        use hyper::StatusCode;
+        let h = map(&[("cf-mitigated", "challenge")]);
+        let go = |t, s: u16| is_challenge_response(t, StatusCode::from_u16(s).unwrap(), &h);
+        assert!(go(RequestType::Document, 403));
+        assert!(go(RequestType::Document, 503));
+        assert!(!go(RequestType::Document, 200));
+        assert!(!go(RequestType::Document, 429));
+        assert!(!go(RequestType::Subdocument, 403));
+        assert!(!go(RequestType::Script, 403));
+        assert!(!is_challenge_response(
+            RequestType::Document,
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn ordinary_responses_are_not_challenges() {
+        assert!(!is_bot_challenge(&HeaderMap::new()));
+        assert!(!is_bot_challenge(&map(&[("cf-mitigated", "block")])));
+        assert!(!is_bot_challenge(&map(&[("server", "cloudflare")])));
+    }
 }
 
 #[cfg(test)]
