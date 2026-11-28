@@ -124,6 +124,10 @@ pub struct RequestDecision {
     pub cleaned_url: Option<(String, RuleId)>,
     /// Edits to the *request* headers (`$cookie`, `$removeheader=request:`).
     pub header_edits: Vec<HeaderEdit>,
+    /// `$redirect=name`: answer with the named redirect resource instead of the network.
+    pub redirect: Option<(String, RuleId)>,
+    /// `$redirect-rule=name`: use this resource only if something else blocks the request.
+    pub redirect_rule: Option<(String, RuleId)>,
     /// Every rule that took part (for logging).
     pub matched: Vec<RuleId>,
 }
@@ -134,6 +138,8 @@ impl RequestDecision {
             && self.rewrite_url.is_none()
             && self.cleaned_url.is_none()
             && self.header_edits.is_empty()
+            && self.redirect.is_none()
+            && self.redirect_rule.is_none()
     }
 }
 

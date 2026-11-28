@@ -20,13 +20,16 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-pub use abp::{find_includes, preprocess_and_meta, split_cosmetic, split_options, Cosmetic};
+pub use abp::{
+    find_includes, preprocess_and_meta, preprocess_and_meta_for, split_cosmetic,
+    split_option_tokens, split_options, split_pipe_tokens, Cosmetic,
+};
 pub use ext::{classify_rejected, scriptlet_alias_table, ExtKind, ExtRule};
 pub use iplist::{IpRange, IpSet};
 
 /// Bumped whenever conversion output could change for the same input (part of the persisted
 /// engine's cache key).
-pub const CONVERTER_VERSION: u32 = 4;
+pub const CONVERTER_VERSION: u32 = 5;
 
 /// Max number of per-line errors kept in [`ConvertStats::errors`].
 pub const MAX_ERRORS: usize = 50;
@@ -190,6 +193,9 @@ pub struct ConvertOptions {
     pub allowlist: bool,
     /// Resolved `!#include` targets, by the path as written in the list (see [`find_includes`]).
     pub includes: HashMap<String, String>,
+    /// The list is trusted. Trusted lists run HTML filtering and `$replace`, so their
+    /// `!#if cap_html_filtering` branches are taken; untrusted lists keep the `!#else` ones.
+    pub trusted: bool,
 }
 
 /// Result of [`convert`].
