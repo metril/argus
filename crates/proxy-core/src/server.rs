@@ -456,6 +456,9 @@ impl ProxyControl {
         self.ctx
             .set_guard_service_workers(config.adblock.guard_service_workers);
         self.ctx.set_block_response(config.proxy.block_response);
+        self.ctx.set_userscripts_enabled(config.userscripts.enabled);
+        self.ctx
+            .set_cookie_provenance(config.privacy.cookie_provenance);
         self.ctx.set_cname(&config.adblock.cname);
         self.ctx
             .set_guard_service_workers_exempt(config.adblock.guard_service_workers_exempt.clone());

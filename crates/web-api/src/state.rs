@@ -326,6 +326,10 @@ pub struct AppState {
 
     /// The proxy's live Stealth Mode settings; saved changes are swapped in here.
     pub stealth: OnceLock<Arc<arc_swap::ArcSwap<common::config::StealthSettings>>>,
+    /// The proxy's userscript-injection switch, set once the proxy runs.
+    pub userscripts_enabled: OnceLock<Arc<std::sync::atomic::AtomicBool>>,
+    /// The proxy's cookie-provenance switch, set once the proxy runs.
+    pub cookie_provenance: OnceLock<Arc<std::sync::atomic::AtomicBool>>,
 
     /// Status of the trusted root set (installed by the proxy; absent otherwise).
     pub roots: OnceLock<Arc<common::certstore::RootsStatusCell>>,
@@ -931,6 +935,8 @@ pub async fn build_state_full(
         bypass: OnceLock::new(),
         certs: OnceLock::new(),
         stealth: OnceLock::new(),
+        userscripts_enabled: OnceLock::new(),
+        cookie_provenance: OnceLock::new(),
         roots: OnceLock::new(),
         chain_probe: OnceLock::new(),
         argus: OnceLock::new(),

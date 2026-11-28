@@ -122,6 +122,60 @@ pub fn UserscriptsPage() -> impl IntoView {
         });
     });
 
+    // Master switch: whether the proxy injects userscripts at all (live setting).
+    let inject = RwSignal::new(Option::<bool>::None);
+    let inject_err = RwSignal::new(Option::<String>::None);
+    let inject_busy = RwSignal::new(false);
+    let user = crate::state::use_auth_state().user;
+    let mode = Signal::derive(move || {
+        user.with(|u| master_mode(u.as_ref().map_or(&[][..], |u| u.scopes.as_slice())))
+    });
+    let loading = StoredValue::new(false);
+    Effect::new(move |_| {
+        if mode.get() == MasterMode::NoAccess
+            || inject.get_untracked().is_some()
+            || loading.get_value()
+        {
+            return;
+        }
+        loading.set_value(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            match ApiClient::new().get_proxy_config().await {
+                Ok(c) => inject.set(Some(c.userscripts_enabled)),
+                Err(e) => inject_err.set(Some(format!("Couldn't read this setting: {e}"))),
+            }
+            loading.set_value(false);
+        });
+    });
+    let set_inject = Callback::new(move |v: bool| {
+        if inject_busy.get_untracked() {
+            return;
+        }
+        inject_busy.set(true);
+        wasm_bindgen_futures::spawn_local(async move {
+            let req = crate::api::proxy::UpdateProxyConfigRequest {
+                userscripts_enabled: Some(v),
+                ..Default::default()
+            };
+            match ApiClient::new().update_proxy_config(&req).await {
+                Ok(c) => {
+                    inject.set(Some(c.userscripts_enabled));
+                    app.get_value().success(if c.userscripts_enabled {
+                        "Userscripts will run on the next page load"
+                    } else {
+                        "Userscript injection is off"
+                    });
+                }
+                Err(e) => app
+                    .get_value()
+                    .error(format!("Couldn't change userscript injection: {e}")),
+            }
+            inject_busy.set(false);
+        });
+    });
+    let inject_warn =
+        move || injection_warning(inject.get(), counts.get().map_or(0, |c| c.enabled));
+
     // Install
     let show_install = RwSignal::new(false);
     let url_mode = RwSignal::new(true);
@@ -366,6 +420,31 @@ pub fn UserscriptsPage() -> impl IntoView {
                             })>"Export\u{2026}"</MenuItem>
                         })}
                     </Menu>
+                </div>
+            </div>
+            <div class="card us-master">
+                <div class="card-b">
+                    <div class="us-master-row">
+                        <Switch checked=Signal::derive(move || inject.get().unwrap_or(false))
+                            on_change=set_inject
+                            disabled=Signal::derive(move || mode.get() != MasterMode::Editable || inject.get().is_none() || inject_busy.get())
+                            label="Inject userscripts" />
+                        <div class="us-master-text">
+                            <span class="us-master-label">"Inject userscripts"</span>
+                            {move || match (inject_err.get(), inject_warn()) {
+                                (Some(e), _) => view! { <span class="hint warn">{e}</span> }.into_any(),
+                                (None, Some(w)) => view! {
+                                    <span class="hint warn" role="status"><Icon name="alert" />" "{w}</span>
+                                }.into_any(),
+                                (None, None) if mode.get() != MasterMode::Editable => view! {
+                                    <span class="hint">"Only an admin can change this."</span>
+                                }.into_any(),
+                                (None, None) => view! {
+                                    <span class="hint">"Installed scripts run on the pages they match. Off: they stay installed but never run."</span>
+                                }.into_any(),
+                            }}
+                        </div>
+                    </div>
                 </div>
             </div>
             <Tabs items=tab_items active=ctx.tab label="Userscripts sections" />

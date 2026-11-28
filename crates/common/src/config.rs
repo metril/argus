@@ -24,6 +24,18 @@ pub struct ProxyConfig {
     /// Stealth Mode: privacy edits to requests, responses and pages.
     #[serde(default)]
     pub stealth: StealthSettings,
+    /// Privacy bookkeeping the extension reads.
+    #[serde(default)]
+    pub privacy: PrivacySettings,
+}
+
+/// Privacy bookkeeping (not request edits; see [`StealthSettings`] for those).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrivacySettings {
+    /// Record cookie names and attributes seen in transit (never values) so the extension can
+    /// show where cookies come from. Off by default.
+    #[serde(default)]
+    pub cookie_provenance: bool,
 }
 
 fn on() -> bool {
@@ -1078,6 +1090,7 @@ impl Default for ProxyConfig {
             dns: DnsSettings::default(),
             bypass: BypassConfig::default(),
             stealth: StealthSettings::default(),
+            privacy: PrivacySettings::default(),
         }
     }
 }

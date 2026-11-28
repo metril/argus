@@ -299,6 +299,7 @@ impl TestProxy {
             dns: Default::default(),
             bypass: Default::default(),
             stealth: Default::default(),
+            privacy: Default::default(),
         };
 
         tweak(&mut config);
@@ -425,6 +426,7 @@ impl TestProxy {
         let dir = self.dir.as_ref().expect("data dir").path().join("us");
         let m = Arc::new(userscript_engine::UserscriptManager::new(dir).expect("manager"));
         self.ctx.set_userscripts(Some(m.clone()));
+        self.ctx.set_userscripts_enabled(true);
         *g = Some(m.clone());
         m
     }

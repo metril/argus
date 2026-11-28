@@ -520,6 +520,60 @@ async fn request_log_capacity_changes_live_via_config_put() {
     assert_eq!(e.recent_blocked(1000).len(), 100);
 }
 
+/// `userscripts_enabled` and `cookie_provenance` apply to the proxy's live switches at once and
+/// persist in the overlay, which a reload reads back.
+#[tokio::test]
+async fn userscripts_and_cookie_provenance_change_live_and_persist() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    let us = Arc::new(AtomicBool::new(false));
+    let cp = Arc::new(AtomicBool::new(false));
+    ctx.state.userscripts_enabled.set(us.clone()).unwrap();
+    ctx.state.cookie_provenance.set(cp.clone()).unwrap();
+
+    let got = admin.get("/api/v1/config").await.json::<Value>();
+    assert_eq!(got["userscripts_enabled"], false);
+    assert_eq!(got["cookie_provenance"], false);
+
+    let r = put_config(&admin, json!({"userscripts_enabled": true})).await;
+    r.assert_status_ok();
+    let body = r.json::<Value>();
+    assert_eq!(body["userscripts_enabled"], true);
+    assert_eq!(body["cookie_provenance"], false);
+    assert!(body["applied"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "userscripts_enabled")));
+    assert_eq!(body["restart_required"], json!([]));
+    assert!(us.load(Ordering::Relaxed) && !cp.load(Ordering::Relaxed));
+
+    put_config(&admin, json!({"cookie_provenance": true}))
+        .await
+        .assert_status_ok();
+    assert!(us.load(Ordering::Relaxed) && cp.load(Ordering::Relaxed));
+
+    // Persisted in the overlay; a reload (what a restart does) reads it back.
+    let overlay = ctx.state.overlay_path.read().clone();
+    let base = ctx.temp_dir.path().join("proxy.toml");
+    let saved = std::fs::read_to_string(&overlay).unwrap();
+    assert!(
+        saved.contains("[userscripts]") && saved.contains("[privacy]"),
+        "{saved}"
+    );
+    let back = ::common::config::ProxyConfig::load_layered(&base, &overlay).unwrap();
+    assert!(back.userscripts.enabled && back.privacy.cookie_provenance);
+
+    put_config(&admin, json!({"userscripts_enabled": false}))
+        .await
+        .assert_status_ok();
+    assert!(!us.load(Ordering::Relaxed) && cp.load(Ordering::Relaxed));
+    let back = ::common::config::ProxyConfig::load_layered(&base, &overlay).unwrap();
+    assert!(!back.userscripts.enabled && back.privacy.cookie_provenance);
+}
+
 /// `max_connections = 0` (auto) reports the derived number; saving the echoed value back leaves
 /// the stored setting at 0, while a different value pins it.
 #[tokio::test]
