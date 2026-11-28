@@ -15,11 +15,13 @@ pub mod events;
 pub mod formats;
 pub mod list;
 pub mod matcher;
+pub mod origins;
 pub mod pipeline;
 pub(crate) mod precheck;
 pub mod reaper;
 pub mod redirect_resources;
 pub mod scriptlet_resources;
+pub mod session_log;
 pub mod shared;
 pub mod stats;
 pub mod ubo_redirects;
@@ -50,6 +52,7 @@ pub use scriptlet_resources::{
     convert_ubo_scriptlets, convert_ubo_sources, ubo_scriptlets_to_json, ubo_sources_to_json,
     validate_resources, DroppedResource, ScriptletConversion, Validated, TRUSTED_PERMISSION,
 };
+pub use session_log::{session_log, SessionEntry, SessionKind, SessionLog};
 pub use shared::{
     build_engine, compile_engine, overlay_from_rules, overlay_from_rules_shared, try_build_engine,
     Cosmetics, Generation, IpFilter, Query, ResourceReport, SharedEngine,

@@ -110,6 +110,8 @@ pub struct Generation {
     pub engine: Arc<AdblockEngine>,
     /// Companion built from the same build, opaque here (downcast by the owner of the type).
     pub aux: Option<Arc<dyn std::any::Any + Send + Sync>>,
+    /// The list of each compiled rule of this build (see [`crate::origins`]).
+    pub origins: Arc<crate::origins::RuleOrigins>,
     /// Strictly increasing per install; equal ids mean the same build.
     pub id: u64,
 }
@@ -268,6 +270,7 @@ impl SharedEngine {
             engine: ArcSwap::new(Arc::new(Generation {
                 engine: build_engine(&[], &[]),
                 aux: None,
+                origins: Arc::default(),
                 id: 0,
             })),
             next_gen: std::sync::atomic::AtomicU64::new(1),
@@ -321,6 +324,7 @@ impl SharedEngine {
         crate::reaper::retire(self.engine.swap(Arc::new(Generation {
             engine: build_engine(&self.blob.load(), &self.resources.load()),
             aux: cur.aux.clone(),
+            origins: cur.origins.clone(),
             id: self.next_gen.fetch_add(1, Ordering::Relaxed),
         })));
         info!("Loaded {n} scriptlet/redirect resources");
@@ -429,10 +433,11 @@ impl SharedEngine {
         ip: Arc<IpFilter>,
         domains: Arc<DomainSet>,
     ) {
-        self.install_set_with(blob, engine, None, ext, ip, domains);
+        self.install_set_with(blob, engine, None, ext, ip, domains, Arc::default());
     }
 
     /// [`Self::install_set`] plus companion data (`aux`) swapped atomically with the engine.
+    #[allow(clippy::too_many_arguments)]
     pub fn install_set_with(
         &self,
         blob: Arc<Vec<u8>>,
@@ -441,6 +446,7 @@ impl SharedEngine {
         ext: Arc<Vec<ExtRule>>,
         ip: Arc<IpFilter>,
         domains: Arc<DomainSet>,
+        origins: Arc<crate::origins::RuleOrigins>,
     ) {
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = blob.len();
@@ -451,6 +457,7 @@ impl SharedEngine {
         crate::reaper::retire(self.engine.swap(Arc::new(Generation {
             engine,
             aux,
+            origins,
             id: self.next_gen.fetch_add(1, Ordering::Relaxed),
         })));
         crate::reaper::retire(self.ext_rules.swap(ext));
@@ -502,6 +509,7 @@ impl SharedEngine {
             error_kind: event.error_kind,
             cert_fp: event.cert_fp.as_deref(),
             outcome: event.outcome,
+            session: None,
         });
     }
 
@@ -708,7 +716,7 @@ impl SharedEngine {
         loop {
             let guard = self.engine.load();
             let r = if self.enabled.load(Ordering::Relaxed) {
-                self.decide_q(&guard.engine, q)
+                Self::attributed(&guard, self.decide_q(&guard.engine, q))
             } else {
                 MatchResult::allowed()
             };
@@ -727,10 +735,27 @@ impl SharedEngine {
     /// whole decision uses that generation (the pre-check sets are separate swaps).
     pub fn check_deferred_q(&self, q: &Query<'_>) -> MatchResult {
         if self.enabled.load(Ordering::Relaxed) {
-            self.decide_q(&self.engine.load().engine, q)
+            let g = self.engine.load();
+            Self::attributed(&g, self.decide_q(&g.engine, q))
         } else {
             MatchResult::allowed()
         }
+    }
+
+    /// Name the list of an engine rule hit (`list_id`), from the build's rule table. Hits of the
+    /// domain set and extended rules already carry theirs.
+    fn attributed(g: &Generation, mut r: MatchResult) -> MatchResult {
+        if r.list_id.is_none() {
+            let rule = if r.blocked {
+                r.matched_rule.as_deref()
+            } else {
+                r.exception_rule.as_deref()
+            };
+            if let Some(rule) = rule {
+                r.list_id = g.origins.lookup(rule).map(str::to_string);
+            }
+        }
+        r
     }
 
     /// Record a finished verdict (statistics and, on a block, the recent-blocked event).
@@ -751,6 +776,7 @@ impl SharedEngine {
             "",
             EventMode::Explicit,
             None,
+            None,
         )
     }
 
@@ -767,6 +793,7 @@ impl SharedEngine {
         method: &str,
         mode: EventMode,
         outcome: Option<EventOutcome>,
+        session: Option<u64>,
     ) -> MatchResult {
         self.record(
             r,
@@ -777,6 +804,7 @@ impl SharedEngine {
             method,
             mode,
             outcome,
+            session,
         )
     }
 
@@ -794,7 +822,10 @@ impl SharedEngine {
             let guard = self.engine.load();
             let generation = &*guard;
             let r = if self.enabled.load(Ordering::Relaxed) {
-                self.decide(&generation.engine, url, source_url, resource_type)
+                Self::attributed(
+                    generation,
+                    self.decide(&generation.engine, url, source_url, resource_type),
+                )
             } else {
                 MatchResult::allowed()
             };
@@ -811,6 +842,7 @@ impl SharedEngine {
                         "",
                         EventMode::Explicit,
                         None,
+                        None,
                     ),
                     arc_swap::Guard::into_inner(guard),
                 );
@@ -826,7 +858,8 @@ impl SharedEngine {
         client: Option<&str>,
     ) -> MatchResult {
         let r = if self.enabled.load(Ordering::Relaxed) {
-            self.decide(&self.engine.load().engine, url, source_url, resource_type)
+            let g = self.engine.load();
+            Self::attributed(&g, self.decide(&g.engine, url, source_url, resource_type))
         } else {
             MatchResult::allowed()
         };
@@ -838,6 +871,7 @@ impl SharedEngine {
             client,
             "",
             EventMode::Explicit,
+            None,
             None,
         )
     }
@@ -854,17 +888,26 @@ impl SharedEngine {
         method: &str,
         mode: EventMode,
         outcome: Option<EventOutcome>,
+        session: Option<u64>,
     ) -> MatchResult {
         if r.blocked {
-            self.stats
-                .record_blocked(resource_type, RequestMatcher::host_of(url));
+            self.stats.record_blocked_by(
+                resource_type,
+                RequestMatcher::host_of(url),
+                r.list_id.as_deref(),
+                r.matched_rule.as_deref(),
+            );
+            let cname_rule = r.via_cname.as_ref().map(|c| format!("cname:{c}"));
             self.block_log.record_event(&EventRef {
                 action: EventAction::Blocked,
                 method,
                 url,
                 source_host: RequestMatcher::host_of(source_url),
                 request_type: resource_type,
-                rule: r.matched_rule.as_deref().unwrap_or(""),
+                rule: cname_rule
+                    .as_deref()
+                    .or(r.matched_rule.as_deref())
+                    .unwrap_or(""),
                 list_id: r.list_id.as_deref(),
                 client,
                 status: None,
@@ -872,6 +915,7 @@ impl SharedEngine {
                 error_kind: None,
                 cert_fp: None,
                 outcome,
+                session,
             });
         } else {
             self.stats.record_allowed();
@@ -1168,6 +1212,7 @@ mod tests {
             error_kind: None,
             cert_fp: None,
             outcome: Some(EventOutcome::Aborted),
+            session: None,
         });
         let urls: Vec<String> = e.recent_blocked(10).into_iter().map(|r| r.url).collect();
         // Query strings and fragments are stripped before storage (they can hold secrets).

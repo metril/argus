@@ -37,7 +37,7 @@ omit both for a token that never expires.
 `POST /auth/extension-token` `{username, password, browser, replace_token_id?}` checks the
 credentials like login (same rate limit, no session, no cookies) and returns
 `{token, token_id, user}`: a never-expiring token named `Extension · {browser}` with exactly
-`logs:read`, `userscripts:bridge`, `stats:read` and `rules:site`. 401 for wrong credentials, 403 `insufficient_role` when the
+`logs:read`, `userscripts:bridge`, `stats:read`, `rules:site` and `rules:ext`. 401 for wrong credentials, 403 `insufficient_role` when the
 role lacks either scope. `replace_token_id` revokes that token if it is the caller's own (anyone
 else's id is ignored). `DELETE /tokens/self` lets any API token revoke itself (400 for a cookie
 session). Both routes accept extension origins (CORS); `GET /downloads/extension/chrome` adds an
@@ -56,6 +56,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `rules:read` | yes | yes | yes | Read custom rules; validate rules and test URLs against the engine (no changes). |
 | `rules:write` | - | yes | yes | Replace the custom rules. |
 | `rules:site` | - | yes | yes | Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules. |
+| `rules:ext` | - | yes | yes | Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules. |
 | `engine:reload` | - | - | yes | Trigger a rebuild of the blocking engine. |
 | `stats:read` | yes | yes | yes | Read blocking, proxy and engine statistics. |
 | `logs:read` | - | yes | yes | Read the request log, live and recent (full browsing history of every client the token may see). |
@@ -215,6 +216,9 @@ token may use them: the binding already limits it to its profiles.
 |---|---|---|
 | `GET /ext/channel` | public at HTTP level | WebSocket; the first frame `{"t":"hello","token","v":1}` authenticates (token with `userscripts:bridge`). Only from an extension origin. 503 without a bridge. |
 | `GET /ext/menu?mdoc=` | `userscripts:bridge` | Menu commands of a bound document, and host grants its scripts wait for. 403 `ext_session_required` / `ext_document_not_bound`, 404 unknown document. |
+| `GET /ext/log?since=` | `logs:read` | The calling session's requests (blocks and allowed, full URL with query, type, first/third party, outcome `blocked`/`allowed`/`redirected`/`modified`/`aborted`, rule, list id and name, page host), oldest first, entries after `since`; `{next, entries}`. Needs `X-Argus-Session`; another session's requests are never returned. Newest 1000 kept per session. |
+| `POST /ext/rules` | `rules:ext` | Body `{op:"add"\|"remove", rule}`: one network rule line (at most 2 KB; no comments, includes, preprocessor, cosmetic, scriptlet, `$replace`/`$csp` rules) appended to or removed from the custom rules; audited, rebuilds the engine; `{rule_count, changed}`. Opens nothing else in the rules. |
+| `GET /ext/rules?site=` | `rules:ext` | The custom rules that mention the site; `{site, rules}`. |
 | `POST /ext/menu/trigger` | `userscripts:bridge` | Body `{mdoc,script,cmd}`: queue a synced command for the page; `{delivered}`. |
 
 ## Script policy and the in-page panel

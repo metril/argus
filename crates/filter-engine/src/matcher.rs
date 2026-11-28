@@ -36,6 +36,10 @@ pub struct MatchResult {
     /// carry their list).
     #[serde(default)]
     pub list_id: Option<String>,
+    /// The canonical name this verdict was reached under (CNAME uncloaking): the request log
+    /// shows `cname:<name>` as the reason while statistics keep the rule and list that matched.
+    #[serde(default)]
+    pub via_cname: Option<String>,
 }
 
 impl MatchResult {

@@ -867,11 +867,12 @@ impl ListService {
         }
         summary.domain_set = built.domains.len();
         summary.ext_stats = Some(index.stats().clone());
-        let (ext, ip, blob, domains) = (
+        let (ext, ip, blob, domains, origins) = (
             Arc::new(built.ext),
             Arc::new(built.ip),
             Arc::new(built.blob),
             Arc::new(built.domains),
+            Arc::new(built.origins),
         );
         info!(
             "Compiled {} list(s): {} network, {} cosmetic, {} extended, {} rejected, {} duplicate and {} compressed rules dropped in {} ms",
@@ -886,6 +887,7 @@ impl ListService {
             ext.clone(),
             ip.clone(),
             domains.clone(),
+            origins.clone(),
         );
         self.installed_once.store(true, Ordering::Release);
         *self.installed_key.lock() = Some(key);
@@ -897,7 +899,7 @@ impl ListService {
         if self.cfg.persist_engine {
             let path = self.cfg.data_dir.join(persist::FILE_NAME);
             let res = tokio::task::spawn_blocking(move || {
-                persist::save(&path, &key, &blob, &domains, &ext, &ip, &summary)
+                persist::save(&path, &key, &blob, &domains, &origins, &ext, &ip, &summary)
             })
             .await;
             match res {
@@ -940,6 +942,7 @@ impl ListService {
                     Arc::new(p.ext),
                     Arc::new(p.ip),
                     Arc::new(p.domains),
+                    Arc::new(p.origins),
                 );
                 self.installed_once.store(true, Ordering::Release);
                 *self.installed_key.lock() = Some(key);

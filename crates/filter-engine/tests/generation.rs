@@ -16,6 +16,7 @@ fn install(e: &SharedEngine, rule: &str, tag: u64) {
         Arc::default(),
         Arc::new(IpFilter::default()),
         Arc::default(),
+        Arc::default(),
     );
 }
 

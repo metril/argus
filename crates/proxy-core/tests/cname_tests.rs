@@ -85,4 +85,7 @@ async fn an_alias_of_a_blocked_name_is_blocked_and_counted_once() {
     let log = engine.recent_blocked(10);
     assert_eq!(log.len(), 1, "{log:?}");
     assert_eq!(log[0].rule.as_deref(), Some("cname:d2gt.tracker.test"));
+    // Statistics keep the rule that matched the canonical name, not the `cname:` reason.
+    let (_, by_rule) = engine.stats_handle().take_sources();
+    assert_eq!(by_rule, vec![("||tracker.test^".to_string(), 1)]);
 }

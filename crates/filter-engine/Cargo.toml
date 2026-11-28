@@ -39,6 +39,12 @@ tokio = { workspace = true, features = ["sync"] }
 # Concurrency
 dashmap = { workspace = true }
 
+# Registrable domains (first/third party)
+psl = "2"
+
+# Stable rule-origin hash
+sha2 = { workspace = true }
+
 # Time
 chrono = { workspace = true }
 

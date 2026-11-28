@@ -8,11 +8,13 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod daily;
 pub mod error;
 pub mod handlers;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
+pub mod rule_origin;
 pub mod server;
 pub mod state;
 pub mod timeseries;

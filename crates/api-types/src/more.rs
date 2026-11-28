@@ -308,6 +308,16 @@ pub struct FilterStatsResponse {
     pub blocked_by_type: std::collections::HashMap<String, u64>,
     #[serde(default)]
     pub top_blocked_domains: Vec<DomainCount>,
+    /// Blocked requests since the first start; survives restarts and statistics resets.
+    #[serde(default)]
+    pub lifetime_blocked: u64,
+    /// All requests since the first start.
+    #[serde(default)]
+    pub lifetime_total: u64,
+    /// Lifetime blocks per category (`ads`, `trackers`, `social`, `annoyances`, `security`,
+    /// `other`).
+    #[serde(default)]
+    pub lifetime_by_category: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,15 +357,19 @@ pub struct TimeseriesPoint {
     pub ts: i64,
     pub requests: u64,
     pub blocked: u64,
+    /// Blocks per category; filled for the daily and monthly ranges only.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub by_category: std::collections::BTreeMap<String, u64>,
 }
 
 /// Requests and blocks over time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct TimeseriesResponse {
-    /// `6h`, `24h` or `7d`.
+    /// `6h`, `24h`, `7d`, or the persisted daily history `d7`, `d30` (UTC days) and `m12`
+    /// (calendar months).
     pub range: String,
-    /// Bucket length in seconds (1800, or 21600 for `7d`).
+    /// Bucket length in seconds (1800, 21600 for `7d`, 86400 for `d7`/`d30`, 2592000 for `m12`).
     pub bucket_secs: i64,
     /// Oldest first, ending with the current bucket.
     pub points: Vec<TimeseriesPoint>,

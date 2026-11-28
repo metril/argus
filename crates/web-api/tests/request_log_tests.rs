@@ -27,6 +27,7 @@ fn ev<'a>(action: EventAction, url: &'a str, client: &'a str, mode: EventMode) -
         error_kind: None,
         cert_fp: None,
         outcome: None,
+        session: None,
     }
 }
 

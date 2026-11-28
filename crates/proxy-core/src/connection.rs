@@ -272,13 +272,14 @@ impl ConnectionHandler {
             },
             // A blocked tunnel is refused by closing it.
             Some(filter_engine::EventOutcome::Aborted),
+            None,
         );
         true
     }
 
     /// [`Self::host_blocked`] for the canonical name `target.host` resolves to (CNAME
     /// uncloaking, see [`crate::cname`]): the hostname-level check of a tunnel that is not
-    /// intercepted. A block is recorded with the rule `cname:<canonical>`.
+    /// intercepted. A block is logged with the reason `cname:<canonical>` and counted under the rule that matched.
     async fn host_cname_blocked(&self, target: &ConnectionTarget) -> bool {
         let ctx = &self.shared.ctx;
         let host = target.host.to_ascii_lowercase();
@@ -307,8 +308,7 @@ impl ConnectionHandler {
             return false;
         }
         let mut logged = verdict;
-        logged.matched_rule = Some(format!("cname:{cn}"));
-        logged.list_id = None;
+        logged.via_cname = Some(cn.to_string());
         profile.engine.record_verdict_meta(
             logged,
             &probe,
@@ -322,6 +322,7 @@ impl ConnectionHandler {
                 filter_engine::EventMode::Explicit
             },
             Some(filter_engine::EventOutcome::Aborted),
+            None,
         );
         true
     }
@@ -367,6 +368,7 @@ impl ConnectionHandler {
             error_kind,
             cert_fp: None,
             outcome: None,
+            session: None,
             mode: if rctx.transparent {
                 filter_engine::EventMode::Transparent
             } else {

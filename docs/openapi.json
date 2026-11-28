@@ -2680,6 +2680,104 @@
         ],
         "type": "object"
       },
+      "ExtLogEntry": {
+        "description": "One request of the extension session's log (`GET /ext/log`).",
+        "properties": {
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`blocked`, `allowed`, `redirected`, `modified` or `aborted`.",
+            "type": "string"
+          },
+          "rule": {
+            "description": "The matched rule text.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seq": {
+            "description": "Position in the session's log; pass the highest one seen as `since`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_host": {
+            "description": "Host of the page that made the request.",
+            "type": "string"
+          },
+          "third_party": {
+            "description": "Whether the request went to another registrable domain than the page; `null` when the\npage is unknown.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "time": {
+            "description": "RFC 3339.",
+            "type": "string"
+          },
+          "type": {
+            "description": "Request type (`script`, `image`, `xhr`, ...).",
+            "type": "string"
+          },
+          "url": {
+            "description": "The full request URL, query included.",
+            "type": "string"
+          },
+          "user_rule": {
+            "description": "The rule is one of the user's custom rules.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "seq",
+          "time",
+          "url",
+          "method",
+          "type",
+          "outcome",
+          "user_rule",
+          "source_host"
+        ],
+        "type": "object"
+      },
+      "ExtLogResponse": {
+        "description": "The requests of one extension session after `since`.",
+        "properties": {
+          "entries": {
+            "description": "Oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ExtLogEntry"
+            },
+            "type": "array"
+          },
+          "next": {
+            "description": "Pass as `since` next time.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "next",
+          "entries"
+        ],
+        "type": "object"
+      },
       "ExtMenuCommand": {
         "description": "One userscript menu command of a document.",
         "properties": {
@@ -2738,6 +2836,24 @@
         ],
         "type": "object"
       },
+      "ExtRuleRequest": {
+        "description": "Add or remove one custom rule.",
+        "properties": {
+          "op": {
+            "description": "`add` or `remove`.",
+            "type": "string"
+          },
+          "rule": {
+            "description": "One rule line (at most 2 KB; no comments, includes or preprocessor lines).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "op",
+          "rule"
+        ],
+        "type": "object"
+      },
       "ExtRuleResponse": {
         "description": "A handed-off rule and what the extended-rule index did with it.",
         "properties": {
@@ -2778,6 +2894,43 @@
           "kind",
           "raw",
           "domains"
+        ],
+        "type": "object"
+      },
+      "ExtRuleResult": {
+        "properties": {
+          "changed": {
+            "description": "The custom rules actually changed.",
+            "type": "boolean"
+          },
+          "rule_count": {
+            "description": "Number of custom rules after the change.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rule_count",
+          "changed"
+        ],
+        "type": "object"
+      },
+      "ExtSiteRules": {
+        "description": "The custom rules that mention a site.",
+        "properties": {
+          "rules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "site": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "site",
+          "rules"
         ],
         "type": "object"
       },
@@ -3161,6 +3314,30 @@
             "type": "object"
           },
           "blocked_requests": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lifetime_blocked": {
+            "description": "Blocked requests since the first start; survives restarts and statistics resets.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lifetime_by_category": {
+            "additionalProperties": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Lifetime blocks per category (`ads`, `trackers`, `social`, `annoyances`, `security`,\n`other`).",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "lifetime_total": {
+            "description": "All requests since the first start.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -5569,6 +5746,7 @@
           "RulesRead",
           "RulesWrite",
           "RulesSite",
+          "RulesExt",
           "EngineReload",
           "StatsRead",
           "LogsRead",
@@ -6516,6 +6694,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "by_category": {
+            "additionalProperties": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Blocks per category; filled for the daily and monthly ranges only.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "requests": {
             "format": "int64",
             "minimum": 0,
@@ -6538,7 +6728,7 @@
         "description": "Requests and blocks over time.",
         "properties": {
           "bucket_secs": {
-            "description": "Bucket length in seconds (1800, or 21600 for `7d`).",
+            "description": "Bucket length in seconds (1800, 21600 for `7d`, 86400 for `d7`/`d30`, 2592000 for `m12`).",
             "format": "int64",
             "type": "integer"
           },
@@ -6550,7 +6740,7 @@
             "type": "array"
           },
           "range": {
-            "description": "`6h`, `24h` or `7d`.",
+            "description": "`6h`, `24h`, `7d`, or the persisted daily history `d7`, `d30` (UTC days) and `m12`\n(calendar months).",
             "type": "string"
           }
         },
@@ -8245,6 +8435,7 @@
       "policy:write": "Change script policy settings, rules and temporary permissions; import policy.",
       "profiles:read": "List and view filtering profiles (lists and overlay rules) the token may access.",
       "profiles:write": "Create, edit and delete filtering profiles.",
+      "rules:ext": "Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules.",
       "rules:read": "Read custom rules; validate rules and test URLs against the engine (no changes).",
       "rules:site": "Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules.",
       "rules:write": "Replace the custom rules.",
@@ -12979,6 +13170,85 @@
         ]
       }
     },
+    "/api/v1/ext/log": {
+      "get": {
+        "operationId": "log",
+        "parameters": [
+          {
+            "description": "Return the entries after this sequence number (default: all that are kept).",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtLogResponse"
+                }
+              }
+            },
+            "description": "Entries after `since`"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "No live extension session for this token"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "logs:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "logs:read"
+            ]
+          }
+        ],
+        "summary": "The requests of the calling extension session (blocks and allowed requests of the connections\nbound to it), oldest first, with the matched rule and its list. Another session's requests\nare never returned; the log holds the newest 1000 entries.",
+        "tags": [
+          "ext"
+        ]
+      }
+    },
     "/api/v1/ext/menu": {
       "get": {
         "operationId": "menu",
@@ -13133,6 +13403,177 @@
           }
         ],
         "summary": "Run one menu command in the page.",
+        "tags": [
+          "ext"
+        ]
+      }
+    },
+    "/api/v1/ext/rules": {
+      "get": {
+        "operationId": "get_rules",
+        "parameters": [
+          {
+            "description": "Host name, lowercase punycode.",
+            "in": "query",
+            "name": "site",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtSiteRules"
+                }
+              }
+            },
+            "description": "Matching custom rules"
+          },
+          "400": {
+            "description": "Not a host name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:ext"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:ext"
+            ]
+          }
+        ],
+        "summary": "The custom rules that mention a site (as a host or one of its subdomains, in the rule or in\n`$domain=`), for resetting that site's rules.",
+        "tags": [
+          "ext"
+        ]
+      },
+      "post": {
+        "operationId": "post_rule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExtRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtRuleResult"
+                }
+              }
+            },
+            "description": "Applied"
+          },
+          "400": {
+            "description": "Not exactly one acceptable rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "rules:ext"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "rules:ext"
+            ]
+          }
+        ],
+        "summary": "Add or remove one line of the custom rules and rebuild the engine. The line is validated with\nthe rule parser: one network rule only (no comments, includes, preprocessor lines, cosmetic,\nscriptlet or response-rewriting rules), at most 2 KB.",
         "tags": [
           "ext"
         ]
@@ -18649,7 +19090,7 @@
         "operationId": "get_timeseries",
         "parameters": [
           {
-            "description": "`6h`, `24h` (30-minute buckets) or `7d` (6-hour buckets). Default `6h`.",
+            "description": "`6h`, `24h` (30-minute buckets) or `7d` (6-hour buckets) from the in-memory history, or\nthe persisted history by category: `d7`, `d30` (UTC days) and `m12` (calendar months,\nkept 400 days). Default `6h`.",
             "in": "query",
             "name": "range",
             "required": false,
@@ -18722,7 +19163,7 @@
             ]
           }
         ],
-        "summary": "Requests and blocked requests per bucket, from the in-memory history (since the last start).",
+        "summary": "Requests and blocked requests per bucket. `6h`, `24h` and `7d` come from the in-memory history\n(since the last start); `d7`, `d30` and `m12` from the persisted daily history, by category.",
         "tags": [
           "stats"
         ]

@@ -52,7 +52,8 @@ beforeEach(() => {
       return Promise.resolve(json(200, cert(host.startsWith('www.a') ? 'A-CA' : 'B-CA')));
     }
     if (scopeless && (path.startsWith('/stats') || path.startsWith('/rules'))) return Promise.resolve(json(403, { error: { code: 'insufficient_scope' } }));
-    if (path === '/stats/filter') return Promise.resolve(json(200, { total_requests: 12345, blocked_requests: 678, allowed_requests: 11667 }));
+    if (path === '/stats/filter') return Promise.resolve(json(200, { total_requests: 12345, blocked_requests: 678, allowed_requests: 11667, lifetime_blocked: 900, lifetime_total: 20000, lifetime_by_category: { ads: 500, trackers: 300, social: 0, annoyances: 0, security: 0, other: 100 } }));
+    if (path === '/stats/timeseries') return Promise.resolve(json(200, { range: 'd7', bucket_secs: 86400, points: [0, 1, 2].map((i) => ({ ts: 1_700_000_000 + i * 86400, requests: 10, blocked: i, by_category: { ads: i } })) }));
     const m = path.match(/^\/rules\/site-exceptions\/(.+)$/);
     if (m) {
       const site = decodeURIComponent(m[1]!);
@@ -75,10 +76,22 @@ describe('popup stats', () => {
     expect(text('page-percent')).toBe('38% of 8 requests');
     expect(root.querySelector('[data-host="ads.a.example"]')?.textContent).toContain('3');
     expect(root.querySelector('[data-host="www.a.example"] td:last-child')?.textContent).toBe('5');
-    expect(text('global-blocked')).toBe('678');
-    expect(text('global-total')).toBe('12,345');
+    expect(text('domains-summary')).toBe('1 of 2 domains blocked');
     expect(root.textContent).toContain('This browser');
     expect(root.textContent).toContain('A-CA');
+    expect(root.querySelector('[data-testid="open-logger"]')).not.toBeNull();
+  });
+
+  it('shows lifetime totals, categories and a chart under the Statistics toggle', async () => {
+    await mount();
+    const stats = [...root.querySelectorAll<HTMLButtonElement>('.seg button')].find((b) => b.textContent === 'Statistics')!;
+    await act(async () => { stats.click(); });
+    await tick(); await tick();
+    expect(text('global-blocked')).toBe('900');
+    expect(text('global-total')).toBe('of 20,000 requests');
+    expect(root.querySelector('[data-cat="ads"]')?.textContent).toBe('500');
+    expect(root.querySelector('[data-testid="chart"] path')?.getAttribute('d')).toMatch(/^M/);
+    expect(root.querySelector('[data-testid="page-stats"]')).toBeNull();
   });
 });
 

@@ -96,3 +96,69 @@ pub struct ExtAuditEvent {
     pub action: String,
     pub target: Option<String>,
 }
+
+/// One request of the extension session's log (`GET /ext/log`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtLogEntry {
+    /// Position in the session's log; pass the highest one seen as `since`.
+    pub seq: u64,
+    /// RFC 3339.
+    pub time: String,
+    /// The full request URL, query included.
+    pub url: String,
+    pub method: String,
+    /// Request type (`script`, `image`, `xhr`, ...).
+    #[serde(rename = "type")]
+    pub request_type: String,
+    /// Whether the request went to another registrable domain than the page; `null` when the
+    /// page is unknown.
+    pub third_party: Option<bool>,
+    /// `blocked`, `allowed`, `redirected`, `modified` or `aborted`.
+    pub outcome: String,
+    /// The matched rule text.
+    pub rule: Option<String>,
+    pub list_id: Option<String>,
+    pub list_name: Option<String>,
+    /// The rule is one of the user's custom rules.
+    pub user_rule: bool,
+    /// Host of the page that made the request.
+    pub source_host: String,
+}
+
+/// The requests of one extension session after `since`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtLogResponse {
+    /// Pass as `since` next time.
+    pub next: u64,
+    /// Oldest first.
+    pub entries: Vec<ExtLogEntry>,
+}
+
+/// Add or remove one custom rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtRuleRequest {
+    /// `add` or `remove`.
+    pub op: String,
+    /// One rule line (at most 2 KB; no comments, includes or preprocessor lines).
+    pub rule: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtRuleResult {
+    /// Number of custom rules after the change.
+    pub rule_count: usize,
+    /// The custom rules actually changed.
+    pub changed: bool,
+}
+
+/// The custom rules that mention a site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtSiteRules {
+    pub site: String,
+    pub rules: Vec<String>,
+}

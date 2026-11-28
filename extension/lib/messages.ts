@@ -11,3 +11,11 @@ export function respondAsync<M, S>(handle: (msg: M, sender: S) => Promise<unknow
     return true;
   };
 }
+
+/**
+ * Whether a message or port comes from one of this extension's own pages (popup, options, logger):
+ * a content script of another page shares the extension id, so the sender URL must be ours too.
+ */
+export function fromExtensionPage(sender: { id?: string; url?: string } | undefined, ownId: string, base: string): boolean {
+  return !!sender && sender.id === ownId && typeof sender.url === 'string' && sender.url.startsWith(base);
+}
