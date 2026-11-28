@@ -2843,6 +2843,249 @@
         ],
         "type": "object"
       },
+      "ExtCookieAttrs": {
+        "description": "The attributes of a `Set-Cookie` exactly as the server sent them. Never a value.",
+        "properties": {
+          "domain": {
+            "description": "Lowercase, without the leading dot; absent for a host-only cookie.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires": {
+            "description": "Seconds since the epoch.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "http_only": {
+            "type": "boolean"
+          },
+          "max_age": {
+            "description": "Seconds; zero or negative expires the cookie at once.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "partitioned": {
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Absent when the server sent none (the browser then uses the request's default path).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "same_site": {
+            "description": "`none`, `lax` or `strict`; absent when the server sent none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "secure": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "secure",
+          "http_only",
+          "partitioned"
+        ],
+        "type": "object"
+      },
+      "ExtCookieChange": {
+        "description": "One attribute a `$cookie` rule changed.",
+        "properties": {
+          "attr": {
+            "description": "`max_age`, `expires` or `same_site`.",
+            "type": "string"
+          },
+          "from": {
+            "description": "The value the server sent (`max_age` and `expires` in seconds, `expires` since the epoch;\n`same_site` lowercase); absent when it sent none.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rule": {
+            "description": "The rule whose value is the one that was applied (a later rule's value can win over an\nearlier one's, per attribute; `expires` follows `max_age`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "description": "The value after the rule; absent when the rule removed the attribute.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_rule": {
+            "description": "The rule is one of the user's custom rules.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "attr",
+          "user_rule"
+        ],
+        "type": "object"
+      },
+      "ExtCookieProvenance": {
+        "description": "The cookie provenance of one extension session after `since`.",
+        "properties": {
+          "enabled": {
+            "description": "False while the setting is off (`records` is then empty).",
+            "type": "boolean"
+          },
+          "more": {
+            "description": "More records follow: ask again with `next_since` right away.",
+            "type": "boolean"
+          },
+          "next_since": {
+            "description": "Pass as `since` next time.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "description": "Oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/ExtCookieRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "records",
+          "next_since",
+          "more"
+        ],
+        "type": "object"
+      },
+      "ExtCookieRecord": {
+        "description": "One cookie event seen in transit (`GET /ext/cookies/provenance`). Carries no cookie value.",
+        "properties": {
+          "attrs": {
+            "$ref": "#/components/schemas/ExtCookieAttrs",
+            "description": "The attributes as the server sent them (all defaults for `blocked_send`)."
+          },
+          "changes": {
+            "description": "What a rule changed (`changed` only).",
+            "items": {
+              "$ref": "#/components/schemas/ExtCookieChange"
+            },
+            "type": "array"
+          },
+          "effect": {
+            "description": "`set` (passed through unchanged), `changed` (a rule changed attributes), `stripped` (a rule\nremoved the `Set-Cookie`) or `blocked_send` (a rule removed the cookie from a request).",
+            "type": "string"
+          },
+          "host": {
+            "description": "Host of the request whose response set the cookie (or whose request carried it).",
+            "type": "string"
+          },
+          "list_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "page_host": {
+            "description": "Host of the page that made the request (the request's own host for a document); empty when\nunknown.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path of that request, without the query string.",
+            "type": "string"
+          },
+          "prefix": {
+            "description": "`__Host-` or `__Secure-` when the name carries that prefix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prefix_valid": {
+            "description": "Whether the attributes satisfy what the prefix implies; absent without a prefix.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "rule": {
+            "description": "The rule that changed, removed or blocked the cookie.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "seq": {
+            "description": "Position in the session's records; pass the highest one seen (or `next_since`) as `since`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "third_party": {
+            "description": "Whether `host` is on another registrable domain than the page; absent when unknown.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "time": {
+            "description": "RFC 3339, millisecond precision.",
+            "type": "string"
+          },
+          "user_rule": {
+            "description": "The rule is one of the user's custom rules.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "seq",
+          "time",
+          "effect",
+          "name",
+          "host",
+          "path",
+          "page_host",
+          "attrs",
+          "changes",
+          "user_rule"
+        ],
+        "type": "object"
+      },
       "ExtGrant": {
         "description": "A script that wants this browser's logins for hosts the extension holds no permission for.",
         "properties": {
@@ -14054,6 +14297,104 @@
           {}
         ],
         "summary": "WebSocket channel of the browser extension.",
+        "tags": [
+          "ext"
+        ]
+      }
+    },
+    "/api/v1/ext/cookies/provenance": {
+      "get": {
+        "operationId": "cookie_provenance",
+        "parameters": [
+          {
+            "description": "Return the records after this sequence number (default: all that are kept).",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only records of this site: its registrable domain and every subdomain.",
+            "in": "query",
+            "name": "host",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "At most this many records (default and maximum 500).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtCookieProvenance"
+                }
+              }
+            },
+            "description": "Records after `since`; `enabled: false` while the setting is off"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "description": "No live extension session for this token"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "logs:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "logs:read"
+            ]
+          }
+        ],
+        "summary": "Where the cookies of the calling extension session came from: for each `Set-Cookie` its name,\nthe response's host and path, the attributes the server sent, and whether a `$cookie` rule\nleft it alone, changed it or removed it, plus the cookies rules kept out of requests. Cookie\nvalues are never recorded or returned. Recording is a setting that is off by default; while\nit is off the answer is `{enabled: false}`. Another session's records are never returned;\nthe newest 3000 are kept per session, in memory only.",
         "tags": [
           "ext"
         ]

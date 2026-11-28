@@ -136,6 +136,96 @@ pub struct ExtLogResponse {
     pub entries: Vec<ExtLogEntry>,
 }
 
+/// One attribute a `$cookie` rule changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtCookieChange {
+    /// `max_age`, `expires` or `same_site`.
+    pub attr: String,
+    /// The value the server sent (`max_age` and `expires` in seconds, `expires` since the epoch;
+    /// `same_site` lowercase); absent when it sent none.
+    pub from: Option<String>,
+    /// The value after the rule; absent when the rule removed the attribute.
+    pub to: Option<String>,
+    /// The rule whose value is the one that was applied (a later rule's value can win over an
+    /// earlier one's, per attribute; `expires` follows `max_age`).
+    pub rule: Option<String>,
+    pub list_id: Option<String>,
+    pub list_name: Option<String>,
+    /// The rule is one of the user's custom rules.
+    pub user_rule: bool,
+}
+
+/// The attributes of a `Set-Cookie` exactly as the server sent them. Never a value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtCookieAttrs {
+    /// Lowercase, without the leading dot; absent for a host-only cookie.
+    pub domain: Option<String>,
+    /// Absent when the server sent none (the browser then uses the request's default path).
+    pub path: Option<String>,
+    pub secure: bool,
+    pub http_only: bool,
+    /// `none`, `lax` or `strict`; absent when the server sent none.
+    pub same_site: Option<String>,
+    /// Seconds; zero or negative expires the cookie at once.
+    pub max_age: Option<i64>,
+    /// Seconds since the epoch.
+    pub expires: Option<i64>,
+    pub partitioned: bool,
+}
+
+/// One cookie event seen in transit (`GET /ext/cookies/provenance`). Carries no cookie value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtCookieRecord {
+    /// Position in the session's records; pass the highest one seen (or `next_since`) as `since`.
+    pub seq: u64,
+    /// RFC 3339, millisecond precision.
+    pub time: String,
+    /// `set` (passed through unchanged), `changed` (a rule changed attributes), `stripped` (a rule
+    /// removed the `Set-Cookie`) or `blocked_send` (a rule removed the cookie from a request).
+    pub effect: String,
+    pub name: String,
+    /// Host of the request whose response set the cookie (or whose request carried it).
+    pub host: String,
+    /// Path of that request, without the query string.
+    pub path: String,
+    /// Host of the page that made the request (the request's own host for a document); empty when
+    /// unknown.
+    pub page_host: String,
+    /// Whether `host` is on another registrable domain than the page; absent when unknown.
+    pub third_party: Option<bool>,
+    /// The attributes as the server sent them (all defaults for `blocked_send`).
+    pub attrs: ExtCookieAttrs,
+    /// What a rule changed (`changed` only).
+    pub changes: Vec<ExtCookieChange>,
+    /// `__Host-` or `__Secure-` when the name carries that prefix.
+    pub prefix: Option<String>,
+    /// Whether the attributes satisfy what the prefix implies; absent without a prefix.
+    pub prefix_valid: Option<bool>,
+    /// The rule that changed, removed or blocked the cookie.
+    pub rule: Option<String>,
+    pub list_id: Option<String>,
+    pub list_name: Option<String>,
+    /// The rule is one of the user's custom rules.
+    pub user_rule: bool,
+}
+
+/// The cookie provenance of one extension session after `since`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExtCookieProvenance {
+    /// False while the setting is off (`records` is then empty).
+    pub enabled: bool,
+    /// Oldest first.
+    pub records: Vec<ExtCookieRecord>,
+    /// Pass as `since` next time.
+    pub next_since: u64,
+    /// More records follow: ask again with `next_since` right away.
+    pub more: bool,
+}
+
 /// Add or remove one custom rule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -170,4 +260,109 @@ pub struct ExtSiteRule {
     pub rule: String,
     /// True when the rule is scoped to this site only (not shared with other domains).
     pub exclusive: bool,
+}
+
+#[cfg(test)]
+mod cookie_wire_tests {
+    use super::*;
+
+    fn keys<T: Serialize>(v: &T) -> Vec<String> {
+        let mut k: Vec<String> = serde_json::to_value(v)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        k.sort();
+        k
+    }
+
+    /// The cookie provenance wire types carry names, attributes, hosts and rules, never a value:
+    /// a new field fails this list until the owner reviews it.
+    #[test]
+    fn cookie_provenance_types_have_no_field_that_could_hold_a_value() {
+        let change = ExtCookieChange {
+            attr: String::new(),
+            from: None,
+            to: None,
+            rule: None,
+            list_id: None,
+            list_name: None,
+            user_rule: false,
+        };
+        assert_eq!(
+            keys(&change),
+            [
+                "attr",
+                "from",
+                "list_id",
+                "list_name",
+                "rule",
+                "to",
+                "user_rule"
+            ]
+        );
+        assert_eq!(
+            keys(&ExtCookieAttrs::default()),
+            [
+                "domain",
+                "expires",
+                "http_only",
+                "max_age",
+                "partitioned",
+                "path",
+                "same_site",
+                "secure"
+            ]
+        );
+        let rec = ExtCookieRecord {
+            seq: 0,
+            time: String::new(),
+            effect: String::new(),
+            name: String::new(),
+            host: String::new(),
+            path: String::new(),
+            page_host: String::new(),
+            third_party: None,
+            attrs: ExtCookieAttrs::default(),
+            changes: vec![],
+            prefix: None,
+            prefix_valid: None,
+            rule: None,
+            list_id: None,
+            list_name: None,
+            user_rule: false,
+        };
+        assert_eq!(
+            keys(&rec),
+            [
+                "attrs",
+                "changes",
+                "effect",
+                "host",
+                "list_id",
+                "list_name",
+                "name",
+                "page_host",
+                "path",
+                "prefix",
+                "prefix_valid",
+                "rule",
+                "seq",
+                "third_party",
+                "time",
+                "user_rule"
+            ]
+        );
+        assert_eq!(
+            keys(&ExtCookieProvenance {
+                enabled: false,
+                records: vec![],
+                next_since: 0,
+                more: false
+            }),
+            ["enabled", "more", "next_since", "records"]
+        );
+    }
 }

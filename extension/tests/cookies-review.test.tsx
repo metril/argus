@@ -83,7 +83,8 @@ describe('import applies what was checked', () => {
 async function act2(_p: Page, f: () => void) { const { act } = await import('preact/test-utils'); await act(async () => { f(); }); }
 
 describe('provenance join keeps host-only and domain cookies apart', () => {
-  const rec = (o: Partial<ProvenanceRecord> & { name: string }): ProvenanceRecord => ({ at: 1000, host: 'a.example', path: '/', sent: {}, ...o });
+  let seq = 0;
+  const rec = (o: Partial<ProvenanceRecord> & { name: string }): ProvenanceRecord => ({ seq: ++seq, at: 1000, host: 'a.example', path: '/', pageHost: '', sent: {}, effect: 'set', changes: [], ...o });
   it('a Domain-attribute record does not describe the host-only cookie of the same name', () => {
     const hostOnly = makeCookie({ name: 'n', domain: 'a.example', storeId: '0' });
     const domain = makeCookie({ name: 'n', domain: '.a.example', hostOnly: false, storeId: '0' });

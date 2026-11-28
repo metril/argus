@@ -13,7 +13,9 @@ use std::net::IpAddr;
 use filter_engine::formats::ExtRule;
 use serde::{Deserialize, Serialize};
 
-use crate::cookie::{apply_set_cookie, filter_request_cookie, CookieSpec, SetCookie};
+use crate::cookie::{
+    apply_set_cookie_traced, filter_request_cookie, removed_request_cookies, CookieSpec, SetCookie,
+};
 use crate::headers::HeaderEdit;
 use crate::parse::{parse_rule, target, Action, Injection, NetMatch, ParsedRule, Party, RuleError};
 use crate::pattern::{for_each_token, token_hash};
@@ -657,6 +659,7 @@ impl ExtIndex {
             }
         }
         let mut cookies: Vec<&CookieSpec> = Vec::new();
+        let mut cookie_ids: Vec<u32> = Vec::new();
         for id in live {
             match &self.rules[id as usize].action {
                 Action::Block => {
@@ -679,7 +682,12 @@ impl ExtIndex {
                         cur = Cow::Owned(n);
                     }
                 }
-                Action::Cookie(c) if !c.modifies() => cookies.push(c),
+                Action::Cookie(c) if !c.modifies() => {
+                    cookies.push(c);
+                    if req.want_cookie_drops {
+                        cookie_ids.push(id);
+                    }
+                }
                 Action::RemoveHeader {
                     name,
                     request: true,
@@ -698,7 +706,14 @@ impl ExtIndex {
                 .map(|(_, v)| *v)
                 .collect();
             if !joined.is_empty() {
-                if let Some(new) = filter_request_cookie(&joined.join("; "), &cookies) {
+                let joined = joined.join("; ");
+                if let Some(new) = filter_request_cookie(&joined, &cookies) {
+                    if req.want_cookie_drops {
+                        d.cookie_drops = removed_request_cookies(&joined, &cookies)
+                            .into_iter()
+                            .map(|(n, i)| (n, cookie_ids[i]))
+                            .collect();
+                    }
                     d.header_edits.push(if new.is_empty() {
                         HeaderEdit::Remove("cookie".into())
                     } else {
@@ -905,6 +920,7 @@ impl ExtIndex {
         }
         let clen = resp.content_length();
         let mut set_cookies: Vec<&CookieSpec> = Vec::new();
+        let mut set_cookie_ids: Vec<u32> = Vec::new();
         let (mut perm_restrict, mut perm_trusted): (Vec<&str>, Vec<&str>) =
             (Vec::new(), Vec::new());
         for id in live {
@@ -922,7 +938,10 @@ impl ExtIndex {
                     name,
                     request: false,
                 } => plan.header_edits.push(HeaderEdit::Remove(name.clone())),
-                Action::Cookie(c) => set_cookies.push(c),
+                Action::Cookie(c) => {
+                    set_cookies.push(c);
+                    set_cookie_ids.push(id);
+                }
                 Action::Permissions(v) if is_doc => {
                     if r.trusted && !crate::permissions::is_restrictive(v) {
                         perm_trusted.push(v)
@@ -1015,12 +1034,34 @@ impl ExtIndex {
                 .collect();
             let mut changed = false;
             let mut new: Vec<String> = Vec::with_capacity(old.len());
-            for line in old {
-                match apply_set_cookie(line, &set_cookies) {
+            for (index, line) in old.into_iter().enumerate() {
+                let ap = apply_set_cookie_traced(line, &set_cookies);
+                let id = |i: usize| set_cookie_ids[i];
+                let touch = |stripped| {
+                    let max_age = ap.max_age.map(|(m, i)| (m, id(i)));
+                    let same_site = ap.same_site.map(|(s, i)| (s, id(i)));
+                    let rule = ap
+                        .by
+                        .map(id)
+                        .or(max_age.map(|x| x.1))
+                        .or(same_site.map(|x| x.1))?;
+                    Some(crate::types::CookieTouch {
+                        index,
+                        stripped,
+                        rule,
+                        max_age,
+                        same_site,
+                    })
+                };
+                match ap.action {
                     SetCookie::Keep => new.push(line.to_string()),
-                    SetCookie::Remove => changed = true,
+                    SetCookie::Remove => {
+                        changed = true;
+                        plan.cookie_touches.extend(touch(true));
+                    }
                     SetCookie::Replace(s) => {
                         changed = true;
+                        plan.cookie_touches.extend(touch(false));
                         new.push(s)
                     }
                 }

@@ -592,7 +592,7 @@ const SECTIONS: &[Section] = &[
         fields: &[Def {
             key: "cookie_prov",
             label: "Cookie provenance",
-            desc: "Records cookie names and attributes seen in transit so the extension can show where cookies come from. Values are never recorded. Off by default.",
+            desc: "Records cookie names and attributes (never values) for browsers using the Argus extension, so it can show where cookies come from. Off by default.",
             kind: Kind::Switch,
             dep: None,
         }],

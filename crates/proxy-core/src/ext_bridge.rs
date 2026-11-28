@@ -597,6 +597,7 @@ impl ExtHub {
         grace_until: Option<Instant>,
     ) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
+        filter_engine::cookie_log().open(id);
         let pinned = ident
             .profiles
             .as_ref()
@@ -858,6 +859,7 @@ impl ExtHub {
     /// Forget a session: its jobs fail, its documents stop being served by it.
     pub fn close(&self, id: u64) {
         filter_engine::session_log().forget(id);
+        filter_engine::cookie_log().forget(id);
         let mut g = self.inner.lock();
         if let Some(s) = g.sessions.remove(&id) {
             for (tx, _) in s.jobs.values() {

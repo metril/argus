@@ -137,6 +137,29 @@ pub struct ResponseTransforms {
     pub injections: Vec<Injection>,
     /// Transform for non-HTML bodies.
     pub body: Option<Arc<dyn BodyTransform>>,
+    /// `Set-Cookie` lines `$cookie` rules removed or changed (for cookie provenance).
+    pub cookie_touches: Vec<CookieTouch>,
+}
+
+/// A `Set-Cookie` line a `$cookie` rule touched, with the rule's text and list.
+#[derive(Debug, Clone)]
+pub struct CookieTouch {
+    /// Position among the response's visible-ASCII `Set-Cookie` lines.
+    pub index: usize,
+    pub stripped: bool,
+    /// The rule that removed the line; for a changed line, that of its first changed attribute.
+    pub rule: String,
+    pub list_id: Option<String>,
+    /// What a rule set and the rule whose value won, per attribute.
+    pub max_age: Option<(u64, CookieSource)>,
+    pub same_site: Option<(ext_rules::SameSite, CookieSource)>,
+}
+
+/// A rule and its list.
+#[derive(Debug, Clone)]
+pub struct CookieSource {
+    pub rule: String,
+    pub list_id: Option<String>,
 }
 
 impl ResponseTransforms {

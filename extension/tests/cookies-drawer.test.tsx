@@ -105,14 +105,47 @@ describe('provenance', () => {
     expect(prov).toMatch(/Lifetime: 1 year → capped to 7 days/);
     expect(prov).toContain('||stackoverflow.com^$cookie=_ga;maxAge=604800');
     expect(prov).toContain('Argus Base');
-    expect(p.q<HTMLAnchorElement>('#prov a').getAttribute('href')).toBe('https://argus.lan/filters/argus-base#L51');
+    expect(prov).toContain('Max-Age: 1 year → 7 days');
+    expect(p.q<HTMLAnchorElement>('#prov a').getAttribute('href')).toBe('https://argus.lan/filters/argus-base?q=%7C%7Cstackoverflow.com%5E%24cookie%3D_ga%3BmaxAge%3D604800');
     expect(prov).toContain('History covers recent activity in this browser session.');
+  });
+
+  it('on: a request a rule kept the cookie out of is listed under "Kept out of requests"', async () => {
+    const p = await mount({ prov: 'on' });
+    await p.click(p.q('[role=radio][aria-checked=false]'));
+    await open(p, 'paywall_count');
+    const prov = p.text('#prov');
+    expect(prov).toContain('Kept out of requests');
+    expect(prov).toContain('Once, last ');
+    expect(prov).toContain('news.example.org');
+    expect(prov).toContain('||news.example.org^$cookie=paywall_count');
+    expect(prov).toContain('Your rules');
+    // A cookie nothing was kept out of has no such line.
+    await p.click(p.q('[data-testid=cookie-drawer] button[aria-label="Close"]'));
+    await open(p, 'theme');
+    expect(p.text('#prov')).not.toContain('Kept out of requests');
   });
 
   it('on: a cookie with no record says it was not seen in transit', async () => {
     const p = await mount({ prov: 'on' });
     await open(p, 'prefs');
     expect(p.text('#prov')).toContain('Not seen in transit.');
+  });
+
+  it('on: each changed attribute names the rule whose value won, with a link to that rule', async () => {
+    const p = await mount({ prov: 'on' });
+    await open(p, '_ga_9XK2LP');
+    const prov = p.text('#prov');
+    expect(prov).toContain('||stackoverflow.com^$cookie=/^_ga_/;maxAge=604800');
+    expect(prov).toContain('||stackoverflow.com^$cookie=/^_ga_/;sameSite=lax');
+    expect(prov).toContain('Max-Age: 2 years → 7 days');
+    expect(prov).toContain('SameSite: None → Lax');
+    expect(prov).toContain('Your rules');
+    const hrefs = p.qa<HTMLAnchorElement>('#prov a').map((a) => a.getAttribute('href'));
+    expect(hrefs).toEqual([
+      'https://argus.lan/filters/argus-base?q=' + encodeURIComponent('||stackoverflow.com^$cookie=/^_ga_/;maxAge=604800'),
+      'https://argus.lan/filters/custom?q=' + encodeURIComponent('||stackoverflow.com^$cookie=/^_ga_/;sameSite=lax'),
+    ]);
   });
 
   it('on: Stripped by Argus lists cookies a rule removed, read-only', async () => {

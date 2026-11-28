@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api_types::{
-    AuditEntry, ExtAuditEvent, ExtError, ExtIdent, ExtLogEntry, ExtLogResponse, ExtMenuResponse,
-    ExtOut, ExtRuleRequest, ExtRuleResult, ExtSiteRule, ExtSiteRules, ExtTriggerRequest,
+    AuditEntry, ExtAuditEvent, ExtCookieAttrs, ExtCookieChange, ExtCookieProvenance,
+    ExtCookieRecord, ExtError, ExtIdent, ExtLogEntry, ExtLogResponse, ExtMenuResponse, ExtOut,
+    ExtRuleRequest, ExtRuleResult, ExtSiteRule, ExtSiteRules, ExtTriggerRequest,
     ExtTriggerResponse, Scope, UserRole,
 };
 use axum::{
@@ -499,6 +500,129 @@ pub async fn log(
     })
     .await?;
     Ok(Json(ExtLogResponse { next, entries }))
+}
+
+// ---------------------------------------------------------------------------
+// Cookie provenance
+// ---------------------------------------------------------------------------
+
+/// Most records one `GET /ext/cookies/provenance` returns.
+const PROVENANCE_PAGE: usize = 500;
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ProvenanceQuery {
+    /// Return the records after this sequence number (default: all that are kept).
+    pub since: Option<u64>,
+    /// Only records of this site: its registrable domain and every subdomain.
+    pub host: Option<String>,
+    /// At most this many records (default and maximum 500).
+    pub limit: Option<usize>,
+}
+
+/// Where the cookies of the calling extension session came from: for each `Set-Cookie` its name,
+/// the response's host and path, the attributes the server sent, and whether a `$cookie` rule
+/// left it alone, changed it or removed it, plus the cookies rules kept out of requests. Cookie
+/// values are never recorded or returned. Recording is a setting that is off by default; while
+/// it is off the answer is `{enabled: false}`. Another session's records are never returned;
+/// the newest 3000 are kept per session, in memory only.
+#[utoipa::path(
+    get, path = "/ext/cookies/provenance", tag = "ext",
+    security(("bearer_auth" = ["logs:read"])),
+    params(ProvenanceQuery),
+    responses(
+        (status = 200, description = "Records after `since`; `enabled: false` while the setting is off", body = ExtCookieProvenance),
+        (status = 403, description = "No live extension session for this token")
+    )
+)]
+pub async fn cookie_provenance(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    headers: HeaderMap,
+    Query(q): Query<ProvenanceQuery>,
+) -> ApiResult<Json<ExtCookieProvenance>> {
+    let session = session_of(&state, &p, &headers)?;
+    let since = q.since.unwrap_or(0);
+    let on = state
+        .cookie_provenance
+        .get()
+        .is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed));
+    if !on {
+        return Ok(Json(ExtCookieProvenance {
+            enabled: false,
+            records: Vec::new(),
+            next_since: since,
+            more: false,
+        }));
+    }
+    let limit = q.limit.unwrap_or(PROVENANCE_PAGE).clamp(1, PROVENANCE_PAGE);
+    let (rows, next_since, more) =
+        filter_engine::cookie_log().since(session, since, limit, q.host.as_deref());
+    let st = state.clone();
+    let records = blocking(move || {
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let list_id = r
+                    .list_id
+                    .as_deref()
+                    .map(|id| crate::rule_origin::public_id(id).to_string());
+                let a = r.attrs;
+                ExtCookieRecord {
+                    seq: r.seq,
+                    time: r.ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    effect: r.effect.as_str().to_string(),
+                    name: r.name,
+                    host: r.host,
+                    path: r.path,
+                    page_host: r.page_host,
+                    third_party: r.third_party,
+                    attrs: ExtCookieAttrs {
+                        domain: a.domain,
+                        path: a.path,
+                        secure: a.secure,
+                        http_only: a.http_only,
+                        same_site: a.same_site.map(|s| s.as_str().to_string()),
+                        max_age: a.max_age,
+                        expires: a.expires,
+                        partitioned: a.partitioned,
+                    },
+                    changes: r
+                        .changes
+                        .into_iter()
+                        .map(|c| {
+                            let lid = c
+                                .list_id
+                                .as_deref()
+                                .map(|id| crate::rule_origin::public_id(id).to_string());
+                            ExtCookieChange {
+                                attr: c.attr.to_string(),
+                                from: c.from,
+                                to: c.to,
+                                rule: c.rule,
+                                list_name: lid.as_deref().and_then(|id| st.list_name(id)),
+                                user_rule: lid.as_deref() == Some(crate::rule_origin::CUSTOM_ID),
+                                list_id: lid,
+                            }
+                        })
+                        .collect(),
+                    prefix: r.prefix.map(|(p, _)| p.to_string()),
+                    prefix_valid: r.prefix.map(|(_, ok)| ok),
+                    rule: r.rule,
+                    list_name: list_id.as_deref().and_then(|id| st.list_name(id)),
+                    user_rule: list_id.as_deref() == Some(crate::rule_origin::CUSTOM_ID),
+                    list_id,
+                }
+            })
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    Ok(Json(ExtCookieProvenance {
+        enabled: true,
+        records,
+        next_since,
+        more,
+    }))
 }
 
 // ---------------------------------------------------------------------------

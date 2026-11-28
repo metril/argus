@@ -92,6 +92,17 @@ pub fn refused_response() -> Response<ProxyBody> {
 /// `Origin`-header form of an authority: scheme, host, and the port unless it is the default.
 /// The page a request came from, for logs: the Referer as the browser sent it, even when
 /// Stealth Mode replaced it on the way out.
+/// The path of an absolute URL without its query or fragment (`/` when it has none).
+fn url_path(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |x| x.1);
+    let from = rest.find('/').map_or("", |i| &rest[i..]);
+    let end = from.find(['?', '#']).unwrap_or(from.len());
+    match &from[..end] {
+        "" => "/",
+        p => p,
+    }
+}
+
 fn src_of<'a>(
     orig_referer: &'a Option<String>,
     headers: &'a hyper::HeaderMap,
@@ -422,6 +433,9 @@ impl ProxyContext {
     /// Live switch for cookie provenance recording.
     pub fn set_cookie_provenance(&self, on: bool) {
         self.cookie_provenance.store(on, Ordering::Relaxed);
+        if !on {
+            filter_engine::cookie_log().clear();
+        }
     }
 
     /// The live cookie-provenance switch, for the web API to flip on save.
@@ -1359,6 +1373,9 @@ impl ProxyContext {
         // response is judged by the same one.
         let mut generation: Option<Arc<filter_engine::Generation>> = None;
         let mut request_edits: Vec<ext_rules::HeaderEdit> = Vec::new();
+        // Cookies a `$cookie` rule removes from the request (name, rule, list); only collected
+        // while cookie provenance is on and the connection is bound to an extension session.
+        let mut cookie_drops: Vec<(String, String, Option<String>)> = Vec::new();
         // Set when the request passed the engine and may still be judged by its canonical name:
         // the page it belongs to, and whether an exception matched it.
         let mut cname_probe: Option<(String, bool)> = None;
@@ -1494,6 +1511,8 @@ impl ProxyContext {
                         ext::DecisionCtx {
                             engine_exception: verdict.exception_rule.is_some(),
                             popup: popup_opener.as_deref(),
+                            cookie_drops: rctx.ext.is_some()
+                                && self.cookie_provenance.load(Ordering::Relaxed),
                         },
                     ) {
                         if let Some(id) = d.block {
@@ -1559,6 +1578,23 @@ impl ProxyContext {
                         if let Some((new_url, _)) = d.rewrite_url {
                             url = new_url;
                         }
+                        if !d.cookie_drops.is_empty()
+                            && rctx.ext.is_some()
+                            && self.cookie_provenance.load(Ordering::Relaxed)
+                        {
+                            cookie_drops = d
+                                .cookie_drops
+                                .iter()
+                                .filter_map(|(name, id)| {
+                                    let r = idx.rule(*id)?;
+                                    Some((
+                                        name.clone(),
+                                        r.raw.clone(),
+                                        (!r.list.is_empty()).then(|| r.list.clone()),
+                                    ))
+                                })
+                                .collect();
+                        }
                         request_edits = d.header_edits;
                     }
                 }
@@ -1619,6 +1655,32 @@ impl ProxyContext {
         }
 
         ext::apply_request_edits(&mut headers, &request_edits);
+        if let (Some(sid), false) = (rctx.ext, cookie_drops.is_empty()) {
+            let page = if rtype == RequestType::Document {
+                host.as_str()
+            } else {
+                filter_engine::RequestMatcher::host_of(source_url_hinted(
+                    &headers,
+                    &url,
+                    rtype,
+                    page_hint.as_deref(),
+                ))
+            };
+            let drops: Vec<(&str, &str, Option<&str>)> = cookie_drops
+                .iter()
+                .map(|(n, r, l)| (n.as_str(), r.as_str(), l.as_deref()))
+                .collect();
+            filter_engine::cookie_log().record_blocked_send(
+                &self.cookie_provenance,
+                sid,
+                &filter_engine::cookie_log::Context {
+                    host: &host,
+                    path: url_path(&url),
+                    page_host: page,
+                },
+                &drops,
+            );
+        }
 
         // Stealth Mode: header, URL and cookie edits, decided once per request. Off for hosts in
         // full bypass, pages with ad blocking switched off, and options a `$stealth` exception
@@ -2110,6 +2172,72 @@ impl ProxyContext {
             debug!("Blocked {} by response rule {}", url, rule);
             let v = filter_engine::MatchResult::blocked(rule);
             return block_outcome(self.block_response(), rtype, &v, &url).into_result();
+        }
+        // Cookie provenance: names and attributes of every `Set-Cookie`, never values; only for
+        // a connection bound to an extension session and only while the setting is on.
+        if let Some(sid) = rctx.ext {
+            if self.cookie_provenance.load(Ordering::Relaxed)
+                && resp_headers.contains_key(hyper::header::SET_COOKIE)
+            {
+                let page = if rtype == RequestType::Document {
+                    host.as_str()
+                } else {
+                    filter_engine::RequestMatcher::host_of(src_of(
+                        &orig_referer,
+                        &headers,
+                        &url,
+                        rtype,
+                        page_hint.as_deref(),
+                    ))
+                };
+                fn source(
+                    s: &crate::rewrite::CookieSource,
+                ) -> filter_engine::cookie_log::Source<'_> {
+                    filter_engine::cookie_log::Source {
+                        rule: &s.rule,
+                        list_id: s.list_id.as_deref(),
+                    }
+                }
+                let touches: Vec<filter_engine::cookie_log::Touch<'_>> = transforms
+                    .cookie_touches
+                    .iter()
+                    .map(|t| filter_engine::cookie_log::Touch {
+                        index: t.index,
+                        stripped: t.stripped,
+                        max_age: t.max_age.as_ref().map(|(m, s)| (*m, source(s))),
+                        same_site: t.same_site.as_ref().map(|(n, s)| {
+                            let n = match n {
+                                ext_rules::SameSite::None => {
+                                    filter_engine::cookie_log::SameSite::None
+                                }
+                                ext_rules::SameSite::Lax => {
+                                    filter_engine::cookie_log::SameSite::Lax
+                                }
+                                ext_rules::SameSite::Strict => {
+                                    filter_engine::cookie_log::SameSite::Strict
+                                }
+                            };
+                            (n, source(s))
+                        }),
+                        rule: &t.rule,
+                        list_id: t.list_id.as_deref(),
+                    })
+                    .collect();
+                filter_engine::cookie_log().record_response(
+                    &self.cookie_provenance,
+                    sid,
+                    &filter_engine::cookie_log::Context {
+                        host: &host,
+                        path: url_path(&url),
+                        page_host: page,
+                    },
+                    resp_headers
+                        .get_all(hyper::header::SET_COOKIE)
+                        .iter()
+                        .map(|v| (v.as_bytes(), v.to_str().is_ok())),
+                    &touches,
+                );
+            }
         }
         if kind == BodyKind::None {
             // Redirects, 204s, `no-transform`, downloads...: header edits only.

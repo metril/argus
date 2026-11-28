@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { BulkResult, StoreInfo } from '../../lib/cookiejar/api';
 import type { Cookie } from '../../lib/cookiejar/model';
-import { HISTORY_NOTE, NOT_SEEN_HINT, OFF_LINE, whenText, type Provenance } from '../../lib/cookiejar/provenance';
+import { HISTORY_NOTE, NOT_SEEN_HINT, OFF_LINE, changeText, changesByRule, ruleUrl, whenText, type Provenance, type ProvenanceRecord, type RuleRef } from '../../lib/cookiejar/provenance';
 import type { Issue } from '../../lib/cookiejar/validate';
 import { postExtRule } from '../../lib/api';
 import { Icon } from '../icons';
@@ -184,12 +184,14 @@ function Where({ row, prov }: { row: Row; prov: Provenance | undefined }) {
       <>
         <p><b>Not seen in transit.</b></p>
         <p class="muted">{NOT_SEEN_HINT}.</p>
+        {info?.blocked && <dl class="kv"><Blocked list={info.blocked} /></dl>}
         <p class="hint">{HISTORY_NOTE}</p>
       </>
     );
   }
   const s = settings.value;
-  const link = rec.listId && s ? `${s.argusUrl}/filters/${encodeURIComponent(rec.listId)}${rec.line ? `#L${rec.line}` : ''}` : '';
+  const own: RuleRef | undefined = rec.rule ? { rule: rec.rule, ...(rec.listId ? { listId: rec.listId } : {}), ...(rec.listName ? { listName: rec.listName } : {}), ...(rec.userRule ? { userRule: true } : {}) } : undefined;
+  const groups = info.effect === 'stripped' || !rec.changes.length ? (own ? [{ by: own, changes: rec.changes }] : []) : changesByRule(rec.changes, own);
   return (
     <>
       <dl class="kv">
@@ -200,12 +202,30 @@ function Where({ row, prov }: { row: Row; prov: Provenance | undefined }) {
         {rec.rule && (
           <>
             <dt>{info.effect === 'stripped' ? 'Stripped by' : 'Changed by'}</dt>
-            <dd><code>{rec.rule}</code><br /><span class="dim">{rec.listName ?? rec.listId ?? 'Your rules'}{link ? <> · <a href={link} target="_blank" rel="noreferrer">{rec.line ? `line ${rec.line}` : 'open list'}</a></> : rec.line ? ` · line ${rec.line}` : ''}</span></dd>
+            <dd>{groups.map((g, i) => <div key={i}>{g.by && <RuleLine by={g.by} base={s?.argusUrl} />}{g.changes.map((c) => <div key={c.attr}>{changeText(c)}</div>)}</div>)}</dd>
           </>
         )}
+        {info.blocked && <Blocked list={info.blocked} />}
       </dl>
       {!row.stripped && <BlockRule cookie={row.c} />}
       <p class="hint">{HISTORY_NOTE}</p>
+    </>
+  );
+}
+
+/** A rule's text, its list, and a link that opens the rule in its list page in Argus. */
+function RuleLine({ by, base }: { by: RuleRef; base?: string | undefined }) {
+  const link = by.listId && base ? ruleUrl(base, by.listId, by.rule) : '';
+  return <><code>{by.rule}</code><br /><span class="dim">{by.listName ?? (by.userRule ? 'Your rules' : by.listId) ?? 'Your rules'}{link ? <> · <a href={link} target="_blank" rel="noreferrer">open rule</a></> : ''}</span></>;
+}
+
+/** Requests a rule kept this cookie out of: how many, the last one, and the rule. */
+function Blocked({ list }: { list: ProvenanceRecord[] }) {
+  const last = list[list.length - 1]!;
+  return (
+    <>
+      <dt>Kept out of requests</dt>
+      <dd>{list.length === 1 ? 'Once' : `${list.length} times`}, last {whenText(last.at)} to <span class="mono">{last.host}</span>{last.rule && <><br /><RuleLine by={{ rule: last.rule, ...(last.listId ? { listId: last.listId } : {}), ...(last.listName ? { listName: last.listName } : {}), ...(last.userRule ? { userRule: true } : {}) }} base={settings.value?.argusUrl} /></>}</dd>
     </>
   );
 }

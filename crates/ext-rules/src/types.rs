@@ -71,6 +71,9 @@ pub struct RequestInfo<'a> {
     /// Request headers (any case); only read when a cookie / header rule matched. Check
     /// [`crate::ExtIndex::needs_request_headers`] to skip building it.
     pub headers: &'a [(&'a str, &'a str)],
+    /// The caller wants [`RequestDecision::cookie_drops`] (cookie provenance). Off: the names of
+    /// removed cookies are never computed.
+    pub want_cookie_drops: bool,
 }
 
 impl<'a> RequestInfo<'a> {
@@ -83,6 +86,7 @@ impl<'a> RequestInfo<'a> {
             third_party: None,
             opened_as_popup: false,
             headers: &[],
+            want_cookie_drops: false,
         }
     }
 }
@@ -130,6 +134,9 @@ pub struct RequestDecision {
     pub redirect_rule: Option<(String, RuleId)>,
     /// Every rule that took part (for logging).
     pub matched: Vec<RuleId>,
+    /// Names (never values) of the cookies `$cookie` rules removed from the `Cookie` header, with
+    /// the rule that did.
+    pub cookie_drops: Vec<(String, RuleId)>,
 }
 
 impl RequestDecision {
@@ -194,6 +201,23 @@ pub struct ResponsePlan<'a> {
     /// (`@@||x^$elemhide`, `$specifichide`, `$jsinject`, `$content`, `$document`...). Besides
     /// masking this index's own rules, a caller applies them to other engines' output.
     pub disabled: u32,
+    /// Which `Set-Cookie` lines `$cookie` rules removed or changed, and by which rule.
+    pub cookie_touches: Vec<CookieTouch>,
+}
+
+/// One `Set-Cookie` header line a `$cookie` rule touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CookieTouch {
+    /// Position among the response's `Set-Cookie` lines that are valid UTF-8 (the ones rules see).
+    pub index: usize,
+    /// Removed outright (otherwise an attribute was changed).
+    pub stripped: bool,
+    /// The rule that removed the line; for a changed line the rule of its first changed attribute.
+    pub rule: RuleId,
+    /// The `Max-Age` (seconds) the rewritten line carries and the rule whose value won.
+    pub max_age: Option<(u64, RuleId)>,
+    /// The `SameSite` the rewritten line carries and the rule whose value won.
+    pub same_site: Option<(crate::SameSite, RuleId)>,
 }
 
 impl ResponsePlan<'_> {
