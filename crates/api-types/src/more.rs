@@ -878,3 +878,95 @@ pub struct ExtRuleResponse {
     #[serde(default)]
     pub reason: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Traffic accounting
+// ---------------------------------------------------------------------------
+
+/// Bytes by how the proxy handled the connection they crossed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TrafficHandling {
+    /// TLS terminated and filtered.
+    pub decrypted: u64,
+    /// Opaque tunnel (bypass, EV, fail-safe).
+    pub tunnelled: u64,
+    /// Plain HTTP.
+    pub plain: u64,
+}
+
+/// One host of a device, by current rate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TrafficTopHost {
+    pub host: String,
+    pub up: u64,
+    pub down: u64,
+    /// Smoothed bytes per second.
+    pub up_rate: f64,
+    pub down_rate: f64,
+    /// Hosts folded together after eviction or idleness.
+    #[serde(default)]
+    pub other: bool,
+}
+
+/// A row of the traffic table: one device (`group=device`) or one host (`group=host`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TrafficRowDto {
+    /// Stable id of the device (`t:...` token device, `x:...` extension session, `i:...` address);
+    /// absent on a host row that merges several devices.
+    pub device_id: Option<String>,
+    /// Device name (its address when it is not a registered device).
+    pub device_name: Option<String>,
+    /// Profile the device resolved to.
+    pub profile_id: Option<String>,
+    /// Host (host rows only).
+    pub host: Option<String>,
+    /// Hosts folded together after eviction or idleness (host rows only).
+    #[serde(default)]
+    pub other: bool,
+    /// Bytes received from the client / sent to the client, including TLS and HTTP framing.
+    pub up: u64,
+    pub down: u64,
+    /// Smoothed bytes per second.
+    pub up_rate: f64,
+    pub down_rate: f64,
+    pub connections_total: u64,
+    pub connections_active: u32,
+    /// Requests answered by the proxy itself, and their body bytes (part of `down`).
+    pub local_requests: u64,
+    pub local_bytes: u64,
+    pub handling: TrafficHandling,
+    /// RFC 3339 time of the last byte.
+    pub last_active: Option<String>,
+    /// Device rows: the busiest hosts by current rate.
+    #[serde(default)]
+    pub top_hosts: Vec<TrafficTopHost>,
+}
+
+/// Process-wide byte totals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TrafficTotals {
+    pub up: u64,
+    pub down: u64,
+}
+
+/// Traffic accounting snapshot. Poll every `interval_ms` or so and draw `*_rate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TrafficResponse {
+    /// `device` or `host`.
+    pub group: String,
+    /// Server time (RFC 3339) and in Unix milliseconds.
+    pub at: String,
+    pub at_ms: u64,
+    /// How often the figures are refreshed on the server.
+    pub interval_ms: u64,
+    /// Whether per-host figures are included (they need `logs:read` besides `stats:read`).
+    pub hosts_visible: bool,
+    /// Totals the caller may see (all devices, or those of its profiles).
+    pub totals: TrafficTotals,
+    pub rows: Vec<TrafficRowDto>,
+}

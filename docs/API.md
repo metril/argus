@@ -199,6 +199,24 @@ disabled or the password is wrong.
 - `POST /rules/validate`: `{rules, format?, allowlist?}` runs the real conversion pipeline and
   reports each line as `translated`, `accepted`, `handed_off`, `skipped` or `rejected`.
 
+## Traffic
+
+`GET /stats/traffic?group=device|host&device=<id>&limit=&sort=rate|down|up` reports bytes counted on
+the client-facing socket (TLS and HTTP framing included) per device and host, with smoothed up and
+down rates (about 3 s time constant, refreshed every `interval_ms`, so poll every 1 to 2 s). Needs
+`stats:read`. Per-host figures are browsing history, so `top_hosts` and `group=host` also need
+`logs:read`: without it `top_hosts` is empty, `hosts_visible` is `false` and `group=host` answers 403
+`insufficient_scope`. A profile-restricted token sees only the devices of its own profiles (and
+totals over those). A device id is `i:<address>` for an address that is not a registered device,
+`t:<first 12 hex characters of the device token digest>` or `x:<extension token id>` (one row per
+bridge token, whatever the browser's reconnects). Hosts are lowercase, without port or trailing
+dot; names that are not valid hostnames or IP literals count as `(invalid)`, and hosts beyond the
+per-device and overall caps fold into `(other hosts)`, so totals stay exact. Nothing is persisted:
+counters restart with the proxy. `POST /stats/traffic/reset` (`stats:reset`, not available to a
+profile-restricted token) clears them. `GET /stats/proxy` and `/system/metrics` report the same totals as
+`requests.bytes_received` (from clients) and `requests.bytes_sent` (to clients); these were always 0
+before and are now real. They reset with the traffic counters.
+
 ## Recently blocked requests
 
 `GET /stats/blocked/recent` reads the engine's bounded ring (newest first, paginated) and filters by

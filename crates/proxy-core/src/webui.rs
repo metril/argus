@@ -279,6 +279,20 @@ impl web_api::RuntimeControl for ProxyRuntime {
         self.0.dns_stats()
     }
 
+    fn traffic_snapshot(&self) -> Option<common::traffic::TrafficSnapshot> {
+        let t = self.0.traffic();
+        t.fold();
+        Some(t.snapshot())
+    }
+
+    fn traffic_totals(&self) -> Option<(u64, u64)> {
+        Some(self.0.traffic().totals())
+    }
+
+    fn traffic_reset(&self) {
+        self.0.traffic().reset();
+    }
+
     async fn test_dns(
         &self,
         settings: &common::config::DnsSettings,

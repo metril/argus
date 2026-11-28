@@ -10,6 +10,7 @@ pub mod error;
 pub mod faults;
 pub mod net_policy;
 pub mod profile_store;
+pub mod traffic;
 pub mod types;
 
 pub use config::{ConfigError, ProxyConfig};

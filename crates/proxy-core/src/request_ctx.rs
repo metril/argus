@@ -238,6 +238,8 @@ pub struct ConnCtx {
     local_ip: OnceLock<std::net::IpAddr>,
     /// Process-unique id of this connection.
     id: u64,
+    /// Byte accounting of this connection (set once by the handler).
+    traffic: OnceLock<Arc<crate::traffic::ConnTraffic>>,
     /// Called with `id` when the connection is gone (drops its upstream connections).
     on_close: OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
 }
@@ -258,7 +260,10 @@ impl ConnCtx {
     pub fn new(profiles: &Profiles, client_addr: SocketAddr) -> Self {
         let (slot, epoch) = profiles.resolve_by_digest(client_addr.ip(), None);
         let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-        let device: Arc<str> = Arc::from(format!("i:{}", client_addr.ip()));
+        let device: Arc<str> = Arc::from(format!(
+            "i:{}",
+            crate::profiles::normalize_ip(client_addr.ip())
+        ));
         Self {
             client_addr,
             digest: OnceLock::new(),
@@ -268,6 +273,7 @@ impl ConnCtx {
                     .with_conn(id, device),
             ),
             id,
+            traffic: OnceLock::new(),
             on_close: OnceLock::new(),
             awaiting_token: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
@@ -279,6 +285,15 @@ impl ConnCtx {
             ext_store: OnceLock::new(),
             local_ip: OnceLock::new(),
         }
+    }
+
+    /// Attach the connection's byte accounting (once).
+    pub fn set_traffic(&self, t: Arc<crate::traffic::ConnTraffic>) {
+        let _ = self.traffic.set(t);
+    }
+
+    pub fn traffic(&self) -> Option<&Arc<crate::traffic::ConnTraffic>> {
+        self.traffic.get()
     }
 
     /// This connection's id.
@@ -301,7 +316,10 @@ impl ConnCtx {
         if let Some(s) = self.ext_session() {
             return Arc::from(format!("x:{s}"));
         }
-        Arc::from(format!("i:{}", self.client_addr.ip()))
+        Arc::from(format!(
+            "i:{}",
+            crate::profiles::normalize_ip(self.client_addr.ip())
+        ))
     }
 
     /// Mark the connection as accepted on the extension-only listener.

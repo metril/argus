@@ -149,6 +149,8 @@ fn build_mitm(c: &LazyCfg) -> Result<Arc<MitmHandler>> {
 
 /// Handle for changing a running proxy without restarting it. Cheap to clone via `Arc`.
 pub struct ProxyControl {
+    /// Byte accounting of every client connection.
+    traffic: Arc<crate::traffic::Traffic>,
     acl: Arc<ArcSwap<ClientAcl>>,
     ctx: Arc<ProxyContext>,
     load_manager: Arc<LoadManager>,
@@ -240,6 +242,11 @@ fn spec_addr(host: &str, port: u16) -> String {
 }
 
 impl ProxyControl {
+    /// The traffic accounting hub.
+    pub fn traffic(&self) -> Arc<crate::traffic::Traffic> {
+        self.traffic.clone()
+    }
+
     /// Current bind addresses (`None` before the server runs).
     pub async fn bind_info(&self) -> Option<BindInfo> {
         self.running.lock().await.as_ref().map(Running::info)
@@ -1078,6 +1085,7 @@ impl ProxyServer {
         );
         let load_manager = Arc::new(LoadManager::new(load_manager_config));
         let control = Arc::new(ProxyControl {
+            traffic: crate::traffic::Traffic::new(),
             acl: client_acl,
             ctx: ctx.clone(),
             load_manager: load_manager.clone(),
@@ -1282,6 +1290,7 @@ impl ProxyServer {
             enable_http2: self.config.any_listener(|f| f.http2),
             enable_websockets: self.config.any_listener(|f| f.websockets),
             ctx: self.ctx.clone(),
+            traffic: self.control.traffic.clone(),
             timeouts,
             #[cfg(feature = "websockets")]
             ws: if self.config.any_listener(|f| f.websockets) {
@@ -1294,6 +1303,7 @@ impl ProxyServer {
             },
         });
 
+        self.control.traffic.spawn_folder();
         let mut shutdown_rx = shutdown_tx.subscribe();
         let ctl = &self.control;
         ctl.live.store(Some(Arc::new(LiveParts {

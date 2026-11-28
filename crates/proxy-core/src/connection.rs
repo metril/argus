@@ -14,7 +14,7 @@ use crate::authority;
 use crate::filtering::ProxyContext;
 use crate::inject::{full_body, ProxyBody};
 use crate::mitm::MitmHandler;
-use crate::request_ctx::ConnCtx;
+use crate::request_ctx::{ConnCtx, RequestCtx};
 use crate::{tls, Error, Result};
 use bytes::Bytes;
 use hyper::body::Incoming;
@@ -65,6 +65,8 @@ pub struct ConnectionShared {
     pub enable_websockets: bool,
     /// Shared filtering + upstream-forwarding context (engine handle + pooled HTTP client).
     pub ctx: Arc<ProxyContext>,
+    /// Byte accounting shared by all connections.
+    pub traffic: Arc<crate::traffic::Traffic>,
     /// Live-swappable time limits (`performance.*`).
     pub timeouts: Arc<arc_swap::ArcSwap<Timeouts>>,
     #[cfg(feature = "websockets")]
@@ -126,11 +128,34 @@ impl ConnectionHandler {
         let conn = Arc::new(ConnCtx::new(shared.ctx.profiles(), client_addr));
         let ctx = shared.ctx.clone();
         conn.set_on_close(Box::new(move |id| ctx.evict_conn(id)));
-        Self {
+        let ct = shared.traffic.register(client_addr);
+        conn.set_traffic(ct);
+        let h = Self {
             client_addr,
             shared,
             conn,
-        }
+        };
+        h.note_ident();
+        h
+    }
+
+    /// The connection's byte accounting.
+    pub(crate) fn ct(&self) -> &Arc<crate::traffic::ConnTraffic> {
+        self.conn.traffic().expect("traffic attached in new")
+    }
+
+    /// Count what crosses `stream` (the client-facing socket).
+    pub(crate) fn counted<S>(&self, stream: S) -> crate::traffic::Counted<S> {
+        crate::traffic::Counted::new(stream, self.ct().clone())
+    }
+
+    /// Refresh who the accounting attributes this connection to (after the device is known).
+    pub(crate) fn note_ident(&self) {
+        let ctx = self.conn.current(
+            self.shared.ctx.profiles(),
+            self.shared.ctx.require_device_token(),
+        );
+        note_traffic_ident(&self.shared, &self.conn, &ctx);
     }
 
     /// Record the local address this connection was accepted on.
@@ -381,7 +406,9 @@ impl ConnectionHandler {
     pub async fn handle(&self, stream: TcpStream) -> Result<()> {
         trace!("Handling connection from {}", self.client_addr);
         let _ = stream.set_nodelay(true);
-        match self.resolve_entry(stream).await? {
+        let entry = self.resolve_entry(stream).await?;
+        self.note_ident();
+        match entry {
             Entry::Target(target, io) => self.intercept_and_serve(io, target).await,
             Entry::PlainHttp(io) => self.serve_http(io, plain_origin()).await,
             Entry::WebUi(io, web, port) => {
@@ -389,6 +416,7 @@ impl ConnectionHandler {
                 Ok(())
             }
             Entry::PlainTo(io, host, port) => {
+                self.ct().set_host(&host);
                 self.serve_http(
                     io,
                     Origin {
@@ -405,7 +433,11 @@ impl ConnectionHandler {
     /// Entry step for the explicit-proxy mode: decide between CONNECT and plain HTTP, read and
     /// parse the CONNECT head (across any number of TCP segments, bounded in size and time) and
     /// acknowledge it. Bytes past the head are preserved in the returned stream.
-    pub async fn resolve_entry(&self, mut stream: TcpStream) -> Result<Entry<Prefixed<TcpStream>>> {
+    pub async fn resolve_entry(
+        &self,
+        stream: TcpStream,
+    ) -> Result<Entry<Prefixed<Counted<TcpStream>>>> {
+        let mut stream = self.counted(stream);
         let limit = self.shared.timeouts.load().handshake;
         let mut buf = Vec::with_capacity(1024);
 
@@ -589,10 +621,10 @@ impl ConnectionHandler {
     /// `host:port` then goes through exactly the checks of an HTTP `CONNECT`.
     async fn socks5_entry(
         &self,
-        mut stream: TcpStream,
+        mut stream: Counted<TcpStream>,
         mut buf: Vec<u8>,
         limit: Duration,
-    ) -> Result<Entry<Prefixed<TcpStream>>> {
+    ) -> Result<Entry<Prefixed<Counted<TcpStream>>>> {
         // One deadline for the whole handshake (greeting, credentials and request): a client that
         // trickles a byte at a time cannot keep the connection open past it.
         let deadline = tokio::time::Instant::now() + limit;
@@ -724,7 +756,7 @@ impl ConnectionHandler {
     }
 
     /// Best-effort error reply for a failed head read; returns the error to propagate.
-    async fn reject(&self, stream: &mut TcpStream, e: HeadError) -> Error {
+    async fn reject(&self, stream: &mut Counted<TcpStream>, e: HeadError) -> Error {
         let (line, err) = match e {
             HeadError::TooLarge => (
                 "HTTP/1.1 431 Request Header Fields Too Large",
@@ -747,9 +779,17 @@ impl ConnectionHandler {
     where
         IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let ct = self.ct();
+        ct.set_host(&target.host);
         let mitm = match (self.shared.mitm.load_full(), target.intercept_tls) {
-            (Some(m), true) => m,
-            _ => return self.tunnel(io, &target).await,
+            (Some(m), true) => {
+                ct.set_handling(crate::traffic::Handling::Decrypted);
+                m
+            }
+            _ => {
+                ct.set_handling(crate::traffic::Handling::Tunnelled);
+                return self.tunnel(io, &target).await;
+            }
         };
         // Extended Validation sites are tunnelled: an intercepting certificate would replace the
         // assurance the site paid for. The verdict is cached per host.
@@ -770,10 +810,14 @@ impl ConnectionHandler {
                 )
                 .await
             {
-                EvVerdict::Ev => return self.tunnel_with(io, &target, Some("ev")).await,
+                EvVerdict::Ev => {
+                    ct.set_handling(crate::traffic::Handling::Tunnelled);
+                    return self.tunnel_with(io, &target, Some("ev")).await;
+                }
                 // The probe could not tell: tunnel rather than risk decrypting an EV site.
                 EvVerdict::Unknown => {
-                    return self.tunnel_with(io, &target, Some("ev_unknown")).await
+                    ct.set_handling(crate::traffic::Handling::Tunnelled);
+                    return self.tunnel_with(io, &target, Some("ev_unknown")).await;
                 }
                 EvVerdict::NotEv => {}
             }
@@ -1109,6 +1153,17 @@ async fn handle_request(
     if let Some(l) = &rctx.listener {
         l.note_request();
     }
+    note_traffic_ident(&shared, &conn, &rctx);
+    if let Some(ct) = conn.traffic() {
+        // Decrypted and tunnelled connections keep the host they were opened for; a plain one
+        // follows the request in flight.
+        if !origin.strict_host {
+            if let Some(h) = request_host(&req).or(origin.authority.as_ref().map(|a| a.0.as_str()))
+            {
+                ct.set_host(h);
+            }
+        }
+    }
     if conn.is_revoked() {
         return Ok(proxy_auth_required());
     }
@@ -1231,10 +1286,60 @@ async fn handle_request(
             .expect("static response"));
     }
 
-    shared
+    let local_hint = req.uri().path().starts_with(crate::csp::INTERNAL_PREFIX)
+        || request_host(&req).is_some_and(|h| shared.ctx.is_panel_host(h));
+    let resp = shared
         .ctx
         .forward_with(req, origin.scheme, origin.authority, &rctx)
-        .await
+        .await;
+    if let (Ok(r), Some(ct)) = (&resp, conn.traffic()) {
+        if local_hint || answered_locally(r) {
+            use hyper::body::Body as _;
+            ct.note_local(r.body().size_hint().exact().unwrap_or(0));
+        }
+    }
+    resp
+}
+
+/// Tell the byte accounting who this connection is: the device, or for an extension session the
+/// bridge token's id (`x:<token id>`, stable across the browser's reconnects; never the sid).
+fn note_traffic_ident(shared: &ConnectionShared, conn: &ConnCtx, rctx: &RequestCtx) {
+    let Some(ct) = conn.traffic() else { return };
+    let profile = rctx.profile.load().id;
+    match rctx.ext {
+        Some(session) => ct.note_ext(session, profile, || {
+            let hub = shared.ctx.internal().gm.ext();
+            hub.token_id_of(session)
+                .map(|t| Arc::from(format!("x:{t}")))
+        }),
+        None => {
+            if let Some(dev) = rctx.device.as_ref() {
+                ct.note_ident(dev, profile);
+            }
+        }
+    }
+}
+
+/// The host a request names (absolute URI, else `Host`), without port.
+fn request_host<B>(req: &Request<B>) -> Option<&str> {
+    if let Some(h) = req.uri().host() {
+        return Some(h);
+    }
+    let v = req.headers().get(hyper::header::HOST)?.to_str().ok()?;
+    if v.starts_with('[') {
+        return v.find(']').map(|i| &v[..=i]);
+    }
+    Some(v.split(':').next().unwrap_or(v))
+}
+
+/// Whether the proxy produced this response itself instead of relaying an origin's.
+fn answered_locally(r: &Response<ProxyBody>) -> bool {
+    r.headers().get("x-adblock").is_some_and(|v| {
+        matches!(
+            v.as_bytes(),
+            b"blocked" | b"redirected" | b"policy" | b"cert-error" | b"destination-refused"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1360,6 +1465,7 @@ pub fn parse_connect(head: &[u8]) -> Result<(String, u16)> {
 // IO adapters
 // ---------------------------------------------------------------------------------------------
 
+use crate::traffic::Counted;
 pub use io::{IdleIo, Prefixed};
 
 mod io {
@@ -1644,6 +1750,7 @@ mod tests {
             mitm: Default::default(),
             enable_http2: false,
             enable_websockets: false,
+            traffic: crate::traffic::Traffic::new(),
             ctx: ctx.clone(),
             timeouts: Arc::new(arc_swap::ArcSwap::from_pointee(Timeouts::from_config(
                 &crate::config::ProxyConfig::default().performance,
@@ -1682,6 +1789,7 @@ mod tests {
             mitm: Default::default(),
             enable_http2: false,
             enable_websockets: false,
+            traffic: crate::traffic::Traffic::new(),
             ctx,
             timeouts: Arc::new(arc_swap::ArcSwap::from_pointee(Timeouts::from_config(
                 &crate::config::ProxyConfig::default().performance,

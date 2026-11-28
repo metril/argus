@@ -102,6 +102,8 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(stats::get_filter_stats))
         .routes(routes!(stats::reset_filter_stats))
         .routes(routes!(stats::get_proxy_stats))
+        .routes(routes!(stats::get_traffic))
+        .routes(routes!(stats::reset_traffic))
         .routes(routes!(stats::get_recent_blocked))
         .routes(routes!(stats::get_timeseries))
         .routes(routes!(stats::get_request_log))
