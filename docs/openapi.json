@@ -2915,12 +2915,29 @@
         ],
         "type": "object"
       },
+      "ExtSiteRule": {
+        "description": "One custom rule scoped to a site.",
+        "properties": {
+          "exclusive": {
+            "description": "True when the rule is scoped to this site only (not shared with other domains).",
+            "type": "boolean"
+          },
+          "rule": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule",
+          "exclusive"
+        ],
+        "type": "object"
+      },
       "ExtSiteRules": {
-        "description": "The custom rules that mention a site.",
+        "description": "The custom rules scoped to a site.",
         "properties": {
           "rules": {
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/ExtSiteRule"
             },
             "type": "array"
           },
@@ -13489,7 +13506,7 @@
             ]
           }
         ],
-        "summary": "The custom rules that mention a site (as a host or one of its subdomains, in the rule or in\n`$domain=`), for resetting that site's rules.",
+        "summary": "The custom rules scoped to a site (cosmetic domain list, `$domain=` or host anchor), each\nmarked `exclusive` when scoped to that site only, for resetting that site's rules.",
         "tags": [
           "ext"
         ]
@@ -13573,7 +13590,7 @@
             ]
           }
         ],
-        "summary": "Add or remove one line of the custom rules and rebuild the engine. The line is validated with\nthe rule parser: one network rule only (no comments, includes, preprocessor lines, cosmetic,\nscriptlet or response-rewriting rules), at most 2 KB.",
+        "summary": "Add or remove one line of the custom rules and rebuild the engine. The line is validated with\nthe rule parser: one network rule or plain element-hiding rule (no comments, includes, preprocessor lines,\nprocedural, scriptlet or response-rewriting rules), at most 2 KB (1 KB for hiding rules).",
         "tags": [
           "ext"
         ]

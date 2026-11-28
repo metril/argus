@@ -147,4 +147,4 @@ export const fetchExtLog = (s: Settings, sid: string, since: number) =>
 export const postExtRule = (s: Settings, op: 'add' | 'remove', rule: string) =>
   call<{ rule_count: number; changed: boolean }>(s, 'POST', '/ext/rules', undefined, { body: { op, rule } });
 export const fetchSiteRules = (s: Settings, site: string) =>
-  call<{ site: string; rules: string[] }>(s, 'GET', `/ext/rules?site=${encodeURIComponent(site)}`);
+  call<{ site: string; rules: { rule: string; exclusive: boolean }[] }>(s, 'GET', `/ext/rules?site=${encodeURIComponent(site)}`);
