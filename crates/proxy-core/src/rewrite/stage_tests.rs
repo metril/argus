@@ -287,6 +287,70 @@ fn removal_replacement_and_extra_injections() {
     }
 }
 
+/// A meta policy whose quotes are character references (what Cloudflare's challenge page sends):
+/// the adapter must see the decoded policy and its answer must be encoded back, not mangled.
+#[test]
+fn meta_csp_with_character_references_is_decoded_and_encoded() {
+    let p = HtmlPlan {
+        element_filters: vec![],
+        head_html: String::new(),
+        injections: vec![],
+        remove_selectors: vec![],
+        replacements: vec![],
+        meta_csp: Some(Arc::new(|c: &str| {
+            assert_eq!(c, "default-src 'none'; script-src 'nonce-x' a&b");
+            Some(format!("{c}; connect-src 'self'"))
+        })),
+        policy: None,
+    };
+    let input = "<html><head><meta http-equiv=\"content-security-policy\" content=\"default-src &#39;none&#39;; script-src &#39;nonce-x&#39; a&amp;b\"></head><body></body></html>";
+    let out = String::from_utf8(run_chunked(
+        &p,
+        encoding_rs::UTF_8,
+        false,
+        0,
+        input.as_bytes(),
+        &[usize::MAX],
+    ))
+    .unwrap();
+    assert!(
+        out.contains(
+            "content=\"default-src 'none'; script-src 'nonce-x' a&amp;b; connect-src 'self'\""
+        ),
+        "{out}"
+    );
+}
+
+/// A policy whose `http-equiv` is itself written with references is still a policy, and a
+/// breakout attempt in its value stays inside the attribute.
+#[test]
+fn meta_csp_encoded_http_equiv_and_breakout_stay_inert() {
+    let p = HtmlPlan {
+        element_filters: vec![],
+        head_html: String::new(),
+        injections: vec![],
+        remove_selectors: vec![],
+        replacements: vec![],
+        meta_csp: Some(Arc::new(|c: &str| Some(format!("{c} x")))),
+        policy: None,
+    };
+    let input = "<html><head><meta http-equiv=\"content-security-p&#111;licy\" content=\"a &quot;&gt;&lt;script&gt;bad()&lt;/script&gt;\"></head><body></body></html>";
+    let out = String::from_utf8(run_chunked(
+        &p,
+        encoding_rs::UTF_8,
+        false,
+        0,
+        input.as_bytes(),
+        &[usize::MAX],
+    ))
+    .unwrap();
+    assert!(
+        out.contains("content=\"a &quot;><script>bad()</script> x\""),
+        "{out}"
+    );
+    assert_eq!(out.matches("<script>").count(), 1, "{out}");
+}
+
 #[test]
 fn sniff_table() {
     let yes: &[&[u8]] = &[
