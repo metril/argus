@@ -989,3 +989,21 @@ fn a_changed_record_names_the_rule_of_each_attribute() {
         ]
     );
 }
+
+#[test]
+fn a_push_refused_by_the_setting_does_not_mark_the_ring_used() {
+    let log = CookieLog::default();
+    log.open(1);
+    let flag = AtomicBool::new(false);
+    let obs = vec![Observed {
+        name: "late".into(),
+        attrs: Attrs::default(),
+        effect: Effect::Set,
+        changes: vec![],
+        rule: None,
+        list_id: None,
+    }];
+    log.push(&flag, 1, &cx(), obs);
+    assert!(!log.sessions.get(&1).unwrap().used.load(Ordering::Relaxed));
+    assert!(log.is_empty());
+}

@@ -283,3 +283,68 @@ e2e_test!(
             .is_empty());
     }
 );
+
+const CHALLENGE_BODY: &str = "<html><body>Just a moment... CHALLENGE-BODY</body></html>";
+
+e2e_test!(
+    a_challenge_pages_set_cookie_is_recorded_while_the_body_passes_through,
+    rules = RULES,
+    explicit_only,
+    |env| {
+        let api = env.proxy.api().await;
+        let hub = env.proxy.ctx.internal().gm.ext().clone();
+        let (id, sid, _rx) = hub.open(ExtIdent {
+            token_id: api.token_id.clone(),
+            user: "u".into(),
+            profiles: None,
+        });
+        let bound = ext_client(&env, &sid).await;
+        env.proxy.ctx.set_cookie_provenance(true);
+        env.origin.route(
+            "/chl",
+            MockResponse::new(403, CHALLENGE_BODY)
+                .header("content-type", "text/html; charset=UTF-8")
+                .header("cf-mitigated", "challenge")
+                .header(
+                    "set-cookie",
+                    &format!("cf_clearance={V1}; Path=/; Secure; HttpOnly; SameSite=None"),
+                )
+                .header("set-cookie", &format!("_gid={V2}; Path=/; Max-Age=86400")),
+        );
+        let r = bound
+            .request(
+                reqwest::Method::GET,
+                &env.origin.https_url("cookies.test", "/chl"),
+            )
+            .header("sec-fetch-dest", "document")
+            .send()
+            .await
+            .expect("response");
+        assert_eq!(r.status().as_u16(), 403);
+        let set: Vec<String> = r
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        // The header-level `$cookie` rule still applies on a challenge response.
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert!(set[0].starts_with("cf_clearance="));
+        // The body is untouched.
+        assert_eq!(r.text().await.unwrap(), CHALLENGE_BODY);
+        let (v, text) = read(&api, &sid, "").await;
+        for s in SECRETS {
+            assert!(!text.contains(s), "{s}\n{text}");
+        }
+        let got = names(&v);
+        assert!(
+            got.contains(&("cf_clearance".to_string(), "set".to_string())),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&("_gid".to_string(), "stripped".to_string())),
+            "{got:?}"
+        );
+        hub.close(id);
+    }
+);

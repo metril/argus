@@ -611,7 +611,7 @@ impl CookieLog {
         let host = truncate(&cx.host.to_ascii_lowercase(), HOST_CAP).to_string();
         let path = truncate(cx.path, PATH_CAP).to_string();
         let page_host = truncate(&cx.page_host.to_ascii_lowercase(), HOST_CAP).to_string();
-        let first = !sess.used.swap(true, Ordering::Relaxed);
+        let first;
         {
             let mut r = sess.ring.lock().unwrap_or_else(|p| p.into_inner());
             // Re-checked under the lock: a switch-off that already emptied this ring cannot be
@@ -619,6 +619,7 @@ impl CookieLog {
             if !on.load(Ordering::Relaxed) {
                 return;
             }
+            first = !sess.used.swap(true, Ordering::Relaxed);
             for o in obs {
                 let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
                 let rec = Stored {
