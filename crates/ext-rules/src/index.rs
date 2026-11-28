@@ -8,6 +8,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 
 use filter_engine::formats::ExtRule;
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,12 @@ pub struct KindStats {
     pub rejected_unsafe_style: usize,
     /// Switched off by a `$badfilter` rule.
     pub badfiltered: usize,
+    /// Parsed and matchable, but nothing in the proxy applies the verdict yet (not in `active`).
+    #[serde(default)]
+    pub not_enforced: usize,
+    /// Meaningless for a proxy (`$popunder`).
+    #[serde(default)]
+    pub not_applicable: usize,
 }
 
 /// One rule that could not be used.
@@ -80,6 +87,10 @@ pub enum RuleState {
     Badfiltered,
     /// A `$badfilter` rule itself (no effect of its own).
     Badfilter,
+    /// Parsed and matched by this index, but the proxy has no hook that applies the verdict yet.
+    NotEnforced(String),
+    /// Well-formed but meaningless for a proxy (not an error).
+    NotApplicable(String),
 }
 
 impl RuleState {
@@ -92,11 +103,16 @@ impl RuleState {
             Self::Invalid(_) => "invalid",
             Self::Badfiltered => "badfiltered",
             Self::Badfilter => "badfilter",
+            Self::NotEnforced(_) => "not_enforced",
+            Self::NotApplicable(_) => "not_applicable",
         }
     }
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Unsupported(r) | Self::Invalid(r) => Some(r),
+            Self::Unsupported(r)
+            | Self::Invalid(r)
+            | Self::NotEnforced(r)
+            | Self::NotApplicable(r) => Some(r),
             _ => None,
         }
     }
@@ -137,6 +153,31 @@ fn needs_trust(r: &ParsedRule) -> bool {
                 | Action::UrlTransform(_)
                 | Action::Inject(Injection::Script(_) | Injection::Snippet(_))
         )
+}
+
+/// Why a parsed rule is matched here but not yet applied by the proxy (`None`: enforced). One
+/// place to flip when the proxy hook for a feature lands.
+fn not_enforced(r: &ParsedRule) -> Option<&'static str> {
+    let mask = r.target_mask();
+    if mask & target::URLSKIP != 0 {
+        return Some("urlskip is matched (ExtIndex::urlskip_target) but the proxy does not redirect navigations yet");
+    }
+    if mask & target::REDIRECT != 0 {
+        return Some("redirect is matched (RequestDecision::redirect) but the proxy does not serve redirect resources for extended rules yet");
+    }
+    if r.net.as_ref().is_some_and(|n| n.ip.is_some()) {
+        return Some("ipaddress is matched (ExtIndex::ip_decision) but the proxy does not check the resolved upstream address yet");
+    }
+    if r.net.as_ref().is_some_and(|n| n.cname) {
+        return Some("cname is matched (ExtIndex::cname_decision) but the proxy does not resolve CNAME chains for extended rules yet");
+    }
+    if r.exception && mask & target::GENERICBLOCK != 0 {
+        return Some("$genericblock has no effect yet; the main engine's generic network rules are not switched off");
+    }
+    if r.exception && mask & target::GENERICHIDE != 0 {
+        return Some("$generichide: only extended generic cosmetics are suppressed; the main engine's generic hiding is not affected yet");
+    }
+    None
 }
 
 #[derive(Default)]
@@ -217,6 +258,10 @@ struct Ctx<'a> {
     method: &'a str,
     popup: bool,
     third: Cell<Option<bool>>,
+    /// Resolved upstream address, when the caller knows it (`$ipaddress`).
+    ip: Option<IpAddr>,
+    /// Evaluating a CNAME-uncloaked request: only `$cname` rules apply (and only then).
+    cname: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -238,6 +283,8 @@ impl<'a> Ctx<'a> {
             method: r.method,
             popup: r.opened_as_popup,
             third: Cell::new(r.third_party),
+            ip: None,
+            cname: false,
         })
     }
 
@@ -261,6 +308,10 @@ impl<'a> Ctx<'a> {
 
     fn matches(&self, n: &NetMatch) -> bool {
         n.types & self.rt != 0
+            && n.cname == self.cname
+            && n.ip
+                .as_ref()
+                .is_none_or(|c| self.ip.is_some_and(|ip| c.matches(ip)))
             && (!n.popup || self.popup)
             && n.method_ok(self.method)
             && n.pat.matches(self.url, self.hr)
@@ -270,8 +321,19 @@ impl<'a> Ctx<'a> {
                 Party::Any => true,
                 Party::Third => self.third_party(),
                 Party::First => !self.third_party(),
+                Party::StrictFirst => self.host == self.src_host,
+                Party::StrictThird => self.has_source && self.host != self.src_host,
             }
     }
+}
+
+/// Verdict of [`ExtIndex::cname_decision`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CnameDecision {
+    /// A `$cname` blocking rule applies to the uncloaked request.
+    pub block: Option<RuleId>,
+    /// An `@@...$cname` exception covers the uncloaked request.
+    pub exempt: Option<RuleId>,
 }
 
 /// Immutable, shareable index of extended rules.
@@ -281,6 +343,9 @@ pub struct ExtIndex {
     resp: NetIdx,
     dom: DomIdx,
     present: u32,
+    /// Active rules with an `$ipaddress` / `$cname` condition.
+    ip_rules: usize,
+    cname_rules: usize,
     needs_req_headers: bool,
     stats: ExtStats,
     /// Fate of every input rule, in input order.
@@ -320,6 +385,10 @@ impl ExtIndex {
                         p.trusted = true;
                     }
                     parsed.push((ri, p));
+                }
+                Err(RuleError::NotApplicable(why)) => {
+                    k.not_applicable += 1;
+                    states[ri] = RuleState::NotApplicable(why);
                 }
                 Err(e) => {
                     let unsupported = matches!(e, RuleError::Unsupported(_));
@@ -361,6 +430,8 @@ impl ExtIndex {
             resp: NetIdx::default(),
             dom: DomIdx::default(),
             present: 0,
+            ip_rules: 0,
+            cname_rules: 0,
             needs_req_headers: false,
             stats: ExtStats::default(),
             states: Vec::new(),
@@ -388,7 +459,12 @@ impl ExtIndex {
                 states[ri] = RuleState::DroppedUntrusted;
                 continue;
             }
-            k.active += 1;
+            if let Some(why) = not_enforced(&p) {
+                k.not_enforced += 1;
+                states[ri] = RuleState::NotEnforced(why.to_string());
+            } else {
+                k.active += 1;
+            }
             let mut p = p;
             if let Action::Cookie(c) = &mut p.action {
                 c.trusted = p.trusted;
@@ -404,6 +480,8 @@ impl ExtIndex {
         let id = self.rules.len() as u32;
         self.present |= p.target_mask();
         if let Some(n) = &p.net {
+            self.ip_rules += n.ip.is_some() as usize;
+            self.cname_rules += n.cname as usize;
             if p.stage & crate::parse::STAGE_REQ != 0 {
                 self.req.add(id, n);
                 if matches!(p.action, Action::Cookie(_))
@@ -417,11 +495,11 @@ impl ExtIndex {
             }
         } else if let Some(d) = &p.dom {
             self.dom.len += 1;
-            match d.bucket_keys() {
-                Some(keys) => keys
-                    .into_iter()
-                    .for_each(|k| self.dom.by_dom.entry(k.into()).or_default().push(id)),
-                None => self.dom.generic.push(id),
+            let (keys, generic) = d.bucket_plan();
+            keys.into_iter()
+                .for_each(|k| self.dom.by_dom.entry(k.into()).or_default().push(id));
+            if generic {
+                self.dom.generic.push(id);
             }
         }
         self.rules.push(p);
@@ -481,18 +559,15 @@ impl ExtIndex {
         out
     }
 
-    fn dom_ids(&self, host: &str) -> Vec<u32> {
+    /// Page-scoped rules (cosmetics, scriptlets, HTML filters) that apply to the document at
+    /// `host` with `pq` as its path plus query.
+    fn dom_ids(&self, host: &str, pq: &str) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         if self.dom.len == 0 {
             return out;
         }
         let mut check = |i: u32| {
-            if self.rules[i as usize]
-                .dom
-                .as_ref()
-                .is_some_and(|d| d.matches(host))
-                && !out.contains(&i)
-            {
+            if self.rules[i as usize].applies_to_page(host, pq) && !out.contains(&i) {
                 out.push(i)
             }
         };
@@ -560,7 +635,8 @@ impl ExtIndex {
                 | target::URLTRANSFORM
                 | target::COOKIE
                 | target::REMOVEHEADER
-                | target::REMOVEPARAM,
+                | target::REMOVEPARAM
+                | target::REDIRECT,
         );
         let mut cur: Cow<'_, str> = Cow::Borrowed(req.url);
         // `$removeparam` first (so `$urltransform` sees the cleaned URL); all rules in one pass.
@@ -585,6 +661,17 @@ impl ExtIndex {
             match &self.rules[id as usize].action {
                 Action::Block => {
                     d.block.get_or_insert(id);
+                }
+                Action::Redirect {
+                    resource,
+                    rule_only,
+                } => {
+                    let slot = if *rule_only {
+                        &mut d.redirect_rule
+                    } else {
+                        &mut d.redirect
+                    };
+                    slot.get_or_insert((resource.clone(), id));
                 }
                 Action::UrlTransform(spec) => {
                     if let Some(n) = transform_url(&cur, spec) {
@@ -621,6 +708,68 @@ impl ExtIndex {
             }
         }
         d
+    }
+
+    /// Destination of a `$urlskip=` redirector URL for a navigation `req`: the extracted URL and
+    /// the rule. `None` when no live rule matches or every matching rule's steps fail. The caller
+    /// performs the navigation redirect. `blocked` says another rule blocks the request (only
+    /// `-blocked` rules then apply).
+    pub fn urlskip_target(&self, req: &RequestInfo<'_>, blocked: bool) -> Option<(String, RuleId)> {
+        if self.present & target::URLSKIP == 0 {
+            return None;
+        }
+        let ctx = Ctx::new(req)?;
+        let ids = self.net_ids(&self.req, &ctx);
+        self.survivors(&ids, target::URLSKIP)
+            .into_iter()
+            .find_map(|id| match &self.rules[id as usize].action {
+                Action::UrlSkip(u) if !blocked || u.allow_blocked => {
+                    u.apply(req.url).map(|t| (t, id))
+                }
+                _ => None,
+            })
+    }
+
+    /// `$ipaddress=` verdict once the upstream address of `req` is known: the blocking rule, if
+    /// a live rule with an address condition matches `ip` and no exception covers it.
+    pub fn ip_decision(&self, req: &RequestInfo<'_>, ip: IpAddr) -> Option<RuleId> {
+        if self.ip_rules == 0 {
+            return None;
+        }
+        let mut ctx = Ctx::new(req)?;
+        ctx.ip = Some(ip);
+        let ids = self.net_ids(&self.req, &ctx);
+        self.survivors(&ids, target::BLOCK).into_iter().find(|&i| {
+            let r = &self.rules[i as usize];
+            matches!(r.action, Action::Block) && r.net.as_ref().is_some_and(|n| n.ip.is_some())
+        })
+    }
+
+    /// `$cname` verdict for a request whose host CNAME-resolves to `cname_host`: the pattern is
+    /// matched against `req.url` with its host replaced. `block` is a live `$cname` blocking rule;
+    /// `exempt` an `@@...$cname` exception that matched (it bypasses blocking of uncloaked
+    /// requests, including the network engine's own).
+    pub fn cname_decision(&self, req: &RequestInfo<'_>, cname_host: &str) -> CnameDecision {
+        let mut out = CnameDecision::default();
+        if self.cname_rules == 0 {
+            return out;
+        }
+        let Some((a, b)) = host_range(req.url) else {
+            return out;
+        };
+        let url = format!("{}{}{}", &req.url[..a], cname_host, &req.url[b..]);
+        let info = RequestInfo { url: &url, ..*req };
+        let Some(mut ctx) = Ctx::new(&info) else {
+            return out;
+        };
+        ctx.cname = true;
+        let ids = self.net_ids(&self.req, &ctx);
+        out.exempt = ids.iter().copied().find(|&i| {
+            let r = &self.rules[i as usize];
+            r.exception && r.value.is_empty() && r.target_mask() & target::BLOCK != 0
+        });
+        out.block = self.survivors(&ids, target::BLOCK).into_iter().next();
+        out
     }
 
     /// What request-side `$removeparam` exceptions matching `req` exempt from the network
@@ -743,13 +892,17 @@ impl ExtIndex {
             .filter(|r| matches!(r.action, Action::Disable { .. }))
             .fold(0, |m, r| m | r.target_mask());
         if is_html {
-            ids.extend(self.dom_ids(&ctx.host));
+            let pq = crate::util::path_and_query(ctx.url);
+            ids.extend(self.dom_ids(&ctx.host, &pq));
         }
         if ids.is_empty() {
             return plan;
         }
         let mime = mime_raw.to_ascii_lowercase();
-        let live = self.survivors(&ids, target::ALL);
+        let mut live = self.survivors(&ids, target::ALL);
+        if plan.disabled & target::GENERICHIDE != 0 {
+            live.retain(|&i| !self.rules[i as usize].is_generic_cosmetic());
+        }
         let clen = resp.content_length();
         let mut set_cookies: Vec<&CookieSpec> = Vec::new();
         let (mut perm_restrict, mut perm_trusted): (Vec<&str>, Vec<&str>) =
@@ -911,16 +1064,17 @@ impl ExtIndex {
     /// Test hook: cosmetic-rule ids matching a page host, indexed or by scan.
     #[doc(hidden)]
     pub fn debug_dom_matches(&self, host: &str, indexed: bool) -> Vec<RuleId> {
+        self.debug_dom_matches_at(host, "/", indexed)
+    }
+
+    /// Like [`Self::debug_dom_matches`] for a document whose path plus query is `pq`.
+    #[doc(hidden)]
+    pub fn debug_dom_matches_at(&self, host: &str, pq: &str, indexed: bool) -> Vec<RuleId> {
         if indexed {
-            return self.dom_ids(host);
+            return self.dom_ids(host, pq);
         }
         (0..self.rules.len() as u32)
-            .filter(|&i| {
-                self.rules[i as usize]
-                    .dom
-                    .as_ref()
-                    .is_some_and(|d| d.matches(host))
-            })
+            .filter(|&i| self.rules[i as usize].applies_to_page(host, pq))
             .collect()
     }
 }

@@ -631,6 +631,8 @@ fn ext_stats_dto(s: &ext_rules::ExtStats) -> api_types::ExtStatsDto {
                         unsupported: v.unsupported,
                         parse_errors: v.parse_errors,
                         badfiltered: v.badfiltered,
+                        not_enforced: v.not_enforced,
+                        not_applicable: v.not_applicable,
                     },
                 )
             })

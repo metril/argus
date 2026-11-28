@@ -2656,6 +2656,16 @@
             "minimum": 0,
             "type": "integer"
           },
+          "not_applicable": {
+            "description": "Meaningless for a proxy (`$popunder`).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "not_enforced": {
+            "description": "Matched by the index but not yet applied by the proxy (not counted in `active`).",
+            "minimum": 0,
+            "type": "integer"
+          },
           "parse_errors": {
             "minimum": 0,
             "type": "integer"

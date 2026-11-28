@@ -72,11 +72,18 @@ fn valid_domain_part(s: &str) -> bool {
 /// Index of the unescaped `/` closing the regex that opens at `s[start]`, honouring `\` escapes
 /// and `[...]` classes.
 fn regex_end(s: &[u8], start: usize) -> Option<usize> {
+    regex_end_stop(s, start, false)
+}
+
+/// Like [`regex_end`]; with `stop_at_bracket` an unescaped `]` outside a class ends the search
+/// (a regex inside a `[$…]` prefix cannot run past the prefix).
+fn regex_end_stop(s: &[u8], start: usize, stop_at_bracket: bool) -> Option<usize> {
     let (mut i, mut class) = (start + 1, false);
     while i < s.len() {
         match s[i] {
             b'\\' => i += 1,
             b'[' => class = true,
+            b']' if !class && stop_at_bracket => return None,
             b']' => class = false,
             b'/' if !class => return Some(i),
             _ => {}
@@ -86,17 +93,82 @@ fn regex_end(s: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// Regex flags accepted after a closing `/`.
+const REGEX_FLAGS: &[u8] = b"gimsuyd";
+
 /// End of a `/regex/` that opens at `s[i]` and is followed by one of `terms` (or the end);
 /// with `flags`, regex flags (`i`, `gi`, ...) may sit between the closing `/` and the terminator.
 fn regex_unit(s: &[u8], i: usize, terms: &[u8], flags: bool) -> Option<usize> {
-    let e = regex_end(s, i)?;
+    regex_unit_stop(s, i, terms, flags, false)
+}
+
+fn regex_unit_stop(
+    s: &[u8],
+    i: usize,
+    terms: &[u8],
+    flags: bool,
+    stop_at_bracket: bool,
+) -> Option<usize> {
+    let e = regex_end_stop(s, i, stop_at_bracket)?;
     let mut j = e + 1;
     if flags {
-        while s.get(j).is_some_and(u8::is_ascii_alphabetic) {
+        // Only real regex flags: `/a|b/` followed by `Anunci…` must not read as flags.
+        while s.get(j).is_some_and(|c| REGEX_FLAGS.contains(c)) {
             j += 1;
         }
     }
     s.get(j).is_none_or(|c| terms.contains(c)).then_some(e)
+}
+
+/// End (index of the last byte) of a `replace=/re/replacement/flags` style value opening at
+/// `b[i]`, when the token starting at `start` is one of the substitution options and the value
+/// ends the token. The three parts may hold `,` and `$`; `\` escapes and `[...]` classes (in the
+/// regex part) are honoured.
+fn substitution_end(b: &[u8], start: usize, i: usize, sep: u8) -> Option<usize> {
+    if sep != b',' || i == start {
+        return None;
+    }
+    let quoted = b[i - 1] == b'\'';
+    let name_end = if quoted { i - 2 } else { i - 1 };
+    let name = std::str::from_utf8(b.get(start..name_end)?).ok()?;
+    if !["replace", "urltransform", "uritransform"]
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
+        return None;
+    }
+    if quoted {
+        // `replace='/re/sub/flags'`: the closing quote ends the token; it follows the closing
+        // `/` or its flags and is followed by `,` or the end (a `'` inside the code is not one).
+        return (i + 1..b.len()).find(|&q| {
+            if b[q] != b'\'' || b.get(q + 1).is_some_and(|&c| c != b',') {
+                return false;
+            }
+            let mut k = q;
+            while k > i && b[k - 1].is_ascii_alphabetic() {
+                k -= 1;
+            }
+            k > i + 1 && b[k - 1] == b'/'
+        });
+    }
+    let e1 = regex_end(b, i)?;
+    let mut e2 = e1 + 1;
+    while e2 < b.len() {
+        match b[e2] {
+            b'\\' => e2 += 1,
+            b'/' => break,
+            _ => {}
+        }
+        e2 += 1;
+    }
+    if e2 >= b.len() {
+        return None;
+    }
+    let mut j = e2 + 1;
+    while b.get(j).is_some_and(|c| REGEX_FLAGS.contains(c)) {
+        j += 1;
+    }
+    b.get(j).is_none_or(|&c| c == b',').then_some(j - 1)
 }
 
 /// Iterator over `s` split on `sep` (`,` or `|`), keeping `/regex/flags` values whole. A regex
@@ -131,8 +203,13 @@ impl<'a> Iterator for Tokens<'a> {
         while i < b.len() {
             match b[i] {
                 b'\\' => i += 1,
-                b'/' if i == start || matches!(b[i - 1], b'=' | b':' | b'|') => {
-                    if let Some(e) = regex_unit(b, i, b",|", true) {
+                b'/' if i == start
+                    || matches!(b[i - 1], b'=' | b':' | b'|')
+                    || (b[i - 1] == b'\'' && i >= 2 && b[i - 2] == b'=') =>
+                {
+                    if let Some(e) = substitution_end(b, start, i, self.sep) {
+                        i = e;
+                    } else if let Some(e) = regex_unit(b, i, b",| ", true) {
                         i = e;
                     }
                 }
@@ -215,7 +292,7 @@ fn bracket_prefix(line: &str) -> Option<(Vec<&str>, usize)> {
         match b[i] {
             b'\\' => i += 1,
             b'/' if matches!(b[i - 1], b'=' | b'|') => {
-                if let Some(e) = regex_unit(b, i, b",]|", true) {
+                if let Some(e) = regex_unit_stop(b, i, b",]|", true, true) {
                     i = e;
                 }
             }
@@ -1197,6 +1274,131 @@ mod tests {
             split_option_tokens(r"removeparam=/^x{1,2}$/,xhr,domain=a.com|/b,c/"),
             vec![r"removeparam=/^x{1,2}$/", "xhr", "domain=a.com|/b,c/"]
         );
+    }
+
+    #[test]
+    fn substitution_values_stay_one_token() {
+        let rows: &[(&str, &[&str])] = &[
+            // Quantifier comma, then another option.
+            (
+                r"replace=/a{9,11}/x/gi,script",
+                &[r"replace=/a{9,11}/x/gi", "script"],
+            ),
+            // Replacement part with `,` and `$`.
+            (
+                r"replace=/(a)/$1,b$2/,important",
+                &[r"replace=/(a)/$1,b$2/", "important"],
+            ),
+            // Escaped `/` in each part.
+            (
+                r"replace=/a\/b{1,2}/c\/d,e/s,domain=x.com",
+                &[r"replace=/a\/b{1,2}/c\/d,e/s", "domain=x.com"],
+            ),
+            // `/` inside a class of the regex part.
+            (
+                r"replace=/[/,]{2,3}/-/,xhr",
+                &[r"replace=/[/,]{2,3}/-/", "xhr"],
+            ),
+            (
+                r"urltransform=/\/p{1,3}/\/q/,1p",
+                &[r"urltransform=/\/p{1,3}/\/q/", "1p"],
+            ),
+            // uBO quotes values that hold commas; `'` inside the code is not the closing quote.
+            (
+                r"script,replace='/^/<script>f({a:1,b:'x','y'})</script>/',xhr",
+                &[
+                    "script",
+                    r"replace='/^/<script>f({a:1,b:'x','y'})</script>/'",
+                    "xhr",
+                ],
+            ),
+            // A regex followed by more steps (`urlskip=/re/ -base64`) is one value.
+            (
+                r"urlskip=/\/p{0,2}\/([^/?#]+)/ -uricomponent +https,doc",
+                &[r"urlskip=/\/p{0,2}\/([^/?#]+)/ -uricomponent +https", "doc"],
+            ),
+            // Not a substitution: plain split.
+            ("replace,script", &["replace", "script"]),
+            // Following option after the flags, and a trailing one.
+            (r"script,replace=/x/y/i", &["script", r"replace=/x/y/i"]),
+        ];
+        for (inp, want) in rows {
+            assert_eq!(&split_option_tokens(inp), want, "{inp}");
+        }
+        // `$` in the replacement does not move the option separator.
+        let (pat, opts) = split_options(r"||a.com^$replace=/x{1,2}/$1y/,script");
+        assert_eq!(
+            (pat, opts),
+            ("||a.com^", Some(r"replace=/x{1,2}/$1y/,script"))
+        );
+    }
+
+    #[test]
+    fn real_startpage_rules_are_cosmetic() {
+        let l = r#"[$path=/search]startpage.com#?##main > div[class^="css-"]:has(> div[class^="css-"] > p[class^="css-"]:contains(/Annoncer|Anzeigen|Ads|Anuncios|Publicités|Advertenties|Annonser|Reklamy|Anúncios/))"#;
+        let c = split_cosmetic(l).unwrap();
+        assert_eq!(
+            (c.sep, c.domains, c.prefix),
+            ("#?#", "startpage.com", "[$path=/search]")
+        );
+        assert!(c.body.starts_with("#main > div"));
+    }
+
+    #[test]
+    fn prefix_regex_never_runs_past_the_bracket() {
+        // The selector's own `/i|y/` must not be taken for the end of the path regex.
+        let c = split_cosmetic("[$path=/x]a.com##div:has-text(/i|y/)").unwrap();
+        assert_eq!(
+            (c.sep, c.domains, c.body, c.modifiers.clone()),
+            ("##", "a.com", "div:has-text(/i|y/)", vec!["path=/x"])
+        );
+        let c = split_cosmetic("[$path=/y]a.com##div:has-text(/i,y/)").unwrap();
+        assert_eq!(c.body, "div:has-text(/i,y/)");
+        // A `]` inside a character class of the path regex is fine.
+        let c = split_cosmetic("[$path=/[a-z]+/]x.com##y").unwrap();
+        assert_eq!(
+            (c.modifiers.clone(), c.domains, c.body),
+            (vec!["path=/[a-z]+/"], "x.com", "y")
+        );
+        let c = split_cosmetic(r"[$path=/[\]/]+/,domain=a.com]##y");
+        assert!(c.is_some());
+    }
+
+    #[test]
+    fn every_cosmetic_separator_after_a_prefix() {
+        let bodies = [
+            ("##", ".ad"),
+            ("#@#", ".ad"),
+            ("#?#", "#main > div:has(> p:contains(/Ads|Anzeigen/))"),
+            ("#@?#", "div:has-text(/a|b/)"),
+            ("#$#", "body { display: block !important; }"),
+            ("#@$#", "body { display: block !important; }"),
+            ("#$?#", "div:has(a) { display: none !important; }"),
+            ("#%#", "//scriptlet('abort-on-property-read', 'x')"),
+            ("#@%#", "//scriptlet('abort-on-property-read', 'x')"),
+            ("##", "^script:has-text(/a|b/)"),
+            ("##", "+js(set, a/b, c)"),
+        ];
+        let prefixes = [
+            "[$path=/search]",
+            "[$path=/a/b/,domain=/x\\d+\\.com$/]",
+            "[$domain=a.com|b.com]",
+            "[$path]",
+        ];
+        let domains = ["", "startpage.com", "a.com,~b.a.com", r"/^w\.x\.com$/"];
+        for pre in prefixes {
+            for d in domains {
+                for (sep, body) in bodies {
+                    let line = format!("{pre}{d}{sep}{body}");
+                    let c = split_cosmetic(&line).unwrap_or_else(|| panic!("{line}"));
+                    assert_eq!(
+                        (c.sep, c.body, c.domains, c.prefix),
+                        (sep, body, d, pre),
+                        "{line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
