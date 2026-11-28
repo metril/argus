@@ -50,12 +50,7 @@ impl AppState {
                 return crate::daily::category_index(&e.category);
             }
         }
-        filter_engine::catalogue()
-            .iter()
-            .find(|e| e.id == id)
-            .map_or(crate::daily::OTHER, |e| {
-                crate::daily::category_index(e.category)
-            })
+        crate::daily::OTHER
     }
 
     /// Attribute the blocks tallied since the last call to categories: by the catalogue category
