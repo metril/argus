@@ -252,15 +252,18 @@ async function runFirefox() {
     } catch (e) { log('net recorder unavailable:', e.message.split('\n')[0]); }
     const results = [];
     for (const s of sites) {
-      results.push(await measure(s, async () => {
+      let shim = null;
+      const res = await measure(s, async () => {
         await driver.get(s.url);
         const r = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${extractorSource(s)}.then(cb, (e) => cb({ __error: String(e) }));`);
         if (r?.__error) throw new Error(r.__error);
-        if (blocker === 'ubo') await logShimStats(driver, s.id);
+        if (blocker === 'ubo') shim = await logShimStats(driver, s.id);
         tagNetwork(r, await driver.executeScript('return window.__argusNet || []').catch(() => []));
         r.control = await driver.executeAsyncScript(`const cb = arguments[arguments.length - 1]; ${CONTROL}.then(cb, () => cb(false));`).catch(() => false);
         return r;
-      }));
+      });
+      const why = s.fetchProbe && res.ok && shim && shimAmbiguous(shim);
+      results.push(why ? { ...res, ok: false, error: why, score: { passed: 0, total: 0, percent: 0 }, categories: {}, tests: [], meta: {} } : res);
     }
     return { ua, ready, extVersion, results };
   } finally {
@@ -318,12 +321,22 @@ const UBO_FF_FETCH_SHIM = `() => {
   };
 }`;
 // Logs what the shim decided on the current page (distribution of opaque-answer times, probe verdicts).
+// Ambiguous = nearly every probe errored yet almost none were converted (the errors came with Resource Timing
+// entries, e.g. uBO redirecting to a neutered resource), so the shim cannot tell blocked from reached.
+const SHIM_AMBIGUOUS_MIN_OPAQUE = 20;
+const SHIM_AMBIGUOUS_MIN_ERROR_RATIO = 0.8;
+const SHIM_AMBIGUOUS_MAX_CONVERTED_RATIO = 0.1; // of the probe errors
+function shimAmbiguous({ opaque, errors, converted }) {
+  if (opaque < SHIM_AMBIGUOUS_MIN_OPAQUE || errors < SHIM_AMBIGUOUS_MIN_ERROR_RATIO * opaque || converted >= SHIM_AMBIGUOUS_MAX_CONVERTED_RATIO * errors) return null;
+  return `not measurable: uBO/Firefox probe ambiguous (${errors} probe errors with resource-timing entries)`;
+}
 async function logShimStats(driver, site) {
   const d = await driver.executeScript('return window.__argusShimLog || []').catch(() => []);
-  if (!d.length) return;
+  if (!d.length) return null;
   const ms = d.map((x) => x.ms).sort((a, b) => a - b);
   const q = (f) => ms[Math.min(ms.length - 1, Math.floor(f * ms.length))];
   log(site, `uBO shim: ${d.length} opaque, ${d.filter((x) => x.blocked).length} converted to blocked, probe error/load/timeout ${['error', 'load', 'timeout'].map((k) => d.filter((x) => x.probe === k).length).join('/')}, calibration ${d[0].cal ? 'ok' : 'FAILED (timing fallback)'}, ms p50/p90/max ${q(0.5)}/${q(0.9)}/${ms[ms.length - 1]}`);
+  return { opaque: d.length, errors: d.filter((x) => x.probe === 'error').length, converted: d.filter((x) => x.blocked).length };
 }
 
 // Each site runs PARITY_PASSES times (default 2). A run is valid only if the unblocked control host was
