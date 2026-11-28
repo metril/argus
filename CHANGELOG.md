@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.11.0 — 2026-11-27
+
 - Extension logger page (popup button "Open logger"): the requests of a tab with time, status, URL, type, rule and list; tab selector, search, filters (first/third party, blocked, allowed, redirected/modified, your rules, type), pause, clear and copy as text; recent history per tab is kept in `storage.session`. A row opens "create rule": block or unblock, this site or everywhere, exact URL, path prefix or whole host, third-party only, important, with the rule text editable before saving.
 - New `GET /ext/log?since=` (scope `logs:read`, `X-Argus-Session`): the extension session's own requests with full URL, outcome, matched rule and list; bounded ring per session, never another session's. Blocked requests the proxy aborts are now attributed exactly from it; `GET /stats/blocked/recent` stays as the fallback for an older proxy.
 - New scope `rules:ext` (User role, extension tokens): `POST /ext/rules` adds or removes one validated network rule in the custom rules (audited, rebuilds the engine) and `GET /ext/rules?site=` lists the rules that mention a site. It cannot read or replace the custom rules. Extension tokens now also carry `rules:ext`; an older token needs signing in again.
