@@ -20,6 +20,9 @@ const MAX_ENTRIES: usize = 5000;
 
 /// An entry that can be checked after parsing; invalid ones are skipped, not fatal.
 pub trait CatalogueEntry: DeserializeOwned {
+    /// The entry's id (collections refer to it).
+    fn id(&self) -> &str;
+
     fn validate(&self) -> Result<(), String>;
 
     /// The list to install, enabled, on a first run (`default_enabled` filter entries).
@@ -90,6 +93,23 @@ pub struct CatalogueDoc<E> {
     pub schema: u32,
     pub kind: String,
     pub entries: Vec<E>,
+    /// Optional named groups of entries; absent in older documents.
+    #[serde(default, deserialize_with = "null_default")]
+    pub collections: Vec<serde_json::Value>,
+}
+
+/// A named group of catalogue lists (`collections` of `filters.json`), e.g. "Recommended".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Collection {
+    pub id: String,
+    pub name: String,
+    #[serde(default, deserialize_with = "null_default")]
+    pub description: String,
+    /// What turning the collection on may break.
+    #[serde(default)]
+    pub warning: Option<String>,
+    /// Catalogue entry ids.
+    pub lists: Vec<String>,
 }
 
 /// One entry of `filters.json`.
@@ -123,6 +143,10 @@ pub struct FilterCatalogueEntry {
 }
 
 impl CatalogueEntry for FilterCatalogueEntry {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     fn validate(&self) -> Result<(), String> {
         named(&self.id, &self.name, &self.category)?;
         if !https(&self.url) {
@@ -178,6 +202,10 @@ where
 }
 
 impl CatalogueEntry for UserscriptCatalogueEntry {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     fn validate(&self) -> Result<(), String> {
         named(&self.id, &self.name, &self.category)?;
         if !https(&self.install_url) && !test_loopback_http(&self.install_url) {
@@ -214,16 +242,107 @@ pub struct UserscriptCatalogueEntry {
     pub requires: Vec<String>,
 }
 
+/// Where the copy in force came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The signed copy built into the binary.
+    Snapshot,
+    /// The copy cached on the data volume (verified again at start).
+    Cache,
+    /// Fetched from the release in this run.
+    Fetched,
+}
+
 /// A verified document in force.
 #[derive(Debug)]
 pub struct Loaded<E> {
     pub entries: Vec<E>,
+    /// Validated collections: every list id exists in `entries`, none is empty.
+    pub collections: Vec<Collection>,
+    pub origin: Origin,
     /// Release the document came from (`vYYYY.MM.DD[.N]`).
     pub version: String,
-    /// When it was verified (RFC 3339); `None` for the copy embedded in the binary.
+    /// When it was fetched and verified (RFC 3339; the cache file's time after a restart);
+    /// `None` for the copy embedded in the binary.
     pub fetched_at: Option<String>,
     /// The copy embedded in the binary, not one fetched or cached.
     pub embedded: bool,
+}
+
+/// What the subscription is doing: shown in the UI.
+#[derive(Debug, Clone, Default)]
+struct Checks {
+    last_checked: Option<String>,
+    next_check: Option<String>,
+    last_ok: Option<String>,
+    last_error: Option<String>,
+}
+
+/// Snapshot of a subscription for the API.
+#[derive(Debug, Clone)]
+pub struct SignedStatus {
+    /// Where the file is fetched from.
+    pub url: String,
+    /// Release in force, if any copy has loaded.
+    pub version: Option<String>,
+    pub origin: Option<Origin>,
+    pub fetched_at: Option<String>,
+    pub last_checked: Option<String>,
+    pub next_check: Option<String>,
+    pub last_ok: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// What a verified copy holds.
+struct Checked<E> {
+    entries: Vec<E>,
+    collections: Vec<Collection>,
+    version: String,
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Keep the collections that are well formed, drop unknown list ids (warning) and empty ones.
+fn validate_collections(file: &str, raw: Vec<serde_json::Value>, ids: &[&str]) -> Vec<Collection> {
+    let known: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    let mut out: Vec<Collection> = Vec::new();
+    for v in raw {
+        let c: Collection = match serde_json::from_value(v.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+                tracing::warn!("{file}: skipping collection {id:?}: {e}");
+                continue;
+            }
+        };
+        if c.id.trim().is_empty() || c.name.trim().is_empty() {
+            tracing::warn!("{file}: skipping a collection with an empty id or name");
+            continue;
+        }
+        if out.iter().any(|o| o.id == c.id) {
+            tracing::warn!("{file}: skipping duplicate collection {:?}", c.id);
+            continue;
+        }
+        let mut lists: Vec<String> = Vec::new();
+        for l in &c.lists {
+            if !known.contains(l.as_str()) {
+                tracing::warn!(
+                    "{file}: collection {:?} names unknown list {l:?}, dropped",
+                    c.id
+                );
+            } else if !lists.contains(l) {
+                lists.push(l.clone());
+            }
+        }
+        if lists.is_empty() {
+            tracing::warn!("{file}: collection {:?} has no known lists, dropped", c.id);
+            continue;
+        }
+        out.push(Collection { lists, ..c });
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -254,6 +373,7 @@ pub struct SignedDoc<E> {
     /// Newest release ever accepted (outlives the cache file).
     min_version: parking_lot::Mutex<Option<String>>,
     busy: tokio::sync::Mutex<()>,
+    checks: parking_lot::Mutex<Checks>,
 }
 
 impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
@@ -268,6 +388,7 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
             wake: Default::default(),
             min_version: Default::default(),
             busy: tokio::sync::Mutex::new(()),
+            checks: Default::default(),
         })
     }
 
@@ -285,6 +406,23 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
     /// The verified document, if one has loaded.
     pub fn get(&self) -> Option<Arc<Loaded<E>>> {
         self.current.read().clone()
+    }
+
+    /// The subscription's state: source, release in force, and the outcome of the checks.
+    pub fn status(&self) -> SignedStatus {
+        let url = Self::url(&self.cfg(), &self.file());
+        let cur = self.get();
+        let c = self.checks.lock().clone();
+        SignedStatus {
+            url,
+            version: cur.as_ref().map(|d| d.version.clone()),
+            origin: cur.as_ref().map(|d| d.origin),
+            fetched_at: cur.as_ref().and_then(|d| d.fetched_at.clone()),
+            last_checked: c.last_checked,
+            next_check: c.next_check,
+            last_ok: c.last_ok,
+            last_error: c.last_error,
+        }
     }
 
     fn file(&self) -> String {
@@ -332,7 +470,7 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         text: &str,
         sig: &str,
         meta: Option<(&str, &str)>,
-    ) -> Result<(Vec<E>, String), String> {
+    ) -> Result<Checked<E>, String> {
         let file = self.file();
         let key = &cfg.public_key;
         let comment =
@@ -375,7 +513,7 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                 return Err(format!("{file}: release differs from meta.json's"));
             }
         }
-        let entries = doc
+        let entries: Vec<E> = doc
             .entries
             .into_iter()
             .filter_map(|v| {
@@ -392,7 +530,13 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                 }
             })
             .collect();
-        Ok((entries, version))
+        let ids: Vec<&str> = entries.iter().map(|e| e.id()).collect();
+        let collections = validate_collections(&file, doc.collections, &ids);
+        Ok(Checked {
+            entries,
+            collections,
+            version,
+        })
     }
 
     fn floor(&self) -> Option<String> {
@@ -439,8 +583,11 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
             return Ok(());
         }
         let cfg = self.cfg();
-        let (entries, version) =
-            self.check(&cfg, snap.text, snap.sig, Some((snap.meta, snap.meta_sig)))?;
+        let Checked {
+            entries,
+            collections,
+            version,
+        } = self.check(&cfg, snap.text, snap.sig, Some((snap.meta, snap.meta_sig)))?;
         if let Some(f) = self.floor() {
             if version_cmp(&version, &f) == Some(Ordering::Less) {
                 return Err(format!("snapshot {version} is older than {f}"));
@@ -450,6 +597,8 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         self.seed(&entries);
         *self.current.write() = Some(Arc::new(Loaded {
             entries,
+            collections,
+            origin: Origin::Snapshot,
             version,
             fetched_at: None,
             embedded: true,
@@ -488,11 +637,16 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         ) else {
             return;
         };
-        let (Ok(text), Ok(sig)) = (std::fs::read_to_string(tp), std::fs::read_to_string(sp)) else {
+        let (Ok(text), Ok(sig)) = (std::fs::read_to_string(&tp), std::fs::read_to_string(sp))
+        else {
             return;
         };
         match self.check(&cfg, &text, &sig, None) {
-            Ok((entries, version)) => {
+            Ok(Checked {
+                entries,
+                collections,
+                version,
+            }) => {
                 if let Some(f) = self.floor() {
                     if version_cmp(&version, &f) == Some(Ordering::Less) {
                         tracing::warn!(
@@ -504,10 +658,17 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                 }
                 self.raise_floor(&version);
                 self.seed(&entries);
+                // The real fetch time survives a restart: the file was written when it was fetched.
+                let fetched_at = std::fs::metadata(&tp)
+                    .and_then(|m| m.modified())
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+                    .unwrap_or_else(|_| now_rfc3339());
                 *self.current.write() = Some(Arc::new(Loaded {
                     entries,
+                    collections,
+                    origin: Origin::Cache,
                     version,
-                    fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+                    fetched_at: Some(fetched_at),
                     embedded: false,
                 }));
                 *self.installed.lock() = Some((text, sig));
@@ -516,8 +677,29 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         }
     }
 
-    /// Fetch, verify and install the newest copy. Returns the release in force.
+    /// Fetch, verify and install the newest copy. Returns the release in force. The outcome is
+    /// recorded in [`Self::status`]; a failure is logged at warn once per distinct message.
     pub async fn refresh(&self) -> Result<String, String> {
+        let r = self.refresh_inner().await;
+        let now = now_rfc3339();
+        let mut c = self.checks.lock();
+        c.last_checked = Some(now.clone());
+        match &r {
+            Ok(_) => {
+                c.last_ok = Some(now);
+                c.last_error = None;
+            }
+            Err(e) => {
+                if c.last_error.as_deref() != Some(e.as_str()) {
+                    tracing::warn!("{} catalogue: {e}", self.kind);
+                }
+                c.last_error = Some(e.clone());
+            }
+        }
+        r
+    }
+
+    async fn refresh_inner(&self) -> Result<String, String> {
         let svc = self.svc.as_ref().ok_or("no fetcher")?;
         // One check at a time, and the config is read under the lock so a refresh that waited
         // never installs with a key that has since been replaced.
@@ -580,7 +762,11 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         meta: Option<(String, String)>,
     ) -> Result<String, String> {
         self.sync_key(cfg);
-        let (entries, version) = self.check(
+        let Checked {
+            entries,
+            collections,
+            version,
+        } = self.check(
             cfg,
             &text,
             &sig,
@@ -598,8 +784,10 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
         self.seed(&entries);
         *self.current.write() = Some(Arc::new(Loaded {
             entries,
+            collections,
+            origin: Origin::Fetched,
             version: version.clone(),
-            fetched_at: Some(chrono::Utc::now().to_rfc3339()),
+            fetched_at: Some(now_rfc3339()),
             embedded: false,
         }));
         *self.installed.lock() = Some((text.clone(), sig.clone()));
@@ -633,18 +821,17 @@ impl<E: CatalogueEntry + Send + Sync + 'static> SignedDoc<E> {
                         tracing::info!("{} catalogue: {v}", this.kind);
                         CHECK_EVERY
                     }
-                    // A verified copy is in force: retry on the normal schedule, quietly.
-                    Err(e) if this.get().is_some() => {
-                        tracing::debug!("{} catalogue: {e}", this.kind);
-                        CHECK_EVERY
-                    }
-                    Err(e) => {
-                        tracing::warn!("{} catalogue: {e}", this.kind);
+                    // A verified copy is in force: retry on the normal schedule.
+                    Err(_) if this.get().is_some() => CHECK_EVERY,
+                    Err(_) => {
                         let w = backoff;
                         backoff = (backoff * 2).min(Duration::from_secs(900));
                         w
                     }
                 };
+                this.checks.lock().next_check = chrono::Duration::from_std(wait)
+                    .ok()
+                    .map(|d| (chrono::Utc::now() + d).to_rfc3339());
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
                     _ = this.wake.notified() => {}
@@ -718,6 +905,21 @@ pub mod testkit {
     pub fn filters_json(format: &str) -> String {
         format!(
             r#"{{"schema":1,"kind":"filters","entries":[{{"id":"fx","name":"Fx","description":"d","url":"https://example.test/fx.txt","format":"{format}","category":"ads","licence":"MIT","homepage":"https://example.test","region":"de","noncommercial":true}}]}}"#
+        )
+    }
+
+    /// A `filters.json` of lists `a` (trusted), `b` and `c` (not) with this raw `collections` array.
+    pub fn filters_with_collections(collections: &str) -> String {
+        let e = |id: &str, trusted: bool| {
+            format!(
+                r#"{{"id":"{id}","name":"List {id}","url":"https://127.0.0.1:1/{id}.txt","format":"abp","category":"ads","trusted":{trusted}}}"#
+            )
+        };
+        format!(
+            r#"{{"schema":1,"kind":"filters","entries":[{},{},{}],"collections":{collections}}}"#,
+            e("a", true),
+            e("b", false),
+            e("c", false)
         )
     }
 
@@ -877,6 +1079,45 @@ mod tests {
     }
 
     #[test]
+    fn the_embedded_snapshot_exposes_its_two_collections() {
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", None, real_cfg());
+        d.load_snapshot(&FILTERS_SNAPSHOT).unwrap();
+        let l = d.get().unwrap();
+        let ids: Vec<_> = l.collections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["recommended", "annoyances-social"]);
+        let entry_ids: std::collections::HashSet<_> =
+            l.entries.iter().map(|e| e.id.as_str()).collect();
+        // Nothing was dropped on load: the signed document lists only known ids.
+        let raw: serde_json::Value = serde_json::from_str(FILTERS_SNAPSHOT.text).unwrap();
+        for c in &l.collections {
+            assert!(c.lists.iter().all(|i| entry_ids.contains(i.as_str())));
+            let n = raw["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == c.id.as_str())
+                .unwrap()["lists"]
+                .as_array()
+                .unwrap()
+                .len();
+            assert_eq!(c.lists.len(), n, "{}", c.id);
+        }
+        let mut rec = l.collections[0].lists.clone();
+        let mut def: Vec<_> = l
+            .entries
+            .iter()
+            .filter(|e| e.default_enabled)
+            .map(|e| e.id.clone())
+            .collect();
+        rec.sort();
+        def.sort();
+        assert_eq!(rec, def, "recommended is the default-enabled set");
+        for id in ["adguard-annoyances", "adguard-social"] {
+            assert!(l.entries.iter().find(|e| e.id == id).unwrap().trusted);
+        }
+    }
+
+    #[test]
     fn a_tampered_snapshot_is_rejected() {
         let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
         for tamper in 0..3 {
@@ -1001,6 +1242,109 @@ mod tests {
         let d = doc(&s, "filters", Some(dir.path()));
         d.init_cache();
         assert!(d.get().is_none());
+    }
+
+    async fn load_collections(raw: &str) -> Vec<Collection> {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = filters_with_collections(raw);
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        d.apply(text, sig, None).await.unwrap();
+        d.get().unwrap().collections.clone()
+    }
+
+    #[tokio::test]
+    async fn collections_load_and_unknown_ids_and_empty_collections_are_dropped() {
+        let cs = load_collections(
+            r#"[{"id":"rec","name":"Recommended","description":"d","warning":"may break","lists":["a","b"]},
+                {"id":"mix","name":"Mixed","lists":["c","nope","c"]},
+                {"id":"ghost","name":"Ghost","lists":["nope"]},
+                {"id":"rec","name":"Dup","lists":["a"]},
+                {"id":"bad","lists":["a"]}]"#,
+        )
+        .await;
+        let ids: Vec<_> = cs.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["rec", "mix"]);
+        assert_eq!(cs[0].warning.as_deref(), Some("may break"));
+        assert_eq!(cs[0].lists, ["a", "b"]);
+        assert_eq!(cs[1].lists, ["c"], "unknown and repeated ids dropped");
+        assert_eq!(cs[1].description, "");
+    }
+
+    #[tokio::test]
+    async fn an_old_document_without_collections_still_loads() {
+        let s = Signer::new();
+        let d = doc(&s, "filters", None);
+        let text = filters_json("abp");
+        assert!(!text.contains("collections"));
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        d.apply(text, sig, None).await.unwrap();
+        let l = d.get().unwrap();
+        assert_eq!(l.entries.len(), 1);
+        assert!(l.collections.is_empty());
+        assert_eq!(
+            load_collections("null").await.len(),
+            0,
+            "a null array is tolerated"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetched_at_is_the_real_fetch_time_and_survives_a_restart() {
+        let s = Signer::new();
+        let dir = tempfile::tempdir().unwrap();
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        let d = doc(&s, "filters", Some(dir.path()));
+        d.apply(text, sig, None).await.unwrap();
+        assert_eq!(d.get().unwrap().origin, Origin::Fetched);
+        // The file was written two days ago: a restart reports that, not "now".
+        let when = std::time::SystemTime::now() - Duration::from_secs(2 * 86400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("filters.json"))
+            .unwrap();
+        f.set_modified(when).unwrap();
+        drop(f);
+        let d = doc(&s, "filters", Some(dir.path()));
+        d.init_cache();
+        let l = d.get().unwrap();
+        assert_eq!(l.origin, Origin::Cache);
+        let got = chrono::DateTime::parse_from_rfc3339(l.fetched_at.as_ref().unwrap()).unwrap();
+        let want = chrono::DateTime::<chrono::Utc>::from(when);
+        assert_eq!(got.timestamp(), want.timestamp());
+        assert_eq!(d.status().origin, Some(Origin::Cache));
+    }
+
+    #[tokio::test]
+    async fn status_shows_a_failed_check_once_and_clears_it_on_success() {
+        let s = Signer::new();
+        let (_d, svc) = svc();
+        let mut cfg = test_cfg(&s);
+        cfg.base_url = "http://127.0.0.1:1/".into();
+        let d = SignedDoc::<FilterCatalogueEntry>::new("filters", Some(svc.clone()), cfg);
+        let st = d.status();
+        assert_eq!(st.url, "http://127.0.0.1:1/filters.json");
+        assert!(st.last_checked.is_none() && st.last_error.is_none() && st.version.is_none());
+        // A verified copy is in force; the check then fails: still served, error visible.
+        let text = filters_json("abp");
+        let sig = s.sign(&text, "v2026.11.23", "filters.json");
+        d.apply(text, sig, None).await.unwrap();
+        let err = d.refresh().await.unwrap_err();
+        let st = d.status();
+        assert_eq!(st.last_error.as_deref(), Some(err.as_str()));
+        assert!(st.last_checked.is_some() && st.last_ok.is_none());
+        assert_eq!(st.version.as_deref(), Some("v2026.11.23"));
+        assert_eq!(st.origin, Some(Origin::Fetched));
+        // A working source clears it.
+        let (base, _) = serve(release_files(&s, "v2026.11.24")).await;
+        let mut cfg = test_cfg(&s);
+        cfg.base_url = base;
+        d.set_config_source(move || cfg.clone());
+        d.refresh().await.unwrap();
+        let st = d.status();
+        assert!(st.last_error.is_none() && st.last_ok.is_some());
+        assert_eq!(st.version.as_deref(), Some("v2026.11.24"));
     }
 
     #[test]

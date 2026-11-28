@@ -15,8 +15,10 @@ pub mod scopes;
 pub use scopes::{scope_table_markdown, Scope};
 
 mod bypass;
+mod catalogue;
 mod more;
 pub use bypass::*;
+pub use catalogue::*;
 pub use more::*;
 
 mod policy;

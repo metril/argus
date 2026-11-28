@@ -142,6 +142,67 @@
         ],
         "type": "object"
       },
+      "ApplyCollectionRequest": {
+        "description": "Request of `POST /lists/catalogue/collections/{id}/apply`.",
+        "properties": {
+          "dry_run": {
+            "description": "Only report what would change.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "ApplyCollectionResponse": {
+        "description": "What applying a collection does (or did).",
+        "properties": {
+          "add": {
+            "description": "Lists added from the catalogue (enabled).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "already": {
+            "description": "Lists already installed and on, left alone.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "conflict": {
+            "description": "Installed lists that reuse a catalogue id with another URL: never changed by apply.",
+            "items": {
+              "$ref": "#/components/schemas/CollectionConflict"
+            },
+            "type": "array"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "enable": {
+            "description": "Installed lists that get turned on.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "trust": {
+            "description": "Lists whose trust changes to what the catalogue says (among those added or enabled).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dry_run",
+          "add",
+          "enable",
+          "trust",
+          "already"
+        ],
+        "type": "object"
+      },
       "ApproveUpdateRequest": {
         "description": "Approve a pending update.",
         "properties": {
@@ -1178,6 +1239,13 @@
       "CatalogueResponse": {
         "description": "The catalogue and where it came from.",
         "properties": {
+          "collections": {
+            "description": "Named groups of lists, with counts for this install.",
+            "items": {
+              "$ref": "#/components/schemas/CollectionResponse"
+            },
+            "type": "array"
+          },
           "entries": {
             "items": {
               "$ref": "#/components/schemas/CatalogueEntryResponse"
@@ -1195,6 +1263,10 @@
             "description": "`signed` for a fetched argus-lists release, `snapshot` for the signed copy built into the\nbinary (no release fetched yet), `signed` with no entries while none has loaded.",
             "type": "string"
           },
+          "status": {
+            "$ref": "#/components/schemas/CatalogueStatus",
+            "description": "The subscription: source, release in force, outcome of the checks."
+          },
           "version": {
             "description": "Release of the signed copy.",
             "type": [
@@ -1205,7 +1277,68 @@
         },
         "required": [
           "source",
-          "entries"
+          "entries",
+          "status"
+        ],
+        "type": "object"
+      },
+      "CatalogueStatus": {
+        "description": "The signed catalogue subscription (`filters.json` of argus-lists).",
+        "properties": {
+          "fetched_at": {
+            "description": "When the copy in force was fetched (RFC 3339); absent for `snapshot`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_checked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the last check failed; absent after a success.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_ok": {
+            "description": "Last successful check.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_check": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "description": "`snapshot` (built into the binary), `cache` (loaded from disk at start) or `fetched`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "description": "Where the catalogue is fetched from.",
+            "type": "string"
+          },
+          "version": {
+            "description": "Release in force (`vYYYY.MM.DD[.N]`); absent while none has loaded.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "url"
         ],
         "type": "object"
       },
@@ -1496,6 +1629,73 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "CollectionConflict": {
+        "description": "A list that clashes with a catalogue entry of the same id.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "CollectionResponse": {
+        "description": "A named group of catalogue lists with its state on this install, computed from the lists.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Lists of the collection that are installed and enabled.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "installed": {
+            "description": "Lists of the collection that are installed.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lists": {
+            "description": "Catalogue ids of its lists.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warning": {
+            "description": "What turning the collection on may break.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "lists",
+          "installed",
+          "enabled",
+          "total"
+        ],
         "type": "object"
       },
       "ConfirmPlanRequest": {
@@ -1920,6 +2120,22 @@
           "counts",
           "limit",
           "has_more"
+        ],
+        "type": "object"
+      },
+      "DisableCollectionResponse": {
+        "description": "Result of `POST /lists/catalogue/collections/{id}/disable`.",
+        "properties": {
+          "disabled": {
+            "description": "Lists turned off (they stay installed).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "disabled"
         ],
         "type": "object"
       },
@@ -14223,6 +14439,257 @@
           }
         ],
         "summary": "The catalogue of well-known lists, from the verified signed argus-lists release (or the\nsigned snapshot shipped with the binary); empty only if none has verified.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/collections/{id}/apply": {
+      "post": {
+        "operationId": "apply_collection",
+        "parameters": [
+          {
+            "description": "Collection id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyCollectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApplyCollectionResponse"
+                }
+              }
+            },
+            "description": "What changes"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Add the collection's missing lists, turn on the disabled ones and align their trust with the\ncatalogue, with one engine rebuild; or, with `dry_run`, only report that.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/collections/{id}/disable": {
+      "post": {
+        "operationId": "disable_collection",
+        "parameters": [
+          {
+            "description": "Collection id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DisableCollectionResponse"
+                }
+              }
+            },
+            "description": "Lists turned off"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Turn off every list of a collection that is on; the lists stay installed.",
+        "tags": [
+          "lists"
+        ]
+      }
+    },
+    "/api/v1/lists/catalogue/refresh": {
+      "post": {
+        "operationId": "refresh_catalogue",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogueStatus"
+                }
+              }
+            },
+            "description": "Status after the check"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "lists:write"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "lists:write"
+            ]
+          }
+        ],
+        "summary": "Check the signed catalogue now (it is otherwise checked every six hours). A failed check is\nnot an HTTP error: it is reported in `last_error` of the returned status.",
         "tags": [
           "lists"
         ]

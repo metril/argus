@@ -12,6 +12,7 @@ import { RouteTracker } from '../lib/route';
 import { StoreRelay } from '../lib/storerelay';
 import { Arming, type PickerMode } from '../lib/arming';
 import { handlePickerMessage } from '../lib/pickerbg';
+import { createCookieService, registerCookieListeners, servePort } from '../lib/cookiejar/service';
 
 /** The toolbar badge is a colored dot for the site state; nothing when there is nothing to say. */
 /** Compact count for the badge (it holds about four characters). */
@@ -231,6 +232,15 @@ export default defineBackground(() => {
       ports.delete(port);
       if (ports.size === 0 && liveTimer) { clearInterval(liveTimer); liveTimer = undefined; }
     });
+  });
+
+  // Cookie manager: activity log and auto-delete listeners at the top level; the page's port.
+  const cookieSvc = createCookieService(browser);
+  registerCookieListeners(browser, cookieSvc);
+  browser.runtime.onConnect.addListener((port: any) => {
+    if (port.name !== 'cookies') return;
+    if (!fromExtensionPage(port.sender, browser.runtime.id, browser.runtime.getURL('/' as any))) { try { port.disconnect(); } catch { /* ignore */ } return; }
+    servePort(port, cookieSvc);
   });
 
   const timers = new Map<number, ReturnType<typeof setTimeout>>();
