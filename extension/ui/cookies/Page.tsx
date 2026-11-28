@@ -3,6 +3,7 @@ import { siteOf } from '../../lib/cookiejar/model';
 import { ActivityTab } from './ActivityTab';
 import { ClientCtx, realClient, useClient, type CookieClient } from './client';
 import { CookiesTab, type Scope } from './CookiesTab';
+import { Icon } from '../icons';
 import { useProvenance } from './data';
 import { Pill, Tabs, ToastHost } from './kit';
 import { noFilters, tabFromHash, type Filters } from './model';
@@ -33,7 +34,7 @@ function StaleNotice() {
   if (!dead) return null;
   return (
     <div class="banner warn" role="alert" data-testid="stale-notice">
-      <span class="bt">Argus was updated. Reload this page.</span>
+      <Icon n="warn" size={16} /><span class="bt">Argus was updated. Reload this page.</span>
       <span class="ba"><button type="button" class="btn" onClick={() => location.reload()}>Reload</button></span>
     </div>
   );
