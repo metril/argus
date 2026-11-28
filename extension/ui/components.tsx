@@ -194,7 +194,7 @@ type PState = { enabled: boolean; stores: Record<string, boolean> };
 type PInfo = { state: PState; active: boolean; listener?: Listener; unreachable?: boolean; firefox: boolean };
 
 /** "Use Argus" switch with a live status line; Firefox also lists containers. */
-export function BrowserCard({ sub }: { sub?: string }) {
+export function BrowserCard({ sub, inline }: { sub?: string; inline?: boolean }) {
   const [info, setInfo] = useState<PInfo>();
   const [names, setNames] = useState<{ id: string; name: string }[]>([]);
   const [argus, setArgus] = useState('');
@@ -227,15 +227,19 @@ export function BrowserCard({ sub }: { sub?: string }) {
   const line = kind === 'blocked' ? "Argus unreachable: browsing is blocked until it's back" : kind === 'on' ? 'On · filtering this browser' : kind === 'connecting' ? 'Connecting…' : kind === 'unset' ? 'Not set up in Argus' : 'Off';
   return (
     <>
+      {/* `inline` (the popup) puts a short status on the switch's own row; a long one still gets a line below. */}
       <div class="sw-row">
         <span>Use Argus{sub && <div class="muted" style="font-size:12px">{sub}</div>}</span>
+        {inline && (kind === 'on' || kind === 'off' || kind === 'connecting') && <span class="muted sw-st" role="status" aria-live="polite">{line}</span>}
         <Switch on={st.enabled} label="Use Argus in this browser" onChange={(v) => void save({ ...st, enabled: v })} />
       </div>
-      <div class="note" role="status" aria-live="polite">
-        {line}
-        {kind === 'blocked' && <> · <button type="button" class="link" onClick={() => void save({ ...st, enabled: false })}>Turn off proxy</button></>}
-        {kind === 'unset' && argus && <> · <a href={`${argus}/extension`} target="_blank" rel="noreferrer">Set up</a></>}
-      </div>
+      {!(inline && (kind === 'on' || kind === 'off' || kind === 'connecting')) && (
+        <div class="note" role="status" aria-live="polite">
+          {line}
+          {kind === 'blocked' && <> · <button type="button" class="link" onClick={() => void save({ ...st, enabled: false })}>Turn off proxy</button></>}
+          {kind === 'unset' && argus && <> · <a href={`${argus}/extension`} target="_blank" rel="noreferrer">Set up</a></>}
+        </div>
+      )}
       {info.firefox && names.length > 0 && (
         <details class="cont">
           <summary>Containers</summary>

@@ -57,7 +57,9 @@ describe('Don\'t decrypt this site row', () => {
     await mount();
     expect(q('actions-slot')!.contains(q('site-bypass'))).toBe(true);
     expect(q('bypass-add')!.textContent).toBe("Don't decrypt this site");
-    expect(row()).toContain('Argus stops inspecting and filtering this site.');
+    expect(q('bypass-add')!.getAttribute('title')).toBe('Argus stops inspecting and filtering this site.');
+    expect(root.querySelector('#' + q('bypass-add')!.getAttribute('aria-describedby'))!.textContent).toBe('Argus stops inspecting and filtering this site.');
+    expect(q('site-bypass')!.querySelector('.hint')).toBeNull();
     expect(calls).toEqual(['GET www.a.example']);
   });
 
@@ -66,7 +68,7 @@ describe('Don\'t decrypt this site row', () => {
     await click('bypass-add');
     expect(calls).toEqual(['GET www.a.example', 'PUT www.a.example']);
     expect(q('bypass-ext')).not.toBeNull();
-    expect(row()).toContain('Not decrypted: Argus tunnels this site untouched.');
+    expect(row()).toContain('Not decrypted. Argus passes this site through unfiltered.');
     expect(row()).toContain('Reload tab to apply.');
     expect(q('bypass-ext')!.querySelector('[role=status]')).not.toBeNull();
     expect(q('bypass-add')).toBeNull();
@@ -78,7 +80,7 @@ describe('Don\'t decrypt this site row', () => {
     expect((fakeBrowser.tabs as any).reload).toHaveBeenCalledWith(7);
     expect(q('bypass-ext')).not.toBeNull();
     expect(q('bypass-reload')).toBeNull();
-    expect(row()).toContain('untouched.');
+    expect(row()).toContain('unfiltered.');
   });
 
   it('Undo removes the entry; the same reload hint applies, then the button is back after a reload', async () => {
@@ -116,10 +118,10 @@ describe('Don\'t decrypt this site row', () => {
     expect(reasonOf(st({ source: 'category', name: 'Health' }) as any)).toBe('Health category');
   });
 
-  it('a profile-restricted token reads "Not available for this profile." and never offers sign-in', async () => {
+  it('a profile-restricted token says the profile does not allow it and never offers sign-in', async () => {
     get = () => json(403, { error: { code: 'profile_restricted', message: 'x' } });
     await mount();
-    expect(row()).toBe('Not available for this profile.');
+    expect(row()).toBe("Your profile doesn't allow this.");
     expect(q('site-bypass')!.querySelector('button')).toBeNull();
   });
 
@@ -134,7 +136,7 @@ describe('Don\'t decrypt this site row', () => {
   it('a 403 on the change turns the row into the matching state', async () => {
     put = () => json(403, { error: { code: 'profile_restricted' } });
     await mount(); await click('bypass-add');
-    expect(row()).toBe('Not available for this profile.');
+    expect(row()).toBe("Your profile doesn't allow this.");
     put = () => json(403, { error: { code: 'insufficient_scope' } });
     render(null, root); clearCache();
     await mount(); await click('bypass-add');

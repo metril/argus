@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { clearSiteBypass, getSiteBypass, setSiteBypass, type Call, type Settings, type SiteBypass } from '../lib/api';
 import { Icon } from './components';
@@ -66,6 +67,22 @@ export function reasonOf(s: SiteBypass): string {
 }
 
 /** The row under the popup's action grid. Each state keeps to the row's reserved height. */
+type Tone = 'info' | 'warn';
+
+/** The row's one-line banner: icon, text, then an optional 32px action at the right. */
+function Note({ tone, testid, title, children, action }: { tone: Tone; testid: string; title?: string | undefined; children: ComponentChildren; action?: ComponentChildren }) {
+  return (
+    <div class={`banner ${tone === 'warn' ? 't-warn' : 't-pass'} sbr`} data-testid={testid} title={title}>
+      <Icon n={tone === 'warn' ? 'warn' : 'info'} size={16} />
+      <span class="sbt" role="status">{children}</span>
+      {action}
+    </div>
+  );
+}
+
+const WHY = 'Argus stops inspecting and filtering this site.';
+
+/** The row under the popup's action grid. Each state keeps to the row's reserved height. */
 export function SiteBypassRow({ st, reload, onSignIn }: { st: SiteBypassState; reload: () => void; onSignIn: () => void }) {
   const { view, busy, changed, note } = st;
   const doReload = () => { reload(); st.reloaded(); };
@@ -73,43 +90,31 @@ export function SiteBypassRow({ st, reload, onSignIn }: { st: SiteBypassState; r
   let body;
   if (view.k === 'loading') body = <div class="sbp-sk" aria-hidden="true" data-testid="bypass-loading" />;
   else if (view.k === 'error') {
-    body = <div class="note sbp-line" role="status" data-testid="bypass-error">Could not check this site. <button type="button" class="lnk" onClick={st.retry}>Retry</button></div>;
+    body = <Note tone="warn" testid="bypass-error" action={<button type="button" class="btn" onClick={st.retry}>Retry</button>}>Could not check this site.</Note>;
   } else if (view.k === 'restricted') {
-    body = <div class="note sbp-line" role="status" data-testid="bypass-restricted">Not available for this profile.</div>;
+    body = <Note tone="info" testid="bypass-restricted">Your profile doesn't allow this.</Note>;
   } else if (view.k === 'scope') {
-    body = (
-      <div class="note sbp-line" data-testid="bypass-scope"><span role="status">Sign in again to use this.</span> <button type="button" class="lnk" onClick={onSignIn}>Sign in</button></div>
-    );
+    body = <Note tone="warn" testid="bypass-scope" action={<button type="button" class="btn" onClick={onSignIn}>Sign in</button>}>Sign in again to use this.</Note>;
   } else {
     const s = view.s;
     const ext = s.source === 'extension' && s.removable;
     if (ext) {
       body = (
-        <div class="banner t-pass sbr" data-testid="bypass-ext">
-          <Icon n="info" size={16} />
-          <span class="sbt" role="status">Not decrypted: Argus tunnels this site untouched.{changed && <> <button type="button" class="lnk" data-testid="bypass-reload" onClick={doReload}>Reload tab</button> to apply.</>}</span>
-          <button type="button" class="btn" data-testid="bypass-undo" disabled={busy} onClick={st.undo}>Undo</button>
-        </div>
+        <Note tone="info" testid="bypass-ext" action={<button type="button" class="btn" data-testid="bypass-undo" disabled={busy} onClick={st.undo}>Undo</button>}>
+          Not decrypted. Argus passes this site through unfiltered.{changed && <> <button type="button" class="lnk" data-testid="bypass-reload" onClick={doReload}>Reload tab</button> to apply.</>}
+        </Note>
       );
     } else if (s.bypassed) {
-      body = (
-        <div class="banner t-pass sbr" data-testid="bypass-other" title={s.name ?? undefined}>
-          <Icon n="info" size={16} />
-          <span class="sbt" role="status">Not decrypted: {reasonOf(s)}</span>
-        </div>
-      );
+      body = <Note tone="info" testid="bypass-other" title={s.name ?? undefined}>Not decrypted: {reasonOf(s)}</Note>;
     } else if (changed) {
       body = (
-        <div class="banner t-pass sbr" data-testid="bypass-undone">
-          <Icon n="info" size={16} />
-          <span class="sbt" role="status">Decrypting again. <button type="button" class="lnk" data-testid="bypass-reload" onClick={doReload}>Reload tab</button> to apply.</span>
-        </div>
+        <Note tone="info" testid="bypass-undone">Decrypting again. <button type="button" class="lnk" data-testid="bypass-reload" onClick={doReload}>Reload tab</button> to apply.</Note>
       );
     } else {
       body = (
         <>
-          <button type="button" class="btn" data-testid="bypass-add" disabled={busy} onClick={st.add}>Don't decrypt this site</button>
-          <div class="hint">Argus stops inspecting and filtering this site.</div>
+          <button type="button" class="btn" data-testid="bypass-add" title={WHY} aria-describedby="bypass-why" disabled={busy} onClick={st.add}>Don't decrypt this site</button>
+          <span id="bypass-why" class="sr">{WHY}</span>
         </>
       );
     }

@@ -147,7 +147,7 @@ export function App() {
         <Scripts state={menu} reload={() => setN(n + 1)} />
         <section class="sec">
           <div class="lbl">This browser</div>
-          <BrowserCard />
+          <BrowserCard inline />
         </section>
         </>}
       </main>
