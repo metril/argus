@@ -17,6 +17,9 @@ pub fn ConfirmButton(
     #[prop(optional)]
     large: bool,
     #[prop(into, optional)] disabled: Signal<bool>,
+    /// While armed, show a Cancel button right after this one.
+    #[prop(optional)]
+    cancel: bool,
 ) -> impl IntoView {
     let armed = RwSignal::new(false);
     let timer = StoredValue::new_local(None::<Timeout>);
@@ -48,6 +51,19 @@ pub fn ConfirmButton(
             <Show when=move || !armed.get()><Icon name="trash" /></Show>
             {move || if armed.get() { confirm_label.clone() } else { l1.clone() }}
         </button>
+        {cancel.then(|| view! {
+            <Show when=move || armed.get()>
+                <button
+                    type="button"
+                    class=format!("btn ghost{}", if large { "" } else { " sm" })
+                    on:mousedown=move |ev| ev.prevent_default()
+                    on:click=move |_| {
+                        armed.set(false);
+                        timer.set_value(None);
+                    }
+                >"Cancel"</button>
+            </Show>
+        })}
         <span class="sr-only" aria-live="polite">{move || if armed.get() { sr.clone() } else { String::new() }}</span>
     }
 }

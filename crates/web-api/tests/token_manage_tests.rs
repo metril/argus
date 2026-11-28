@@ -119,6 +119,63 @@ async fn patch_narrows_and_edits_but_never_widens() {
 }
 
 #[tokio::test]
+async fn an_edit_may_keep_scopes_the_editor_no_longer_holds_but_not_add_them() {
+    let ctx = TestContext::new().await.unwrap();
+    let admin = ctx.admin().await;
+    ctx.user(&admin, "alice", "user").await;
+    let alice = ctx.login("alice").await;
+    let u = ctx
+        .state
+        .session_store
+        .get_user_by_username("alice")
+        .unwrap()
+        .unwrap();
+    // A token that kept a scope its owner has since lost (a demotion).
+    let (info, _) = ctx
+        .state
+        .tokens
+        .create(
+            "kept".into(),
+            vec![api_types::Scope::StatsRead, api_types::Scope::ConfigWrite],
+            None,
+            u.id,
+            u.username,
+            None,
+            api_types::TokenPurpose::Custom,
+        )
+        .unwrap();
+    let url = format!("/api/v1/tokens/{}", info.id);
+    // Narrowing around the scope alice no longer holds, and leaving it as it is, both pass.
+    let r = alice
+        .patch(&url)
+        .json(&json!({"scopes": ["stats:read", "lists:read", "config:write"]}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let t: Value = r.json();
+    assert!(t["scopes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("config:write")));
+    // Adding one she does not hold is still refused.
+    let r = alice
+        .patch(&url)
+        .json(&json!({"scopes": ["stats:read", "config:write", "users:admin"]}))
+        .await;
+    assert_code(r, StatusCode::FORBIDDEN, "scope_escalation").await;
+    // Once removed, the scope is no longer the token's, so it cannot be put back.
+    let r = alice
+        .patch(&url)
+        .json(&json!({"scopes": ["stats:read"]}))
+        .await;
+    assert_eq!(r.status_code(), StatusCode::OK, "{}", r.text());
+    let r = alice
+        .patch(&url)
+        .json(&json!({"scopes": ["stats:read", "config:write"]}))
+        .await;
+    assert_code(r, StatusCode::FORBIDDEN, "scope_escalation").await;
+}
+
+#[tokio::test]
 async fn a_restricted_token_cannot_widen_profiles_through_patch() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;

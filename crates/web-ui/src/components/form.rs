@@ -68,7 +68,8 @@ pub fn Switch(
     }
 }
 
-/// Single-select radio group with arrow-key movement and one tab stop.
+/// Single-select radio group (`role=radiogroup`): arrow keys, Home and End move the selection
+/// and focus, and only the checked option is a tab stop (the first one when none is checked).
 #[component]
 pub fn Segmented(
     /// `(value, label)` pairs.
@@ -77,46 +78,63 @@ pub fn Segmented(
     #[prop(into)] on_change: Callback<String>,
     #[prop(into)] label: String,
     #[prop(into, optional)] disabled: Signal<bool>,
+    /// Extra classes on the group (e.g. `perm`, `wide`).
+    #[prop(into, optional)]
+    class: String,
+    /// Optional count shown after each label, in option order.
+    #[prop(into, optional)]
+    counts: Option<Signal<Vec<usize>>>,
 ) -> impl IntoView {
     let values: Vec<String> = options.iter().map(|(v, _)| v.clone()).collect();
-    let move_by = {
+    let first = values.first().cloned().unwrap_or_default();
+    let move_to = {
         let values = values.clone();
-        move |from: &str, delta: isize| {
+        move |from: &str, key: &str| {
             if values.is_empty() {
                 return;
             }
-            let i = values.iter().position(|v| v == from).unwrap_or(0) as isize;
             let n = values.len() as isize;
-            let j = ((i + delta) % n + n) % n;
+            let i = values.iter().position(|v| v == from).unwrap_or(0) as isize;
+            let j = match key {
+                "ArrowRight" | "ArrowDown" => (i + 1) % n,
+                "ArrowLeft" | "ArrowUp" => (i + n - 1) % n,
+                "Home" => 0,
+                "End" => n - 1,
+                _ => return,
+            };
             on_change.run(values[j as usize].clone());
         }
     };
+    let values_all = values.clone();
     view! {
-        <div class="seg" role="radiogroup" aria-label=label>
-            {options.into_iter().map(|(v, l)| {
-                let v1 = v.clone();
-                let v2 = v.clone();
-                let v3 = v.clone();
-                let move_by = move_by.clone();
+        <div class=format!("seg {class}") role="radiogroup" aria-label=label>
+            {options.into_iter().enumerate().map(|(idx, (v, l))| {
+                let (v1, v2, v3) = (v.clone(), v.clone(), v.clone());
+                let first = first.clone();
+                let values_all = values_all.clone();
+                let move_to = move_to.clone();
                 view! {
                     <button
                         type="button"
                         role="radio"
                         aria-checked=move || (value.get() == v1).to_string()
-                        tabindex=move || if value.get() == v2 { "0" } else { "-1" }
+                        tabindex=move || {
+                            let cur = value.get();
+                            let known = values_all.contains(&cur);
+                            if (known && cur == v2) || (!known && v2 == first) { "0" } else { "-1" }
+                        }
                         disabled=move || disabled.get()
                         on:click={
                             let v = v.clone();
                             move |_| on_change.run(v.clone())
                         }
                         on:keydown=move |ev: web_sys::KeyboardEvent| {
-                            let d = match ev.key().as_str() {
-                                "ArrowRight" | "ArrowDown" => 1,
-                                "ArrowLeft" | "ArrowUp" => -1,
-                                _ => return,
-                            };
+                            let key = ev.key();
+                            if !matches!(key.as_str(), "ArrowRight" | "ArrowDown" | "ArrowLeft" | "ArrowUp" | "Home" | "End") {
+                                return;
+                            }
                             ev.prevent_default();
-                            move_by(&v3, d);
+                            move_to(&v3, &key);
                             // Move focus to the newly checked radio.
                             if let Some(group) = ev
                                 .current_target()
@@ -130,6 +148,7 @@ pub fn Segmented(
                         }
                     >
                         {l}
+                        {counts.map(|c| view! { <span class="n">{move || c.get().get(idx).copied().unwrap_or(0).to_string()}</span> })}
                     </button>
                 }
             }).collect_view()}
