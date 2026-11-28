@@ -95,6 +95,7 @@ fn test_config(proxy_port: u16) -> ProxyConfig {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     }
 }
 

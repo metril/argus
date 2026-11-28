@@ -92,6 +92,7 @@ fn test_custom_config() {
         dns: Default::default(),
         bypass: Default::default(),
         stealth: Default::default(),
+        privacy: Default::default(),
     };
 
     assert_eq!(config.proxy.host, "127.0.0.1");

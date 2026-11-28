@@ -62,6 +62,8 @@ pub fn proxy_config_response(config: &ProxyConfig) -> ProxyConfigResponse {
         stealth: stealth_dto(&config.stealth),
         cname: cname_dto(&config.adblock.cname),
         request_log_capacity: config.adblock.request_log_capacity as u32,
+        userscripts_enabled: config.userscripts.enabled,
+        cookie_provenance: config.privacy.cookie_provenance,
         bind: None,
     }
 }
@@ -400,6 +402,12 @@ fn apply_live(state: &AppState, config: &ProxyConfig) {
     if let Some(h) = state.stealth.get() {
         h.store(Arc::new(config.stealth.clone()));
     }
+    if let Some(h) = state.userscripts_enabled.get() {
+        h.store(config.userscripts.enabled, Ordering::Relaxed);
+    }
+    if let Some(h) = state.cookie_provenance.get() {
+        h.store(config.privacy.cookie_provenance, Ordering::Relaxed);
+    }
     state.list_service.set_schedule(
         config.adblock.auto_update,
         Duration::from_secs(config.adblock.update_interval_hours.max(1) * 3600),
@@ -672,6 +680,25 @@ async fn apply_update_locked(
         req.request_log_capacity.map(|v| v as usize),
         true
     );
+    for (name, slot, val) in [
+        (
+            "userscripts_enabled",
+            &mut config.userscripts.enabled,
+            req.userscripts_enabled,
+        ),
+        (
+            "cookie_provenance",
+            &mut config.privacy.cookie_provenance,
+            req.cookie_provenance,
+        ),
+    ] {
+        if let Some(v) = val {
+            if *slot != v {
+                *slot = v;
+                applied.push(name.into());
+            }
+        }
+    }
     if let Some(u) = &req.upstream_proxy {
         let next = merge_upstream_proxy(&config.proxy.upstream.proxy, u);
         next.validate().map_err(ApiError::ValidationError)?;

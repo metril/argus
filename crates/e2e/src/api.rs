@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use crate::TestProxy;
 
 const PASSWORD: &str = "SecurePassword123!";
-const SCOPES: [&str; 11] = [
+const SCOPES: [&str; 13] = [
+    "config:read",
+    "config:write",
     "logs:read",
     "profiles:read",
     "profiles:write",
@@ -53,7 +55,9 @@ impl TestProxy {
         cfg.auth.jwt_secret_path = p.join("jwt_secret");
         cfg.session.storage_path = p.join("sessions");
         cfg.auth.bcrypt_cost = 4;
-        let proxy_config = proxy_core::ProxyConfig::default();
+        let mut proxy_config = proxy_core::ProxyConfig::default();
+        // The test proxy's engine is on; a config save must not switch it off.
+        proxy_config.adblock.enabled = true;
         let config_path = p.join("proxy.toml");
         std::fs::write(&config_path, toml::to_string_pretty(&proxy_config).unwrap()).unwrap();
         let state = proxy_core::webui::build_api_state(

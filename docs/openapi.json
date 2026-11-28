@@ -5217,6 +5217,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "cookie_provenance": {
+            "description": "Record cookie names and attributes seen in transit (never values).",
+            "type": "boolean"
+          },
           "dns": {
             "$ref": "#/components/schemas/DnsDto",
             "description": "Upstream DNS resolution."
@@ -5314,6 +5318,10 @@
           "upstream_proxy": {
             "$ref": "#/components/schemas/UpstreamProxyDto",
             "description": "Another proxy Argus's own upstream traffic goes through."
+          },
+          "userscripts_enabled": {
+            "description": "Inject userscripts into pages. Off: installed scripts are kept but never run.",
+            "type": "boolean"
           },
           "webui_host": {
             "description": "Address the web API listens on.",
@@ -7154,6 +7162,13 @@
               "null"
             ]
           },
+          "cookie_provenance": {
+            "description": "Record cookie names and attributes seen in transit; applied live.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "dns": {
             "oneOf": [
               {
@@ -7323,6 +7338,13 @@
                 "$ref": "#/components/schemas/UpstreamProxyUpdate",
                 "description": "Upstream proxy settings; applied live (new connections go through the proxy at once)."
               }
+            ]
+          },
+          "userscripts_enabled": {
+            "description": "Inject userscripts into pages; applied live, from the next document.",
+            "type": [
+              "boolean",
+              "null"
             ]
           },
           "webui_host": {

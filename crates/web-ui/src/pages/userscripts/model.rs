@@ -451,6 +451,40 @@ pub fn fmt_abs(iso: &str) -> String {
     iso.get(..16).unwrap_or(iso).replace('T', " ")
 }
 
+/// The warning shown on the master-switch card: scripts are enabled but injection is off.
+pub fn injection_warning(injecting: Option<bool>, enabled_scripts: usize) -> Option<String> {
+    (injecting == Some(false) && enabled_scripts > 0).then(|| {
+        let head = match enabled_scripts {
+            1 => "1 script is".to_string(),
+            n => format!("{n} scripts are"),
+        };
+        format!("{head} enabled, but injection is off. Nothing will run until you turn it on.")
+    })
+}
+
+/// What the signed-in user can do with the injection switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MasterMode {
+    /// Can read and change the setting.
+    Editable,
+    /// Can read the setting but not change it: the switch shows the state, disabled.
+    ReadOnly,
+    /// Cannot even read it: the switch shows no state and is disabled.
+    NoAccess,
+}
+
+/// Pick the master card's mode from the user's scopes.
+pub fn master_mode(scopes: &[api_types::Scope]) -> MasterMode {
+    use api_types::Scope::{ConfigRead, ConfigWrite};
+    if scopes.contains(&ConfigWrite) {
+        MasterMode::Editable
+    } else if scopes.contains(&ConfigRead) {
+        MasterMode::ReadOnly
+    } else {
+        MasterMode::NoAccess
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +624,34 @@ mod tests {
             v[k] = val.clone();
         }
         serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn injection_warning_condition_and_text() {
+        assert_eq!(injection_warning(Some(true), 3), None);
+        assert_eq!(injection_warning(Some(false), 0), None);
+        assert_eq!(injection_warning(None, 3), None);
+        assert_eq!(
+            injection_warning(Some(false), 1).unwrap(),
+            "1 script is enabled, but injection is off. Nothing will run until you turn it on."
+        );
+        assert_eq!(
+            injection_warning(Some(false), 9).unwrap(),
+            "9 scripts are enabled, but injection is off. Nothing will run until you turn it on."
+        );
+    }
+
+    #[test]
+    fn master_mode_follows_config_scopes() {
+        use api_types::Scope::{ConfigRead, ConfigWrite, LogsRead};
+        assert_eq!(master_mode(&[]), MasterMode::NoAccess);
+        assert_eq!(master_mode(&[LogsRead]), MasterMode::NoAccess);
+        assert_eq!(master_mode(&[ConfigRead]), MasterMode::ReadOnly);
+        assert_eq!(
+            master_mode(&[ConfigRead, ConfigWrite]),
+            MasterMode::Editable
+        );
+        assert_eq!(master_mode(&[ConfigWrite]), MasterMode::Editable);
     }
 
     #[test]
