@@ -137,6 +137,9 @@ pub struct Delta {
 struct Bound {
     device: Arc<AtomicU32>,
     host: Arc<AtomicU32>,
+    /// Set when the entry behind the counter was dropped from the table (evicted or retired).
+    device_gone: Arc<AtomicBool>,
+    host_gone: Arc<AtomicBool>,
 }
 
 /// Live accounting of one client connection.
@@ -204,8 +207,7 @@ impl ConnTraffic {
         if self.host.load().as_str() == new {
             return;
         }
-        self.hub.flush(self);
-        self.host.store(Arc::new(new));
+        self.hub.switch(self, || self.host.store(Arc::new(new)));
     }
 
     pub fn host(&self) -> Arc<String> {
@@ -223,12 +225,13 @@ impl ConnTraffic {
             return;
         }
         drop(cur);
-        self.hub.flush(self);
-        self.ident.store(Arc::new(Ident {
-            device: device.clone(),
-            profile_id,
-            ext_session: 0,
-        }));
+        self.hub.switch(self, || {
+            self.ident.store(Arc::new(Ident {
+                device: device.clone(),
+                profile_id,
+                ext_session: 0,
+            }))
+        });
     }
 
     /// Like [`Self::note_ident`] for a connection bound to extension session `session`:
@@ -241,12 +244,13 @@ impl ConnTraffic {
         }
         drop(cur);
         let Some(device) = key() else { return };
-        self.hub.flush(self);
-        self.ident.store(Arc::new(Ident {
-            device,
-            profile_id,
-            ext_session: session,
-        }));
+        self.hub.switch(self, || {
+            self.ident.store(Arc::new(Ident {
+                device,
+                profile_id,
+                ext_session: session,
+            }))
+        });
     }
 
     pub fn device(&self) -> Arc<str> {
@@ -276,15 +280,23 @@ impl ConnTraffic {
         }
     }
 
-    fn is_bound(&self) -> bool {
-        self.bound.lock().is_some()
+    /// Counted active in entries that are still in the table.
+    fn is_bound_live(&self) -> bool {
+        self.bound
+            .lock()
+            .as_ref()
+            .is_some_and(|b| !b.device_gone.load(Relaxed) && !b.host_gone.load(Relaxed))
     }
 
     /// Count this connection active in the entries behind `b` (and no longer in its old ones).
     fn bind(&self, b: Bound) {
         let mut g = self.bound.lock();
         if let Some(old) = g.as_ref() {
-            if Arc::ptr_eq(&old.device, &b.device) && Arc::ptr_eq(&old.host, &b.host) {
+            if Arc::ptr_eq(&old.device, &b.device)
+                && Arc::ptr_eq(&old.host, &b.host)
+                && !b.device_gone.load(Relaxed)
+                && !b.host_gone.load(Relaxed)
+            {
                 return;
             }
         }
@@ -408,6 +420,8 @@ struct Agg {
     hand: [u64; 3],
     /// Live connections counted in this entry (held by the connections through [`Bound`]).
     active: Arc<AtomicU32>,
+    /// Set once the entry leaves the table, so connections holding its counter rebind.
+    gone: Arc<AtomicBool>,
     /// Bytes since the last tick.
     acc_up: u64,
     acc_down: u64,
@@ -427,6 +441,10 @@ impl Agg {
 
     fn active(&self) -> u32 {
         self.active.load(Relaxed)
+    }
+
+    fn mark_gone(&self) {
+        self.gone.store(true, Relaxed);
     }
 
     fn add(&mut self, d: &Delta, mode: Handling, now_ms: u64) {
@@ -511,6 +529,14 @@ struct DeviceAgg {
     other: Agg,
 }
 
+impl DeviceAgg {
+    /// The device entry and all its host entries leave the table.
+    fn mark_gone(&self) {
+        self.agg.mark_gone();
+        self.hosts.values().for_each(Agg::mark_gone);
+    }
+}
+
 #[derive(Default)]
 struct Table {
     devices: HashMap<Arc<str>, DeviceAgg>,
@@ -548,6 +574,7 @@ impl Table {
         if let Some(k) = victim {
             if let Some(d) = self.devices.remove(&k) {
                 self.host_count -= d.hosts.len();
+                d.mark_gone();
             }
         }
     }
@@ -582,6 +609,7 @@ impl Table {
                     .map(|(k, _)| k.clone());
                 if let Some(k) = victim {
                     if let Some(h) = dev.hosts.remove(&k) {
+                        h.mark_gone();
                         dev.other.absorb(&h);
                         self.host_count -= 1;
                     }
@@ -596,6 +624,8 @@ impl Table {
         Bound {
             device: dev.agg.active.clone(),
             host: h.active.clone(),
+            device_gone: dev.agg.gone.clone(),
+            host_gone: h.gone.clone(),
         }
     }
 
@@ -615,6 +645,7 @@ impl Table {
         for (_, _, dk, hk) in all.into_iter().take(n) {
             if let Some(d) = self.devices.get_mut(&dk) {
                 if let Some(h) = d.hosts.remove(&hk) {
+                    h.mark_gone();
                     d.other.absorb(&h);
                     self.host_count -= 1;
                 }
@@ -635,6 +666,7 @@ impl Table {
             }
             for k in retire {
                 if let Some(h) = d.hosts.remove(&k) {
+                    h.mark_gone();
                     d.other.absorb(&h);
                     self.host_count -= 1;
                 }
@@ -651,6 +683,7 @@ impl Table {
         for k in gone {
             if let Some(d) = self.devices.remove(&k) {
                 self.host_count -= d.hosts.len();
+                d.mark_gone();
             }
         }
     }
@@ -725,15 +758,18 @@ impl Traffic {
     /// Credit what `c` counted so far to its current device and host and stop counting it active
     /// there. Used before either changes (and by the final fold). A connection whose host is
     /// still unknown keeps its bytes pending for the host it will name.
-    fn flush(&self, c: &ConnTraffic) {
-        if c.host.load().is_empty() {
-            return;
-        }
+    ///
+    /// `apply` (the host or identity store) runs under the same table lock, so a fold never sees
+    /// the connection between the settle and the switch.
+    fn switch(&self, c: &ConnTraffic, apply: impl FnOnce()) {
         let mut t = self.table.lock();
-        if c.has_bytes() {
-            self.credit(&mut t, c, now_ms());
+        if !c.host.load().is_empty() {
+            if c.has_bytes() {
+                self.credit(&mut t, c, now_ms());
+            }
+            c.unbind();
         }
-        c.unbind();
+        apply();
     }
 
     /// Take `c`'s pending bytes into `t` under its current device and host. Table lock held.
@@ -788,7 +824,7 @@ impl Traffic {
                     continue;
                 }
                 // Nothing new and already counted active: no map work at all.
-                if c.is_bound() && !c.has_pending() {
+                if c.is_bound_live() && !c.has_pending() {
                     continue;
                 }
                 let b = self.credit(&mut t, c, now);
@@ -810,6 +846,7 @@ impl Traffic {
             // Counted again (as active) by the next fold, in the fresh table.
             c.unbind();
         }
+        t.devices.values().for_each(DeviceAgg::mark_gone);
         *t = Table::default();
         self.up_total.store(0, Relaxed);
         self.down_total.store(0, Relaxed);
@@ -1422,5 +1459,114 @@ mod tests {
         let d = hub.register(addr("10.0.0.41:1"));
         d.note_ext(77, 0, || None);
         assert_eq!(&*d.device(), "i:10.0.0.41");
+    }
+
+    #[test]
+    fn evicted_entry_with_live_connection_is_rebound_by_the_next_fold() {
+        let hub = Traffic::new();
+        let key = "i:10.0.0.30";
+        // Every host entry has a live connection, host0 the oldest.
+        let mut conns = Vec::new();
+        for i in 0..MAX_HOSTS_PER_DEVICE {
+            let c = hub.register(addr("10.0.0.30:1"));
+            c.set_host(&format!("h{i}.example"));
+            c.add_down(10);
+            hub.fold_with(1.0, 1_000 + i as u64);
+            conns.push(c);
+        }
+        let extra = hub.register(addr("10.0.0.30:2"));
+        extra.set_host("new.example");
+        extra.add_down(5);
+        hub.fold_with(1.0, 10_000);
+        let dv = dev(&hub.snapshot(), key);
+        assert!(!dv.hosts.iter().any(|h| h.host == "h0.example"), "evicted");
+        let total = |dv: &DeviceTraffic| {
+            dv.hosts
+                .iter()
+                .map(|h| h.row.connections_active)
+                .sum::<u32>()
+        };
+        assert_eq!(
+            total(&dv),
+            MAX_HOSTS_PER_DEVICE as u32,
+            "h0's connection is unaccounted"
+        );
+        // The next fold rebinds it to a re-created entry (evicting another, whose connection is
+        // rebound in turn): every connection stays counted, bytes stay exact.
+        hub.fold_with(1.0, 11_000);
+        let dv = dev(&hub.snapshot(), key);
+        assert_eq!(dv.row.connections_active, MAX_HOSTS_PER_DEVICE as u32 + 1);
+        assert_eq!(dv.row.down, 10 * MAX_HOSTS_PER_DEVICE as u64 + 5);
+        assert_eq!(
+            host_row(&dv, "h0.example").connections_active,
+            1,
+            "re-created entry counts the connection"
+        );
+        let kept: u64 = dv.hosts.iter().map(|h| h.row.down).sum();
+        assert_eq!(kept + dv.other.down, dv.row.down);
+        drop(conns);
+    }
+
+    #[test]
+    fn eviction_spares_hosts_with_live_connections_while_idle_ones_exist() {
+        let hub = Traffic::new();
+        let key = "i:10.0.0.31";
+        let busy = hub.register(addr("10.0.0.31:1"));
+        busy.set_host("busy.example");
+        busy.add_down(1);
+        hub.fold_with(1.0, 1_000);
+        // Idle entries (their connections closed) that are newer than the busy one.
+        for i in 0..MAX_HOSTS_PER_DEVICE {
+            let c = hub.register(addr("10.0.0.31:2"));
+            c.set_host(&format!("h{i}.example"));
+            c.add_down(1);
+            drop(c);
+            hub.fold_with(1.0, 2_000 + i as u64);
+        }
+        let dv = dev(&hub.snapshot(), key);
+        assert_eq!(dv.hosts.len(), MAX_HOSTS_PER_DEVICE);
+        assert_eq!(host_row(&dv, "busy.example").connections_active, 1);
+        assert_eq!(dv.row.connections_active, 1);
+        assert!(dv.other.down > 0, "an idle entry was evicted instead");
+    }
+
+    #[test]
+    fn host_switch_settles_and_stores_under_one_table_lock() {
+        let hub = Traffic::new();
+        let ct = hub.register(addr("10.0.0.32:1"));
+        ct.set_host("a.com");
+        ct.add_down(9);
+        // The store happens while the table lock is held, so no fold can run between the two.
+        hub.switch(&ct, || assert!(hub.table.try_lock().is_none()));
+        let dv = dev(&hub.snapshot(), "i:10.0.0.32");
+        assert_eq!(host_row(&dv, "a.com").down, 9);
+        assert_eq!(dv.row.connections_active, 0);
+        // Hammer it against a folder: once quiet, the connection is active under its last host.
+        let h2 = hub.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let folder = std::thread::spawn(move || {
+            while !s2.load(Relaxed) {
+                h2.fold_with(1.0, now_ms());
+            }
+        });
+        for i in 0..3000 {
+            ct.set_host(if i % 2 == 0 { "x.com" } else { "y.com" });
+            ct.add_down(1);
+        }
+        ct.set_host("z.com");
+        stop.store(true, Relaxed);
+        folder.join().unwrap();
+        hub.fold_with(1.0, now_ms());
+        let dv = dev(&hub.snapshot(), "i:10.0.0.32");
+        assert_eq!(host_row(&dv, "z.com").connections_active, 1);
+        assert_eq!(
+            dv.hosts
+                .iter()
+                .map(|h| h.row.connections_active)
+                .sum::<u32>(),
+            1
+        );
+        assert_eq!(dv.row.down, 9 + 3000);
     }
 }
