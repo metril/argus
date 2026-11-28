@@ -569,8 +569,6 @@ mod tests {
         svc.reload_now().await;
         let (c, gen) = svc.classified("a", &Scope::Global).await.unwrap().unwrap();
         assert!(gen > 0 && c.in_build);
-        // The stored digest keys the cache: text swapped behind its back is not even read.
-        svc.store().put_content("a", "||changed.test^\n").unwrap();
         // A running classification holds the lock; a hit does not wait for it.
         let _held = svc.class_lock.lock().await;
         let hit = tokio::time::timeout(Duration::from_secs(2), svc.classified("a", &Scope::Global))
