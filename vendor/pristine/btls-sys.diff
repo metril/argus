@@ -1,0 +1,14 @@
+--- a/build/main.rs
++++ b/build/main.rs
+@@ -479,6 +479,11 @@
+     println!("cargo:warning=applying windows cross compile patch to boringssl");
+     apply_patch(config, "boringssl-windows.patch")?;
+ 
++    // Modified by Argus: ML-DSA signature algorithms, GREASE signature algorithm and the
++    // server_padding extension, as sent by current Chrome. See vendor/README.md.
++    println!("cargo:warning=applying Argus Chrome ClientHello patch to boringssl");
++    apply_patch(config, "argus-chrome-tls.patch")?;
++
+     if config.features.underscore_wildcards {
+         println!("cargo:warning=applying underscore wildcards patch to boringssl");
+         apply_patch(config, "underscore-wildcards.patch")?;

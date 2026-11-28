@@ -1,0 +1,1139 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -139,6 +139,9 @@
+ [dependencies.btls-sys]
+ version = "0.5.6"
+ 
++[dependencies.foreign-types]
++version = "0.5"
++
+ [dependencies.bytes]
+ version = "1.11.1"
+ 
+--- a/src/client/layer/client/pool.rs
++++ b/src/client/layer/client/pool.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: `Pool::evict_where` (evict one downstream connection's upstream connections, patch 4).
+ use std::{
+     collections::{HashMap, HashSet, VecDeque},
+     convert::Infallible,
+@@ -80,6 +81,9 @@
+     // state, waiting to receive a new Request to send on the socket.
+     idle: LruCache<K, Vec<Idle<T>>>,
+     max_idle_per_host: usize,
++    // Bound on idle connections over all keys (Argus: counts connections, not keys; the
++    // oldest idle connection of the least recently used key goes first).
++    max_total_idle: Option<usize>,
+     // These are outstanding Checkouts that are waiting for a socket to be
+     // able to send a Request one. This is used when "racing" for a new
+     // connection.
+@@ -120,9 +124,8 @@
+         let inner = if config.is_enabled() {
+             Some(Arc::new(Mutex::new(PoolInner {
+                 connecting: HashSet::default(),
+-                idle: config
+-                    .max_pool_size
+-                    .map_or_else(LruCache::unbounded, LruCache::new),
++                idle: LruCache::unbounded(),
++                max_total_idle: config.max_pool_size.map(NonZeroUsize::get),
+                 idle_interval_ref: None,
+                 max_idle_per_host: config.max_idle_per_host,
+                 waiters: HashMap::default(),
+@@ -143,6 +146,26 @@
+ }
+ 
+ impl<T: Poolable, K: Key> Pool<T, K> {
++    /// Drop every idle connection (and parked waiter) whose key `matches`.
++    pub fn evict_where(&self, matches: impl Fn(&K) -> bool) {
++        let Some(ref enabled) = self.inner else {
++            return;
++        };
++        let mut inner = enabled.lock();
++        let keys: Vec<K> = inner
++            .idle
++            .iter()
++            .map(|(k, _)| k)
++            .filter(|k| matches(k))
++            .cloned()
++            .collect();
++        let evicted: Vec<_> = keys.iter().filter_map(|k| inner.idle.pop(k)).collect();
++        inner.waiters.retain(|k, _| !matches(k));
++        // Dropped outside the lock: closing a connection can run arbitrary drop code.
++        drop(inner);
++        drop(evicted);
++    }
++
+     /// Returns a `Checkout` which is a future that resolves if an idle
+     /// connection becomes available.
+     pub fn checkout(&self, key: K) -> Checkout<T, K> {
+@@ -362,6 +385,7 @@
+                     idle_at: now,
+                 });
+             }
++            self.trim_idle();
+ 
+             self.spawn_idle_interval(__pool_ref);
+         } else {
+@@ -369,6 +393,30 @@
+         }
+     }
+ 
++    /// Drop idle connections (oldest of the least recently used key first) until at most
++    /// `max_total_idle` remain.
++    fn trim_idle(&mut self) {
++        let Some(max) = self.max_total_idle else {
++            return;
++        };
++        let mut total: usize = self.idle.iter().map(|(_, v)| v.len()).sum();
++        while total > max {
++            let Some(key) = self.idle.peek_lru().map(|(k, _)| k.clone()) else {
++                break;
++            };
++            if let Some(list) = self.idle.peek_mut(&key) {
++                if !list.is_empty() {
++                    drop(list.remove(0));
++                    total -= 1;
++                }
++                if !list.is_empty() {
++                    continue;
++                }
++            }
++            self.idle.pop(&key);
++        }
++    }
++
+     /// A `Connecting` task is complete. Not necessarily successfully,
+     /// but the lock is going away, so clean up.
+     fn connected(&mut self, key: &K) {
+@@ -1107,4 +1155,26 @@
+         assert!(pool.locked().idle.get(&key2).is_some());
+         assert!(pool.locked().idle.get(&key3).is_some());
+     }
++
++    /// Argus patch 6: the re-send of an unstarted request must not take an idle connection.
++    #[tokio::test]
++    async fn an_idle_connection_is_not_handed_to_the_resend_key() {
++        use crate::conn::descriptor::{resend_descriptor, tests::descriptor};
++
++        let original = descriptor();
++        let (key, resend_key) = (original.id(), resend_descriptor(&original).id());
++        let pool = pool_no_timer();
++        drop(pool.pooled(c(key.clone()), Uniq(7)));
++
++        let mut resend = pool.checkout(resend_key);
++        assert!(
++            PollOnce(&mut resend).await.is_none(),
++            "the re-send took an idle connection"
++        );
++        // The idle connection is still there for ordinary requests.
++        match pool.checkout(key).await {
++            Ok(pooled) => assert_eq!(*pooled, Uniq(7)),
++            Err(_) => panic!("not ready"),
++        }
++    }
+ }
+--- a/src/client/layer/client.rs
++++ b/src/client/layer/client.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: `HttpClient::group_evictor` (patch 4); one internal re-send of unstarted requests, flagged (patch 5), on a fresh connection (patch 6).
+ //! Much of this codebase is adapted and refined from [hyper](https://github.com/hyperium/hyper-util),
+ 
+ mod lazy;
+@@ -43,7 +44,7 @@
+     config::RequestConfig,
+     conn::{
+         Connected, Connection,
+-        descriptor::{ConnectionDescriptor, ConnectionId},
++        descriptor::{ConnectionDescriptor, ConnectionId, resend_descriptor},
+         proxy,
+     },
+     error::ProxyConnect,
+@@ -79,6 +80,8 @@
+     source: Option<BoxError>,
+     #[allow(unused)]
+     connect_info: Option<Connected>,
++    /// Returned after the one internal re-send of an unstarted request.
++    retried: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -114,6 +117,7 @@
+             kind: ErrorKind::$kind,
+             source: None,
+             connect_info: None,
++            retried: false,
+         }
+     };
+     ($kind:ident, $src:expr) => {
+@@ -121,12 +125,24 @@
+             kind: ErrorKind::$kind,
+             source: Some($src.into()),
+             connect_info: None,
++            retried: false,
+         }
+     };
+ }
+ 
+ // ===== impl HttpClient =====
+ 
++impl<C, B> HttpClient<C, B>
++where
++    B: Send + 'static,
++{
++    /// A handle that drops the idle pooled connections opened for one request group.
++    pub(crate) fn group_evictor(&self) -> std::sync::Arc<dyn Fn(&crate::group::Group) + Send + Sync> {
++        let pool = self.pool.clone();
++        std::sync::Arc::new(move |g| pool.evict_where(|k: &ConnectionId| k.in_request_group(g)))
++    }
++}
++
+ impl HttpClient<(), ()> {
+     /// Create a builder to configure a new [`HttpClient`].
+     #[inline]
+@@ -206,20 +222,26 @@
+     ) -> Result<Response<Incoming>, Error> {
+         let uri = req.uri().clone();
+ 
++        let mut retried = false;
++        let mut descriptor = descriptor;
+         loop {
+             req = match self.try_send_request(req, descriptor.clone()).await {
+                 Ok(resp) => return Ok(resp),
+-                Err(TrySendError::Nope(err)) => return Err(err),
++                Err(TrySendError::Nope(err)) => return Err(err.retried(retried)),
+                 Err(TrySendError::Retryable {
+                     mut req,
+                     error,
+                     connection_reused,
+                 }) => {
+-                    if !self.config.retry_canceled_requests || !connection_reused {
++                    if !self.config.retry_canceled_requests || !connection_reused || retried {
+                         // if client disabled, don't retry
+                         // a fresh connection means we definitely can't retry
+-                        return Err(error);
++                        // (Argus: and one re-send at most)
++                        return Err(error.retried(retried));
+                     }
++                    retried = true;
++                    // Argus: the re-send takes a fresh connection, never another idle one.
++                    descriptor = resend_descriptor(&descriptor);
+ 
+                     trace!(
+                         "unstarted request canceled, trying again (reason={:?})",
+@@ -1006,6 +1028,7 @@
+             kind,
+             source: Some(error),
+             connect_info: None,
++            retried: false,
+         }
+     }
+ 
+@@ -1022,6 +1045,17 @@
+     }
+ 
+     #[inline]
++    fn retried(self, retried: bool) -> Self {
++        Self { retried, ..self }
++    }
++
++    /// Whether this error came after the one internal re-send.
++    #[inline]
++    pub(crate) fn is_retried(&self) -> bool {
++        self.retried
++    }
++
++    #[inline]
+     fn with_connect_info(self, connect_info: Connected) -> Self {
+         Self {
+             connect_info: Some(connect_info),
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: add `ClientBuilder::tls_custom_verify` (patch 1) and `Client::evict_group` (patch 4).
+ pub(super) mod body;
+ pub(super) mod emulate;
+ pub(super) mod future;
+@@ -65,6 +66,7 @@
+     },
+     dns::{DnsResolverWithOverrides, DynResolver, GaiResolver, IntoResolve, Resolve},
+     error::{self, Error},
++    group::Group,
+     header::OrigHeaderMap,
+     http1::Http1Options,
+     http2::Http2Options,
+@@ -73,7 +75,7 @@
+     retry,
+     rt::{BoxSendFuture, Executor, Timer},
+     tls::{
+-        AlpnProtocol, TlsOptions, TlsVersion,
++        AlpnProtocol, CustomVerify, TlsOptions, TlsVersion,
+         keylog::KeyLog,
+         session::{IntoTlsSessionCache, TlsSessionCache},
+         trust::{CertStore, Identity},
+@@ -149,7 +151,10 @@
+ ///
+ /// [`Rc`]: std::rc::Rc
+ #[derive(Clone)]
+-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
++pub struct Client(
++    Arc<Either<ClientService, BoxedClientService>>,
++    Arc<dyn Fn(&Group) + Send + Sync>,
++);
+ 
+ /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
+ #[must_use]
+@@ -216,6 +221,7 @@
+     tls_cert_store: Option<CertStore>,
+     tls_cert_verification: bool,
+     tls_verify_hostname: bool,
++    tls_custom_verify: Option<CustomVerify>,
+     tls_min_version: Option<TlsVersion>,
+     tls_max_version: Option<TlsVersion>,
+     tls_session_cache: Option<Arc<dyn TlsSessionCache>>,
+@@ -235,6 +241,13 @@
+ }
+ 
+ impl Client {
++    /// Drops the idle pooled connections that were opened for requests of `group` (see
++    /// [`RequestBuilder::group`]; groups match by their name). Connections serving a request
++    /// right now finish it, and are dropped when they next go idle only by the idle timeout.
++    pub fn evict_group(&self, group: &Group) {
++        (self.1)(group)
++    }
++
+     /// Constructs a new [`Client`].
+     ///
+     /// # Panics
+@@ -305,6 +318,7 @@
+                 tls_cert_store: None,
+                 tls_cert_verification: true,
+                 tls_verify_hostname: true,
++                tls_custom_verify: None,
+                 tls_min_version: None,
+                 tls_max_version: None,
+                 tls_session_cache: None,
+@@ -484,7 +498,7 @@
+         }
+ 
+         // Create base client service
+-        let service = {
++        let (service, evictor) = {
+             let resolver = {
+                 let mut resolver: Arc<dyn Resolve> = match config.dns_resolver {
+                     Some(dns_resolver) => dns_resolver,
+@@ -521,6 +535,7 @@
+                     .tls_sni(config.tls_sni)
+                     .verify_hostname(config.tls_verify_hostname)
+                     .cert_verification(config.tls_cert_verification)
++                    .custom_verify(config.tls_custom_verify)
+                     .session_store(config.tls_session_cache)
+                 })
+                 .with_http(|http| {
+@@ -570,7 +585,7 @@
+                 builder = builder.cookie_store(config.cookie_store);
+             }
+ 
+-            builder
++            let http = builder
+                 .http1_options(config.http1_options)
+                 .http2_options(config.http2_options)
+                 .http2_only(matches!(config.http_version_pref, HttpVersionPref::Http2))
+@@ -579,7 +594,9 @@
+                 .pool_idle_timeout(config.pool_idle_timeout)
+                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
+                 .pool_max_size(config.pool_max_size)
+-                .build(connector)
++                .build(connector);
++            let evictor = http.group_evictor();
++            (http, evictor)
+         };
+ 
+         // Configured client service with layers
+@@ -635,7 +652,7 @@
+             }
+         };
+ 
+-        Ok(Client(Arc::new(client)))
++        Ok(Client(Arc::new(client), evictor))
+     }
+ 
+     // Runtime options
+@@ -1446,6 +1463,16 @@
+         self
+     }
+ 
++    /// Installs an in-handshake certificate verification hook.
++    ///
++    /// Runs during the TLS handshake, before any request bytes are sent, and **replaces** the
++    /// built-in chain and hostname verification: the hook must verify the peer chain itself.
++    #[inline]
++    pub fn tls_custom_verify(mut self, verify: CustomVerify) -> ClientBuilder {
++        self.config.tls_custom_verify = Some(verify);
++        self
++    }
++
+     /// Configures the use of hostname verification when connecting.
+     ///
+     /// Defaults to `true`.
+--- a/src/conn/connector.rs
++++ b/src/conn/connector.rs
+@@ -1,12 +1,15 @@
++// Modified by Argus: tunnel via HTTP CONNECT to a locally resolved IP when `Proxy::resolve_locally` is set (patch 2).
+ use std::{
+     borrow::Cow,
+     future::Future,
++    net::IpAddr,
+     pin::Pin,
+     sync::Arc,
+     task::{Context, Poll},
+     time::Duration,
+ };
+ 
++use http::Uri;
+ use tokio_btls::SslStream;
+ use tower::{
+     BoxError, Service, ServiceBuilder, ServiceExt,
+@@ -22,7 +25,7 @@
+     net::TcpConnector, proxy, verbose::Verbose,
+ };
+ use crate::{
+-    dns::DynResolver,
++    dns::{DynResolver, Name},
+     error::{ProxyConnect, TimedOut, map_timeout_to_connector_error},
+     ext::UriExt,
+     proxy::{Intercepted, Matcher as ProxyMatcher, matcher::Intercept},
+@@ -53,7 +56,6 @@
+ /// Builder for `Connector`.
+ pub struct ConnectorBuilder {
+     config: Config,
+-    #[cfg(feature = "socks")]
+     resolver: DynResolver,
+     http: HttpConnector,
+     builder: TlsConnectorBuilder,
+@@ -70,7 +72,6 @@
+ #[derive(Clone)]
+ pub struct ConnectorService {
+     config: Config,
+-    #[cfg(feature = "socks")]
+     resolver: DynResolver,
+     tls: TlsConnector,
+     http: HttpConnector,
+@@ -136,7 +137,6 @@
+     ) -> crate::Result<Connector> {
+         let mut service = ConnectorService {
+             config: self.config,
+-            #[cfg(feature = "socks")]
+             resolver: self.resolver.clone(),
+             http: self.http,
+             tls: self
+@@ -205,7 +205,6 @@
+                 tls_info: false,
+                 timeout: None,
+             },
+-            #[cfg(feature = "socks")]
+             resolver: resolver.clone(),
+             http: HttpConnector::new(resolver, TcpConnector::new()),
+             builder: TlsConnector::builder(),
+@@ -410,7 +409,9 @@
+                     }
+                 }
+ 
+-                if is_https {
++                // `resolve_locally` tunnels plain http too (never absolute-form).
++                let resolve_locally = proxy.resolve_locally();
++                if is_https || resolve_locally {
+                     trace!("tunneling over HTTP(s) proxy: {:?}", proxy_uri);
+ 
+                     // Build an HTTPS connector.
+@@ -431,11 +432,19 @@
+                             tunnel = tunnel.with_headers(headers.clone());
+                         }
+ 
++                        // With `resolve_locally`, CONNECT to the vetted `ip:port`; the descriptor
++                        // keeps the hostname for SNI, verification and the Host header.
++                        let target = if resolve_locally {
++                            resolve_connect_target(&self.resolver, &uri).await?
++                        } else {
++                            uri
++                        };
++
+                         // Connect to the proxy and establish the tunnel.
+-                        tunnel.call(uri).await?
++                        tunnel.call(target).await?
+                     };
+ 
+-                    // Wrap the established tunneled stream with TLS.
++                    // Wrap the established tunneled stream with TLS (no-op for plain http).
+                     let io = connector
+                         .call(EstablishedConn::new(tunneled, descriptor))
+                         .await?;
+@@ -531,6 +540,36 @@
+     }
+ }
+ 
++/// Resolve `uri`'s host through the client's DNS resolver and return a URI whose authority is
++/// the first resolved `ip:port`, for use as the HTTP CONNECT target.
++async fn resolve_connect_target(resolver: &DynResolver, uri: &Uri) -> Result<Uri, BoxError> {
++    let host = uri.host().ok_or("URI missing host")?;
++    let port = uri.port_or_default();
++    let literal = host.trim_start_matches('[').trim_end_matches(']');
++
++    let ip = match literal.parse::<IpAddr>() {
++        Ok(ip) => ip,
++        Err(_) => {
++            let mut addrs = resolver.clone().call(Name::from(host)).await?;
++            addrs
++                .next()
++                .ok_or_else(|| BoxError::from(format!("no addresses resolved for {host}")))?
++                .ip()
++        }
++    };
++
++    let authority = match ip {
++        IpAddr::V4(ip) => format!("{ip}:{port}"),
++        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
++    };
++    Uri::builder()
++        .scheme("http")
++        .authority(authority)
++        .path_and_query("/")
++        .build()
++        .map_err(Into::into)
++}
++
+ impl Service<ConnectionDescriptor> for ConnectorService {
+     type Response = Conn;
+     type Error = BoxError;
+--- a/src/conn/descriptor.rs
++++ b/src/conn/descriptor.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: `ConnectionDescriptor::session_id` (per-device TLS session cache, patch 3) and `ConnectionId::in_request_group` (pool eviction, patch 4) and `ConnectionDescriptor::fresh` (patch 6) and `resend_descriptor`.
+ use std::{
+     hash::{BuildHasher, Hash, Hasher},
+     num::NonZeroU64,
+@@ -20,6 +21,13 @@
+ #[derive(Debug, Clone)]
+ pub(crate) struct ConnectionId(Arc<(Group, AtomicU64)>);
+ 
++impl ConnectionId {
++    /// Whether the connection was opened for requests of `target`'s request group.
++    pub(crate) fn in_request_group(&self, target: &Group) -> bool {
++        self.0.0.in_request_group(target)
++    }
++}
++
+ /// A blueprint for creating a new client connection, containing all necessary parameters.
+ ///
+ /// This descriptor bundles the target `Uri`, HTTP version, `TlsOptions`, proxy settings,
+@@ -33,6 +41,7 @@
+     tls_options: Option<TlsOptions>,
+     socket_bind: Option<SocketBindOptions>,
+     connection_id: ConnectionId,
++    session_id: ConnectionId,
+ }
+ 
+ // ===== impl ConnectionId =====
+@@ -81,13 +90,17 @@
+         tls_options: Option<TlsOptions>,
+         socket_bind: Option<SocketBindOptions>,
+     ) -> ConnectionDescriptor {
+-        let connection_id = {
++        let (connection_id, session_id) = {
+             group
+                 .uri(uri.clone())
+                 .version(version)
+                 .proxy(proxy.clone())
+                 .socket_bind(socket_bind.clone());
+-            ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
++            let session = group.session_scope();
++            (
++                ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN)))),
++                ConnectionId(Arc::new((session, AtomicU64::new(u64::MIN)))),
++            )
+         };
+ 
+         ConnectionDescriptor {
+@@ -97,9 +110,28 @@
+             tls_options,
+             socket_bind,
+             connection_id,
++            session_id,
++        }
++    }
++
++    /// The same descriptor under a unique pool key: its connection is a new one, never an idle
++    /// pooled connection. TLS session resumption is unaffected.
++    pub(crate) fn fresh(&self) -> ConnectionDescriptor {
++        let mut group = self.connection_id.0.0.clone();
++        group.fresh();
++        ConnectionDescriptor {
++            connection_id: ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN)))),
++            ..self.clone()
+         }
+     }
+ 
++    /// The TLS session cache key: the pool key, except that connections of one session scope
++    /// share it (see [`Group::session`]).
++    #[inline]
++    pub(crate) fn session_id(&self) -> ConnectionId {
++        self.session_id.clone()
++    }
++
+     /// Returns a [`ConnectionId`] group ID for this descriptor.
+     #[inline]
+     pub(crate) fn id(&self) -> ConnectionId {
+@@ -141,3 +173,39 @@
+         self.socket_bind.as_ref()
+     }
+ }
++
++/// The descriptor the one internal re-send of a canceled (unstarted) request uses: same target
++/// and TLS session scope, but a pool key no idle connection can be under, so the re-send dials a
++/// new connection instead of taking another (equally dead) idle one.
++pub(crate) fn resend_descriptor(original: &ConnectionDescriptor) -> ConnectionDescriptor {
++    original.fresh()
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use http::Uri;
++
++    use super::*;
++
++    pub(crate) fn descriptor() -> ConnectionDescriptor {
++        ConnectionDescriptor::new(
++            Uri::from_static("https://example.test/"),
++            Group::default(),
++            None,
++            None,
++            None,
++            None,
++        )
++    }
++
++    #[test]
++    fn the_resend_descriptor_is_a_new_connection_in_the_same_tls_session_scope() {
++        let original = descriptor();
++        let resend = resend_descriptor(&original);
++        assert_ne!(resend.id(), original.id(), "must not share the pool key");
++        assert_eq!(resend.session_id(), original.session_id(), "TLS resumption kept");
++        assert_eq!(resend.uri(), original.uri());
++        // Each re-send is unique, too.
++        assert_ne!(resend_descriptor(&original).id(), resend.id());
++    }
++}
+--- a/src/conn/proxy/socks.rs
++++ b/src/conn/proxy/socks.rs
+@@ -1,3 +1,6 @@
++// Modified by Argus: `SocksError::source` exposes the wrapped error, so a destination-policy
++// refusal raised by the DNS resolver stays recognisable through the error chain. The target is
++// resolved before the proxy is dialled.
+ use std::{
+     borrow::Cow,
+     task::{Context, Poll},
+@@ -52,7 +55,17 @@
+     }
+ }
+ 
+-impl std::error::Error for SocksError {}
++impl std::error::Error for SocksError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::ConnectFailed(e) | Self::DnsResolveFailure(e) => Some(&**e as _),
++            Self::Socks(e) => Some(e),
++            Self::Io(e) => Some(e),
++            Self::Utf8(e) => Some(e),
++            _ => None,
++        }
++    }
++}
+ 
+ impl From<std::io::Error> for SocksError {
+     fn from(err: std::io::Error) -> Self {
+@@ -167,13 +180,6 @@
+             let host = crate::util::strip_ipv6_brackets(host);
+             let port = dst.port_or_default();
+ 
+-            // Attempt to tcp connect to the proxy server.
+-            // This will return a `tokio::net::TcpStream` if successful.
+-            let socket = connecting
+-                .await
+-                .map_err(Into::into)
+-                .map_err(SocksError::ConnectFailed)?;
+-
+             // Resolve the target address using the provided resolver.
+             let target_addr = match dns_resolve {
+                 DnsResolve::Local => {
+@@ -190,6 +196,13 @@
+                 DnsResolve::Remote => TargetAddr::Domain(Cow::Borrowed(host), port),
+             };
+ 
++            // Attempt to tcp connect to the proxy server (after the target is resolved and
++            // vetted, so a refused target never reaches the proxy).
++            let socket = connecting
++                .await
++                .map_err(Into::into)
++                .map_err(SocksError::ConnectFailed)?;
++
+             match version {
+                 Version::V4 => {
+                     // For SOCKS4, we connect directly to the target address.
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: `Error::is_retried` (patch 5).
+ use std::{error::Error as StdError, fmt, io};
+ 
+ use http::Uri;
+@@ -219,6 +220,26 @@
+                     return true;
+                 }
+             }
++
++            source = err.source();
++        }
++
++        false
++    }
++
++    /// Returns true if the error came after the client already re-sent the request once because
++    /// its reused connection was closed before the request started.
++    pub fn is_retried(&self) -> bool {
++        use crate::client::layer::client::Error;
++
++        let mut source = self.source();
++
++        while let Some(err) = source {
++            if let Some(err) = err.downcast_ref::<Error>() {
++                if err.is_retried() {
++                    return true;
++                }
++            }
+ 
+             source = err.source();
+         }
+--- a/src/group.rs
++++ b/src/group.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: `Group::session` / `Group::session_scope` (per-device TLS session cache, patch 3) and `Group::in_request_group` (pool eviction, patch 4) and `Group::fresh` (fresh connection for a re-send, patch 6).
+ //! # Request Grouping Mechanism
+ //!
+ //! This module provides the [`Group`] structure, which defines the logical boundaries
+@@ -40,6 +41,7 @@
+ }
+ 
+ impl_group_variants! {
++    Session(GroupId),
+     Request(Group),
+     Emulate(Group),
+     Named(GroupId),
+@@ -47,6 +49,7 @@
+     Version(Version),
+     Proxy(Matcher),
+     SocketBind(Option<SocketBindOptions>),
++    Fresh(u64),
+ }
+ 
+ /// A logical identifier for request grouping.
+@@ -68,6 +71,50 @@
+         )]))
+     }
+ 
++    /// Tags this group with a TLS session scope. Connections of different request groups that
++    /// carry the same scope share TLS session resumption (the session cache key drops the
++    /// request group and keeps the scope); connections never share sessions across scopes.
++    #[inline]
++    pub fn session<N: Into<GroupId>>(mut self, scope: N) -> Self {
++        self.0
++            .insert(GroupKey::Session, GroupVariant::Session(scope.into()));
++        self
++    }
++
++    /// The key of the TLS session cache entry for connections of this group: the group itself,
++    /// with its request group replaced by the request group's session scope when it has one.
++    pub(crate) fn session_scope(&self) -> Group {
++        let mut out = self.clone();
++        if let Some(GroupVariant::Request(inner)) = self.0.get(&GroupKey::Request) {
++            if let Some(scope) = inner.0.get(&GroupKey::Session) {
++                out.0.remove(&GroupKey::Request);
++                out.0.insert(GroupKey::Session, scope.clone());
++            }
++        }
++        out
++    }
++
++    /// Whether this (connection) group was made by a request in a group that carries the same
++    /// name as `target` (the session scope and other criteria of `target` are ignored).
++    pub(crate) fn in_request_group(&self, target: &Group) -> bool {
++        let Some(want) = target.0.get(&GroupKey::Named) else {
++            return false;
++        };
++        matches!(
++            self.0.get(&GroupKey::Request),
++            Some(GroupVariant::Request(inner)) if inner.0.get(&GroupKey::Named) == Some(want)
++        )
++    }
++
++    /// Makes this group unique, so a pool never has an idle connection under its key.
++    pub(crate) fn fresh(&mut self) -> &mut Self {
++        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
++        self.extend(
++            GroupKey::Fresh,
++            GroupVariant::Fresh(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
++        )
++    }
++
+     /// Groups the request by a specific target [`Uri`].
+     #[inline]
+     pub(crate) fn uri(&mut self, uri: Uri) -> &mut Self {
+--- a/src/proxy/matcher.rs
++++ b/src/proxy/matcher.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: expose `Intercept::resolve_locally` (patch 2).
+ //! Proxy matchers
+ //!
+ //! This module contains different matchers to configure rules for when a proxy
+@@ -161,6 +162,11 @@
+     }
+ 
+     #[inline]
++    pub(crate) fn resolve_locally(&self) -> bool {
++        self.extra.resolve_locally
++    }
++
++    #[inline]
+     pub(crate) fn custom_headers(&self) -> Option<&HeaderMap> {
+         self.extra.misc.as_ref()
+     }
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: add `Proxy::resolve_locally` (CONNECT to a locally resolved IP, patch 2).
+ #[cfg(all(target_os = "macos", feature = "system-proxy"))]
+ mod mac;
+ #[cfg(unix)]
+@@ -99,6 +100,7 @@
+ struct Extra {
+     auth: Option<HeaderValue>,
+     misc: Option<HeaderMap>,
++    resolve_locally: bool,
+ }
+ 
+ // ===== impl Proxy =====
+@@ -185,6 +187,7 @@
+             extra: Extra {
+                 auth: None,
+                 misc: None,
++                resolve_locally: false,
+             },
+             scheme,
+             no_proxy: None,
+@@ -271,6 +274,17 @@
+         self
+     }
+ 
++    /// Resolve the target host locally and send the vetted `ip:port` in the HTTP CONNECT line.
++    ///
++    /// For HTTP proxies the target host is resolved through the client's configured DNS resolver,
++    /// the proxy is asked to `CONNECT ip:port`, and TLS SNI, certificate verification and the
++    /// `Host` header keep using the hostname. Plain `http` targets are tunnelled via CONNECT too
++    /// (never absolute-form). Has no effect on SOCKS or Unix-socket proxies.
++    pub fn resolve_locally(mut self, enabled: bool) -> Proxy {
++        self.extra.resolve_locally = enabled;
++        self
++    }
++
+     /// Adds a `No Proxy` exclusion list to this Proxy
+     ///
+     /// # Example
+@@ -389,6 +403,7 @@
+ impl Hash for Extra {
+     fn hash<H: Hasher>(&self, state: &mut H) {
+         self.auth.hash(state);
++        self.resolve_locally.hash(state);
+         if let Some(ref misc) = self.misc {
+             for (k, v) in misc.iter() {
+                 k.as_str().hash(state);
+--- a/src/tls/conn.rs
++++ b/src/tls/conn.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: add `TlsConnectorBuilder::custom_verify`, an in-handshake certificate verification hook (patch 1).
+ //! SSL support via BoringSSL.
+ 
+ #[macro_use]
+@@ -17,7 +18,10 @@
+ use btls::{
+     error::ErrorStack,
+     ex_data::Index,
+-    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
++    ssl::{
++        Ssl, SslAlert, SslConnector, SslMethod, SslOptions, SslSessionCacheMode, SslVerifyError,
++        SslVerifyMode,
++    },
+ };
+ use ext::SslConnectorBuilderExt;
+ use http::{Uri, Version};
+@@ -29,13 +33,19 @@
+     Error,
+     conn::{Connected, Connection, descriptor::ConnectionDescriptor},
+     tls::{
+-        AlpnProtocol, AlpsProtocol, KeyShare, TlsOptions, TlsVersion,
++        AlpnProtocol, AlpsProtocol, CustomVerify, KeyShare, TlsOptions, TlsVersion,
+         keylog::KeyLog,
+         session::{Key, LruTlsSessionCache, TlsSession, TlsSessionCache},
+         trust::{CertStore, Identity},
+     },
+ };
+ 
++fn host_index() -> Result<Index<Ssl, String>, ErrorStack> {
++    static IDX: LazyLock<Result<Index<Ssl, String>, ErrorStack>> =
++        LazyLock::new(Ssl::new_ex_index);
++    IDX.clone()
++}
++
+ fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
+     static IDX: LazyLock<Result<Index<Ssl, Key>, ErrorStack>> = LazyLock::new(Ssl::new_ex_index);
+     IDX.clone()
+@@ -46,6 +56,7 @@
+ pub struct HandshakeSettings {
+     no_ticket: bool,
+     enable_ech_grease: bool,
++    server_padding_request: Option<u16>,
+     verify_hostname: bool,
+     tls_sni: bool,
+     alpn_protocols: Option<Cow<'static, [AlpnProtocol]>>,
+@@ -73,6 +84,7 @@
+     cert_store: Option<CertStore>,
+     cert_verification: bool,
+     keylog: Option<KeyLog>,
++    custom_verify: Option<CustomVerify>,
+     session_cache: Arc<dyn TlsSessionCache>,
+ }
+ 
+@@ -122,6 +134,7 @@
+             cert_store: None,
+             cert_verification: true,
+             keylog: None,
++            custom_verify: None,
+             session_cache: Arc::new(LruTlsSessionCache::new(8)),
+         }
+     }
+@@ -130,7 +143,8 @@
+         let cfg = self.ssl.configure()?;
+         let host = uri.host().ok_or("URI missing host")?;
+         let host = Self::normalize_host(host);
+-        let ssl = cfg.into_ssl(host)?;
++        let mut ssl = cfg.into_ssl(host)?;
++        ssl.set_ex_data(host_index()?, host.to_string());
+         Ok(ssl)
+     }
+ 
+@@ -198,7 +212,7 @@
+         let host = Self::normalize_host(host);
+ 
+         if let Some(ref cache) = self.cache {
+-            let key = Key(descriptor.id());
++            let key = Key(descriptor.session_id());
+ 
+             // If the session cache is enabled, we try to retrieve the session
+             // associated with the key. If it exists, we set it in the SSL configuration.
+@@ -215,7 +229,19 @@
+             cfg.set_ex_data(idx, key);
+         }
+ 
+-        Ok(cfg.into_ssl(host)?)
++        // Remember the expected identity for the custom verify hook.
++        let mut ssl = cfg.into_ssl(host)?;
++        ssl.set_ex_data(host_index()?, host.to_string());
++
++        // Modified by Argus: the server_padding extension is per connection.
++        if let Some(bytes) = self.settings.server_padding_request {
++            use foreign_types::ForeignType;
++            #[allow(unsafe_code)]
++            unsafe {
++                btls_sys::SSL_set_server_padding_request(ssl.as_ptr(), bytes);
++            }
++        }
++        Ok(ssl)
+     }
+ 
+     /// If `host` is an IPv6 address, we must strip away the square brackets that surround
+@@ -248,6 +274,18 @@
+         self
+     }
+ 
++    /// Sets an in-handshake certificate verification hook.
++    ///
++    /// The hook runs inside the TLS handshake (BoringSSL custom verify, `SslVerifyMode::PEER`),
++    /// so an `Err` aborts the connection before any application bytes are sent. It **replaces**
++    /// the built-in chain and hostname verification: the hook must perform full verification
++    /// itself, using `SslRef::peer_cert_chain()` and `SslRef::servername()`.
++    #[inline]
++    pub fn custom_verify(mut self, verify: Option<CustomVerify>) -> Self {
++        self.custom_verify = verify;
++        self
++    }
++
+     /// Sets the identity to be used for client certificate authentication.
+     #[inline]
+     pub fn identity(mut self, identity: Option<Identity>) -> Self {
+@@ -388,6 +426,25 @@
+         // Set TLS permute extensions options
+         set_option!(opts, permute_extensions, connector, set_permute_extensions);
+ 
++        // Modified by Argus: GREASE signature algorithm and trust anchors (patched BoringSSL).
++        #[allow(unsafe_code)]
++        unsafe {
++            btls_sys::SSL_CTX_set_grease_signature_algorithm(
++                connector.as_ptr(),
++                opts.grease_signature_algorithm as _,
++            );
++            if let Some(ref ids) = opts.requested_trust_anchors {
++                if btls_sys::SSL_CTX_set1_requested_trust_anchors(
++                    connector.as_ptr(),
++                    ids.as_ptr(),
++                    ids.len(),
++                ) != 1
++                {
++                    return Err(Error::tls(ErrorStack::get()));
++                }
++            }
++        }
++
+         // Set TLS curves list
+         set_option_ref_try!(opts, curves_list, connector, set_curves_list);
+ 
+@@ -426,6 +483,27 @@
+                 .map_err(Error::tls)?;
+         }
+ 
++        // Set the in-handshake certificate verification hook.
++        if let Some(verify) = self.custom_verify.clone() {
++            connector.set_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
++                let host = host_index()
++                    .ok()
++                    .and_then(|idx| ssl.ex_data(idx).cloned())
++                    .unwrap_or_default();
++                // A panic must not unwind through BoringSSL's C frames.
++                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| verify(ssl, &host)))
++                {
++                    Ok(res) => res.map_err(SslVerifyError::Invalid),
++                    Err(_) => Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR)),
++                }
++            });
++            // BoringSSL skips the verify callback on resumed sessions unless told otherwise.
++            #[allow(unsafe_code)]
++            unsafe {
++                btls_sys::SSL_CTX_set_reverify_on_resume(connector.as_ptr(), 1);
++            }
++        }
++
+         // Set TLS keylog handler.
+         if let Some(ref policy) = self.keylog {
+             let handle = policy.clone().handle().map_err(Error::tls)?;
+@@ -443,6 +521,7 @@
+             alps_protocols: opts.alps_protocols.clone(),
+             alps_use_new_codepoint: opts.alps_use_new_codepoint,
+             enable_ech_grease: opts.enable_ech_grease,
++            server_padding_request: opts.server_padding_request,
+             key_shares: opts.key_shares.clone(),
+             random_aes_hw_override: opts.random_aes_hw_override,
+         };
+--- a/src/tls.rs
++++ b/src/tls.rs
+@@ -1,3 +1,4 @@
++// Modified by Argus: add the `CustomVerify` in-handshake certificate verification hook type (patch 1).
+ //!  TLS options configuration
+ //!
+ //! - Various parts of TLS can also be configured or even disabled on the `ClientBuilder`.
+@@ -12,7 +13,18 @@
+ use std::borrow::Cow;
+ 
+ /// Re-exports of TLS-related types from `btls` for public use.
+-pub use btls::ssl::{ExtensionType, KeyShare};
++pub use btls::ssl::{ExtensionType, KeyShare, NameType, SslAlert, SslRef};
++
++/// In-handshake certificate verification hook (see `ClientBuilder::tls_custom_verify`).
++///
++/// Receives the connection's `SslRef` (peer chain via `peer_cert_chain()`) and the normalized
++/// expected host (DNS name or IP literal, without IPv6 brackets) the connection was made for.
++/// The expected host is always set, unlike the SNI (absent for IP literals and with
++/// `tls_sni(false)`), so the hook **must** check the peer certificate against it.
++/// `Err(alert)` aborts the handshake with that alert; a panic is mapped to `INTERNAL_ERROR`.
++/// Runs on resumed sessions too.
++pub type CustomVerify =
++    std::sync::Arc<dyn Fn(&mut SslRef, &str) -> Result<(), SslAlert> + Send + Sync>;
+ use bytes::{BufMut, Bytes, BytesMut};
+ use compress::CertificateCompressor;
+ 
+@@ -199,6 +211,26 @@
+     /// **Default:** `None` (implementation default)
+     pub permute_extensions: Option<bool>,
+ 
++    /// Sends a GREASE value first in the `signature_algorithms` extension (Chrome 153+), when
++    /// GREASE is enabled. Modified by Argus (patch 8, needs the patched BoringSSL of `btls-sys`).
++    ///
++    /// **Default:** `false`
++    pub grease_signature_algorithm: bool,
++
++    /// Sends the `server_padding` extension (0x12e0) requesting this many bytes of padding in
++    /// the server's EncryptedExtensions. Chrome sends `0` only while its field trial is on, so no
++    /// Argus profile enables it; the option exists to emulate such a build. Modified by Argus (patch 8).
++    ///
++    /// **Default:** `None` (extension not sent)
++    pub server_padding_request: Option<u16>,
++
++    /// Trust anchor identifiers for the `trust_anchors` extension (0xca34), in wire format (a
++    /// series of 8-bit length-prefixed strings). `Some(&[])` sends the extension with an empty
++    /// list. Modified by Argus (patch 8).
++    ///
++    /// **Default:** `None` (extension not sent)
++    pub requested_trust_anchors: Option<Cow<'static, [u8]>>,
++
+     /// Controls whether GREASE extensions ([RFC 8701](https://datatracker.ietf.org/doc/html/rfc8701))
+     /// are enabled in general.
+     ///
+@@ -359,6 +391,33 @@
+         self
+     }
+ 
++    /// Sends a GREASE signature algorithm first in `signature_algorithms`. Modified by Argus.
++    #[inline]
++    pub fn grease_signature_algorithm(mut self, enabled: bool) -> Self {
++        self.config.grease_signature_algorithm = enabled;
++        self
++    }
++
++    /// Sends the `server_padding` extension requesting `bytes` of padding. Modified by Argus.
++    #[inline]
++    pub fn server_padding_request<T>(mut self, bytes: T) -> Self
++    where
++        T: Into<Option<u16>>,
++    {
++        self.config.server_padding_request = bytes.into();
++        self
++    }
++
++    /// Sends the `trust_anchors` extension with this wire-format list. Modified by Argus.
++    #[inline]
++    pub fn requested_trust_anchors<T>(mut self, ids: T) -> Self
++    where
++        T: Into<Option<Cow<'static, [u8]>>>,
++    {
++        self.config.requested_trust_anchors = ids.into();
++        self
++    }
++
+     /// Sets whether to permute ClientHello extensions.
+     #[inline]
+     pub fn permute_extensions<T>(mut self, permute: T) -> Self
+@@ -557,6 +616,9 @@
+             pre_shared_key: false,
+             enable_ech_grease: false,
+             permute_extensions: None,
++            grease_signature_algorithm: false,
++            server_padding_request: None,
++            requested_trust_anchors: None,
+             grease_enabled: None,
+             enable_ocsp_stapling: false,
+             enable_signed_cert_timestamps: false,

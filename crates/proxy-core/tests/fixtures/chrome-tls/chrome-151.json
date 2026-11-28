@@ -1,0 +1,114 @@
+{
+ "ja4": "t13d1516h2_8daaf6152771_806a8c22fdea",
+ "cipher_suites": [
+  "GREASE",
+  "1301",
+  "1302",
+  "1303",
+  "c02b",
+  "c02f",
+  "c02c",
+  "c030",
+  "cca9",
+  "cca8",
+  "c013",
+  "c014",
+  "009c",
+  "009d",
+  "002f",
+  "0035"
+ ],
+ "groups": [
+  "GREASE",
+  "11ec",
+  "001d",
+  "0017",
+  "0018"
+ ],
+ "key_shares": [
+  "GREASE:1",
+  "11ec:1216",
+  "001d:32"
+ ],
+ "sigalgs": [
+  "0904",
+  "0905",
+  "0906",
+  "0403",
+  "0804",
+  "0401",
+  "0503",
+  "0805",
+  "0501",
+  "0806",
+  "0601"
+ ],
+ "sigalg_grease_first": false,
+ "sigalg_grease_count": 0,
+ "alpn": [
+  "h2",
+  "http/1.1"
+ ],
+ "alps_17613": [
+  "h2"
+ ],
+ "alps_17513": null,
+ "cert_compression": [
+  "0002"
+ ],
+ "psk_modes": [
+  1
+ ],
+ "supported_versions": [
+  "GREASE",
+  "0304",
+  "0303"
+ ],
+ "ec_point_formats": [
+  0
+ ],
+ "status_request": "0100000000",
+ "ext_set": [
+  "0000",
+  "0005",
+  "000a",
+  "000b",
+  "000d",
+  "0010",
+  "0012",
+  "0017",
+  "001b",
+  "0023",
+  "002b",
+  "002d",
+  "0033",
+  "44cd",
+  "fe0d",
+  "ff01"
+ ],
+ "ext_grease_first_last": true,
+ "trust_anchors": null,
+ "server_padding": null,
+ "ech_header": "0000010001",
+ "ech_enc_len": 32,
+ "ech_payload_lens": [
+  186,
+  218,
+  250,
+  282
+ ],
+ "ext_orders_seen": 12,
+ "source": {
+  "browser": "Google Chrome 151.0.7922.137",
+  "flags": [
+   "--headless=new",
+   "--no-sandbox",
+   "--disable-gpu",
+   "--no-first-run",
+   "--disable-field-trial-config",
+   "--ignore-certificate-errors"
+  ],
+  "samples": 12,
+  "captured": "2026-11-28"
+ }
+}

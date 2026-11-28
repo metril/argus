@@ -29,7 +29,7 @@ impl Default for BrowserProfile {
     fn default() -> Self {
         Self {
             family: Family::Chrome,
-            profile: Profile::Chrome149,
+            profile: Profile::Chrome156,
         }
     }
 }
@@ -76,6 +76,9 @@ const CHROME: &[(u32, Profile)] = &[
     (147, Profile::Chrome147),
     (148, Profile::Chrome148),
     (149, Profile::Chrome149),
+    (151, Profile::Chrome151),
+    (153, Profile::Chrome153),
+    (156, Profile::Chrome156),
 ];
 
 const EDGE: &[(u32, Profile)] = &[
@@ -98,6 +101,14 @@ const EDGE: &[(u32, Profile)] = &[
     (146, Profile::Edge146),
     (147, Profile::Edge147),
     (148, Profile::Edge148),
+    // Edge 151 and newer is Chromium with the same network stack: `wreq-util`'s Edge 143 to 148
+    // profiles are the Chrome ones with other client hints (see `edge_tls_equals_chrome_tls`), and
+    // Argus forwards the browser's own headers, so the matching Chrome profile is the Edge
+    // handshake. Not verified against a real Edge build (none was available to capture): an Edge
+    // field trial could differ in `trust_anchors` or `server_padding`.
+    (151, Profile::Chrome151),
+    (153, Profile::Chrome153),
+    (156, Profile::Chrome156),
 ];
 
 const FIREFOX: &[(u32, Profile)] = &[
@@ -392,6 +403,36 @@ mod tests {
                 P::Edge147,
             ),
             (
+                "Edge 150 is still the 148 handshake",
+                vec![ch(r#""Chromium";v="150", "Microsoft Edge";v="150""#)],
+                Edge,
+                P::Edge148,
+            ),
+            (
+                "Edge 151 takes the Chrome 151 handshake, family stays Edge",
+                vec![ch(r#""Chromium";v="151", "Microsoft Edge";v="151""#)],
+                Edge,
+                P::Chrome151,
+            ),
+            (
+                "Edge 154 rounds down to 153",
+                vec![ch(r#""Chromium";v="154", "Microsoft Edge";v="154""#)],
+                Edge,
+                P::Chrome153,
+            ),
+            (
+                "Edge 158 and newer use 156",
+                vec![ch(r#""Chromium";v="158", "Microsoft Edge";v="158""#)],
+                Edge,
+                P::Chrome156,
+            ),
+            (
+                "Edge 156 by UA",
+                vec![("user-agent", format!("{CHROME_UA} Edg/156.0.3000.1"))],
+                Edge,
+                P::Chrome156,
+            ),
+            (
                 "Chromium-only brands (Brave, Opera) are Chrome",
                 vec![ch(r#""Brave";v="141", "Chromium";v="141""#)],
                 Chrome,
@@ -404,6 +445,24 @@ mod tests {
                 P::Chrome124,
             ),
             (
+                "Chrome 150 is still the 149 handshake",
+                vec![ch(r#""Google Chrome";v="150""#)],
+                Chrome,
+                P::Chrome149,
+            ),
+            (
+                "Chrome 152 and 155 round down to 151 and 153",
+                vec![ch(r#""Google Chrome";v="152""#)],
+                Chrome,
+                P::Chrome151,
+            ),
+            (
+                "Chrome 158 (between 156 and nothing newer) uses 156",
+                vec![ch(r#""Google Chrome";v="158""#)],
+                Chrome,
+                P::Chrome156,
+            ),
+            (
                 "version below the oldest rounds up to it",
                 vec![ch(r#""Google Chrome";v="80""#)],
                 Chrome,
@@ -413,7 +472,7 @@ mod tests {
                 "version above the newest uses the newest",
                 vec![ch(r#""Google Chrome";v="200""#)],
                 Chrome,
-                P::Chrome149,
+                P::Chrome156,
             ),
             ("Chrome by UA", vec![("user-agent", CHROME_UA.into())], Chrome, P::Chrome146),
             (
@@ -470,8 +529,8 @@ mod tests {
                 Chrome,
                 P::Chrome139,
             ),
-            ("no hints, no UA", vec![], Chrome, P::Chrome149),
-            ("curl is the default", vec![("user-agent", "curl/8.5.0".into())], Chrome, P::Chrome149),
+            ("no hints, no UA", vec![], Chrome, P::Chrome156),
+            ("curl is the default", vec![("user-agent", "curl/8.5.0".into())], Chrome, P::Chrome156),
             (
                 "unrecognised hints fall back to the UA",
                 vec![ch(r#""Not A;Brand";v="99""#), ("user-agent", CHROME_UA.into())],
@@ -494,6 +553,48 @@ mod tests {
         assert!(FIREFOX.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(SAFARI.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(SAFARI_IOS.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    /// The premise of the Edge 151+ mapping: wherever `wreq-util` has both, an Edge profile and
+    /// the Chrome profile of the same major differ only in headers, never in the TLS or HTTP/2
+    /// transport options (Edge 143 to 148 share Chrome's builders).
+    #[test]
+    fn edge_tls_equals_chrome_tls() {
+        let pairs = [
+            (Profile::Edge143, Profile::Chrome143),
+            (Profile::Edge144, Profile::Chrome144),
+            (Profile::Edge145, Profile::Chrome145),
+            (Profile::Edge146, Profile::Chrome146),
+            (Profile::Edge147, Profile::Chrome147),
+            (Profile::Edge148, Profile::Chrome148),
+        ];
+        for (edge, chrome) in pairs {
+            let e = BrowserProfile {
+                family: Family::Edge,
+                profile: edge,
+            }
+            .emulation();
+            let c = BrowserProfile {
+                family: Family::Chrome,
+                profile: chrome,
+            }
+            .emulation();
+            assert_eq!(
+                format!("{:?}", e.tls_options),
+                format!("{:?}", c.tls_options),
+                "{edge:?}"
+            );
+            assert_eq!(
+                format!("{:?}", e.http2_options),
+                format!("{:?}", c.http2_options),
+                "{edge:?}"
+            );
+            assert_eq!(
+                format!("{:?}", e.http1_options),
+                format!("{:?}", c.http1_options),
+                "{edge:?}"
+            );
+        }
     }
 
     #[test]

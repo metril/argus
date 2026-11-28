@@ -1,0 +1,4 @@
+# crate version sha256-of-the-.crate (equals the crates.io index "cksum"; verified by scripts/verify-vendor.sh)
+btls-sys 0.5.6 9b1b8638a2e1c38a5ae4efa90ae57e643baec35a30d03fc5b399b893adc4954b
+wreq 6.0.0-rc.31 0b100d81c46113fa7f0719e43b26b13264b38589a4f059e6ebfccb5308159336
+wreq-util 3.0.0-rc.14 1d8d73c75be86fbde675988dbe5cb15f02567025c13f6ffab910361ad1ba6c89

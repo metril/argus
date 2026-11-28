@@ -1795,6 +1795,111 @@ mod_generator!(
     ]
 );
 
+// Chrome 151, 153 and 156 differ from 149 in the ClientHello (ML-DSA signature algorithms; a GREASE
+// signature algorithm and the trust_anchors extension; a new trust anchor list). Captured from real
+// builds, see docs/UPSTREAM-TLS.md. Modified by Argus.
+mod_generator!(
+    v151,
+    tls_options!(8, CURVES_3),
+    http2_options!(3),
+    header_initializer_with_zstd_priority,
+    [
+        (
+            MacOS,
+            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+        ),
+        (
+            Linux,
+            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+        ),
+        (
+            Android,
+            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36"
+        ),
+        (
+            Windows,
+            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+        ),
+        (
+            IOS,
+            r#""Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151""#,
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/151.0.0.0 Mobile/15E148 Safari/604.1"
+        )
+    ]
+);
+
+mod_generator!(
+    v153,
+    tls_options!(9, CURVES_3, TRUST_ANCHORS_153),
+    http2_options!(3),
+    header_initializer_with_zstd_priority,
+    [
+        (
+            MacOS,
+            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        ),
+        (
+            Linux,
+            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        ),
+        (
+            Android,
+            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36"
+        ),
+        (
+            Windows,
+            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        ),
+        (
+            IOS,
+            r#""Not_A Brand";v="8", "Chromium";v="153", "Google Chrome";v="153""#,
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/153.0.0.0 Mobile/15E148 Safari/604.1"
+        )
+    ]
+);
+
+mod_generator!(
+    v156,
+    tls_options!(9, CURVES_3, TRUST_ANCHORS_156),
+    http2_options!(3),
+    header_initializer_with_zstd_priority,
+    [
+        (
+            MacOS,
+            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        ),
+        (
+            Linux,
+            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        ),
+        (
+            Android,
+            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Mobile Safari/537.36"
+        ),
+        (
+            Windows,
+            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+        ),
+        (
+            IOS,
+            r#""Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156""#,
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/156.0.0.0 Mobile/15E148 Safari/604.1"
+        )
+    ]
+);
+
 mod_generator!(
     edge143,
     v132::build_emulation,
