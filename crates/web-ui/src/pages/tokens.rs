@@ -341,7 +341,7 @@ pub fn TokensPage() -> impl IntoView {
                             <dt>"Last used"</dt><dd>{ago}{addr.map(|a| format!(" from {a}"))}</dd>
                             <dt>"Profiles"</dt><dd>{profile_label(&t)}</dd>
                         </dl>
-                        {grace.map(|g| view! { <div class="banner info"><Icon name="alert" /><span class="bt">{g}</span></div> })}
+                        {grace.map(|g| view! { <div class="banner info"><Icon name="info" /><span class="bt">{g}</span></div> })}
                         <div class="sec-t">"Permissions"</div>
                         <p>{summary_sentence(&t.scopes)}</p>
                         <GrantedList scopes=t.scopes.clone() unknown=t.unknown_scopes.clone() />
