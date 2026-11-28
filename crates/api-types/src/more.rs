@@ -769,54 +769,6 @@ pub struct ExtStatsDto {
     pub issues_truncated: usize,
 }
 
-/// A well-known list that can be added with `POST /lists/catalogue/{id}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct CatalogueEntryResponse {
-    pub id: String,
-    pub name: String,
-    pub url: String,
-    /// `abp`, `ubo`, `adguard`, `hosts`, `domains` or `ips`.
-    pub format: String,
-    pub category: String,
-    pub licence: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub homepage: String,
-    /// Language/region the list targets (`de`, `fr`, ...).
-    #[serde(default)]
-    pub region: Option<String>,
-    /// The licence forbids commercial use.
-    #[serde(default)]
-    pub noncommercial: bool,
-    #[serde(default)]
-    pub licence_note: Option<String>,
-    /// Adding it makes the list trusted (extended rules may run).
-    #[serde(default)]
-    pub trusted: bool,
-    /// Recommended: installed and enabled on a fresh install.
-    #[serde(default)]
-    pub default_enabled: bool,
-    /// Already installed as a list.
-    pub installed: bool,
-}
-
-/// The catalogue and where it came from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct CatalogueResponse {
-    /// `signed` for a fetched argus-lists release, `snapshot` for the signed copy built into the
-    /// binary (no release fetched yet), `signed` with no entries while none has loaded.
-    pub source: String,
-    /// When the signed copy was fetched and verified (RFC 3339); absent for `snapshot` and while
-    /// none has loaded.
-    pub fetched_at: Option<String>,
-    /// Release of the signed copy.
-    pub version: Option<String>,
-    pub entries: Vec<CatalogueEntryResponse>,
-}
-
 /// A handed-off rule and what the extended-rule index did with it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
