@@ -286,13 +286,7 @@ pub async fn login(
 }
 
 /// Scopes of an extension token: what the popup and the userscript bridge need, nothing else.
-const EXTENSION_SCOPES: [api_types::Scope; 5] = [
-    api_types::Scope::LogsRead,
-    api_types::Scope::UserscriptsBridge,
-    api_types::Scope::StatsRead,
-    api_types::Scope::RulesSite,
-    api_types::Scope::RulesExt,
-];
+pub const EXTENSION_SCOPES: &[api_types::Scope] = api_types::scopes::TEMPLATE_BROWSER_EXTENSION;
 
 /// Sign in from the browser extension: the same credential check and rate limit as login, but no
 /// session or cookies. Mints a token named `Extension · {browser}` (no expiry) with just the
@@ -354,6 +348,7 @@ pub async fn extension_token(
             uid,
             uname,
             None,
+            api_types::TokenPurpose::Extension,
         )?;
         // Only the caller's own extension tokens may be replaced.
         let want = EXTENSION_SCOPES.to_vec();

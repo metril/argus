@@ -102,6 +102,78 @@ pub struct CreateTokenRequest {
     /// Restrict the token to these profile ids (enforced once profiles exist).
     #[serde(default)]
     pub profiles: Option<Vec<String>>,
+    /// What the token is for (a label for the UI; grants nothing). Default `custom`.
+    #[serde(default)]
+    pub purpose: Option<TokenPurpose>,
+}
+
+/// What a token was made for. A presentation label only; the scopes decide access.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TokenPurpose {
+    Extension,
+    Monitoring,
+    Script,
+    Full,
+    ReadOnly,
+    #[default]
+    Custom,
+}
+
+/// Change a token. Absent fields stay as they are. Scopes and profiles are checked like on
+/// creation: nothing can be widened beyond what the caller holds, and narrowing is always fine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
+pub struct UpdateTokenRequest {
+    #[cfg_attr(
+        feature = "server",
+        validate(length(min = 1, max = 100, message = "Name must be 1-100 characters"))
+    )]
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Replaces the scopes; a non-empty subset of the caller's own.
+    #[serde(default)]
+    pub scopes: Option<Vec<Scope>>,
+    /// Replaces the profile restriction (ids of existing profiles).
+    #[serde(default)]
+    pub profiles: Option<Vec<String>>,
+    /// Remove the profile restriction (only for a caller who is not restricted).
+    #[serde(default)]
+    pub clear_profiles: bool,
+    #[serde(default)]
+    pub purpose: Option<TokenPurpose>,
+    /// New lifetime in days from now. Exclusive with `expires_at` and `never_expires`.
+    #[cfg_attr(feature = "server", validate(range(min = 1, max = 3650)))]
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+    /// New absolute expiry (RFC 3339, in the future).
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Remove the expiry.
+    #[serde(default)]
+    pub never_expires: bool,
+}
+
+/// Issue a new secret for a token.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "server", derive(validator::Validate, utoipa::ToSchema))]
+pub struct RegenerateTokenRequest {
+    /// Seconds the old secret keeps working (0 to 7 days, default 0).
+    #[cfg_attr(feature = "server", validate(range(min = 0, max = 604800)))]
+    #[serde(default)]
+    pub grace_secs: u32,
+    /// New lifetime in days. Required (one of the three) for an expired token; on a live token
+    /// it replaces the expiry when given.
+    #[cfg_attr(feature = "server", validate(range(min = 1, max = 3650)))]
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+    /// New absolute expiry (RFC 3339, in the future).
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Remove the expiry.
+    #[serde(default)]
+    pub never_expires: bool,
 }
 
 /// Sign in from the browser extension: checks the credentials like a login, but starts no session
@@ -153,6 +225,22 @@ pub struct ApiTokenInfo {
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
     pub revoked: bool,
+    /// Scope names this release does not know (set by a newer one); shown as-is, grant nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_scopes: Vec<String>,
+    #[serde(default)]
+    pub purpose: TokenPurpose,
+    /// Non-secret display form, e.g. `abk_1a2b3c4d5e6f7a8b_…9f3e`; never enough to rebuild the secret.
+    #[serde(default)]
+    pub secret_hint: String,
+    /// Address of the last request made with the token.
+    #[serde(default)]
+    pub last_used_addr: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// While in the future, the previous secret still works until then.
+    #[serde(default)]
+    pub prev_valid_until: Option<String>,
 }
 
 /// Returned once on creation; `secret` (`abk_<id>_<secret>`) cannot be retrieved again.

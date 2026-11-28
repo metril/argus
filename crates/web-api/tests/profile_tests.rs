@@ -56,7 +56,8 @@ fn code(v: &Value) -> &str {
 async fn restricted_token_cannot_touch_the_default_profile() {
     let ctx = TestContext::new().await.unwrap();
     let admin = ctx.admin().await;
-    let t = restricted(&admin, &["policy:read", "scripts:read"], &["5"]).await;
+    let p = mk_profile(&admin, "five").await;
+    let t = restricted(&admin, &["policy:read", "scripts:read"], &[p.as_str()]).await;
     for path in ["/api/v1/policy/site-rules", "/api/v1/userscripts"] {
         ctx.bearer("GET", path, &t)
             .await

@@ -30,14 +30,43 @@ scope its creator lacks, and its power shrinks if the creator is demoted or disa
 the given profile ids (see "Profiles, devices and restricted tokens").
 
 Expiry: `expires_in_days` (1 to 3650) or `expires_at` (RFC 3339, must be in the future), not both;
-omit both for a token that never expires.
+omit both for a token that never expires. Optional `purpose` (`extension`, `monitoring`, `script`,
+`full`, `read_only`, `custom`; default `custom`) is a label for the UI and grants nothing. Profile ids
+must exist. Token info carries `purpose`, `secret_hint` (token id and the last four characters,
+never enough to rebuild the secret), `last_used_at`, `last_used_addr`, `updated_at` and, while an
+old secret is still accepted, `prev_valid_until`.
+
+### Editing and regenerating
+
+`PATCH /tokens/{id}` (`tokens:self`; `PATCH /admin/tokens/{id}` with `tokens:admin`) changes
+`name`, `scopes`, `profiles` (or `clear_profiles`), `purpose` and expiry (`expires_in_days`,
+`expires_at` or `never_expires`; one of them). Absent fields stay. Scopes and profiles are checked
+like on creation: the caller must hold every scope and cannot widen the profile restriction, so a
+token can be narrowed but never widened beyond what the caller holds.
+
+`POST /tokens/{id}/regenerate` `{grace_secs?}` (0 to 604800, default 0) issues a new secret for the
+same token id and settings and returns it once. The old secret keeps working for `grace_secs`, then
+stops. Revoking the token ends both secrets. Both calls are audited.
+
+A token (not a session) calling these routes can act only on a token whose scopes, unknown scopes
+and profile restriction are within its own (403 `token_outside_grant`), and cannot give a token a
+lifetime beyond its own (403 `expiry_outside_grant`; `never_expires` is refused when the caller
+expires). An expired token cannot be edited (409 `token_expired`); regenerate it with a new expiry
+(`expires_in_days`, `expires_at` or `never_expires`, required for an expired token and optional on
+a live one, where it replaces the expiry). A revoked token cannot be revived.
+
+Compatibility: stored tokens that carry the new `bypass:site` scope are not readable by releases
+before this one (an older release skips a record with an unknown scope, so the token disappears
+from its list and can no longer be revoked there). From this release on, scope names the release
+does not know are kept verbatim (`unknown_scopes` in the token info), grant nothing, and the token
+still loads, lists and can be revoked.
 
 ### Browser extension sign-in
 
 `POST /auth/extension-token` `{username, password, browser, replace_token_id?}` checks the
 credentials like login (same rate limit, no session, no cookies) and returns
 `{token, token_id, user}`: a never-expiring token named `Extension · {browser}` with exactly
-`logs:read`, `userscripts:bridge`, `stats:read`, `rules:site` and `rules:ext`. 401 for wrong credentials, 403 `insufficient_role` when the
+`userscripts:bridge`, `rules:site`, `rules:ext`, `bypass:site`, `logs:read` and `stats:read`. 401 for wrong credentials, 403 `insufficient_role` when the
 role lacks either scope. `replace_token_id` revokes that token if it is the caller's own (anyone
 else's id is ignored). `DELETE /tokens/self` lets any API token revoke itself (400 for a cookie
 session). Both routes accept extension origins (CORS); `GET /downloads/extension/chrome` adds an
@@ -57,6 +86,7 @@ bundles of scopes (table below), so a session's permissions are its role's scope
 | `rules:write` | - | yes | yes | Replace the custom rules. |
 | `rules:site` | - | yes | yes | Switch ad blocking off or on for a single site (a document exception in the custom rules); nothing else in the rules. |
 | `rules:ext` | - | yes | yes | Add or remove one custom rule at a time through the browser extension (a single validated line); nothing else in the rules. |
+| `bypass:site` | - | yes | yes | Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists. |
 | `engine:reload` | - | - | yes | Trigger a rebuild of the blocking engine. |
 | `stats:read` | yes | yes | yes | Read blocking, proxy and engine statistics. |
 | `logs:read` | - | yes | yes | Read the request log, live and recent (full browsing history of every client the token may see). |

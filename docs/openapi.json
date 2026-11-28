@@ -69,6 +69,13 @@
           "id": {
             "type": "string"
           },
+          "last_used_addr": {
+            "description": "Address of the last request made with the token.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "last_used_at": {
             "type": [
               "string",
@@ -77,6 +84,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "prev_valid_until": {
+            "description": "While in the future, the previous secret still works until then.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "profiles": {
             "items": {
@@ -87,6 +101,9 @@
               "null"
             ]
           },
+          "purpose": {
+            "$ref": "#/components/schemas/TokenPurpose"
+          },
           "revoked": {
             "type": "boolean"
           },
@@ -95,6 +112,23 @@
               "$ref": "#/components/schemas/Scope"
             },
             "type": "array"
+          },
+          "secret_hint": {
+            "description": "Non-secret display form, e.g. `abk_1a2b3c4d5e6f7a8b_…9f3e`; never enough to rebuild the secret.",
+            "type": "string"
+          },
+          "unknown_scopes": {
+            "description": "Scope names this release does not know (set by a newer one); shown as-is, grant nothing.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1845,6 +1879,17 @@
             "type": [
               "array",
               "null"
+            ]
+          },
+          "purpose": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenPurpose",
+                "description": "What the token is for (a label for the UI; grants nothing). Default `custom`."
+              }
             ]
           },
           "scopes": {
@@ -4150,6 +4195,13 @@
                 "id": {
                   "type": "string"
                 },
+                "last_used_addr": {
+                  "description": "Address of the last request made with the token.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "last_used_at": {
                   "type": [
                     "string",
@@ -4158,6 +4210,13 @@
                 },
                 "name": {
                   "type": "string"
+                },
+                "prev_valid_until": {
+                  "description": "While in the future, the previous secret still works until then.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "profiles": {
                   "items": {
@@ -4168,6 +4227,9 @@
                     "null"
                   ]
                 },
+                "purpose": {
+                  "$ref": "#/components/schemas/TokenPurpose"
+                },
                 "revoked": {
                   "type": "boolean"
                 },
@@ -4176,6 +4238,23 @@
                     "$ref": "#/components/schemas/Scope"
                   },
                   "type": "array"
+                },
+                "secret_hint": {
+                  "description": "Non-secret display form, e.g. `abk_1a2b3c4d5e6f7a8b_…9f3e`; never enough to rebuild the secret.",
+                  "type": "string"
+                },
+                "unknown_scopes": {
+                  "description": "Scope names this release does not know (set by a newer one); shown as-is, grant nothing.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "updated_at": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
@@ -5644,6 +5723,38 @@
         ],
         "type": "object"
       },
+      "RegenerateTokenRequest": {
+        "description": "Issue a new secret for a token.",
+        "properties": {
+          "expires_at": {
+            "description": "New absolute expiry (RFC 3339, in the future).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_in_days": {
+            "description": "New lifetime in days. Required (one of the three) for an expired token; on a live token\nit replaces the expiry when given.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "grace_secs": {
+            "description": "Seconds the old secret keeps working (0 to 7 days, default 0).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "never_expires": {
+            "description": "Remove the expiry.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "RegisterRequest": {
         "description": "Register request payload.",
         "properties": {
@@ -5980,6 +6091,7 @@
           "RulesWrite",
           "RulesSite",
           "RulesExt",
+          "BypassSite",
           "EngineReload",
           "StatsRead",
           "LogsRead",
@@ -6984,6 +7096,18 @@
         ],
         "type": "object"
       },
+      "TokenPurpose": {
+        "description": "What a token was made for. A presentation label only; the scopes decide access.",
+        "enum": [
+          "extension",
+          "monitoring",
+          "script",
+          "full",
+          "read_only",
+          "custom"
+        ],
+        "type": "string"
+      },
       "TransparentStatus": {
         "allOf": [
           {
@@ -7604,6 +7728,72 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateTokenRequest": {
+        "description": "Change a token. Absent fields stay as they are. Scopes and profiles are checked like on\ncreation: nothing can be widened beyond what the caller holds, and narrowing is always fine.",
+        "properties": {
+          "clear_profiles": {
+            "description": "Remove the profile restriction (only for a caller who is not restricted).",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "description": "New absolute expiry (RFC 3339, in the future).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_in_days": {
+            "description": "New lifetime in days from now. Exclusive with `expires_at` and `never_expires`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "never_expires": {
+            "description": "Remove the expiry.",
+            "type": "boolean"
+          },
+          "profiles": {
+            "description": "Replaces the profile restriction (ids of existing profiles).",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "purpose": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TokenPurpose"
+              }
+            ]
+          },
+          "scopes": {
+            "description": "Replaces the scopes; a non-empty subset of the caller's own.",
+            "items": {
+              "$ref": "#/components/schemas/Scope"
+            },
+            "type": [
+              "array",
               "null"
             ]
           }
@@ -8654,6 +8844,7 @@
     },
     "x-scopes": {
       "audit:read": "Read the audit log.",
+      "bypass:site": "Stop Argus decrypting a single site (a no-decrypt bypass entry made through the browser extension); nothing else in the bypass lists.",
       "ca:admin": "Manage the CA certificate (reserved).",
       "ca:read": "Read CA certificate details (fingerprint, expiry, subject).",
       "config:read": "Read the proxy configuration.",
@@ -9089,6 +9280,98 @@
           }
         ],
         "summary": "Revoke any user's token.",
+        "tags": [
+          "tokens"
+        ]
+      },
+      "patch": {
+        "operationId": "admin_update_token",
+        "parameters": [
+          {
+            "description": "Token id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenInfo"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "tokens:admin"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "tokens:admin"
+            ]
+          }
+        ],
+        "summary": "Change any user's token. Scopes and profiles are still limited to what the caller holds.",
         "tags": [
           "tokens"
         ]
@@ -20062,7 +20345,7 @@
             ]
           }
         ],
-        "summary": "Create an API token. The secret is returned once and cannot be retrieved again. Requested\nscopes must all be held by the caller (a token can never mint more than it has).",
+        "summary": "Create an API token. The secret is returned once and cannot be retrieved again. Requested\nscopes must all be held by the caller (a token can never mint more than it has), and\n`profiles` must name existing profiles within the caller's own restriction.",
         "tags": [
           "tokens"
         ]
@@ -20219,6 +20502,192 @@
           }
         ],
         "summary": "Revoke one of your own tokens; it stops working immediately.",
+        "tags": [
+          "tokens"
+        ]
+      },
+      "patch": {
+        "operationId": "update_token",
+        "parameters": [
+          {
+            "description": "Token id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiTokenInfo"
+                }
+              }
+            },
+            "description": "Updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "tokens:self"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "tokens:self"
+            ]
+          }
+        ],
+        "summary": "Change one of your own tokens: name, scopes, profiles or expiry. Scopes and profiles are\nchecked like on creation; a token can be narrowed but never widened beyond what you hold.\nA token caller can only edit tokens within its own grant and cannot extend a lifetime past\nits own. An expired token cannot be edited (409): regenerate it with a new expiry.",
+        "tags": [
+          "tokens"
+        ]
+      }
+    },
+    "/api/v1/tokens/{id}/regenerate": {
+      "post": {
+        "operationId": "regenerate_token",
+        "parameters": [
+          {
+            "description": "Token id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegenerateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedTokenResponse"
+                }
+              }
+            },
+            "description": "New secret; shown only here"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "tokens:self"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "tokens:self"
+            ]
+          }
+        ],
+        "summary": "Issue a new secret for one of your own tokens (same id and settings). The new secret is\nreturned once. The old secret keeps working for `grace_secs` (0 to 7 days, default 0), then\nstops; revoking the token ends both. An expired token needs a new expiry in the request\n(`expires_in_days`, `expires_at` or `never_expires`), else 409; on a live token they are\noptional and replace the expiry. A token caller can only regenerate a token within its own\ngrant, with a lifetime no longer than its own.",
         "tags": [
           "tokens"
         ]
