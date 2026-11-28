@@ -938,6 +938,16 @@ impl ExtHub {
 
     /// The profile a session's connections are pinned to: the first profile its token is
     /// restricted to (`None`: the usual resolution by client address and device token).
+    /// The id of the bridge token that opened `session` (a non-secret identifier, stable across
+    /// the browser's reconnects).
+    pub fn token_id_of(&self, session: u64) -> Option<String> {
+        self.inner
+            .lock()
+            .sessions
+            .get(&session)
+            .map(|s| s.token_id.clone())
+    }
+
     pub fn pinned_profile(&self, session: u64) -> Option<u64> {
         self.inner.lock().sessions.get(&session)?.pinned
     }

@@ -107,8 +107,8 @@ fn looks_like_http(buf: &[u8]) -> bool {
 
 /// Parse a ClientHello out of `buf` (reading more from `stream` as needed, never discarding
 /// anything: `buf` keeps every byte for replay).
-async fn read_client_hello(
-    stream: &mut TcpStream,
+async fn read_client_hello<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
     buf: &mut Vec<u8>,
     limit: Duration,
 ) -> Result<Hello> {
@@ -184,7 +184,7 @@ impl TransparentEntry {
     }
 
     /// Handle one redirected connection end to end.
-    pub async fn handle(&self, h: &ConnectionHandler, mut stream: TcpStream) -> Result<()> {
+    pub async fn handle(&self, h: &ConnectionHandler, stream: TcpStream) -> Result<()> {
         let _ = stream.set_nodelay(true);
         h.mark_transparent();
         let dst = self
@@ -216,6 +216,8 @@ impl TransparentEntry {
             )));
         }
 
+        // Everything past the loop guard is counted on the client-facing socket.
+        let mut stream = h.counted(stream);
         let limit = h.shared.timeouts.load().handshake;
         let mut buf = Vec::with_capacity(2048);
         read_at_least(&mut stream, &mut buf, 1, limit)

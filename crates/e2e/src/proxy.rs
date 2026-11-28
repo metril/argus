@@ -382,6 +382,11 @@ impl TestProxy {
         })
     }
 
+    /// The proxy's traffic accounting hub.
+    pub fn traffic(&self) -> Arc<proxy_core::traffic::Traffic> {
+        self.control.traffic()
+    }
+
     /// The proxy's live-control handle (rebinding, access settings).
     pub fn control(&self) -> Arc<proxy_core::server::ProxyControl> {
         self.control.clone()

@@ -42,7 +42,13 @@ pub fn filter_stats(state: &AppState) -> FilterStatsResponse {
 }
 
 pub fn proxy_stats(state: &AppState) -> ProxyStatsResponse {
-    let s = state.proxy_state.stats.snapshot();
+    let mut s = state.proxy_state.stats.snapshot();
+    // Byte totals come from the traffic accounting (the client-facing socket); they used to be
+    // always 0. They reset together with the traffic statistics.
+    if let Some((up, down)) = state.runtime.get().and_then(|r| r.traffic_totals()) {
+        s.bytes_received = up;
+        s.bytes_sent = down;
+    }
     ProxyStatsResponse {
         bypassed_total: state.bypass().bypassed_total(),
         failsafe: {
@@ -608,5 +614,309 @@ pub async fn get_timeseries(
         range,
         bucket_secs: step,
         points,
+    }))
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TrafficQuery {
+    /// `device` (one row per device, default) or `host`.
+    pub group: Option<String>,
+    /// Only this device (an id from a `group=device` row).
+    pub device: Option<String>,
+    /// Most rows (1..=1000, default 100).
+    pub limit: Option<u32>,
+    /// `rate` (current up+down rate, default), `down` or `up` (cumulative bytes).
+    pub sort: Option<String>,
+}
+
+/// The id shown for a device key: the token digest is cut short, never exposed whole.
+fn public_device_id(key: &str) -> String {
+    match key.strip_prefix("t:") {
+        Some(hex) => format!("t:{}", &hex[..hex.len().min(12)]),
+        None => key.to_string(),
+    }
+}
+
+fn to_ms_rfc3339(ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .unwrap_or_default()
+        .to_rfc3339()
+}
+
+fn blank_row() -> api_types::TrafficRowDto {
+    api_types::TrafficRowDto {
+        device_id: None,
+        device_name: None,
+        profile_id: None,
+        host: None,
+        other: false,
+        up: 0,
+        down: 0,
+        up_rate: 0.0,
+        down_rate: 0.0,
+        connections_total: 0,
+        connections_active: 0,
+        local_requests: 0,
+        local_bytes: 0,
+        handling: Default::default(),
+        last_active: None,
+        top_hosts: Vec::new(),
+    }
+}
+
+fn add_row(d: &mut api_types::TrafficRowDto, r: &common::traffic::TrafficRow) {
+    d.up += r.up;
+    d.down += r.down;
+    d.up_rate += r.up_rate;
+    d.down_rate += r.down_rate;
+    d.connections_total += r.connections_total;
+    d.connections_active += r.connections_active;
+    d.local_requests += r.local_requests;
+    d.local_bytes += r.local_bytes;
+    d.handling.decrypted += r.handling.decrypted;
+    d.handling.tunnelled += r.handling.tunnelled;
+    d.handling.plain += r.handling.plain;
+    if let Some(ms) = r.last_active_ms {
+        let cur = d
+            .last_active
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.timestamp_millis() as u64)
+            .unwrap_or(0);
+        if ms > cur {
+            d.last_active = Some(to_ms_rfc3339(ms));
+        }
+    }
+}
+
+const OTHER_HOSTS: &str = "(other hosts)";
+
+fn unmap(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Live traffic per device or host: bytes and smoothed rates counted on the client-facing
+/// socket (TLS and HTTP framing included). Needs `stats:read`; the per-host figures (`top_hosts`
+/// and `group=host`) are browsing history and also need `logs:read` (without it `top_hosts` is
+/// empty, `hosts_visible` is false and `group=host` answers 403). A profile-restricted token sees
+/// only the devices of its own profiles. A device's id is `i:<address>` (an unregistered
+/// address), `t:<first 12 hex of the device token digest>` or `x:<extension token id>`.
+#[utoipa::path(
+    get, path = "/stats/traffic", tag = "stats",
+    security(("bearer_auth" = ["stats:read"])),
+    params(TrafficQuery),
+    responses((status = 200, description = "Traffic", body = api_types::TrafficResponse))
+)]
+pub async fn get_traffic(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+    ApiQuery(q): ApiQuery<TrafficQuery>,
+) -> ApiResult<Json<api_types::TrafficResponse>> {
+    let group = q.group.as_deref().unwrap_or("device");
+    if !["device", "host"].contains(&group) {
+        return Err(ApiError::ValidationError(format!(
+            "unknown group '{group}' (device, host)"
+        )));
+    }
+    let sort = q.sort.as_deref().unwrap_or("rate");
+    if !["rate", "down", "up"].contains(&sort) {
+        return Err(ApiError::ValidationError(format!(
+            "unknown sort '{sort}' (rate, down, up)"
+        )));
+    }
+    let limit = match q.limit {
+        None => 100,
+        Some(l @ 1..=1000) => l as usize,
+        Some(_) => {
+            return Err(ApiError::ValidationError(
+                "limit must be between 1 and 1000".into(),
+            ))
+        }
+    };
+    // Per-host figures are a browsing history: they need `logs:read` like the request log.
+    let hosts_visible = p.has(api_types::Scope::LogsRead);
+    if group == "host" && !hosts_visible {
+        return Err(ApiError::coded(
+            axum::http::StatusCode::FORBIDDEN,
+            "insufficient_scope",
+            "Missing required scope: logs:read (per-host traffic is browsing history)",
+        ));
+    }
+    let snap = state
+        .runtime
+        .get()
+        .and_then(|r| r.traffic_snapshot())
+        .unwrap_or_default();
+    let st = state.clone();
+    let devices = crate::state::blocking(move || Ok(st.profiles.devices()?))
+        .await
+        .unwrap_or_default();
+    let name_of = |key: &str| -> String {
+        if let Some(hex) = key.strip_prefix("t:") {
+            for d in &devices {
+                if let Some(dg) = d.token_digest {
+                    let h: String = dg.iter().map(|b| format!("{b:02x}")).collect();
+                    if h == hex {
+                        return d.name.clone();
+                    }
+                }
+            }
+            return "Device token".into();
+        }
+        if let Some(ip) = key.strip_prefix("i:") {
+            if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                let addr = unmap(addr);
+                if let Some(d) = devices
+                    .iter()
+                    .find(|d| d.ips.iter().any(|n| n.contains(&addr)))
+                {
+                    return d.name.clone();
+                }
+            }
+            return ip.to_string();
+        }
+        "Browser extension".into()
+    };
+
+    let visible: Vec<&common::traffic::DeviceTraffic> = snap
+        .devices
+        .iter()
+        .filter(|d| p.may_access_profile(&d.profile_id.to_string()))
+        .filter(|d| {
+            q.device
+                .as_deref()
+                .is_none_or(|w| public_device_id(&d.key) == w)
+        })
+        .collect();
+
+    let mut totals = api_types::TrafficTotals::default();
+    if p.profiles.is_none() && q.device.is_none() {
+        totals.up = snap.up_total;
+        totals.down = snap.down_total;
+    } else {
+        for d in &visible {
+            totals.up += d.row.up;
+            totals.down += d.row.down;
+        }
+    }
+
+    let mut rows: Vec<api_types::TrafficRowDto> = Vec::new();
+    if group == "device" {
+        for d in &visible {
+            let mut r = blank_row();
+            r.device_id = Some(public_device_id(&d.key));
+            r.device_name = Some(name_of(&d.key));
+            r.profile_id = Some(d.profile_id.to_string());
+            add_row(&mut r, &d.row);
+            let mut hosts: Vec<&common::traffic::HostTraffic> = d.hosts.iter().collect();
+            let k = |h: &common::traffic::HostTraffic| {
+                (
+                    h.row.up_rate + h.row.down_rate,
+                    (h.row.up + h.row.down) as f64,
+                )
+            };
+            hosts.sort_by(|a, b| k(b).partial_cmp(&k(a)).unwrap_or(std::cmp::Ordering::Equal));
+            r.top_hosts = hosts
+                .into_iter()
+                .filter(|_| hosts_visible)
+                .take(5)
+                .map(|h| api_types::TrafficTopHost {
+                    host: h.host.clone(),
+                    up: h.row.up,
+                    down: h.row.down,
+                    up_rate: h.row.up_rate,
+                    down_rate: h.row.down_rate,
+                    other: false,
+                })
+                .collect();
+            rows.push(r);
+        }
+    } else {
+        let single = q.device.is_some();
+        let mut by_host: std::collections::HashMap<
+            (Option<String>, String, bool),
+            api_types::TrafficRowDto,
+        > = Default::default();
+        for d in &visible {
+            let dev = single.then(|| public_device_id(&d.key));
+            let other = (d.other.up + d.other.down > 0).then_some((OTHER_HOSTS, true, &d.other));
+            let entries = d
+                .hosts
+                .iter()
+                .map(|h| (h.host.as_str(), false, &h.row))
+                .chain(other);
+            for (host, is_other, row) in entries {
+                let e = by_host
+                    .entry((dev.clone(), host.to_string(), is_other))
+                    .or_insert_with(|| {
+                        let mut r = blank_row();
+                        r.host = Some(host.to_string());
+                        r.other = is_other;
+                        if single {
+                            r.device_id = Some(public_device_id(&d.key));
+                            r.device_name = Some(name_of(&d.key));
+                            r.profile_id = Some(d.profile_id.to_string());
+                        }
+                        r
+                    });
+                add_row(e, row);
+            }
+        }
+        rows = by_host.into_values().collect();
+    }
+    rows.sort_by(|a, b| {
+        let key = |r: &api_types::TrafficRowDto| match sort {
+            "down" => (r.down as f64, r.up as f64),
+            "up" => (r.up as f64, r.down as f64),
+            _ => (r.up_rate + r.down_rate, (r.up + r.down) as f64),
+        };
+        key(b)
+            .partial_cmp(&key(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.host.cmp(&b.host))
+            .then_with(|| a.device_id.cmp(&b.device_id))
+    });
+    rows.truncate(limit);
+    Ok(Json(api_types::TrafficResponse {
+        group: group.into(),
+        at: to_ms_rfc3339(snap.at_ms),
+        at_ms: snap.at_ms,
+        interval_ms: snap.interval_ms,
+        hosts_visible,
+        totals,
+        rows,
+    }))
+}
+
+/// Forget all traffic counted so far.
+#[utoipa::path(
+    post, path = "/stats/traffic/reset", tag = "stats",
+    security(("bearer_auth" = ["stats:reset"])),
+    responses((status = 200, description = "Reset", body = MessageResponse))
+)]
+pub async fn reset_traffic(
+    State(state): State<Arc<AppState>>,
+    Extension(p): Extension<Principal>,
+) -> ApiResult<Json<MessageResponse>> {
+    if p.profiles.is_some() {
+        // The counters span every device: a profile-restricted token cannot clear them.
+        return Err(ApiError::coded(
+            axum::http::StatusCode::FORBIDDEN,
+            "profile_restricted",
+            "Traffic counters span all devices; a profile-restricted token cannot reset them",
+        ));
+    }
+    if let Some(r) = state.runtime.get() {
+        r.traffic_reset();
+    }
+    info!("Traffic statistics reset by {}", p.username);
+    Ok(Json(MessageResponse {
+        message: "Traffic statistics reset successfully".into(),
     }))
 }

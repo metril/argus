@@ -49,6 +49,7 @@ pub mod self_route;
 pub mod server;
 pub mod stealth;
 pub mod tls;
+pub mod traffic;
 pub mod transparent;
 pub mod upstream;
 pub mod upstream_proxy;

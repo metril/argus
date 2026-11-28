@@ -7388,6 +7388,249 @@
         ],
         "type": "string"
       },
+      "TrafficHandling": {
+        "description": "Bytes by how the proxy handled the connection they crossed.",
+        "properties": {
+          "decrypted": {
+            "description": "TLS terminated and filtered.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "plain": {
+            "description": "Plain HTTP.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tunnelled": {
+            "description": "Opaque tunnel (bypass, EV, fail-safe).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "decrypted",
+          "tunnelled",
+          "plain"
+        ],
+        "type": "object"
+      },
+      "TrafficResponse": {
+        "description": "Traffic accounting snapshot. Poll every `interval_ms` or so and draw `*_rate`.",
+        "properties": {
+          "at": {
+            "description": "Server time (RFC 3339) and in Unix milliseconds.",
+            "type": "string"
+          },
+          "at_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "group": {
+            "description": "`device` or `host`.",
+            "type": "string"
+          },
+          "hosts_visible": {
+            "description": "Whether per-host figures are included (they need `logs:read` besides `stats:read`).",
+            "type": "boolean"
+          },
+          "interval_ms": {
+            "description": "How often the figures are refreshed on the server.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/TrafficRowDto"
+            },
+            "type": "array"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/TrafficTotals",
+            "description": "Totals the caller may see (all devices, or those of its profiles)."
+          }
+        },
+        "required": [
+          "group",
+          "at",
+          "at_ms",
+          "interval_ms",
+          "hosts_visible",
+          "totals",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "TrafficRowDto": {
+        "description": "A row of the traffic table: one device (`group=device`) or one host (`group=host`).",
+        "properties": {
+          "connections_active": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "connections_total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "device_id": {
+            "description": "Stable id of the device (`t:...` token device, `x:...` extension session, `i:...` address);\nabsent on a host row that merges several devices.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "device_name": {
+            "description": "Device name (its address when it is not a registered device).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "down": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "down_rate": {
+            "format": "double",
+            "type": "number"
+          },
+          "handling": {
+            "$ref": "#/components/schemas/TrafficHandling"
+          },
+          "host": {
+            "description": "Host (host rows only).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_active": {
+            "description": "RFC 3339 time of the last byte.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "local_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "local_requests": {
+            "description": "Requests answered by the proxy itself, and their body bytes (part of `down`).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "other": {
+            "description": "Hosts folded together after eviction or idleness (host rows only).",
+            "type": "boolean"
+          },
+          "profile_id": {
+            "description": "Profile the device resolved to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "top_hosts": {
+            "description": "Device rows: the busiest hosts by current rate.",
+            "items": {
+              "$ref": "#/components/schemas/TrafficTopHost"
+            },
+            "type": "array"
+          },
+          "up": {
+            "description": "Bytes received from the client / sent to the client, including TLS and HTTP framing.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_rate": {
+            "description": "Smoothed bytes per second.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "up",
+          "down",
+          "up_rate",
+          "down_rate",
+          "connections_total",
+          "connections_active",
+          "local_requests",
+          "local_bytes",
+          "handling"
+        ],
+        "type": "object"
+      },
+      "TrafficTopHost": {
+        "description": "One host of a device, by current rate.",
+        "properties": {
+          "down": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "down_rate": {
+            "format": "double",
+            "type": "number"
+          },
+          "host": {
+            "type": "string"
+          },
+          "other": {
+            "description": "Hosts folded together after eviction or idleness.",
+            "type": "boolean"
+          },
+          "up": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_rate": {
+            "description": "Smoothed bytes per second.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "host",
+          "up",
+          "down",
+          "up_rate",
+          "down_rate"
+        ],
+        "type": "object"
+      },
+      "TrafficTotals": {
+        "description": "Process-wide byte totals.",
+        "properties": {
+          "down": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "up",
+          "down"
+        ],
+        "type": "object"
+      },
       "TransparentStatus": {
         "allOf": [
           {
@@ -20785,6 +21028,192 @@
           }
         ],
         "summary": "Requests and blocked requests per bucket. `6h`, `24h` and `7d` come from the in-memory history\n(since the last start); `d7`, `d30` and `m12` from the persisted daily history, by category.",
+        "tags": [
+          "stats"
+        ]
+      }
+    },
+    "/api/v1/stats/traffic": {
+      "get": {
+        "operationId": "get_traffic",
+        "parameters": [
+          {
+            "description": "`device` (one row per device, default) or `host`.",
+            "in": "query",
+            "name": "group",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this device (an id from a `group=device` row).",
+            "in": "query",
+            "name": "device",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Most rows (1..=1000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`rate` (current up+down rate, default), `down` or `up` (cumulative bytes).",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficResponse"
+                }
+              }
+            },
+            "description": "Traffic"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "stats:read"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "stats:read"
+            ]
+          }
+        ],
+        "summary": "Live traffic per device or host: bytes and smoothed rates counted on the client-facing\nsocket (TLS and HTTP framing included). Needs `stats:read`; the per-host figures (`top_hosts`\nand `group=host`) are browsing history and also need `logs:read` (without it `top_hosts` is\nempty, `hosts_visible` is false and `group=host` answers 403). A profile-restricted token sees\nonly the devices of its own profiles. A device's id is `i:<address>` (an unregistered\naddress), `t:<first 12 hex of the device token digest>` or `x:<extension token id>`.",
+        "tags": [
+          "stats"
+        ]
+      }
+    },
+    "/api/v1/stats/traffic/reset": {
+      "post": {
+        "operationId": "reset_traffic",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageResponse"
+                }
+              }
+            },
+            "description": "Reset"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing, invalid, expired or revoked credentials"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Missing scope, or CSRF check failed"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Rate limit exceeded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": [
+              "stats:reset"
+            ]
+          },
+          {
+            "cookie_auth": [
+              "stats:reset"
+            ]
+          }
+        ],
+        "summary": "Forget all traffic counted so far.",
         "tags": [
           "stats"
         ]

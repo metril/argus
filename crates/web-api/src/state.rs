@@ -239,6 +239,17 @@ pub trait RuntimeControl: Send + Sync {
     ) -> Result<Vec<api_types::DnsTestResult>, String> {
         Err("this build cannot test the DNS upstreams".into())
     }
+    /// Point-in-time traffic accounting (bytes per device and host); `None` without a proxy.
+    fn traffic_snapshot(&self) -> Option<common::traffic::TrafficSnapshot> {
+        None
+    }
+    /// Exact byte totals `(received from clients, sent to clients)` since start or the last
+    /// reset: two atomic loads, no fold. `None` without a proxy.
+    fn traffic_totals(&self) -> Option<(u64, u64)> {
+        None
+    }
+    /// Forget all traffic counted so far.
+    fn traffic_reset(&self) {}
     /// Issue the web UI's HTTPS certificate from the Argus CA for `sans` (DNS names and IP
     /// literals). Returns `(certificate PEM, key PEM)`.
     async fn issue_webui_cert(&self, _sans: &[String]) -> Result<(String, String), String> {
