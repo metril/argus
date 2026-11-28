@@ -107,7 +107,7 @@ export interface LogEntry {
 /** `message` is the server's error text (the body of a JSON error), when it sent one. */
 export type Call<T> = { ok: true; value: T } | { ok: false; scope: boolean; status: number; message?: string; restricted?: true };
 
-async function call<T>(s: Settings, method: string, path: string, signal?: AbortSignal, extra?: { headers?: Record<string, string>; body?: unknown }): Promise<Call<T>> {
+export async function call<T>(s: Settings, method: string, path: string, signal?: AbortSignal, extra?: { headers?: Record<string, string>; body?: unknown }): Promise<Call<T>> {
   if (!s.argusUrl || !s.token) return { ok: false, scope: false, status: 0 };
   try {
     const headers: Record<string, string> = { Authorization: `Bearer ${s.token}`, ...extra?.headers };

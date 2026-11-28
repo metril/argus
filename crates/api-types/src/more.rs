@@ -832,6 +832,12 @@ pub struct ExtKindStatsDto {
     pub unsupported: usize,
     pub parse_errors: usize,
     pub badfiltered: usize,
+    /// Matched by the index but not yet applied by the proxy (not counted in `active`).
+    #[serde(default)]
+    pub not_enforced: usize,
+    /// Meaningless for a proxy (`$popunder`).
+    #[serde(default)]
+    pub not_applicable: usize,
 }
 
 /// A handed-off rule that could not be used.

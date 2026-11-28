@@ -4,6 +4,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
+use regex::{Regex, RegexBuilder};
+
 /// Fx-style hasher: fast for short strings and integer keys. Keys are rule-derived; request data
 /// is only ever probed, never inserted, so hash flooding is not a concern.
 #[derive(Default, Clone, Copy)]
@@ -75,6 +77,105 @@ pub(crate) fn suffixes(host: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// Size limit of every regex compiled from a rule (matches the other rule regexes).
+pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
+/// Index of the unescaped `/` closing the regex literal opening at `b[start]`, honouring `\`
+/// escapes and `[...]` classes.
+fn regex_end(b: &[u8], start: usize) -> Option<usize> {
+    let (mut i, mut class) = (start + 1, false);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' => class = true,
+            b']' => class = false,
+            b'/' if !class => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Compile a `/regex/flags` literal (flags: `i`, `s`). `force_ci` makes it case-insensitive
+/// (hostnames). Every failure message contains "unsupported" so callers report the rule as
+/// unsupported: the `regex` crate has no look-around or back-references.
+pub(crate) fn compile_slash_regex(lit: &str, force_ci: bool) -> Result<Regex, String> {
+    let lit = lit.trim();
+    let end = lit
+        .starts_with('/')
+        .then(|| lit.rfind('/'))
+        .flatten()
+        .filter(|&e| e > 0)
+        .ok_or_else(|| "unsupported regex: unterminated /regex/".to_string())?;
+    let (src, flags) = (&lit[1..end], &lit[end + 1..]);
+    if src.is_empty() {
+        return Err("unsupported regex: empty regular expression".into());
+    }
+    if !flags.bytes().all(|c| matches!(c, b'i' | b's')) {
+        return Err(format!("unsupported regex flags `{flags}`"));
+    }
+    RegexBuilder::new(src)
+        .case_insensitive(force_ci || flags.contains('i'))
+        .dot_matches_new_line(flags.contains('s'))
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| {
+            let msg = e.to_string();
+            let first = msg.lines().last().unwrap_or("").trim().to_string();
+            let what = if msg.contains("look-around") || msg.contains("backreferences") {
+                "look-around and back-references are not supported"
+            } else if msg.contains("size limit") {
+                "pattern too large"
+            } else {
+                "pattern does not compile"
+            };
+            format!("unsupported regex ({what}): {first}")
+        })
+}
+
+/// Split `list` on `sep`, keeping `/regex/flags` items (optionally `~`-prefixed) whole, so a
+/// separator inside a regex (`{0,1}`, `a|b`) does not split it.
+pub(crate) fn split_items(list: &str, sep: char) -> Vec<&str> {
+    let b = list.as_bytes();
+    let sep = sep as u8;
+    let (mut out, mut start, mut i) = (Vec::new(), 0usize, 0usize);
+    while i <= b.len() {
+        if i == start {
+            let s = if b.get(i) == Some(&b'~') { i + 1 } else { i };
+            if b.get(s) == Some(&b'/') {
+                if let Some(e) = regex_end(b, s) {
+                    i = e + 1;
+                    while i < b.len() && b[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        if i >= b.len() || b[i] == sep {
+            out.push(&list[start..i.min(b.len())]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Path and query of an absolute URL (`/` when empty; the fragment is dropped).
+pub(crate) fn path_and_query(url: &str) -> Cow<'_, str> {
+    let Some((_, e)) = host_range(url) else {
+        return Cow::Borrowed("/");
+    };
+    let rest = &url[e..];
+    let rest = &rest[rest.find(['/', '?']).unwrap_or(rest.len())..];
+    let rest = rest.split('#').next().unwrap_or("");
+    match rest {
+        "" => Cow::Borrowed("/"),
+        r if r.starts_with('?') => Cow::Owned(format!("/{r}")),
+        r => Cow::Borrowed(r),
+    }
+}
+
 /// `host == d` or `host` is a subdomain of `d`.
 pub(crate) fn host_is_or_under(host: &str, d: &str) -> bool {
     host == d
@@ -83,8 +184,24 @@ pub(crate) fn host_is_or_under(host: &str, d: &str) -> bool {
             && host.as_bytes()[host.len() - d.len() - 1] == b'.')
 }
 
+/// A `/regex/` hostname entry; compared by its source text.
+#[derive(Debug, Clone)]
+pub(crate) struct HostRe {
+    src: Box<str>,
+    re: Regex,
+}
+
+impl PartialEq for HostRe {
+    fn eq(&self, o: &Self) -> bool {
+        self.src == o.src
+    }
+}
+impl Eq for HostRe {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Dom {
+    /// `/regex/` matched against the whole hostname (case-insensitive).
+    Regex(HostRe),
     /// `example.com` (and its subdomains).
     Suffix(Box<str>),
     /// `example.*`: `example` followed by any 1-3 label suffix (`.com`, `.co.uk`).
@@ -104,6 +221,7 @@ impl Dom {
     }
     fn matches(&self, host: &str) -> bool {
         match self {
+            Dom::Regex(r) => r.re.is_match(host),
             Dom::Suffix(d) => host_is_or_under(host, d),
             Dom::Entity(base) => suffixes(host).any(|s| {
                 s.strip_prefix(&**base)
@@ -112,8 +230,17 @@ impl Dom {
             }),
         }
     }
-    fn weight(&self) -> usize {
+    /// Specificity. A regex is the least specific positive entry but beats any plain entry when
+    /// it excludes, so `b.com,~/^m\.b\.com$/` leaves `m.b.com` out.
+    fn weight(&self, exclude: bool) -> usize {
         match self {
+            Dom::Regex(_) => {
+                if exclude {
+                    usize::MAX / 2
+                } else {
+                    1
+                }
+            }
             Dom::Suffix(d) => d.len(),
             Dom::Entity(d) => d.len() + 2,
         }
@@ -133,7 +260,7 @@ impl DomainSet {
     /// Parse entries separated by `sep`; `Err` on a malformed entry.
     pub fn parse(list: &str, sep: char) -> Result<Self, String> {
         let mut out = DomainSet::default();
-        for part in list.split(sep) {
+        for part in split_items(list, sep) {
             let part = part.trim();
             if part.is_empty() {
                 continue;
@@ -142,10 +269,14 @@ impl DomainSet {
                 Some(n) => (true, n),
                 None => (false, part),
             };
-            if name.starts_with('/') {
-                return Err("regular-expression domains are not supported".into());
-            }
-            let d = Dom::parse(name).ok_or_else(|| format!("bad domain `{part}`"))?;
+            let d = if name.starts_with('/') {
+                Dom::Regex(HostRe {
+                    src: name.into(),
+                    re: compile_slash_regex(name, true)?,
+                })
+            } else {
+                Dom::parse(name).ok_or_else(|| format!("bad domain `{part}`"))?
+            };
             if neg {
                 out.exclude.push(d)
             } else {
@@ -161,8 +292,9 @@ impl DomainSet {
         let mut best: Option<(usize, bool)> = None;
         for (set, inc) in [(&self.include, true), (&self.exclude, false)] {
             for d in set {
-                if d.matches(host) && best.is_none_or(|(w, _)| d.weight() > w) {
-                    best = Some((d.weight(), inc));
+                let w = d.weight(!inc);
+                if d.matches(host) && best.is_none_or(|(b, _)| w > b) {
+                    best = Some((w, inc));
                 }
             }
         }
@@ -170,6 +302,21 @@ impl DomainSet {
             Some((_, inc)) => inc,
             None => self.include.is_empty(),
         }
+    }
+    /// Host-bucket plan for page-scoped rules: the plain-suffix keys, and whether the rule must
+    /// also sit in the generic list (it has entity or regex entries, or no positive entry).
+    /// Candidates are a superset of the matches; exclusions are applied by [`Self::matches`].
+    pub fn bucket_plan(&self) -> (Vec<&str>, bool) {
+        let keys: Vec<&str> = self
+            .include
+            .iter()
+            .filter_map(|d| match d {
+                Dom::Suffix(s) => Some(&**s),
+                _ => None,
+            })
+            .collect();
+        let generic = self.include.is_empty() || keys.len() != self.include.len();
+        (keys, generic)
     }
     /// Plain-suffix keys usable for host bucketing, or `None` if any positive entry is an entity
     /// or the set has no positive entries.
@@ -181,7 +328,7 @@ impl DomainSet {
             .iter()
             .map(|d| match d {
                 Dom::Suffix(s) => Some(&**s),
-                Dom::Entity(_) => None,
+                Dom::Entity(_) | Dom::Regex(_) => None,
             })
             .collect()
     }
@@ -197,6 +344,35 @@ mod tests {
         assert_eq!(host_of("http://[::1]:80/"), Some("[::1]"));
         assert_eq!(host_of("nope"), None);
         assert_eq!(suffixes("a.b.c").collect::<Vec<_>>(), ["a.b.c", "b.c", "c"]);
+    }
+
+    #[test]
+    fn regex_domains() {
+        let d = DomainSet::parse(r"b.com,~/^m\.b\.com$/", ',').unwrap();
+        assert!(d.matches("b.com") && d.matches("www.b.com") && !d.matches("m.b.com"));
+        let d = DomainSet::parse(r"/(\d{0,1})?tamilprint(\d{1,2})?\.[a-z]{3,7}/", ',').unwrap();
+        assert!(
+            d.matches("tamilprint12.com") && d.matches("TAMILPRINT.net") && !d.matches("x.org")
+        );
+        assert!(d.bucket_keys().is_none());
+        let d = DomainSet::parse(r"/^a\.(b|c)\.com$/|x.org", '|').unwrap();
+        assert!(d.matches("a.c.com") && d.matches("x.org") && !d.matches("a.d.com"));
+        for bad in [r"/(?=x)/", r"/(a)\1/", "/(/", "/x"] {
+            let e = DomainSet::parse(bad, ',').unwrap_err();
+            assert!(e.contains("unsupported"), "{bad}: {e}");
+        }
+        assert_eq!(
+            split_items(r"a,/x{1,2}/,~/y,z/i,b", ','),
+            ["a", "/x{1,2}/", "~/y,z/i", "b"]
+        );
+    }
+
+    #[test]
+    fn path_query() {
+        assert_eq!(path_and_query("https://a.com"), "/");
+        assert_eq!(path_and_query("https://a.com/x/y?z=1#f"), "/x/y?z=1");
+        assert_eq!(path_and_query("https://a.com:81?z=1"), "/?z=1");
+        assert_eq!(path_and_query("https://a.com/#f"), "/");
     }
 
     #[test]

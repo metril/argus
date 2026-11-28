@@ -129,35 +129,47 @@ fn is_opt(o: &str, k: &str) -> bool {
 pub(crate) fn strip_redirects(rules: &str) -> String {
     let mut out = String::with_capacity(rules.len());
     for line in rules.lines() {
-        let Some((pat, opts)) = line
-            .rsplit_once('$')
-            .filter(|_| line.contains("redirect") && !line.starts_with("@@"))
-        else {
-            out.push_str(line);
+        if let Some(l) = strip_redirects_line(line) {
+            out.push_str(&l);
             out.push('\n');
-            continue;
-        };
-        if opts
-            .split(',')
-            .any(|o| is_opt(o, "domain") || is_opt(o, "from"))
-        {
-            out.push_str(line);
-            out.push('\n');
-            continue;
         }
-        let is = is_opt;
-        if opts.split(',').any(|o| is(o, "redirect-rule")) {
-            continue;
-        }
-        let kept: Vec<&str> = opts.split(',').filter(|o| !is(o, "redirect")).collect();
-        out.push_str(pat);
-        if !kept.is_empty() {
-            out.push('$');
-            out.push_str(&kept.join(","));
-        }
-        out.push('\n');
     }
     out
+}
+
+/// One line of [`strip_redirects`]: the (possibly rewritten) line, or `None` when it is dropped.
+pub(crate) fn strip_redirects_line(line: &str) -> Option<std::borrow::Cow<'_, str>> {
+    use crate::formats::{split_option_tokens, split_options};
+    use std::borrow::Cow;
+    if !line.contains("redirect") || line.starts_with("@@") {
+        return Some(Cow::Borrowed(line));
+    }
+    let (pat, Some(opts)) = split_options(line) else {
+        return Some(Cow::Borrowed(line));
+    };
+    let toks = split_option_tokens(opts);
+    if toks
+        .iter()
+        .any(|o| is_opt(o, "domain") || is_opt(o, "from"))
+    {
+        return Some(Cow::Borrowed(line));
+    }
+    if toks.iter().any(|o| is_opt(o, "redirect-rule")) {
+        return None;
+    }
+    if !toks.iter().any(|o| is_opt(o, "redirect")) {
+        return Some(Cow::Borrowed(line));
+    }
+    let kept: Vec<&str> = toks
+        .into_iter()
+        .filter(|o| !is_opt(o, "redirect"))
+        .collect();
+    let mut l = pat.to_string();
+    if !kept.is_empty() {
+        l.push('$');
+        l.push_str(&kept.join(","));
+    }
+    Some(Cow::Owned(l))
 }
 
 /// Drop AdGuard's bare-host exceptions `@@://host^|` (no options). AdGuard ships them to keep
@@ -166,21 +178,22 @@ pub(crate) fn strip_redirects(rules: &str) -> String {
 /// unblock the host's root URL (`https://host/`) while `||host^` blocks everything else.
 pub(crate) fn strip_host_only_exceptions(rules: &str) -> String {
     let mut out = String::with_capacity(rules.len());
-    for line in rules.lines() {
-        let host_only = line
-            .strip_prefix("@@://")
-            .and_then(|r| r.strip_suffix("^|"))
-            .is_some_and(|h| {
-                !h.is_empty()
-                    && h.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-            });
-        if !host_only {
-            out.push_str(line);
-            out.push('\n');
-        }
+    for line in rules.lines().filter(|l| !is_host_only_exception(l)) {
+        out.push_str(line);
+        out.push('\n');
     }
     out
+}
+
+/// Whether `line` is a bare-host exception dropped by [`strip_host_only_exceptions`].
+pub(crate) fn is_host_only_exception(line: &str) -> bool {
+    line.strip_prefix("@@://")
+        .and_then(|r| r.strip_suffix("^|"))
+        .is_some_and(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        })
 }
 
 /// Convert, dedupe and compile `inputs`.
@@ -203,6 +216,7 @@ pub fn build_set_checked(
                     format: i.format,
                     allowlist: i.allowlist,
                     includes: i.includes.clone(),
+                    trusted: i.trusted,
                 },
             )
         })
@@ -481,6 +495,21 @@ mod tests {
             let r = engine.check("https://googleadservices.com/", "https://page.test/", ty);
             assert!(r.blocked, "{ty}: {r:?}");
         }
+    }
+
+    #[test]
+    fn redirect_stripping_is_regex_aware() {
+        // A regex `$` in a `domain=` value must not hide the site restriction or the redirect.
+        let kept = r"||x.test^$domain=/a$/,redirect=noop.js";
+        assert_eq!(strip_redirects(&format!("{kept}\n")), format!("{kept}\n"));
+        assert_eq!(
+            strip_redirects("||x.test^$removeparam=/^a$/,redirect=noop.js\n"),
+            "||x.test^$removeparam=/^a$/\n"
+        );
+        assert!(matches!(
+            strip_redirects_line("||x.test^$script"),
+            Some(std::borrow::Cow::Borrowed(_))
+        ));
     }
 
     #[test]

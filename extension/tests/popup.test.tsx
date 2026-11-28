@@ -97,7 +97,7 @@ describe('popup stats', () => {
     await act(async () => { stats.click(); });
     await tick(); await tick();
     expect(text('global-blocked')).toBe('900');
-    expect(text('global-total')).toBe('of 20,000 requests');
+    expect(text('global-total')).toBe('20,000');
     expect(root.querySelector('[data-cat="ads"]')?.textContent).toBe('500');
     expect(root.querySelector('[data-testid="chart"] path')?.getAttribute('d')).toMatch(/^M/);
     expect(root.querySelector('[data-testid="page-stats"]')).toBeNull();
@@ -211,5 +211,36 @@ describe('per-domain grid and site rules', () => {
     await mount();
     await act(async () => { root.querySelector<HTMLButtonElement>('[data-testid="pick"]')!.click(); }); await tick();
     expect(sent).toContainEqual({ type: 'picker-arm', tabId: 1, mode: 'picker' });
+  });
+});
+
+describe('popup layout', () => {
+  it('has a full-width Actions | Statistics control, the switch in the site card header, and a 2x2 grid of actions', async () => {
+    await mount();
+    const seg = root.querySelector('.seg.wide[role=radiogroup]')!;
+    expect([...seg.querySelectorAll('[role=radio]')].map((b) => [b.textContent, b.getAttribute('aria-checked')])).toEqual([['Actions', 'true'], ['Statistics', 'false']]);
+    expect(root.querySelector('.card .phd [role=switch][aria-label="Argus on a.example"]')).not.toBeNull();
+    expect([...root.querySelectorAll('.pgrid > button')].map((b) => b.textContent)).toEqual(['Open logger', 'Cookies', 'Block an element', 'Zap elements']);
+    // The row a later slice adds ("Don't decrypt this site") goes in the slot right under the grid.
+    expect(root.querySelector('.pgrid')!.nextElementSibling?.getAttribute('data-testid')).toBe('actions-slot');
+  });
+
+  it('Cookies opens the cookie manager for the active tab, Open logger the logger', async () => {
+    await mount();
+    const create = vi.fn(async () => ({}));
+    (fakeBrowser.tabs as any).create = create;
+    await act(async () => { root.querySelector<HTMLButtonElement>('[data-testid=open-cookies]')!.click(); });
+    expect(create).toHaveBeenCalledWith({ url: expect.stringMatching(/\/cookies\.html#tab=1$/) });
+    await act(async () => { root.querySelector<HTMLButtonElement>('[data-testid=open-logger]')!.click(); });
+    expect(create).toHaveBeenCalledWith({ url: expect.stringMatching(/\/logger\.html#tab=1$/) });
+  });
+
+  it('arrow keys move through the view control', async () => {
+    await mount();
+    const first = root.querySelector<HTMLButtonElement>('[role=radio][aria-checked=true]')!;
+    await act(async () => { first.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true })); });
+    await tick(); await tick();
+    expect(root.querySelector('[role=radio][aria-checked=true]')!.textContent).toBe('Statistics');
+    expect(text('global-stats')).toContain('Since install');
   });
 });
