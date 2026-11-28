@@ -35,7 +35,7 @@ const CATALOGUE_SEEDED_KEY: &str = "catalogue_seeded";
 /// META keys of the removed Strict / default blocking profiles.
 const OLD_PROFILE_KEYS: [&str; 2] = ["default_offered", "strict_profile"];
 /// Report key for the custom rules (not a list id: list ids cannot contain NUL).
-pub(crate) const CUSTOM_REPORT_ID: &str = "\0custom";
+pub const CUSTOM_REPORT_ID: &str = "\0custom";
 
 /// Fetch outcome of a list, surfaced through the filters API.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

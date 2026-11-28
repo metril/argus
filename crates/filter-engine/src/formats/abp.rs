@@ -607,6 +607,18 @@ pub fn find_includes(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// What the preprocessor made of one source line (see [`preprocess_trace`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pre {
+    /// Handed to rule conversion (an included rule carries its `!#include` line's number).
+    Active,
+    /// Inside a branch whose `!#if` is false.
+    Inactive,
+    /// `!#if`, `!#else`, `!#endif` or `!#include`.
+    Directive,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn preprocess_into<'a>(
     content: &'a str,
     includes: &'a HashMap<String, String>,
@@ -615,12 +627,27 @@ fn preprocess_into<'a>(
     base_line: Option<usize>,
     html: bool,
     out: &mut Vec<(usize, &'a str)>,
+    mut trace: Option<&mut Vec<(usize, &'a str, Pre)>>,
 ) {
     // Stack of (this branch active, any branch taken, parent active).
     let mut stack: Vec<(bool, bool, bool)> = Vec::new();
     let active = |s: &Vec<(bool, bool, bool)>| s.last().is_none_or(|t| t.0);
     for (n, line) in content.lines().enumerate() {
         let t = line.trim();
+        if base_line.is_none() {
+            // Directives and inactive lines of the list itself (not of an include) are traced.
+            if let Some(tr) = trace.as_deref_mut() {
+                let directive = t.starts_with("!#if")
+                    || t.starts_with("!#else")
+                    || t.starts_with("!#endif")
+                    || t.starts_with("!#include");
+                if directive {
+                    tr.push((n + 1, line, Pre::Directive));
+                } else if !active(&stack) {
+                    tr.push((n + 1, line, Pre::Inactive));
+                }
+            }
+        }
         if let Some(rest) = t.strip_prefix("!#if") {
             let parent = active(&stack);
             let v = parent && eval_cond(rest, html);
@@ -644,13 +671,41 @@ fn preprocess_into<'a>(
                         Some(base_line.unwrap_or(n + 1)),
                         html,
                         out,
+                        trace.as_deref_mut(),
                     );
                 }
             }
         } else if active(&stack) {
-            out.push((base_line.unwrap_or(n + 1), line));
+            let at = base_line.unwrap_or(n + 1);
+            out.push((at, line));
+            if let Some(tr) = trace.as_deref_mut() {
+                tr.push((at, line, Pre::Active));
+            }
         }
     }
+}
+
+/// The preprocessor's decision for every line of `content`, in source order: directives and
+/// inactive lines of the list itself, and every active line (included rules carry the number of
+/// their `!#include` line). Same evaluation as [`convert`](super::convert).
+pub(crate) fn preprocess_trace<'a>(
+    content: &'a str,
+    includes: &'a HashMap<String, String>,
+    trusted: bool,
+) -> Vec<(usize, &'a str, Pre)> {
+    let mut out = Vec::new();
+    let mut trace = Vec::new();
+    preprocess_into(
+        content,
+        includes,
+        0,
+        &mut { MAX_INCLUDES },
+        None,
+        trusted,
+        &mut out,
+        Some(&mut trace),
+    );
+    trace
 }
 
 /// Evaluate `!#if` / `!#else` / `!#endif`, splice `!#include`s from `includes`, and parse header
@@ -677,6 +732,7 @@ pub fn preprocess_and_meta_for(
         None,
         trusted,
         &mut lines,
+        None,
     );
     let text: String = lines.iter().flat_map(|(_, l)| [*l, "\n"]).collect();
     (text, scan_meta(content))
@@ -1010,6 +1066,7 @@ pub(crate) fn convert_abp(content: &str, opts: &ConvertOptions) -> Converted {
         None,
         opts.trusted,
         &mut lines,
+        None,
     );
     for (line_no, raw) in lines {
         let Some(rule) = convert_line(raw, opts.allowlist) else {
@@ -1030,7 +1087,12 @@ pub(crate) fn convert_abp(content: &str, opts: &ConvertOptions) -> Converted {
                 out.stats.ext(e.kind);
                 out.ext.push(e);
             }
-            Rule::Error(reason) => out.stats.error(line_no, reason),
+            Rule::Error(reason) => {
+                out.stats.error(line_no, reason);
+                if out.stats.error_texts.len() < super::MAX_ERRORS {
+                    out.stats.error_texts.push(raw.trim().to_string());
+                }
+            }
         }
     }
     out.finish(scan_meta(content))

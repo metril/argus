@@ -112,6 +112,9 @@ pub struct Generation {
     pub aux: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// The list of each compiled rule of this build (see [`crate::origins`]).
     pub origins: Arc<crate::origins::RuleOrigins>,
+    /// The pure domain rules of this build: part of the generation, so a reader holding it
+    /// cannot see another build's set (the separate [`SharedEngine::domains`] swap lags it).
+    pub domains: Arc<DomainSet>,
     /// Strictly increasing per install; equal ids mean the same build.
     pub id: u64,
 }
@@ -271,6 +274,7 @@ impl SharedEngine {
                 engine: build_engine(&[], &[]),
                 aux: None,
                 origins: Arc::default(),
+                domains: Arc::new(DomainSet::empty()),
                 id: 0,
             })),
             next_gen: std::sync::atomic::AtomicU64::new(1),
@@ -325,6 +329,7 @@ impl SharedEngine {
             engine: build_engine(&self.blob.load(), &self.resources.load()),
             aux: cur.aux.clone(),
             origins: cur.origins.clone(),
+            domains: cur.domains.clone(),
             id: self.next_gen.fetch_add(1, Ordering::Relaxed),
         })));
         info!("Loaded {n} scriptlet/redirect resources");
@@ -451,6 +456,7 @@ impl SharedEngine {
         let _g = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = blob.len();
         let n = domains.len();
+        let gen_domains = domains.clone();
         // Old values go to the reaper: a request may still hold them, and whoever drops last
         // must not free a large structure on a request thread.
         crate::reaper::retire(self.blob.swap(blob));
@@ -458,6 +464,7 @@ impl SharedEngine {
             engine,
             aux,
             origins,
+            domains: gen_domains,
             id: self.next_gen.fetch_add(1, Ordering::Relaxed),
         })));
         crate::reaper::retire(self.ext_rules.swap(ext));

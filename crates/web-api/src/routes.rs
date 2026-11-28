@@ -10,8 +10,8 @@ use utoipa_axum::{
 };
 
 use crate::handlers::{
-    audit, auth, bypass, certificate, certs, devices, dns, downloads, ext, health, lists, policy,
-    profiles, proxy, rules, stats, tokens, users, userscripts, webui_tls,
+    audit, auth, bypass, certificate, certs, devices, dns, downloads, ext, health, lines, lists,
+    policy, profiles, proxy, rules, stats, tokens, users, userscripts, webui_tls,
 };
 use crate::state::AppState;
 
@@ -74,6 +74,8 @@ pub fn api_router() -> OpenApiRouter<Arc<AppState>> {
         ))
         .routes(routes!(lists::get_list_status))
         .routes(routes!(lists::get_list_report))
+        .routes(routes!(lines::get_list_lines))
+        .routes(routes!(lines::get_custom_lines))
         .routes(routes!(lists::refresh_list))
         // engine
         .routes(routes!(lists::reload_engine))

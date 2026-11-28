@@ -20,6 +20,7 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use abp::{convert_line, preprocess_trace, Pre, Rule};
 pub use abp::{
     find_includes, preprocess_and_meta, preprocess_and_meta_for, split_cosmetic,
     split_option_tokens, split_options, split_pipe_tokens, Cosmetic,
@@ -29,7 +30,7 @@ pub use iplist::{IpRange, IpSet};
 
 /// Bumped whenever conversion output could change for the same input (part of the persisted
 /// engine's cache key).
-pub const CONVERTER_VERSION: u32 = 5;
+pub const CONVERTER_VERSION: u32 = 6;
 
 /// Max number of per-line errors kept in [`ConvertStats::errors`].
 pub const MAX_ERRORS: usize = 50;
@@ -150,18 +151,46 @@ pub struct ConvertStats {
     pub translated: usize,
     /// Lines skipped by category (e.g. `rpz-nsdname`, `dnstype`, `header`), for the UI.
     pub skipped_reasons: BTreeMap<String, usize>,
+    /// The source text of the first [`MAX_ERRORS`] errors of an ABP-family list, parallel to
+    /// [`Self::errors`] (empty for other formats: their source line is the rule).
+    #[serde(default)]
+    pub error_texts: Vec<String>,
+    /// Line being converted (set by the line-oriented converters; used by the trace).
+    #[serde(skip)]
+    pub(crate) cur: usize,
+    /// Per-line events, when [`ConvertOptions::trace`] is set (non-ABP formats).
+    #[serde(skip)]
+    pub(crate) trace: Option<Vec<(usize, Ev)>>,
+}
+
+/// What a non-ABP converter did on one source line (see [`ConvertOptions::trace`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ev {
+    /// Emitted one rule line (the next unread line of [`Converted::rules`]).
+    Rule,
+    /// Emitted one IP range.
+    Ip,
+    Skip(String),
+    Error(String),
 }
 
 impl ConvertStats {
     pub(crate) fn error(&mut self, line_no: usize, reason: impl Into<String>) {
         self.error_count += 1;
+        let reason = reason.into();
+        if let Some(t) = &mut self.trace {
+            t.push((line_no, Ev::Error(reason.clone())));
+        }
         if self.errors.len() < MAX_ERRORS {
-            self.errors.push((line_no, reason.into()));
+            self.errors.push((line_no, reason));
         }
     }
 
     pub(crate) fn skip(&mut self, reason: &str) {
         self.skipped += 1;
+        if let Some(t) = &mut self.trace {
+            t.push((self.cur, Ev::Skip(reason.to_string())));
+        }
         *self.skipped_reasons.entry(reason.to_string()).or_default() += 1;
     }
 
@@ -196,6 +225,9 @@ pub struct ConvertOptions {
     /// The list is trusted. Trusted lists run HTML filtering and `$replace`, so their
     /// `!#if cap_html_filtering` branches are taken; untrusted lists keep the `!#else` ones.
     pub trusted: bool,
+    /// Record which source line produced each rule, skip and error (non-ABP formats; see
+    /// [`crate::inspect`]).
+    pub trace: bool,
 }
 
 /// Result of [`convert`].
@@ -540,6 +572,7 @@ impl Out {
             allow: opts.allowlist,
             stats: ConvertStats {
                 total_lines: content.lines().count(),
+                trace: opts.trace.then(Vec::new),
                 ..Default::default()
             },
             ext: Vec::new(),
@@ -555,6 +588,9 @@ impl Out {
         self.buf.push_str(rule_body);
         self.buf.push('\n');
         self.stats.converted += 1;
+        if let Some(t) = &mut self.stats.trace {
+            t.push((self.stats.cur, Ev::Rule));
+        }
     }
 
     /// Block (or, in an allowlist / when `exception`, allow) `d` and its subdomains.
@@ -584,6 +620,9 @@ impl Out {
 
     pub fn ip(&mut self, r: IpRange, exception: bool) {
         self.stats.converted += 1;
+        if let Some(t) = &mut self.stats.trace {
+            t.push((self.stats.cur, Ev::Ip));
+        }
         if exception || self.allow {
             self.ip_allow.push(r);
         } else {

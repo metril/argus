@@ -79,6 +79,7 @@ pub(crate) fn clip_echo(s: &str) -> String {
 pub(crate) fn sanitize_report(r: &mut filter_engine::ListReport) {
     for e in &mut r.errors {
         e.reason = clip_echo(&e.reason);
+        e.rule = clip_echo(&e.rule);
     }
     r.skipped_reasons = std::mem::take(&mut r.skipped_reasons)
         .into_iter()
